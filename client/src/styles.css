@@ -790,6 +790,7 @@ body {
 .model-opt {
   display: flex;
   align-items: center;
+  flex-wrap: wrap; /* lets the selected row's weight status drop to its own line */
   gap: 10px;
   padding: 12px 14px;
   border: 1px solid var(--line);
@@ -822,6 +823,40 @@ body {
   font-size: 12px;
   color: var(--ink-faint);
   margin-left: auto;
+}
+
+/* Weight status for the selected model. Takes a full row of its own (the row is
+   a flex line with params pushed right, so anything appended would fight for
+   the same line) — this is where the old floating banner's content went. */
+.model-opt__weights {
+  flex-basis: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+  color: var(--ink-dim);
+  cursor: default;
+}
+
+.model-opt__weights--ok { color: var(--ink-faint); }
+.model-opt__weights--err { color: var(--bad); }
+
+.model-opt__wbar {
+  flex: 0 0 120px;
+  height: 5px;
+  border-radius: 3px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.model-opt__wbar > i {
+  display: block;
+  height: 100%;
+  background: var(--amber);
+  transition: width 0.3s ease;
 }
 
 .model-opt__soon {
@@ -2881,48 +2916,3 @@ body {
 .cap-foot { margin: 10px 0 0; font-size: 12px; opacity: 0.65; line-height: 1.5; }
 .cap-loading, .cap-err { font-size: 13px; opacity: 0.7; }
 
-/* ---- Weight download banner ----------------------------------------------
-   Pinned to the bottom: it can be present for tens of minutes (80 GiB of
-   weights), so it must neither push page content around nor scroll away.
-
-   This block used to name four variables this stylesheet has never defined
-   (--text, --border, --accent, --danger), so every one of them silently fell
-   through to a hardcoded DARK value. In the light theme that painted #e8eaed
-   text on an #f1f5f9 surface: the banner was there, correctly positioned, and
-   unreadable. The real tokens are --ink / --line / --amber / --bad.
-   A var() typo does not fail loudly — it just quietly uses the fallback. */
-.wbanner {
-  position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
-  z-index: 40; display: flex; align-items: center; gap: 12px;
-  max-width: min(760px, calc(100vw - 32px));
-  padding: 10px 14px; border-radius: 10px;
-  background: var(--surface); color: var(--ink);
-  border: 1px solid var(--line-strong);
-  box-shadow: var(--shadow);
-  font-size: 13px;
-}
-.wbanner--err { border-color: var(--bad); }
-.wbanner__msg  { color: var(--ink-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.wbanner__hint { color: var(--ink-faint); font-size: 12px; }
-.wbanner__bar {
-  flex: 0 0 160px; height: 6px; border-radius: 3px;
-  background: var(--line); overflow: hidden;
-}
-.wbanner__bar > i {
-  display: block; height: 100%; background: var(--amber);
-  transition: width .3s ease;
-}
-@media (max-width: 620px) {
-  .wbanner { flex-wrap: wrap; gap: 8px; }
-  .wbanner__bar { flex-basis: 100%; }
-}
-
-/* The banner floats over the page, so the last rows of a scrolled view sat
-   underneath it (Settings' "API service" section was unreachable while a
-   download ran). Reserve the strip on every scroll container it can cover —
-   Settings scrolls in its OWN pane (.settings-content), not in .app__content,
-   so padding the page-level scroller alone fixes nothing there. */
-.app--wbanner .app__content,
-.app--wbanner .settings-content {
-  padding-bottom: 84px;
-}

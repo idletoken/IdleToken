@@ -757,59 +757,6 @@ function Dashboard(props: {
 }
 
 // ---- root -----------------------------------------------------------------
-// ---- Weight download banner -----------------------------------------------
-// The most fragile step of the supply-side funnel: the user installs, picks a
-// model, presses start, and then waits for a file of 0.5 to 80 GiB. The three
-// rules here come from what makes people give up:
-//   1. Always show the **source** -- HF or a mirror. Silently switching over when
-//      the direct connection fails makes it look stuck.
-//   2. A failure must offer **a next step they can follow**, and say that what has
-//      been downloaded is kept (otherwise users delete it and start over).
-//   3. Cancel is a first-class citizen. A long task without a cancel button gets
-//      cancelled by quitting the whole application.
-//
-// TRANSIENT STATES ONLY (2026-08-10). It used to have a fourth state — "no
-// weights on this machine yet" — which is not an event, it is the resting
-// condition of every fresh install. A floating bar that never goes away stops
-// being read within a minute and covers the page for the rest of the session.
-// That fact now lives where the decision is made: on the model itself, in
-// Settings → Quick. What is left here happens only while something is running.
-function WeightsBanner(props: {
-  dl: { have: number; total: number; endpoint?: string; note?: string; error?: string } | null;
-  onCancel: () => void;
-  onStart: () => void;
-  onDismissError: () => void;
-}) {
-  const { t } = useI18n();
-  const d = props.dl;
-  if (d?.error) {
-    return (
-      <div className="wbanner wbanner--err" role="alert">
-        <strong>{t("weights.failed")}</strong>
-        <span className="wbanner__msg">{d.error}</span>
-        <span className="wbanner__hint">{t("weights.resumeHint")}</span>
-        <button className="btn-secondary" onClick={props.onStart}>{t("weights.retry")}</button>
-        <button className="iconbtn" onClick={props.onDismissError} aria-label="dismiss">✕</button>
-      </div>
-    );
-  }
-  if (d) {
-    const pctv = d.total > 0 ? Math.min(100, (d.have / d.total) * 100) : 0;
-    return (
-      <div className="wbanner" role="status">
-        <strong>{t("weights.downloading")}</strong>
-        <span className="wbanner__bar"><i style={{ width: `${pctv}%` }} /></span>
-        <span className="wbanner__msg">
-          {fmtBytes(d.have)}{d.total > 0 ? ` / ${fmtBytes(d.total)}` : ""}
-          {d.endpoint ? ` · ${t("weights.from")} ${new URL(d.endpoint).host}` : ""}
-        </span>
-        {d.note ? <span className="wbanner__hint">{d.note}</span> : null}
-        <button className="iconbtn" onClick={props.onCancel}>{t("weights.cancel")}</button>
-      </div>
-    );
-  }
-  return null;
-}
 
 export default function App() {
   const [theme, setTheme] = usePersisted<Theme>("idletoken.theme", "light");
@@ -885,12 +832,37 @@ export default function App() {
 
   useEffect(() => { void refreshWeights(); }, [refreshWeights]);
 
+  // Ids the user has cancelled. The engine only notices the cancel flag between
+  // reads, and a read blocks until the next chunk arrives — on a slow endpoint
+  // that is seconds away. Waiting for it meant the row sat there showing
+  // progress after the user pressed Cancel, then flashed a message. The click
+  // is the decision; the UI acts on it now and drops whatever that download
+  // says afterwards.
+  const cancelled = useRef<Set<string>>(new Set());
+
+  const cancelDownload = useCallback(() => {
+    cancelled.current.add("primary");
+    setDl(null);
+    void cancelFetch("primary");
+    void refreshWeights();
+  }, [refreshWeights]);
+
   // Progress event subscription. Subscribed once for the whole application;
   // filtering by id is left for future multi-download support.
   useEffect(() => {
     let un: (() => void) | null = null;
     let dead = false;
     onFetchProgress((p) => {
+      const id = p.id || "primary";
+      if (cancelled.current.has(id)) {
+        // The download is winding down. Only its final word clears the mark —
+        // anything before that (a last progress tick) is stale by definition.
+        if (p.kind === "done" || p.kind === "error" || p.kind === "cancelled") {
+          cancelled.current.delete(id);
+          void refreshWeights();
+        }
+        return;
+      }
       if (p.kind === "progress" || p.kind === "probe") {
         setDl((prev) => ({
           have: p.have ?? prev?.have ?? 0,
@@ -899,6 +871,11 @@ export default function App() {
           note: p.note ?? prev?.note,
         }));
       } else if (p.kind === "done") {
+        setDl(null);
+        void refreshWeights();
+      } else if (p.kind === "cancelled") {
+        // Cancelled without going through our button (older shell, or a second
+        // window): still not an error — back to "not downloaded", resume ready.
         setDl(null);
         void refreshWeights();
       } else if (p.kind === "error") {
@@ -1108,6 +1085,44 @@ export default function App() {
             }
           })();
         }
+        // Cancel oracle (2026-08-10). "Press cancel, then see what the client
+        // says" is a timing question, and timing is exactly what reading the
+        // code cannot settle: the engine notices the cancel flag only between
+        // reads, so the wrong version stayed on screen for seconds and then
+        // announced a failure. This starts a real download, cancels it through
+        // the SAME handler the button calls, and reports what arrived after.
+        //   weights-cancel:<modelId>:<ms-before-cancel>
+        const wc = d.match(/^weights-cancel:([a-z0-9.\-]+):(\d+)$/);
+        if (wc) {
+          (async () => {
+            const seen: string[] = [];
+            const un = await onFetchProgress((p) => {
+              if (p.kind !== "progress") seen.push(p.kind);
+            });
+            try {
+              const man = getManifest(wc[1]);
+              const target = resolveDownload(man, defaultQuant(wc[1]));
+              if (!target) { reportTest("weightsCancel", { error: "manifest has no repo/gguf" }); return; }
+              const dir = await defaultModelDir();
+              void fetchWeights({ id: "primary", target, destDir: dir }).catch(() => {});
+              await new Promise((r) => setTimeout(r, Number(wc[2])));
+              const tCancel = Date.now();
+              cancelDownload();
+              const uiClearedMs = Date.now() - tCancel; // the click-to-UI latency
+              await new Promise((r) => setTimeout(r, 15000)); // let the engine wind down
+              reportTest("weightsCancel", {
+                uiClearedMs,
+                kindsAfterStart: seen,
+                sawError: seen.includes("error"),
+                sawCancelled: seen.includes("cancelled"),
+              });
+            } catch (e) {
+              reportTest("weightsCancel", { error: String(e) });
+            } finally {
+              un();
+            }
+          })();
+        }
         if (d === "report-probe") {
           getResourceProvider()
             .probe({})
@@ -1257,7 +1272,7 @@ export default function App() {
 
   return (
     <LangContext.Provider value={{ lang, setLang }}>
-      <div className={`app${dl ? " app--wbanner" : ""}`}>
+      <div className="app">
         <TopBar
           cluster={cluster}
           theme={theme}
@@ -1317,7 +1332,7 @@ export default function App() {
                   dl,
                   onDownload: () =>
                     void ensureWeights().catch((e) => setDl({ have: 0, total: 0, error: String(e) })),
-                  onCancel: () => void cancelFetch("primary"),
+                  onCancel: cancelDownload,
                 }}
                 onClose={() => setView("cluster")}
               />
@@ -1377,17 +1392,10 @@ export default function App() {
           </div>
         </div>
       </div>
-      {/* Only while a download is running or has failed — `dl` covers both.
-          "This machine has no weights yet" is a standing condition, not an
-          event, and lives on the model row in Settings → Quick. */}
-      {dl ? (
-        <WeightsBanner
-          dl={dl}
-          onCancel={() => void cancelFetch("primary")}
-          onStart={() => void ensureWeights().catch((e) => setDl({ have: 0, total: 0, error: String(e) }))}
-          onDismissError={() => setDl(null)}
-        />
-      ) : null}
+      {/* No floating download bar at all (2026-08-10). Every weight state —
+          missing, downloading, failed, ready — is rendered on the model row it
+          belongs to, in Settings → Quick. A box that covers the page to narrate
+          a file transfer the user already asked for is pure interruption. */}
       {showAuth ? (
         <AuthScreen
           onAuthed={(s) => {

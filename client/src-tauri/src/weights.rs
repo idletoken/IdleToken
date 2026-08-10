@@ -178,6 +178,7 @@ pub async fn weights_fetch(
 ) -> Result<(), String> {
     let cancel = register(&id);
     let id2 = id.clone();
+    let cancel_probe = cancel.clone();
     let r = tauri::async_runtime::spawn_blocking(move || {
         let emit = |v: serde_json::Value| {
             let _ = app.emit("weights-fetch", v);
@@ -188,6 +189,15 @@ pub async fn weights_fetch(
         match &out {
             Ok(path) => emit(serde_json::json!({
                 "id": id2, "kind": "done", "path": path
+            })),
+            // A user pressing Cancel is not a failure. It used to arrive as
+            // `kind: "error"`, so the UI announced "download failed" seconds
+            // after the user asked for the stop they got — blaming the product
+            // for doing what it was told. The flag is the authority on which
+            // one this was; the message text is not (it is also produced by a
+            // read that was interrupted for other reasons).
+            Err(e) if cancel_probe.load(Ordering::SeqCst) => emit(serde_json::json!({
+                "id": id2, "kind": "cancelled", "message": e
             })),
             Err(e) => emit(serde_json::json!({
                 "id": id2, "kind": "error", "message": e

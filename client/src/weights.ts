@@ -69,7 +69,10 @@ export async function weightsState(
 
 export interface FetchProgress {
   id: string;
-  kind: "probe" | "progress" | "done" | "error";
+  // "cancelled" is distinct from "error" on purpose: the user asking to stop is
+  // not a failure, and reporting it as one made the client apologise for doing
+  // what it was told (see weights.rs).
+  kind: "probe" | "progress" | "done" | "error" | "cancelled";
   endpoint?: string;
   have?: number;
   total?: number;
