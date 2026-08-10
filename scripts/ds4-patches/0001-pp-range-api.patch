@@ -1,0 +1,537 @@
+--- ds4/ds4.c	2026-05-15 11:51:19.505479199 +0000
++++ IdleToken/vendor/ds4/ds4.c	2026-07-17 10:06:20.000000000 +0000
+@@ -1372,9 +1372,35 @@
+     return mb * 1048576ull;
+ }
+ 
+-static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *cached_out) {
++/* IdleToken PP extension: parse the leading `blk.N.` from a tensor name.
++ * Returns 1 and sets *out_il = N on match; 0 otherwise.
++ * Recognises both `blk.<digits>.` and the slightly-uncommon `blk.<digits>` end
++ * (latter shouldn't appear in DS4 GGUF but handled defensively). */
++static int parse_layer_index_from_tensor_name(const ds4_str *name, uint32_t *out_il) {
++    if (!name || name->len < 5) return 0;
++    if (memcmp(name->ptr, "blk.", 4) != 0) return 0;
++    const char *p = name->ptr + 4;
++    const char *e = name->ptr + name->len;
++    uint32_t il = 0;
++    int digits = 0;
++    while (p < e && *p >= '0' && *p <= '9') {
++        il = il * 10 + (uint32_t)(*p - '0');
++        p++; digits++;
++    }
++    if (digits == 0) return 0;
++    if (p < e && *p != '.') return 0;
++    *out_il = il;
++    return 1;
++}
++
++static bool accelerator_cache_model_tensor_spans(const ds4_model *m,
++                                                  int load_layer_lo,
++                                                  int load_layer_hi,
++                                                  uint64_t *cached_out) {
++    const int filter_active = (load_layer_hi > load_layer_lo);
+     accelerator_tensor_span *spans = xmalloc((size_t)m->n_tensors * sizeof(spans[0]));
+     uint64_t nspan = 0;
++    uint64_t skipped_bytes = 0;
+     for (uint64_t i = 0; i < m->n_tensors; i++) {
+         const ds4_tensor *t = &m->tensors[i];
+         if (t->bytes == 0) continue;
+@@ -1382,13 +1408,33 @@
+             free(spans);
+             return false;
+         }
++        if (filter_active) {
++            uint32_t il;
++            if (parse_layer_index_from_tensor_name(&t->name, &il) &&
++                ((int)il < load_layer_lo || (int)il >= load_layer_hi)) {
++                skipped_bytes += t->bytes;
++                continue;
++            }
++        }
+         spans[nspan++] = (accelerator_tensor_span){
+             .off = t->abs_offset,
+             .end = t->abs_offset + t->bytes,
+         };
+     }
++    if (filter_active && skipped_bytes > 0) {
++        fprintf(stderr,
++                "ds4: IdleToken PP filter active [%d, %d): skipped %.2f GiB of layer weights\n",
++                load_layer_lo, load_layer_hi,
++                (double)skipped_bytes / 1073741824.0);
++    }
+     qsort(spans, (size_t)nspan, sizeof(spans[0]), accelerator_tensor_span_cmp);
+ 
++    uint64_t kept_sum = 0;
++    for (uint64_t i = 0; i < nspan; i++) kept_sum += spans[i].end - spans[i].off;
++    fprintf(stderr,
++            "ds4: IdleToken span debug: kept %" PRIu64 " spans totaling %.2f GiB (before merge)\n",
++            nspan, (double)kept_sum / 1073741824.0);
++
+     const uint64_t max_span = accelerator_cuda_preload_span_bytes();
+     uint64_t cached = 0;
+     uint64_t merged = 0;
+@@ -1405,6 +1451,20 @@
+             if (chunk_end - off > max_span) chunk_end = off + max_span;
+             char label[96];
+             snprintf(label, sizeof(label), "tensor-span:%" PRIu64, merged);
++#ifdef _WIN32
++            /* IdleToken: Windows MapViewOfFile pages are demand-committed, so the
++             * CUDA runtime cudaHostRegister/cudaMemcpy fail with "invalid
++             * argument" on tensor pages never CPU-touched (late layer weights
++             * at high file offsets). Fault the range in by reading one byte per
++             * 4 KiB page; only touches the spans we cache (a few GiB), not the
++             * whole 80 GiB. Linux handles non-resident mmap pages in cudaMemcpy. */
++            {
++                volatile const unsigned char *pp = (const unsigned char *)m->map + off;
++                unsigned char sink = 0;
++                for (uint64_t k = 0; k < chunk_end - off; k += 4096u) sink ^= pp[k];
++                (void)sink;
++            }
++#endif
+             if (ds4_gpu_cache_model_range(m->map, m->size, off, chunk_end - off, label) == 0) {
+                 fprintf(stderr,
+                         "ds4: accelerator failed to cache model tensor span %" PRIu64
+@@ -1419,11 +1479,15 @@
+         }
+     }
+     free(spans);
++    fprintf(stderr,
++            "ds4: IdleToken span debug: merged into %" PRIu64 " ranges, requested %.2f GiB to GPU cache\n",
++            merged, (double)cached / 1073741824.0);
+     if (cached_out) *cached_out = cached;
+     return true;
+ }
+ 
+-static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
++static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m,
++                                             int load_layer_lo, int load_layer_hi) {
+     if (backend != DS4_BACKEND_CUDA) return true;
+     if (!m || !m->map || m->size == 0) return false;
+     if (getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
+@@ -1432,7 +1496,8 @@
+ 
+     const double t0 = now_sec();
+     uint64_t cached = 0;
+-    if (!accelerator_cache_model_tensor_spans(m, &cached)) return false;
++    if (!accelerator_cache_model_tensor_spans(m, load_layer_lo, load_layer_hi, &cached))
++        return false;
+     if (getenv("DS4_CUDA_Q8_F16_PRELOAD") != NULL ||
+         getenv("DS4_CUDA_Q8_F32_PRELOAD") != NULL) {
+         for (uint64_t i = 0; i < m->n_tensors; i++) {
+@@ -1460,9 +1525,12 @@
+     return true;
+ }
+ #else
+-static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
++static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m,
++                                             int load_layer_lo, int load_layer_hi) {
+     (void)backend;
+     (void)m;
++    (void)load_layer_lo;
++    (void)load_layer_hi;
+     return true;
+ }
+ #endif
+@@ -15590,6 +15658,222 @@
+     bool mtp_draft_valid;
+ };
+ 
++#ifndef DS4_NO_GPU
++/* IdleToken PP extension: encode a contiguous range of decode layers.
++ *
++ * - When lo == 0, seeds g->cur_hc by embedding `token` (stage-0 entry).
++ * - When 0 < lo, caller must have staged g->cur_hc from the previous PP
++ *   stage (via ds4_session_hc_tensor_write, added with INFER wire path).
++ * - When hi == DS4_N_LAYER, runs the output head so logits become readable.
++ * - Otherwise, caller harvests g->cur_hc and ships it to the next stage.
++ *
++ * Mirrors metal_graph_encode_token_raw_swa: same per-layer body, same
++ * ping-pong, no split-flush (PP boundary serves the same hide-work purpose). */
++bool ds4_session_encode_layer_range(
++        ds4_session *s,
++        int          token,
++        uint32_t     pos,
++        uint32_t     lo,
++        uint32_t     hi) {
++    if (!s || !s->engine) return false;
++    if (hi > DS4_N_LAYER || lo >= hi) return false;
++    ds4_gpu_graph     *g       = &s->graph;
++    const ds4_model   *model   = &s->engine->model;
++    const ds4_weights *weights = &s->engine->weights;
++    if (g->raw_cap == 0) {
++        fprintf(stderr, "ds4: Metal graph raw KV cache is not allocated\n");
++        return false;
++    }
++    const uint32_t raw_row = pos % g->raw_cap;
++    const uint32_t n_raw   = metal_graph_raw_span_for_batch(g, pos, 1);
++
++    bool ok = true;
++    if (lo == 0) {
++        ok = ds4_gpu_embed_token_hc_tensor(g->cur_hc,
++                                            model->map,
++                                            model->size,
++                                            weights->token_embd->abs_offset,
++                                            (uint32_t)weights->token_embd->dim[1],
++                                            (uint32_t)token,
++                                            DS4_N_EMBD,
++                                            DS4_N_HC) != 0;
++    }
++    for (uint32_t il = lo; ok && il < hi; il++) {
++        ok = metal_graph_encode_decode_layer(g,
++                                             model,
++                                             &weights->layer[il],
++                                             il,
++                                             pos,
++                                             g->layer_raw_cache[il],
++                                             g->raw_cap,
++                                             raw_row,
++                                             n_raw,
++                                             token);
++        ds4_gpu_tensor *tmp = g->cur_hc;
++        g->cur_hc = g->after_ffn_hc;
++        g->after_ffn_hc = tmp;
++    }
++    if (ok && hi == DS4_N_LAYER) {
++        ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
++    }
++    return ok;
++}
++
++/* IdleToken PP extension: HC residual tensor accessors at the PP boundary.
++ *
++ * cur_hc is the layer-to-layer residual stream (hc_dim = N_HC * N_EMBD =
++ * 16384 floats per token, F32 in v0.1). At the PP boundary the sending
++ * worker harvests cur_hc to host, ships it over TCP, and the receiving
++ * worker stages it back into its own cur_hc before encoding more layers. */
++uint64_t ds4_session_hc_tensor_bytes(ds4_session *s) {
++    if (!s) return 0;
++    return ds4_gpu_tensor_bytes(s->graph.cur_hc);
++}
++
++bool ds4_session_hc_tensor_read(ds4_session *s, void *out, uint64_t bytes) {
++    if (!s || !out) return false;
++    return ds4_gpu_tensor_read(s->graph.cur_hc, 0, out, bytes) != 0;
++}
++
++bool ds4_session_hc_tensor_write(ds4_session *s, const void *in, uint64_t bytes) {
++    if (!s || !in) return false;
++    return ds4_gpu_tensor_write(s->graph.cur_hc, 0, in, bytes) != 0;
++}
++
++/* IdleToken PP extension: read full logits vector from the last PP stage.
++ *
++ * Valid only after ds4_session_encode_layer_range(..., hi=DS4_N_LAYER) ran
++ * (which calls metal_graph_encode_output_head). `out` must be at least
++ * DS4_N_VOCAB floats. Coord samples this vector and broadcasts the chosen
++ * token via INFER_TOKEN_ACK. */
++bool ds4_session_logits_read(ds4_session *s, float *out) {
++    if (!s || !out) return false;
++    return ds4_gpu_tensor_read(s->graph.logits, 0, out,
++                               (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
++}
++
++/* IdleToken PP extension: batched chunk prefill over decode-layers [lo, hi).
++ *
++ * Numerics-critical: mirrors one chunk iteration of
++ * metal_graph_prefill_chunked_range (upload tokens → embed batch → per-layer
++ * encode_layer_batch), so a PP cluster prefill takes the exact same kernel
++ * path as official single-machine ds4. Per-token prefill via
++ * ds4_session_encode_layer_range is NOT equivalent: batched matrix-matrix
++ * projections round FP8 compressor state differently from the small-batch
++ * decode path (see metal_graph_refresh_ratio4_compressor_state), and greedy
++ * decode amplifies that into different tokens.
++ *
++ * - `tokens` must be provided on EVERY stage (not just stage 0): the MoE
++ *   router batch kernel is token-aware (tid2eid), not just the embedding.
++ * - lo == 0          → embeds the chunk into batch_cur_hc (stage-0 entry).
++ * - 0 < lo           → caller staged batch_cur_hc via ds4_session_batch_hc_write.
++ * - hi == DS4_N_LAYER → runs the output head on the last chunk row; logits
++ *                       become readable via ds4_session_logits_read.
++ * - Otherwise        → caller harvests via ds4_session_batch_hc_read.
++ *
++ * Chunk size must not exceed ds4_session_prefill_chunk_cap(); the coordinator
++ * must chunk exactly like official ds4 (see ds4_prefill_chunk_cap_for_ctx)
++ * or chunk-boundary numerics drift from the single-machine baseline. */
++uint32_t ds4_session_prefill_chunk_cap(ds4_session *s) {
++    if (!s) return 0;
++    return s->prefill_cap;
++}
++
++bool ds4_session_prefill_layer_range(
++        ds4_session *s,
++        const int   *tokens,
++        uint32_t     n_tokens,
++        uint32_t     pos0,
++        uint32_t     lo,
++        uint32_t     hi) {
++    if (!s || !s->engine || !tokens) return false;
++    if (hi > DS4_N_LAYER || lo >= hi) return false;
++    ds4_gpu_graph     *g       = &s->graph;
++    const ds4_model   *model   = &s->engine->model;
++    const ds4_weights *weights = &s->engine->weights;
++    if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
++
++    token_vec chunk = { (int *)tokens, (int)n_tokens, (int)n_tokens };
++    bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, &chunk, 0, n_tokens);
++    if (ok) ok = metal_graph_warmup_prefill_kernels(g, model, weights, n_tokens);
++    if (ok && lo == 0) {
++        ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
++                                                     g->prefill_tokens,
++                                                     model,
++                                                     weights,
++                                                     &chunk,
++                                                     0,
++                                                     n_tokens);
++    }
++    for (uint32_t il = lo; ok && il < hi; il++) {
++        ok = ds4_gpu_begin_commands() != 0;
++        if (ok) ok = metal_graph_encode_layer_batch(g,
++                                                    model,
++                                                    &weights->layer[il],
++                                                    il,
++                                                    pos0,
++                                                    n_tokens);
++        if (ok) ok = ds4_gpu_end_commands() != 0;
++    }
++    if (ok && hi == DS4_N_LAYER) {
++        /* Output head on the last chunk row. Reads state only, so running it
++         * per chunk (not just the final one) is numerically harmless. */
++        const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
++        ds4_gpu_tensor *last_hc = metal_graph_tensor_row_view(g->batch_cur_hc,
++                                                              n_tokens - 1u,
++                                                              hc_dim);
++        ok = last_hc != NULL;
++        if (ok) {
++            ds4_gpu_tensor *saved_cur = g->cur_hc;
++            g->cur_hc = last_hc;
++            ok = ds4_gpu_begin_commands() != 0;
++            if (ok) ok = metal_graph_encode_output_head(g, model, weights,
++                                                        weights->output->dim[1]);
++            if (ok) ok = ds4_gpu_end_commands() != 0;
++            g->cur_hc = saved_cur;
++            ds4_gpu_tensor_free(last_hc);
++        }
++    }
++    if (!ok) {
++        if (ds4_gpu_synchronize() == 0) {
++            fprintf(stderr, "ds4: synchronize after PP chunk prefill failure also failed\n");
++        }
++        return false;
++    }
++    return true;
++}
++
++/* IdleToken PP extension: batch HC accessors at the PP boundary during chunk
++ * prefill. After encode_layer_batch's per-layer ping-pong, the live batch
++ * activations are always in batch_cur_hc — both for harvesting on the sender
++ * and staging on the receiver. Row layout: n_tokens rows of
++ * N_HC * N_EMBD floats. */
++uint64_t ds4_session_batch_hc_bytes(ds4_session *s, uint32_t n_tokens) {
++    (void)s;
++    return (uint64_t)n_tokens * DS4_N_HC * DS4_N_EMBD * sizeof(float);
++}
++
++bool ds4_session_batch_hc_read(ds4_session *s, void *out, uint32_t n_tokens) {
++    if (!s || !out) return false;
++    return ds4_gpu_tensor_read(s->graph.batch_cur_hc, 0, out,
++                               ds4_session_batch_hc_bytes(s, n_tokens)) != 0;
++}
++
++bool ds4_session_batch_hc_write(ds4_session *s, const void *in, uint32_t n_tokens) {
++    if (!s || !in) return false;
++    return ds4_gpu_tensor_write(s->graph.batch_cur_hc, 0, in,
++                                ds4_session_batch_hc_bytes(s, n_tokens)) != 0;
++}
++#endif /* !DS4_NO_GPU */
++
++/* IdleToken PP extension: the chunk cap official ds4 would use for this context
++ * size. Plain CPU math (no graph), callable from the -DDS4_NO_GPU coordinator
++ * so it can split prompts on exactly the same chunk boundaries as official
++ * single-machine prefill. */
++uint32_t ds4_prefill_chunk_cap_for_ctx(int ctx_size) {
++    return ds4_default_prefill_cap_for_prompt(ctx_size);
++}
++
+ /* =========================================================================
+  * Session Snapshot Payloads.
+  * =========================================================================
+@@ -17090,7 +17374,17 @@
+             return 1;
+         }
+         ds4_gpu_set_quality(e->quality);
++#ifdef _WIN32
++        /* IdleToken: model fd opened by MinGW CRT (worker.exe); CUDA kernels live
++         * in an MSVC-compiled DLL with a SEPARATE CRT whose fd table doesn't
++         * share this number. Passing it makes the DLL's fd-based model reads
++         * hit a wrong/invalid handle -> garbage reads + heap corruption
++         * (nondeterministic 0xc0000409 caching weights on a discrete GPU).
++         * Withhold the fd so the DLL uses the mmap pointer path (CRT-agnostic). */
++        (void)ds4_gpu_set_model_fd(-1);
++#else
+         (void)ds4_gpu_set_model_fd(e->model.fd);
++#endif
+         if (!ds4_gpu_set_model_map_range(e->model.map,
+                                            e->model.size,
+                                            e->model.tensor_data_pos,
+@@ -17118,7 +17412,9 @@
+             *out = NULL;
+             return 1;
+         }
+-        if (!e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->model)) {
++        if (!e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->model,
++                                                                opt->load_layer_lo,
++                                                                opt->load_layer_hi)) {
+             fprintf(stderr, "ds4: %s failed to prepare startup model cache\n",
+                     ds4_backend_name(e->backend));
+             ds4_engine_close(e);
+--- ds4/ds4.h	2026-05-15 11:51:19.505479199 +0000
++++ IdleToken/vendor/ds4/ds4.h	2026-07-16 07:57:29.000000000 +0000
+@@ -67,6 +67,13 @@
+     float directional_steering_ffn;
+     bool warm_weights;
+     bool quality;
++    /* IdleToken PP extension: load only this layer range into the accelerator
++     * cache.  When `load_layer_hi <= load_layer_lo` (e.g. both 0, the default),
++     * the full model is loaded — the original single-machine behavior.
++     * Non-layer tensors (token_embd, output_*, mtp.0.*) are always loaded,
++     * regardless of range. */
++    int load_layer_lo;
++    int load_layer_hi;
+ } ds4_engine_options;
+ 
+ typedef void (*ds4_token_emit_fn)(void *ud, int token);
+@@ -173,6 +180,52 @@
+                                         int max_tokens, int eos_token,
+                                         int *accepted, int accepted_cap,
+                                         char *err, size_t errlen);
++
++/* IdleToken PP extension: encode decode-layers [lo, hi) on this worker shard.
++ * - lo == 0          → embeds `token` into cur_hc first (stage-0 entry).
++ * - 0 < lo < N_LAYER → caller must stage cur_hc from previous PP stage.
++ * - hi == DS4_N_LAYER → runs the output head, logits become readable.
++ * - Otherwise        → caller harvests cur_hc for the next PP stage.
++ *
++ * Only compiled when DS4_NO_GPU is not defined (it needs ds4_gpu_graph).
++ * Coord builds with -DDS4_NO_GPU and must not call this. */
++bool ds4_session_encode_layer_range(ds4_session *s, int token,
++                                    uint32_t pos, uint32_t lo, uint32_t hi);
++
++/* IdleToken PP extension: HC residual tensor accessors at the PP boundary.
++ * - `_bytes` returns the live byte size of cur_hc (depends on n_tokens
++ *   currently configured in the graph; v0.1 decode is one token at a time
++ *   so this is N_HC * N_EMBD * sizeof(float) = 64 KiB).
++ * - `_read` harvests cur_hc into host memory (sending worker side).
++ * - `_write` stages incoming bytes back into cur_hc (receiving worker side).
++ * Only callable when DS4_NO_GPU is not defined. */
++uint64_t ds4_session_hc_tensor_bytes(ds4_session *s);
++bool     ds4_session_hc_tensor_read (ds4_session *s, void *out, uint64_t bytes);
++bool     ds4_session_hc_tensor_write(ds4_session *s, const void *in, uint64_t bytes);
++
++/* Read full logits vector from the last PP stage. Valid after
++ * ds4_session_encode_layer_range(..., hi=DS4_N_LAYER). `out` must hold at
++ * least DS4_N_VOCAB floats. */
++bool ds4_session_logits_read(ds4_session *s, float *out);
++
++/* IdleToken PP extension: batched chunk prefill over decode-layers [lo, hi).
++ * Mirrors official chunked-prefill numerics exactly (per-token prefill via
++ * encode_layer_range diverges: batch vs small-batch FP8 rounding).
++ * `tokens` is required on EVERY stage (the MoE router is token-aware).
++ * Chunks must not exceed ds4_session_prefill_chunk_cap(); the coordinator
++ * gets the same value without a GPU via ds4_prefill_chunk_cap_for_ctx(ctx).
++ * Batch HC crosses the PP boundary with the _batch_hc accessors (n_tokens
++ * rows of N_HC*N_EMBD floats, always in/out of batch_cur_hc). GPU builds
++ * only, except ds4_prefill_chunk_cap_for_ctx which is plain CPU math. */
++uint32_t ds4_session_prefill_chunk_cap(ds4_session *s);
++bool ds4_session_prefill_layer_range(ds4_session *s, const int *tokens,
++                                     uint32_t n_tokens, uint32_t pos0,
++                                     uint32_t lo, uint32_t hi);
++uint64_t ds4_session_batch_hc_bytes(ds4_session *s, uint32_t n_tokens);
++bool     ds4_session_batch_hc_read (ds4_session *s, void *out, uint32_t n_tokens);
++bool     ds4_session_batch_hc_write(ds4_session *s, const void *in, uint32_t n_tokens);
++uint32_t ds4_prefill_chunk_cap_for_ctx(int ctx_size);
++
+ void ds4_session_invalidate(ds4_session *s);
+ void ds4_session_rewind(ds4_session *s, int pos);
+ int ds4_session_pos(ds4_session *s);
+--- ds4/ds4_cuda.cu	2026-05-15 11:51:19.506479202 +0000
++++ IdleToken/vendor/ds4/ds4_cuda.cu	2026-07-17 10:18:40.000000000 +0000
+@@ -23,7 +23,11 @@
+ #endif
+ 
+ #define CUDA_QK_K 256
++#ifdef _MSC_VER
++#define DS4_CUDA_UNUSED   /* MSVC has no __attribute__((unused)); harmless to drop */
++#else
+ #define DS4_CUDA_UNUSED __attribute__((unused))
++#endif
+ 
+ enum {
+     /* attention_decode_mixed_kernel stores raw-window scores plus visible
+@@ -231,6 +235,11 @@
+     }
+ 
+     cudaError_t err = cudaSuccess;
++#ifndef _WIN32
++    /* Windows/WDDM: zero-copy host-register of a file-section view is unreliable
++     * (works for low offsets, fails for the late layer weights) and a discrete
++     * GPU wants weights resident in VRAM anyway. Skip straight to cudaMalloc +
++     * heap-staged copy below. */
+     if (g_model_range_mapping_supported) {
+         const long page_sz_l = sysconf(_SC_PAGESIZE);
+         const uint64_t page_sz = page_sz_l > 0 ? (uint64_t)page_sz_l : 4096u;
+@@ -264,6 +273,7 @@
+             (void)cudaGetLastError();
+         }
+     }
++#endif  /* !_WIN32 */
+ 
+     void *dev = NULL;
+     err = cudaMalloc(&dev, (size_t)bytes);
+@@ -276,20 +286,46 @@
+ 
+     const char *src = (const char *)model_map + offset;
+     const uint64_t chunk = 64ull * 1024ull * 1024ull;
++#ifdef _WIN32
++    /* WDDM cannot DMA directly from a file-backed section view: cudaMemcpy
++     * returns cudaErrorInvalidValue for weights whose pages come straight from
++     * the mmap'd GGUF (observed on the late layer tensors at high file
++     * offsets). Bounce each chunk through a regular heap buffer, which CUDA
++     * accepts as ordinary pageable host memory; the memcpy also faults the
++     * view pages in. malloc/free stay inside this DLL's CRT. */
++    char *stage = (char *)malloc((size_t)(bytes < chunk ? bytes : chunk));
++    if (!stage) {
++        fprintf(stderr, "ds4: CUDA model range staging alloc failed for %s\n",
++                what ? what : "weights");
++        (void)cudaFree(dev);
++        return NULL;
++    }
++#endif
+     for (uint64_t done = 0; done < bytes; done += chunk) {
+         uint64_t n = bytes - done < chunk ? bytes - done : chunk;
++#ifdef _WIN32
++        memcpy(stage, src + done, (size_t)n);
++        err = cudaMemcpy((char *)dev + done, stage, (size_t)n, cudaMemcpyHostToDevice);
++#else
+         err = cudaMemcpy((char *)dev + done, src + done, (size_t)n, cudaMemcpyHostToDevice);
++#endif
+         if (err != cudaSuccess) {
+             fprintf(stderr, "ds4: CUDA model range copy failed for %s at %.2f/%.2f MiB: %s\n",
+                     what ? what : "weights",
+                     (double)done / 1048576.0,
+                     (double)bytes / 1048576.0,
+                     cudaGetErrorString(err));
++#ifdef _WIN32
++            free(stage);
++#endif
+             (void)cudaFree(dev);
+             (void)cudaGetLastError();
+             return NULL;
+         }
+     }
++#ifdef _WIN32
++    free(stage);
++#endif
+     g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0});
+     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
+     g_model_range_bytes += bytes;

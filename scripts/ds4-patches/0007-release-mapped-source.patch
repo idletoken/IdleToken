@@ -1,0 +1,52 @@
+--- IdleToken/vendor/ds4/ds4_cuda.cu	(0001+0002+0004+0005+0006 applied)
++++ IdleToken/vendor/ds4/ds4_cuda.cu	(0007-release-mapped-source)
+@@ -222,6 +222,31 @@
+  * Must sit at FILE scope ABOVE cuda_model_range_ptr, its only reader: C++ needs
+  * the declaration first, and `extern "C"` is illegal inside a function body. */
+ static uint64_t g_hybrid_budget_bytes;   /* 0 = not set explicitly */
++
++#ifdef _WIN32
++/* IdleToken: drop just-copied source pages from this process's working set.
++ *
++ * Loading maps the GGUF and copies each span into pinned host memory or VRAM.
++ * The mapped SOURCE pages are dead the moment the copy returns, but nothing
++ * trims them, so they sit in the working set until the system is desperate.
++ * Measured on win-a mid-load (28 layers): working set 55.9 GiB vs private
++ * 34.9 GiB — a 21 GiB gap that is entirely dead source pages — while the
++ * system-wide standby cache collapsed 14109 -> 685 MiB and available memory
++ * hit 833 MiB. Windows does reclaim them eventually; it just does it under
++ * maximum pressure, which is exactly when the machine stops responding.
++ *
++ * VirtualUnlock on a range that was never VirtualLock'ed returns FALSE with
++ * ERROR_NOT_LOCKED and *still* removes the pages from the working set. That
++ * is documented behaviour and the intended use here — the failure return is
++ * expected, not an error, which is why it is discarded.
++ *
++ * These are clean, file-backed pages: if anything reads them again they fault
++ * straight back in from disk. Correctness cannot depend on this call. */
++static void release_mapped_source(const void *p, uint64_t bytes) {
++    if (!p || !bytes) return;
++    (void)VirtualUnlock((LPVOID)p, (SIZE_T)bytes);
++}
++#endif
+ 
+ extern "C" void ds4_gpu_set_hybrid_vram_budget(uint64_t bytes) {
+     g_hybrid_budget_bytes = bytes;
+@@ -333,6 +358,9 @@
+                     uint64_t n = bytes - d < chunk ? bytes - d : chunk;
+                     memcpy(stg, src + d, (size_t)n);
+                     ok = (cudaMemcpy((char *)dvr + d, stg, (size_t)n, cudaMemcpyHostToDevice) == cudaSuccess);
++                    /* Release per chunk rather than after the whole span: the peak
++                     * occurs while the copy is in progress. */
++                    release_mapped_source(src + d, n);
+                 }
+                 free(stg);
+                 if (ok) {
+@@ -359,6 +386,7 @@
+             return NULL;
+         }
+         memcpy(hptr, src, (size_t)bytes);
++        release_mapped_source(src, bytes);
+         void *dptr = NULL;
+         if (cudaHostGetDevicePointer(&dptr, hptr, 0) != cudaSuccess || !dptr) {
+             (void)cudaGetLastError();

@@ -1,0 +1,272 @@
+--- IdleToken/vendor/ds4/ds4_cuda.cu	(0001..0008 applied)
++++ IdleToken/vendor/ds4/ds4_cuda.cu	(0009-moe-lru-expert-cache)
+@@ -10498,8 +10498,252 @@
+     (void)cudaMemcpyAsync(g_sel_trace + g_sel_trace_n, selected,
+                           (size_t)n_expert * sizeof(int32_t), cudaMemcpyDeviceToDevice, 0);
+     g_sel_trace_n += n_expert;
++}
++
++/* =====================================================================
++ * IdleToken: a resident per-layer LRU expert cache
++ *
++ * Why it is worth doing (measured on a real dataset): within a layer, the top-6
++ * experts of adjacent tokens overlap 39.7% (random would be 2.3%), and still 29%
++ * two tokens apart. Replacing today's static placement with an LRU **without
++ * increasing the VRAM budget** moves the hit rate from 10.9% to 64.6% and cuts
++ * PCIe traffic to 39.7%.
++ *
++ * The design is deliberately conservative, because 16 downstream kernels consume
++ * `sel_ptr`:
++ *   hit -> copy device-to-device from the cache into the existing 6-slot staging
++ *   buffer; miss -> pull only the missing experts across PCIe into the cache,
++ *   then D2D. **The gate_w / sel_ptr semantics downstream do not change by one
++ *   byte.** The cost is one extra 40.5 MiB D2D per layer (about 0.09 ms; VRAM
++ *   bandwidth is ample) in place of roughly 1.8 ms of PCIe. Passing slot indices
++ *   straight downstream would save that D2D, but it means checking the boundary
++ *   assumptions of all 16 sites one by one -- left until v1 works and the gain is
++ *   measured.
++ *
++ * **Zero host synchronization** throughout: `selected` exists only on the device,
++ * and the eviction decision is made there by a single-threaded kernel. Reading
++ * `selected` back to the host is what once brought a machine down, and we are not
++ * going back.
++ * ===================================================================== */
++#define IDLETOKEN_MOE_CACHE_MAX_SEL 8u
++
++struct moe_layer_cache {
++    char     *gate, *up, *down;   /* `slots` expert slots */
++    int32_t  *slot_of;            /* [n_total] expert -> slot, -1 = not cached */
++    int32_t  *slot_expert;        /* [slots]   slot -> expert, -1 = empty */
++    uint32_t *slot_stamp;         /* [slots]   last-use clock */
++    int32_t  *out_slots;          /* [n_sel]   the slot each selected expert is in */
++    int32_t  *miss_src;           /* [n_sel]   experts to pull from the host */
++    int32_t  *miss_dst;           /* [n_sel]   their destination slots */
++    int32_t  *n_miss;             /* [1] */
++    uint32_t *clock;              /* [1] monotonic clock */
++    uint32_t  slots;
++    uint64_t  gate_bytes, down_bytes;
++    unsigned long long hit, tot;  /* statistics, for logging only */
++};
++static std::unordered_map<uint64_t, moe_layer_cache> g_moe_cache;
++/* Hit statistics. Accumulated on the device and read back only every N calls --
++ * synchronizing every layer would cancel out the entire point of this. */
++static unsigned long long *g_moe_cache_stat = NULL;   /* [0]=hits [1]=total */
++static unsigned long long  g_moe_cache_calls = 0;   /* keyed by gate_offset, unique per layer */
++static uint32_t g_moe_cache_slots = 0;    /* 0 = disabled */
++
++static uint32_t moe_cache_slots_cfg(void) {
++    static int cached = -1;
++    if (cached < 0) {
++        cached = 0;
++        const char *e = getenv("IDLETOKEN_MOE_CACHE");
++        if (e && e[0]) {
++            unsigned long v = strtoul(e, NULL, 10);
++            /* Floor = the size of one top-k: with fewer slots than selections
++             * there is nothing to evict. */
++            if (v >= IDLETOKEN_MOE_CACHE_MAX_SEL && v <= 256ul) cached = (int)v;
++        }
++        g_moe_cache_slots = (uint32_t)cached;
++    }
++    return g_moe_cache_slots;
++}
++
++/* A single thread makes the eviction decision. A linear scan of 6 selections
++ * across at most 256 slots costs nothing; going multi-threaded would instead
++ * require handling "two misses in the same token racing for one slot", which is
++ * not worth it. */
++__global__ static void moe_cache_admit_kernel(
++        const int32_t *selected, uint32_t n_sel, uint32_t n_total,
++        int32_t *slot_of, int32_t *slot_expert, uint32_t *slot_stamp,
++        uint32_t slots, uint32_t *clk,
++        int32_t *out_slots, int32_t *miss_src, int32_t *miss_dst, int32_t *n_miss,
++        unsigned long long *stat) {
++    if (threadIdx.x != 0 || blockIdx.x != 0) return;
++    const uint32_t now = ++(*clk);
++    int nm = 0;
++    for (uint32_t i = 0; i < n_sel; i++) {
++        int32_t e = selected[i];
++        if (e < 0 || (uint32_t)e >= n_total) e = 0;   /* same clamping as the other kernels */
++        int32_t s = slot_of[e];
++        if (stat) atomicAdd(&stat[1], 1ull);
++        if (s >= 0) {
++            if (stat) atomicAdd(&stat[0], 1ull);
++            slot_stamp[s] = now; out_slots[i] = s; continue;
++        }
++        /* Miss: take the least recently used slot not already used by this token.
++         * Empty slots first. */
++        int32_t victim = -1; uint32_t best = 0xFFFFFFFFu;
++        for (uint32_t k = 0; k < slots; k++) {
++            if (slot_stamp[k] == now) continue;              /* already taken by this token */
++            if (slot_expert[k] < 0) { victim = (int32_t)k; break; }
++            if (slot_stamp[k] < best) { best = slot_stamp[k]; victim = (int32_t)k; }
++        }
++        if (victim < 0) victim = 0;   /* should not happen while slots >= n_sel */
++        if (slot_expert[victim] >= 0) slot_of[slot_expert[victim]] = -1;
++        slot_expert[victim] = e; slot_of[e] = victim; slot_stamp[victim] = now;
++        out_slots[i] = victim;
++        miss_src[nm] = e; miss_dst[nm] = victim; nm++;
++    }
++    *n_miss = nm;
++}
++
++/* Move only the misses: dst[miss_dst[j]] <- src[miss_src[j]]. gridDim.y is
++ * launched for the worst case and the surplus blocks exit immediately on
++ * *n_miss -- which lives on the device, so the host cannot know it in advance. */
++__global__ static void moe_cache_fill_kernel(
++        char *dst, const char *src, const int32_t *miss_src, const int32_t *miss_dst,
++        const int32_t *n_miss, uint64_t expert_bytes, uint32_t n_total) {
++    const uint32_t j = blockIdx.y;
++    if ((int)j >= *n_miss) return;
++    int32_t e = miss_src[j];
++    if (e < 0 || (uint32_t)e >= n_total) e = 0;
++    const char *s = src + (uint64_t)e * expert_bytes;
++    char *d = dst + (uint64_t)miss_dst[j] * expert_bytes;
++    const uint64_t n16 = expert_bytes / 16u;
++    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n16;
++         i += (uint64_t)gridDim.x * blockDim.x)
++        ((uint4 *)d)[i] = ((const uint4 *)s)[i];
++}
++
++/* Cache slot to staging slot D2D: stage[i] <- cache[out_slots[i]], leaving the
++ * downstream contract unchanged. */
++__global__ static void moe_cache_to_stage_kernel(
++        char *stage, const char *cache, const int32_t *out_slots,
++        uint32_t n_sel, uint64_t expert_bytes) {
++    const uint32_t i = blockIdx.y;
++    if (i >= n_sel) return;
++    const char *s = cache + (uint64_t)out_slots[i] * expert_bytes;
++    char *d = stage + (uint64_t)i * expert_bytes;
++    const uint64_t n16 = expert_bytes / 16u;
++    for (uint64_t k = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; k < n16;
++         k += (uint64_t)gridDim.x * blockDim.x)
++        ((uint4 *)d)[k] = ((const uint4 *)s)[k];
+ }
+ 
++static moe_layer_cache *moe_cache_get(uint64_t key, uint32_t slots, uint32_t n_total,
++                                      uint32_t n_sel, uint64_t gate_bytes, uint64_t down_bytes) {
++    auto it = g_moe_cache.find(key);
++    if (it != g_moe_cache.end()) {
++        moe_layer_cache *c = &it->second;
++        /* A changed size means treating the cache as absent -- better to degrade
++         * to the slow path than to move data with a wrongly sized buffer. */
++        if (c->gate_bytes != gate_bytes || c->down_bytes != down_bytes) return NULL;
++        return c;
++    }
++    moe_layer_cache c;
++    memset(&c, 0, sizeof(c));
++    c.slots = slots; c.gate_bytes = gate_bytes; c.down_bytes = down_bytes;
++    const size_t gb = (size_t)gate_bytes * slots, db = (size_t)down_bytes * slots;
++    int ok = cudaMalloc((void **)&c.gate, gb) == cudaSuccess
++          && cudaMalloc((void **)&c.up,   gb) == cudaSuccess
++          && cudaMalloc((void **)&c.down, db) == cudaSuccess
++          && cudaMalloc((void **)&c.slot_of,     (size_t)n_total * sizeof(int32_t)) == cudaSuccess
++          && cudaMalloc((void **)&c.slot_expert, (size_t)slots  * sizeof(int32_t)) == cudaSuccess
++          && cudaMalloc((void **)&c.slot_stamp,  (size_t)slots  * sizeof(uint32_t)) == cudaSuccess
++          && cudaMalloc((void **)&c.out_slots,   (size_t)n_sel  * sizeof(int32_t)) == cudaSuccess
++          && cudaMalloc((void **)&c.miss_src,    (size_t)n_sel  * sizeof(int32_t)) == cudaSuccess
++          && cudaMalloc((void **)&c.miss_dst,    (size_t)n_sel  * sizeof(int32_t)) == cudaSuccess
++          && cudaMalloc((void **)&c.n_miss,      sizeof(int32_t)) == cudaSuccess
++          && cudaMalloc((void **)&c.clock,       sizeof(uint32_t)) == cudaSuccess;
++    if (!ok) {
++        (void)cudaGetLastError();
++        if (c.gate) cudaFree(c.gate); if (c.up) cudaFree(c.up); if (c.down) cudaFree(c.down);
++        if (c.slot_of) cudaFree(c.slot_of); if (c.slot_expert) cudaFree(c.slot_expert);
++        if (c.slot_stamp) cudaFree(c.slot_stamp); if (c.out_slots) cudaFree(c.out_slots);
++        if (c.miss_src) cudaFree(c.miss_src); if (c.miss_dst) cudaFree(c.miss_dst);
++        if (c.n_miss) cudaFree(c.n_miss); if (c.clock) cudaFree(c.clock);
++        return NULL;
++    }
++    (void)cudaMemset(c.slot_of,     0xFF, (size_t)n_total * sizeof(int32_t));  /* -1 */
++    (void)cudaMemset(c.slot_expert, 0xFF, (size_t)slots  * sizeof(int32_t));   /* -1 */
++    (void)cudaMemset(c.slot_stamp,  0,    (size_t)slots  * sizeof(uint32_t));
++    (void)cudaMemset(c.clock,       0,    sizeof(uint32_t));
++    g_moe_cache[key] = c;
++    return &g_moe_cache[key];
++}
++
++/* The cached decode path. Any failed step returns 0 and the caller falls back to
++ * the original gather -- degrade to "slow but correct", never to "fast but
++ * wrong". */
++static int cuda_moe_cache_decode(const char **gate_w, const char **up_w, const char **down_w,
++                                 const int32_t **selected_out, const int32_t *selected,
++                                 uint32_t n_expert, uint64_t gate_expert_bytes,
++                                 uint64_t down_expert_bytes, uint32_t n_expert_total,
++                                 uint64_t layer_key) {
++    const uint32_t slots = moe_cache_slots_cfg();
++    if (slots == 0 || n_expert > IDLETOKEN_MOE_CACHE_MAX_SEL) return 0;
++    if (!cuda_moe_stage_prepare(gate_expert_bytes, down_expert_bytes, n_expert)) return 0;
++    moe_layer_cache *c = moe_cache_get(layer_key, slots, n_expert_total, n_expert,
++                                       gate_expert_bytes, down_expert_bytes);
++    if (!c) return 0;
++
++    if (!g_moe_cache_stat &&
++        cudaMalloc((void **)&g_moe_cache_stat, 2 * sizeof(unsigned long long)) == cudaSuccess)
++        (void)cudaMemset(g_moe_cache_stat, 0, 2 * sizeof(unsigned long long));
++
++    moe_cache_admit_kernel<<<1, 1>>>(selected, n_expert, n_expert_total,
++                                     c->slot_of, c->slot_expert, c->slot_stamp,
++                                     c->slots, c->clock,
++                                     c->out_slots, c->miss_src, c->miss_dst, c->n_miss,
++                                     g_moe_cache_stat);
++
++    const uint32_t threads = 256u;
++    uint32_t gb = (uint32_t)((gate_expert_bytes / 16u + threads - 1) / threads);
++    if (gb > 1024u) gb = 1024u; if (gb == 0u) gb = 1u;
++    uint32_t db = (uint32_t)((down_expert_bytes / 16u + threads - 1) / threads);
++    if (db > 1024u) db = 1024u; if (db == 0u) db = 1u;
++    dim3 gmiss(gb, n_expert, 1), dmiss(db, n_expert, 1);
++
++    /* Fill in only the three tensors that missed. */
++    moe_cache_fill_kernel<<<gmiss, threads>>>(c->gate, *gate_w, c->miss_src, c->miss_dst,
++                                              c->n_miss, gate_expert_bytes, n_expert_total);
++    moe_cache_fill_kernel<<<gmiss, threads>>>(c->up,   *up_w,   c->miss_src, c->miss_dst,
++                                              c->n_miss, gate_expert_bytes, n_expert_total);
++    moe_cache_fill_kernel<<<dmiss, threads>>>(c->down, *down_w, c->miss_src, c->miss_dst,
++                                              c->n_miss, down_expert_bytes, n_expert_total);
++    /* Cache slot to staging slot, preserving the existing downstream contract
++     * that sel_ptr = ident. */
++    moe_cache_to_stage_kernel<<<gmiss, threads>>>(g_moe_stage.gate, c->gate, c->out_slots,
++                                                  n_expert, gate_expert_bytes);
++    moe_cache_to_stage_kernel<<<gmiss, threads>>>(g_moe_stage.up,   c->up,   c->out_slots,
++                                                  n_expert, gate_expert_bytes);
++    moe_cache_to_stage_kernel<<<dmiss, threads>>>(g_moe_stage.down, c->down, c->out_slots,
++                                                  n_expert, down_expert_bytes);
++    if (cudaGetLastError() != cudaSuccess) return 0;
++
++    /* The period is 256: one round of 32 tokens x 28 layers is 896 calls, so a
++     * period of 2048 would never print once -- the third time in this session that
++     * a diagnostic which only prints at some counter threshold has bitten us. */
++    if (++g_moe_cache_calls % 256ull == 0ull && g_moe_cache_stat) {
++        unsigned long long h[2] = {0, 0};
++        if (cudaMemcpy(h, g_moe_cache_stat, sizeof(h), cudaMemcpyDeviceToHost) == cudaSuccess && h[1])
++            fprintf(stderr, "ds4: MoE cache %u slots/layer  hits %llu/%llu = %.1f%%  (%zu layers built)\n",
++                    slots, h[0], h[1], 100.0 * (double)h[0] / (double)h[1], g_moe_cache.size());
++    }
++
++    *gate_w = g_moe_stage.gate;
++    *up_w   = g_moe_stage.up;
++    *down_w = g_moe_stage.down;
++    *selected_out = g_moe_stage.ident;
++    return 1;
++}
++
+ static int cuda_moe_stage_decode(const char **gate_w, const char **up_w, const char **down_w,
+                                  const int32_t **selected_out, const int32_t *selected,
+                                  uint32_t n_expert,
+@@ -10739,10 +10965,14 @@
+          * The difference is whether the distinct-expert count is read back to
+          * the host, which is forbidden on decode. */
+         if (n_tokens == 1u) cuda_moe_stage_release_prefill();
+         const int staged = (n_tokens == 1u)
+-            ? cuda_moe_stage_decode(&gate_w, &up_w, &down_w, &sel_ptr,
++            ? (cuda_moe_cache_decode(&gate_w, &up_w, &down_w, &sel_ptr,
++                                     (const int32_t *)selected->ptr, n_expert,
++                                     gate_expert_bytes, down_expert_bytes, 256u,
++                                     gate_offset)
++               || cuda_moe_stage_decode(&gate_w, &up_w, &down_w, &sel_ptr,
+                                     (const int32_t *)selected->ptr, n_expert,
+-                                    gate_expert_bytes, down_expert_bytes, 256u)
++                                    gate_expert_bytes, down_expert_bytes, 256u))
+             : cuda_moe_stage_prefill(&gate_w, &up_w, &down_w, &sel_ptr,
+                                      (const int32_t *)selected->ptr, n_tokens, n_expert,
+                                      gate_expert_bytes, down_expert_bytes, 256u);

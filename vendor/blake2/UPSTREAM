@@ -1,0 +1,24 @@
+BLAKE2b — cryptographic hash (RFC 7693), unkeyed one-shot subset.
+
+Source:   compact clean-room implementation of RFC 7693 / the public-domain
+          reference at https://github.com/BLAKE2/BLAKE2 (blake2b-ref.c).
+          Same algorithm, reduced API surface: one-shot, unkeyed, salt/personal
+          all-zero — exactly the parameters libsodium's crypto_generichash
+          uses for the sealed-box nonce.
+License:  Public domain / CC0, matching the upstream reference dedication
+          (authors of the reference: Samuel Neves, Jean-Philippe Aumasson).
+
+Why vendored here (per the dependency rule, and the vendor/tweetnacl precedent):
+  - TweetNaCl's sealed-box helper in src/common/privacy.c derives its nonce
+    with SHA-512, which is self-consistent but NOT wire-compatible with
+    libsodium's crypto_box_seal (nonce = BLAKE2b-192(eph_pk || recip_pk)).
+    The service this talks to speaks libsodium, so the
+    cluster-side platform Agent needs a real BLAKE2b for interop.
+  - Self-contained: one .c + one .h, C99, no dependencies, builds on
+    Windows / Linux / macOS with plain cc -- the same smallest-package philosophy as
+    vendor/tweetnacl.
+
+Verified against libsodium: a cross-language end-to-end test seals with real
+libsodium-wrappers and opens in C (and vice versa); a wrong nonce would fail
+the Poly1305 MAC, so a green e2e is a proof of BLAKE2b correctness for the
+64-byte unkeyed 24-byte-digest case we use.

@@ -1,0 +1,13 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+src-tauri/binaries/
+# src-tauri/icons/ used to be ignored here, so those icons were never actually
+# committed -- they lived only on one maintainer's machine. tauri.conf.json
+# references them directly and generate_context! fails at compile time if it
+# cannot read them, which means **no fresh clone could build the client**, while
+# the acceptance gates on that one machine stayed green throughout.
+# Icons are a product asset, not a build artifact, and must travel with the repo.
+*.log
+.DS_Store

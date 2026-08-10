@@ -1,0 +1,26 @@
+{
+  "id": "glm-5.2",
+  "label": "GLM-5.2",
+  "family": "glm",
+  "backend": "ds4x",
+  "arch": "GLM_DSA",
+  "available": false,
+  "license": "MIT",
+  "params_summary": "744B · 40B active · Q2 ≈ 238 GB",
+  "n_layers": 78,
+  "n_embd": 6144,
+  "hc_streams": 1,
+  "n_vocab": 154880,
+  "layer_weight_bytes": 253403070464,
+  "shared_weight_bytes": 2147483648,
+  "context_max": 1048576,
+  "split": { "boundary_multiple": 4 },
+  "kv": { "kind": "mla", "bytes_per_token_per_layer": 1152 },
+  "overhead_base_bytes": 3221225472,
+  "default_gguf": "glm-5.2-q2.gguf",
+  "chat_template": "gguf",
+  "sources": [
+    { "repo": "unsloth/GLM-5.2-GGUF", "quant": "UD-IQ2_XXS" }
+  ],
+  "note": "ds4x backend pending (Phase B) — needs a large-RAM HYBRID cluster"
+}

@@ -1,0 +1,43 @@
+name: Bug report
+description: Something doesn't work
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The client can export everything we need in one click:
+        **Settings → Privacy & diagnostics → Export diagnostics bundle**. It contains your hardware
+        probe, the capability table and cluster state — and no access tokens.
+        Attaching it usually saves a round trip.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      placeholder: What you did, what you expected, what you got instead.
+    validations: {required: true}
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      placeholder: "v0.1.0 (Help → About, or the installer filename)"
+    validations: {required: true}
+  - type: dropdown
+    id: setup
+    attributes:
+      label: Setup
+      options:
+        - One machine
+        - Two or more machines (cluster)
+    validations: {required: true}
+  - type: textarea
+    id: diag
+    attributes:
+      label: Diagnostics bundle
+      description: Paste it here, or drag the file in.
+      render: json
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines
+      description: Only if the diagnostics bundle doesn't already cover it.
+      render: shell

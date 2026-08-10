@@ -1,0 +1,38 @@
+IdleToken
+Copyright 2026 IdleToken contributors
+
+This product includes software developed as part of the IdleToken project,
+licensed under the Apache License, Version 2.0 (see LICENSE).
+
+--------------------------------------------------------------------------
+Third-party components vendored in this repository
+--------------------------------------------------------------------------
+
+vendor/ds4/ — ds4.c, the DeepSeek V4 Flash single-machine reference engine
+    Copyright (c) 2026 The ds4.c authors
+    Copyright (c) 2023-2026 The ggml authors
+    MIT License — full text in vendor/ds4/LICENSE
+    Upstream: https://github.com/antirez/ds4 (pinned commit in vendor/ds4/UPSTREAM)
+
+vendor/tweetnacl/ — TweetNaCl, "a crypto library in 100 tweets"
+    Public domain, dedicated by D. J. Bernstein, Bernard van Gastel,
+    Wesley Janssen, Tanja Lange, Peter Schwabe, Sjaak Smetsers.
+    Upstream: https://tweetnacl.cr.yp.to/20140427/
+
+vendor/blake2/ — BLAKE2b (RFC 7693), unkeyed one-shot subset
+    Public domain / CC0, matching the upstream reference dedication by
+    Samuel Neves and Jean-Philippe Aumasson.
+    Upstream: https://github.com/BLAKE2/BLAKE2
+
+Model weights are NOT distributed with this software. IdleToken downloads
+GGUF files published by their respective authors; those files carry their
+own licenses (DeepSeek-V4-Flash-0731 is MIT, per its model card).
+
+--------------------------------------------------------------------------
+Trademarks
+--------------------------------------------------------------------------
+
+"IdleToken" and the IdleToken logo are trademarks of the project's owner.
+The Apache License does not grant permission to use them (Apache-2.0 §6).
+You may fork and redistribute this code under the terms of the License, but
+not under the IdleToken name or logo.

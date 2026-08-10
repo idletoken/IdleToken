@@ -1,0 +1,75 @@
+{
+  "id": "qwen3.5-9b",
+  "label": "Qwen3.5 9B",
+  "family": "qwen3.5",
+  "backend": "ds4x",
+  "arch": "qwen35",
+  "available": true,
+  "license": "Apache-2.0",
+  "params_summary": "9B · 32 layers · hybrid linear attention (Gated DeltaNet 3:1 full)",
+  "n_layers": 32,
+  "n_embd": 4096,
+  "hc_streams": 1,
+  "n_vocab": 248320,
+  "context_max": 262144,
+  "attn": {
+    "kind": "hybrid",
+    "full_attention_interval": 4,
+    "full": {
+      "kind": "gqa",
+      "n_head": 16,
+      "n_head_kv": 4,
+      "head_dim": 256,
+      "qk_norm": true,
+      "rope_dim_partial": 64,
+      "out_gate": "sigmoid"
+    },
+    "linear": {
+      "kind": "gated_deltanet",
+      "k_heads": 16,
+      "k_dim": 128,
+      "v_heads": 32,
+      "v_dim": 128,
+      "conv_kernel": 4,
+      "z_gate": "silu"
+    }
+  },
+  "kv": {
+    "kind": "hybrid",
+    "bytes_per_token_per_layer": 8192,
+    "state_bytes_per_layer": 2195456,
+    "full_attention_interval": 4
+  },
+  "rope_theta": 10000000,
+  "split": {
+    "boundary_multiple": 0
+  },
+  "overhead_base_bytes": 1610612736,
+  "chat_template": "gguf",
+  "layer_weight_bytes": 4263053312,
+  "shared_weight_bytes": 1406500864,
+  "default_gguf": "Qwen3.5-9B-Q4_K_M.gguf",
+  "sources": [
+    {
+      "repo": "unsloth/Qwen3.5-9B-GGUF",
+      "quant": "Q4_K_M"
+    }
+  ],
+  "default_quant": "Q4_K_M",
+  "variants": [
+    {
+      "quant": "Q4_K_M",
+      "layer_weight_bytes": 4263053312,
+      "shared_weight_bytes": 1406500864,
+      "repo": "unsloth/Qwen3.5-9B-GGUF",
+      "gguf": "Qwen3.5-9B-Q4_K_M.gguf"
+    }
+  ],
+  "notes": [
+    "Field for field identical to qwen3.5-4b (32 layers, k_heads 16 / v_heads 32 i.e. grp=2, full layers 16/4 heads × 256, full_attention_interval 4); only n_embd (4096 vs 2560) and the FFN width differ.",
+    "Full layers: 4 KV heads × 256 head_dim × 2 (K+V) × 4 B = 8192 B per token per layer. Linear layers: state 32×128×128×4 plus conv window 3×8192×4 = 2195456 B, independent of context length.",
+    "Verified on DGX 2026-07-28: same GGUF and prompt as llama.cpp, greedy output identical character for character (\"The capital of France is Paris.\"); CPU and CUDA produce the same recurrence token ids; GDN_CHECK reports at most 1.788e-07 element-wise difference over 120 chunks (docs/linear-attention-design.md §4j).",
+    "layer_weight_bytes / shared_weight_bytes are measured, summed tensor by tensor via scripts/gguf_shard.py index.",
+    "Only Q4_K_M is registered. Precisions we have not downloaded stay out of variants, so no unverified number ever appears here."
+  ]
+}

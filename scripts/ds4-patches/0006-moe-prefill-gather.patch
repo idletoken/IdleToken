@@ -1,0 +1,468 @@
+--- IdleToken/vendor/ds4/ds4_cuda.cu	(0001+0002+0004+0005 applied)
++++ IdleToken/vendor/ds4/ds4_cuda.cu	(0006-moe-prefill-gather)
+@@ -10080,7 +10080,25 @@
+     if (e < 0 || (uint32_t)e >= n_expert) e = 0;   /* mirrors the kernels' clamp */
+     const char *s = src + (uint64_t)e * expert_bytes;
+     char *d = dst + (uint64_t)slot * expert_bytes;
+-    /* 16-byte vector copy; expert tensors are quant-block aligned. */
++    /* 16-byte vector copy; expert tensors are quant-block aligned.
++     *
++     * NOTE: this naive shape -- one uint4 per thread, the three tensors issued as
++     * three separate launches -- measured as the fastest. On real hardware
++     * (RTX 5060 Ti in a PCIe 5.0 x8 slot) it reaches 11.6 GB/s, and two
++     * seemingly smarter variants are both slower:
++     *
++     *   4 independent loads per thread, a quarter of the blocks (more ILP)  9.4 GB/s
++     *   gate/up/down fused into one launch, 3x the blocks in flight        10.0 GB/s
++     *   one uint4 per thread, three launches (current)                     11.6 GB/s
++     *
++     * So the bottleneck reading from pinned host memory is **neither the load
++     * depth per thread nor the number of blocks in flight** -- the grid is
++     * saturated long before, and more parallelism only adds scheduling overhead.
++     * Going faster requires a different transfer mechanism (copy-engine DMA,
++     * which would mean reading `selected` back to the host and synchronizing 43
++     * times per token -- exactly what once brought a machine down), or simply
++     * **moving fewer bytes** (a higher resident fraction in VRAM). Do not tune
++     * this kernel further. */
+     const uint64_t n16 = expert_bytes / 16u;
+     for (uint64_t i = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x; i < n16;
+          i += (uint64_t)gridDim.x * blockDim.x) {
+@@ -10089,9 +10101,66 @@
+     for (uint64_t i = n16 * 16u + blockIdx.x * blockDim.x + threadIdx.x;
+          i < expert_bytes; i += (uint64_t)gridDim.x * blockDim.x) {
+         d[i] = s[i];
++    }
++}
++
++/* ---- The prefill variant: deduplicate first, then move the compacted set ----
++ *
++ * Decode touches only 6 experts per token, so moving 6 copies in `selected`
++ * order is fine. One prefill chunk has n_tokens*6 (token, expert) pairs with
++ * heavy duplication -- the 90 pairs of 15 tokens usually land on a few dozen
++ * distinct experts. Moving them verbatim would transfer the same expert a dozen
++ * times over, burning PCIe for nothing.
++ *
++ * So the set of used experts is computed on the device first (present ->
++ * compact), `selected` is remapped to **compacted slot indices**, and the
++ * compacted set is moved once. Downstream kernels use selected[] purely as an
++ * index into the weight base and do not clamp it against 256, so the remapped
++ * slot indices can be fed straight in -- the same trick decode plays with
++ * `ident`.
++ *
++ * What motivated it, measured (stage 0, 22 of 28 layers in host memory): prefill
++ * spent 131-164 ms per layer on gateup, i.e. 1.8 GB/s, while decode moves the
++ * same bytes through gather at 14.5 GB/s. **The 8x difference is not bandwidth
++ * but access pattern** -- strided scattered reads of quantization blocks versus
++ * a contiguous DMA. */
++__global__ static void moe_mark_used_kernel(int32_t *present, const int32_t *selected,
++                                            uint32_t n_sel, uint32_t n_total) {
++    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= n_sel) return;
++    int32_t e = selected[i];
++    if (e < 0 || (uint32_t)e >= n_total) e = 0;   /* same clamping as the other kernels */
++    present[e] = 1;
++}
++
++/* A single thread scans 256 entries to build the compaction table. Negligible
++ * against the hundreds of MiB moved per layer, and it removes any need for a
++ * parallel prefix sum -- correctness matters far more than that much time. */
++__global__ static void moe_build_compact_kernel(const int32_t *present, int32_t *slot_of,
++                                                int32_t *compact, int32_t *n_dist,
++                                                uint32_t n_total, uint32_t max_slots) {
++    int32_t n = 0;
++    for (uint32_t e = 0; e < n_total; e++) {
++        if (present[e]) {
++            if ((uint32_t)n < max_slots) { compact[n] = (int32_t)e; slot_of[e] = n; }
++            n++;
++        } else {
++            slot_of[e] = 0;
++        }
+     }
++    *n_dist = n;
+ }
+ 
++__global__ static void moe_remap_sel_kernel(int32_t *remap, const int32_t *selected,
++                                            const int32_t *slot_of,
++                                            uint32_t n_sel, uint32_t n_total) {
++    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= n_sel) return;
++    int32_t e = selected[i];
++    if (e < 0 || (uint32_t)e >= n_total) e = 0;
++    remap[i] = slot_of[e];
++}
++
+ struct cuda_moe_stage_state {
+     char    *gate;
+     char    *up;
+@@ -10101,14 +10163,52 @@
+     int32_t *ident;
+     uint32_t ident_n;
+     int      inited;
++    /* For prefill deduplication. Like the buffers above, these only grow and are
++     * reused, avoiding a malloc/free per layer. */
++    int32_t *present;     /* n_total entries */
++    int32_t *slot_of;     /* n_total entries: expert index -> compacted slot */
++    int32_t *compact;     /* slot_cap entries: compacted slot -> expert index */
++    int32_t *remap;       /* pair_cap entries: the remapped `selected` */
++    int32_t *n_dist_dev;  /* 1 entry */
++    uint32_t slot_cap;    /* slots prepared (i.e. the most distinct experts one pass can move) */
++    uint32_t pair_cap;
++    uint32_t total_cap;
+ };
+ static cuda_moe_stage_state g_moe_stage;
+ 
++/* **On by default on Windows** (`IDLETOKEN_MOE_STAGE=0` turns it off); still
++ * opt-in elsewhere (=1 to enable).
++ *
++ * Why the default changed: it only engages when the weights really are in host
++ * memory (`cuda_model_range_is_host`), any failed step returns 0 and leaves the
++ * caller's pointers untouched, degrading to the old slow path rather than to
++ * wrong output; and the measured gain is not marginal -- decode 8.4x, prefill
++ * 152 ms to 3 ms per layer, with token-for-token identical output.
++ *
++ * More importantly: leaving it opt-in means **it never takes effect in the
++ * product**. Nobody sets an environment variable when the client or a scheduled
++ * task starts a worker, so only hand-written benchmark scripts would be fast. We
++ * fell into that exact trap once already with the VRAM budget (MinGW's setenv
++ * does not reach the MSVC CRT), and should not fall into it twice.
++ *
++ * Why it is **not** on by default off Windows: this gather assumes host memory
++ * and VRAM are distinct, with PCIe in between. A DGX Spark has Grace unified
++ * memory, where the two are the same physical memory; `is_host` is still true
++ * there (the range is established through cudaHostRegister), but moving the data
++ * merely wastes time and VRAM. Discrete GPUs on Windows are this path's use
++ * case, and the Windows HYBRID overflow branch only exists under `_WIN32`
++ * anyway. On a Linux machine with a discrete card, set =1 explicitly -- that
++ * configuration has not been measured on real hardware, so we should not decide
++ * for it. */
+ static int cuda_moe_stage_enabled(void) {
+     static int cached = -1;
+     if (cached < 0) {
+         const char *e = getenv("IDLETOKEN_MOE_STAGE");
++#ifdef _WIN32
++        cached = (e && e[0] == '0') ? 0 : 1;
++#else
+         cached = (e && e[0] == '1') ? 1 : 0;
++#endif
+     }
+     return cached;
+ }
+@@ -10142,35 +10232,166 @@
+     if (g_moe_stage.down)  { (void)cudaFree(g_moe_stage.down);  g_moe_stage.down  = NULL; }
+     if (g_moe_stage.ident) { (void)cudaFree(g_moe_stage.ident); g_moe_stage.ident = NULL; }
+     g_moe_stage.inited = 0;
++    /* `ident` must be built for the **actual slot count**, not pinned to
++     * MAX_EXPERTS. Prefill calls this function with hundreds of slots; hardcoding
++     * 8 would make the cache test above (ident_n >= n_expert) never hold, so
++     * every layer would free and reallocate hundreds of MiB of buffers -- worse
++     * than not staging at all. */
++    const uint32_t ident_n = n_expert > IDLETOKEN_MOE_STAGE_MAX_EXPERTS
++                           ? n_expert : IDLETOKEN_MOE_STAGE_MAX_EXPERTS;
+     if (cudaMalloc((void **)&g_moe_stage.gate, (size_t)gneed) != cudaSuccess ||
+         cudaMalloc((void **)&g_moe_stage.up,   (size_t)gneed) != cudaSuccess ||
+         cudaMalloc((void **)&g_moe_stage.down, (size_t)dneed) != cudaSuccess ||
+         cudaMalloc((void **)&g_moe_stage.ident,
+-                   (size_t)IDLETOKEN_MOE_STAGE_MAX_EXPERTS * sizeof(int32_t)) != cudaSuccess) {
++                   (size_t)ident_n * sizeof(int32_t)) != cudaSuccess) {
+         (void)cudaGetLastError();
+         fprintf(stderr, "ds4: IdleToken MoE staging disabled — cudaMalloc failed (%.1f MiB)\n",
+                 (double)(2 * gneed + dneed) / 1048576.0);
+         return 0;
+     }
+-    int32_t host_ident[IDLETOKEN_MOE_STAGE_MAX_EXPERTS];
+-    for (uint32_t i = 0; i < IDLETOKEN_MOE_STAGE_MAX_EXPERTS; i++) host_ident[i] = (int32_t)i;
+-    if (cudaMemcpy(g_moe_stage.ident, host_ident, sizeof(host_ident),
+-                   cudaMemcpyHostToDevice) != cudaSuccess) {
+-        (void)cudaGetLastError();
+-        return 0;
++    {
++        int32_t *host_ident = (int32_t *)malloc((size_t)ident_n * sizeof(int32_t));
++        if (!host_ident) return 0;
++        for (uint32_t i = 0; i < ident_n; i++) host_ident[i] = (int32_t)i;
++        cudaError_t ce = cudaMemcpy(g_moe_stage.ident, host_ident,
++                                    (size_t)ident_n * sizeof(int32_t), cudaMemcpyHostToDevice);
++        free(host_ident);
++        if (ce != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+     }
+     g_moe_stage.gate_cap = gneed;
+     g_moe_stage.down_cap = dneed;
+-    g_moe_stage.ident_n  = IDLETOKEN_MOE_STAGE_MAX_EXPERTS;
++    g_moe_stage.ident_n  = ident_n;
+     g_moe_stage.inited   = 1;
++    g_moe_stage.slot_cap = 0;   /* buffers were rebuilt, so the compaction table's capacity test must be invalidated too */
+     fprintf(stderr, "ds4: IdleToken MoE staging on — %.1f MiB VRAM, %u experts/layer, GPU-side gather\n",
+             (double)(2 * gneed + dneed) / 1048576.0, n_expert);
+     return 1;
+ }
+ 
++/* Prepare every buffer prefill deduplication and movement needs. The slot count
++ * is the VRAM budget divided by the bytes per slot, capped at the total number of
++ * experts (more is pointless). A failed cudaMalloc halves the request, down to a
++ * floor of 8 slots -- when it does not fit we would **rather move fewer experts
++ * and fall back to the slow path** than drain VRAM here: the weights alone
++ * already fill this card close to its budget, and one greedy allocation would
++ * push the machine back into WDDM paging. */
++static int cuda_moe_stage_prefill_prepare(uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
++                                          uint32_t n_expert_total, uint32_t n_sel) {
++    const uint64_t slot_bytes = 2ull * gate_expert_bytes + down_expert_bytes;
++    if (slot_bytes == 0ull) return 0;
++
++    /* The number of distinct experts **cannot exceed the number of
++     * (token, expert) pairs** -- 15 tokens at top-6 is at most 90. The first
++     * version sized against the total expert count (256) and asked for 189 slots
++     * = 1276 MiB, while only a few dozen were ever used; the wasted VRAM pushed
++     * decode from 211 to 258 ms/token. Take the minimum of all three bounds. */
++    uint32_t want_slots = n_expert_total < n_sel ? n_expert_total : n_sel;
++    {
++        uint64_t budget_mb = 0ull;
++        const char *e = getenv("IDLETOKEN_MOE_STAGE_MB");
++        if (e && e[0]) { char *end = NULL; unsigned long long v = strtoull(e, &end, 10); if (end != e) budget_mb = v; }
++        if (budget_mb == 0ull) {
++            /* Size against the VRAM **actually free right now**, keeping a
++             * margin. A hardcoded number means nothing on this path: the weight
++             * budget, the KV cache and the context already fill the card close to
++             * full, and anything extra gets swallowed by WDDM paging -- which is
++             * precisely what this whole line of optimization exists to avoid. */
++            size_t freeb = 0, totalb = 0;
++            if (cudaMemGetInfo(&freeb, &totalb) == cudaSuccess) {
++                const uint64_t reserve = 768ull << 20;
++                budget_mb = (uint64_t)freeb > reserve ? ((uint64_t)freeb - reserve) >> 20 : 0ull;
++            } else {
++                budget_mb = 256ull;
++            }
++        }
++        uint64_t by_budget = ((budget_mb << 20) / slot_bytes);
++        if (by_budget < want_slots) want_slots = (uint32_t)by_budget;
++    }
++    if (want_slots < 8u) return 0;   /* not enough free VRAM: skip it rather than squeeze */
++    /* Never retry a size that has already failed to allocate. Without this gate,
++     * after a successful step-down every layer would first retry the original
++     * want_slots, fail, and step down again -- several doomed cudaMallocs per
++     * layer, when the entire point of this path is not to squeeze VRAM. */
++    static uint32_t slots_ceiling = 0xffffffffu;
++    if (want_slots > slots_ceiling) want_slots = slots_ceiling;
++
++    if (g_moe_stage.inited && g_moe_stage.slot_cap >= want_slots &&
++        g_moe_stage.gate_cap >= want_slots * gate_expert_bytes &&
++        g_moe_stage.down_cap >= want_slots * down_expert_bytes &&
++        g_moe_stage.total_cap >= n_expert_total && g_moe_stage.pair_cap >= n_sel)
++        return 1;
++
++    for (uint32_t slots = want_slots; slots >= 8u; slots /= 2u) {
++        if (!cuda_moe_stage_prepare(gate_expert_bytes, down_expert_bytes, slots)) {
++            slots_ceiling = slots / 2u;
++            continue;
++        }
++        /* The small dedup arrays: a few KiB, nothing like the hundreds of MiB
++         * above, so a failure here abandons the whole thing. */
++        if (g_moe_stage.total_cap < n_expert_total || g_moe_stage.pair_cap < n_sel) {
++            if (g_moe_stage.present) { (void)cudaFree(g_moe_stage.present); g_moe_stage.present = NULL; }
++            if (g_moe_stage.slot_of) { (void)cudaFree(g_moe_stage.slot_of); g_moe_stage.slot_of = NULL; }
++            if (g_moe_stage.remap)   { (void)cudaFree(g_moe_stage.remap);   g_moe_stage.remap   = NULL; }
++            if (cudaMalloc((void **)&g_moe_stage.present, (size_t)n_expert_total * sizeof(int32_t)) != cudaSuccess ||
++                cudaMalloc((void **)&g_moe_stage.slot_of, (size_t)n_expert_total * sizeof(int32_t)) != cudaSuccess ||
++                cudaMalloc((void **)&g_moe_stage.remap,   (size_t)n_sel * sizeof(int32_t)) != cudaSuccess) {
++                return 0;
++            }
++            g_moe_stage.total_cap = n_expert_total;
++            g_moe_stage.pair_cap  = n_sel;
++        }
++        if (g_moe_stage.slot_cap < slots) {
++            if (g_moe_stage.compact) { (void)cudaFree(g_moe_stage.compact); g_moe_stage.compact = NULL; }
++            if (cudaMalloc((void **)&g_moe_stage.compact, (size_t)slots * sizeof(int32_t)) != cudaSuccess) return 0;
++            g_moe_stage.slot_cap = slots;
++        }
++        if (!g_moe_stage.n_dist_dev &&
++            cudaMalloc((void **)&g_moe_stage.n_dist_dev, sizeof(int32_t)) != cudaSuccess) return 0;
++        static uint32_t announced = 0;
++        if (announced != slots) {
++            announced = slots;
++            fprintf(stderr,
++                    "ds4: IdleToken MoE prefill gather ready -- %u slots x %.2f MiB = %.0f MiB VRAM\n",
++                    slots, (double)slot_bytes / 1048576.0,
++                    (double)slots * (double)slot_bytes / 1048576.0);
++        }
++        return 1;
++    }
++    return 0;
++}
++
++/* Give the large buffers back once prefill is done. Decode needs only 6 slots
++ * (about 40 MiB) while prefill's are hundreds of MiB -- **keeping them means
++ * trading prefill's one-off gain for a resident cost on every decode token**,
++ * measured as 211 to 258 ms/token. They are released on the first decode call and
++ * rebuilt at the next prefill: at most one free and one malloc per request, which
++ * is negligible against hundreds of milliseconds per token. */
++static void cuda_moe_stage_release_prefill(void) {
++    if (!g_moe_stage.inited || g_moe_stage.slot_cap <= IDLETOKEN_MOE_STAGE_MAX_EXPERTS) return;
++    if (g_moe_stage.gate)  { (void)cudaFree(g_moe_stage.gate);  g_moe_stage.gate  = NULL; }
++    if (g_moe_stage.up)    { (void)cudaFree(g_moe_stage.up);    g_moe_stage.up    = NULL; }
++    if (g_moe_stage.down)  { (void)cudaFree(g_moe_stage.down);  g_moe_stage.down  = NULL; }
++    if (g_moe_stage.ident) { (void)cudaFree(g_moe_stage.ident); g_moe_stage.ident = NULL; }
++    if (g_moe_stage.compact) { (void)cudaFree(g_moe_stage.compact); g_moe_stage.compact = NULL; }
++    g_moe_stage.gate_cap = 0; g_moe_stage.down_cap = 0;
++    g_moe_stage.ident_n = 0;  g_moe_stage.slot_cap = 0;
++    g_moe_stage.inited = 0;
++    (void)cudaGetLastError();
++}
++
+ /* Returns 1 when the staged buffers should be used. On ANY failure returns 0
+  * and leaves the caller's pointers untouched, so a broken staging degrades to
+  * the previous (slow but correct) behaviour rather than to wrong output. */
++/* Timing for the gather itself. **It has to be accounted separately**: the MoE
++ * profile events are recorded after the gather, so the gateup they measure is
++ * compute time reading from the VRAM staging buffer and has nothing to do with
++ * the PCIe transfer. Reading only those numbers yields "MoE is 0.24 ms per layer,
++ * 6.7 ms across 28 layers" while stage 0 takes 108 ms per token -- the missing
++ * 100 ms is all here, and was completely invisible for a while. */
++static cudaEvent_t g_gather_ev0, g_gather_ev1;
++static double      g_gather_ms_acc;
++static uint64_t    g_gather_bytes_acc, g_gather_calls;
++
+ static int cuda_moe_stage_decode(const char **gate_w, const char **up_w, const char **down_w,
+                                  const int32_t **selected_out, const int32_t *selected,
+                                  uint32_t n_expert,
+@@ -10178,6 +10384,11 @@
+                                  uint32_t n_expert_total) {
+     if (n_expert > IDLETOKEN_MOE_STAGE_MAX_EXPERTS) return 0;
+     if (!cuda_moe_stage_prepare(gate_expert_bytes, down_expert_bytes, n_expert)) return 0;
++    const int prof_gather = getenv("DS4_CUDA_MOE_PROFILE") != NULL;
++    if (prof_gather) {
++        if (!g_gather_ev0) { (void)cudaEventCreate(&g_gather_ev0); (void)cudaEventCreate(&g_gather_ev1); }
++        if (g_gather_ev0) (void)cudaEventRecord(g_gather_ev0, 0);
++    }
+ 
+     const uint32_t threads = 256u;
+     const uint64_t n16 = gate_expert_bytes / 16u;
+@@ -10198,6 +10409,22 @@
+     moe_gather_experts_kernel<<<dgrid, threads>>>(g_moe_stage.down, *down_w, selected,
+                                                   n_expert, down_expert_bytes, n_expert_total);
+     if (cudaGetLastError() != cudaSuccess) return 0;
++    if (prof_gather && g_gather_ev0) {
++        (void)cudaEventRecord(g_gather_ev1, 0);
++        if (cudaEventSynchronize(g_gather_ev1) == cudaSuccess) {
++            float ms = 0.0f;
++            (void)cudaEventElapsedTime(&ms, g_gather_ev0, g_gather_ev1);
++            const uint64_t moved = (uint64_t)n_expert * (2ull * gate_expert_bytes + down_expert_bytes);
++            g_gather_ms_acc += ms; g_gather_bytes_acc += moved; g_gather_calls++;
++            if ((g_gather_calls % 128ull) == 0ull) {
++                fprintf(stderr,
++                        "ds4: MoE gather(decode) cumulative %llu calls %.0f MiB / %.0f ms = %.1f GB/s\n",
++                        (unsigned long long)g_gather_calls,
++                        (double)g_gather_bytes_acc / 1048576.0, g_gather_ms_acc,
++                        (double)g_gather_bytes_acc / (g_gather_ms_acc * 1e-3) / 1e9);
++            }
++        }
++    }
+ 
+     *gate_w = g_moe_stage.gate;
+     *up_w   = g_moe_stage.up;
+@@ -10209,6 +10436,82 @@
+     return 1;
+ }
+ 
++/* The prefill staging path. Returning 1 means the compacted VRAM buffer is now in
++ * use; any failed step returns 0 and leaves the caller's pointers untouched,
++ * degrading to the original (slow but correct) path.
++ *
++ * The one substantive difference from the decode version: this one **reads the
++ * distinct-expert count back to the host**, to know how much to move and whether
++ * it exceeds the slots. The decode path deliberately does not -- synchronizing 43
++ * times per token once brought a machine down; prefill synchronizes 43 times per
++ * chunk, smaller by a factor of the token count, so the cost is negligible. This
++ * asymmetry is intentional: do not "unify" it by making decode synchronize
++ * too. */
++static int cuda_moe_stage_prefill(const char **gate_w, const char **up_w, const char **down_w,
++                                  const int32_t **selected_out, const int32_t *selected,
++                                  uint32_t n_tokens, uint32_t n_expert,
++                                  uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
++                                  uint32_t n_expert_total) {
++    const uint32_t n_sel = n_tokens * n_expert;
++    if (n_sel == 0u || n_expert_total == 0u) return 0;
++    if (!cuda_moe_stage_prefill_prepare(gate_expert_bytes, down_expert_bytes,
++                                        n_expert_total, n_sel)) return 0;
++
++    if (cudaMemset(g_moe_stage.present, 0,
++                   (size_t)g_moe_stage.total_cap * sizeof(int32_t)) != cudaSuccess) return 0;
++    moe_mark_used_kernel<<<(n_sel + 255u) / 256u, 256>>>(
++        g_moe_stage.present, selected, n_sel, n_expert_total);
++    moe_build_compact_kernel<<<1, 1>>>(g_moe_stage.present, g_moe_stage.slot_of,
++                                       g_moe_stage.compact, g_moe_stage.n_dist_dev,
++                                       n_expert_total, g_moe_stage.slot_cap);
++    int32_t n_dist = 0;
++    if (cudaMemcpy(&n_dist, g_moe_stage.n_dist_dev, sizeof(int32_t),
++                   cudaMemcpyDeviceToHost) != cudaSuccess) return 0;
++    if (n_dist <= 0 || (uint32_t)n_dist > g_moe_stage.slot_cap) {
++        /* Not enough slots. **Reported once only**: a line per layer would drown
++         * the log, and the value of this message is "raise
++         * IDLETOKEN_MOE_STAGE_MB", which needs saying once. */
++        static int warned = 0;
++        if (!warned && n_dist > 0) {
++            warned = 1;
++            fprintf(stderr,
++                    "ds4: IdleToken MoE prefill gather skipped -- this chunk uses %d distinct experts "
++                    "but there are only %u slots (raise IDLETOKEN_MOE_STAGE_MB)\n",
++                    n_dist, g_moe_stage.slot_cap);
++        }
++        return 0;
++    }
++    moe_remap_sel_kernel<<<(n_sel + 255u) / 256u, 256>>>(
++        g_moe_stage.remap, selected, g_moe_stage.slot_of, n_sel, n_expert_total);
++
++    const uint32_t threads = 256u;
++    const uint64_t n16 = gate_expert_bytes / 16u;
++    uint32_t blocks_x = (uint32_t)((n16 + threads - 1) / threads);
++    if (blocks_x > 1024u) blocks_x = 1024u;
++    if (blocks_x == 0u) blocks_x = 1u;
++    dim3 grid(blocks_x, (uint32_t)n_dist, 1);
++    /* Reuse decode's gather kernel: feed the "compacted slot -> expert" table in
++     * as the selection table, where the semantics line up exactly. */
++    moe_gather_experts_kernel<<<grid, threads>>>(g_moe_stage.gate, *gate_w, g_moe_stage.compact,
++                                                 (uint32_t)n_dist, gate_expert_bytes, n_expert_total);
++    moe_gather_experts_kernel<<<grid, threads>>>(g_moe_stage.up, *up_w, g_moe_stage.compact,
++                                                 (uint32_t)n_dist, gate_expert_bytes, n_expert_total);
++    const uint64_t d16 = down_expert_bytes / 16u;
++    uint32_t dblocks = (uint32_t)((d16 + threads - 1) / threads);
++    if (dblocks > 1024u) dblocks = 1024u;
++    if (dblocks == 0u) dblocks = 1u;
++    dim3 dgrid(dblocks, (uint32_t)n_dist, 1);
++    moe_gather_experts_kernel<<<dgrid, threads>>>(g_moe_stage.down, *down_w, g_moe_stage.compact,
++                                                  (uint32_t)n_dist, down_expert_bytes, n_expert_total);
++    if (cudaGetLastError() != cudaSuccess) return 0;
++
++    *gate_w = g_moe_stage.gate;
++    *up_w   = g_moe_stage.up;
++    *down_w = g_moe_stage.down;
++    *selected_out = g_moe_stage.remap;
++    return 1;
++}
++
+ static int routed_moe_launch(
+         ds4_gpu_tensor *out,
+         ds4_gpu_tensor *gate,
+@@ -10306,12 +10604,20 @@
+                     cuda_model_range_is_host(gate_offset, gate_bytes));
+         }
+     }
+-    if (n_tokens == 1u && cuda_moe_stage_enabled() &&
+-        cuda_model_range_is_host(gate_offset, gate_bytes)) {
++    if (cuda_moe_stage_enabled() && cuda_model_range_is_host(gate_offset, gate_bytes)) {
+         static unsigned long long n_gathered = 0, n_resident = 0;
+-        if (cuda_moe_stage_decode(&gate_w, &up_w, &down_w, &sel_ptr,
+-                                  (const int32_t *)selected->ptr, n_expert,
+-                                  gate_expert_bytes, down_expert_bytes, 256u)) {
++        /* prefill and decode take two different staging paths: see the comment on
++         * cuda_moe_stage_prefill. The difference is whether the distinct-expert
++         * count is read back to the host, which is forbidden on decode. */
++        if (n_tokens == 1u) cuda_moe_stage_release_prefill();
++        const int staged = (n_tokens == 1u)
++            ? cuda_moe_stage_decode(&gate_w, &up_w, &down_w, &sel_ptr,
++                                    (const int32_t *)selected->ptr, n_expert,
++                                    gate_expert_bytes, down_expert_bytes, 256u)
++            : cuda_moe_stage_prefill(&gate_w, &up_w, &down_w, &sel_ptr,
++                                     (const int32_t *)selected->ptr, n_tokens, n_expert,
++                                     gate_expert_bytes, down_expert_bytes, 256u);
++        if (staged) {
+             n_gathered++;
+         } else {
+             n_resident++;

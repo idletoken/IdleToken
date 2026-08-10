@@ -1,0 +1,79 @@
+{
+  "id": "deepseek-v4-flash",
+  "label": "DeepSeek V4 Flash",
+  "family": "deepseek",
+  "backend": "ds4",
+  "arch": "deepseek4",
+  "available": true,
+  "license": "MIT",
+  "params_summary": "304B · 13B active · Q2",
+  "release": "0731",
+  "n_layers": 43,
+  "n_embd": 4096,
+  "hc_streams": 4,
+  "n_vocab": 129280,
+  "layer_weight_bytes": 85092941824,
+  "shared_weight_bytes": 1621835840,
+  "context_max": 1048576,
+  "split": {
+    "boundary_multiple": 0
+  },
+  "kv": {
+    "kind": "dsv4",
+    "bytes_per_token_per_layer": 0
+  },
+  "overhead_base_bytes": 0,
+  "default_gguf": "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf",
+  "chat_template": "ds4",
+  "sources": [
+    {
+      "repo": "antirez/deepseek-v4-gguf",
+      "quant": "IQ2_XXS+Q2_K"
+    }
+  ],
+  "default_quant": "IQ2_XXS+Q2_K",
+  "variants": [
+    {
+      "quant": "IQ2_XXS+Q2_K",
+      "layer_weight_bytes": 85092941824,
+      "shared_weight_bytes": 1621835840,
+      "repo": "antirez/deepseek-v4-gguf",
+      "gguf": "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
+    },
+    {
+      "quant": "IQ2_XXS+Q4_K-L37-42",
+      "layer_weight_bytes": 95964577792,
+      "shared_weight_bytes": 1621835840,
+      "repo": "antirez/deepseek-v4-gguf",
+      "gguf": "DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf"
+    }
+  ],
+  "speculative": {
+    "kind": "dspark",
+    "available": false,
+    "gguf": "DeepSeek-V4-Flash-DSpark-support.gguf",
+    "repo": "antirez/deepseek-v4-gguf",
+    "weight_bytes": 5989114272,
+    "block_size": 5,
+    "stage_count": 3,
+    "markov_rank": 256,
+    "noise_token_id": 128799,
+    "target_layer_ids": [
+      40,
+      41,
+      42
+    ],
+    "placement": "last_stage",
+    "status": "parked-2026-08-03"
+  },
+  "notes": [
+    "Since 2026-08-03 the **release build DeepSeek-V4-Flash-0731** is the source of truth (deepseek-ai/DeepSeek-V4-Flash-0731, MIT). The official model card marks the preview, deepseek-ai/DeepSeek-V4-Flash, as superseded; this project no longer references it.",
+    "The release and preview GGUFs have **identical tensor layout**: 1328 tensors, arch string deepseek4, block_count 43, and equal byte sizes tensor for tensor. Only the weight values differ, so the ds4 inference path needs no change.",
+    "compress_ratios has 46 entries in the official config.json (44 in the preview), but antirez's converted GGUF metadata still carries 44; ds4 validates only the first n_layers (43) entries and requires length >= 43, so both pass.",
+    "The model card states 304B (284B for the preview). The extra ~20B is the DSpark speculative decoding module, **packaged separately** as DeepSeek-V4-Flash-DSpark-support.gguf (5.6 GiB) and absent from the main weight file -- which is why the main GGUF is byte for byte the same size as the preview.",
+    "layer_weight_bytes / shared_weight_bytes are **measured**: summed tensor by tensor from the GGUF tensor directory (blk.N.* counted as layer weights, everything else as shared), reading only the header over HTTP Range. Self-check: layer + shared + data_start == file size, exactly, for both variants.",
+    "The previously registered 81 GiB / 1 GiB were estimates and were off by a visible margin (measured: 79.249 GiB / 1.510 GiB). Within shared, token_embd (1.06 GB) lands on the first stage and output (0.56 GB) on the last, so a wrong estimate skews the pipeline-parallel plan directly.",
+    "speculative.weight_bytes lands on the **last stage only** -- the draft module consumes the hidden states of layers 40/41/42 -- unlike shared_weight_bytes, which every stage loads. available=false means the weights are confirmed fetchable but the engine forward pass is not implemented yet (see docs/dspark-design.md).",
+    "DSpark is shelved (decided 2026-08-03): the code and analysis stay in the tree but are not enabled, speculative.available=false, there are zero production call sites, and the G_DSPARK gate defaults to SKIP (set HOMEAI_DSPARK_GATE=1 to run it). Read the shelving note at the top of docs/dspark-design.md before restarting the work."
+  ]
+}

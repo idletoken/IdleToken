@@ -1,0 +1,77 @@
+# IdleToken platform Agent — standalone build.
+#
+# Same philosophy as Makefile.privacy (which it deliberately does not touch):
+# the agent is pure portable C (vendored TweetNaCl + BLAKE2b, no external
+# deps), so it builds on macOS / Linux / Windows with just a C compiler —
+# no GPU, no CUDA, no cluster needed. It reuses the privacy/net/http common
+# objects by compiling them from their unmodified sources.
+#
+#   make -f Makefile.platform          # build build/idletoken-platform-agent
+#   make -f Makefile.platform clean
+#
+# Oracle: scripts/platform_agent_e2e.sh (builds this, then runs the
+# cross-language e2e against the real platform gateway).
+
+CC       ?= cc
+CFLAGS   ?= -O2 -std=c99 -Wall -Wextra
+INCLUDES := -Iinclude -Ivendor/tweetnacl -Ivendor/blake2
+LDLIBS   :=
+
+# The agent spawns one thread per connection (see the concurrency section in
+# platform_agent.c). On macOS pthread lives in libc, and so it does on recent
+# glibc, so omitting -pthread goes unnoticed on both -- but other libcs do need
+# it, and that failure shows up at link time, far from its cause. Be explicit.
+ifneq ($(OS),Windows_NT)
+  CFLAGS += -pthread
+  LDLIBS += -pthread
+endif
+
+# Windows needs bcrypt for BCryptGenRandom (randombytes in privacy.c).
+ifeq ($(OS),Windows_NT)
+  LDLIBS += -lbcrypt
+endif
+
+BUILD := build/platform
+BIN   := build/idletoken-platform-agent
+
+# Crypto + common objects (compiled from existing sources, unmodified).
+OBJS := $(BUILD)/tweetnacl.o \
+        $(BUILD)/blake2b.o \
+        $(BUILD)/privacy.o \
+        $(BUILD)/sodium_seal.o \
+        $(BUILD)/net.o \
+        $(BUILD)/http.o \
+        $(BUILD)/platform_agent.o
+
+.PHONY: all clean
+all: $(BIN)
+
+$(BUILD):
+	@mkdir -p $(BUILD)
+
+$(BUILD)/tweetnacl.o: vendor/tweetnacl/tweetnacl.c vendor/tweetnacl/tweetnacl.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
+
+$(BUILD)/blake2b.o: vendor/blake2/blake2b.c vendor/blake2/blake2.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
+
+$(BUILD)/privacy.o: src/common/privacy.c include/idletoken_privacy.h vendor/tweetnacl/tweetnacl.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
+
+$(BUILD)/sodium_seal.o: src/tools/sodium_seal.c include/idletoken_sodium_seal.h include/idletoken_privacy.h vendor/blake2/blake2.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
+
+$(BUILD)/net.o: src/common/net.c include/idletoken_net.h include/idletoken_proto.h | $(BUILD)
+	$(CC) $(CFLAGS) -D_GNU_SOURCE $(INCLUDES) -c -o $@ $<
+
+$(BUILD)/http.o: src/common/http.c include/idletoken_http.h | $(BUILD)
+	$(CC) $(CFLAGS) -D_GNU_SOURCE $(INCLUDES) -c -o $@ $<
+
+$(BUILD)/platform_agent.o: src/tools/platform_agent.c include/idletoken_sodium_seal.h include/idletoken_privacy.h include/idletoken_net.h include/idletoken_http.h | $(BUILD)
+	$(CC) $(CFLAGS) -D_GNU_SOURCE $(INCLUDES) -c -o $@ $<
+
+$(BIN): $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+clean:
+	rm -rf $(BUILD) $(BIN)

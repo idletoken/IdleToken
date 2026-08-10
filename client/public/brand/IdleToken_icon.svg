@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <title>IdleToken icon</title>
+  <desc>Distributed nodes converging into an awakened compute token.</desc>
+  
+    <g transform="">
+      <!-- Incoming distributed nodes -->
+      <g fill="none" stroke="#2563EB" stroke-width="18" stroke-linecap="round">
+        <path d="M 76 176 L 160 215"/>
+        <path d="M 70 260 L 146 260"/>
+        <path d="M 76 344 L 160 305"/>
+      </g>
+      <g fill="#2563EB">
+        <circle cx="65" cy="171" r="16"/>
+        <circle cx="58" cy="260" r="16"/>
+        <circle cx="65" cy="349" r="16"/>
+      </g>
+
+      <!-- Token -->
+      <path d="M 412.10 209.05 A 136 136 0 1 1 349.85 139.92" fill="none" stroke="#2563EB" stroke-width="38" stroke-linecap="butt"/>
+      <circle cx="286" cy="260" r="51" fill="#2563EB"/>
+
+      <!-- Spark -->
+      <polygon points="412,93 428,131 466,147 428,163 412,201 396,163 358,147 396,131" fill="#F59E0B"/>
+    </g>
+    
+</svg>

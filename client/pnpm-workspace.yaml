@@ -1,0 +1,9 @@
+# esbuild needs to run an install script to place its native binary. Since pnpm
+# 10 dependency build scripts are refused by default, so this must allow it
+# explicitly -- the file previously kept pnpm's generated placeholder text, "set
+# this to true or false", which is neither true nor false, so pnpm install failed
+# outright and the client could not install its dependencies at all.
+allowBuilds:
+  esbuild: true
+onlyBuiltDependencies:
+  - esbuild

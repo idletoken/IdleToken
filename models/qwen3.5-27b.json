@@ -1,0 +1,77 @@
+{
+  "id": "qwen3.5-27b",
+  "label": "Qwen3.5 27B",
+  "family": "qwen3.5",
+  "backend": "ds4x",
+  "arch": "qwen35",
+  "available": true,
+  "license": "Apache-2.0",
+  "params_summary": "27B · 64 layers · hybrid linear attention (Gated DeltaNet 3:1 full)",
+  "n_layers": 64,
+  "n_embd": 5120,
+  "hc_streams": 1,
+  "n_vocab": 248320,
+  "context_max": 262144,
+  "attn": {
+    "kind": "hybrid",
+    "full_attention_interval": 4,
+    "full": {
+      "kind": "gqa",
+      "n_head": 24,
+      "n_head_kv": 4,
+      "head_dim": 256,
+      "qk_norm": true,
+      "rope_dim_partial": 64,
+      "out_gate": "sigmoid"
+    },
+    "linear": {
+      "kind": "gated_deltanet",
+      "k_heads": 16,
+      "k_dim": 128,
+      "v_heads": 48,
+      "v_dim": 128,
+      "conv_kernel": 4,
+      "z_gate": "silu"
+    }
+  },
+  "kv": {
+    "kind": "hybrid",
+    "bytes_per_token_per_layer": 8192,
+    "state_bytes_per_layer": 3268608,
+    "full_attention_interval": 4
+  },
+  "rope_theta": 10000000,
+  "split": {
+    "boundary_multiple": 0
+  },
+  "overhead_base_bytes": 2147483648,
+  "chat_template": "gguf",
+  "layer_weight_bytes": 14971693056,
+  "shared_weight_bytes": 1758126080,
+  "default_gguf": "Qwen3.5-27B-Q4_K_M.gguf",
+  "sources": [
+    {
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "quant": "Q4_K_M"
+    }
+  ],
+  "default_quant": "Q4_K_M",
+  "variants": [
+    {
+      "quant": "Q4_K_M",
+      "layer_weight_bytes": 14971693056,
+      "shared_weight_bytes": 1758126080,
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "gguf": "Qwen3.5-27B-Q4_K_M.gguf"
+    }
+  ],
+  "notes": [
+    "The linear path shares k heads at grp=3 (k_heads 16 / v_heads 48); 4B and 9B are grp=2 and 0.8B is grp=1 -- all three ratios have now run on real weights.",
+    "Full layers: 24 q heads / 4 KV heads × 256; conv channels 10240 = k_dim*2 + v_dim(6144); FFN width 17408. All derived from GGUF metadata, so the loader needs no change.",
+    "Full layers: 4 KV heads × 256 × 2 (K+V) × 4 B = 8192 B per token per layer. Linear layers: state 48×128×128×4 plus conv window 3×10240×4 = 3268608 B, independent of context length.",
+    "Verified on DGX 2026-07-28: greedy continuation of \"Count: 1, 2, 3,\" matches llama.cpp character for character (\" 4, 5, 6, \"); layer 0 attn_output 3.9443 vs 3.9477 and final_output 10.1229 vs 10.1200 (<0.1%). CPU and CUDA produce the same recurrence token ids.",
+    "Stated honestly: on a reasoning prompt (\"What is the capital of France?\") we diverge from llama.cpp after <think> at a near-tie. Both continuations are reasonable and layer 0 agrees to within quantization noise, **but we have not established token-for-token equality over a long output the way we did for 4B and 9B**.",
+    "layer_weight_bytes / shared_weight_bytes are measured, summed tensor by tensor via scripts/gguf_shard.py index.",
+    "Only Q4_K_M is registered."
+  ]
+}

@@ -1,0 +1,434 @@
+--- IdleToken/vendor/ds4/ds4_cuda.cu	(0001+0002+0004 applied)
++++ IdleToken/vendor/ds4/ds4_cuda.cu	(0005-hybrid-budget-api)
+@@ -204,6 +204,31 @@
+     return (const char *)model_map + offset;
+ }
+ 
++/* IdleToken: hybrid VRAM budget, set by the worker through an explicit call.
++ *
++ * It used to be passed as IDLETOKEN_HYBRID / IDLETOKEN_HYBRID_VRAM_GB via
++ * setenv() from worker_main.c. That silently did nothing on Windows: the worker
++ * is built with MinGW and this DLL with nvcc/MSVC, and the two CRTs keep
++ * SEPARATE environment blocks — MinGW's setenv never reaches this getenv().
++ * The budget is a safety mechanism (it is what keeps cudaMalloc from
++ * oversubscribing VRAM and leaving WDDM to fight the whole machine for memory),
++ * so "silently inert" was much worse than slow: measured 3.46 s/token with it
++ * dead vs 0.49 s/token once it actually applied, plus two machine hangs.
++ *
++ * Variables set by the launching shell DO reach both CRTs (they live in the
++ * process environment block), which is why IDLETOKEN_MOE_STAGE worked while
++ * IDLETOKEN_HYBRID did not — a difference that cost six debugging rounds.
++ *
++ * Must sit at FILE scope ABOVE cuda_model_range_ptr, its only reader: C++ needs
++ * the declaration first, and `extern "C"` is illegal inside a function body. */
++static uint64_t g_hybrid_budget_bytes;   /* 0 = not set explicitly */
++
++extern "C" void ds4_gpu_set_hybrid_vram_budget(uint64_t bytes) {
++    g_hybrid_budget_bytes = bytes;
++    fprintf(stderr, "ds4: IdleToken hybrid VRAM budget set to %.2f GiB (explicit API)\n",
++            (double)bytes / 1073741824.0);
++}
++
+ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
+     if (bytes == 0) return cuda_model_ptr(model_map, offset);
+     if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
+@@ -292,8 +317,10 @@
+      * the process dies near the limit — verified on a Turing 2070.) Budget in
+      * GB via IDLETOKEN_HYBRID_VRAM_GB (default 4); leaves headroom for the CUDA
+      * context, KV cache and prefill batch buffers. */
+-    if (getenv("IDLETOKEN_HYBRID")) {
+-        uint64_t vram_budget = 4ull << 30;
++    if (g_hybrid_budget_bytes || getenv("IDLETOKEN_HYBRID")) {
++        uint64_t vram_budget = g_hybrid_budget_bytes ? g_hybrid_budget_bytes : (4ull << 30);
++        /* env still wins when present: it is how this gets A/B tested without
++         * rebuilding, and how a user overrides the worker's own computation. */
+         const char *bg = getenv("IDLETOKEN_HYBRID_VRAM_GB");
+         if (bg && bg[0]) { char *e=NULL; unsigned long long v=strtoull(bg,&e,10); if(e!=bg) vram_budget = v<<30; }
+         const int to_ram = (g_hybrid_vram_bytes + bytes > vram_budget);
+@@ -10012,6 +10039,176 @@
+     if (threadIdx.x == 0) down_out[(uint64_t)pair * out_dim + row] = partial[0];
+ }
+ 
++/* ===================================================================== *
++ * IdleToken: decode-time routed-expert gather (IDLETOKEN_MOE_STAGE=1)
++ *
++ * WHY THIS IS NOT A COPY OF llama.cpp. llama.cpp keeps CPU-resident experts on
++ * the CPU during decode and lets ggml's CPU kernels read them at memory
++ * bandwidth — its "copy only the used experts" path
++ * (ggml_backend_sched_compute_splits) only runs when a GPU steals the op, which
++ * needs batch >= GGML_OP_OFFLOAD_MIN_BATCH (32), i.e. prefill. ds4 has no
++ * usable CPU compute path (upstream calls it reference/debug; measured
++ * 12.84 s/token on an i7-12700), so for us every expert byte must reach the
++ * GPU. This is a workaround for that, not an upstream-blessed design.
++ *
++ * The hard floor it buys: DSv4 decode touches 6 of 256 experts per layer,
++ * ~42 MiB per layer, ~1.7 GiB per token. Even at full PCIe 4.0 x16 that is
++ * ~68 ms/token => ~14 tok/s ceiling for this architecture.
++ *
++ * WHY THE GATHER RUNS ON THE GPU. The first attempt read `selected` back to the
++ * host (cudaMemcpy D2H) once per layer so it could issue cudaMemcpyAsync per
++ * expert — 43 synchronisation points per token. On WDDM with VRAM at 98%
++ * occupancy that wedged the whole machine twice. llama.cpp can afford its one
++ * sync per split because it caches `prev_ids_tensor` across splits; our router
++ * picks new experts every layer, so caching buys nothing. Doing the gather in a
++ * kernel that reads `selected` straight from device memory removes the host
++ * from the loop entirely: zero syncs, one launch per layer.
++ * ===================================================================== */
++#define IDLETOKEN_MOE_STAGE_MAX_EXPERTS 8u
++
++/* dst[i*expert_bytes ..] = src[selected[i]*expert_bytes ..], i < n_used.
++ * Grid-stride over bytes so one launch covers all experts and any size.
++ * `src` may be mapped host memory: the reads are then PCIe reads, but they are
++ * fully coalesced and sequential here, unlike the strided quantised-block
++ * access the MoE kernels perform when they read the same bytes in place. */
++__global__ static void moe_gather_experts_kernel(
++        char *dst, const char *src, const int32_t *selected,
++        uint32_t n_used, uint64_t expert_bytes, uint32_t n_expert) {
++    const uint32_t slot = blockIdx.y;
++    if (slot >= n_used) return;
++    int32_t e = selected[slot];
++    if (e < 0 || (uint32_t)e >= n_expert) e = 0;   /* mirrors the kernels' clamp */
++    const char *s = src + (uint64_t)e * expert_bytes;
++    char *d = dst + (uint64_t)slot * expert_bytes;
++    /* 16-byte vector copy; expert tensors are quant-block aligned. */
++    const uint64_t n16 = expert_bytes / 16u;
++    for (uint64_t i = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x; i < n16;
++         i += (uint64_t)gridDim.x * blockDim.x) {
++        ((uint4 *)d)[i] = ((const uint4 *)s)[i];
++    }
++    for (uint64_t i = n16 * 16u + blockIdx.x * blockDim.x + threadIdx.x;
++         i < expert_bytes; i += (uint64_t)gridDim.x * blockDim.x) {
++        d[i] = s[i];
++    }
++}
++
++struct cuda_moe_stage_state {
++    char    *gate;
++    char    *up;
++    char    *down;
++    uint64_t gate_cap;
++    uint64_t down_cap;
++    int32_t *ident;
++    uint32_t ident_n;
++    int      inited;
++};
++static cuda_moe_stage_state g_moe_stage;
++
++static int cuda_moe_stage_enabled(void) {
++    static int cached = -1;
++    if (cached < 0) {
++        const char *e = getenv("IDLETOKEN_MOE_STAGE");
++        cached = (e && e[0] == '1') ? 1 : 0;
++    }
++    return cached;
++}
++
++/* Host-resident means: the bytes are reached over PCIe rather than living in
++ * VRAM. A cached range that came from cudaHostAlloc/registration keeps a
++ * non-NULL registered_base; a real cudaMalloc range leaves it NULL. When NO
++ * range covers the tensor at all, cuda_model_range_ptr fell back to the raw
++ * mapping — which is also host-resident, and is in fact the common case once
++ * the VRAM budget is spent. (The first version returned 0 here and so never
++ * engaged; a silent no-op reads exactly like "the optimisation did not help".) */
++static int cuda_model_range_is_host(uint64_t offset, uint64_t bytes) {
++    if (g_model_device_owned) return 0;
++    for (size_t i = 0; i < g_model_ranges.size(); i++) {
++        const cuda_model_range &r = g_model_ranges[i];
++        if (offset >= r.offset && offset + bytes <= r.offset + r.bytes)
++            return r.registered_base != NULL;
++    }
++    return 1;
++}
++
++static int cuda_moe_stage_prepare(uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
++                                  uint32_t n_expert) {
++    const uint64_t gneed = gate_expert_bytes * n_expert;
++    const uint64_t dneed = down_expert_bytes * n_expert;
++    if (g_moe_stage.inited && g_moe_stage.gate_cap >= gneed &&
++        g_moe_stage.down_cap >= dneed && g_moe_stage.ident_n >= n_expert)
++        return 1;
++    if (g_moe_stage.gate)  { (void)cudaFree(g_moe_stage.gate);  g_moe_stage.gate  = NULL; }
++    if (g_moe_stage.up)    { (void)cudaFree(g_moe_stage.up);    g_moe_stage.up    = NULL; }
++    if (g_moe_stage.down)  { (void)cudaFree(g_moe_stage.down);  g_moe_stage.down  = NULL; }
++    if (g_moe_stage.ident) { (void)cudaFree(g_moe_stage.ident); g_moe_stage.ident = NULL; }
++    g_moe_stage.inited = 0;
++    if (cudaMalloc((void **)&g_moe_stage.gate, (size_t)gneed) != cudaSuccess ||
++        cudaMalloc((void **)&g_moe_stage.up,   (size_t)gneed) != cudaSuccess ||
++        cudaMalloc((void **)&g_moe_stage.down, (size_t)dneed) != cudaSuccess ||
++        cudaMalloc((void **)&g_moe_stage.ident,
++                   (size_t)IDLETOKEN_MOE_STAGE_MAX_EXPERTS * sizeof(int32_t)) != cudaSuccess) {
++        (void)cudaGetLastError();
++        fprintf(stderr, "ds4: IdleToken MoE staging disabled — cudaMalloc failed (%.1f MiB)\n",
++                (double)(2 * gneed + dneed) / 1048576.0);
++        return 0;
++    }
++    int32_t host_ident[IDLETOKEN_MOE_STAGE_MAX_EXPERTS];
++    for (uint32_t i = 0; i < IDLETOKEN_MOE_STAGE_MAX_EXPERTS; i++) host_ident[i] = (int32_t)i;
++    if (cudaMemcpy(g_moe_stage.ident, host_ident, sizeof(host_ident),
++                   cudaMemcpyHostToDevice) != cudaSuccess) {
++        (void)cudaGetLastError();
++        return 0;
++    }
++    g_moe_stage.gate_cap = gneed;
++    g_moe_stage.down_cap = dneed;
++    g_moe_stage.ident_n  = IDLETOKEN_MOE_STAGE_MAX_EXPERTS;
++    g_moe_stage.inited   = 1;
++    fprintf(stderr, "ds4: IdleToken MoE staging on — %.1f MiB VRAM, %u experts/layer, GPU-side gather\n",
++            (double)(2 * gneed + dneed) / 1048576.0, n_expert);
++    return 1;
++}
++
++/* Returns 1 when the staged buffers should be used. On ANY failure returns 0
++ * and leaves the caller's pointers untouched, so a broken staging degrades to
++ * the previous (slow but correct) behaviour rather than to wrong output. */
++static int cuda_moe_stage_decode(const char **gate_w, const char **up_w, const char **down_w,
++                                 const int32_t **selected_out, const int32_t *selected,
++                                 uint32_t n_expert,
++                                 uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
++                                 uint32_t n_expert_total) {
++    if (n_expert > IDLETOKEN_MOE_STAGE_MAX_EXPERTS) return 0;
++    if (!cuda_moe_stage_prepare(gate_expert_bytes, down_expert_bytes, n_expert)) return 0;
++
++    const uint32_t threads = 256u;
++    const uint64_t n16 = gate_expert_bytes / 16u;
++    uint32_t blocks_x = (uint32_t)((n16 + threads - 1) / threads);
++    if (blocks_x > 1024u) blocks_x = 1024u;
++    if (blocks_x == 0u) blocks_x = 1u;
++    dim3 grid(blocks_x, n_expert, 1);
++
++    moe_gather_experts_kernel<<<grid, threads>>>(g_moe_stage.gate, *gate_w, selected,
++                                                 n_expert, gate_expert_bytes, n_expert_total);
++    moe_gather_experts_kernel<<<grid, threads>>>(g_moe_stage.up, *up_w, selected,
++                                                 n_expert, gate_expert_bytes, n_expert_total);
++    const uint64_t d16 = down_expert_bytes / 16u;
++    uint32_t dblocks = (uint32_t)((d16 + threads - 1) / threads);
++    if (dblocks > 1024u) dblocks = 1024u;
++    if (dblocks == 0u) dblocks = 1u;
++    dim3 dgrid(dblocks, n_expert, 1);
++    moe_gather_experts_kernel<<<dgrid, threads>>>(g_moe_stage.down, *down_w, selected,
++                                                  n_expert, down_expert_bytes, n_expert_total);
++    if (cudaGetLastError() != cudaSuccess) return 0;
++
++    *gate_w = g_moe_stage.gate;
++    *up_w   = g_moe_stage.up;
++    *down_w = g_moe_stage.down;
++    /* Staged slot order IS the selection order, so downstream kernels index
++     * 0..n-1. `selected` itself is left untouched — unlike the first attempt,
++     * which overwrote the router's scratch in place. */
++    *selected_out = g_moe_stage.ident;
++    return 1;
++}
++
+ static int routed_moe_launch(
+         ds4_gpu_tensor *out,
+         ds4_gpu_tensor *gate,
+@@ -10052,6 +10249,20 @@
+         out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
+         return 0;
+     }
++    {
++        /* Entry probe, once. Two rounds of "the optimisation did not engage"
++         * were spent instrumenting points that sit AFTER the type gate below —
++         * if this function is not entered, or bails on the quant types, nothing
++         * downstream can ever report anything. Print before any return. */
++        static int entered = 0;
++        if (!entered) {
++            entered = 1;
++            fprintf(stderr,
++                    "ds4: IdleToken routed_moe_launch entry — gate_type=%u down_type=%u "
++                    "n_tokens=%u n_expert=%u stage_env=%d\n",
++                    gate_type, down_type, n_tokens, n_expert, cuda_moe_stage_enabled());
++        }
++    }
+     const int q4k_path = (gate_type == 12u && down_type == 12u);
+     if (!q4k_path && (gate_type != 16u || down_type != 10u)) return 0;
+     if (q4k_path && (n_tokens != 1u || n_expert != 6u)) return 0;
+@@ -10067,6 +10278,50 @@
+     const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
+     if (!gate_w || !up_w || !down_w) return 0;
+ 
++    const int32_t *sel_ptr = (const int32_t *)selected->ptr;
++    /* Decode-time expert gather: only for a single token's selection, only when
++     * the experts are not already in VRAM, and only behind the env switch. */
++    if (n_tokens == 1u && cuda_moe_stage_enabled()) {
++        /* Per-call diagnostic for the first 20 decode calls. Four rounds were
++         * lost to one-shot probes that fired on the prefill call (n_tokens=15)
++         * or on layer 0, whose experts genuinely ARE in VRAM. A decision this
++         * cheap must be observable per call, not in aggregate. */
++        static int shown = 0;
++        if (shown < 20) {
++            shown++;
++            int hit = -1; uint64_t roff = 0, rbytes = 0; const char *kind = "none";
++            for (size_t i = 0; i < g_model_ranges.size(); i++) {
++                const cuda_model_range &r = g_model_ranges[i];
++                if (gate_offset >= r.offset && gate_offset + gate_bytes <= r.offset + r.bytes) {
++                    hit = (int)i; roff = r.offset; rbytes = r.bytes;
++                    kind = r.registered_base ? "host" : "vram";
++                    break;
++                }
++            }
++            fprintf(stderr,
++                    "ds4: MoE decode#%d gate_off=%llu gate_MiB=%.0f range=%d(off=%llu,%.0fMiB,%s) is_host=%d\n",
++                    shown, (unsigned long long)gate_offset,
++                    (double)gate_bytes / 1048576.0, hit,
++                    (unsigned long long)roff, (double)rbytes / 1048576.0, kind,
++                    cuda_model_range_is_host(gate_offset, gate_bytes));
++        }
++    }
++    if (n_tokens == 1u && cuda_moe_stage_enabled() &&
++        cuda_model_range_is_host(gate_offset, gate_bytes)) {
++        static unsigned long long n_gathered = 0, n_resident = 0;
++        if (cuda_moe_stage_decode(&gate_w, &up_w, &down_w, &sel_ptr,
++                                  (const int32_t *)selected->ptr, n_expert,
++                                  gate_expert_bytes, down_expert_bytes, 256u)) {
++            n_gathered++;
++        } else {
++            n_resident++;
++        }
++        if (((n_gathered + n_resident) % 1024ull) == 0ull) {
++            fprintf(stderr, "ds4: IdleToken MoE gather: %llu done / %llu skipped\n",
++                    n_gathered, n_resident);
++        }
++    }
++
+     int ok = 1;
+     const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
+     const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
+@@ -10192,7 +10447,7 @@
+                 if (ok) {
+                     moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(
+                         counts,
+-                        (const int32_t *)selected->ptr,
++                        sel_ptr,
+                         pair_count);
+                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted count launch");
+                 }
+@@ -10204,7 +10459,7 @@
+                     moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(
+                         sorted_pairs,
+                         cursors,
+-                        (const int32_t *)selected->ptr,
++                        sel_ptr,
+                         pair_count);
+                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted scatter launch");
+                 }
+@@ -10283,7 +10538,7 @@
+                     up_w,
+                     xq,
+                     sorted_pairs,
+-                    (const int32_t *)selected->ptr,
++                    sel_ptr,
+                     (const float *)weights->ptr,
+                     gate_expert_bytes,
+                     gate_row_bytes,
+@@ -10301,7 +10556,7 @@
+                     up_w,
+                     xq,
+                     sorted_pairs,
+-                    (const int32_t *)selected->ptr,
++                    sel_ptr,
+                     (const float *)weights->ptr,
+                     gate_expert_bytes,
+                     gate_row_bytes,
+@@ -10319,7 +10574,7 @@
+                         gate_w,
+                         up_w,
+                         xq,
+-                        (const int32_t *)selected->ptr,
++                        sel_ptr,
+                         (const float *)weights->ptr,
+                         gate_expert_bytes,
+                         gate_row_bytes,
+@@ -10336,7 +10591,7 @@
+                         gate_w,
+                         up_w,
+                         xq,
+-                        (const int32_t *)selected->ptr,
++                        sel_ptr,
+                         (const float *)weights->ptr,
+                         gate_expert_bytes,
+                         gate_row_bytes,
+@@ -10353,7 +10608,7 @@
+                         gate_w,
+                         up_w,
+                         xq,
+-                        (const int32_t *)selected->ptr,
++                        sel_ptr,
+                         (const float *)weights->ptr,
+                         gate_expert_bytes,
+                         gate_row_bytes,
+@@ -10391,7 +10646,7 @@
+                         (float *)out->ptr,
+                         down_w,
+                         midq,
+-                        (const int32_t *)selected->ptr,
++                        sel_ptr,
+                         down_expert_bytes,
+                         down_row_bytes,
+                         midq_blocks,
+@@ -10401,7 +10656,7 @@
+                         (float *)out->ptr,
+                         down_w,
+                         midq,
+-                        (const int32_t *)selected->ptr,
++                        sel_ptr,
+                         down_expert_bytes,
+                         down_row_bytes,
+                         midq_blocks,
+@@ -10468,7 +10723,7 @@
+                     down_w,
+                     midq,
+                     sorted_pairs,
+-                    (const int32_t *)selected->ptr,
++                    sel_ptr,
+                     down_expert_bytes,
+                     down_row_bytes,
+                     midq_blocks,
+@@ -10481,7 +10736,7 @@
+                     down_w,
+                     midq,
+                     sorted_pairs,
+-                    (const int32_t *)selected->ptr,
++                    sel_ptr,
+                     down_expert_bytes,
+                     down_row_bytes,
+                     midq_blocks,
+@@ -10492,7 +10747,7 @@
+                     (float *)down->ptr,
+                     down_w,
+                     midq,
+-                    (const int32_t *)selected->ptr,
++                    sel_ptr,
+                     down_expert_bytes,
+                     down_row_bytes,
+                     midq_blocks,
+@@ -10536,7 +10791,7 @@
+             gate_w,
+             up_w,
+             (const float *)x->ptr,
+-            (const int32_t *)selected->ptr,
++            sel_ptr,
+             (const float *)weights->ptr,
+             gate_expert_bytes,
+             gate_row_bytes,
+@@ -10552,7 +10807,7 @@
+             (float *)down->ptr,
+             down_w,
+             (const float *)mid->ptr,
+-            (const int32_t *)selected->ptr,
++            sel_ptr,
+             down_expert_bytes,
+             down_row_bytes,
+             expert_mid_dim,
+--- IdleToken/vendor/ds4/ds4_gpu.h	(0001+0002+0004 applied)
++++ IdleToken/vendor/ds4/ds4_gpu.h	(0005-hybrid-budget-api)
+@@ -17,6 +17,9 @@
+ 
+ int ds4_gpu_init(void);
+ void ds4_gpu_cleanup(void);
++/* IdleToken: hybrid VRAM budget in bytes. Must be a call, not an env var —
++ * the worker (MinGW) and this DLL (MSVC) do not share a CRT environment. */
++void ds4_gpu_set_hybrid_vram_budget(uint64_t bytes);
+ 
+ ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
+ ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);

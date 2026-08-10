@@ -1,0 +1,105 @@
+{
+  "id": "qwen3.5-0.8b",
+  "label": "Qwen3.5 0.8B",
+  "family": "qwen3.5",
+  "backend": "ds4x",
+  "arch": "qwen35",
+  "available": true,
+  "license": "Apache-2.0",
+  "params_summary": "0.8B · 24 layers · hybrid linear attention (Gated DeltaNet 3:1 full)",
+  "n_layers": 24,
+  "n_embd": 1024,
+  "hc_streams": 1,
+  "n_vocab": 248320,
+  "context_max": 262144,
+  "attn": {
+    "kind": "hybrid",
+    "full_attention_interval": 4,
+    "full": {
+      "kind": "gqa",
+      "n_head": 8,
+      "n_head_kv": 2,
+      "head_dim": 256,
+      "qk_norm": true,
+      "rope_dim_partial": 64,
+      "out_gate": "sigmoid"
+    },
+    "linear": {
+      "kind": "gated_deltanet",
+      "k_heads": 16,
+      "k_dim": 128,
+      "v_heads": 16,
+      "v_dim": 128,
+      "conv_kernel": 4,
+      "z_gate": "silu"
+    }
+  },
+  "kv": {
+    "kind": "hybrid",
+    "bytes_per_token_per_layer": 4096,
+    "state_bytes_per_layer": 1122304,
+    "full_attention_interval": 4
+  },
+  "rope_theta": 10000000,
+  "split": {
+    "boundary_multiple": 0
+  },
+  "overhead_base_bytes": 858993459,
+  "chat_template": "gguf",
+  "layer_weight_bytes": 312962304,
+  "shared_weight_bytes": 208592896,
+  "default_gguf": "Qwen3.5-0.8B-Q4_K_M.gguf",
+  "sources": [
+    {
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "quant": "Q4_K_M"
+    }
+  ],
+  "default_quant": "Q4_K_M",
+  "variants": [
+    {
+      "quant": "Q4_K_M",
+      "layer_weight_bytes": 312962304,
+      "shared_weight_bytes": 208592896,
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "gguf": "Qwen3.5-0.8B-Q4_K_M.gguf"
+    },
+    {
+      "quant": "Q5_K_M",
+      "layer_weight_bytes": 370502912,
+      "shared_weight_bytes": 208592896,
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "gguf": "Qwen3.5-0.8B-Q5_K_M.gguf"
+    },
+    {
+      "quant": "Q6_K",
+      "layer_weight_bytes": 419474688,
+      "shared_weight_bytes": 208592896,
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "gguf": "Qwen3.5-0.8B-Q6_K.gguf"
+    },
+    {
+      "quant": "Q8_0",
+      "layer_weight_bytes": 530705664,
+      "shared_weight_bytes": 270176256,
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "gguf": "Qwen3.5-0.8B-Q8_0.gguf"
+    },
+    {
+      "quant": "BF16",
+      "layer_weight_bytes": 997219584,
+      "shared_weight_bytes": 508563456,
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "gguf": "Qwen3.5-0.8B-BF16.gguf"
+    }
+  ],
+  "notes": [
+    "Hybrid attention: the last of every 4 layers is full Gated Attention, the other 3 are Gated DeltaNet linear attention.",
+    "The recurrent state of a linear layer is fixed size and independent of context length, so long contexts cost far less memory than in a pure GQA model of the same size.",
+    "The two gates use different activations: silu for the linear layer z gate, sigmoid for the full layer output gate.",
+    "The q projection of a full layer emits [q|gate] interleaved per head (512 per head = 256 q + 256 gate).",
+    "Aligned against llama.cpp layer by layer and token by token on real Q4_K_M weights, DGX, 2026-07-28 (docs/linear-attention-design.md §4d).",
+    "All five precisions load and infer on real GGUF files (DGX, 2026-07-28); Q5_K_M/Q6_K/Q8_0/BF16 answer \"Paris\" correctly, Q4_K_M does not -- quantization loss is perceptible at 0.8B.",
+    "layer_weight_bytes / shared_weight_bytes are **measured**, not estimated from bits per weight: summed tensor by tensor from the GGUF tensor directory, with blk.N.* counted as layer weights and everything else as shared."
+  ]
+}

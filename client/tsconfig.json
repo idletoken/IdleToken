@@ -1,0 +1,33 @@
+{
+  "compilerOptions": {
+    "target": "ES2021",
+    "useDefineForClassFields": true,
+    "lib": ["ES2021", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "baseUrl": ".",
+    "paths": {
+      "@idletoken/shared-ui": ["../packages/shared-ui/src/index.ts"],
+      // The shared-ui sources are outside the client directory tree, so tsc
+      // walking up from them cannot find react's types (the build machine syncs
+      // only the shared-ui sources). Pin them to the client's own @types copy --
+      // the other half of the same problem as the react alias in vite.config.
+      "react": ["./node_modules/@types/react"],
+      "react/jsx-runtime": ["./node_modules/@types/react/jsx-runtime"],
+      "react-dom": ["./node_modules/@types/react-dom"],
+      "react-dom/client": ["./node_modules/@types/react-dom/client"]
+    }
+  },
+  "include": ["src", "../packages/shared-ui/src"],
+  "references": [{ "path": "./tsconfig.node.json" }]
+}

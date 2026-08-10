@@ -1,0 +1,22 @@
+# Build outputs
+build/
+*.o
+*.exe
+*.dll
+idletoken-coord
+idletoken-worker
+idletoken-platform-agent
+# Model weights are never committed (80 GiB, and not ours to distribute)
+*.gguf
+models/*
+!models/*.json
+# Client
+client/node_modules/
+client/dist/
+client/src-tauri/target/
+client/src-tauri/gen/
+client/src-tauri/binaries/
+# Local environment
+.env
+.env.local
+.DS_Store

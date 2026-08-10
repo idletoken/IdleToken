@@ -1,0 +1,59 @@
+name: CI
+on:
+  push: {branches: [main]}
+  pull_request:
+permissions: {contents: read}
+
+jobs:
+  # Engine-side model registry, planner, and ds4x forward-pass alignment.
+  # This is the one gate in the acceptance ladder that needs NO hardware, which
+  # is why it is the one that can live in CI. Every other gate ssh's into real
+  # machines with NVIDIA GPUs; a GitHub runner has none.
+  engine:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The ds4x alignment reference generates its vectors with numpy, which the
+      # runner does not preinstall. The very first CI run went red on this, with
+      # an empty error message (`ds4x forward alignment failed ()`).
+      - run: pip install --quiet numpy
+      - name: Acceptance gate G_MODEL (registry + planner + ds4x forward)
+        run: scripts/acceptance.sh --gate G_MODEL
+      - name: Manifests match the compiled registry
+        run: |
+          make -f Makefile plantest >/dev/null 2>&1 || true
+          if [ -x build/model_registry_dump ]; then
+            python3 scripts/model_manifest_check.py
+          else
+            echo "no registry dumper on this runner — skipped (G_MODEL already covers the registry)"
+          fi
+
+  client:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: 22}
+      - run: corepack enable && corepack prepare pnpm@11.2.2 --activate
+      - working-directory: client
+        run: pnpm install --frozen-lockfile
+      - name: Type-check
+        working-directory: client
+        run: npx tsc --noEmit
+      - name: Build frontend
+        working-directory: client
+        run: npx vite build
+
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Syntax errors have reached main several times and were only caught when
+      # someone happened to run the script. `bash -n` costs nothing.
+      - name: Shell syntax
+        run: |
+          fail=0
+          for f in scripts/*.sh; do bash -n "$f" || { echo "  syntax: $f"; fail=1; }; done
+          exit $fail
+      - name: Python syntax
+        run: python3 -m compileall -q scripts/*.py

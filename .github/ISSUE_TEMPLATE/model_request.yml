@@ -1,0 +1,27 @@
+name: Model support
+description: Ask for a model to be supported
+labels: [model]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Adding a model means a `models/<id>.json` manifest plus a backend that
+        can run its architecture — see
+        [docs/multi-model-design.md](../../docs/multi-model-design.md).
+        Models that reuse an architecture we already run are much cheaper.
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      placeholder: "org/name on Hugging Face"
+    validations: {required: true}
+  - type: input
+    id: gguf
+    attributes:
+      label: GGUF repo
+      placeholder: "Where the quantized weights live, if they exist"
+  - type: input
+    id: arch
+    attributes:
+      label: Architecture
+      placeholder: "e.g. dense GQA / MLA-MoE / linear attention — or the config.json arch field"

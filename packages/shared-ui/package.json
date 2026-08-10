@@ -1,0 +1,16 @@
+{
+  "name": "@idletoken/shared-ui",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared consumer-side UI (reused by the web portal and the Tauri client): presentation-only pieces for identity, honors, formatting and the getting-started guide, with no api/i18n/Tauri dependencies -- everything is injected through props.",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "peerDependencies": {
+    "react": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "react": "^18.3.1"
+  }
+}

@@ -1,0 +1,80 @@
+{
+  "id": "qwen3-8b",
+  "label": "Qwen3 8B",
+  "family": "qwen3",
+  "backend": "ds4x",
+  "arch": "qwen3",
+  "available": true,
+  "license": "Apache-2.0",
+  "params_summary": "8.2B dense · 36 layers · GQA",
+  "n_layers": 36,
+  "n_embd": 4096,
+  "hc_streams": 1,
+  "n_vocab": 151936,
+  "context_max": 40960,
+  "attn": {
+    "kind": "gqa",
+    "n_head": 32,
+    "n_head_kv": 8,
+    "head_dim": 128,
+    "qk_norm": true
+  },
+  "kv": {
+    "kind": "gqa",
+    "bytes_per_token_per_layer": 4096
+  },
+  "rope_theta": 1000000,
+  "split": {
+    "boundary_multiple": 0
+  },
+  "overhead_base_bytes": 1610612736,
+  "chat_template": "gguf",
+  "layer_weight_bytes": 4161245184,
+  "shared_weight_bytes": 860581888,
+  "default_gguf": "Qwen3-8B-Q4_K_M.gguf",
+  "sources": [
+    {
+      "repo": "Qwen/Qwen3-8B-GGUF",
+      "quant": "Q4_K_M"
+    }
+  ],
+  "default_quant": "Q4_K_M",
+  "variants": [
+    {
+      "quant": "Q4_K_M",
+      "layer_weight_bytes": 4161245184,
+      "shared_weight_bytes": 860581888,
+      "repo": "Qwen/Qwen3-8B-GGUF",
+      "gguf": "Qwen3-8B-Q4_K_M.gguf"
+    },
+    {
+      "quant": "Q5_K_M",
+      "layer_weight_bytes": 5270000000,
+      "shared_weight_bytes": 1010000000,
+      "repo": "Qwen/Qwen3-8B-GGUF",
+      "gguf": "Qwen3-8B-Q5_K_M.gguf"
+    },
+    {
+      "quant": "Q6_K",
+      "layer_weight_bytes": 6070000000,
+      "shared_weight_bytes": 1160000000,
+      "repo": "Qwen/Qwen3-8B-GGUF",
+      "gguf": "Qwen3-8B-Q6_K.gguf"
+    },
+    {
+      "quant": "Q8_0",
+      "layer_weight_bytes": 7860000000,
+      "shared_weight_bytes": 1490000000,
+      "repo": "Qwen/Qwen3-8B-GGUF",
+      "gguf": "Qwen3-8B-Q8_0.gguf"
+    },
+    {
+      "quant": "BF16",
+      "layer_weight_bytes": 14800000000,
+      "shared_weight_bytes": 2810000000,
+      "repo": "Qwen/Qwen3-8B-GGUF",
+      "gguf": "Qwen3-8B-BF16.gguf"
+    }
+  ],
+  "note": "Runs on a single machine; verified on real hardware 2026-07-27 (Qwen3-8B Q4_K_M, CPU and CUDA agree token for token)"
+}

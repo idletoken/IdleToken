@@ -1,0 +1,30 @@
+; Exports for ds4xcuda.dll — the ds4x GPU matvec built by nvcc/MSVC and linked
+; into the MinGW-built idletoken-worker.exe (same pattern as ds4cuda.dll).
+;
+; Cross-CRT safety (the trap that cost days on ds4): this boundary passes only
+; READ-ONLY host pointers plus sizes, and every allocation returned by
+; ds4x_cuda_upload is freed by ds4x_cuda_free INSIDE this DLL. No file
+; descriptors, no FILE*, no malloc-here/free-there. Keep it that way.
+LIBRARY ds4xcuda.dll
+EXPORTS
+ds4x_cuda_available
+ds4x_cuda_set_budget
+ds4x_cuda_upload
+ds4x_cuda_free
+ds4x_cuda_matvec
+ds4x_cuda_matvec_off
+ds4x_cuda_bytes_resident
+ds4x_cuda_device_name
+ds4x_cuda_last_error
+ds4x_cuda_stats
+ds4x_cuda_stats_reset
+ds4x_cuda_upload_stats
+ds4x_cuda_matmul
+ds4x_cuda_matmul_stats
+ds4x_cuda_gdn_create
+ds4x_cuda_gdn_free
+ds4x_cuda_gdn_zero
+ds4x_cuda_gdn_run
+ds4x_cuda_gdn_get_state
+ds4x_cuda_gdn_set_state
+ds4x_cuda_gdn_stats

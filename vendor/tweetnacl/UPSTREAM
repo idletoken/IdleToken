@@ -1,0 +1,32 @@
+TweetNaCl — a crypto library in 100 tweets.
+
+Source:   https://tweetnacl.cr.yp.to/20140427/tweetnacl.{c,h}
+Version:  20140427 (the canonical single-file release)
+License:  Public domain (dedicated by the authors D. J. Bernstein,
+          Bernard van Gastel, Wesley Janssen, Tanja Lange, Peter Schwabe,
+          Sjaak Smetsers).
+
+Why vendored here (per the dependency rule: reuse a reference implementation,
+do not rebuild the wheel):
+  - Self-contained: one .c + one .h, no build-system dependency, compiles
+    with any C99 compiler on Windows / Linux / macOS. Keeps the package as small
+    as possible -- nothing to `apt install`, no DLL to ship.
+  - Correct + auditable: the reference NaCl API (X25519, XSalsa20-Poly1305,
+    SHA-512) in ~800 lines, widely reviewed. We do NOT hand-roll crypto.
+  - Provides exactly what the privacy pipeline needs:
+      * crypto_box / crypto_box_open  — X25519 + XSalsa20-Poly1305 (envelope)
+      * crypto_box_keypair            — X25519 keygen
+      * crypto_secretbox(_open)       — authenticated symmetric cipher
+      * crypto_hash (SHA-512)         — sealed-box nonce derivation
+      * crypto_scalarmult_base        — public key from secret key
+
+The design calls for libsodium's crypto_box_seal (X25519 + XSalsa20-Poly1305)
+and AES-256-GCM. TweetNaCl gives the same X25519 + XSalsa20-Poly1305
+primitives; our PayloadCipher role is filled by XSalsa20-Poly1305
+(crypto_secretbox), an authenticated cipher equivalent in role to AES-256-GCM.
+Because the pipeline is pluggable (see include/idletoken_privacy.h), a libsodium
+AES-GCM PayloadCipher / HPKE SealedTransport can drop in later without
+touching callers.
+
+TweetNaCl requires the host to supply `randombytes()`; IdleToken provides it in
+src/common/privacy.c (getrandom/urandom on POSIX, BCryptGenRandom on Windows).

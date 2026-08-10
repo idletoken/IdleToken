@@ -1,0 +1,87 @@
+{
+  "id": "qwen3.5-35b-a3b",
+  "label": "Qwen3.5 35B-A3B",
+  "family": "qwen3.5",
+  "backend": "ds4x",
+  "arch": "qwen35moe",
+  "available": true,
+  "license": "Apache-2.0",
+  "params_summary": "35B total / 3B active · 40 layers · hybrid linear attention + 256-expert MoE",
+  "n_layers": 40,
+  "n_embd": 2048,
+  "hc_streams": 1,
+  "n_vocab": 248320,
+  "context_max": 262144,
+  "attn": {
+    "kind": "hybrid",
+    "full_attention_interval": 4,
+    "full": {
+      "kind": "gqa",
+      "n_head": 16,
+      "n_head_kv": 2,
+      "head_dim": 256,
+      "qk_norm": true,
+      "rope_dim_partial": 64,
+      "out_gate": "sigmoid"
+    },
+    "linear": {
+      "kind": "gated_deltanet",
+      "k_heads": 16,
+      "k_dim": 128,
+      "v_heads": 32,
+      "v_dim": 128,
+      "conv_kernel": 4,
+      "z_gate": "silu"
+    }
+  },
+  "kv": {
+    "kind": "hybrid",
+    "bytes_per_token_per_layer": 4096,
+    "state_bytes_per_layer": 2195456,
+    "full_attention_interval": 4
+  },
+  "rope_theta": 10000000,
+  "split": {
+    "boundary_multiple": 0
+  },
+  "overhead_base_bytes": 1610612736,
+  "chat_template": "gguf",
+  "layer_weight_bytes": 21047503360,
+  "shared_weight_bytes": 957530112,
+  "default_gguf": "Qwen3.5-35B-A3B-Q4_K_M.gguf",
+  "sources": [
+    {
+      "repo": "unsloth/Qwen3.5-35B-A3B-GGUF",
+      "quant": "Q4_K_M"
+    }
+  ],
+  "default_quant": "Q4_K_M",
+  "variants": [
+    {
+      "quant": "Q4_K_M",
+      "layer_weight_bytes": 21047503360,
+      "shared_weight_bytes": 957530112,
+      "repo": "unsloth/Qwen3.5-35B-A3B-GGUF",
+      "gguf": "Qwen3.5-35B-A3B-Q4_K_M.gguf"
+    }
+  ],
+  "notes": [
+    "**The first MoE model we got running.** The MoE path used by DSv4 and GLM had never run on real weights before, because 80 GB / 240 GB would not fit. The architecture is qwen35moe: hybrid linear attention plus 256 experts, top-8.",
+    "It adds exactly one thing to the existing MoE path: **the shared expert carries a scalar sigmoid gate** (ffn_gate_inp_shexp). In the llama.cpp graph this is shared_expert_gate → SIGMOID → MUL, whereas other MoE models (DSv4) add the shared expert ungated.",
+    "Two settings are absent from the GGUF and hardcoded per architecture in llama.cpp, so we hardcode them the same way: top-k weights must be renormalized (SUM_ROWS→CLAMP→DIV in the graph), and expert_shared_count is missing, so we derive it from expert_shared_feed_forward_length -- otherwise the shared expert is silently skipped.",
+    "Verified on DGX 2026-07-28: the continuation of \"Count: 1, 2, 3,\" matches llama.cpp character for character (\" 4, 5, 6,\"); layer 0 l_out is -0.5434 against the oracle's -0.5504, and input_embed is identical on both sides.",
+    "Falsification: ignoring the shared expert gate turns l_out-0 into -1.5660 and the output into garbage; dropping the shared expert entirely yields \" 4, 5, 5\" -- subtly wrong. Both injected faults were caught.",
+    "layer_weight_bytes / shared_weight_bytes are measured, summed tensor by tensor via scripts/gguf_shard.py index.",
+    "Only Q4_K_M is registered."
+  ],
+  "moe": {
+    "n_expert": 256,
+    "n_expert_used": 8,
+    "n_expert_shared": 1,
+    "expert_ff": 512,
+    "shared_expert_ff": 512,
+    "gating": "softmax",
+    "weights_norm": true,
+    "shared_expert_gate": "sigmoid"
+  }
+}

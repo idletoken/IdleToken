@@ -1,0 +1,93 @@
+# IdleToken privacy pipeline — standalone build (G-PRIV).
+#
+# Deliberately separate from the top-level Makefile, which errors out on
+# non-Linux hosts and links CUDA/ds4. The privacy module is pure portable C
+# (vendored TweetNaCl, no external deps), so it builds and self-tests on
+# macOS / Linux / Windows with just a C compiler — letting the crypto be
+# verified anywhere, including the control machine, without a GPU cluster.
+#
+#   make -f Makefile.privacy selftest   # build + run the G-PRIV oracle
+#   make -f Makefile.privacy clean
+#
+# Produces: build/privacy/idletoken-privacy-selftest
+
+CC       ?= cc
+CFLAGS   ?= -O2 -std=c99 -Wall -Wextra
+INCLUDES := -Iinclude -Ivendor/tweetnacl
+LDLIBS   :=
+
+# Windows needs bcrypt for BCryptGenRandom (randombytes).
+ifeq ($(OS),Windows_NT)
+  LDLIBS += -lbcrypt
+endif
+
+BUILD := build/privacy
+BIN   := $(BUILD)/idletoken-privacy-selftest
+HTTP_BIN := $(BUILD)/idletoken-privacy-http-selftest
+PROXY_BIN := $(BUILD)/idletoken-privacy-proxy
+CLIENT_BIN := $(BUILD)/idletoken-privacy-client
+
+# Core library objects (shared by all binaries).
+LIB_OBJS := $(BUILD)/tweetnacl.o \
+            $(BUILD)/privacy.o \
+            $(BUILD)/privacy_http.o
+
+# Networking objects (reused from the coord/worker common code, unmodified).
+NET_OBJS := $(BUILD)/net.o $(BUILD)/http.o
+
+.PHONY: all selftest proxy clean
+all: $(BIN) $(HTTP_BIN) $(PROXY_BIN) $(CLIENT_BIN)
+
+$(BUILD):
+	@mkdir -p $(BUILD)
+
+$(BUILD)/tweetnacl.o: vendor/tweetnacl/tweetnacl.c vendor/tweetnacl/tweetnacl.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
+
+$(BUILD)/privacy.o: src/common/privacy.c include/idletoken_privacy.h vendor/tweetnacl/tweetnacl.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
+
+$(BUILD)/privacy_http.o: src/common/privacy_http.c include/idletoken_privacy_http.h include/idletoken_privacy.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
+
+$(BUILD)/privacy_selftest.o: src/tools/privacy_selftest.c include/idletoken_privacy.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
+
+$(BUILD)/privacy_http_selftest.o: src/tools/privacy_http_selftest.c include/idletoken_privacy_http.h include/idletoken_privacy.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
+
+$(BUILD)/net.o: src/common/net.c include/idletoken_net.h include/idletoken_proto.h | $(BUILD)
+	$(CC) $(CFLAGS) -D_GNU_SOURCE $(INCLUDES) -c -o $@ $<
+
+$(BUILD)/http.o: src/common/http.c include/idletoken_http.h | $(BUILD)
+	$(CC) $(CFLAGS) -D_GNU_SOURCE $(INCLUDES) -c -o $@ $<
+
+$(BUILD)/privacy_proxy.o: src/tools/privacy_proxy.c include/idletoken_privacy_http.h include/idletoken_privacy.h include/idletoken_net.h include/idletoken_http.h | $(BUILD)
+	$(CC) $(CFLAGS) -D_GNU_SOURCE $(INCLUDES) -c -o $@ $<
+
+$(BUILD)/privacy_client.o: src/tools/privacy_client.c include/idletoken_privacy_http.h include/idletoken_privacy.h include/idletoken_net.h | $(BUILD)
+	$(CC) $(CFLAGS) -D_GNU_SOURCE $(INCLUDES) -c -o $@ $<
+
+$(BIN): $(BUILD)/privacy_selftest.o $(LIB_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+$(HTTP_BIN): $(BUILD)/privacy_http_selftest.o $(LIB_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+$(PROXY_BIN): $(BUILD)/privacy_proxy.o $(LIB_OBJS) $(NET_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+$(CLIENT_BIN): $(BUILD)/privacy_client.o $(LIB_OBJS) $(NET_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+# Build then run both oracles; fail if either fails.
+selftest: $(BIN) $(HTTP_BIN)
+	@$(BIN)
+	@echo ""
+	@$(HTTP_BIN)
+
+# Build the proxy + reference client (deployable front terminator).
+proxy: $(PROXY_BIN) $(CLIENT_BIN)
+
+clean:
+	rm -rf $(BUILD)

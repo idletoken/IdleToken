@@ -1,0 +1,26 @@
+{
+  "id": "kimi-k2.5",
+  "label": "Kimi K2.5",
+  "family": "kimi",
+  "backend": "ds4x",
+  "arch": "deepseek2",
+  "available": false,
+  "license": "Modified MIT",
+  "params_summary": "1T · 32B active · ~1.8-bit ≈ 240 GB",
+  "n_layers": 61,
+  "n_embd": 7168,
+  "hc_streams": 1,
+  "n_vocab": 163840,
+  "layer_weight_bytes": 253403070464,
+  "shared_weight_bytes": 2147483648,
+  "context_max": 262144,
+  "split": { "boundary_multiple": 0 },
+  "kv": { "kind": "mla", "bytes_per_token_per_layer": 1152 },
+  "overhead_base_bytes": 3221225472,
+  "default_gguf": "kimi-k2.5-q2.gguf",
+  "chat_template": "gguf",
+  "sources": [
+    { "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF", "quant": "IQ1_M" }
+  ],
+  "note": "ds4x backend pending (Phase B/C) — DeepSeek2-shaped, near-zero extra kernel work"
+}
