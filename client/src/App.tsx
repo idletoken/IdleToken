@@ -767,9 +767,15 @@ function Dashboard(props: {
 //      been downloaded is kept (otherwise users delete it and start over).
 //   3. Cancel is a first-class citizen. A long task without a cancel button gets
 //      cancelled by quitting the whole application.
+//
+// TRANSIENT STATES ONLY (2026-08-10). It used to have a fourth state — "no
+// weights on this machine yet" — which is not an event, it is the resting
+// condition of every fresh install. A floating bar that never goes away stops
+// being read within a minute and covers the page for the rest of the session.
+// That fact now lives where the decision is made: on the model itself, in
+// Settings → Quick. What is left here happens only while something is running.
 function WeightsBanner(props: {
   dl: { have: number; total: number; endpoint?: string; note?: string; error?: string } | null;
-  needsWeights: boolean;
   onCancel: () => void;
   onStart: () => void;
   onDismissError: () => void;
@@ -799,16 +805,6 @@ function WeightsBanner(props: {
         </span>
         {d.note ? <span className="wbanner__hint">{d.note}</span> : null}
         <button className="iconbtn" onClick={props.onCancel}>{t("weights.cancel")}</button>
-      </div>
-    );
-  }
-  if (props.needsWeights) {
-    return (
-      <div className="wbanner" role="status">
-        <strong>{t("weights.needed")}</strong>
-        {/* the ACTION, not the state — this button read "Downloading weights"
-            while nothing was downloading, which is what it turns into. */}
-        <button className="btn-secondary" onClick={props.onStart}>{t("weights.download")}</button>
       </div>
     );
   }
@@ -1261,7 +1257,7 @@ export default function App() {
 
   return (
     <LangContext.Provider value={{ lang, setLang }}>
-      <div className={`app${dl || needsWeights ? " app--wbanner" : ""}`}>
+      <div className={`app${dl ? " app--wbanner" : ""}`}>
         <TopBar
           cluster={cluster}
           theme={theme}
@@ -1315,6 +1311,14 @@ export default function App() {
                 session={session}
                 onSignIn={() => setShowAuth(true)}
                 initialCategory={settingsCategory}
+                weights={{
+                  needs: needsWeights,
+                  path: weightsPath,
+                  dl,
+                  onDownload: () =>
+                    void ensureWeights().catch((e) => setDl({ have: 0, total: 0, error: String(e) })),
+                  onCancel: () => void cancelFetch("primary"),
+                }}
                 onClose={() => setView("cluster")}
               />
             ) : (
@@ -1373,12 +1377,12 @@ export default function App() {
           </div>
         </div>
       </div>
-      {/* The weight download banner. It appears only when weights are genuinely
-          missing or a download is running -- a permanent notice bar gets ignored. */}
-      {dl || needsWeights ? (
+      {/* Only while a download is running or has failed — `dl` covers both.
+          "This machine has no weights yet" is a standing condition, not an
+          event, and lives on the model row in Settings → Quick. */}
+      {dl ? (
         <WeightsBanner
           dl={dl}
-          needsWeights={needsWeights}
           onCancel={() => void cancelFetch("primary")}
           onStart={() => void ensureWeights().catch((e) => setDl({ have: 0, total: 0, error: String(e) }))}
           onDismissError={() => setDl(null)}

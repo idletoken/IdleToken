@@ -93,6 +93,58 @@ function CapSlider(props: { label: string; noCap: string; totalBytes: number; va
   );
 }
 
+// ---- weight status, on the model it belongs to ----------------------------
+// Four states, and the button says what pressing it DOES in each:
+//   downloading -> progress + Cancel      failed -> reason + Retry
+//   missing     -> Download               present -> "ready", no button
+export interface WeightsInfo {
+  needs: boolean;
+  path: string;
+  dl: { have: number; total: number; endpoint?: string; note?: string; error?: string } | null;
+  onDownload: () => void;
+  onCancel: () => void;
+}
+
+function WeightsRow(props: { w: WeightsInfo }) {
+  const { t } = useI18n();
+  const d = props.w.dl;
+  // Clicks land on a <label> that owns a radio input; without this, hitting
+  // "Download" would also re-select the model (harmless here, but it makes the
+  // button feel like it did something else).
+  const stop = (e: React.MouseEvent) => e.preventDefault();
+
+  if (d?.error) {
+    return (
+      <span className="model-opt__weights model-opt__weights--err" onClick={stop}>
+        <span>{t("weights.failed")}</span>
+        <button className="linkbtn" onClick={props.w.onDownload}>{t("weights.retry")}</button>
+      </span>
+    );
+  }
+  if (d) {
+    const pct = d.total > 0 ? Math.min(100, Math.round((d.have / d.total) * 100)) : 0;
+    return (
+      <span className="model-opt__weights" onClick={stop}>
+        <span className="model-opt__wbar"><i style={{ width: `${pct}%` }} /></span>
+        <span>
+          {fmtBytes(d.have)}{d.total > 0 ? ` / ${fmtBytes(d.total)}` : ""}
+          {d.endpoint ? ` · ${t("weights.from")} ${new URL(d.endpoint).host}` : ""}
+        </span>
+        <button className="linkbtn" onClick={props.w.onCancel}>{t("weights.cancel")}</button>
+      </span>
+    );
+  }
+  if (props.w.needs) {
+    return (
+      <span className="model-opt__weights" onClick={stop}>
+        <span>{t("weights.needed")}</span>
+        <button className="linkbtn" onClick={props.w.onDownload}>{t("weights.download")}</button>
+      </span>
+    );
+  }
+  return <span className="model-opt__weights model-opt__weights--ok">{t("weights.ready")}</span>;
+}
+
 // ---- schema (everything except the bespoke Quick page) --------------------
 // Six categories, down from fifteen (2026-07 UX audit): the handful of
 // settings that actually work today must not drown in reserved placeholders.
@@ -299,6 +351,9 @@ export default function SettingsPanel(props: {
   // on whatever was open last. Applied on mount only — after that the nav owns
   // the selection, so navigating away inside settings isn't fought.
   initialCategory?: string | null;
+  // Weight presence + download control for the SELECTED model. Owned by App
+  // (it holds the progress-event subscription); rendered on the model row.
+  weights?: WeightsInfo;
   // Sidebar IA: settings is a PLACE now, rendered inline in the content area.
   // (The modal wrapper remains only for potential embedded reuse.)
   asPage?: boolean;
@@ -487,6 +542,12 @@ export default function SettingsPanel(props: {
               <span className="model-opt__name">{m.label}</span>
               <span className="model-opt__params">{m.params}</span>
               {!m.available ? <span className="model-opt__soon">{t("settings.soon")}</span> : null}
+              {/* Weight status sits on the SELECTED row only. It used to be a
+                  floating bar pinned to every screen, which is wrong twice:
+                  "no weights yet" is the resting state of a fresh install (so
+                  the bar never left), and the thing it is about — which model —
+                  is chosen right here. One probe, on the model it describes. */}
+              {s.modelId === m.id && props.weights ? <WeightsRow w={props.weights} /> : null}
             </label>
           ))}
         </div>
