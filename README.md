@@ -1,10 +1,19 @@
-# IdleToken
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/logo-dark.svg">
+    <img src="docs/images/logo.svg" alt="IdleToken" width="380">
+  </picture>
+</p>
 
 **Run models on your own machines and produce tokens. Share the ones you don't use; use someone else's when you run short.**
 
 IdleToken is an open-source local LLM client and inference engine.
 
 [中文](README.zh-CN.md)
+
+<p align="center">
+  <img src="docs/images/screenshot.png" alt="IdleToken" width="820">
+</p>
 
 ---
 
@@ -105,7 +114,11 @@ Worth knowing for now:
 
 IdleToken would not exist without a number of excellent open-source projects. Particular thanks to:
 
-* Ollama
-* [ds4](https://github.com/antirez/ds4)
+* [ds4](https://github.com/antirez/ds4) — the inference core this is built on and extends
+* [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) — where the GGUF format and its quantization come from, and our reference when checking numerical agreement
+* [Ollama](https://github.com/ollama/ollama) — for showing what running a model locally should feel like
+* [Tauri](https://github.com/tauri-apps/tauri) — the shell the desktop client is built in
+* [TweetNaCl](https://tweetnacl.cr.yp.to/) and [BLAKE2](https://github.com/BLAKE2/BLAKE2) — encryption and hashing, so that we never roll our own cryptography
+* [DeepSeek](https://github.com/deepseek-ai) and [Qwen](https://github.com/QwenLM) — without open weights there would be nothing to run
 
 and to every open-source project IdleToken depends on, and everyone who contributes to them.
