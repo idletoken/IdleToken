@@ -21,6 +21,22 @@
 
 ---
 
+## Why IdleToken
+
+Agent workloads are peaky by nature. Most of the time only one or two inference
+tasks are running; then a complex job arrives, several agents start working at
+once, and a burst of parallel requests drives the demand for compute straight up.
+
+Machines deployed at home are peaky in the same way — busy sometimes, idle most
+of the time. Nobody runs a model around the clock, so a machine spends most of
+its life with capacity to spare and then turns out to be short of it exactly when
+a lot of inference is needed.
+
+What IdleToken connects is one person's idle hours and another's busy ones:
+**share your compute when you are not using it and earn Sparks; spend Sparks to
+use someone else's idle machine when you need more.** Capacity that would
+otherwise sit idle flows to where it is actually needed.
+
 ## What it does
 
 - **Runs a model locally** and serves it on `:8000` as an OpenAI- and
@@ -32,8 +48,7 @@
 - **Downloads only what each machine needs**: a node assigned 4 of 43 layers
   fetches those 4, not the whole file.
 - **Shares spare capacity** to the marketplace when you turn it on, and lets you
-  use other people's when you run short. Off by default; settled in credits, not
-  money.
+  use other people's when you run short. Off by default; settled in Sparks, not money.
 
 ## How to use it
 
