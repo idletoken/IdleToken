@@ -11,7 +11,6 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/idletoken/IdleToken/releases/latest">Download</a> ·
   <a href="https://github.com/idletoken/IdleToken/issues">Issues</a> ·
   <a href="README.zh-CN.md">中文</a>
 </p>
@@ -31,7 +30,10 @@ desktop app, not a config file.
 
 ## Quick start
 
-1. Install from [Releases](https://github.com/idletoken/IdleToken/releases/latest)
+> **No installer is published yet.** Build from source (see Requirements below)
+> until the first release ships.
+
+1. Install and launch the app
 2. Sign in, pick a model that fits your card
 3. Start — the API comes up on `:8000`
 
@@ -69,7 +71,8 @@ short.
 - Gigabit LAN is enough; nothing leaves your network
 - CUDA Toolkit optional — noticeably faster prompt processing when present
 
-Linux has no prebuilt package yet — build from source:
+Until the first release ships, building from source is the only route (a Windows
+installer and a Linux package follow):
 
 ```sh
 make                                        # engine (CUDA toolkit + nvcc)
@@ -100,9 +103,10 @@ Beta. Releases are gated by an acceptance ladder that runs on real machines,
 including a walkthrough of the shipped installer on a clean one:
 `scripts/acceptance.sh`.
 
-Known gaps: the installer is unsigned — verify the SHA256 on the release page;
-automatic weight download is new in v0.1.0 and not yet walked through end to end
-(fall back to setting the GGUF path in Settings); there is no auto-update.
+Known gaps: no installer is published yet; the build that ships will be
+unsigned, so Windows will warn once; automatic weight download is new and not yet
+walked through end to end (fall back to setting the GGUF path in Settings); there
+is no auto-update.
 
 Questions and bug reports belong in
 [Issues](https://github.com/idletoken/IdleToken/issues). A change that breaks one

@@ -11,7 +11,6 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/idletoken/IdleToken/releases/latest">下载</a> ·
   <a href="https://github.com/idletoken/IdleToken/issues">问题反馈</a> ·
   <a href="README.md">English</a>
 </p>
@@ -30,7 +29,9 @@
 
 ## 快速开始
 
-1. 从 [Releases](https://github.com/idletoken/IdleToken/releases/latest) 安装
+> **安装包尚未发布。** 首个版本发出来之前，请按下面「硬件要求」一节从源码构建。
+
+1. 安装并启动客户端
 2. 登录，选一个你的卡放得下的模型
 3. 点开始 —— API 在 `:8000` 上线
 
@@ -66,7 +67,7 @@ claude
 - 千兆局域网够用；数据不出你的网络
 - CUDA Toolkit 可选 —— 装了长提示词处理明显更快
 
-Linux 暂无预编译包 —— 从源码构建：
+首个版本发布之前只能从源码构建（之后会有 Windows 安装包与 Linux 包）：
 
 ```sh
 make                                        # 引擎（需要 CUDA toolkit + nvcc）
@@ -93,8 +94,8 @@ exo 和 llama.cpp 的 RPC 后端支持的硬件比我们广得多。IdleToken �
 Beta。发版由一条跑在真机上的验收阶梯把关（`scripts/acceptance.sh`），其中一条
 走查跑在**发出去的安装包**上（干净机器）。
 
-已知缺口：安装包未签名 —— 下载后核对 Release 页的 SHA256；权重自动下载是 v0.1.0
-新加的，还没端到端走查过（可以退回在设置里手填 GGUF 路径）；没有自动更新。
+已知缺口：安装包尚未发布；发出来的那版不会有代码签名，Windows 会拦一次；权重
+自动下载是新加的，还没端到端走查过（可以退回在设置里手填 GGUF 路径）；没有自动更新。
 
 提问与报错请走 [Issues](https://github.com/idletoken/IdleToken/issues)。违反上面
 那些硬性要求的改动——退回 CPU、拿总显存拍脑袋而不实测——即使能跑也不会被合入。
