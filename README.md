@@ -5,7 +5,7 @@
   </picture>
 </p>
 
-**Run models on your own machines and produce tokens. Share the ones you don't use; use someone else's when you run short.**
+**Share your idle tokens.**
 
 IdleToken is an open-source local LLM client and inference engine.
 
@@ -23,7 +23,7 @@ Agent workloads are peaky by nature. Most of the time only one or two inference 
 
 Machines deployed at home are peaky in the same way — busy sometimes, idle most of the time. Nobody runs a model around the clock, so a machine spends most of its life with capacity to spare, and then turns out to be short of it exactly when a lot of inference is needed.
 
-What IdleToken sets out to do is connect one person's idle hours to another's busy ones: **share your compute when you are not using it and earn Sparks; spend Sparks to use someone else's idle machine when you need more.** Capacity that would otherwise sit idle flows to where it is actually needed.
+What IdleToken sets out to do is connect one person's idle hours to another's busy ones: **share your compute when you are not using it and earn Sparks; spend Sparks to use someone else's idle machine when you need more.**
 
 ## How to use it
 
