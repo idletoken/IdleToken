@@ -114,11 +114,13 @@ Worth knowing for now:
 
 IdleToken would not exist without a number of excellent open-source projects. Particular thanks to:
 
-* [ds4](https://github.com/antirez/ds4) — the inference core this is built on and extends
-* [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) — where the GGUF format and its quantization come from, and our reference when checking numerical agreement
-* [Ollama](https://github.com/ollama/ollama) — for showing what running a model locally should feel like
-* [Tauri](https://github.com/tauri-apps/tauri) — the shell the desktop client is built in
-* [TweetNaCl](https://tweetnacl.cr.yp.to/) and [BLAKE2](https://github.com/BLAKE2/BLAKE2) — encryption and hashing, so that we never roll our own cryptography
-* [DeepSeek](https://github.com/deepseek-ai) and [Qwen](https://github.com/QwenLM) — without open weights there would be nothing to run
+* [ds4](https://github.com/antirez/ds4)
+* [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)
+* [Ollama](https://github.com/ollama/ollama)
+* [Tauri](https://github.com/tauri-apps/tauri)
+* [TweetNaCl](https://tweetnacl.cr.yp.to/)
+* [BLAKE2](https://github.com/BLAKE2/BLAKE2)
+* [DeepSeek](https://github.com/deepseek-ai)
+* [Qwen](https://github.com/QwenLM)
 
 and to every open-source project IdleToken depends on, and everyone who contributes to them.

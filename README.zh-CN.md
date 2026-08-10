@@ -114,11 +114,13 @@ cd src-tauri && cargo build --release
 
 IdleToken 的实现离不开许多优秀的开源项目，特别感谢：
 
-* [ds4](https://github.com/antirez/ds4) —— 推理内核基于它，并在其上扩展
-* [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) —— GGUF 格式与量化方案的来处，也是我们做数值对齐时的参照
-* [Ollama](https://github.com/ollama/ollama) —— 本地跑模型该是什么体验，它做了很好的示范
-* [Tauri](https://github.com/tauri-apps/tauri) —— 桌面客户端的外壳
-* [TweetNaCl](https://tweetnacl.cr.yp.to/) 与 [BLAKE2](https://github.com/BLAKE2/BLAKE2) —— 加密与哈希，我们不自己造密码学
-* [DeepSeek](https://github.com/deepseek-ai) 与 [Qwen](https://github.com/QwenLM) —— 没有开放的权重，就没有可跑的东西
+* [ds4](https://github.com/antirez/ds4)
+* [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)
+* [Ollama](https://github.com/ollama/ollama)
+* [Tauri](https://github.com/tauri-apps/tauri)
+* [TweetNaCl](https://tweetnacl.cr.yp.to/)
+* [BLAKE2](https://github.com/BLAKE2/BLAKE2)
+* [DeepSeek](https://github.com/deepseek-ai)
+* [Qwen](https://github.com/QwenLM)
 
 以及所有 IdleToken 所依赖的开源项目和它们的贡献者。
