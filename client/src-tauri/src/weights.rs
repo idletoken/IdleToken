@@ -57,6 +57,13 @@ fn register(id: &str) -> Arc<AtomicBool> {
     flag
 }
 
+/// Is a download with this id still running? An entry lives until the task
+/// actually exits, so "still winding down after a cancel" counts as active —
+/// which is exactly what the caller must not race against.
+fn is_active(id: &str) -> bool {
+    ACTIVE.lock().unwrap().iter().any(|(k, _)| k == id)
+}
+
 fn unregister(id: &str) {
     ACTIVE.lock().unwrap().retain(|(k, _)| k != id);
 }
@@ -176,6 +183,20 @@ pub async fn weights_fetch(
     expect_bytes: u64,
     endpoints: Vec<String>,
 ) -> Result<(), String> {
+    // One download per id, enforced here. `register` used to just drop the old
+    // entry and keep going, so a second call left the first task running —
+    // uncancellable (its flag was no longer reachable) and still appending to
+    // the SAME .part. Two writers on one file produced a partial longer than the
+    // source, which the resume path then blessed as a finished download.
+    //
+    // This is what "the button gave no feedback" cost: the user pressed it
+    // again, and again, and each press added a writer.
+    if is_active(&id) {
+        return Err(
+            "a download is already running (if you just cancelled it, it is still stopping — try again in a moment)"
+                .into(),
+        );
+    }
     let cancel = register(&id);
     let id2 = id.clone();
     let cancel_probe = cancel.clone();
@@ -323,9 +344,27 @@ fn fetch_inner(
     let total = if p.total > 0 { p.total } else { expect_bytes };
 
     let mut have = fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
-    if total > 0 && have >= total {
-        // The .part is already long enough (finished last time but never renamed)
-        // -- just complete it.
+    // LONGER than the source cannot be a prefix of the source: the bytes on disk
+    // are not a partial download, they are garbage. This used to fall into the
+    // branch below and get **renamed and declared complete** — the client would
+    // certify a corrupt file as the model's weights, and the failure surfaced
+    // much later as an unexplained load error.
+    //
+    // Seen for real on 2026-08-10: two concurrent downloads appended to the same
+    // .part (see weights_fetch) and left it 517 MB over size. The concurrency is
+    // fixed there; this is the second lock on the door, because anything that
+    // ends with an over-long .part has the same right answer — throw it away.
+    if total > 0 && have > total {
+        let _ = fs::remove_file(&part_path);
+        emit(serde_json::json!({
+            "id": id, "kind": "progress",
+            "note": "the partial file was longer than the source and could not be a resume point; starting over",
+            "have": 0u64, "total": total
+        }));
+        have = 0;
+    }
+    if total > 0 && have == total {
+        // Exactly the right length: finished last time but never renamed.
         fs::rename(&part_path, &final_path)
             .map_err(|e| format!("rename failed for {}: {e}", final_path.display()))?;
         return Ok(final_path.to_string_lossy().into_owned());

@@ -1,35 +1,75 @@
 # IdleToken Cluster top-level Makefile.
 #
 # Builds two binaries:
-#   idletoken-worker  — inference shard. Links full GPU ds4 (CUDA).
-#   idletoken-coord   — scheduler + API server. CPU-only ds4 (-DDS4_NO_GPU).
+#   idletoken-worker  — inference shard. Links the GPU ds4 backend of the host
+#                       platform: CUDA on Linux, Metal on macOS.
+#   idletoken-coord   — scheduler + API server. CPU-only ds4 (-DDS4_NO_GPU),
+#                       identical on both platforms (it never touches a GPU).
 #
-# Linux + NVIDIA CUDA only -- a hard constraint. Mac is for editing;
-# rsync to a Linux GPU host (DGX Spark or a home GPU machine) to build.
+# Compute hosts: Linux + NVIDIA CUDA, or macOS + Apple Silicon (Metal).
+# Windows is built by scripts/build_*_win.bat, not from here.
+#
+# The Metal path is the SAME ds4 engine: vendor/ds4 implements ds4_gpu.h twice
+# (ds4_cuda.cu / ds4_metal.m) and every IdleToken PP extension sits above that
+# interface, so nothing under src/ is backend-specific. The only Mac-only file
+# is src/platform/mac/mac_gpu.m, the Metal facts the C resource probe needs.
 
 UNAME_S := $(shell uname -s)
-ifneq ($(UNAME_S),Linux)
-$(info IdleToken Cluster builds on Linux + NVIDIA CUDA only.)
-$(info Detected host: $(UNAME_S). Use ./scripts/sync-to-spark.sh and build remotely.)
-$(error unsupported build host)
+UNAME_M := $(shell uname -m)
+ifeq ($(UNAME_S),Linux)
+  IDLETOKEN_GPU := cuda
+else ifeq ($(UNAME_S),Darwin)
+  IDLETOKEN_GPU := metal
+  ifneq ($(UNAME_M),arm64)
+    $(info IdleToken Cluster needs Apple Silicon on macOS: the ds4 Metal kernels)
+    $(info assume unified memory, which an Intel Mac's GPU does not have.)
+    $(error unsupported mac architecture: $(UNAME_M))
+  endif
+else
+  $(info IdleToken Cluster builds on Linux + NVIDIA CUDA, or macOS + Apple Silicon.)
+  $(info Detected host: $(UNAME_S). Use ./scripts/sync-to-spark.sh to build remotely.)
+  $(error unsupported build host)
 endif
 
 CC              ?= cc
 CUDA_HOME       ?= /usr/local/cuda
 NVCC            ?= $(CUDA_HOME)/bin/nvcc
-NATIVE_CPU_FLAG ?= -march=native
+ifeq ($(IDLETOKEN_GPU),metal)
+  NATIVE_CPU_FLAG ?= -mcpu=native
+else
+  NATIVE_CPU_FLAG ?= -march=native
+endif
 
 DS4 := vendor/ds4
 
+# _GNU_SOURCE / -fno-finite-math-only are glibc- and gcc-shaped; the vendored
+# ds4 Makefile applies them only off-Darwin and we follow it rather than find
+# out the hard way which header they perturb on macOS.
 CFLAGS_BASE := -O3 -ffast-math $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99 \
-               -D_GNU_SOURCE -fno-finite-math-only \
                -I$(DS4) -Iinclude
+ifeq ($(IDLETOKEN_GPU),cuda)
+  CFLAGS_BASE += -D_GNU_SOURCE -fno-finite-math-only
+endif
 
-# Worker needs NVML headers (in CUDA toolkit, not in default sysroot).
-# IDLETOKEN_DS4X_CUDA turns on the ds4x GPU matvec (the worker already links
-# cudart); without it a ds4x cluster would silently serve on CPU only.
-CFLAGS_WORKER := $(CFLAGS_BASE) -I$(CUDA_HOME)/include -DIDLETOKEN_DS4X_CUDA
+ifeq ($(IDLETOKEN_GPU),cuda)
+  # Worker needs NVML headers (in CUDA toolkit, not in default sysroot).
+  # IDLETOKEN_DS4X_CUDA turns on the ds4x GPU matvec (the worker already links
+  # cudart); without it a ds4x cluster would silently serve on CPU only.
+  CFLAGS_WORKER := $(CFLAGS_BASE) -I$(CUDA_HOME)/include -DIDLETOKEN_DS4X_CUDA
+else
+  # No -DIDLETOKEN_DS4X_CUDA: ds4x has no Metal kernel yet, so small models run
+  # on its C reference path. That is a speed gap, not a correctness one — and
+  # it is LOUD rather than silent, because ds4x_cuda_available() is compiled
+  # out entirely instead of returning 0 at runtime.
+  CFLAGS_WORKER := $(CFLAGS_BASE)
+endif
 CFLAGS_COORD  := $(CFLAGS_BASE) -DDS4_NO_GPU
+
+# Objective-C for the Metal sources. -fobjc-arc matches vendor/ds4's Makefile;
+# mixing ARC and non-ARC translation units in one binary is legal but the
+# vendored .m assumes ARC.
+OBJCFLAGS := -O3 -ffast-math $(NATIVE_CPU_FLAG) -Wall -Wextra -fobjc-arc \
+             -I$(DS4) -Iinclude
 
 NVCCFLAGS := -O3 --use_fast_math \
              -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
@@ -40,12 +80,20 @@ CUDA_LDLIBS := -lm -Xcompiler -pthread \
                -L$(CUDA_HOME)/targets/sbsa-linux/lib \
                -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lnvidia-ml
 
+METAL_LDLIBS := -lm -pthread -framework Foundation -framework Metal
+
 WORKER_BUILD := build/worker
 COORD_BUILD  := build/coord
 
-# vendor objects
+# vendor objects. ds4_cuda.o / ds4_metal.o are the two implementations of the
+# same ds4_gpu.h; exactly one is linked.
+ifeq ($(IDLETOKEN_GPU),cuda)
+  DS4_GPU_OBJ := $(WORKER_BUILD)/vendor/ds4_cuda.o
+else
+  DS4_GPU_OBJ := $(WORKER_BUILD)/vendor/ds4_metal.o
+endif
 DS4_WORKER_OBJ := $(WORKER_BUILD)/vendor/ds4.o \
-                  $(WORKER_BUILD)/vendor/ds4_cuda.o \
+                  $(DS4_GPU_OBJ) \
                   $(WORKER_BUILD)/vendor/rax.o
 DS4_COORD_OBJ  := $(COORD_BUILD)/vendor/ds4.o \
                   $(COORD_BUILD)/vendor/rax.o
@@ -65,8 +113,19 @@ WORKER_COMMON_OBJ   := $(patsubst src/common/%.c,$(WORKER_BUILD)/common/%.o,$(CO
 # CUDA — links into the worker so a ds4x cluster serves on CPU (a CUDA kernel is
 # a later speed-up, not a correctness gate). small-model-design.md §S-C.
 DS4X_UNITS          := ds4x_config ds4x_model ds4x_forward ds4x_runner ds4x_quant
-DS4X_WORKER_OBJ     := $(patsubst %,$(WORKER_BUILD)/ds4x/%.o,$(DS4X_UNITS)) \
-                       $(WORKER_BUILD)/ds4x/ds4x_cuda.o
+DS4X_WORKER_OBJ     := $(patsubst %,$(WORKER_BUILD)/ds4x/%.o,$(DS4X_UNITS))
+ifeq ($(IDLETOKEN_GPU),cuda)
+  DS4X_WORKER_OBJ   += $(WORKER_BUILD)/ds4x/ds4x_cuda.o
+endif
+
+# macOS-only: the Metal facts resource.c cannot reach from plain C. Worker only
+# (the coordinator never probes hardware), and it costs no new framework — the
+# worker already links Metal for ds4.
+ifeq ($(IDLETOKEN_GPU),metal)
+  PLATFORM_WORKER_OBJ := $(WORKER_BUILD)/platform/mac_gpu.o
+else
+  PLATFORM_WORKER_OBJ :=
+endif
 # Coord only needs the GGUF byte-BPE tokenizer (prompt encode + detokenize for
 # ds4x models); embed/lm_head run on the workers.
 DS4X_COORD_OBJ      := $(COORD_BUILD)/ds4x/ds4x_tokenizer.o
@@ -177,8 +236,12 @@ disctest:
 worker: idletoken-worker
 coord:  idletoken-coord
 
-idletoken-worker: $(WORKER_MAIN_OBJ) $(WORKER_COMMON_OBJ) $(DS4X_WORKER_OBJ) $(DS4_WORKER_OBJ)
+idletoken-worker: $(WORKER_MAIN_OBJ) $(WORKER_COMMON_OBJ) $(DS4X_WORKER_OBJ) $(DS4_WORKER_OBJ) $(PLATFORM_WORKER_OBJ)
+ifeq ($(IDLETOKEN_GPU),cuda)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+else
+	$(CC) -o $@ $^ $(METAL_LDLIBS)
+endif
 
 idletoken-coord: $(COORD_MAIN_OBJ) $(COORD_COMMON_OBJ) $(DS4X_COORD_OBJ) $(DS4_COORD_OBJ)
 	$(CC) $(CFLAGS_COORD) -o $@ $^ -lm -pthread
@@ -190,6 +253,12 @@ $(WORKER_BUILD)/vendor/ds4.o: $(DS4)/ds4.c $(DS4)/ds4.h $(DS4)/ds4_gpu.h | $(WOR
 
 $(WORKER_BUILD)/vendor/ds4_cuda.o: $(DS4)/ds4_cuda.cu $(DS4)/ds4_gpu.h $(DS4)/ds4_iq2_tables_cuda.inc | $(WORKER_BUILD)/vendor
 	$(NVCC) $(NVCCFLAGS) -c -o $@ $<
+
+$(WORKER_BUILD)/vendor/ds4_metal.o: $(DS4)/ds4_metal.m $(DS4)/ds4_gpu.h | $(WORKER_BUILD)/vendor
+	$(CC) $(OBJCFLAGS) -c -o $@ $<
+
+$(WORKER_BUILD)/platform/mac_gpu.o: src/platform/mac/mac_gpu.m include/idletoken_mac_gpu.h | $(WORKER_BUILD)/platform
+	$(CC) $(OBJCFLAGS) -c -o $@ $<
 
 $(WORKER_BUILD)/vendor/rax.o: $(DS4)/rax.c $(DS4)/rax.h $(DS4)/rax_malloc.h | $(WORKER_BUILD)/vendor
 	$(CC) $(CFLAGS_WORKER) -c -o $@ $<
@@ -227,7 +296,7 @@ $(COORD_BUILD)/%.o: src/coord/%.c include/idletoken_proto.h include/idletoken_ne
 
 # --- dirs ------------------------------------------------------------------
 
-$(WORKER_BUILD) $(WORKER_BUILD)/vendor $(WORKER_BUILD)/common $(WORKER_BUILD)/ds4x $(COORD_BUILD) $(COORD_BUILD)/vendor $(COORD_BUILD)/common $(COORD_BUILD)/ds4x:
+$(WORKER_BUILD) $(WORKER_BUILD)/vendor $(WORKER_BUILD)/common $(WORKER_BUILD)/ds4x $(WORKER_BUILD)/platform $(COORD_BUILD) $(COORD_BUILD)/vendor $(COORD_BUILD)/common $(COORD_BUILD)/ds4x:
 	@mkdir -p $@
 
 # --- helpers ---------------------------------------------------------------

@@ -15,6 +15,7 @@ import Capability from "./Capability";
 import AuthScreen from "./AuthScreen";
 import PairingPanel from "./PairingPanel";
 import Chat from "./Chat";
+import WeightsRow, { type WeightsInfo } from "./WeightsRow";
 import { inTauri, platformGate } from "./platform";
 import { accountPairSecret, getPairingProvider, type PairingSnapshot, type ClusterApi } from "./pairing";
 import { fmtBytes, fmtGiB, pct } from "./format";
@@ -511,6 +512,12 @@ function ClusterCard(props: {
   // The card owns the quantities; this row owns the choice.
   fitsStandalone?: boolean;
   onServeStandalone?: () => void;
+  // "Run it here" downloads the weights first when they are missing — 4.7 GB
+  // for an 8B, 80 GB for DSv4. Without this the button looked broken: it really
+  // had started a multi-GB download, and the only place that said so was a
+  // different page. Whatever a button sets in motion has to report back next to
+  // that button.
+  weights?: WeightsInfo;
   onCreate: () => void;
   onJoin: () => void;
   onManage: () => void;
@@ -547,11 +554,16 @@ function ClusterCard(props: {
           </div>
           <button
             className={fits ? "btn-primary" : "btn-secondary"}
-            disabled={!fits}
+            // Also disabled while its own download runs — pressing it again
+            // would start the sequence a second time with nothing to show for it.
+            disabled={!fits || !!props.weights?.dl}
             onClick={props.onServeStandalone}
           >
-            {t("cluster.serveLocal")}
+            {props.weights?.dl && !props.weights.dl.error ? t("weights.downloading") : t("cluster.serveLocal")}
           </button>
+          {/* Progress / failure for the download this button starts. `idle=hide`:
+              "no weights yet" is already implied by the button next to it. */}
+          {props.weights ? <WeightsRow w={props.weights} idle="hide" /> : null}
         </div>
 
         <div className="deploy-opt">
@@ -710,6 +722,7 @@ function Dashboard(props: {
   onManageCluster: () => void;
   onOpenSharing: () => void;
   onStartChat: (q: string) => void;
+  weights?: WeightsInfo;
 }) {
   const { t } = useI18n();
   const s = props.snap;
@@ -728,6 +741,7 @@ function Dashboard(props: {
             pair={props.pair}
             fitsStandalone={standalone.gapBytes === 0}
             onServeStandalone={props.onServeStandalone}
+            weights={props.weights}
             onCreate={props.onCreateCluster}
             onJoin={props.onJoinCluster}
             onManage={props.onManageCluster}
@@ -908,6 +922,21 @@ export default function App() {
     });
     return after.path;
   }, [settings.weightsSource, settings.ggufPath, settings.modelDir, settings.modelId, settings.quant]);
+
+  // One object, two renderers: the model row in Settings → Quick, and the
+  // "run on this machine" row on Cluster. Both start the same download, so
+  // both must show the same progress — building it once is what keeps them
+  // from drifting into two half-truths.
+  const weightsInfo = useMemo<WeightsInfo>(
+    () => ({
+      needs: needsWeights,
+      path: weightsPath,
+      dl,
+      onDownload: () => void ensureWeights().catch((e) => setDl({ have: 0, total: 0, error: String(e) })),
+      onCancel: cancelDownload,
+    }),
+    [needsWeights, weightsPath, dl, ensureWeights, cancelDownload]
+  );
 
   // Preset caps derive from the machine's totals (learned from the first probe);
   // "custom" uses the precise sliders directly.
@@ -1123,6 +1152,43 @@ export default function App() {
             }
           })();
         }
+        // Concurrency oracle (2026-08-10). Two fetches for one id used to both
+        // run, appending to the same .part until it was longer than the source
+        // — which the resume path then renamed and called a finished download.
+        // The second call must be refused, and the file must never exceed total.
+        //   weights-double:<modelId>
+        const wd = d.match(/^weights-double:([a-z0-9.\-]+)$/);
+        if (wd) {
+          (async () => {
+            try {
+              const man = getManifest(wd[1]);
+              const target = resolveDownload(man, defaultQuant(wd[1]));
+              if (!target) { reportTest("weightsDouble", { error: "manifest has no repo/gguf" }); return; }
+              const dir = await defaultModelDir();
+              const first = fetchWeights({ id: "primary", target, destDir: dir }).catch((e) => `ERR:${e}`);
+              await new Promise((r) => setTimeout(r, 3000)); // let it get past register()
+              let secondRefused = false;
+              let secondMsg = "";
+              try {
+                await fetchWeights({ id: "primary", target, destDir: dir });
+              } catch (e) {
+                secondRefused = true;
+                secondMsg = String(e);
+              }
+              cancelDownload();
+              await new Promise((r) => setTimeout(r, 8000));
+              const st = await weightsState(dir, target.file, target.expectBytes);
+              reportTest("weightsDouble", {
+                secondRefused, secondMsg,
+                haveBytes: st.have_bytes, expectBytes: target.expectBytes,
+                overshoot: st.have_bytes > target.expectBytes,
+              });
+              void first;
+            } catch (e) {
+              reportTest("weightsDouble", { error: String(e) });
+            }
+          })();
+        }
         if (d === "report-probe") {
           getResourceProvider()
             .probe({})
@@ -1326,14 +1392,7 @@ export default function App() {
                 session={session}
                 onSignIn={() => setShowAuth(true)}
                 initialCategory={settingsCategory}
-                weights={{
-                  needs: needsWeights,
-                  path: weightsPath,
-                  dl,
-                  onDownload: () =>
-                    void ensureWeights().catch((e) => setDl({ have: 0, total: 0, error: String(e) })),
-                  onCancel: cancelDownload,
-                }}
+                weights={weightsInfo}
                 onClose={() => setView("cluster")}
               />
             ) : (
@@ -1383,6 +1442,7 @@ export default function App() {
                   setShowPairing(true);
                 }}
                 onOpenSharing={() => openSettings("platform")}
+                weights={weightsInfo}
                 onStartChat={(q) => {
                   setChatInitial(q);
                   setView("chat");

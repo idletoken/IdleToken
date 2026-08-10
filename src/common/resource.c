@@ -1,4 +1,5 @@
-/* IdleToken Cluster — resource probe (Linux NVML + Windows runtime nvml.dll).
+/* IdleToken Cluster — resource probe (Linux NVML + Windows runtime nvml.dll
+ * + macOS Metal/mach).
  *
  * Numbers report what's *actually free for our worker*, after deducting
  * what the system and other processes already use, plus safety margins. */
@@ -20,14 +21,23 @@
   #include <unistd.h>
 #endif
 
+#ifdef __APPLE__
+  #include <mach/mach.h>
+  #include <mach/mach_host.h>
+  #include <sys/sysctl.h>
+  #include "idletoken_mac_gpu.h"
+#endif
+
 /* GPU probe backends:
  *   - Linux: link NVML from the CUDA install (nvml.h + -lnvidia-ml, always
  *     present at /usr/local/cuda/include/nvml.h on the DGX Spark).
  *   - Windows: load nvml.dll from the NVIDIA driver at *runtime* (see the
  *     _WIN32 probe_gpu below), so a driver-only machine with no CUDA toolkit
  *     can still report its GPU (driver-only one-click start, architecture.md §2). No nvml.h needed.
+ *   - macOS: Metal via src/platform/mac/mac_gpu.m. No NVML equivalent exists
+ *     and none is needed — see the Darwin probe_gpu below.
  * NVML ships with every NVIDIA driver, so neither path adds a toolkit dep. */
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__APPLE__)
   #define IDLETOKEN_HAVE_NVML 1
   #include <nvml.h>
 #endif
@@ -156,6 +166,9 @@ static int probe_gpu(idletoken_resource_report *r) {
         r->cc_minor = (uint8_t)minor;
     }
 
+    /* NVML answered, so this is an NVIDIA card whatever else fails below. */
+    r->gpu_vendor = IDLETOKEN_GPU_VENDOR_NVIDIA;
+
     /* Discrete Windows GPUs (RTX 5060 Ti / 2070) are never unified memory. */
     r->unified_memory = false;
 
@@ -178,6 +191,80 @@ static int probe_gpu(idletoken_resource_report *r) {
     #undef ESTR
     down();
     FreeLibrary(nv);
+    return 0;
+}
+#elif defined(__APPLE__)
+/* ---- macOS GPU probe via Metal -------------------------------------------
+ * Everything NVML answers on the other two platforms is either unavailable or
+ * meaningless here, and the reasons differ per field:
+ *
+ *   "how much VRAM"        — there is none. The GPU reads host RAM. What binds
+ *                            us instead is recommendedMaxWorkingSetSize: the
+ *                            bytes Apple says we may keep resident before the
+ *                            system starts evicting our resources.
+ *   "how much do OTHER
+ *    processes hold"       — no such query, and charging it here would
+ *                            DOUBLE-COUNT: another app's Metal buffers are host
+ *                            RAM, so probe_host has already subtracted them in
+ *                            ram_used_other. Left at 0 deliberately.
+ *   compute capability /
+ *   driver version         — CUDA concepts with no Metal analogue. Left 0/"",
+ *                            which is why idletoken_hw_check dispatches on
+ *                            gpu_vendor before it looks at either.
+ *
+ * Measured on the M4 / 16 GiB test machine (macOS 26.5):
+ *   recommendedMaxWorkingSetSize = 11.84 GiB (74% of physical)
+ *   maxBufferLength              =  8.88 GiB (55% of physical — a per-buffer
+ *                                   cap, which is why ds4_metal.m splits the
+ *                                   mapped model into views) */
+static int probe_gpu(idletoken_resource_report *r) {
+    /* Same test hook as the NVML paths: pretend the GPU is absent. */
+    if (getenv("IDLETOKEN_FORCE_NO_NVML")) {
+        fprintf(stderr, "idletoken-probe: no Metal device (forced)\n");
+        return -1;
+    }
+
+    idletoken_mac_gpu_info g;
+    if (idletoken_mac_gpu_probe(&g) != 0) {
+        fprintf(stderr, "idletoken-probe: no Metal device found. IdleToken "
+                        "needs a GPU to serve layers.\n");
+        return -1;
+    }
+
+    snprintf(r->gpu_name, sizeof(r->gpu_name), "%s", g.name);
+    r->unified_memory = g.unified_memory ? true : false;
+
+    /* An Intel Mac's AMD/Intel GPU reports a Metal device but not Apple7 and
+     * not unified memory. Record it as UNKNOWN so hw_check refuses with a
+     * specific sentence instead of letting it join and produce garbage: the
+     * ds4 Metal kernels are written against unified memory. */
+    r->gpu_vendor = (g.apple_silicon && g.unified_memory)
+                        ? IDLETOKEN_GPU_VENDOR_APPLE
+                        : IDLETOKEN_GPU_VENDOR_UNKNOWN;
+
+    r->vram_total      = g.recommended_working_set;
+    r->vram_used_other = 0;   /* see the double-counting note above */
+
+    /* The GPU may not keep more resident than Apple recommends, and it may not
+     * use memory the host probe has already ruled out (other processes, the
+     * 4 GiB safety floor, the 70% proportional ceiling). Take the smaller.
+     *
+     * Only the workspace reserve is subtracted, not IDLETOKEN_VRAM_SAFETY_BYTES:
+     * that 1 GiB stands for the CUDA context, which has no Metal counterpart.
+     * The workspace reserve stays — Metal heaps, command buffers and kernel
+     * scratch are real. This is a reasoned reuse of a CUDA-derived constant,
+     * not a measured one; it wants calibrating on a big-memory Mac. */
+    uint64_t budget = g.recommended_working_set;
+    if (r->ram_usable < budget) budget = r->ram_usable;
+    r->vram_usable = budget > IDLETOKEN_VRAM_WORKSPACE_BYTES
+                         ? budget - IDLETOKEN_VRAM_WORKSPACE_BYTES
+                         : 0;
+    /* No `ram_usable > 0` guard on that clamp, deliberately. The first version
+     * had one — meaning "only clamp if the host probe produced something" — and
+     * it inverted the worst case into the best one: on a Mac with no free
+     * memory (ram_usable == 0) the clamp was skipped and the node advertised
+     * the full 10.3 GiB it definitely did not have. A failed host probe must
+     * report zero usable, not unlimited. */
     return 0;
 }
 #elif defined(IDLETOKEN_HAVE_NVML)
@@ -216,6 +303,9 @@ static int probe_gpu(idletoken_resource_report *r) {
         nvmlShutdown();
         return -1;
     }
+
+    /* NVML answered, so this is an NVIDIA card whatever else fails below. */
+    r->gpu_vendor = IDLETOKEN_GPU_VENDOR_NVIDIA;
 
     char name[NVML_DEVICE_NAME_BUFFER_SIZE] = {0};
     if (nvmlDeviceGetName(dev, name, sizeof(name)) == NVML_SUCCESS) {
@@ -315,6 +405,72 @@ static int probe_host(idletoken_resource_report *r) {
     uint64_t ram_avail = (uint64_t)ms.ullAvailPhys;
     if (ram_avail > r->ram_total) ram_avail = r->ram_total;
     r->ram_used_other = r->ram_total - ram_avail;
+
+    if (r->ram_total > r->ram_used_other + IDLETOKEN_RAM_SAFETY_BYTES) {
+        r->ram_usable = r->ram_total - r->ram_used_other - IDLETOKEN_RAM_SAFETY_BYTES;
+    } else {
+        r->ram_usable = 0;
+    }
+    ram_apply_proportional_ceiling(r);
+    return 0;
+#elif defined(__APPLE__)
+    struct utsname un;
+    if (uname(&un) == 0) {
+        size_t n = strnlen(un.nodename, sizeof(un.nodename));
+        if (n >= sizeof(r->hostname)) n = sizeof(r->hostname) - 1;
+        memcpy(r->hostname, un.nodename, n);
+        r->hostname[n] = '\0';
+    }
+
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    r->cpu_count = ncpu > 0 ? (uint32_t)ncpu : 0;
+
+    {
+        uint64_t memsize = 0;
+        size_t len = sizeof(memsize);
+        if (sysctlbyname("hw.memsize", &memsize, &len, NULL, 0) != 0 || memsize == 0) {
+            fprintf(stderr, "idletoken-probe: sysctl hw.memsize: %s\n", strerror(errno));
+            return -1;
+        }
+        r->ram_total = memsize;
+    }
+
+    /* macOS has no MemAvailable. Reconstruct what Activity Monitor calls
+     * "Memory Used" from the mach VM counters and treat the rest as available:
+     *
+     *   used = internal (anonymous/app pages)
+     *        - purgeable (app pages the kernel may drop on demand)
+     *        + wired     (unpageable kernel/driver pages)
+     *        + compressed
+     *
+     * File-backed pages (external_page_count) are deliberately NOT counted as
+     * used — they are the page cache, and on this project that matters more
+     * than usual: the GGUF is mmap'd, so at steady state a large share of
+     * "used-looking" memory is our own model file and is reclaimable. Counting
+     * it would make a warm machine look full and refuse work it can do. */
+    {
+        vm_size_t page_size = 0;
+        if (host_page_size(mach_host_self(), &page_size) != KERN_SUCCESS || page_size == 0)
+            page_size = 16384;   /* Apple Silicon default; sysconf agrees */
+
+        vm_statistics64_data_t vm;
+        mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+        if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                              (host_info64_t)&vm, &count) != KERN_SUCCESS) {
+            fprintf(stderr, "idletoken-probe: host_statistics64 failed\n");
+            return -1;
+        }
+
+        uint64_t internal   = (uint64_t)vm.internal_page_count;
+        uint64_t purgeable  = (uint64_t)vm.purgeable_count;
+        uint64_t app_pages  = internal > purgeable ? internal - purgeable : 0;
+        uint64_t used_pages = app_pages + (uint64_t)vm.wire_count +
+                              (uint64_t)vm.compressor_page_count;
+
+        uint64_t used = used_pages * (uint64_t)page_size;
+        if (used > r->ram_total) used = r->ram_total;
+        r->ram_used_other = used;
+    }
 
     if (r->ram_total > r->ram_used_other + IDLETOKEN_RAM_SAFETY_BYTES) {
         r->ram_usable = r->ram_total - r->ram_used_other - IDLETOKEN_RAM_SAFETY_BYTES;
@@ -455,6 +611,35 @@ idletoken_hw_status idletoken_hw_check(const idletoken_resource_report *r,
     if (!r) return IDLETOKEN_HW_NO_GPU;
     #define SAY(...) do { if (reason && cap) snprintf(reason, cap, __VA_ARGS__); } while (0)
 
+    /* Apple Silicon: a different stack, so a different floor. Compute
+     * capability and driver version below are CUDA concepts and are zero here;
+     * running the NVIDIA checks on a Mac would refuse every Mac ever made. */
+    if (r->gpu_vendor == IDLETOKEN_GPU_VENDOR_APPLE) {
+        if (r->vram_total < IDLETOKEN_MIN_APPLE_WORKING_SET_BYTES) {
+            SAY("%s can keep only %.1f GB resident for the GPU; IdleToken needs "
+                "at least %.0f GB (roughly an 8 GB Mac). This machine can still "
+                "run the client and control the cluster.",
+                r->gpu_name, (double)r->vram_total / 1073741824.0,
+                (double)IDLETOKEN_MIN_APPLE_WORKING_SET_BYTES / 1073741824.0);
+            return IDLETOKEN_HW_VRAM_TOO_SMALL;
+        }
+        SAY("%s (Metal, unified memory, %.1f GB working set) meets the hardware floor.",
+            r->gpu_name, (double)r->vram_total / 1073741824.0);
+        return IDLETOKEN_HW_OK;   /* SAY is #undef'd once, at the end of the function */
+    }
+
+    /* A GPU we recognise as present but have no backend for. Today that is an
+     * Intel Mac: Metal answers, unified memory does not, and the ds4 Metal
+     * kernels assume unified memory. Say so instead of failing at load time. */
+    if (r->gpu_vendor == IDLETOKEN_GPU_VENDOR_UNKNOWN && r->gpu_name[0] != '\0' &&
+        r->cc_major == 0 && r->cc_minor == 0) {
+        SAY("%s is not a GPU IdleToken can compute on — it needs either an "
+            "NVIDIA card (RTX 20 series or newer) or an Apple Silicon Mac. "
+            "This machine can still run the client and control the cluster.",
+            r->gpu_name);
+        return IDLETOKEN_HW_GPU_UNSUPPORTED;
+    }
+
     if (r->gpu_name[0] == '\0' || (r->cc_major == 0 && r->cc_minor == 0)) {
         SAY("no usable NVIDIA GPU detected. IdleToken needs an NVIDIA card "
             "(RTX 20 series or newer) with the NVIDIA driver installed "
@@ -526,7 +711,11 @@ void idletoken_resource_print(const idletoken_resource_report *r) {
            r->gpu_name, r->cc_major, r->cc_minor,
            r->driver_version[0] ? r->driver_version : "unknown",
            r->unified_memory ? "  [unified memory]" : "");
-    if (r->unified_memory) {
+    if (r->gpu_vendor == IDLETOKEN_GPU_VENDOR_APPLE) {
+        printf("  vram total : %s   (Metal recommended working set, unified pool)\n", vt);
+        printf("  vram other : %s   (not queryable; already charged to ram other)\n", vo);
+        printf("  vram usable: %s   (min(working set, ram usable) - 1.5G workspace)\n", vu);
+    } else if (r->unified_memory) {
         printf("  vram total : %s   (aliased to host RAM, unified pool)\n", vt);
         printf("  vram other : %s\n", vo);
         printf("  vram usable: %s   (= ram_usable on unified-memory hosts)\n", vu);
@@ -567,11 +756,18 @@ void idletoken_resource_print_json(const idletoken_resource_report *r) {
     json_str("windows");
 #elif defined(__linux__)
     json_str("linux");
+#elif defined(__APPLE__)
+    json_str("macos");
 #else
     json_str("unknown");
 #endif
     fputs(",\"cpu_count\":", stdout);      printf("%u", r->cpu_count);
     fputs(",\"gpu_name\":", stdout);       json_str(r->gpu_name);
+    /* Which GPU stack, so the client can label the node and pick the right
+     * "what you need" sentence without parsing gpu_name. */
+    fputs(",\"gpu_vendor\":", stdout);
+    json_str(r->gpu_vendor == IDLETOKEN_GPU_VENDOR_NVIDIA ? "nvidia" :
+             r->gpu_vendor == IDLETOKEN_GPU_VENDOR_APPLE  ? "apple"  : "unknown");
     printf(",\"cc_major\":%u,\"cc_minor\":%u", r->cc_major, r->cc_minor);
     fputs(",\"driver_version\":", stdout); json_str(r->driver_version);
     {   /* Verdict travels with the numbers so the client can gate the UI on a

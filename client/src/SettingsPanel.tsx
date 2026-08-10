@@ -13,6 +13,7 @@ import {
 import type { NodeSnapshot } from "./types";
 import type { Session } from "./auth";
 import PlatformPanel from "./PlatformPanel";
+import WeightsRow, { type WeightsInfo } from "./WeightsRow";
 import { getEngineProvider } from "./provider/engine";
 import { buildDiagnosticsBundle, diagnosticsFileName } from "./diagnostics";
 
@@ -91,58 +92,6 @@ function CapSlider(props: { label: string; noCap: string; totalBytes: number; va
       <input className="slider" type="range" min={1024} max={totalMb} step={512} value={pos} onChange={(e) => { const v = Number(e.target.value); props.onChange(v >= totalMb ? 0 : v); }} />
     </div>
   );
-}
-
-// ---- weight status, on the model it belongs to ----------------------------
-// Four states, and the button says what pressing it DOES in each:
-//   downloading -> progress + Cancel      failed -> reason + Retry
-//   missing     -> Download               present -> "ready", no button
-export interface WeightsInfo {
-  needs: boolean;
-  path: string;
-  dl: { have: number; total: number; endpoint?: string; note?: string; error?: string } | null;
-  onDownload: () => void;
-  onCancel: () => void;
-}
-
-function WeightsRow(props: { w: WeightsInfo }) {
-  const { t } = useI18n();
-  const d = props.w.dl;
-  // Clicks land on a <label> that owns a radio input; without this, hitting
-  // "Download" would also re-select the model (harmless here, but it makes the
-  // button feel like it did something else).
-  const stop = (e: React.MouseEvent) => e.preventDefault();
-
-  if (d?.error) {
-    return (
-      <span className="model-opt__weights model-opt__weights--err" onClick={stop}>
-        <span>{t("weights.failed")}</span>
-        <button className="linkbtn" onClick={props.w.onDownload}>{t("weights.retry")}</button>
-      </span>
-    );
-  }
-  if (d) {
-    const pct = d.total > 0 ? Math.min(100, Math.round((d.have / d.total) * 100)) : 0;
-    return (
-      <span className="model-opt__weights" onClick={stop}>
-        <span className="model-opt__wbar"><i style={{ width: `${pct}%` }} /></span>
-        <span>
-          {fmtBytes(d.have)}{d.total > 0 ? ` / ${fmtBytes(d.total)}` : ""}
-          {d.endpoint ? ` · ${t("weights.from")} ${new URL(d.endpoint).host}` : ""}
-        </span>
-        <button className="linkbtn" onClick={props.w.onCancel}>{t("weights.cancel")}</button>
-      </span>
-    );
-  }
-  if (props.w.needs) {
-    return (
-      <span className="model-opt__weights" onClick={stop}>
-        <span>{t("weights.needed")}</span>
-        <button className="linkbtn" onClick={props.w.onDownload}>{t("weights.download")}</button>
-      </span>
-    );
-  }
-  return <span className="model-opt__weights model-opt__weights--ok">{t("weights.ready")}</span>;
 }
 
 // ---- schema (everything except the bespoke Quick page) --------------------
@@ -547,7 +496,7 @@ export default function SettingsPanel(props: {
                   "no weights yet" is the resting state of a fresh install (so
                   the bar never left), and the thing it is about — which model —
                   is chosen right here. One probe, on the model it describes. */}
-              {s.modelId === m.id && props.weights ? <WeightsRow w={props.weights} /> : null}
+              {s.modelId === m.id && props.weights ? <WeightsRow w={props.weights} idle="show" /> : null}
             </label>
           ))}
         </div>

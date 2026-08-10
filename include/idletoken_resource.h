@@ -71,11 +71,38 @@
  * exempt — their "VRAM" is host RAM. */
 #define IDLETOKEN_MIN_VRAM_BYTES (4ull * 1024ull * 1024ull * 1024ull)
 
+/* Apple Silicon floor. The VRAM floor above is waived for unified-memory hosts
+ * (their "VRAM" is host RAM), so a Mac would otherwise have no floor at all.
+ * The number it is applied to is Metal's recommendedMaxWorkingSetSize, which
+ * on the machines measured so far sits near 74% of physical RAM — so this
+ * admits an 8 GB Mac and refuses anything smaller. Same reasoning as the CUDA
+ * floor: enough for the runtime's own state plus at least one model layer. */
+#define IDLETOKEN_MIN_APPLE_WORKING_SET_BYTES (4ull * 1024ull * 1024ull * 1024ull)
+
+/* Which GPU stack this node runs. Decides which hardware floor applies:
+ * compute capability and driver version are CUDA-only concepts and are left
+ * zero on Apple Silicon, so idletoken_hw_check must dispatch on this BEFORE
+ * it reads them.
+ *
+ * Deliberately NOT on the wire. RESOURCE_REPORT (docs/wire-protocol.md) is
+ * unchanged: the hardware floor is checked locally by the worker before it
+ * even sends HELLO, so the coordinator never needs the vendor to decide
+ * whether a node may join. What the coordinator DOES need — `unified_memory`
+ * and the byte counts — it already gets. This becomes a wire field the day a
+ * heterogeneous cluster has to plan around per-vendor throughput rather than
+ * per-node bytes. */
+typedef enum {
+    IDLETOKEN_GPU_VENDOR_UNKNOWN = 0,
+    IDLETOKEN_GPU_VENDOR_NVIDIA  = 1,
+    IDLETOKEN_GPU_VENDOR_APPLE   = 2,   /* Apple Silicon, Metal, unified memory */
+} idletoken_gpu_vendor;
+
 typedef struct {
     /* GPU */
     char     gpu_name[64];
-    uint8_t  cc_major;
-    uint8_t  cc_minor;
+    idletoken_gpu_vendor gpu_vendor;
+    uint8_t  cc_major;          /* CUDA only; 0 on Metal */
+    uint8_t  cc_minor;          /* CUDA only; 0 on Metal */
     char     driver_version[32]; /* NVML "580.126.09" — empty if unreadable */
     bool     unified_memory;     /* DGX Spark / Grace: 1, discrete VRAM: 0 */
     uint64_t vram_total;
@@ -120,6 +147,9 @@ typedef enum {
     IDLETOKEN_HW_CC_TOO_LOW,      /* pre-Turing card */
     IDLETOKEN_HW_DRIVER_TOO_OLD,  /* driver older than the shipped CUDA needs */
     IDLETOKEN_HW_VRAM_TOO_SMALL,  /* < IDLETOKEN_MIN_VRAM_BYTES */
+    IDLETOKEN_HW_GPU_UNSUPPORTED, /* a GPU, but not one we have a backend for
+                                   * (e.g. an Intel Mac's AMD card: Metal is
+                                   * present, unified memory is not) */
 } idletoken_hw_status;
 
 /* Verdict on whether this machine can serve layers at all. Writes a one-line

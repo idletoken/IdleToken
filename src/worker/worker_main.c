@@ -60,6 +60,10 @@ void ds4_gpu_set_moe_cache(uint64_t bytes, uint32_t n_layers);
   #include <signal.h>
   #include <sys/prctl.h>
 #endif
+#ifdef __APPLE__
+  #include <limits.h>
+  #include <mach-o/dyld.h>   /* _NSGetExecutablePath: where this binary lives */
+#endif
 
 #define IDLETOKEN_WORKER_VERSION "idletoken-worker v0.1.0-pre"
 
@@ -70,7 +74,14 @@ void ds4_gpu_set_moe_cache(uint64_t bytes, uint32_t n_layers);
 static const idletoken_model_spec *g_model;
 
 static void fill_uuid(uint8_t uuid[16]) {
+#if defined(__APPLE__)
+    /* macOS has no getrandom(2). getentropy(3) is the same kernel CSPRNG and
+     * is documented never to fail for <= 256 bytes; the fallback below stays
+     * reachable anyway rather than assuming that. */
+    if (getentropy(uuid, 16) == 0) return;
+#else
     if (getrandom(uuid, 16, 0) == 16) return;
+#endif
     /* Fallback: time ^ pid. */
     uint64_t t = (uint64_t)time(NULL);
     uint64_t p = (uint64_t)getpid();
@@ -426,7 +437,57 @@ static int seq_resolve(uint8_t seq_id,
     return 0;   /* MOCK: no sequence state needed */
 }
 
+#ifdef __APPLE__
+/* Point the ds4 Metal backend at its shader sources.
+ *
+ * ds4 compiles the metal/ shader sources at ds4_gpu_init() time and looks for
+ * them relative to the CURRENT WORKING DIRECTORY. That works for `./ds4` run
+ * from its checkout and fails for us: the worker is started by the client, or
+ * by a script, or from the user's home — and the failure ("Metal source not
+ * found") looks like a broken install rather than a wrong cwd.
+ *
+ * So resolve it from where THIS BINARY lives, which is stable no matter who
+ * launched it, and hand ds4 a single base directory (patch 0011). An explicit
+ * DS4_METAL_SOURCE_DIR always wins, so a packaged app can point elsewhere. */
+static void mac_locate_metal_sources(void) {
+    if (getenv("DS4_METAL_SOURCE_DIR")) return;
+
+    char exe[PATH_MAX];
+    uint32_t n = sizeof(exe);
+    if (_NSGetExecutablePath(exe, &n) != 0) return;
+
+    char real[PATH_MAX];
+    if (!realpath(exe, real)) snprintf(real, sizeof(real), "%s", exe);
+    char *slash = strrchr(real, '/');
+    if (!slash) return;
+    *slash = '\0';                       /* real = directory of the binary */
+
+    /* Installed layout first, then the repo layout (make drops the binary in
+     * the repo root, where the vendored engine sits under vendor/ds4). */
+    const char *rel[] = { "metal", "vendor/ds4/metal", "../vendor/ds4/metal" };
+    for (size_t i = 0; i < sizeof(rel) / sizeof(rel[0]); i++) {
+        char cand[PATH_MAX], probe[PATH_MAX];
+        snprintf(cand, sizeof(cand), "%s/%s", real, rel[i]);
+        snprintf(probe, sizeof(probe), "%s/flash_attn.metal", cand);
+        if (access(probe, R_OK) == 0) {
+            setenv("DS4_METAL_SOURCE_DIR", cand, 1);
+            /* Logged, not silent: "which shaders did it actually compile" is
+             * the first question when a Metal build behaves oddly. */
+            fprintf(stderr, "idletoken-worker: ds4 Metal shaders from %s\n", cand);
+            return;
+        }
+    }
+    /* Not found: say so now, with the directories tried, instead of letting
+     * Metal init fail later with only the file name. */
+    fprintf(stderr, "idletoken-worker: ds4 Metal shader sources not found near %s "
+                    "— set DS4_METAL_SOURCE_DIR if they live elsewhere\n", real);
+}
+#endif /* __APPLE__ */
+
 int main(int argc, char **argv) {
+#ifdef __APPLE__
+    mac_locate_metal_sources();
+#endif
 #ifdef __linux__
     /* Opt-in (set by the client supervisor): die with the launching client so
      * even a SIGKILLed client never orphans the engine. Must NOT be default —

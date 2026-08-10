@@ -1,0 +1,113 @@
+diff --git a/vendor/ds4/ds4_metal.m b/vendor/ds4/ds4_metal.m
+index f5569ec..b89e09d 100644
+--- a/vendor/ds4/ds4_metal.m
++++ b/vendor/ds4/ds4_metal.m
+@@ -1225,6 +1225,17 @@ void ds4_gpu_set_quality(bool quality) {
+         @[@"DS4_METAL_SET_ROWS_SOURCE",   @"metal/set_rows.metal"],
+     ];
+ 
++    /* IdleToken: one base directory instead of nineteen per-file overrides.
++     *
++     * The shaders are compiled from SOURCE at startup, and the two fallback
++     * paths below are relative to the CURRENT WORKING DIRECTORY. That is fine
++     * for `./ds4` run from its own checkout and wrong for everything else: the
++     * IdleToken worker is launched by the client (or by systemd, or from the
++     * user's home) and would fail Metal init with "source not found" for
++     * reasons having nothing to do with the machine. The per-file variables
++     * could express this, but only by setting all nineteen correctly. */
++    const char *source_dir = getenv("DS4_METAL_SOURCE_DIR");
++
+     NSMutableString *source = [NSMutableString stringWithString:base];
+     for (NSArray<NSString *> *spec in required_sources) {
+         const char *override_path = getenv([spec[0] UTF8String]);
+@@ -1232,6 +1243,14 @@ void ds4_gpu_set_quality(bool quality) {
+         if (override_path && override_path[0]) {
+             [paths addObject:[NSString stringWithUTF8String:override_path]];
+         }
++        if (source_dir && source_dir[0]) {
++            /* spec[1] is "metal/<name>.metal"; the dir may or may not already
++             * end in "metal", so try both <dir>/<name> and <dir>/metal/<name>. */
++            NSString *dir = [NSString stringWithUTF8String:source_dir];
++            [paths addObject:[dir stringByAppendingPathComponent:
++                                  [spec[1] lastPathComponent]]];
++            [paths addObject:[dir stringByAppendingPathComponent:spec[1]]];
++        }
+         [paths addObject:spec[1]];
+         [paths addObject:[@"./" stringByAppendingString:spec[1]]];
+ 
+@@ -14698,3 +14717,75 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
+ 
+     return 1;
+ }
++
++/* =========================================================================
++ * IdleToken: unified-memory counterparts of the CUDA-only hooks.
++ * =========================================================================
++ *
++ * `ds4.c` and the IdleToken worker call six entry points that exist only in
++ * `ds4_cuda.cu`. Every one of them manages the boundary between host memory
++ * and a *separate* device memory pool: budget the VRAM, prefetch experts over
++ * PCIe, measure how much host memory can be pinned. On Apple Silicon there is
++ * no such boundary — `ds4_gpu_wrap_model_range` above hands the mmap'd GGUF
++ * straight to Metal as a no-copy `MTLBuffer` view, so a weight is readable by
++ * the GPU the moment the page is resident and there is nothing to move, budget
++ * or pin.
++ *
++ * So these are deliberate no-ops, not placeholders for unwritten work. They
++ * are written out as real functions (rather than `#define`d away in ds4.c)
++ * so `ds4_gpu.h` stays one contract with two implementations, and so anyone
++ * grepping for the symbol lands on this explanation.
++ *
++ * The one that is NOT free: if a future Metal path ever copies weights into
++ * private storage, `ds4_gpu_set_hybrid_vram_budget` becomes load-bearing and
++ * must start enforcing. It logs its argument for exactly that reason — a
++ * silently-ignored user memory cap is how the CUDA side once let the card
++ * fill past the limit the client had set. */
++
++void ds4_gpu_set_hybrid_vram_budget(uint64_t bytes) {
++    /* Unified memory: weights are read in place from the mapped GGUF, so no
++     * allocation is made against this budget and there is nothing to clamp.
++     * Reported once so a user who set a memory cap can see it arrived. */
++    static int said = 0;
++    if (!said) {
++        said = 1;
++        fprintf(stderr,
++                "ds4: metal backend, unified memory — VRAM budget %.2f GiB noted "
++                "but not enforced (weights are mapped, never copied)\n",
++                (double)bytes / 1073741824.0);
++    }
++}
++
++void ds4_gpu_set_moe_cache(uint64_t bytes, uint32_t n_layers) {
++    /* The CUDA MoE cache keeps hot experts resident in VRAM to avoid re-reading
++     * them over PCIe every token. Mapped weights have no such round trip. */
++    (void)bytes; (void)n_layers;
++}
++
++uint64_t ds4_gpu_probe_pinned_max(void) {
++    /* 0 = "not measured"; callers must then treat the host side as
++     * unconstrained (see idletoken_resource_report.ram_pinnable). That is the
++     * truth here: there is no pinned-staging pool to run out of. */
++    return 0;
++}
++
++void ds4_gpu_moe_prefetch(const void *model_map, uint64_t model_size,
++                          uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
++                          uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
++                          const ds4_gpu_tensor *predicted, uint32_t n_sel) {
++    (void)model_map; (void)model_size;
++    (void)gate_offset; (void)up_offset; (void)down_offset;
++    (void)gate_expert_bytes; (void)down_expert_bytes;
++    (void)predicted; (void)n_sel;
++}
++
++void ds4_gpu_pred_stash(const ds4_gpu_tensor *pred_sel, uint32_t n) {
++    /* Diagnostic only: measures how well layer L's router predicts layer L+1's
++     * expert choice, to decide whether prefetching is worth it. Without a
++     * prefetch to justify, the measurement has no consumer here. */
++    (void)pred_sel; (void)n;
++}
++
++void ds4_gpu_pred_check(const ds4_gpu_tensor *actual_sel, uint32_t n) {
++    (void)actual_sel; (void)n;
++}

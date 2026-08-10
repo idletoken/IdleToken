@@ -825,10 +825,12 @@ body {
   margin-left: auto;
 }
 
-/* Weight status for the selected model. Takes a full row of its own (the row is
-   a flex line with params pushed right, so anything appended would fight for
-   the same line) — this is where the old floating banner's content went. */
-.model-opt__weights {
+/* Weight status. Rendered inside two different flex rows — the model option in
+   Settings and the "run on this machine" row on Cluster — so it claims a full
+   line of its own in both (each host row already has content pushed to the
+   right that it must not fight with). This is where the old floating banner's
+   content went. */
+.wrow {
   flex-basis: 100%;
   display: flex;
   align-items: center;
@@ -841,10 +843,19 @@ body {
   cursor: default;
 }
 
-.model-opt__weights--ok { color: var(--ink-faint); }
-.model-opt__weights--err { color: var(--bad); }
+/* Long endpoint/error text must not shove the Cancel button off the row. */
+.wrow__msg {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
-.model-opt__wbar {
+.wrow--ok { color: var(--ink-faint); }
+.wrow--err { color: var(--bad); }
+
+.wrow__bar {
   flex: 0 0 120px;
   height: 5px;
   border-radius: 3px;
@@ -852,7 +863,7 @@ body {
   overflow: hidden;
 }
 
-.model-opt__wbar > i {
+.wrow__bar > i {
   display: block;
   height: 100%;
   background: var(--amber);
@@ -2008,6 +2019,12 @@ body {
 .deploy-opt {
   display: flex;
   align-items: center;
+  /* Required, not cosmetic: .wrow is a flex-basis:100% child, and without wrap
+     it competes for the SAME line — .deploy-opt__text has min-width:0, so it
+     gets squeezed to zero and the paragraph renders as one character per line.
+     That is what a failed download looked like on 2026-08-10 (reported as
+     "the page looks garbled"). .model-opt got this; this row was missed. */
+  flex-wrap: wrap;
   gap: 24px;
   padding: 18px 20px;
   border: 1px solid var(--line);
