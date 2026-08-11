@@ -83,6 +83,19 @@ int idletoken_http_send_sse_head(int conn_fd);
 int idletoken_http_sse_event(int conn_fd, const char *event,
                           const char *data, size_t data_len);
 
+/* Where a request came from, so the coordinator can tell a job the platform
+ * dispatched from one a client on the LAN sent directly. Both arrive on the same
+ * endpoint: the platform agent opens the sealed envelope and forwards the
+ * plaintext to the coordinator over loopback, which until now was
+ * indistinguishable from a local request.
+ *
+ * This matters for overflow routing (docs/overflow-routing-design.md): a job the
+ * platform dispatched must be finished locally or refused, and must never be
+ * forwarded back out. Defining the name in one place keeps the agent that sets
+ * it and the coordinator that reads it from drifting apart. */
+#define IDLETOKEN_HDR_ORIGIN       "X-IdleToken-Origin"
+#define IDLETOKEN_ORIGIN_PLATFORM  "platform"
+
 /* Extract one header value by name (case-insensitive) from `req->headers`.
  * Copies the value (leading/trailing whitespace trimmed) into `out`.
  * Returns 0 on success, -1 if the header is absent (or was truncated away).

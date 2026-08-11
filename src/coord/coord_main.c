@@ -1173,6 +1173,29 @@ static size_t coord_tok_text(ds4_engine *e, ds4x_tokenizer *xt, int tok,
     return n;
 }
 
+/* Did this request come from the platform, or from a client on this LAN?
+ *
+ * Both arrive on this same endpoint: the platform agent opens the sealed
+ * envelope and forwards the plaintext here over loopback (platform_agent.c),
+ * which until the agent started marking it was indistinguishable from a request
+ * a user sent directly.
+ *
+ * Overflow routing needs the distinction (docs/overflow-routing-design.md §2): a
+ * job the platform dispatched is finished here or refused, and is never
+ * forwarded back out. Only requests that started locally may ever be forwarded.
+ *
+ * A request with no marker counts as local, because a local client -- curl,
+ * Claude Code, anything -- has no reason to send one. That puts the entire
+ * weight of the rule on the agent actually setting the header, which is why the
+ * gate asserts against the real agent rather than against this function alone.
+ * Nothing reads this yet; O0 records the fact and changes no behaviour. */
+static int request_from_platform(const idletoken_http_req *req) {
+    char origin[32] = "";
+    if (idletoken_http_header_get(req, IDLETOKEN_HDR_ORIGIN, origin, sizeof(origin)) != 0)
+        return 0;
+    return strcmp(origin, IDLETOKEN_ORIGIN_PLATFORM) == 0;
+}
+
 /* --selftest: unit tests for the two blocks of pure logic above (no GGUF or
  * engine dependency), runnable on a Mac as well as on real hardware. */
 static int msg_collect_cb(void *ud, const char *role, const char *content) {
@@ -1399,6 +1422,40 @@ static int coord_selftest(void) {
 
         kv_slots_reset_all();
         g_n_slots = 1;
+    }
+
+    /* Request origin (docs/overflow-routing-design.md §3). Overflow routing
+     * hangs entirely off this predicate, so it is tested directly rather than
+     * only through the agent. */
+    {
+        idletoken_http_req r;
+        memset(&r, 0, sizeof(r));
+
+        snprintf(r.headers, sizeof(r.headers),
+                 "Host: 127.0.0.1:8000\r\n" IDLETOKEN_HDR_ORIGIN ": " IDLETOKEN_ORIGIN_PLATFORM "\r\n");
+        ST(request_from_platform(&r) == 1, "origin: the agent's marker is recognized");
+
+        /* Header names are case-insensitive on the wire; a proxy may rewrite
+         * them, and the answer must not change. */
+        snprintf(r.headers, sizeof(r.headers), "x-idletoken-origin: platform\r\n");
+        ST(request_from_platform(&r) == 1, "origin: marker matches case-insensitively");
+
+        snprintf(r.headers, sizeof(r.headers), "Content-Type: application/json\r\n");
+        ST(request_from_platform(&r) == 0, "origin: no marker means local");
+
+        r.headers[0] = 0;
+        ST(request_from_platform(&r) == 0, "origin: no headers at all means local");
+
+        /* A value we did not write must never be read as the platform: an
+         * unknown marker is not a licence to skip the rule. */
+        snprintf(r.headers, sizeof(r.headers), IDLETOKEN_HDR_ORIGIN ": platform-ish\r\n");
+        ST(request_from_platform(&r) == 0, "origin: an unknown value is not the platform");
+
+        /* A LAN client can spoof the marker, and that is harmless by
+         * construction: claiming to be the platform only forfeits its own
+         * request's right to be forwarded. It can never gain one. */
+        snprintf(r.headers, sizeof(r.headers), IDLETOKEN_HDR_ORIGIN ": local\r\n");
+        ST(request_from_platform(&r) == 0, "origin: an explicit local marker stays local");
     }
 
     /* --- Automatic decision on interleaved execution (E3.4) -------------
@@ -2172,8 +2229,9 @@ static void handle_http_request(int conn_fd,
         idletoken_http_send_error(conn_fd, 400, "bad request");
         return;
     }
-    fprintf(stderr, "coord: http: %s %s  body=%zuB\n",
-            req.method, req.path, req.body_len);
+    const int from_platform = request_from_platform(&req);
+    fprintf(stderr, "coord: http: %s %s  body=%zuB  origin=%s\n",
+            req.method, req.path, req.body_len, from_platform ? "platform" : "local");
 
     /* GET /health — quick liveness probe. */
     if (!strcmp(req.method, "GET") && !strcmp(req.path, "/health")) {

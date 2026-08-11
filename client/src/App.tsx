@@ -938,6 +938,39 @@ export default function App() {
     [needsWeights, weightsPath, dl, ensureWeights, cancelDownload]
   );
 
+  /**
+   * "Run it here": download the weights if needed, then serve from this one
+   * machine. Single-node-first (small-model-design §4) — a solo create
+   * (num_workers=1, co-located worker) plus start IS a 1-node serving cluster;
+   * more machines can join later via Manage.
+   *
+   * Standalone means this machine is the coordinator and nobody else can feed
+   * it shards, so a complete local copy is **required** — hence ensureWeights
+   * first, which blocks for the whole download. That step used to be absent:
+   * "auto" passed an empty path, the engine took the mock branch, mock no
+   * longer falls back, and all the user saw was "failed to start".
+   *
+   * Named (not inline) so the UI-test channel can drive the REAL handler
+   * instead of a lookalike copy — headless_pair's "create" is not equivalent,
+   * it waits for a second peer before starting.
+   */
+  const serveStandalone = useCallback(async () => {
+    if (!snap) return;
+    try {
+      const path = await ensureWeights();
+      await getPairingProvider().create({
+        hostname: snap.hostname,
+        gpu: snap.gpu_name,
+        modelPath: path,
+        tuning: engineTuning(settings),
+      });
+      await getPairingProvider().start();
+    } catch (e) {
+      console.error("serve-standalone:", e);
+      setDl({ have: 0, total: 0, error: String(e) });
+    }
+  }, [snap, ensureWeights, settings]);
+
   // Preset caps derive from the machine's totals (learned from the first probe);
   // "custom" uses the precise sliders directly.
   const caps = useMemo(
@@ -1189,6 +1222,39 @@ export default function App() {
             }
           })();
         }
+        // "Does finishing the download actually start the service?" — driven
+        // through the SAME callback the button uses, then it reports what the
+        // cluster and its API did. headless_pair's create() is not a substitute:
+        // it waits for a second peer before starting, which is the opposite of
+        // what this path is for.
+        if (d === "serve-standalone") {
+          (async () => {
+            const t0 = Date.now();
+            try {
+              // There is no snapshot() on the provider — state arrives by
+              // subscription, so latch the latest and watch that. Held in an
+              // object because a plain `let` assigned only inside the callback
+              // gets narrowed to `never` by control-flow analysis.
+              const box: { s: PairingSnapshot | null } = { s: null };
+              const un = getPairingProvider().subscribe((v) => { box.s = v; });
+              await serveStandalone();
+              for (let i = 0; i < 120; i++) {
+                await new Promise((r) => setTimeout(r, 2000));
+                if (box.s && (box.s.phase === "ready" || box.s.peers.some((p) => p.stage === "error"))) break;
+              }
+              un();
+              const s = box.s;
+              reportTest("serveStandalone", {
+                seconds: Math.round((Date.now() - t0) / 1000),
+                phase: s?.phase ?? null,
+                peers: s?.peers.map((p) => ({ stage: p.stage, layers: `${p.layerLo}-${p.layerHi}` })) ?? [],
+                api: s?.api ?? null,
+              });
+            } catch (e) {
+              reportTest("serveStandalone", { error: String(e), seconds: Math.round((Date.now() - t0) / 1000) });
+            }
+          })();
+        }
         if (d === "report-probe") {
           getResourceProvider()
             .probe({})
@@ -1402,33 +1468,7 @@ export default function App() {
                 quant={settings.quant}
                 tier={TIERS.find((x) => x.id === settings.tier) ?? TIERS[1]}
                 pair={pairSnap}
-                onServeStandalone={async () => {
-                  // Single-node-first (small-model-design §4): the model+precision
-                  // fits this one machine → serve immediately, no pairing. A solo
-                  // create (num_workers=1, co-located worker) + start = a 1-node
-                  // serving cluster; others can still be added later via Manage.
-                  try {
-                    // Standalone means this machine is the coordinator and nobody
-                    // else can feed it shards, so a complete local copy of the
-                    // weights is **required**. If it is missing, download it first
-                    // (progress reaches the banner below through weights-fetch
-                    // events). This step used to be absent: auto passed an empty
-                    // string, the engine took the mock branch, mock no longer falls
-                    // back, loading failed outright -- and all the user saw was
-                    // "failed to start".
-                    const path = await ensureWeights();
-                    await getPairingProvider().create({
-                      hostname: snap.hostname,
-                      gpu: snap.gpu_name,
-                      modelPath: path,
-                      tuning: engineTuning(settings),
-                    });
-                    await getPairingProvider().start();
-                  } catch (e) {
-                    console.error("serve-standalone:", e);
-                    setDl({ have: 0, total: 0, error: String(e) });
-                  }
-                }}
+                onServeStandalone={serveStandalone}
                 onCreateCluster={() => {
                   setPairingView("choose");
                   setShowPairing(true);

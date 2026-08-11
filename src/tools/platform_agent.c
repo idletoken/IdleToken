@@ -574,7 +574,7 @@ static int json_int_field(const char *json, size_t len, const char *key, int dfl
  * inference where the caller owns pacing). */
 static uint8_t *http_request_json(const char *method,
                                   const char *addr, const char *path,
-                                  const char *bearer,
+                                  const char *bearer, const char *extra_hdr,
                                   const uint8_t *body, size_t body_len,
                                   int *out_status, size_t *out_len,
                                   int timeout_secs) {
@@ -606,9 +606,10 @@ static uint8_t *http_request_json(const char *method,
                       "Host: %s\r\n"
                       "Content-Type: application/json\r\n"
                       "Content-Length: %zu\r\n"
-                      "%s"
+                      "%s%s"
                       "Connection: close\r\n\r\n",
-                      method, path, addr, body_len, auth);
+                      method, path, addr, body_len, auth,
+                      extra_hdr ? extra_hdr : "");
     if (hn < 0 || (size_t)hn >= sizeof(head)) { close(fd); return NULL; }
     if (idletoken_sendall(fd, head, (size_t)hn) < 0 ||
         (body_len && idletoken_sendall(fd, body, body_len) < 0)) {
@@ -754,13 +755,30 @@ static char *platform_register(const char *platform_addr, const char *jwt,
 static uint8_t *http_post_json(const char *addr, const char *path, const char *bearer,
                                const uint8_t *body, size_t body_len,
                                int *out_status, size_t *out_len, int timeout_secs) {
-    return http_request_json("POST", addr, path, bearer, body, body_len,
+    return http_request_json("POST", addr, path, bearer, NULL, body, body_len,
                              out_status, out_len, timeout_secs);
+}
+
+/* The forward into the local coordinator, marked as platform-dispatched.
+ *
+ * The coordinator must be able to tell this job from one a LAN client sent
+ * directly, because a platform job has to be finished here or refused -- it is
+ * never forwarded back out (docs/overflow-routing-design.md §2). Both arrive on
+ * the same endpoint over loopback, so the marker is the only thing that
+ * distinguishes them; if this header is ever dropped, that rule silently stops
+ * holding. G_OVERFLOW_ORIGIN exists to catch exactly that. */
+static uint8_t *http_post_json_platform(const char *addr, const char *path,
+                                        const uint8_t *body, size_t body_len,
+                                        int *out_status, size_t *out_len,
+                                        int timeout_secs) {
+    return http_request_json("POST", addr, path, NULL,
+                             IDLETOKEN_HDR_ORIGIN ": " IDLETOKEN_ORIGIN_PLATFORM "\r\n",
+                             body, body_len, out_status, out_len, timeout_secs);
 }
 
 static uint8_t *http_get_json(const char *addr, const char *path,
                               int *out_status, size_t *out_len, int timeout_secs) {
-    return http_request_json("GET", addr, path, NULL, NULL, 0,
+    return http_request_json("GET", addr, path, NULL, NULL, NULL, 0,
                              out_status, out_len, timeout_secs);
 }
 
@@ -1072,7 +1090,7 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
     int cstatus = 0; size_t cresp_len = 0;
     uint8_t *cresp = NULL;
     if (cl > 0 && (size_t)cl < creq_cap)
-        cresp = http_post_json(coord_addr, "/v1/chat/completions", NULL,
+        cresp = http_post_json_platform(coord_addr, "/v1/chat/completions",
                                (const uint8_t *)creq, (size_t)cl, &cstatus, &cresp_len,
                                0 /* no timeout: real-model inference is slow by design */);
     /* plaintext request buffers are done — wipe immediately */
