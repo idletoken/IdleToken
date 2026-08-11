@@ -298,6 +298,36 @@ int idletoken_http_header_get(const idletoken_http_req *req, const char *name,
 /* Naive flat-JSON string extractor. Finds `"key"` then `:` then a `"..."`
  * value with simple \\ and \" escapes. Returns 0 on success, -1 if not
  * found or malformed. */
+/* Parse exactly four hex digits into *out. Returns 0 on success. */
+static int json_hex4(const char *s, unsigned *out) {
+    unsigned v = 0;
+    for (int i = 0; i < 4; i++) {
+        char c = s[i];
+        unsigned d;
+        if (c >= '0' && c <= '9')      d = (unsigned)(c - '0');
+        else if (c >= 'a' && c <= 'f') d = (unsigned)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') d = (unsigned)(c - 'A' + 10);
+        else return -1;
+        v = (v << 4) | d;
+    }
+    *out = v;
+    return 0;
+}
+
+/* Encode one code point as UTF-8; returns the number of bytes written (<= 4).
+ * Caller guarantees room. Unpaired surrogates become U+FFFD rather than
+ * invalid UTF-8 -- the tokenizer downstream must never see a broken sequence. */
+static size_t json_utf8_put(char *out, unsigned cp) {
+    if (cp >= 0xD800 && cp <= 0xDFFF) cp = 0xFFFD;
+    if (cp < 0x80)    { out[0] = (char)cp; return 1; }
+    if (cp < 0x800)   { out[0] = (char)(0xC0 | (cp >> 6));  out[1] = (char)(0x80 | (cp & 0x3F)); return 2; }
+    if (cp < 0x10000) { out[0] = (char)(0xE0 | (cp >> 12)); out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                        out[2] = (char)(0x80 | (cp & 0x3F)); return 3; }
+    out[0] = (char)(0xF0 | (cp >> 18));        out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    out[2] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[3] = (char)(0x80 | (cp & 0x3F));
+    return 4;
+}
+
 int idletoken_http_json_extract_str(const char *json, size_t json_len,
                                  const char *key,
                                  char *out, size_t out_cap) {
@@ -321,15 +351,51 @@ int idletoken_http_json_extract_str(const char *json, size_t json_len,
                                  json[p] == '\n' || json[p] == '\r')) p++;
         if (p >= json_len || json[p] != '"') continue;
         p++;
-        /* Copy until closing `"`, honoring \\ and \". */
+        /* Copy until the closing `"`, decoding JSON string escapes.
+         *
+         * The table used to stop at \" \\ \n \t and copy anything else with the
+         * backslash dropped, which quietly corrupted two things that arrive
+         * every day:
+         *   \uXXXX -- Python's json.dumps escapes ALL non-ASCII by default
+         *             (ensure_ascii=True), so an OpenAI-compatible client
+         *             sending "你好" puts \u4f60\u597d on the wire and the
+         *             engine fed the model the literal text "u4f60u597d".
+         *             Every CJK prompt from such a client was garbage.
+         *   \r     -- survives a round trip through any Windows text a user
+         *             pastes, and became a bare "r" mid-sentence.
+         * Both are silent: the request succeeds and the reply is merely wrong,
+         * which is the hardest kind of failure to attribute. */
         size_t op = 0;
         while (p < json_len && op + 1 < out_cap) {
             char c = json[p];
             if (c == '\\' && p + 1 < json_len) {
                 char e = json[p + 1];
-                if (e == '"' || e == '\\') { out[op++] = e; p += 2; continue; }
+                if (e == '"' || e == '\\' || e == '/') { out[op++] = e; p += 2; continue; }
                 if (e == 'n') { out[op++] = '\n'; p += 2; continue; }
                 if (e == 't') { out[op++] = '\t'; p += 2; continue; }
+                if (e == 'r') { out[op++] = '\r'; p += 2; continue; }
+                if (e == 'b') { out[op++] = '\b'; p += 2; continue; }
+                if (e == 'f') { out[op++] = '\f'; p += 2; continue; }
+                if (e == 'u' && p + 5 < json_len) {
+                    unsigned cp = 0;
+                    if (json_hex4(json + p + 2, &cp) == 0) {
+                        p += 6;
+                        /* Surrogate pair: the escape encodes UTF-16, and a high
+                         * surrogate alone is not a character. */
+                        if (cp >= 0xD800 && cp <= 0xDBFF && p + 5 < json_len &&
+                            json[p] == '\\' && json[p + 1] == 'u') {
+                            unsigned lo = 0;
+                            if (json_hex4(json + p + 2, &lo) == 0 &&
+                                lo >= 0xDC00 && lo <= 0xDFFF) {
+                                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                                p += 6;
+                            }
+                        }
+                        if (op + 4 >= out_cap) break;   /* no room: stop cleanly */
+                        op += json_utf8_put(out + op, cp);
+                        continue;
+                    }
+                }
                 /* Unrecognized escape: copy as-is. */
                 out[op++] = e; p += 2; continue;
             }

@@ -16,23 +16,52 @@
  * each file's tensor directory was summed, blk.N.* to layer and the rest to
  * shared. These numbers drive mode selection and the layer split, so an
  * estimate that is 20% high can turn a workable GPU_ONLY plan into HYBRID. */
-/* Only the quant that has actually been downloaded and run. Listing sizes for
- * files nobody has measured would put invented numbers into the resource
- * planner, which is the one place they would silently become "facts". */
+/* Every entry below is MEASURED, never estimated: scripts/measure_gguf.py reads
+ * the file's tensor directory over HTTP Range and sums blk.N.* into layer and
+ * the rest into shared, asserting layer + shared + header == file size. An
+ * invented number here becomes a "fact" inside the resource planner, silently.
+ *
+ * These lists used to hold one quant each precisely because nobody had measured
+ * the others -- the right call, but it left the precision menu present on some
+ * models and absent on others. Meanwhile QWEN3_8B_VARIANTS had quietly broken
+ * the rule: four of its five entries were round numbers somebody estimated,
+ * 0.4-0.6 GB high, and its BF16 entry named a file that does not exist in
+ * Qwen/Qwen3-8B-GGUF at all -- picking it could only ever 404. Measuring is now
+ * one command, so "we have not measured it" is no longer a reason to ship a
+ * short menu, and estimating is not a shortcut anyone needs to take.
+ *
+ * A quant appears here only if the repo really publishes it AND ds4x can
+ * dequantize it (src/ds4x/ds4x_quant.c: F32/F16/BF16/Q8_0/Q4_0/Q2_K/Q4_K/Q5_K/
+ * Q6_K/IQ2_XXS) -- which is why the IQ4_XS and Q3_K files upstream ships are
+ * absent, and why three repos have no BF16 row. */
 static const idletoken_model_variant QWEN35_4B_VARIANTS[] = {
-    { .quant = "Q4_K_M", .layer_weight_bytes = 2208487424ull, .shared_weight_bytes = 521482240ull, .gguf = "Qwen3.5-4B-Q4_K_M.gguf" },
+    { .quant = "Q4_K_M", .layer_weight_bytes = 2208487424ull, .shared_weight_bytes =  521482240ull, .gguf = "Qwen3.5-4B-Q4_K_M.gguf" },
+    { .quant = "Q5_K_M", .layer_weight_bytes = 2611206144ull, .shared_weight_bytes =  521482240ull, .gguf = "Qwen3.5-4B-Q5_K_M.gguf" },
+    { .quant = "Q6_K",   .layer_weight_bytes = 2993506304ull, .shared_weight_bytes =  521482240ull, .gguf = "Qwen3.5-4B-Q6_K.gguf" },
+    { .quant = "Q8_0",   .layer_weight_bytes = 3795994624ull, .shared_weight_bytes =  675440640ull, .gguf = "Qwen3.5-4B-Q8_0.gguf" },
+    { .quant = "BF16",   .layer_weight_bytes = 7142017024ull, .shared_weight_bytes = 1271408640ull, .gguf = "Qwen3.5-4B-BF16.gguf" },
 };
 
 static const idletoken_model_variant QWEN35_9B_VARIANTS[] = {
-    { .quant = "Q4_K_M", .layer_weight_bytes = 4263053312ull, .shared_weight_bytes = 1406500864ull, .gguf = "Qwen3.5-9B-Q4_K_M.gguf" },
+    { .quant = "Q4_K_M", .layer_weight_bytes =  4263053312ull, .shared_weight_bytes = 1406500864ull, .gguf = "Qwen3.5-9B-Q4_K_M.gguf" },
+    { .quant = "Q5_K_M", .layer_weight_bytes =  5033232384ull, .shared_weight_bytes = 1533640704ull, .gguf = "Qwen3.5-9B-Q5_K_M.gguf" },
+    { .quant = "Q6_K",   .layer_weight_bytes =  5778606080ull, .shared_weight_bytes = 1668726784ull, .gguf = "Qwen3.5-9B-Q6_K.gguf" },
+    { .quant = "Q8_0",   .layer_weight_bytes =  7355140096ull, .shared_weight_bytes = 2161393664ull, .gguf = "Qwen3.5-9B-Q8_0.gguf" },
+    { .quant = "BF16",   .layer_weight_bytes = 13841238016ull, .shared_weight_bytes = 4068491264ull, .gguf = "Qwen3.5-9B-BF16.gguf" },
 };
 
 static const idletoken_model_variant QWEN35_27B_VARIANTS[] = {
     { .quant = "Q4_K_M", .layer_weight_bytes = 14971693056ull, .shared_weight_bytes = 1758126080ull, .gguf = "Qwen3.5-27B-Q4_K_M.gguf" },
+    { .quant = "Q5_K_M", .layer_weight_bytes = 17680951296ull, .shared_weight_bytes = 1917050880ull, .gguf = "Qwen3.5-27B-Q5_K_M.gguf" },
+    { .quant = "Q6_K",   .layer_weight_bytes = 20357031936ull, .shared_weight_bytes = 2085908480ull, .gguf = "Qwen3.5-27B-Q6_K.gguf" },
+    { .quant = "Q8_0",   .layer_weight_bytes = 25883027456ull, .shared_weight_bytes = 2701742080ull, .gguf = "Qwen3.5-27B-Q8_0.gguf" },
 };
 
 static const idletoken_model_variant QWEN35_35B_A3B_VARIANTS[] = {
-    { .quant = "Q4_K_M", .layer_weight_bytes = 21047503360ull, .shared_weight_bytes = 957530112ull, .gguf = "Qwen3.5-35B-A3B-Q4_K_M.gguf" },
+    { .quant = "Q4_K_M", .layer_weight_bytes = 21047503360ull, .shared_weight_bytes =  957530112ull, .gguf = "Qwen3.5-35B-A3B-Q4_K_M.gguf" },
+    { .quant = "Q5_K_M", .layer_weight_bytes = 25157921280ull, .shared_weight_bytes = 1080696832ull, .gguf = "Qwen3.5-35B-A3B-Q5_K_M.gguf" },
+    { .quant = "Q6_K",   .layer_weight_bytes = 27761175040ull, .shared_weight_bytes = 1080696832ull, .gguf = "Qwen3.5-35B-A3B-Q6_K.gguf" },
+    { .quant = "Q8_0",   .layer_weight_bytes = 35811453440ull, .shared_weight_bytes = 1080696832ull, .gguf = "Qwen3.5-35B-A3B-Q8_0.gguf" },
 };
 
 static const idletoken_model_variant QWEN35_08B_VARIANTS[] = {
@@ -44,11 +73,10 @@ static const idletoken_model_variant QWEN35_08B_VARIANTS[] = {
 };
 
 static const idletoken_model_variant QWEN3_8B_VARIANTS[] = {
-    { .quant = "Q4_K_M", .layer_weight_bytes = 4161245184ull, .shared_weight_bytes = 860581888ull,  .gguf = "Qwen3-8B-Q4_K_M.gguf" },
-    { .quant = "Q5_K_M", .layer_weight_bytes = 5270000000ull, .shared_weight_bytes = 1010000000ull, .gguf = "Qwen3-8B-Q5_K_M.gguf" },
-    { .quant = "Q6_K",   .layer_weight_bytes = 6070000000ull, .shared_weight_bytes = 1160000000ull, .gguf = "Qwen3-8B-Q6_K.gguf" },
-    { .quant = "Q8_0",   .layer_weight_bytes = 7860000000ull, .shared_weight_bytes = 1490000000ull, .gguf = "Qwen3-8B-Q8_0.gguf" },
-    { .quant = "BF16",   .layer_weight_bytes = 14800000000ull, .shared_weight_bytes = 2810000000ull, .gguf = "Qwen3-8B-BF16.gguf" },
+    { .quant = "Q4_K_M", .layer_weight_bytes = 4161245184ull, .shared_weight_bytes =  860581888ull, .gguf = "Qwen3-8B-Q4_K_M.gguf" },
+    { .quant = "Q5_K_M", .layer_weight_bytes = 4906782720ull, .shared_weight_bytes =  938373120ull, .gguf = "Qwen3-8B-Q5_K_M.gguf" },
+    { .quant = "Q6_K",   .layer_weight_bytes = 5698916352ull, .shared_weight_bytes = 1021026304ull, .gguf = "Qwen3-8B-Q6_K.gguf" },
+    { .quant = "Q8_0",   .layer_weight_bytes = 7381094400ull, .shared_weight_bytes = 1322467328ull, .gguf = "Qwen3-8B-Q8_0.gguf" },
 };
 
 /* DSv4-Flash precision menu. Both entries are the OFFICIAL 0731 release

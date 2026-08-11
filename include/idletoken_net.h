@@ -20,6 +20,10 @@ ssize_t idletoken_sendall(int fd, const void *buf, size_t n);
  * errno=ECONNRESET. On error returns -1 with errno set. */
 ssize_t idletoken_recvall(int fd, void *buf, size_t n);
 
+/* 1 if the peer has closed its end (never consumes data, never blocks).
+ * Fails open: 0 also means "cannot tell". */
+int idletoken_peer_closed(int fd);
+
 /* Serialize/deserialize the 48-byte fixed header in canonical little-endian
  * wire form. Safe to call on big-endian hosts (not that we target any). */
 void idletoken_header_pack(const idletoken_msg_header *h, uint8_t out[48]);

@@ -5,6 +5,7 @@
 // whether an access token goes out, the last place that should have two
 // implementations.
 import type { AppSettings } from "./settings";
+import { readChatFailures } from "./chatErrors";
 
 // The settings fields that go into the bundle (an **allowlist**). Anything that
 // could carry a credential is excluded: apiToken, the platform session, any
@@ -27,7 +28,12 @@ export function buildDiagnosticsBundle(
 ): Record<string, unknown> {
   const picked: Record<string, unknown> = {};
   for (const k of DIAG_SETTING_KEYS) picked[k] = settings[k];
-  return { ...report, settings: picked };
+  // Recent chat failures. The bundle exists so a user does not have to open a
+  // console, and it used to carry hardware and settings but not one word about
+  // what actually went wrong — the error lived in a banner the next send wiped,
+  // so "what did it say?" had no answer. No prompts or replies go in: see
+  // chatErrors.ts for what is deliberately excluded.
+  return { ...report, settings: picked, recent_chat_failures: readChatFailures() };
 }
 
 /** The filename carries a UTC timestamp: users often send several in a row, and identically named files have overwritten each other. */

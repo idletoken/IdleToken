@@ -44,8 +44,24 @@
  * now loop straight back to recv INFER_BEGIN / INFER_HC_FORWARD. Coord MUST
  * NOT send it: a stray ACK would land where the worker expects the next
  * INFER_BEGIN and be rejected as a protocol error. See scheduler-design.md
- * §6-E3. */
-#define IDLETOKEN_PROTO_VERSION 5u
+ * §6-E3.
+ * v6 (argmax at the last stage, 2026-08-11): INFER_LOGITS gains a SHORT FORM.
+ * `n_vocab == 0` means "the last stage already took the argmax"; the payload is
+ * then `u32 pos, u32 0, u32 token_id` — 12 bytes instead of 8 + 4*n_vocab.
+ *
+ * Why: the coordinator's only use of that vector has always been one argmax
+ * (coord_main.c), so a 248,320-entry vocab shipped 993,280 B per token to
+ * decide 4 bytes' worth of answer. Measured on one machine over loopback that
+ * round trip plus the argmax cost ~6.9 ms of a 32.8 ms token — the socket has
+ * to move ~1 MB through default-sized buffers every step. Across a real LAN it
+ * is worse: 970 KB per token is ~8 ms on gigabit before anything else.
+ *
+ * The long form is NOT retired — it stays the wire format whenever the
+ * coordinator needs the distribution rather than the winner (temperature /
+ * top-p / logprobs are all future callers), and IDLETOKEN_FULL_LOGITS=1 forces
+ * it for debugging. A v6 coordinator accepts both forms; that is what makes
+ * adding sampling later a coordinator-side change instead of a wire change. */
+#define IDLETOKEN_PROTO_VERSION 6u
 
 /* Upper bound on persistent sequence slots per cluster. seq_id is a single
  * byte on the wire; the platform scheduler caps concurrency at 64 anyway

@@ -63,6 +63,34 @@
       "shared_weight_bytes": 521482240,
       "repo": "unsloth/Qwen3.5-4B-GGUF",
       "gguf": "Qwen3.5-4B-Q4_K_M.gguf"
+    },
+    {
+      "quant": "Q5_K_M",
+      "layer_weight_bytes": 2611206144,
+      "shared_weight_bytes": 521482240,
+      "repo": "unsloth/Qwen3.5-4B-GGUF",
+      "gguf": "Qwen3.5-4B-Q5_K_M.gguf"
+    },
+    {
+      "quant": "Q6_K",
+      "layer_weight_bytes": 2993506304,
+      "shared_weight_bytes": 521482240,
+      "repo": "unsloth/Qwen3.5-4B-GGUF",
+      "gguf": "Qwen3.5-4B-Q6_K.gguf"
+    },
+    {
+      "quant": "Q8_0",
+      "layer_weight_bytes": 3795994624,
+      "shared_weight_bytes": 675440640,
+      "repo": "unsloth/Qwen3.5-4B-GGUF",
+      "gguf": "Qwen3.5-4B-Q8_0.gguf"
+    },
+    {
+      "quant": "BF16",
+      "layer_weight_bytes": 7142017024,
+      "shared_weight_bytes": 1271408640,
+      "repo": "unsloth/Qwen3.5-4B-GGUF",
+      "gguf": "Qwen3.5-4B-BF16.gguf"
     }
   ],
   "notes": [

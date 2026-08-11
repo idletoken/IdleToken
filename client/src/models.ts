@@ -102,7 +102,24 @@ function toSpec(m: ModelManifest): ModelSpec {
 
 export const MODELS: ModelSpec[] = MANIFESTS.map(toSpec);
 
+/**
+ * The models a user can actually pick.
+ *
+ * `MODELS` still holds every manifest, because `getModel`/`getManifest` must be
+ * able to resolve an id that is no longer offered (a stored setting, a cluster
+ * reporting what it serves). But nothing user-facing should list a model the
+ * engine cannot run: a greyed-out row with a "coming soon" badge is a promise
+ * in the settings panel, and it pushed the four models that DO run below the
+ * fold. Roadmap belongs in the docs, not in a picker.
+ */
+export const AVAILABLE_MODELS: ModelSpec[] = MODELS.filter((m) => m.available);
+
 export const DEFAULT_MODEL_ID = "deepseek-v4-flash";
+
+/** Is this id something the engine can run today? Unknown ids are not. */
+export function isAvailable(id: string): boolean {
+  return MODELS.some((m) => m.id === id && m.available);
+}
 
 export function getModel(id: string): ModelSpec {
   return MODELS.find((m) => m.id === id) ?? MODELS[0];

@@ -36,14 +36,24 @@ function ctxLabel(ctx: number): string {
   return `${Math.round(ctx / 1024)}K`;
 }
 
-/** Load the report: cluster endpoint when paired, local engine otherwise. */
+/**
+ * Load the report: cluster endpoint when paired, local engine otherwise.
+ *
+ * The cluster call goes through Rust (`api_capability`), NOT the webview's
+ * fetch. The engine serves plain LAN HTTP with no CORS headers, so a direct
+ * fetch is refused before a byte moves — which surfaced as
+ * "读取能力报告失败: TypeError: Failed to fetch" the moment a cluster came up.
+ * Every other engine call here already went through Rust for this reason
+ * (api_stats, api_chat, diagnostics); this one was the exception.
+ *
+ * In a plain browser there is no Tauri and no cluster to reach; the caller
+ * renders the error, which is the honest outcome there.
+ */
 export async function loadCapability(apiBaseUrl?: string | null): Promise<CapabilityReport> {
-  if (apiBaseUrl) {
-    const res = await fetch(`${apiBaseUrl.replace(/\/+$/, "")}/v1/capability`);
-    if (!res.ok) throw new Error(`capability ${res.status}`);
-    return (await res.json()) as CapabilityReport;
-  }
   const { invoke } = await import("@tauri-apps/api/core");
+  if (apiBaseUrl) {
+    return (await invoke("api_capability", { baseUrl: apiBaseUrl })) as CapabilityReport;
+  }
   return (await invoke("advise_capability")) as CapabilityReport;
 }
 

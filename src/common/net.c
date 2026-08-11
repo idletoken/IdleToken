@@ -59,6 +59,44 @@ ssize_t idletoken_sendall(int fd, const void *buf, size_t n) {
     return (ssize_t)sent;
 }
 
+/* Has the peer closed its end? Non-blocking, never consumes data.
+ *
+ * Exists so a long generation stops when nobody is listening any more. The
+ * streaming path notices a hang-up because its writes fail, but a non-stream
+ * request writes nothing until it is done -- so it used to decode to the very
+ * end for a client that left, which with an unbounded --max-decode means
+ * occupying the whole cluster for hours over an answer no one will read.
+ *
+ * Only a genuine EOF counts. Readable-with-data is NOT treated as closed: an
+ * HTTP/1.1 client may pipeline the next request onto the same connection, and
+ * killing a live generation for that would be far worse than the waste.
+ * Returns 1 = closed, 0 = still open or unknown (always fail open). */
+int idletoken_peer_closed(int fd) {
+    if (fd < 0) return 0;
+    fd_set rd;
+    struct timeval tv = { 0, 0 };
+    FD_ZERO(&rd);
+#ifdef _WIN32
+    FD_SET((SOCKET)fd, &rd);
+#else
+    if (fd >= FD_SETSIZE) return 0;   /* select() cannot express it; assume open */
+    FD_SET(fd, &rd);
+#endif
+    int n = select(fd + 1, &rd, NULL, NULL, &tv);
+    if (n <= 0) return 0;             /* not readable => no EOF pending */
+    char b;
+    ssize_t r = recv(fd, &b, 1, MSG_PEEK);
+    if (r == 0) return 1;             /* orderly shutdown */
+    if (r < 0) {
+#ifdef _WIN32
+        return WSAGetLastError() != WSAEWOULDBLOCK;
+#else
+        return !(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR);
+#endif
+    }
+    return 0;                         /* real data waiting (pipelined request) */
+}
+
 ssize_t idletoken_recvall(int fd, void *buf, size_t n) {
     unsigned char *p = (unsigned char *)buf;
     size_t got = 0;

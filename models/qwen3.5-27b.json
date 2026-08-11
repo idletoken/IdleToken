@@ -63,6 +63,27 @@
       "shared_weight_bytes": 1758126080,
       "repo": "unsloth/Qwen3.5-27B-GGUF",
       "gguf": "Qwen3.5-27B-Q4_K_M.gguf"
+    },
+    {
+      "quant": "Q5_K_M",
+      "layer_weight_bytes": 17680951296,
+      "shared_weight_bytes": 1917050880,
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "gguf": "Qwen3.5-27B-Q5_K_M.gguf"
+    },
+    {
+      "quant": "Q6_K",
+      "layer_weight_bytes": 20357031936,
+      "shared_weight_bytes": 2085908480,
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "gguf": "Qwen3.5-27B-Q6_K.gguf"
+    },
+    {
+      "quant": "Q8_0",
+      "layer_weight_bytes": 25883027456,
+      "shared_weight_bytes": 2701742080,
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "gguf": "Qwen3.5-27B-Q8_0.gguf"
     }
   ],
   "notes": [

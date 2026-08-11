@@ -28,7 +28,12 @@ MAGIC = 0x31494148
 # coordinator rejects any worker whose version differs at HELLO. Every protocol
 # bump has to be mirrored here.
 # v4 (multi-sequence, 2026-07-30): reserved byte [3] of INFER_BEGIN became seq_id.
-VERSION = 5
+# v6 (argmax at the last stage, 2026-08-11): INFER_LOGITS gained a short form
+# (n_vocab == 0, then a u32 token id). This mock keeps sending the LONG form on
+# purpose -- the coordinator must go on accepting it, both because that is what
+# IDLETOKEN_FULL_LOGITS=1 produces and because non-greedy sampling will need it
+# again. So this file is also the regression test for that acceptance path.
+VERSION = 6
 MSG_HELLO = 0x0001
 MSG_HELLO_ACK = 0x0002
 MSG_RESOURCE_REPORT = 0x0010

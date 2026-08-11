@@ -49,31 +49,24 @@
     },
     {
       "quant": "Q5_K_M",
-      "layer_weight_bytes": 5270000000,
-      "shared_weight_bytes": 1010000000,
+      "layer_weight_bytes": 4906782720,
+      "shared_weight_bytes": 938373120,
       "repo": "Qwen/Qwen3-8B-GGUF",
       "gguf": "Qwen3-8B-Q5_K_M.gguf"
     },
     {
       "quant": "Q6_K",
-      "layer_weight_bytes": 6070000000,
-      "shared_weight_bytes": 1160000000,
+      "layer_weight_bytes": 5698916352,
+      "shared_weight_bytes": 1021026304,
       "repo": "Qwen/Qwen3-8B-GGUF",
       "gguf": "Qwen3-8B-Q6_K.gguf"
     },
     {
       "quant": "Q8_0",
-      "layer_weight_bytes": 7860000000,
-      "shared_weight_bytes": 1490000000,
+      "layer_weight_bytes": 7381094400,
+      "shared_weight_bytes": 1322467328,
       "repo": "Qwen/Qwen3-8B-GGUF",
       "gguf": "Qwen3-8B-Q8_0.gguf"
-    },
-    {
-      "quant": "BF16",
-      "layer_weight_bytes": 14800000000,
-      "shared_weight_bytes": 2810000000,
-      "repo": "Qwen/Qwen3-8B-GGUF",
-      "gguf": "Qwen3-8B-BF16.gguf"
     }
   ],
   "note": "Runs on a single machine; verified on real hardware 2026-07-27 (Qwen3-8B Q4_K_M, CPU and CUDA agree token for token)"

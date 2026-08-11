@@ -66,6 +66,8 @@ export default function PairingPanel(props: {
   const [code, setCode] = useState("");
   const [codeErr, setCodeErr] = useState(false);
   const [copied, setCopied] = useState(false);
+  // Revealed only on request while running solo; see the active view below.
+  const [showCode, setShowCode] = useState(false);
   const [snap, setSnap] = useState<PairingSnapshot | null>(null);
 
   useEffect(() => {
@@ -111,6 +113,9 @@ export default function PairingPanel(props: {
     setView("choose");
     setCode("");
   };
+  // "Running on one machine", not merely "one peer": while the cluster is still
+  // forming, the roster is legitimately one machine and the code must stay put.
+  const soloRunning = !!snap && snap.phase !== "idle" && snap.peers.length === 1;
   const copyCode = async () => {
     if (!snap?.code) return;
     try {
@@ -209,7 +214,24 @@ export default function PairingPanel(props: {
 
         {view === "active" && snap ? (
           <>
-            {snap.code ? (
+            {/* A RUNNING one-machine deployment does not lead with a join code.
+                Someone who picked "just run here" has nobody to share it with,
+                and a 6-character secret sitting at the top of the panel reads
+                like a step they still owe.
+
+                Not deleted, though: the standalone empty state promises "you can
+                add machines later from Manage", and this code is the only way to
+                do that — removing it outright would make that sentence false. It
+                moves behind an explicit ask instead.
+
+                Only when RUNNING: while the cluster is still forming (idle) the
+                code is the whole point of the screen, however many peers. */}
+            {snap.code && soloRunning && !showCode ? (
+              <button className="linkbtn linkbtn--center" onClick={() => setShowCode(true)}>
+                {t("pairing.addMachine")}
+              </button>
+            ) : null}
+            {snap.code && (!soloRunning || showCode) ? (
               <div className="code-share">
                 <span className="code-share__label">{t("pairing.yourCode")}</span>
                 <div className="code-share__row">

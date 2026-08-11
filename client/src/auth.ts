@@ -248,8 +248,11 @@ export function portalRegisterUrl(): string | null {
   if (!base) return null;
   try {
     const u = new URL(base);
-    u.pathname = "/";
-    u.search = "?auth=register";
+    // A real route, not `/?auth=register`: it is the address of the signup page,
+    // so it can be bookmarked, pasted to someone else, and read as what it is.
+    // (The portal also still honours the old query form — see its App.tsx.)
+    u.pathname = "/register";
+    u.search = "";
     return u.toString();
   } catch {
     return null;

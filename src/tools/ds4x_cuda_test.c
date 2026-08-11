@@ -276,6 +276,20 @@ int main(void) {
     /* non-square (FFN down: n_embd x ff) */
     run_type(12, "Q4_K 4096x12288", 256, 12288);
 
+    /* NARROW rows (n_in <= 2048) select a different Q4_K kernel — one warp per
+     * row instead of one block per row, with a different summation order. Every
+     * case above has n_in 4096 or 12288, so without these two the kernel that
+     * 1024-wide models (Qwen3.5-0.8B and friends) actually run would be
+     * completely uncovered while the gate reported all green.
+     *
+     * That is not hypothetical: a kernel added one commit earlier passed this
+     * gate 35/35 while never executing, because its shape predicate never
+     * matched anything the gate builds. A gate that cannot fail is not a gate.
+     * n_out = 2050 is deliberately not a multiple of MV_WARPS (4), so the
+     * last block's masked-off warps are exercised too. */
+    run_type(12, "Q4_K narrow 2050x1024", 2050, 1024);
+    run_type(12, "Q4_K narrow  512x512",   512,  512);
+
     /* Batched matmul. 13 tokens is deliberately not a multiple of the token
      * tile (8), so the masked tail lanes are exercised; 300 crosses the
      * internal per-launch token block (256). */

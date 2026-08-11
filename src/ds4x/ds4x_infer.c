@@ -251,6 +251,23 @@ int main(int argc, char **argv) {
                     "(%.3f ms/call)  total %.0f ms  overhead %.0f%%\n",
                     (unsigned long long)nc, (unsigned long long)nrows, kms,
                     kms / (double)nc, tms, tms > 0 ? 100.0 * (tms - kms) / tms : 0.0);
+        /* Its own bucket, not folded into matmuls: the whole point of fusing is
+         * that three matmuls become one call, so it has to be visible as the
+         * matmul count dropping and this count rising. */
+        ds4x_cuda_ffn_stats(&kms, &tms, &nc, &nrows);
+        if (nc > 0)
+            fprintf(stderr,
+                    "ds4x cuda: %llu ffns (%llu token-rows)  kernel %.0f ms "
+                    "(%.3f ms/call)  total %.0f ms  overhead %.0f%%\n",
+                    (unsigned long long)nc, (unsigned long long)nrows, kms,
+                    kms / (double)nc, tms, tms > 0 ? 100.0 * (tms - kms) / tms : 0.0);
+        ds4x_cuda_proj_stats(&kms, &tms, &nc, &nrows);
+        if (nc > 0)
+            fprintf(stderr,
+                    "ds4x cuda: %llu projfans (%llu token-rows)  kernel %.0f ms "
+                    "(%.3f ms/call)  total %.0f ms  overhead %.0f%%\n",
+                    (unsigned long long)nc, (unsigned long long)nrows, kms,
+                    kms / (double)nc, tms, tms > 0 ? 100.0 * (tms - kms) / tms : 0.0);
         ds4x_cuda_gdn_stats(&kms, &tms, &nc);
         if (nc > 0)
             fprintf(stderr,

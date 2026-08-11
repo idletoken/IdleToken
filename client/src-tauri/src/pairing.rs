@@ -84,6 +84,20 @@ pub struct Tuning {
     /// Context window (settings.tier → ctx) → coord `--ctx-size`. Feeds the
     /// engine's mode decision + per-node overhead in the layer split.
     ctx_size: u32,
+    /// Per-request generation ceiling (settings.maxTokens) → coord
+    /// `--max-decode`. Configuration, not a compiled-in constant: 4096 used to
+    /// be hardcoded in the engine, so "Max tokens per reply" could not raise it.
+    /// 0 = bounded only by the remaining context.
+    #[serde(default = "default_max_decode")]
+    max_decode: u32,
+}
+
+/// 0 = context-bound, matching DEFAULT_SETTINGS.maxTokens. A different number
+/// here would mean a caller that omits the field gets a ceiling the UI never
+/// shows — the divergence is only reachable from a stale/hand-written payload,
+/// which is exactly when a silent cap would be hardest to diagnose.
+fn default_max_decode() -> u32 {
+    0
 }
 
 impl Default for Tuning {
@@ -97,6 +111,7 @@ impl Default for Tuning {
             model_id: "deepseek-v4-flash".into(),
             quant: String::new(),
             ctx_size: 8192,
+            max_decode: default_max_decode(),
         }
     }
 }
@@ -437,6 +452,7 @@ fn materialize_engine(app: &AppHandle) {
             "--n-predict".into(), "0".into(),
             "--model-id".into(), tuning.model_id.clone(),
             "--ctx-size".into(), tuning.ctx_size.to_string(),
+            "--max-decode".into(), tuning.max_decode.to_string(),
         ];
         if !tuning.api_token.is_empty() {
             coord_args.push("--api-token".into());
@@ -492,10 +508,54 @@ fn http_get_body(ip: &str, port: u16, path: &str) -> Option<String> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).ok()?;
     s.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
     write!(s, "GET {path} HTTP/1.1\r\nHost: {ip}\r\nConnection: close\r\n\r\n").ok()?;
-    let mut buf = String::new();
-    s.read_to_string(&mut buf).ok()?;
-    let body = buf.split_once("\r\n\r\n")?.1.to_string();
+
+    // Read until Content-Length is satisfied, or until EOF, and KEEP whatever
+    // arrived if the read times out.
+    //
+    // This used to be `read_to_string`, which waits for EOF and — on timeout —
+    // returns Err and throws away everything it buffered. The coordinator
+    // answers `Connection: close` in the header and then leaves the socket
+    // open (verified 2026-08-11: 256 bytes delivered, no FIN, read times out).
+    // So the client discarded a perfectly good reply once a second, the
+    // cluster never flipped to "ready", and the UI sat at "starting" forever
+    // while the very same coordinator was serving inference.
+    //
+    // Trusting a server's `Connection: close` is optional; reading the length
+    // it told us is not.
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match s.read(&mut chunk) {
+            Ok(0) => break,                       // clean EOF
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(end) = find_header_end(&buf) {
+                    match content_length(&buf[..end]) {
+                        Some(len) if buf.len() - end >= len => break, // whole body in hand
+                        None => break, // no length: EOF is the only terminator, take what came
+                        _ => {}
+                    }
+                }
+            }
+            Err(_) => break, // timeout or reset: use what we already have
+        }
+    }
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let body = text.split_once("\r\n\r\n")?.1.to_string();
     Some(body)
+}
+
+/// Index just past the blank line that ends the HTTP headers.
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+}
+
+/// `Content-Length` from a header block, case-insensitively.
+fn content_length(headers: &[u8]) -> Option<usize> {
+    let text = String::from_utf8_lossy(headers);
+    text.lines()
+        .find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length")))
+        .and_then(|(_, v)| v.trim().parse().ok())
 }
 
 /// Poll the engine coordinator's status API and merge the real stage/layer
@@ -887,14 +947,28 @@ pub fn pairing_join(
 /// Creator freezes the roster and everyone launches engines. The chosen
 /// coordinator machine's ip comes from the roster (creator = local).
 #[tauri::command]
-pub fn pairing_start(app: AppHandle, state: State<'_, Pairing>) -> Result<(), String> {
+pub fn pairing_start(
+    app: AppHandle,
+    state: State<'_, Pairing>,
+    allow_solo: Option<bool>,
+) -> Result<(), String> {
     let generation;
     {
         let mut inner = state.0.lock().unwrap();
         if inner.mode != Mode::Creator {
             return Err("only the cluster creator can start it".into());
         }
-        if inner.peers.len() < 2 {
+        // Two machines is the right floor for the PAIRING flow — pressing Start
+        // before anyone joined is a mistake there. It is the wrong floor for the
+        // single-machine flow, whose entire point is one machine, and which the
+        // rest of this path already supports: materialize_engine computes
+        // `workers = non-coordinator peers + 1`, i.e. 1 co-located worker.
+        //
+        // Until 2026-08-11 there was no way to say which flow you were in, so
+        // "Run it here" downloaded the weights and then died on this line with
+        // "need at least 2 machines" — the headline single-node feature could
+        // not start at all.
+        if inner.peers.len() < 2 && allow_solo != Some(true) {
             return Err("need at least 2 machines".into());
         }
         generation = inner.generation;
@@ -1041,7 +1115,7 @@ pub fn headless_pair(app: &AppHandle, spec: &str) {
                     inner.mode == Mode::Creator && inner.phase == "idle" && inner.peers.len() >= 2
                 };
                 if ready_to_start {
-                    let _ = pairing_start(app2.clone(), app2.state());
+                    let _ = pairing_start(app2.clone(), app2.state(), None);
                     return;
                 }
             });

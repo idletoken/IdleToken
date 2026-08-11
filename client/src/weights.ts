@@ -15,6 +15,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { ModelManifest } from "./models";
+import { inTauri } from "./platform";
 
 export interface DownloadTarget {
   repo: string;
@@ -138,6 +139,12 @@ export async function resolveLocalWeights(args: {
   manifest: ModelManifest;
   quant?: string;
 }): Promise<{ path: string; needsDownload: boolean; target: DownloadTarget | null }> {
+  // Browser dev build: no engine, no filesystem, so every call below throws on
+  // the missing Tauri bridge — which blocked "run on this machine alone", a
+  // headline mode, from being reachable in the dev sim at all. Report the
+  // weights as present. inTauri() is false ONLY under `vite dev`/`preview`;
+  // the packaged app always takes the real path below.
+  if (!inTauri()) return { path: "(dev-sim)", needsDownload: false, target: null };
   if (args.weightsSource === "local") {
     return { path: args.ggufPath, needsDownload: false, target: null };
   }

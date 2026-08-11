@@ -27,6 +27,25 @@
 #include <errno.h>
 #include <signal.h>
 #include <stdarg.h>
+
+/* WINDOWS: close() is the CRT's, and it takes a FILE DESCRIPTOR. Every fd in
+ * this file is a SOCKET handle from accept()/socket(), which the CRT knows
+ * nothing about — so `close(sock)` returned -1/EBADF and **left the connection
+ * open**. No FIN was ever sent, so a client that reads until end-of-stream sat
+ * there until its own timeout: our desktop client showed "the cluster went
+ * silent for 300s" AFTER a reply that had in fact completed normally. Handles
+ * leaked on top of that.
+ *
+ * src/worker/worker_main.c has had this exact guard since the Windows port;
+ * the coordinator never got it, and Linux/macOS hid the omission completely
+ * because there close() is correct for sockets. src/common/net.c also exports
+ * idletoken_close_fd() for the same purpose — this mirrors the worker so the
+ * ~25 existing call sites stay as they are. */
+#ifdef _WIN32
+  #include <winsock2.h>
+  #undef close
+  #define close(fd) closesocket((SOCKET)(fd))
+#endif
 #ifdef __linux__
   #include <sys/prctl.h>
   #include <unistd.h>
@@ -98,6 +117,7 @@ static void usage(FILE *out) {
 "idletoken-coord  cluster coordinator + OpenAI/Anthropic API (v0.1)\n"
 "Usage: idletoken-coord [--bind H:P] [--num-workers N] [--ctx-size N]\n"
 "                    [--model-id ID] [--model-path P] [--quant Q] [--n-predict N]\n"
+"                    [--max-decode N]\n"
 "\n"
 "Optional:\n"
 "  --bind H:P          worker-facing TCP (default: 0.0.0.0:14100)\n"
@@ -115,6 +135,12 @@ static void usage(FILE *out) {
 "  --quant Q           precision for small models (e.g. Q4_K_M, Q8_0, BF16);\n"
 "                      default = the model's default variant. Ignored for\n"
 "                      models with a single precision.\n"
+"  --max-decode N      ceiling on tokens generated per request (default: 4096,\n"
+"                      0 = bounded only by the remaining context). The client\n"
+"                      passes the user's setting here, so it is configuration,\n"
+"                      not a compiled-in constant -- and it ships 0, so this\n"
+"                      4096 applies only when the engine is run by hand, where\n"
+"                      a bounded default is the friendlier accident.\n"
 "  --n-predict N       decode steps to drive after cluster_ready (default: 1;\n"
 "                      0 = skip warmup so the first HTTP request starts at pos 0,\n"
 "                      needed for token-exact comparison against single-node ds4)\n"
@@ -478,6 +504,31 @@ static int coord_round_recv(idletoken_worker_info *ws, int n,
     uint32_t got_pos = 0, got_n_vocab = 0;
     idletoken_buf_get_u32(&lb, &got_pos);
     idletoken_buf_get_u32(&lb, &got_n_vocab);
+    /* v6 SHORT FORM: n_vocab == 0 means the last stage already took the argmax
+     * and the payload is just the winning token id. That is the normal case —
+     * this function's only use of a full distribution has always been to pick
+     * its maximum, so shipping ~1 MB per token to learn 4 bytes was the single
+     * largest non-compute cost per token (~6.9 ms of 32.8 on one machine over
+     * loopback; worse across a LAN).
+     *
+     * The long form is still accepted, and must stay accepted: it is what
+     * IDLETOKEN_FULL_LOGITS=1 produces, and it is what any non-greedy sampling
+     * will need. Handling both here is what keeps "add temperature/top-p" a
+     * change to this file rather than a change to the wire. */
+    uint32_t argmax = 0;
+    if (got_n_vocab == 0) {
+        if (lb.err || lh.payload_bytes < 12) {
+            fprintf(stderr, "coord: INFER_LOGITS short form too small (%u B)\n",
+                    (unsigned)lh.payload_bytes);
+            return -1;
+        }
+        idletoken_buf_get_u32(&lb, &argmax);
+        if (lb.err || argmax >= coord_model()->n_vocab) {
+            fprintf(stderr, "coord: INFER_LOGITS short form token %u out of range "
+                            "(n_vocab=%u)\n", argmax, coord_model()->n_vocab);
+            return -1;
+        }
+    } else {
     /* vocab must match THIS model's registry entry — never a hard-coded DSv4
      * constant (multi-model §3.3: no model-specific numbers in the planner). */
     if (lb.err || got_n_vocab != coord_model()->n_vocab ||
@@ -487,10 +538,11 @@ static int coord_round_recv(idletoken_worker_info *ws, int n,
         return -1;
     }
     const float *logits = (const float *)(lbuf + 8);
-    uint32_t argmax = 0;
     float    best   = logits[0];
     for (uint32_t i = 1; i < got_n_vocab; i++) {
         if (logits[i] > best) { best = logits[i]; argmax = i; }
+    }
+    (void)best;
     }
 
     /* v5: this used to broadcast INFER_TOKEN_ACK to **every** stage. Removed --
@@ -507,7 +559,6 @@ static int coord_round_recv(idletoken_worker_info *ws, int n,
     (void)got_pos;
     if (out_token)  *out_token  = argmax;
     if (out_req_id) *out_req_id = lh.request_id;
-    (void)best;
     return 0;
 }
 
@@ -1086,13 +1137,20 @@ static int for_each_chat_message(const char *body, size_t len, chat_msg_fn fn, v
         if (!content) return -1;
         content[0] = '\0';
         idletoken_http_json_extract_str(body + obj0, obj_len, "role", role, sizeof(role));
-        if (idletoken_http_json_extract_str(body + obj0, obj_len, "content",
-                                         content, obj_len + 1) != 0) {
+        int have = idletoken_http_json_extract_str(body + obj0, obj_len, "content",
+                                                   content, obj_len + 1) == 0;
+        if (!have) {
             /* Anthropic content block array: {"content":[{"type":"text","text":"..."}]} */
-            idletoken_http_json_extract_str(body + obj0, obj_len, "text",
-                                         content, obj_len + 1);
+            have = idletoken_http_json_extract_str(body + obj0, obj_len, "text",
+                                                   content, obj_len + 1) == 0;
         }
-        if (role[0] && content[0]) {
+        /* Keyed on "was there a content field", not on "is it non-empty". An
+         * assistant turn whose text is "" is a real turn -- a generation the
+         * user stopped before its first token, which stays in the stored
+         * transcript. Dropping it silently deleted one side of the exchange and
+         * handed the model two consecutive user messages, so from that turn on
+         * the conversation it saw was not the conversation on screen. */
+        if (role[0] && have) {
             if (fn(ud, role, content) != 0) { free(content); return -1; }
             count++;
         }
@@ -1228,6 +1286,89 @@ static int coord_selftest(void) {
         ST(strstr(got, "[user:say \"hi\"\nplease]") != NULL, "parse: escapes");
         ST(strstr(got, "[assistant:ok]") != NULL, "parse: anthropic text block");
     }
+    /* What CONTINUING AN OLD CONVERSATION actually sends. A first turn is one
+     * user message; every later turn also carries assistant messages holding a
+     * real model's output — escapes, CRLF, reasoning tags, JSON-looking text.
+     * That is the only structural difference between "new chat works" and "old
+     * chat fails", so it is the shape worth pinning down. */
+    {
+        char got[512] = "";
+        const char *body =
+            "{\"messages\":["
+            "{\"role\":\"user\",\"content\":\"什么是流水线并行？\"},"
+            "{\"role\":\"assistant\",\"content\":\"<think>用户在问 PP。</think>按层切分。\"},"
+            "{\"role\":\"user\",\"content\":\"那张量并行呢？\"}"
+            "]}";
+        int n = for_each_chat_message(body, strlen(body), msg_collect_cb, got);
+        ST(n == 3, "resume: 3 messages incl. an assistant turn");
+        ST(strstr(got, "[assistant:<think>用户在问 PP。</think>按层切分。]") != NULL,
+           "resume: reasoning tags and CJK survive verbatim");
+    }
+    {   /* A reply that talks about JSON. The object cutter counts braces and the
+         * key search takes the first hit, so a reply containing "role"/"content"
+         * and braces must not be able to steer either. */
+        char got[512] = "";
+        const char *body =
+            "{\"messages\":["
+            "{\"role\":\"assistant\",\"content\":\"send {\\\"role\\\":\\\"user\\\"} in the body\"}"
+            "]}";
+        int n = for_each_chat_message(body, strlen(body), msg_collect_cb, got);
+        ST(n == 1, "resume: a reply quoting JSON is still one message");
+        ST(strstr(got, "[assistant:send {\"role\":\"user\"} in the body]") != NULL,
+           "resume: quoted JSON in a reply does not steer role/content extraction");
+    }
+    {   /* CRLF and a unicode escape: both appear in real replies, and neither is
+         * in the extractor's escape table. */
+        char got[512] = "";
+        const char *body =
+            "{\"messages\":["
+            "{\"role\":\"assistant\",\"content\":\"line one\\r\\nline two\\u00e9\"}"
+            "]}";
+        for_each_chat_message(body, strlen(body), msg_collect_cb, got);
+        ST(strstr(got, "line one\r\nline two") != NULL,
+           "resume: CRLF in a reply survives as CRLF");
+        ST(strstr(got, "u00e9") == NULL,
+           "resume: \\uXXXX is decoded, not spelled out into the prompt");
+    }
+    {   /* An assistant turn with empty text -- a generation that was stopped
+         * before its first token, which stays in the stored transcript. */
+        char got[512] = "";
+        const char *body =
+            "{\"messages\":["
+            "{\"role\":\"user\",\"content\":\"a\"},"
+            "{\"role\":\"assistant\",\"content\":\"\"},"
+            "{\"role\":\"user\",\"content\":\"b\"}"
+            "]}";
+        int n = for_each_chat_message(body, strlen(body), msg_collect_cb, got);
+        ST(n == 3, "resume: an empty assistant turn is not silently dropped");
+    }
+
+    {   /* Python's json.dumps escapes ALL non-ASCII by default, so this is what
+         * an ordinary OpenAI-compatible client sends for Chinese. It reached the
+         * model as the literal text "u4f60u597d" until 2026-08-12. */
+        char got[512] = "";
+        const char *body =
+            "{\"messages\":[{\"role\":\"user\",\"content\":\"\\u4f60\\u597d\"}]}";
+        for_each_chat_message(body, strlen(body), msg_collect_cb, got);
+        ST(strstr(got, "[user:你好]") != NULL, "parse: ensure_ascii CJK decodes to UTF-8");
+    }
+    {   /* Emoji: a surrogate PAIR, which is two \u escapes for one character. */
+        char got[512] = "";
+        const char *body =
+            "{\"messages\":[{\"role\":\"user\",\"content\":\"\\ud83d\\ude80 go\"}]}";
+        for_each_chat_message(body, strlen(body), msg_collect_cb, got);
+        ST(strstr(got, "[user:\xf0\x9f\x9a\x80 go]") != NULL,
+           "parse: surrogate pair becomes one UTF-8 code point");
+    }
+    {   /* A lone high surrogate is not a character; it must not become invalid
+         * UTF-8, because the tokenizer downstream has to be able to read it. */
+        char got[512] = "";
+        const char *body =
+            "{\"messages\":[{\"role\":\"user\",\"content\":\"\\ud83d ok\"}]}";
+        for_each_chat_message(body, strlen(body), msg_collect_cb, got);
+        ST(strstr(got, "\xef\xbf\xbd") != NULL, "parse: unpaired surrogate -> U+FFFD");
+    }
+
     {   /* No messages array -> 0 (falls back to the old single-turn path). */
         const char *body = "{\"content\":\"hello\"}";
         char got[512] = "";
@@ -1502,6 +1643,11 @@ static int coord_selftest(void) {
  * drive ONE mock INFER step (workers return zero logits → argmax=0 → token 0)
  * and report that token id in the response. Once ds4 + GGUF wire in,
  * tokenize→decode_loop→detokenize→content is the swap. */
+/* Per-request generation ceiling, from --max-decode (0 = context-bound only).
+ * File-scope because the HTTP handler runs far from main(); set once at startup
+ * and read-only afterwards. */
+static int g_max_decode = 4096;
+
 /* Naive JSON int extractor for `"max_tokens": N`. Returns N if found, else
  * `dflt`. Not robust against trailing decimal or strings; v0.1 enough. */
 static int extract_int_field(const char *json, size_t json_len,
@@ -1697,6 +1843,36 @@ static void sse_error(idletoken_sse *s, const char *msg) {
                   "{\"error\":{\"type\":\"api_error\",\"message\":\"%s\"}}", msg);
 }
 
+/* Keepalive + progress during prefill.
+ *
+ * Prefill on a LAN cluster is minutes, not milliseconds, and it used to be
+ * minutes of ABSOLUTE SILENCE on the socket: sse_begin ran only after the last
+ * chunk. Any client with a read timeout — ours has one, 300s — kills the
+ * request and shows the raw OS error ("os error 10060" on Windows, which is
+ * just WSAETIMEDOUT). Turn one was short enough to land inside the window and
+ * turn two was not, so the client looked like it broke after a couple of
+ * rounds. Now bytes flow the whole way through.
+ *
+ * The progress line is an SSE **comment** (`: prefill 128/512`). The spec says
+ * a line starting with ':' is ignored, so Claude Code and every OpenAI client
+ * skip it; our own client parses it to show "processing the prompt" instead of
+ * a blank bubble. Anthropic additionally gets a real `ping` event, which is
+ * what the upstream API sends for exactly this purpose. */
+static void sse_prefill_tick(idletoken_sse *s, int done, int total, int reused) {
+    if (!s || s->failed) return;
+    /* `reused` is how many prompt tokens came from the KV cache. It is reported
+     * separately and not merely implied by the starting `done`, because the two
+     * cases have to be TELLABLE APART on screen: "120/135" (a hit, 15 tokens of
+     * real work) and "0/135" (a miss, the whole prompt recomputed) look
+     * identical while they scroll past, and a user watching that reasonably
+     * concludes the cache is doing nothing. */
+    char line[96];
+    int n = snprintf(line, sizeof(line), ": prefill %d/%d reuse=%d\n\n", done, total, reused);
+    if (n < 0 || (size_t)n >= sizeof(line)) return;
+    if (idletoken_sendall(s->fd, line, (size_t)n) < 0) { s->failed = 1; return; }
+    if (s->anthropic) sse_emitf(s, "ping", "{\"type\":\"ping\"}");
+}
+
 static void sse_finish(idletoken_sse *s, int n_input, int n_output, int eos_stop) {
     if (s->anthropic) {
         sse_emitf(s, "content_block_stop",
@@ -1808,6 +1984,10 @@ typedef struct {
     int        want_stream;
     uint64_t   req_id;
     idletoken_sse sse;
+    /* The stream was already opened by the prefill stage (head + preamble sent,
+     * keepalives running), so coord_req_begin must not open it a second time —
+     * a second HTTP head mid-stream is garbage on the wire. */
+    int        sse_started;
 
     /* --- Sequence slot (the ledger behind KV prefix reuse) --- */
     int            sel;            /* index into g_slots */
@@ -1827,14 +2007,23 @@ typedef struct {
     int  n_generated;
     int  n_fed;                    /* generated tokens actually fed back into the KV */
     int  decode_failed;
+    int  client_gone;              /* peer hung up mid-generation (see below) */
     int  next_token;
     int  eos;
     int      await_logits;         /* INFER_BEGIN sent, logits not back yet */
     uint64_t step_req_id;          /* this step's request_id, used to claim LOGITS */
 
-    /* --- Accumulated output --- */
-    char   text_out[4096];
+    /* --- Accumulated output ---
+     * Heap, grown on demand. This used to be `char text_out[4096]` with the
+     * append silently skipped once full: the non-stream body was cut off
+     * mid-sentence while finish_reason still said "stop" and completion_tokens
+     * still reported every token — a truncation the caller cannot detect, which
+     * is precisely what the decode_failed path below exists to avoid. It was
+     * always reachable (4096 BYTES is roughly 1-1.5k tokens, well under the old
+     * 4096-token ceiling); with --max-decode 0 it is the common case. */
+    char  *text_out;
     size_t text_len;
+    size_t text_cap;
     char   carry[8];               /* incomplete trailing UTF-8 bytes held across frames */
     size_t carry_len;
 
@@ -1875,10 +2064,12 @@ typedef struct {
  * step_send returns 0 = sent and awaiting, 1 = this request is done decoding
  * (nothing pending), -1 = error. */
 static int coord_req_begin(coord_req *r, const coord_exec *x) {
-    r->sse = (idletoken_sse){ r->conn_fd, r->is_anthropic, 0, "", 0 };
-    snprintf(r->sse.id, sizeof(r->sse.id), "%llu", (unsigned long long)r->req_id);
-    r->sse.created = (long long)time(NULL);
-    if (r->want_stream) sse_begin(&r->sse, r->prompt.len);
+    if (!r->sse_started) {
+        r->sse = (idletoken_sse){ r->conn_fd, r->is_anthropic, 0, "", 0 };
+        snprintf(r->sse.id, sizeof(r->sse.id), "%llu", (unsigned long long)r->req_id);
+        r->sse.created = (long long)time(NULL);
+        if (r->want_stream) sse_begin(&r->sse, r->prompt.len);
+    }
 
     r->eos = coord_tok_eos(x->engine, x->xtok);
     /* Clamp against remaining context once more: the prompt already occupies up
@@ -1897,7 +2088,15 @@ static int coord_req_begin(coord_req *r, const coord_exec *x) {
         /* This path **cleans up after itself** (reply, free, release the slot);
          * on a non-zero return the caller must not touch r again. */
         r->hs->in_flight = 0;
-        idletoken_http_send_error(r->conn_fd, 500, "oom");
+        /* Once the stream is open the HTTP status is already 200 and can no
+         * longer be changed; the only place left to tell the truth is the
+         * stream itself. */
+        if (r->want_stream && r->sse_started) {
+            sse_error(&r->sse, "out of memory");
+            sse_finish(&r->sse, r->prompt.len, 0, 0);
+        } else {
+            idletoken_http_send_error(r->conn_fd, 500, "oom");
+        }
         ds4_tokens_free(&r->prompt);
         free(r->http_body);
         return -1;
@@ -1907,6 +2106,23 @@ static int coord_req_begin(coord_req *r, const coord_exec *x) {
      * r->next_token (the argmax of prefill's last chunk), so this moment is where
      * TTFT ends. */
     if (r->exec_start_ms > 0) r->ttft_ms = now_ms() - r->exec_start_ms;
+    return 0;
+}
+
+/* Append decoded text to r->text_out, growing it. Keeps room for the NUL that
+ * coord_req_finish writes. Returns 0, or -1 on OOM (caller must fail the
+ * request rather than continue with a short buffer). */
+static int coord_text_append(coord_req *r, const char *s, size_t n) {
+    if (r->text_len + n + 1 > r->text_cap) {
+        size_t cap = r->text_cap ? r->text_cap : 4096;
+        while (cap < r->text_len + n + 1) cap *= 2;
+        char *p = realloc(r->text_out, cap);
+        if (!p) return -1;
+        r->text_out = p;
+        r->text_cap = cap;
+    }
+    memcpy(r->text_out + r->text_len, s, n);
+    r->text_len += n;
     return 0;
 }
 
@@ -1921,9 +2137,11 @@ static int coord_req_step_send(coord_req *r, const coord_exec *x) {
             size_t tlen = coord_tok_text(x->engine, x->xtok, r->next_token, tbuf, sizeof(tbuf));
             char *t = tlen ? tbuf : NULL;
             if (t) {
-                if (r->text_len + tlen + 1 < sizeof(r->text_out)) {
-                    memcpy(r->text_out + r->text_len, t, tlen);
-                    r->text_len += tlen;
+                if (coord_text_append(r, t, tlen) != 0) {
+                    /* Out of memory. Loud, not silent: the reply would be short
+                     * by exactly this token and nothing downstream could tell. */
+                    r->decode_failed = 1;
+                    return 1;
                 }
                 if (r->want_stream && !r->sse.failed) {
                     char work[512];
@@ -1932,7 +2150,9 @@ static int coord_req_step_send(coord_req *r, const coord_exec *x) {
                         memcpy(work + r->carry_len, t, tlen);
                         size_t wl = r->carry_len + tlen;
                         size_t comp = utf8_complete_len(work, wl);
-                        char esc[2048];
+                        /* 6x the 512-byte token cap: every byte can escape to
+                         * \u00XX, and the escaper truncates rather than fails. */
+                        char esc[3200];
                         json_escape_text(esc, sizeof(esc), work, comp);
                         sse_delta(&r->sse, esc);
                         r->carry_len = wl - comp;   /* ≤ 3 bytes by construction */
@@ -1941,7 +2161,9 @@ static int coord_req_step_send(coord_req *r, const coord_exec *x) {
                     } else {
                         /* Pathologically long token text: flush carry, then
                          * the token as-is (escaper truncates at its cap). */
-                        char esc[2048];
+                        /* 6x the 512-byte token cap: every byte can escape to
+                         * \u00XX, and the escaper truncates rather than fails. */
+                        char esc[3200];
                         if (r->carry_len > 0) {
                             json_escape_text(esc, sizeof(esc), r->carry, r->carry_len);
                             sse_delta(&r->sse, esc);
@@ -1959,6 +2181,14 @@ static int coord_req_step_send(coord_req *r, const coord_exec *x) {
     if (r->next_token == r->eos) return 1;
     if (r->n_generated >= r->max_tokens) return 1;
     if (r->want_stream && r->sse.failed) return 1;   /* client hung up: stop decoding */
+    /* Same question for the non-stream path, which writes nothing until the end
+     * and so cannot learn it from a failed send. Probed every 32 tokens rather
+     * than every one: a select() per token is pure overhead next to a PP round
+     * trip, and 32 tokens is a couple of seconds of waste at worst. */
+    if (!r->want_stream && (r->n_generated & 31) == 0 && idletoken_peer_closed(r->conn_fd)) {
+        r->client_gone = 1;
+        return 1;
+    }
     /* This step's req_id must be **unique**: the executor claims results by the
      * request_id echoed in the LOGITS header, and a collision would hand A's
      * token to B. */
@@ -2033,7 +2263,7 @@ static void coord_req_finish(coord_req *r, const coord_exec *x) {
     /* Legacy out-parameter: keeps the "cursor of the most recently used slot"
      * semantics, for the logs and warmup to hook into. */
     *x->running_pos = r->hs->pos;
-    r->text_out[r->text_len] = 0;
+    if (r->text_out) r->text_out[r->text_len] = 0;   /* NULL when nothing decoded */
     if (r->want_stream && r->carry_len > 0 && !r->sse.failed) {
         /* Generation ended mid-UTF-8-char: emit the tail bytes anyway for
          * parity with the non-stream body, which also carries them. */
@@ -2056,6 +2286,7 @@ static void coord_req_finish(coord_req *r, const coord_exec *x) {
      * API that is fatal -- downstreams like Claude Code would treat a truncated
      * answer as the final one. */
     const char *stop_why = r->decode_failed ? "decode_failed"
+                         : r->client_gone   ? "client_gone"
                          : (stop_reason_eos ? "EOS" : "max_tokens");
     fprintf(stderr, "coord: chat: generated %d tok (%zu B text), stop=%s%s\n",
             r->n_generated, r->text_len, stop_why,
@@ -2094,6 +2325,7 @@ static void coord_req_finish(coord_req *r, const coord_exec *x) {
         if (r->decode_failed) sse_error(&r->sse, "decode failed mid-generation");
         sse_finish(&r->sse, n_input, n_output, stop_reason_eos);
         free(r->generated);
+        free(r->text_out);
         ds4_tokens_free(&r->prompt);
         free(r->http_body);
         return;
@@ -2107,20 +2339,46 @@ static void coord_req_finish(coord_req *r, const coord_exec *x) {
     if (r->decode_failed) {
         idletoken_http_send_error(r->conn_fd, 500, "decode failed mid-generation");
         free(r->generated);
+        free(r->text_out);
         ds4_tokens_free(&r->prompt);
         free(r->http_body);
         return;
     }
 
-    /* 5. Non-stream: escape the accumulated text for JSON embedding. */
-    char json_text[8192];
-    json_escape_text(json_text, sizeof(json_text), r->text_out, r->text_len);
+    /* 5. Non-stream: escape the accumulated text for JSON embedding.
+     * Heap-sized from the actual text, for the same reason text_out is: the
+     * fixed 8 KiB buffer truncated silently (json_escape_text just stops), so a
+     * long reply -- or a short one full of quotes and newlines, which escape to
+     * 2 bytes each -- came back cut off with finish_reason=stop. Worst case is
+     * 6 bytes out per byte in (\u00XX for control chars), plus the NUL. */
+    size_t json_cap = r->text_len * 6 + 8;
+    char *json_text = malloc(json_cap);
+    if (!json_text) {
+        idletoken_http_send_error(r->conn_fd, 500, "out of memory building the response");
+        free(r->generated);
+        free(r->text_out);
+        ds4_tokens_free(&r->prompt);
+        free(r->http_body);
+        return;
+    }
+    json_escape_text(json_text, json_cap, r->text_out, r->text_len);
 
-    /* 6. Build response JSON. */
-    char body[12 * 1024];
+    /* 6. Build response JSON. The envelope (ids, model name, usage) is well
+     * under 1 KiB; 4 KiB of headroom over the escaped text is generous. */
+    size_t body_cap = json_cap + 4096;
+    char *body = malloc(body_cap);
+    if (!body) {
+        idletoken_http_send_error(r->conn_fd, 500, "out of memory building the response");
+        free(json_text);
+        free(r->generated);
+        free(r->text_out);
+        ds4_tokens_free(&r->prompt);
+        free(r->http_body);
+        return;
+    }
     int bl;
     if (r->is_anthropic) {
-        bl = snprintf(body, sizeof(body),
+        bl = snprintf(body, body_cap,
                       "{\"id\":\"msg_homeai_%llu\","
                        "\"type\":\"message\","
                        "\"role\":\"assistant\","
@@ -2134,7 +2392,7 @@ static void coord_req_finish(coord_req *r, const coord_exec *x) {
                       n_input, n_output,
                       r->cache_hit ? "true" : "false", r->cached_tokens);
     } else {
-        bl = snprintf(body, sizeof(body),
+        bl = snprintf(body, body_cap,
                       "{\"id\":\"chatcmpl_homeai_%llu\","
                        "\"object\":\"chat.completion\","
                        "\"created\":%lld,"
@@ -2153,13 +2411,16 @@ static void coord_req_finish(coord_req *r, const coord_exec *x) {
                       n_input, n_output, n_input + n_output,
                       r->cache_hit ? "true" : "false", r->cached_tokens);
     }
-    if (bl < 0 || (size_t)bl >= sizeof(body)) {
+    if (bl < 0 || (size_t)bl >= body_cap) {
         idletoken_http_send_error(r->conn_fd, 500, "response too large");
     } else {
         idletoken_http_send_json(r->conn_fd, 200, body, (size_t)bl);
     }
 
+    free(body);
+    free(json_text);
     free(r->generated);
+    free(r->text_out);
     ds4_tokens_free(&r->prompt);
     free(r->http_body);
 }
@@ -2257,9 +2518,15 @@ static void handle_http_request(int conn_fd,
         uint32_t slot_tokens = 0;
         for (int si = 0; si < g_n_slots; si++)
             if (g_slots[si].valid && g_slots[si].len > 0) { slots_live++; slot_tokens += g_slots[si].len; }
-        char body[520];   /* grew for the concurrency / avg_ttft_ms fields */
+        /* What this cluster is ACTUALLY serving. The client used to show the
+         * model from its own local settings, which is a claim it cannot back:
+         * change the setting without restarting, or join a cluster someone
+         * else coordinates, and the panel confidently names the wrong model.
+         * The only authority on "what is loaded" is the process that loaded it. */
+        char body[640];   /* grew for the concurrency / avg_ttft_ms / model fields */
         int bl = snprintf(body, sizeof(body),
-            "{\"requests\":%llu,\"input_tokens\":%llu,\"output_tokens\":%llu,"
+            "{\"model\":\"%s\",\"model_label\":\"%s\",\"quant\":\"%s\","
+             "\"requests\":%llu,\"input_tokens\":%llu,\"output_tokens\":%llu,"
              "\"cache_hits\":%llu,\"cached_tokens\":%llu,"
              "\"seq_slots\":%d,\"seq_slots_auto\":%d,\"seq_slots_live\":%d,\"slot_prefix_tokens\":%u,"
              "\"concurrency\":%d,"
@@ -2268,6 +2535,7 @@ static void handle_http_request(int conn_fd,
              "\"ctx_size\":%u,"
              "\"uptime_s\":%lld,\"last_request_unix\":%lld,"
              "\"last_tok_per_s\":%.2f}",
+            coord_model()->id, coord_model()->label, coord_quant(),
             (unsigned long long)g_stats.requests,
             (unsigned long long)g_stats.in_tokens,
             (unsigned long long)g_stats.out_tokens,
@@ -2497,18 +2765,31 @@ static void handle_http_request(int conn_fd,
         return;
     }
 
-    int max_tokens = extract_int_field((const char *)req.body,
-                                       req.body ? req.body_len : 0,
-                                       "max_tokens", 16);
-    if (max_tokens < 1) max_tokens = 1;
     /* Cap = min(hard cap, remaining context). The hard cap went from 256 to 4096
      * (256 is nowhere near enough for coding); at the same time prompt+decode
      * must not exceed ctx, which would overflow the KV. On a cache hit
      * running_pos already sits past the prefix, so headroom is computed from it.
      * IDLETOKEN_MAX_DECODE overrides. */
-    int hard_cap = 4096;
+    /* The ceiling is configuration now, not a constant: --max-decode carries
+     * the user's setting in from the client, and 0 means "only the context
+     * bounds this". IDLETOKEN_MAX_DECODE still wins for ops on a running box. */
+    int hard_cap = g_max_decode > 0 ? g_max_decode : INT_MAX;
     { const char *mc = getenv("IDLETOKEN_MAX_DECODE");
       if (mc && atoi(mc) > 0) hard_cap = atoi(mc); }
+
+    /* No max_tokens in the request = "generate until EOS or the context runs
+     * out" -- what OpenAI clients, llama.cpp (n_predict -1) and Ollama all
+     * assume. It used to default to **16**, so every reply to a client that
+     * omitted the field was chopped after a few words with finish_reason
+     * "length". Anthropic makes the field mandatory, so Claude Code never hit
+     * it; a plain OpenAI client hit it every single time -- on the one endpoint
+     * this product advertises as OpenAI-compatible.
+     * The ctx-headroom clamp further down is what keeps "until the context runs
+     * out" from overflowing the KV. */
+    int max_tokens = extract_int_field((const char *)req.body,
+                                       req.body ? req.body_len : 0,
+                                       "max_tokens", 0);
+    if (max_tokens < 1) max_tokens = hard_cap;
     if (max_tokens > hard_cap) max_tokens = hard_cap;
 
     const uint64_t req_id = ((uint64_t)time(NULL) << 16) ^ (uint64_t)*running_pos;
@@ -2622,6 +2903,55 @@ static void handle_http_request(int conn_fd,
             prompt.len, n_msgs > 0 ? n_msgs : 1, first_text,
             strlen(first_text) > 40 ? "..." : "");
 
+    /* The prompt must FIT THE CONTEXT, with room left to actually answer.
+     *
+     * Nothing downstream checked this. Prefill would drive the KV cursor
+     * straight past ctx_size, the workers write beyond the allocation they
+     * were assigned, and the request dies as a bare "cluster prefill failed"
+     * -- or, worse, comes back with quiet garbage. The normal way to reach it
+     * is simply a conversation that got long: the client resends the whole
+     * history every turn, so an old thread eventually exceeds the window while
+     * a fresh one still works. That asymmetry ("old chats are broken, new
+     * chats are fine") is impossible to interpret from the old message.
+     *
+     * Switching models makes it arrive sooner: ctx_size is clamped to the
+     * model's own ceiling at startup (1M for DSv4, 262K for the Qwen3.5
+     * family, 40K for qwen3-8b), so the same conversation that fitted before
+     * can stop fitting after a switch, with nothing on screen connecting the
+     * two events.
+     *
+     * Deliberately placed BEFORE the SSE head goes out, so this is still a
+     * real HTTP status rather than an error smuggled through the stream. */
+    {
+        /* Room for a reply worth having; below this the answer is a stub and
+         * "it fits" would be a technicality. */
+        const int min_reply = 16;
+        if (prompt.len + min_reply > (int)ctx_size) {
+            /* JSON, not send_error's text/plain: every client on both wire
+             * protocols reads errors out of {"error":{"message":...}}, and a
+             * bare text body reaches the user as "unexpected response" with the
+             * explanation buried inside it. No escaping needed — the message is
+             * assembled here from a literal and three integers. */
+            char body[420];
+            int bl = snprintf(body, sizeof(body),
+                "{\"error\":{\"type\":\"context_length_exceeded\",\"message\":"
+                "\"This conversation needs %d tokens but the cluster is running a "
+                "%u-token context. Start a new conversation, or raise the context "
+                "tier in Settings and restart the cluster.\"},"
+                "\"prompt_tokens\":%d,\"context_size\":%u}",
+                prompt.len + min_reply, ctx_size, prompt.len, ctx_size);
+            fprintf(stderr, "coord: chat: prompt %d tok + %d reserve > ctx %u -> 413\n",
+                    prompt.len, min_reply, ctx_size);
+            if (bl > 0 && bl < (int)sizeof(body))
+                idletoken_http_send_json(conn_fd, 413, body, (size_t)bl);
+            else
+                idletoken_http_send_error(conn_fd, 413, "conversation too long for the context");
+            ds4_tokens_free(&prompt);
+            free(req.body);
+            return;
+        }
+    }
+
     /* 1b. Select a sequence slot and decide on KV prefix reuse (see the
      *      coord_kv_slot comment at the top of this file). v4 multi-sequence:
      *      look for a slot that can **strictly extend** this prompt (evicting an
@@ -2692,6 +3022,23 @@ static void handle_http_request(int conn_fd,
      *    chunk's argmax becomes the first sampled token. */
     uint32_t out_tok = 0;
     int prefill_rc = 0;
+    /* Open the stream BEFORE prefill, not after it.
+     *
+     * Everything above this point can still fail with a real HTTP status (400
+     * bad request, 429 no free slot, ...), which is why the head goes out here
+     * and not earlier. From here on the status is committed to 200 and failures
+     * have to be reported as SSE `error` events — see the prefill_rc branch.
+     *
+     * What this buys: the client gets bytes immediately and a progress tick per
+     * chunk, instead of a silent socket for the entire prefill. See
+     * sse_prefill_tick for the failure this fixes. */
+    idletoken_sse pre_sse = (idletoken_sse){ conn_fd, is_anthropic, 0, "", 0 };
+    snprintf(pre_sse.id, sizeof(pre_sse.id), "%llu", (unsigned long long)req_id);
+    pre_sse.created = (long long)time(NULL);
+    if (want_stream) {
+        sse_begin(&pre_sse, prompt.len);
+        sse_prefill_tick(&pre_sse, (int)cached_tokens, prompt.len, (int)cached_tokens);
+    }
     /* Per-token prefill fallback: feed the prompt one token at a time through
      * the DECODE path (single-token INFER) instead of batched chunks. Slower
      * and numerically slightly different (per-token vs batched FP8 rounding),
@@ -2714,6 +3061,21 @@ static void handle_http_request(int conn_fd,
         if (rc != 0) { prefill_rc = -1; break; }
         hs->pos += chunk;
         off += (int)chunk;
+        if (want_stream) {
+            sse_prefill_tick(&pre_sse, off, prompt.len, (int)cached_tokens);
+            /* The tick is also how we notice the client left. A client that
+             * gave up (its own read timeout, or the user closing the window)
+             * used to go unnoticed until the first decode write, so the cluster
+             * ground through the rest of a prefill nobody would ever read —
+             * and the user's NEXT request queued behind that ghost, which is
+             * how one timeout turns into a cascade of them. */
+            if (pre_sse.failed) {
+                fprintf(stderr, "coord: chat: client hung up during prefill "
+                                "(%d/%d tok) — abandoning the request\n", off, prompt.len);
+                prefill_rc = -2;
+                break;
+            }
+        }
     }
     if (prefill_rc != 0) {
         kv_slot_reset(sel);  /* how far the KV actually got is unknown: invalidate this slot's history conservatively */
@@ -2722,15 +3084,27 @@ static void handle_http_request(int conn_fd,
                               * have leaked that everything 429s -- with no clue
                               * which path leaked them */
         *running_pos = hs->pos;
-        idletoken_http_send_error(conn_fd, 503, "cluster prefill failed");
+        /* prefill_rc == -2 is "the client is already gone": there is nobody to
+         * tell, and writing more only produces another EPIPE. */
+        if (prefill_rc != -2) {
+            if (want_stream) {
+                /* The 200 + head already went out, so the honest channel is the
+                 * stream. A bare socket close here would look to the client
+                 * like a successful empty reply. */
+                sse_error(&pre_sse, "cluster prefill failed");
+                sse_finish(&pre_sse, prompt.len, 0, 0);
+            } else {
+                idletoken_http_send_error(conn_fd, 503, "cluster prefill failed");
+            }
+        }
         ds4_tokens_free(&prompt);
         free(req.body);
         return;
     }
 
-    /* 3. Decode loop, streaming-aware. The SSE head + preamble go out only
-     *    now — after prefill succeeded — so prefill errors still surface as a
-     *    plain HTTP 503 above. Each sampled token is detokenized immediately
+    /* 3. Decode loop, streaming-aware. The SSE head + preamble went out before
+     *    prefill (see pre_sse above), so a prefill failure is an SSE `error`
+     *    event rather than an HTTP 503. Each sampled token is detokenized immediately
      *    (ds4_token_text) and accumulated into text_out for the non-stream
      *    body/logs; with "stream":true it is ALSO pushed as one SSE frame,
      *    held back only while it ends mid-UTF-8-sequence (BPE tokens can
@@ -2749,6 +3123,8 @@ static void handle_http_request(int conn_fd,
     r.conn_fd        = conn_fd;
     r.is_anthropic   = is_anthropic;
     r.want_stream    = want_stream;
+    r.sse            = pre_sse;   /* head + preamble already on the wire */
+    r.sse_started    = 1;
     r.req_id         = req_id;
     r.sel            = sel;
     r.hs             = hs;
@@ -2801,6 +3177,7 @@ int main(int argc, char **argv) {
     const char *quant      = NULL;   /* --quant; default = model's default variant */
     int num_workers        = 1;
     int n_predict          = 1;
+    int max_decode         = 4096;   /* per-request generation ceiling */
     int http_serve         = 0;
     int tokenizer_only     = 0;
     uint32_t ctx_size      = 8192;
@@ -2826,6 +3203,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--gguf-dir")    && i + 1 < argc) gguf_dir    = argv[++i];
         else if (!strcmp(a, "--quant")       && i + 1 < argc) quant       = argv[++i];
         else if (!strcmp(a, "--n-predict")   && i + 1 < argc) n_predict   = atoi(argv[++i]);
+        else if (!strcmp(a, "--max-decode")  && i + 1 < argc) max_decode  = atoi(argv[++i]);
         else if (!strcmp(a, "--seq-slots")   && i + 1 < argc) {
             const char *v = argv[++i];
             if (!strcmp(v, "auto")) { g_n_slots = 0; }
@@ -2971,6 +3349,10 @@ int main(int argc, char **argv) {
         }
         pairing = 1;
     }
+    if (max_decode < 0) {
+        fprintf(stderr, "idletoken-coord: --max-decode must be >= 0 (0 = context-bound)\n");
+        return 2;
+    }
     if (n_predict < 0 || n_predict > 4096) {
         fprintf(stderr, "idletoken-coord: --n-predict must be 0..4096 (0 = no warmup)\n");
         return 2;
@@ -2989,6 +3371,8 @@ int main(int argc, char **argv) {
     printf("  ctx size    : %u\n", ctx_size);
     printf("  model path  : %s\n", model_path);
     if (coord_tok_path != model_path) printf("  tokenizer   : %s\n", coord_tok_path);
+    g_max_decode = max_decode;
+    printf("  max_decode  : %d%s\n", max_decode, max_decode ? "" : " (context-bound)");
     printf("  n_predict   : %d\n\n", n_predict);
 
     /* --- tokenizer-only mode (integration-plan: platform metering) --------

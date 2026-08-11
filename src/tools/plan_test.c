@@ -66,8 +66,11 @@ int main(void) {
     /* ---- small-model precision menu (small-model-design.md §3.2) ------ */
     {
         const idletoken_model_spec *Q = idletoken_model_get("qwen3-8b");
-        ok(Q != NULL && Q->kv_kind == IDLETOKEN_KV_GQA && Q->n_variants == 5,
-           "qwen3-8b registered as GQA with 5 precision variants");
+        /* Four, not five: the BF16 row was removed on 2026-08-11 because
+         * Qwen/Qwen3-8B-GGUF publishes no BF16 file — picking it could only
+         * 404. This assertion asked for 5 and so was pinning the bug in place. */
+        ok(Q != NULL && Q->kv_kind == IDLETOKEN_KV_GQA && Q->n_variants == 4,
+           "qwen3-8b registered as GQA with 4 precision variants");
         /* scalars mirror the default (Q4_K_M) variant */
         const idletoken_model_variant *def = idletoken_model_variant_get(Q, NULL);
         ok(def != NULL && strcmp(def->quant, "Q4_K_M") == 0 &&
@@ -77,9 +80,33 @@ int main(void) {
            "quant name resolves to its variant");
         ok(idletoken_model_variant_get(Q, "does-not-exist") == def,
            "unknown quant falls back to default variant");
-        ok(idletoken_model_variant_get(Q, "BF16")->layer_weight_bytes >
+        ok(idletoken_model_variant_get(Q, "Q8_0")->layer_weight_bytes >
            idletoken_model_variant_get(Q, "Q4_K_M")->layer_weight_bytes,
            "higher precision costs more weight bytes");
+        /* Every model's menu, not just this one: precision lists are ordered
+         * cheapest-first and each step must genuinely cost more bytes. The UI
+         * shows them in registry order, so an out-of-order or duplicated entry
+         * is a menu that lies about which option is smaller. This also catches
+         * the failure mode that prompted the 2026-08-11 sweep — invented sizes
+         * copied in without measuring, which do not have to come out ordered. */
+        int menu_ok = 1;
+        for (int mi = 0; mi < idletoken_model_count(); mi++) {
+            const idletoken_model_spec *m = idletoken_model_at(mi);
+            for (int vi = 1; vi < m->n_variants; vi++) {
+                uint64_t prev = m->variants[vi - 1].layer_weight_bytes +
+                                m->variants[vi - 1].shared_weight_bytes;
+                uint64_t cur  = m->variants[vi].layer_weight_bytes +
+                                m->variants[vi].shared_weight_bytes;
+                if (cur <= prev) {
+                    fprintf(stderr, "  %s: %s (%llu B) is not larger than %s (%llu B)\n",
+                            m->id, m->variants[vi].quant, (unsigned long long)cur,
+                            m->variants[vi - 1].quant, (unsigned long long)prev);
+                    menu_ok = 0;
+                }
+            }
+        }
+        ok(menu_ok, "every precision menu is ordered strictly cheapest-to-largest");
+
         /* glm-5.2 has no variant table. This used to point at DSv4, which
          * only passed because DSv4 happened to ship a single quant — it now
          * has a precision menu (Q2 default + Q4_K-mixed), so the assertion

@@ -1,6 +1,7 @@
 import { useMemo, useRef, useState } from "react";
 import { useI18n, type Lang } from "./i18n";
-import { MODELS, hasQuantChoice, quantOptions, defaultQuant } from "./models";
+import { AVAILABLE_MODELS, hasQuantChoice, quantOptions, defaultQuant } from "./models";
+import Capability from "./Capability";
 import { fmtBytes } from "./format";
 import {
   APP_VERSION,
@@ -33,6 +34,8 @@ interface Field {
   hint?: Bi;
   reserved?: boolean;
   options?: { value: string; label: Bi }[];
+  /** select whose stored value is a number (option values still written as strings). */
+  numeric?: boolean;
   min?: number;
   max?: number;
   step?: number;
@@ -108,7 +111,17 @@ const CATEGORIES: Category[] = [
       { key: "accent", type: "select", label: { en: "Accent color", zh: "强调色" }, options: [
         { value: "amber", label: { en: "Electric", zh: "电光蓝" } }, { value: "teal", label: { en: "Teal", zh: "青绿" } },
         { value: "violet", label: { en: "Violet", zh: "紫" } }, { value: "rose", label: { en: "Rose", zh: "玫红" } } ] },
-      { key: "uiScale", type: "slider", label: { en: "UI scale", zh: "界面缩放" }, min: 0.8, max: 1.4, step: 0.05, unit: "×" },
+      // Was a 0.8–1.4 slider until 2026-08-11. Dragging it re-zoomed the whole
+      // document on every 0.05 tick — the page strobed and the slider moved out
+      // from under the cursor. Auto (follow the window) is the default now; the
+      // manual escape hatch is four discrete steps, one relayout per choice.
+      { key: "uiScale", type: "select", numeric: true, label: { en: "UI scale", zh: "界面缩放" },
+        hint: { en: "Auto follows the window size.", zh: "自动：跟随窗口大小调整。" }, options: [
+        { value: "0", label: { en: "Auto", zh: "自动" } },
+        { value: "0.9", label: { en: "Small", zh: "小" } },
+        { value: "1", label: { en: "Standard", zh: "标准" } },
+        { value: "1.15", label: { en: "Large", zh: "大" } },
+        { value: "1.3", label: { en: "Extra large", zh: "特大" } } ] },
       { key: "density", type: "select", label: { en: "Density", zh: "密度" }, options: [
         { value: "comfortable", label: { en: "Comfortable", zh: "宽松" } }, { value: "compact", label: { en: "Compact", zh: "紧凑" } } ] },
       { key: "reduceMotion", type: "toggle", label: { en: "Reduce motion", zh: "减少动效" } },
@@ -152,10 +165,14 @@ const CATEGORIES: Category[] = [
         { key: "idleUnloadMin", type: "number", label: { en: "Idle timeout (min)", zh: "空闲超时（分钟）" }, reserved: true, showIf: (s) => s.idleUnload },
       ] },
       { label: { en: "Inference & cache", zh: "推理与缓存" }, fields: [
-        // reserved: the chat path hardcodes max_tokens in Rust (main.rs 200/512)
-        // and never reads this. The default here happens to be 512 too, so it
-        // LOOKS wired until you change it — the worst shape of a fake setting.
-        { key: "maxTokens", type: "number", label: { en: "Max tokens per reply", zh: "单次最大生成 tokens" }, reserved: true },
+        // Real since 2026-08-11, in both directions: the chat sends it per
+        // request, and it is also passed to the coordinator as --max-decode, so
+        // it bounds third-party API clients too. (It used to be the worst shape
+        // of a fake setting: the Rust chat path hardcoded 200/512 and the engine
+        // hardcoded 4096, while the default here happened to be 512 — so it
+        // looked wired right up until you changed it.)
+        { key: "maxTokens", type: "number", label: { en: "Max tokens per reply", zh: "单次最大生成 tokens" },
+          hint: { en: "0 = until the model stops or the context runs out. Also the ceiling this cluster enforces for every client, including third-party API clients.", zh: "0 = 一直生成到模型说完或上下文用尽。这同时是本集群对所有客户端（含第三方 API 客户端）强制的上限。" } },
         { key: "kvDir", type: "text", label: { en: "KV cache directory", zh: "KV 缓存目录" }, placeholder: "/tmp/idletoken-kv", hint: { en: "Empty = the platform cache directory.", zh: "留空 = 系统缓存目录。" } },
         { type: "action", action: "clearKv", label: { en: "Clear my cache now", zh: "立即清除我的缓存" }, hint: { en: "Wipes this machine's on-disk KV cache immediately.", zh: "立即清除本机落盘的 KV 缓存。" } },
       ] },
@@ -283,6 +300,14 @@ const CATEGORIES: Category[] = [
   },
 ];
 
+// Hidden for now (2026-08-11): "Advanced · coming soon" was a roadmap shelf —
+// 19 disabled controls for things the engine/OS side hasn't landed. Until they
+// are wired it is noise, so the category is kept in the schema (defaults and
+// AppSettings keys are unchanged, nothing migrates) but taken out of the nav
+// and out of search. Delete the id from this set to bring it back.
+const HIDDEN_CATEGORIES: ReadonlySet<string> = new Set(["advanced"]);
+const VISIBLE_CATEGORIES = CATEGORIES.filter((c) => !HIDDEN_CATEGORIES.has(c.id));
+
 // ---- panel -----------------------------------------------------------------
 export default function SettingsPanel(props: {
   settings: AppSettings;
@@ -314,7 +339,7 @@ export default function SettingsPanel(props: {
 }) {
   const { t, lang } = useI18n();
   const [active, setActive] = useState(
-    props.initialCategory && CATEGORIES.some((c) => c.id === props.initialCategory) ? props.initialCategory : "quick"
+    props.initialCategory && VISIBLE_CATEGORIES.some((c) => c.id === props.initialCategory) ? props.initialCategory : "quick"
   );
   const [query, setQuery] = useState("");
   // "Clear my cache now" feedback (philosophy 15: every action has clear
@@ -394,7 +419,7 @@ export default function SettingsPanel(props: {
   const searchHits = useMemo(() => {
     if (!q) return null;
     const hits: { cat: Category; field: Field }[] = [];
-    for (const c of CATEGORIES) {
+    for (const c of VISIBLE_CATEGORIES) {
       for (const sec of c.sections ?? []) {
         for (const f of sec.fields) {
           if (f.label && L(f.label, lang).toLowerCase().includes(q)) hits.push({ cat: c, field: f });
@@ -404,7 +429,7 @@ export default function SettingsPanel(props: {
     return hits;
   }, [q, lang]);
 
-  const cat = CATEGORIES.find((c) => c.id === active) ?? CATEGORIES[0];
+  const cat = VISIBLE_CATEGORIES.find((c) => c.id === active) ?? VISIBLE_CATEGORIES[0];
 
   const renderField = (f: Field, i: number) => {
     if (f.showIf && !f.showIf(s)) return null;
@@ -443,7 +468,7 @@ export default function SettingsPanel(props: {
     if (f.type === "toggle") control = <Toggle checked={val as boolean} disabled={dis} onChange={(v) => set(key, v as AppSettings[typeof key])} label={label} />;
     else if (f.type === "select")
       control = (
-        <select className="select" value={val as string} disabled={dis} onChange={(e) => set(key, e.target.value as AppSettings[typeof key])}>
+        <select className="select" value={String(val)} disabled={dis} onChange={(e) => set(key, (f.numeric ? Number(e.target.value) : e.target.value) as AppSettings[typeof key])}>
           {f.options!.map((o) => <option key={o.value} value={o.value}>{L(o.label, lang)}</option>)}
         </select>
       );
@@ -477,20 +502,18 @@ export default function SettingsPanel(props: {
       <div className="setting-group">
         <div className="setting-group__label">{t("settings.model")}</div>
         <div className="model-list">
-          {MODELS.map((m) => (
-            <label key={m.id} className={`model-opt${s.modelId === m.id ? " is-on" : ""}${m.available ? "" : " is-disabled"}`}>
+          {AVAILABLE_MODELS.map((m) => (
+            <label key={m.id} className={`model-opt${s.modelId === m.id ? " is-on" : ""}`}>
               <input
                 type="radio"
                 name="model"
                 checked={s.modelId === m.id}
-                disabled={!m.available}
                 // Switching model resets precision to that model's default so
                 // we never carry a quant the new model doesn't offer.
                 onChange={() => props.onChange({ ...s, modelId: m.id, quant: defaultQuant(m.id) })}
               />
               <span className="model-opt__name">{m.label}</span>
               <span className="model-opt__params">{m.params}</span>
-              {!m.available ? <span className="model-opt__soon">{t("settings.soon")}</span> : null}
               {/* Weight status sits on the SELECTED row only. It used to be a
                   floating bar pinned to every screen, which is wrong twice:
                   "no weights yet" is the resting state of a fresh install (so
@@ -521,6 +544,11 @@ export default function SettingsPanel(props: {
             </div>
           </div>
         ) : null}
+        {/* "What can I run?" moved here from the cluster card (2026-08-11).
+            On the cluster card it was a table of models you could not choose —
+            it listed what the hardware supports next to no way to act on it.
+            Here it sits directly under the picker it is advice ABOUT. */}
+        <Capability apiBaseUrl={props.apiBaseUrl ?? null} />
       </div>
       <div className="setting-group">
         <div className="setting-group__label">{t("settings.tier")}</div>
@@ -571,7 +599,7 @@ export default function SettingsPanel(props: {
           </div>
           <input className="settings-search" placeholder="🔍" value={query} onChange={(e) => setQuery(e.target.value)} aria-label="search settings" />
           <div className="settings-nav__list">
-            {CATEGORIES.map((c) => (
+            {VISIBLE_CATEGORIES.map((c) => (
               <button key={c.id} className={`settings-nav__item${active === c.id && !q ? " is-on" : ""}`} onClick={() => { setActive(c.id); setQuery(""); }}>
                 {L(c.label, lang)}
               </button>

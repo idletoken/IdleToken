@@ -7,9 +7,18 @@
  * VRAM in its ON-DISK QUANTIZED form (a Q4_K_M 8B model is ~4.7 GB, so it fits
  * a 12-16 GB card whole; dequant happens per block inside the kernel).
  *
- * Norms / rope / softmax / the attention reduction stay on the CPU for now:
- * they are a few percent of the time and keeping them shared with the
- * reference path means the GPU can never silently diverge on them.
+ * Norms / rope / softmax / the attention reduction started on the CPU because
+ * they are a few percent of the time and sharing them with the reference path
+ * means the GPU can never silently diverge on them.
+ *
+ * That reasoning priced the wrong thing (2026-08-11). What these ops cost is
+ * not their arithmetic — it is the host↔device ROUND TRIP they force on the
+ * matmuls around them, and that cost is charged per call, not per byte: ~57 µs
+ * on a discrete RTX 5060 Ti versus ~10 µs on the DGX's unified memory. For
+ * Qwen3.5-0.8B on the discrete card it added up to ~48% of all GPU-path time.
+ * So the ops are being moved onto the device in fused BLOCKS (ds4x_cuda_swiglu
+ * is the first), each one still gated against the CPU reference. See
+ * docs/linear-attention-design.md §4m-bis.
  *
  * Contract: a CUDA matvec must match the CPU matvec within fp32 tolerance
  * (src/tools/ds4x_cuda_test.cu is that gate). If CUDA is unavailable at
@@ -44,6 +53,19 @@ int ds4x_cuda_available(void);
 static inline int ds4x_gpu_wanted(void) {
     const char *cpu = getenv("IDLETOKEN_DS4X_CPU");
     return !(cpu && cpu[0] == '1');
+}
+
+/* Should fused blocks (ds4x_cuda_swiglu and the ones that follow it) be used?
+ * YES by default; IDLETOKEN_DS4X_NO_FUSE=1 forces the unfused path.
+ *
+ * This exists to make the A/B measurable IN ONE BINARY. Comparing two builds
+ * cannot separate "the fusion helped" from "something else changed between the
+ * two builds", and the first attempt at this measurement produced a 3x
+ * disagreement between the standalone profiler and the cluster that two
+ * separate builds could not resolve. Same binary, same weights, one env var. */
+static inline int ds4x_fuse_wanted(void) {
+    const char *n = getenv("IDLETOKEN_DS4X_NO_FUSE");
+    return !(n && n[0] == '1');
 }
 
 /* Cap on how many bytes of weights this process may keep in VRAM. 0 = no cap
@@ -101,6 +123,59 @@ int ds4x_cuda_matmul(const ds4x_cuda_wt *w, const float *X, float *Y,
  * it is comparable with the matvec call count. */
 void ds4x_cuda_matmul_stats(double *ms_kernel, double *ms_total,
                             uint64_t *calls, uint64_t *rows);
+
+/* ---- fused SwiGLU FFN ----------------------------------------------------
+ * Y = Wd · (silu(Wg·X) ⊙ (Wu·X)) for a whole chunk. X is [n_tokens][n_in],
+ * Y is [n_tokens][n_out]; both host, both contiguous.
+ *
+ * Same arithmetic as three ds4x_cuda_matmul calls with the elementwise step on
+ * the host in between — but the intermediates never leave VRAM, so the FFN
+ * costs 1 H2D + 1 D2H instead of 3 + 3.
+ *
+ * Why that matters more than it looks: the per-call host↔device cost is
+ * charged PER CALL, not per byte. Measured 2026-08-11 on an RTX 5060 Ti it is
+ * ~57 µs whatever the transfer size, which was ~48% of all GPU-path time for
+ * Qwen3.5-0.8B — and only ~10 µs on the DGX's unified memory, which is why
+ * three earlier rounds of kernel tuning measured "no gain" and were reverted
+ * (docs/linear-attention-design.md §4m-bis). The fix is therefore worth MOST
+ * on small models and on discrete cards, i.e. exactly the product's target
+ * hardware.
+ *
+ * The CPU swiglu() in ds4x_forward.c stays the numeric reference.
+ * Returns 0, or -1 (caller falls back to the CPU path — never a wrong answer). */
+int ds4x_cuda_swiglu(const ds4x_cuda_wt *Wg, const ds4x_cuda_wt *Wu,
+                     const ds4x_cuda_wt *Wd, const float *X, float *Y,
+                     uint32_t n_tokens);
+
+/* Fused-FFN time, split like ds4x_cuda_matmul_stats. Reported as its own bucket
+ * rather than folded into the matmul one so that moving work INTO the fused
+ * path is visible as the matmul bucket shrinking and this one growing — a
+ * single merged number would hide exactly the effect being measured. */
+void ds4x_cuda_ffn_stats(double *ms_kernel, double *ms_total,
+                         uint64_t *calls, uint64_t *rows);
+
+/* ---- fused projection fan-out --------------------------------------------
+ * Y[i] = W[i] · X for i < n_proj, where every projection reads the SAME X.
+ * X is [n_tokens][n_in]; Y[i] is [n_tokens][W[i]->n_out]. The Y[i] need not be
+ * contiguous with each other — GQA passes pointers straight into the KV cache.
+ *
+ * Two call sites, and between them most of the remaining per-call cost:
+ *   Gated DeltaNet  qkv / z / b / a  read `normed`   (4)
+ *   GQA attention   q / k / v        read `nrm_all`  (3)
+ *
+ * Unfused: N ds4x_cuda_matmul calls = the same input uploaded N times, N
+ * downloads, N synchronizes. Fused: one upload, N kernels, one download, one
+ * synchronize.
+ *
+ * All W[i] must agree on n_in — that is the premise that lets them share one
+ * upload, and a mismatch means the caller grouped the wrong weights.
+ * Returns 0, or -1 (caller falls back to the unfused path). */
+#define DS4X_PROJ_FANOUT_MAX 8
+int ds4x_cuda_proj_fanout(const ds4x_cuda_wt *const *W, float *const *Y,
+                          uint32_t n_proj, const float *X, uint32_t n_tokens);
+
+void ds4x_cuda_proj_stats(double *ms_kernel, double *ms_total,
+                          uint64_t *calls, uint64_t *rows);
 
 /* ---- Gated DeltaNet recurrence (linear-attention layers) -----------------
  * The delta-rule recurrence is strictly sequential in t and, once the

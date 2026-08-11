@@ -464,6 +464,150 @@ __global__ void matvec_q4k_kernel(const unsigned char *W, uint32_t n_in,
     }
 }
 
+/* Rows per block for the one-warp-per-row kernels. */
+#define MV_WARPS 4
+
+/* Q4_K for a NARROW matrix: one WARP per output row, MV_WARPS rows per block.
+ * Same coalescing as matvec_q4k_kernel (a warp still walks qs[] consecutively),
+ * but no shared memory, no __syncthreads, and only the intra-warp shuffle.
+ *
+ * Why a second Q4_K kernel. The block-per-row version does nblk*128 = n_in/2
+ * half-byte positions spread over 128 threads, i.e. n_in/256 iterations PER
+ * THREAD. At n_in = 4096 that is 16 and the reduction is well amortized; at
+ * n_in = 1024 — every projection of a 1024-wide model — it is FOUR. Four
+ * iterations of ~8 flops, then ~10 shuffle steps plus a shared round trip plus
+ * __syncthreads to reduce them. The reduction costs more than the arithmetic.
+ *
+ * One warp per row gives each lane 4x the work (16 iterations at n_in=1024) and
+ * cuts the reduction to a single 5-step shuffle with no barrier.
+ *
+ * This is the hypothesis that failed the first time it was tried, because it
+ * was aimed at the OUTPUT HEAD — which turned out to be Q6_K (tied embedding),
+ * and which the generic path was already running one-warp-per-row. Aimed at the
+ * Q4_K projections instead it targets a shape that genuinely has the defect.
+ * The lesson is in the git history: verify the hot tensor's TYPE and DIMS
+ * before reshaping a kernel for it.
+ *
+ * Summation order differs from the block-per-row kernel (32 partials rather
+ * than 128), so it is gated on shape and checked by the numeric gate. */
+__global__ void matvec_q4k_narrow_kernel(const unsigned char *W, uint32_t n_in,
+                                         uint32_t n_out, const float *x, float *y) {
+    const uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    const uint32_t row  = blockIdx.x * MV_WARPS + warp;
+    if (row >= n_out) return;
+    const uint32_t nblk = n_in / QK_K;
+    const unsigned char *rowp = W + (size_t)row * nblk * 144;
+
+    float acc = 0.0f;
+    for (uint32_t qb = 0; qb < nblk; qb++) {
+        const unsigned char *p = rowp + (size_t)qb * 144;
+        const float d    = f16_to_f32_d(*(const unsigned short *)p);
+        const float dmin = f16_to_f32_d(*(const unsigned short *)(p + 2));
+        const unsigned char *scales = p + 4;
+        const unsigned char *qs = p + 16;
+        const float *xb = x + (size_t)qb * QK_K;
+        for (uint32_t i = lane; i < 128; i += 32u) {
+            const uint32_t j = i >> 5, l = i & 31u;
+            unsigned char sc, mm;
+            get_scale_min_k4_d((int)(2 * j),     scales, &sc, &mm);
+            const float d1 = d * sc, m1 = dmin * mm;
+            get_scale_min_k4_d((int)(2 * j + 1), scales, &sc, &mm);
+            const float d2 = d * sc, m2 = dmin * mm;
+            const unsigned char b = qs[i];
+            acc += (d1 * (float)(b & 0xF) - m1) * xb[j * 64 + l];
+            acc += (d2 * (float)(b >>  4) - m2) * xb[j * 64 + 32 + l];
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (lane == 0) y[row] = acc;
+}
+
+/* Q6_K specialization: COALESCED, for exactly the reason Q4_K got one.
+ *
+ * This matters more than the type's share of a Q4_K_M model suggests, because
+ * of where Q6_K actually sits: llama.cpp keeps the embedding/output matrix at
+ * higher precision, and Qwen3.5 TIES them — so `token_embd.weight` is a single
+ * Q6_K [248320][1024], and it is re-read for every decoded token as the output
+ * head. Measured on an RTX 5060 Ti it was 2.96 ms/token, 26% of ALL kernel
+ * time, against a ~0.47 ms memory roofline for the ~209 MB it reads.
+ *
+ * The generic unit kernel gives thread t the t-th 32-element unit, so a warp
+ * scatters across quant blocks and each load drags in far more sectors than it
+ * uses. Here the whole block cooperates on ONE 256-element block at a time and
+ * thread i reads ql[i] — consecutive threads, consecutive bytes.
+ *
+ * Layout (210 B/block, mirrors ds4x_quant.c): ql[0..127] low nibbles,
+ * qh[128..191] 2-bit highs, sc[192..207] 16 int8 scales, d at 208.
+ * Byte ql[i] carries TWO elements. With nn = i>>6 (128-group), h = (i>>5)&1,
+ * l = i&31: the low nibble belongs to quarter g = h, the high nibble to
+ * g = h+2. Both take their 2 high bits from qh[nn*32 + l] at bit pair 2g, and
+ * their scale from sc[nn*8 + 2g + (l >= 16)].
+ *
+ * Byte loads only, deliberately: a Q6_K block is 210 B, NOT a multiple of 4, so
+ * every other block starts 2 B off and 32-bit loads fault with "misaligned
+ * address" (the generic path's comment records the same trap). */
+__global__ void matvec_q6k_kernel(const unsigned char *W, uint32_t n_in,
+                                  const float *x, float *y) {
+    const uint32_t row  = blockIdx.x;
+    const uint32_t nblk = n_in / QK_K;
+    const unsigned char *rowp = W + (size_t)row * nblk * 210;
+
+    float acc = 0.0f;
+    for (uint32_t qb = 0; qb < nblk; qb++) {
+        const unsigned char *p  = rowp + (size_t)qb * 210;
+        const unsigned char *ql = p;
+        const unsigned char *qh = p + 128;
+        const signed char   *sc = (const signed char *)(p + 192);
+        const float d = f16_to_f32_d(*(const unsigned short *)(p + 208));
+        const float *xb = x + (size_t)qb * QK_K;
+        for (uint32_t i = threadIdx.x; i < 128; i += blockDim.x) {
+            const uint32_t nn = i >> 6, h = (i >> 5) & 1u, l = i & 31u;
+            const uint32_t g0 = h, g1 = h + 2u;
+            const unsigned char b  = ql[i];
+            const unsigned char hb = qh[nn * 32u + l];
+            const uint32_t shalf = (l >= 16u) ? 1u : 0u;
+            const int v0 = (int)((uint32_t)(b & 0x0Fu) | (((uint32_t)(hb >> (2u * g0)) & 3u) << 4)) - 32;
+            const int v1 = (int)((uint32_t)(b >> 4)    | (((uint32_t)(hb >> (2u * g1)) & 3u) << 4)) - 32;
+            const float s0 = d * (float)sc[nn * 8u + 2u * g0 + shalf];
+            const float s1 = d * (float)sc[nn * 8u + 2u * g1 + shalf];
+            acc += s0 * (float)v0 * xb[nn * 128u + g0 * 32u + l];
+            acc += s1 * (float)v1 * xb[nn * 128u + g1 * 32u + l];
+        }
+    }
+
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    extern __shared__ float smq6[];
+    const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const uint32_t nwarps = (blockDim.x + 31u) / 32u;
+    if (lane == 0) smq6[warp] = acc;
+    __syncthreads();
+    if (warp == 0) {
+        float v = (lane < nwarps) ? smq6[lane] : 0.0f;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            v += __shfl_down_sync(0xffffffffu, v, off);
+        if (lane == 0) y[row] = v;
+    }
+}
+
+/* Should this Q4_K matvec use one warp per row instead of one block per row?
+ *
+ * The block-per-row kernel gives each of its 128 threads n_in/256 iterations.
+ * Below n_in = 2048 that is <= 8, at which point the block-wide reduction (a
+ * shared round trip and a __syncthreads on top of two shuffle chains) costs
+ * more than the work it reduces. 1024-wide models — Qwen3.5-0.8B and every
+ * other n_embd=1024 build — sit at 4.
+ *
+ * Threshold on n_in, not n_out: the defect is "too little work per thread",
+ * which n_in alone decides. */
+static inline int q4k_narrow_shape(const ds4x_cuda_wt *w) {
+    return w->type == T_Q4_K && w->n_in <= 2048u && (w->n_in % QK_K) == 0;
+}
+
 /* One block per output row; threads stride over the row's 32-element units.
  * Reduction is warp-shuffle first (no shared traffic inside a warp), then one
  * shared slot per warp. */
@@ -833,9 +977,17 @@ extern "C" int ds4x_cuda_matvec_off(const ds4x_cuda_wt *w, uint64_t elem_off,
     }
     const uint32_t shmem = ((threads + 31u) / 32u) * (uint32_t)sizeof(float);
     cudaEventRecord(g_ev0);
-    if (w->type == T_Q4_K) {
+    if (q4k_narrow_shape(w)) {
+        const uint32_t th = MV_WARPS * 32u;
+        matvec_q4k_narrow_kernel<<<(n_out + MV_WARPS - 1u) / MV_WARPS, th>>>(
+            base, w->n_in, n_out, w->d_x, w->d_y);
+    } else if (w->type == T_Q4_K) {
         const uint32_t th = 128;
         matvec_q4k_kernel<<<n_out, th, ((th + 31u) / 32u) * (uint32_t)sizeof(float)>>>(
+            base, w->n_in, w->d_x, w->d_y);
+    } else if (w->type == T_Q6_K) {
+        const uint32_t th = 128;
+        matvec_q6k_kernel<<<n_out, th, ((th + 31u) / 32u) * (uint32_t)sizeof(float)>>>(
             base, w->n_in, w->d_x, w->d_y);
     } else {
         matvec_kernel<<<n_out, threads, shmem>>>(
@@ -874,10 +1026,21 @@ extern "C" int ds4x_cuda_matvec(const ds4x_cuda_wt *w, const float *x, float *y)
     /* shared = one float per warp */
     const uint32_t shmem = ((threads + 31u) / 32u) * (uint32_t)sizeof(float);
     cudaEventRecord(g_ev0);
-    if (w->type == T_Q4_K) {
+    if (q4k_narrow_shape(w)) {
+        const uint32_t th = MV_WARPS * 32u;
+        matvec_q4k_narrow_kernel<<<(w->n_out + MV_WARPS - 1u) / MV_WARPS, th>>>(
+            (const unsigned char *)w->d_data, w->n_in, w->n_out, w->d_x, w->d_y);
+    } else if (w->type == T_Q4_K) {
         /* coalesced specialization (dominant type in a Q4_K_M model) */
         const uint32_t th = 128;
         matvec_q4k_kernel<<<w->n_out, th, ((th + 31u) / 32u) * (uint32_t)sizeof(float)>>>(
+            (const unsigned char *)w->d_data, w->n_in, w->d_x, w->d_y);
+    } else if (w->type == T_Q6_K) {
+        /* The output head lands here: a Q4_K_M model keeps the tied
+         * embedding/output matrix at Q6_K, and it is the largest single matvec
+         * in the model, re-read every decoded token. */
+        const uint32_t th = 128;
+        matvec_q6k_kernel<<<w->n_out, th, ((th + 31u) / 32u) * (uint32_t)sizeof(float)>>>(
             (const unsigned char *)w->d_data, w->n_in, w->d_x, w->d_y);
     } else {
         matvec_kernel<<<w->n_out, threads, shmem>>>(
@@ -923,6 +1086,80 @@ static int stage_reserve(size_t nx, size_t ny) {
     return 0;
 }
 
+/* Launch the matmul kernel for `nt` token-rows, DEVICE POINTER IN, DEVICE
+ * POINTER OUT. No copies, no synchronize, no timing — the caller owns all
+ * three.
+ *
+ * Extracted from ds4x_cuda_matmul so that a fused block (see
+ * ds4x_cuda_swiglu below) can chain several matmuls with the intermediate
+ * activations never leaving VRAM. That chaining is the whole point: measured
+ * on an RTX 5060 Ti, each host<->device round trip costs ~57 us regardless of
+ * how small the transfer is, and the per-call overhead was ~48% of all GPU
+ * path time for a 0.8B model (docs/linear-attention-design.md §4m-bis). */
+/* Single-token counterpart of launch_matmul: same device-in/device-out shape,
+ * but the MATVEC kernel (one block per output row, no token tiling).
+ *
+ * Needed because the matmul kernel tiles TOK_TILE=8 token-rows per block, so a
+ * 1-token launch leaves 7 of 8 lanes masked off. ds4x_cuda_matmul's comment
+ * claims that costs what a matvec did; measured on a 5060 Ti it does not — the
+ * first cut of the fused FFN routed decode through the matmul kernel and paid
+ * +33 ms of kernel time per 32 tokens, eating half of what fusing had just
+ * saved in round trips.
+ *
+ * It also keeps the numerics where they were: the unfused decode FFN went
+ * through matvec_q, so using the matvec kernel here reproduces the old path
+ * exactly rather than introducing a new reduction order. */
+static int launch_matvec(const ds4x_cuda_wt *w, const float *d_x, float *d_y) {
+    const uint32_t bc = blk_count(w->type);
+    const uint32_t bb = (uint32_t)blk_bytes(w->type);
+    const uint32_t n_units = w->n_in / UNIT;
+    uint32_t threads = n_units < 256 ? n_units : 256;
+    threads = ((threads + 31u) / 32u) * 32u;
+    if (threads == 0) threads = 32;
+    if (q4k_narrow_shape(w)) {
+        const uint32_t th = MV_WARPS * 32u;
+        matvec_q4k_narrow_kernel<<<(w->n_out + MV_WARPS - 1u) / MV_WARPS, th>>>(
+            (const unsigned char *)w->d_data, w->n_in, w->n_out, d_x, d_y);
+    } else if (w->type == T_Q4_K) {
+        const uint32_t th = 128;
+        matvec_q4k_kernel<<<w->n_out, th, ((th + 31u) / 32u) * (uint32_t)sizeof(float)>>>(
+            (const unsigned char *)w->d_data, w->n_in, d_x, d_y);
+    } else if (w->type == T_Q6_K) {
+        const uint32_t th = 128;
+        matvec_q6k_kernel<<<w->n_out, th, ((th + 31u) / 32u) * (uint32_t)sizeof(float)>>>(
+            (const unsigned char *)w->d_data, w->n_in, d_x, d_y);
+    } else {
+        const uint32_t shmem = ((threads + 31u) / 32u) * (uint32_t)sizeof(float);
+        matvec_kernel<<<w->n_out, threads, shmem>>>(
+            (const unsigned char *)w->d_data, w->type, w->n_in, bc, bb, d_x, d_y);
+    }
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { set_err("matvec launch", e); return -1; }
+    return 0;
+}
+
+static int launch_matmul(const ds4x_cuda_wt *w, const float *d_x, float *d_y,
+                         uint32_t nt) {
+    const uint32_t ntile = (nt + TOK_TILE - 1u) / TOK_TILE;
+    if (w->type == T_Q4_K) {
+        const uint32_t th = 128;
+        const uint32_t sh = ((th + 31u) / 32u) * TOK_TILE * (uint32_t)sizeof(float);
+        matmul_q4k_kernel<<<dim3(w->n_out, ntile), th, sh>>>(
+            (const unsigned char *)w->d_data, w->n_in, w->n_out, nt, d_x, d_y);
+    } else {
+        uint32_t th = (w->n_in / UNIT) < 256u ? (w->n_in / UNIT) : 256u;
+        th = ((th + 31u) / 32u) * 32u;
+        if (th == 0) th = 32;
+        const uint32_t sh = ((th + 31u) / 32u) * TOK_TILE * (uint32_t)sizeof(float);
+        matmul_kernel<<<dim3(w->n_out, ntile), th, sh>>>(
+            (const unsigned char *)w->d_data, w->type, w->n_in, w->n_out,
+            blk_count(w->type), (uint32_t)blk_bytes(w->type), nt, d_x, d_y);
+    }
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { set_err("matmul launch", e); return -1; }
+    return 0;
+}
+
 extern "C" int ds4x_cuda_matmul(const ds4x_cuda_wt *w, const float *X, float *Y,
                                 uint32_t n_tokens) {
     if (!w || !X || !Y || n_tokens == 0) return -1;
@@ -933,8 +1170,6 @@ extern "C" int ds4x_cuda_matmul(const ds4x_cuda_wt *w, const float *X, float *Y,
      * 1-token call costs what the matvec did. */
     const double t0 = host_ms();
     if (!g_mev0) { cudaEventCreate(&g_mev0); cudaEventCreate(&g_mev1); }
-    const uint32_t bc = blk_count(w->type);
-    const uint32_t bb = (uint32_t)blk_bytes(w->type);
 
     for (uint32_t base = 0; base < n_tokens; base += MM_BLOCK) {
         const uint32_t nt = (n_tokens - base) < MM_BLOCK ? (n_tokens - base) : MM_BLOCK;
@@ -946,25 +1181,9 @@ extern "C" int ds4x_cuda_matmul(const ds4x_cuda_wt *w, const float *X, float *Y,
                                  cudaMemcpyHostToDevice, 0)) != cudaSuccess) {
             set_err("cudaMemcpyAsync(matmul X)", e); return -1;
         }
-        const uint32_t ntile = (nt + TOK_TILE - 1u) / TOK_TILE;
         cudaEventRecord(g_mev0);
-        if (w->type == T_Q4_K) {
-            const uint32_t th = 128;
-            const uint32_t sh = ((th + 31u) / 32u) * TOK_TILE * (uint32_t)sizeof(float);
-            matmul_q4k_kernel<<<dim3(w->n_out, ntile), th, sh>>>(
-                (const unsigned char *)w->d_data, w->n_in, w->n_out, nt,
-                g_stage.d_x, g_stage.d_y);
-        } else {
-            uint32_t th = (w->n_in / UNIT) < 256u ? (w->n_in / UNIT) : 256u;
-            th = ((th + 31u) / 32u) * 32u;
-            if (th == 0) th = 32;
-            const uint32_t sh = ((th + 31u) / 32u) * TOK_TILE * (uint32_t)sizeof(float);
-            matmul_kernel<<<dim3(w->n_out, ntile), th, sh>>>(
-                (const unsigned char *)w->d_data, w->type, w->n_in, w->n_out,
-                bc, bb, nt, g_stage.d_x, g_stage.d_y);
-        }
+        if (launch_matmul(w, g_stage.d_x, g_stage.d_y, nt) != 0) return -1;
         cudaEventRecord(g_mev1);
-        if ((e = cudaGetLastError()) != cudaSuccess) { set_err("matmul launch", e); return -1; }
         if ((e = cudaMemcpyAsync(g_stage.h_y, g_stage.d_y, ny * sizeof(float),
                                  cudaMemcpyDeviceToHost, 0)) != cudaSuccess) {
             set_err("cudaMemcpyAsync(matmul Y)", e); return -1;
@@ -978,6 +1197,436 @@ extern "C" int ds4x_cuda_matmul(const ds4x_cuda_wt *w, const float *X, float *Y,
     }
     g_mm_ms_total += host_ms() - t0;
     return 0;
+}
+
+/* ---- fused SwiGLU FFN ----------------------------------------------------
+ * y = Wd . (silu(Wg.x) (*) (Wu.x)), the whole thing on the device.
+ *
+ * Unfused this is three ds4x_cuda_matmul calls with the elementwise silu*mul
+ * on the host in between: 3 H2D + 3 D2H per FFN per token. Fused it is 1 + 1.
+ * A dense FFN is entirely token-independent (no cache, no position), so there
+ * is nothing to prove here beyond the matmul contract and the elementwise op.
+ *
+ * The CPU swiglu() in ds4x_forward.c stays the numeric reference. */
+static struct { float *d_g, *d_u; size_t n; } g_ffn = { NULL, NULL, 0 };
+static double g_ffn_ms_kernel = 0.0, g_ffn_ms_total = 0.0;
+static unsigned long long g_ffn_calls = 0, g_ffn_rows = 0;
+
+static int ffn_reserve(size_t n) {
+    if (n <= g_ffn.n) return 0;
+    cudaError_t e;
+    cudaFree(g_ffn.d_g); cudaFree(g_ffn.d_u);
+    g_ffn.d_g = NULL; g_ffn.d_u = NULL; g_ffn.n = 0;
+    if ((e = cudaMalloc(&g_ffn.d_g, n * sizeof(float))) != cudaSuccess ||
+        (e = cudaMalloc(&g_ffn.d_u, n * sizeof(float))) != cudaSuccess) {
+        set_err("cudaMalloc(ffn scratch)", e); return -1;
+    }
+    g_ffn.n = n;
+    return 0;
+}
+
+/* g[i] = silu(g[i]) * u[i]. Mirrors the CPU loop in swiglu() exactly; expf is
+ * left as expf (not __expf) so the only fast-math divergence is the one the
+ * whole translation unit already has from --use_fast_math. */
+__global__ void silu_mul_kernel(float *g, const float *u, size_t n) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float v = g[i];
+    g[i] = (v / (1.0f + expf(-v))) * u[i];
+}
+
+extern "C" int ds4x_cuda_swiglu(const ds4x_cuda_wt *Wg, const ds4x_cuda_wt *Wu,
+                                const ds4x_cuda_wt *Wd, const float *X, float *Y,
+                                uint32_t n_tokens) {
+    if (!Wg || !Wu || !Wd || !X || !Y || n_tokens == 0) return -1;
+    /* Shape agreement is the caller's contract, but a mismatch here would read
+     * out of bounds on the device, so check rather than trust: Wg and Wu must
+     * share both dimensions, and Wd must consume what they produce. */
+    if (Wg->n_in != Wu->n_in || Wg->n_out != Wu->n_out || Wd->n_in != Wg->n_out) {
+        snprintf(g_err, sizeof(g_err),
+                 "swiglu: shape mismatch g=[%ux%u] u=[%ux%u] d=[%ux%u]",
+                 Wg->n_out, Wg->n_in, Wu->n_out, Wu->n_in, Wd->n_out, Wd->n_in);
+        return -1;
+    }
+    const double t0 = host_ms();
+    if (!g_mev0) { cudaEventCreate(&g_mev0); cudaEventCreate(&g_mev1); }
+    const uint32_t ff = Wg->n_out, n_embd_in = Wg->n_in, n_embd_out = Wd->n_out;
+
+    for (uint32_t base = 0; base < n_tokens; base += MM_BLOCK) {
+        const uint32_t nt = (n_tokens - base) < MM_BLOCK ? (n_tokens - base) : MM_BLOCK;
+        const size_t nx = (size_t)nt * n_embd_in, ny = (size_t)nt * n_embd_out;
+        const size_t nff = (size_t)nt * ff;
+        if (stage_reserve(nx, ny) != 0 || ffn_reserve(nff) != 0) return -1;
+        memcpy(g_stage.h_x, X + (size_t)base * n_embd_in, nx * sizeof(float));
+        cudaError_t e;
+        if ((e = cudaMemcpyAsync(g_stage.d_x, g_stage.h_x, nx * sizeof(float),
+                                 cudaMemcpyHostToDevice, 0)) != cudaSuccess) {
+            set_err("cudaMemcpyAsync(swiglu X)", e); return -1;
+        }
+        cudaEventRecord(g_mev0);
+        /* The three projections and the elementwise op are all on the default
+         * stream, so they serialize in issue order with no explicit sync.
+         *
+         * FFN_PROJ picks the kernel the UNFUSED path would have used at this
+         * chunk size: swiglu() (decode, 1 token) went through matvec_q, and
+         * swiglu_chunk() (prefill) through matmul_q. Keeping that split matters
+         * twice over — it reproduces the old reduction order exactly instead of
+         * inventing a new one, and the matmul kernel's TOK_TILE=8 would leave
+         * 7 of 8 lanes masked off on a 1-token launch (measured: +33 ms kernel
+         * per 32 tokens, half the round-trip saving handed straight back).
+         *
+         * Deliberately NOT folded into launch_matmul: ds4x_cuda_matmul routes
+         * n_tokens==1 through the matmul kernel on purpose, so that decode and
+         * prefill stay comparable through that API. */
+#define FFN_PROJ(W, DX, DY) \
+    (nt == 1 ? launch_matvec((W), (DX), (DY)) : launch_matmul((W), (DX), (DY), nt))
+        if (FFN_PROJ(Wg, g_stage.d_x, g_ffn.d_g) != 0) return -1;
+        if (FFN_PROJ(Wu, g_stage.d_x, g_ffn.d_u) != 0) return -1;
+        {
+            const uint32_t th = 256;
+            const size_t blocks = (nff + th - 1) / th;
+            silu_mul_kernel<<<(uint32_t)blocks, th>>>(g_ffn.d_g, g_ffn.d_u, nff);
+            if ((e = cudaGetLastError()) != cudaSuccess) { set_err("silu_mul launch", e); return -1; }
+        }
+        if (FFN_PROJ(Wd, g_ffn.d_g, g_stage.d_y) != 0) return -1;
+#undef FFN_PROJ
+        cudaEventRecord(g_mev1);
+        if ((e = cudaMemcpyAsync(g_stage.h_y, g_stage.d_y, ny * sizeof(float),
+                                 cudaMemcpyDeviceToHost, 0)) != cudaSuccess) {
+            set_err("cudaMemcpyAsync(swiglu Y)", e); return -1;
+        }
+        if ((e = cudaStreamSynchronize(0)) != cudaSuccess) { set_err("swiglu sync", e); return -1; }
+        memcpy(Y + (size_t)base * n_embd_out, g_stage.h_y, ny * sizeof(float));
+        float kms = 0.0f;
+        if (cudaEventElapsedTime(&kms, g_mev0, g_mev1) == cudaSuccess) g_ffn_ms_kernel += kms;
+        g_ffn_calls++;
+        g_ffn_rows += nt;
+    }
+    g_ffn_ms_total += host_ms() - t0;
+    return 0;
+}
+
+/* h[i] += o[i] — the residual add, on device so the value never has to come
+ * back just to be added to. */
+__global__ void residual_add_kernel(float *h, const float *o, size_t n) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) h[i] += o[i];
+}
+
+/* y[t] = (h[t] / rms(h[t])) * w   — one block per token row.
+ * Mirrors rmsnorm() in ds4x_forward.c including the eps placement (inside the
+ * sqrt, on the mean), which is the detail that silently changes results if
+ * copied wrong. */
+__global__ void rmsnorm_kernel(const float *h, const float *w, float *y,
+                               uint32_t n, float eps) {
+    const float *hr = h + (size_t)blockIdx.x * n;
+    float *yr = y + (size_t)blockIdx.x * n;
+    float ss = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) ss += hr[i] * hr[i];
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        ss += __shfl_down_sync(0xffffffffu, ss, off);
+    extern __shared__ float smn[];
+    const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const uint32_t nwarps = (blockDim.x + 31u) / 32u;
+    if (lane == 0) smn[warp] = ss;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float s = 0.0f;
+        for (uint32_t k = 0; k < nwarps; k++) s += smn[k];
+        smn[0] = 1.0f / sqrtf(s / (float)n + eps);
+    }
+    __syncthreads();
+    const float inv = smn[0];
+    /* Multiply order is x*w*inv, matching rmsnorm() in ds4x_forward.c exactly.
+     * fp32 multiplication is not associative, so x*inv*w is a DIFFERENT number;
+     * writing it the other way round is a divergence that no compiler warns
+     * about and that only shows up as a flipped token much later. */
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) yr[i] = hr[i] * w[i] * inv;
+}
+
+extern "C" void ds4x_cuda_ffn_stats(double *ms_kernel, double *ms_total,
+                                    uint64_t *calls, uint64_t *rows) {
+    if (ms_kernel) *ms_kernel = g_ffn_ms_kernel;
+    if (ms_total)  *ms_total  = g_ffn_ms_total;
+    if (calls)     *calls     = (uint64_t)g_ffn_calls;
+    if (rows)      *rows      = (uint64_t)g_ffn_rows;
+}
+
+/* ---- fused attention-output + FFN tail -----------------------------------
+ * The whole back half of a layer, in one call:
+ *
+ *     h = x + Wo·attn_in            (attention output projection + residual)
+ *     n = rmsnorm(h) * ffn_norm_w
+ *     x = h + Wd·(silu(Wg·n) ⊙ (Wu·n))
+ *
+ * Unfused this is TWO device calls (the output projection, then the fused FFN)
+ * with the residual and the norm on the host in between — so the hidden state
+ * makes a full round trip purely to have two elementwise operations done to it.
+ * Fused it is one upload of (attn_in, x) and one download of x.
+ *
+ * That middle round trip is the whole `matmuls` bucket in a dense model: 2856
+ * calls per 118 tokens, 350 ms, 55% of it not kernel time. Folding it in here
+ * makes the bucket disappear rather than shrink.
+ *
+ * Works for both attention kinds because both end the same way — GQA passes
+ * concat(heads) with Wo = attn_out, a linear layer passes the recurrence output
+ * `core` with Wo = out_proj. Only the input width differs, and that is Wo->n_in.
+ *
+ * Dense FFN only: a MoE layer routes each token to different experts, so there
+ * is no single (Wg,Wu,Wd) to fuse with. Those keep the unfused path. */
+static struct { float *d_attn, *d_h, *d_n, *d_w, *h_io; size_t n_attn, n_h, n_w, n_io; } g_tail =
+    { NULL, NULL, NULL, NULL, NULL, 0, 0, 0, 0 };
+static double g_tail_ms_kernel = 0.0, g_tail_ms_total = 0.0;
+static unsigned long long g_tail_calls = 0, g_tail_rows = 0;
+
+static int tail_reserve(size_t n_attn, size_t n_h, size_t n_w, size_t n_io) {
+    cudaError_t e;
+    if (n_attn > g_tail.n_attn) {
+        cudaFree(g_tail.d_attn); g_tail.d_attn = NULL; g_tail.n_attn = 0;
+        if ((e = cudaMalloc(&g_tail.d_attn, n_attn * sizeof(float))) != cudaSuccess) {
+            set_err("cudaMalloc(tail attn)", e); return -1; }
+        g_tail.n_attn = n_attn;
+    }
+    if (n_h > g_tail.n_h) {
+        cudaFree(g_tail.d_h); cudaFree(g_tail.d_n);
+        g_tail.d_h = NULL; g_tail.d_n = NULL; g_tail.n_h = 0;
+        if ((e = cudaMalloc(&g_tail.d_h, n_h * sizeof(float))) != cudaSuccess ||
+            (e = cudaMalloc(&g_tail.d_n, n_h * sizeof(float))) != cudaSuccess) {
+            set_err("cudaMalloc(tail h)", e); return -1; }
+        g_tail.n_h = n_h;
+    }
+    if (n_w > g_tail.n_w) {
+        cudaFree(g_tail.d_w); g_tail.d_w = NULL; g_tail.n_w = 0;
+        if ((e = cudaMalloc(&g_tail.d_w, n_w * sizeof(float))) != cudaSuccess) {
+            set_err("cudaMalloc(tail w)", e); return -1; }
+        g_tail.n_w = n_w;
+    }
+    if (n_io > g_tail.n_io) {
+        cudaFreeHost(g_tail.h_io); g_tail.h_io = NULL; g_tail.n_io = 0;
+        if ((e = cudaHostAlloc(&g_tail.h_io, n_io * sizeof(float), cudaHostAllocDefault)) != cudaSuccess) {
+            set_err("cudaHostAlloc(tail io)", e); return -1; }
+        g_tail.n_io = n_io;
+    }
+    return 0;
+}
+
+extern "C" int ds4x_cuda_attn_ffn_tail(const ds4x_cuda_wt *Wo,
+                                       const ds4x_cuda_wt *Wg, const ds4x_cuda_wt *Wu,
+                                       const ds4x_cuda_wt *Wd,
+                                       const float *attn_in, const float *ffn_norm_w,
+                                       float *x, uint32_t n_tokens, float eps) {
+    if (!Wo || !Wg || !Wu || !Wd || !attn_in || !ffn_norm_w || !x || n_tokens == 0)
+        return -1;
+    const uint32_t n_embd = Wo->n_out, ff = Wg->n_out, ain = Wo->n_in;
+    if (Wg->n_in != n_embd || Wu->n_in != n_embd || Wu->n_out != ff ||
+        Wd->n_in != ff || Wd->n_out != n_embd) {
+        snprintf(g_err, sizeof(g_err),
+                 "attn_ffn_tail: shape mismatch o=[%ux%u] g=[%ux%u] u=[%ux%u] d=[%ux%u]",
+                 Wo->n_out, Wo->n_in, Wg->n_out, Wg->n_in,
+                 Wu->n_out, Wu->n_in, Wd->n_out, Wd->n_in);
+        return -1;
+    }
+    const double t0 = host_ms();
+    if (!g_mev0) { cudaEventCreate(&g_mev0); cudaEventCreate(&g_mev1); }
+
+    for (uint32_t base = 0; base < n_tokens; base += MM_BLOCK) {
+        const uint32_t nt = (n_tokens - base) < MM_BLOCK ? (n_tokens - base) : MM_BLOCK;
+        const size_t na = (size_t)nt * ain, nh = (size_t)nt * n_embd;
+        const size_t nff = (size_t)nt * ff;
+        /* One pinned buffer holding BOTH inputs back to back, so the two uploads
+         * are issued without a synchronize between them. Staging them through
+         * the same region one after the other would need a sync to know the
+         * first copy had drained before overwriting it — i.e. it would put back
+         * exactly the round trip this function exists to remove. */
+        if (tail_reserve(na, nh, n_embd, na + nh) != 0) return -1;
+        if (ffn_reserve(nff) != 0) return -1;
+        cudaError_t e;
+        memcpy(g_tail.h_io,      attn_in + (size_t)base * ain,    na * sizeof(float));
+        memcpy(g_tail.h_io + na, x       + (size_t)base * n_embd, nh * sizeof(float));
+        if ((e = cudaMemcpyAsync(g_tail.d_attn, g_tail.h_io, na * sizeof(float),
+                                 cudaMemcpyHostToDevice, 0)) != cudaSuccess) {
+            set_err("cudaMemcpyAsync(tail attn_in)", e); return -1; }
+        if ((e = cudaMemcpyAsync(g_tail.d_h, g_tail.h_io + na, nh * sizeof(float),
+                                 cudaMemcpyHostToDevice, 0)) != cudaSuccess) {
+            set_err("cudaMemcpyAsync(tail x)", e); return -1; }
+        if (base == 0) {
+            if ((e = cudaMemcpyAsync(g_tail.d_w, ffn_norm_w, n_embd * sizeof(float),
+                                     cudaMemcpyHostToDevice, 0)) != cudaSuccess) {
+                set_err("cudaMemcpyAsync(tail norm_w)", e); return -1; }
+        }
+        cudaEventRecord(g_mev0);
+        /* h = x + Wo·attn_in : project into d_n as scratch, then add into d_h */
+        if ((nt == 1 ? launch_matvec(Wo, g_tail.d_attn, g_tail.d_n)
+                     : launch_matmul(Wo, g_tail.d_attn, g_tail.d_n, nt)) != 0) return -1;
+        {
+            const uint32_t th = 256;
+            residual_add_kernel<<<(uint32_t)((nh + th - 1) / th), th>>>(g_tail.d_h, g_tail.d_n, nh);
+            if ((e = cudaGetLastError()) != cudaSuccess) { set_err("residual launch", e); return -1; }
+        }
+        /* n = rmsnorm(h) * ffn_norm_w */
+        {
+            const uint32_t th = 256;
+            const uint32_t sh = ((th + 31u) / 32u) * (uint32_t)sizeof(float);
+            rmsnorm_kernel<<<nt, th, sh>>>(g_tail.d_h, g_tail.d_w, g_tail.d_n, n_embd, eps);
+            if ((e = cudaGetLastError()) != cudaSuccess) { set_err("rmsnorm launch", e); return -1; }
+        }
+        /* swiglu(n) into d_attn (reused as scratch: it is >= nh only when
+         * ain >= n_embd, so use the ffn arena's d_g result path instead) */
+        if ((nt == 1 ? launch_matvec(Wg, g_tail.d_n, g_ffn.d_g)
+                     : launch_matmul(Wg, g_tail.d_n, g_ffn.d_g, nt)) != 0) return -1;
+        if ((nt == 1 ? launch_matvec(Wu, g_tail.d_n, g_ffn.d_u)
+                     : launch_matmul(Wu, g_tail.d_n, g_ffn.d_u, nt)) != 0) return -1;
+        {
+            const uint32_t th = 256;
+            silu_mul_kernel<<<(uint32_t)((nff + th - 1) / th), th>>>(g_ffn.d_g, g_ffn.d_u, nff);
+            if ((e = cudaGetLastError()) != cudaSuccess) { set_err("silu_mul launch", e); return -1; }
+        }
+        /* x = h + Wd·g : project into d_n, add into d_h, download d_h */
+        if ((nt == 1 ? launch_matvec(Wd, g_ffn.d_g, g_tail.d_n)
+                     : launch_matmul(Wd, g_ffn.d_g, g_tail.d_n, nt)) != 0) return -1;
+        {
+            const uint32_t th = 256;
+            residual_add_kernel<<<(uint32_t)((nh + th - 1) / th), th>>>(g_tail.d_h, g_tail.d_n, nh);
+            if ((e = cudaGetLastError()) != cudaSuccess) { set_err("residual2 launch", e); return -1; }
+        }
+        cudaEventRecord(g_mev1);
+        if ((e = cudaMemcpyAsync(g_tail.h_io, g_tail.d_h, nh * sizeof(float),
+                                 cudaMemcpyDeviceToHost, 0)) != cudaSuccess) {
+            set_err("cudaMemcpyAsync(tail out)", e); return -1; }
+        if ((e = cudaStreamSynchronize(0)) != cudaSuccess) { set_err("tail sync", e); return -1; }
+        memcpy(x + (size_t)base * n_embd, g_tail.h_io, nh * sizeof(float));
+        float kms = 0.0f;
+        if (cudaEventElapsedTime(&kms, g_mev0, g_mev1) == cudaSuccess) g_tail_ms_kernel += kms;
+        g_tail_calls++;
+        g_tail_rows += nt;
+    }
+    g_tail_ms_total += host_ms() - t0;
+    return 0;
+}
+
+extern "C" void ds4x_cuda_tail_stats(double *ms_kernel, double *ms_total,
+                                     uint64_t *calls, uint64_t *rows) {
+    if (ms_kernel) *ms_kernel = g_tail_ms_kernel;
+    if (ms_total)  *ms_total  = g_tail_ms_total;
+    if (calls)     *calls     = (uint64_t)g_tail_calls;
+    if (rows)      *rows      = (uint64_t)g_tail_rows;
+}
+
+/* ---- fused projection fan-out --------------------------------------------
+ * N projections that all read the SAME input, in one call.
+ *
+ * Two places in the forward have this shape and between them they are most of
+ * the remaining calls:
+ *   - Gated DeltaNet: qkv / z / b / a all read `normed`   (4 projections)
+ *   - GQA attention:  q / k / v      all read `nrm_all`   (3 projections)
+ *
+ * Unfused that is N ds4x_cuda_matmul calls: the identical input uploaded N
+ * times, N downloads, N synchronizes. Fused it is one upload, N kernels, ONE
+ * download, one synchronize — the outputs are written into slices of a single
+ * contiguous device arena and come back in a single transfer, then get
+ * scattered to the caller's N destinations (which need not be contiguous with
+ * each other: GQA writes k and v straight into the KV cache).
+ *
+ * Deliberately ONE function rather than one per call site. The first cut had a
+ * GDN-specific version and the GQA one would have been a 60-line near-copy —
+ * and this repository's standing failure mode is two copies of the same logic
+ * drifting apart (see the header of scripts/testbed-lib.sh for the last three
+ * times).
+ *
+ * Outputs stay host-side for now: the conv/gates/recurrence and the attention
+ * reduction that consume them are still CPU code. When those move over, these
+ * downloads disappear rather than being rewritten. */
+static struct { float *d, *h; size_t n; } g_proj = { NULL, NULL, 0 };
+static double g_proj_ms_kernel = 0.0, g_proj_ms_total = 0.0;
+static unsigned long long g_proj_calls = 0, g_proj_rows = 0;
+
+static int proj_reserve(size_t n) {
+    if (n <= g_proj.n) return 0;
+    cudaError_t e;
+    cudaFree(g_proj.d); cudaFreeHost(g_proj.h);
+    g_proj.d = NULL; g_proj.h = NULL; g_proj.n = 0;
+    if ((e = cudaMalloc(&g_proj.d, n * sizeof(float))) != cudaSuccess ||
+        (e = cudaHostAlloc(&g_proj.h, n * sizeof(float), cudaHostAllocDefault)) != cudaSuccess) {
+        set_err("cudaMalloc(gdn proj arena)", e); return -1;
+    }
+    g_proj.n = n;
+    return 0;
+}
+
+extern "C" int ds4x_cuda_proj_fanout(const ds4x_cuda_wt *const *W,
+                                     float *const *Y, uint32_t n_proj,
+                                     const float *X, uint32_t n_tokens) {
+    if (!W || !Y || !X || n_tokens == 0 || n_proj == 0 ||
+        n_proj > DS4X_PROJ_FANOUT_MAX) return -1;
+    const uint32_t n_in = W[0] ? W[0]->n_in : 0;
+    for (uint32_t i = 0; i < n_proj; i++) {
+        if (!W[i] || !Y[i]) return -1;
+        if (W[i]->n_in != n_in) {
+            /* The whole premise is that they share one upload; a disagreeing
+             * n_in means the caller grouped the wrong weights together. */
+            snprintf(g_err, sizeof(g_err),
+                     "proj_fanout: projection %u wants n_in=%u, group is %u",
+                     i, W[i]->n_in, n_in);
+            return -1;
+        }
+    }
+    const double t0 = host_ms();
+    if (!g_mev0) { cudaEventCreate(&g_mev0); cudaEventCreate(&g_mev1); }
+
+    for (uint32_t base = 0; base < n_tokens; base += MM_BLOCK) {
+        const uint32_t nt = (n_tokens - base) < MM_BLOCK ? (n_tokens - base) : MM_BLOCK;
+        const size_t nx = (size_t)nt * n_in;
+        size_t off[DS4X_PROJ_FANOUT_MAX], total = 0;
+        for (uint32_t i = 0; i < n_proj; i++) {
+            off[i] = total;
+            total += (size_t)nt * W[i]->n_out;
+        }
+        if (stage_reserve(nx, 1) != 0 || proj_reserve(total) != 0) return -1;
+        memcpy(g_stage.h_x, X + (size_t)base * n_in, nx * sizeof(float));
+        cudaError_t e;
+        if ((e = cudaMemcpyAsync(g_stage.d_x, g_stage.h_x, nx * sizeof(float),
+                                 cudaMemcpyHostToDevice, 0)) != cudaSuccess) {
+            set_err("cudaMemcpyAsync(proj_fanout X)", e); return -1;
+        }
+        cudaEventRecord(g_mev0);
+        for (uint32_t i = 0; i < n_proj; i++) {
+            /* Same kernel-choice rule as the fused FFN: decode (1 token) uses
+             * the matvec kernel the unfused path used, so neither the reduction
+             * order nor the tile occupancy changes. */
+            const int rc = (nt == 1)
+                ? launch_matvec(W[i], g_stage.d_x, g_proj.d + off[i])
+                : launch_matmul(W[i], g_stage.d_x, g_proj.d + off[i], nt);
+            if (rc != 0) return -1;
+        }
+        cudaEventRecord(g_mev1);
+        /* ONE download for every output — that is the point of packing them
+         * into a single arena. */
+        if ((e = cudaMemcpyAsync(g_proj.h, g_proj.d, total * sizeof(float),
+                                 cudaMemcpyDeviceToHost, 0)) != cudaSuccess) {
+            set_err("cudaMemcpyAsync(proj_fanout out)", e); return -1;
+        }
+        if ((e = cudaStreamSynchronize(0)) != cudaSuccess) {
+            set_err("proj_fanout sync", e); return -1;
+        }
+        for (uint32_t i = 0; i < n_proj; i++)
+            memcpy(Y[i] + (size_t)base * W[i]->n_out, g_proj.h + off[i],
+                   (size_t)nt * W[i]->n_out * sizeof(float));
+        float kms = 0.0f;
+        if (cudaEventElapsedTime(&kms, g_mev0, g_mev1) == cudaSuccess) g_proj_ms_kernel += kms;
+        g_proj_calls++;
+        g_proj_rows += nt;
+    }
+    g_proj_ms_total += host_ms() - t0;
+    return 0;
+}
+
+extern "C" void ds4x_cuda_proj_stats(double *ms_kernel, double *ms_total,
+                                     uint64_t *calls, uint64_t *rows) {
+    if (ms_kernel) *ms_kernel = g_proj_ms_kernel;
+    if (ms_total)  *ms_total  = g_proj_ms_total;
+    if (calls)     *calls     = (uint64_t)g_proj_calls;
+    if (rows)      *rows      = (uint64_t)g_proj_rows;
 }
 
 extern "C" void ds4x_cuda_matmul_stats(double *ms_kernel, double *ms_total,

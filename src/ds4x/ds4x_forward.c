@@ -156,6 +156,15 @@ static float silu(float x) { return x / (1.0f + expf(-x)); }
 static void swiglu(ds4x_wt Wg, ds4x_wt Wu, ds4x_wt Wd,
                    const float *x, float *y, uint32_t ff, uint32_t n_embd,
                    float *scratch, float *rowbuf) {
+#ifdef IDLETOKEN_DS4X_CUDA
+    /* All three weights resident and whole (dev_elem_off 0 — a sliced MoE
+     * expert has no fused form) → one GPU call for the whole block instead of
+     * three matmuls with a host round trip between each. */
+    if (ds4x_fuse_wanted() && Wg.dev && Wu.dev && Wd.dev &&
+        !Wg.dev_elem_off && !Wu.dev_elem_off && !Wd.dev_elem_off &&
+        ds4x_cuda_swiglu((const ds4x_cuda_wt *)Wg.dev, (const ds4x_cuda_wt *)Wu.dev,
+                         (const ds4x_cuda_wt *)Wd.dev, x, y, 1) == 0) return;
+#endif
     float *g = scratch, *u = scratch + ff;
     matvec_q(Wg, x, g, ff, n_embd, rowbuf);
     matvec_q(Wu, x, u, ff, n_embd, rowbuf);
@@ -173,6 +182,12 @@ static void swiglu_chunk(ds4x_wt Wg, ds4x_wt Wu, ds4x_wt Wd,
                          const float *X, float *Y, uint32_t n_tokens,
                          uint32_t ff, uint32_t n_embd,
                          float *scratch, float *rowbuf) {
+#ifdef IDLETOKEN_DS4X_CUDA
+    if (ds4x_fuse_wanted() && Wg.dev && Wu.dev && Wd.dev &&
+        !Wg.dev_elem_off && !Wu.dev_elem_off && !Wd.dev_elem_off &&
+        ds4x_cuda_swiglu((const ds4x_cuda_wt *)Wg.dev, (const ds4x_cuda_wt *)Wu.dev,
+                         (const ds4x_cuda_wt *)Wd.dev, X, Y, n_tokens) == 0) return;
+#endif
     float *g = scratch, *u = scratch + (size_t)n_tokens * ff;
     matmul_q(Wg, X, g, n_tokens, ff, n_embd, rowbuf);
     matmul_q(Wu, X, u, n_tokens, ff, n_embd, rowbuf);
@@ -400,10 +415,29 @@ static int gdn_attn_cpu(const ds4x_config *cfg, const ds4x_layer_weights *w,
     /* ---- pass 1: projections; stash raw conv channels + z + (b,a) ---- */
     const int prof = gdn_prof_on();
     const double t0 = prof ? now_s() : 0.0;
-    matmul_q(w->in_proj_qkv, normed, raw,  n_tokens, conv_ch, n_embd, rowbuf);
-    matmul_q(w->in_proj_z,   normed, zbuf, n_tokens, vd,      n_embd, rowbuf);
-    matmul_q(w->in_proj_b,   normed, bbuf, n_tokens, vh,      n_embd, rowbuf);
-    matmul_q(w->in_proj_a,   normed, abuf, n_tokens, vh,      n_embd, rowbuf);
+    /* All four read the same `normed`, so fused they cost one upload and one
+     * download instead of four of each. */
+    int projected = 0;
+#ifdef IDLETOKEN_DS4X_CUDA
+    {
+        const ds4x_wt src[4] = { w->in_proj_qkv, w->in_proj_z, w->in_proj_b, w->in_proj_a };
+        float *dst[4] = { raw, zbuf, bbuf, abuf };
+        const ds4x_cuda_wt *dw[4];
+        int ok = ds4x_fuse_wanted();
+        for (int i = 0; i < 4 && ok; i++) {
+            if (!src[i].dev || src[i].dev_elem_off) ok = 0;
+            else dw[i] = (const ds4x_cuda_wt *)src[i].dev;
+        }
+        if (ok && ds4x_cuda_proj_fanout(dw, dst, 4, normed, n_tokens) == 0)
+            projected = 1;
+    }
+#endif
+    if (!projected) {
+        matmul_q(w->in_proj_qkv, normed, raw,  n_tokens, conv_ch, n_embd, rowbuf);
+        matmul_q(w->in_proj_z,   normed, zbuf, n_tokens, vd,      n_embd, rowbuf);
+        matmul_q(w->in_proj_b,   normed, bbuf, n_tokens, vh,      n_embd, rowbuf);
+        matmul_q(w->in_proj_a,   normed, abuf, n_tokens, vh,      n_embd, rowbuf);
+    }
 
     const int dump = gdn_dump_on() && w == g_dump_layer;
     if (dump) { gdn_sum("normed(attn_norm)", normed, n_embd);
@@ -650,11 +684,32 @@ int ds4x_layer_forward_cpu(const ds4x_config *cfg, uint32_t il,
     for (uint32_t t = 0; t < n_tokens; t++)
         rmsnorm(out + (size_t)t * n_embd, w->attn_norm,
                 nrm_all + (size_t)t * n_embd, n_embd);
-    matmul_q(w->q_proj, nrm_all, q_all, n_tokens, (uint32_t)qn_all, n_embd, rowbuf);
-    matmul_q(w->k_proj, nrm_all, cache->k + (size_t)pos0 * kv_dim,
-             n_tokens, kv_dim, n_embd, rowbuf);
-    matmul_q(w->v_proj, nrm_all, cache->v + (size_t)pos0 * kv_dim,
-             n_tokens, kv_dim, n_embd, rowbuf);
+    /* q/k/v all read nrm_all, so they fan out from ONE upload. k and v write
+     * straight into the KV cache, which is fine: the fan-out scatters to N
+     * independent host destinations. */
+    int qkv_projected = 0;
+#ifdef IDLETOKEN_DS4X_CUDA
+    {
+        const ds4x_wt src[3] = { w->q_proj, w->k_proj, w->v_proj };
+        float *dst[3] = { q_all, cache->k + (size_t)pos0 * kv_dim,
+                                 cache->v + (size_t)pos0 * kv_dim };
+        const ds4x_cuda_wt *dw[3];
+        int ok = ds4x_fuse_wanted();
+        for (int i = 0; i < 3 && ok; i++) {
+            if (!src[i].dev || src[i].dev_elem_off) ok = 0;
+            else dw[i] = (const ds4x_cuda_wt *)src[i].dev;
+        }
+        if (ok && ds4x_cuda_proj_fanout(dw, dst, 3, nrm_all, n_tokens) == 0)
+            qkv_projected = 1;
+    }
+#endif
+    if (!qkv_projected) {
+        matmul_q(w->q_proj, nrm_all, q_all, n_tokens, (uint32_t)qn_all, n_embd, rowbuf);
+        matmul_q(w->k_proj, nrm_all, cache->k + (size_t)pos0 * kv_dim,
+                 n_tokens, kv_dim, n_embd, rowbuf);
+        matmul_q(w->v_proj, nrm_all, cache->v + (size_t)pos0 * kv_dim,
+                 n_tokens, kv_dim, n_embd, rowbuf);
+    }
     for (uint32_t t = 0; t < n_tokens; t++) {
         const uint32_t pos = pos0 + t;
         /* qt/ht are this token's slices of the chunk buffers — deliberately

@@ -94,7 +94,10 @@ export interface PairingProvider {
   // engine's --pair-account/rendezvous path is a later convergence).
   createAccount(self: SelfInfo, secret: string): Promise<void>;
   joinAccount(self: SelfInfo, secret: string): Promise<void>;
-  start(): Promise<void>; // creator: freeze the roster, launch the engines (P4 entry)
+  // creator: freeze the roster, launch the engines (P4 entry).
+  // allowSolo=true is the single-machine flow saying it really does mean one
+  // machine; without it the engine enforces a 2-machine floor.
+  start(allowSolo?: boolean): Promise<void>;
   leave(): Promise<void>;
   setCoordinator(peerId: string): Promise<void>;
   subscribe(cb: (s: PairingSnapshot) => void): () => void;
@@ -223,8 +226,15 @@ class DevSimPairing implements PairingProvider {
     this.emit();
   }
 
-  async start(): Promise<void> {
-    // dev-sim orchestrates automatically; nothing to trigger
+  async start(allowSolo?: boolean): Promise<void> {
+    // allowSolo is not decoration: it is how "run on this machine alone"
+    // differs from "create a cluster". The sim used to ignore it and always
+    // fabricate two joiners, so a one-machine deployment — a headline mode —
+    // could not be seen in the browser build at all, and anything specific to
+    // it was unreviewable until it reached a real machine.
+    if (!allowSolo) return;   // otherwise the sim orchestrates on its own timers
+    this.clearTimers();       // cancel the simulated joiners; go with just this machine
+    this.orchestrate();
   }
 
   async leave(): Promise<void> {
@@ -362,8 +372,8 @@ class EnginePairing implements PairingProvider {
     });
   }
 
-  async start(): Promise<void> {
-    await this.call("pairing_start");
+  async start(allowSolo?: boolean): Promise<void> {
+    await this.call("pairing_start", { allowSolo: allowSolo ?? false });
   }
 
   async leave(): Promise<void> {

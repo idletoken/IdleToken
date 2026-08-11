@@ -24,6 +24,15 @@ export interface PlatformMe {
   role: string;
   balanceMilli: number;
   balanceCredits: number;
+  // Public identity layer (the portal's profile page writes these). The gateway
+  // has always returned them from GET /me; they were simply not declared here,
+  // so the desktop client could not show the user as the account they set up.
+  // avatarHue is never null on the wire — the gateway derives one from the id
+  // when the user has not chosen a colour.
+  username?: string | null;
+  displayName?: string | null;
+  avatarHue?: number;
+  emailVerified?: boolean;
 }
 
 export interface LedgerEntry {

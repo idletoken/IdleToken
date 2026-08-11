@@ -239,6 +239,12 @@ static uint64_t g_compute_calls = 0;
  * be here. */
 static double   g_logits_s = 0.0;
 static uint64_t g_logits_calls = 0;
+/* IDLETOKEN_FULL_LOGITS=1 keeps the pre-v6 wire form (the whole f32 vocab vector
+ * instead of the argmax the coordinator would take anyway). Kept for two
+ * reasons: it is the A/B switch for measuring what the short form buys, in one
+ * binary rather than across two builds; and it is the form a coordinator will
+ * need again the day sampling stops being pure greedy. */
+static int g_full_logits_wanted = 0;
 /* prefill and decode are accounted separately. Mixed together, a single
  * multi-second prefill drags "avg_ms" up until it means nothing -- and decode is
  * the number to watch when chasing latency. */
@@ -381,6 +387,30 @@ static void prof2_dump(uint32_t stage_id, uint32_t layer_lo, uint32_t layer_hi) 
             (unsigned long long)g_prefill_calls,
             g_prefill_calls ? g_prefill_s * 1000.0 / (double)g_prefill_calls : 0.0,
             g_pf_other_s * 1000.0);
+    /* The output head, on the periodic line for the same -Force reason. It was
+     * only on the exit path, which meant the one number that explains the gap
+     * between this stage's `enc` and the coordinator's per-token total was
+     * never visible in a benchmark: on a 248,320-vocab model the head is a
+     * [n_vocab][n_embd] matvec, i.e. ~30% of the whole 0.8B model's weights
+     * read again for every single token. */
+    fprintf(stderr, "idletoken-worker: PROF2 stage=%u logits: n=%llu avg=%.1fms\n",
+            stage_id, (unsigned long long)g_logits_calls,
+            g_logits_calls ? g_logits_s * 1000.0 / (double)g_logits_calls : 0.0);
+#ifdef IDLETOKEN_DS4X_CUDA
+    /* Fused-block call counts, on the SAME periodic line for the same reason:
+     * they answer "did the fused path run on this stage at all", which the
+     * stage timing cannot, and a counter that only prints on clean exit is a
+     * counter that never prints under a -Force teardown. (Written once on the
+     * exit path first — it printed nothing, exactly as the comment above
+     * predicted.) 0 calls = that fusion did NOT run here. */
+    {
+        double k = 0, t = 0; uint64_t c = 0, r = 0, cffn = 0, cproj = 0;
+        ds4x_cuda_ffn_stats(&k, &t, &c, &r);      cffn  = c;
+        ds4x_cuda_proj_stats(&k, &t, &c, &r);     cproj = c;
+        fprintf(stderr, "idletoken-worker: PROF2 fused: ffn=%llu projfan=%llu\n",
+                (unsigned long long)cffn, (unsigned long long)cproj);
+    }
+#endif
     fflush(stderr);
 }
 
@@ -549,6 +579,10 @@ int main(int argc, char **argv) {
     const char *env_ram  = getenv("IDLETOKEN_MAX_RAM_MB");
     uint64_t max_vram_mb = env_vram ? strtoull(env_vram, NULL, 10) : 0;
     uint64_t max_ram_mb  = env_ram  ? strtoull(env_ram,  NULL, 10) : 0;
+    {
+        const char *fl = getenv("IDLETOKEN_FULL_LOGITS");
+        g_full_logits_wanted = (fl && fl[0] == '1');
+    }
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -2004,7 +2038,30 @@ int main(int argc, char **argv) {
             } else {
                 memset(msg_buf + 8, 0, logits_bytes);  /* mock: zeros */
             }
-            lb.pos = logits_payload_bytes;
+            /* v6 short form: the coordinator's only use of this vector is one
+             * argmax, so take it here and ship 12 bytes instead of ~1 MB. The
+             * scan is over host memory the output head just wrote, and costs
+             * far less than the socket round trip it removes.
+             *
+             * Byte-for-byte the same decision as the coordinator's loop: strict
+             * `>` keeps the LOWEST index on ties, exactly as coord_main.c does.
+             * Getting that backwards would change generated text only on exact
+             * ties -- rare, silent, and maddening to bisect. */
+            size_t logits_wire_bytes = logits_bytes;
+            if (!g_full_logits_wanted && (cur_session || cur_xr)) {
+                const float *lv = (const float *)(msg_buf + 8);
+                uint32_t best_i = 0;
+                float    best_v = lv[0];
+                for (uint32_t i = 1; i < g_model->n_vocab; i++)
+                    if (lv[i] > best_v) { best_v = lv[i]; best_i = i; }
+                idletoken_buf_init(&lb, msg_buf, msg_buf_cap);
+                idletoken_buf_put_u32(&lb, pos0);
+                idletoken_buf_put_u32(&lb, 0u);        /* n_vocab == 0 = short form */
+                idletoken_buf_put_u32(&lb, best_i);
+                logits_wire_bytes = 4;
+            } else {
+                lb.pos = logits_payload_bytes;
+            }
             idletoken_msg_header lh = {
                 .magic = IDLETOKEN_PROTO_MAGIC,
                 .version = IDLETOKEN_PROTO_VERSION,
@@ -2020,7 +2077,7 @@ int main(int argc, char **argv) {
             }
             fprintf(stderr,
                     "idletoken-worker: sent INFER_LOGITS (pos=%u, %zu B incl. %zu B logits)\n",
-                    pos0, lb.pos, logits_bytes);
+                    pos0, lb.pos, logits_wire_bytes);
         } else {
             /* Send INFER_HC_FORWARD to next stage (zero-filled cur_hc in mock).
              * Prefill chunks (n_tokens > 1) append the chunk token ids after

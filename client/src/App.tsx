@@ -7,16 +7,16 @@ import type { NodeSnapshot, ClusterState } from "./types";
 import { HW_NO_GPU, HW_CC_TOO_LOW, HW_DRIVER_TOO_OLD, HW_VRAM_TOO_SMALL } from "./types";
 import { getModel, getManifest, defaultQuant, estimateClusterCapacity, pickBestFittingModel, type ModelSpec } from "./models";
 import { resolveLocalWeights, fetchWeights, onFetchProgress, defaultModelDir, cancelFetch, resolveDownload, weightsState } from "./weights";
-import { loadSettings, saveSettings, settingsWerePersisted, effectiveCaps, engineTuning, TIERS, type AppSettings } from "./settings";
+import { loadSettings, saveSettings, settingsWerePersisted, effectiveCaps, engineTuning, autoUiScale, TIERS, type AppSettings } from "./settings";
 import { buildDiagnosticsBundle } from "./diagnostics";
 import { getAuthProvider, type Session } from "./auth";
 import SettingsPanel from "./SettingsPanel";
-import Capability from "./Capability";
 import AuthScreen from "./AuthScreen";
 import PairingPanel from "./PairingPanel";
 import Chat from "./Chat";
 import WeightsRow, { type WeightsInfo } from "./WeightsRow";
-import { inTauri, platformGate } from "./platform";
+import { inTauri, platformGate, getMe } from "./platform";
+import { identityFrom, type UserIdentity } from "./Avatar";
 import { accountPairSecret, getPairingProvider, type PairingSnapshot, type ClusterApi } from "./pairing";
 import { fmtBytes, fmtGiB, pct } from "./format";
 
@@ -63,7 +63,7 @@ function AccountMenu(props: { session: Session | null; onSignIn: () => void; onS
   }, [open]);
   if (!props.session) {
     return (
-      <button className="iconbtn" onClick={props.onSignIn}>
+      <button className="iconbtn iconbtn--signin" onClick={props.onSignIn}>
         {t("auth.submitSignIn")}
       </button>
     );
@@ -149,7 +149,7 @@ function TopBar(props: {
         <span className="pill__dot" />
         {t(clusterKey)}
       </button>
-      <button className="iconbtn" onClick={props.onToggleLang} aria-label={t("lang.switch")}>
+      <button className="iconbtn iconbtn--lang" onClick={props.onToggleLang} aria-label={t("lang.switch")}>
         {t("lang.switch")}
       </button>
       <button
@@ -396,14 +396,42 @@ interface ClusterStats {
   cached_tokens?: number;  // cumulative prefill tokens saved
   uptime_s: number;
   last_tok_per_s: number;
+  // What the cluster is ACTUALLY serving, straight from the coordinator that
+  // loaded it. Absent on older engines — the UI then says nothing rather than
+  // falling back to the local setting, which is a different claim.
+  model?: string;
+  model_label?: string;
+  quant?: string;
 }
 
-function ActivityRow(props: { api: ClusterApi; source: "engine" | "dev-sim" }) {
-  const { t } = useI18n();
+/**
+ * Poll the cluster's serving counters.
+ *
+ * A hook, not an effect inside ActivityRow, because two things on the cluster
+ * card need it: the activity numbers and the served-model row. The coordinator
+ * executes requests **serially**, so a second independent 5s poll is not free —
+ * it is another connection competing with generation. One poll, shared.
+ */
+/** Dev-sim: the model the simulated cluster "loaded". Module scope, not effect
+ *  scope, because a real coordinator latches this once at startup and keeps
+ *  reporting it — navigating between pages must not silently re-latch it, or
+ *  the setting and the cluster can never disagree in the browser build and the
+ *  mismatch path goes untested until it reaches a real machine. */
+let g_simLoadedModel: { id: string; label: string; quant: string } | null = null;
+
+function useClusterStats(
+  api: ClusterApi | null,
+  source: "engine" | "dev-sim",
+  /** Dev-sim only: what to claim is loaded. Latched on the first tick, the way
+   *  a real coordinator latches it at startup — so changing the setting
+   *  afterwards diverges in the browser build exactly as it does on a machine. */
+  simModel?: { id: string; label: string; quant: string }
+): ClusterStats | null {
   const [stats, setStats] = useState<ClusterStats | null>(null);
+  const props = { api, source };
 
   useEffect(() => {
-    if (props.api.status !== "online") return;
+    if (!props.api || props.api.status !== "online") return;
     let live = true;
     let simBase = { requests: 0, tokens: 0 };
     const tick = async () => {
@@ -411,13 +439,14 @@ function ActivityRow(props: { api: ClusterApi; source: "engine" | "dev-sim" }) {
       if (inTauri()) {
         try {
           const { invoke } = await import("@tauri-apps/api/core");
-          const v = await invoke<ClusterStats>("api_stats", { baseUrl: props.api.baseUrl });
+          const v = await invoke<ClusterStats>("api_stats", { baseUrl: props.api!.baseUrl });
           if (live) setStats(v);
         } catch {
           /* stats are best-effort; the row just stays as-is */
         }
       } else if (props.source === "dev-sim") {
         simBase = { requests: simBase.requests + (Math.random() < 0.4 ? 1 : 0), tokens: simBase.tokens + 40 };
+        if (!g_simLoadedModel && simModel) g_simLoadedModel = { ...simModel };
         if (live)
           setStats({
             requests: simBase.requests,
@@ -425,6 +454,9 @@ function ActivityRow(props: { api: ClusterApi; source: "engine" | "dev-sim" }) {
             output_tokens: Math.floor(simBase.tokens * 0.4),
             uptime_s: Math.floor(performance.now() / 1000) + 60,
             last_tok_per_s: 9.5,
+            model: g_simLoadedModel?.id,
+            model_label: g_simLoadedModel?.label,
+            quant: g_simLoadedModel?.quant,
           });
       }
     };
@@ -434,8 +466,14 @@ function ActivityRow(props: { api: ClusterApi; source: "engine" | "dev-sim" }) {
       live = false;
       clearInterval(timer);
     };
-  }, [props.api.status, props.api.baseUrl, props.source]);
+  }, [props.api?.status, props.api?.baseUrl, props.source]);
 
+  return stats;
+}
+
+function ActivityRow(props: { stats: ClusterStats | null }) {
+  const { t } = useI18n();
+  const stats = props.stats;
   if (!stats) return null;
   const up = stats.uptime_s;
   const uptimeLabel =
@@ -472,27 +510,6 @@ function ActivityRow(props: { api: ClusterApi; source: "engine" | "dev-sim" }) {
 // ---- chat launcher: the cluster card's quick box now LEADS to the chat view
 // (a box that looks like chat must be chat — the one-shot answer lived here
 // before and violated that expectation).
-function ChatLauncher(props: { onStart: (q: string) => void }) {
-  const { t } = useI18n();
-  const [q, setQ] = useState("");
-  const go = () => {
-    if (q.trim()) props.onStart(q.trim());
-  };
-  return (
-    <div className="tryit__row cluster-chatlaunch">
-      <input
-        className="tryit__input"
-        value={q}
-        placeholder={t("tryit.placeholder")}
-        onChange={(e) => setQ(e.target.value)}
-        onKeyDown={(e) => e.key === "Enter" && !e.nativeEvent.isComposing && go()}
-      />
-      <button className="btn-primary tryit__send" disabled={!q.trim()} onClick={go}>
-        {t("tryit.send")}
-      </button>
-    </div>
-  );
-}
 
 // ---- cluster: the product's home on the dashboard --------------------------
 // The cluster (not this machine) is what the user is here for. Empty state =
@@ -522,13 +539,37 @@ function ClusterCard(props: {
   onJoin: () => void;
   onManage: () => void;
   onOpenSharing: () => void;
-  onStartChat: (q: string) => void;
+  // The LOCAL setting, used only to detect disagreement with what the cluster
+  // reports it is serving. Never used as the displayed value.
+  settingModelId: string;
+  settingQuant: string;
+  onOpenModelSetting: () => void;
 }) {
   const { t } = useI18n();
   const [copiedApi, setCopiedApi] = useState(false);
   const [copiedCode, setCopiedCode] = useState(false);
   const snap = props.pair;
+  // Before the early return below: hooks cannot be conditional.
+  const stats = useClusterStats(snap?.api ?? null, snap?.source ?? "engine", {
+    id: props.settingModelId,
+    label: getModel(props.settingModelId).label,
+    quant: props.settingQuant,
+  });
   const active = snap !== null && snap.peers.length > 0;
+  // Reported by the coordinator. Absent on an older engine -> show nothing;
+  // substituting the local setting would answer a different question.
+  const served = stats?.model_label
+    ? { id: stats.model ?? "", label: stats.model_label, quant: stats.quant ?? "" }
+    : null;
+  // Compare precision only when both sides state one, so a model with no
+  // variant menu never looks like a disagreement.
+  const mismatch =
+    !!served &&
+    (served.id !== props.settingModelId ||
+      (!!served.quant && !!props.settingQuant && served.quant !== props.settingQuant));
+  const mismatchLabel = `${getModel(props.settingModelId).label}${
+    props.settingQuant ? ` · ${props.settingQuant}` : ""
+  }`;
   const anyError = active && snap.peers.some((p) => p.stage === "error");
   const fits = !!props.fitsStandalone;
 
@@ -634,6 +675,28 @@ function ClusterCard(props: {
         </div>
       ) : null}
 
+      {/* What is loaded, reported by the coordinator that loaded it — read only.
+          Everything else on this card (the layer ranges, the capacity figures)
+          is a consequence of this one fact, and it was the only one not shown. */}
+      {served ? (
+        <div className="cluster-model">
+          <span className="cluster-model__label">{t("cluster.serving")}</span>
+          <span className="cluster-model__name">{served.label}</span>
+          {served.quant ? <span className="cluster-model__quant">{served.quant}</span> : null}
+        </div>
+      ) : null}
+      {/* The setting and reality disagree: the model is chosen at launch, so
+          changing it later does nothing until the cluster restarts. Saying so
+          beats letting someone believe they switched models. */}
+      {served && mismatch ? (
+        <p className="cluster-hint cluster-hint--warn">
+          {t("cluster.modelMismatch", { chosen: mismatchLabel })}{" "}
+          <button className="linkbtn" onClick={props.onOpenModelSetting}>
+            {t("cluster.modelSettingLink")}
+          </button>
+        </p>
+      ) : null}
+
       <div className="cluster-peers">
         {snap.peers.map((p) => (
           <div key={p.id} className="cpeer">
@@ -686,15 +749,9 @@ function ClusterCard(props: {
             </button>
           </div>
           <p className="cluster-api__hint">{t("cluster.apiHint")}</p>
-          <ActivityRow api={snap.api} source={snap.source} />
+          <ActivityRow stats={stats} />
         </div>
       ) : null}
-
-      {snap.api?.status === "online" ? <ChatLauncher onStart={props.onStartChat} /> : null}
-      {/* "What can I run?" — the first question after installing. Uses the
-          cluster endpoint once an API is up (whole pool), the local engine
-          otherwise (this machine alone). */}
-      <Capability apiBaseUrl={snap.api?.status === "online" ? snap.api.baseUrl : null} />
 
       {snap.phase === "ready" ? (
         <div className="cluster-share">
@@ -721,7 +778,8 @@ function Dashboard(props: {
   onJoinCluster: () => void;
   onManageCluster: () => void;
   onOpenSharing: () => void;
-  onStartChat: (q: string) => void;
+  /** Jump to the model picker in settings (the cluster card only reads). */
+  onOpenModelSetting: () => void;
   weights?: WeightsInfo;
 }) {
   const { t } = useI18n();
@@ -746,7 +804,9 @@ function Dashboard(props: {
             onJoin={props.onJoinCluster}
             onManage={props.onManageCluster}
             onOpenSharing={props.onOpenSharing}
-            onStartChat={props.onStartChat}
+            settingModelId={props.model.id}
+            settingQuant={props.quant}
+            onOpenModelSetting={props.onOpenModelSetting}
           />
         </div>
         <div className="dash-col">
@@ -793,10 +853,21 @@ export default function App() {
     setSettingsCategory(category);
     setView("settings");
   };
-  // A prompt typed into the cluster card's quick box carries over into the
-  // chat view and auto-sends there (one action, one home).
-  const [chatInitial, setChatInitial] = useState<string | null>(null);
   const [session, setSession] = useState<Session | null>(() => getAuthProvider().currentSession());
+  // The signed-in person's public identity (display name + avatar colour), so
+  // the chat can show the user as the account they configured on the platform
+  // rather than a generic silhouette. Cloud sessions only: a local identity has
+  // no profile to read, and a failed fetch simply leaves the neutral glyph —
+  // never block or nag over an avatar.
+  const [identity, setIdentity] = useState<UserIdentity | null>(null);
+  useEffect(() => {
+    if (!session || session.provider !== "cloud") { setIdentity(null); return; }
+    let live = true;
+    void getMe()
+      .then((me) => { if (live) setIdentity(identityFrom(me)); })
+      .catch(() => { if (live) setIdentity(null); });
+    return () => { live = false; };
+  }, [session]);
   const [showAuth, setShowAuth] = useState(false);
   const [showPairing, setShowPairing] = useState(false);
   const [pairingView, setPairingView] = useState<"choose" | "join">("choose");
@@ -954,8 +1025,12 @@ export default function App() {
    * instead of a lookalike copy — headless_pair's "create" is not equivalent,
    * it waits for a second peer before starting.
    */
-  const serveStandalone = useCallback(async () => {
-    if (!snap) return;
+  const serveStandalone = useCallback(async (): Promise<boolean> => {
+    // Returns false when the hardware probe has not landed yet — there is no
+    // hostname/GPU to register. A user cannot hit this (the button only exists
+    // once the dashboard has a probe), but the UI-test channel fires on mount,
+    // and a silent no-op there reads as "serving is broken".
+    if (!snap) return false;
     try {
       const path = await ensureWeights();
       await getPairingProvider().create({
@@ -964,12 +1039,25 @@ export default function App() {
         modelPath: path,
         tuning: engineTuning(settings),
       });
-      await getPairingProvider().start();
+      // allowSolo: this IS the one-machine flow. Without it the engine's
+      // 2-machine pairing floor rejects the start and the button dies after
+      // downloading the weights.
+      await getPairingProvider().start(true);
+      return true;
     } catch (e) {
       console.error("serve-standalone:", e);
       setDl({ have: 0, total: 0, error: String(e) });
+      return true; // it ran; it failed. Distinct from "could not run yet".
     }
   }, [snap, ensureWeights, settings]);
+
+  // The UI-test effect runs once on mount, so it captures the FIRST render's
+  // closure — where snap is still null. A ref keeps the directive pointed at
+  // the current handler instead of a stale one.
+  const serveStandaloneRef = useRef(serveStandalone);
+  useEffect(() => {
+    serveStandaloneRef.current = serveStandalone;
+  });
 
   // Preset caps derive from the machine's totals (learned from the first probe);
   // "custom" uses the precise sliders directly.
@@ -1237,7 +1325,13 @@ export default function App() {
               // gets narrowed to `never` by control-flow analysis.
               const box: { s: PairingSnapshot | null } = { s: null };
               const un = getPairingProvider().subscribe((v) => { box.s = v; });
-              await serveStandalone();
+              // Wait for the probe before pressing: on mount there is no snap.
+              let pressed = false;
+              for (let i = 0; i < 30 && !pressed; i++) {
+                pressed = await serveStandaloneRef.current();
+                if (!pressed) await new Promise((r) => setTimeout(r, 1000));
+              }
+              if (!pressed) { reportTest("serveStandalone", { error: "probe never landed; never pressed" }); un(); return; }
               for (let i = 0; i < 120; i++) {
                 await new Promise((r) => setTimeout(r, 2000));
                 if (box.s && (box.s.phase === "ready" || box.s.peers.some((p) => p.stage === "error"))) break;
@@ -1252,6 +1346,67 @@ export default function App() {
               });
             } catch (e) {
               reportTest("serveStandalone", { error: String(e), seconds: Math.round((Date.now() - t0) / 1000) });
+            }
+          })();
+        }
+        // Stop-generation oracle (2026-08-11). Two claims worth proving on real
+        // hardware: deltas stop arriving when the user presses Stop, and the
+        // partial text survives. Timing again — unprovable by reading code.
+        //   chat-stop:<ms-before-stop>
+        const cs = d.match(/^chat-stop:(\d+)$/);
+        if (cs) {
+          (async () => {
+            try {
+              const { listen } = await import("@tauri-apps/api/event");
+              const { invoke } = await import("@tauri-apps/api/core");
+              // Wait for the cluster this test needs.
+              let api: ClusterApi | null = null;
+              const box: { s: PairingSnapshot | null } = { s: null };
+              const un = getPairingProvider().subscribe((v) => { box.s = v; });
+              for (let i = 0; i < 120; i++) {
+                await new Promise((r) => setTimeout(r, 2000));
+                if (box.s?.api?.status === "online") { api = box.s.api; break; }
+              }
+              un();
+              if (!api) { reportTest("chatStop", { error: "cluster never came online" }); return; }
+
+              const reqId = `stoptest-${Date.now()}`;
+              let deltas = 0;
+              let chars = 0;
+              let deltasAfterStop = 0;
+              let stopped = false;
+              const unl = await listen<{ id: string; kind: string; text?: string }>("api-chat", (ev) => {
+                if (ev.payload.id !== reqId) return;
+                if (ev.payload.kind === "delta") {
+                  deltas++;
+                  chars += ev.payload.text?.length ?? 0;
+                  if (stopped) deltasAfterStop++;
+                }
+              });
+              void invoke("api_chat_stream", {
+                id: reqId,
+                baseUrl: api.baseUrl,
+                messages: [{ role: "user", content: "Write a very long, detailed 2000-word essay about distributed systems." }],
+                token: "",
+                model: settings.modelId,
+                maxTokens: 4096,
+              }).catch(() => {});
+              await new Promise((r) => setTimeout(r, Number(cs[1])));
+              const atStop = deltas;
+              const tStop = Date.now();
+              stopped = true;
+              const wasRunning = await invoke<boolean>("api_chat_cancel", { id: reqId });
+              await new Promise((r) => setTimeout(r, 8000)); // watch for stragglers
+              unl();
+              reportTest("chatStop", {
+                wasRunning,
+                deltasBeforeStop: atStop,
+                charsKept: chars,
+                deltasAfterStop,
+                msWatchedAfterStop: Date.now() - tStop,
+              });
+            } catch (e) {
+              reportTest("chatStop", { error: String(e) });
             }
           })();
         }
@@ -1348,8 +1503,28 @@ export default function App() {
     r.setAttribute("data-density", settings.density);
     if (settings.reduceMotion) r.setAttribute("data-reduce-motion", "");
     else r.removeAttribute("data-reduce-motion");
-    (document.body.style as { zoom?: string }).zoom = String(settings.uiScale);
-  }, [settings.accent, settings.density, settings.reduceMotion, settings.uiScale]);
+  }, [settings.accent, settings.density, settings.reduceMotion]);
+
+  // uiScale 0 = auto: track the window and pick a band (see autoUiScale). The
+  // listener exists only in auto mode, and the band + hysteresis mean a resize
+  // drag crosses at most one boundary — a zoom change re-lays-out the whole
+  // document, so it has to be rare, not per-pixel.
+  const [autoScale, setAutoScale] = useState(() => autoUiScale(window.innerWidth, window.innerHeight));
+  useEffect(() => {
+    if (settings.uiScale !== 0) return;
+    let raf = 0;
+    const onResize = () => {
+      cancelAnimationFrame(raf);
+      // body zoom does not change window.innerWidth, so this cannot feed back.
+      raf = requestAnimationFrame(() => setAutoScale((p) => autoUiScale(window.innerWidth, window.innerHeight, p)));
+    };
+    onResize();
+    window.addEventListener("resize", onResize);
+    return () => { window.removeEventListener("resize", onResize); cancelAnimationFrame(raf); };
+  }, [settings.uiScale]);
+  useEffect(() => {
+    (document.body.style as { zoom?: string }).zoom = String(settings.uiScale || autoScale);
+  }, [settings.uiScale, autoScale]);
 
   // Re-probe whenever the effective caps change so the dashboard reflects the
   // new limit immediately (the setting visibly takes effect). We keep the old
@@ -1440,8 +1615,9 @@ export default function App() {
                 api={pairSnap?.api ?? null}
                 apiToken={settings.apiToken}
                 modelId={settings.modelId}
-                initialPrompt={chatInitial}
-                onInitialConsumed={() => setChatInitial(null)}
+                quant={settings.quant}
+                maxTokens={settings.maxTokens}
+                identity={identity}
                 onGoCluster={() => setView("cluster")}
               />
             ) : view === "settings" ? (
@@ -1482,11 +1658,8 @@ export default function App() {
                   setShowPairing(true);
                 }}
                 onOpenSharing={() => openSettings("platform")}
+                onOpenModelSetting={() => openSettings("quick")}
                 weights={weightsInfo}
-                onStartChat={(q) => {
-                  setChatInitial(q);
-                  setView("chat");
-                }}
               />
             )}
           </div>

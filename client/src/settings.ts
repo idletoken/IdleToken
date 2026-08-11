@@ -2,7 +2,7 @@
 // Split into a Simple set (what a home user needs) and an Advanced set (precise
 // control). Persisted to localStorage and restored on launch. Theme + language
 // live separately (pure UI state) but are surfaced in the Simple tab.
-import { DEFAULT_MODEL_ID, defaultQuant } from "./models";
+import { DEFAULT_MODEL_ID, defaultQuant, isAvailable, quantOptions } from "./models";
 
 const MiB = 1024 ** 2;
 
@@ -59,6 +59,8 @@ export interface AppSettings {
   topP: number;
   topK: number;
   maxTokens: number;
+  /** Bumped when a stored value must be discarded; see loadSettings. */
+  schemaVersion: number;
   // ---- advanced: KV warm-cache policy (acceptance P5) ----
   // Honesty note (2026-07 audit): today the engine's ONLY real KV-disk surface
   // is maintenance — `idletoken-worker --kv-clear [--kv-dir DIR]`. So kvDir is
@@ -83,7 +85,7 @@ export interface AppSettings {
   experimental: boolean;
 
   // ---- appearance / UI details (client-side, real) ----
-  uiScale: number; // 1.0 = 100%
+  uiScale: number; // 0 = auto (follow the window); otherwise a fixed factor, 1.0 = 100%
   density: Density;
   reduceMotion: boolean;
   accent: Accent;
@@ -187,7 +189,20 @@ export const DEFAULT_SETTINGS: AppSettings = {
   temperature: 0.7,
   topP: 0.95,
   topK: 40,
-  maxTokens: 512,
+  // Governs BOTH the engine's ceiling (--max-decode at launch) and what the
+  // chat sends per request.
+  //
+  // 0 = no ceiling but the context, matching llama.cpp/Ollama. Chosen over a
+  // finite default because truncation is a SILENT wrong answer — the user just
+  // sees a reply that stops mid-sentence and concludes the model is bad —
+  // whereas a long generation is visible, streaming, and interruptible (Stop).
+  // The cost is real and accepted: a model that never emits EOS runs until the
+  // context fills, which at ~13 tok/s and a 1M window is many hours of the
+  // cluster. Anyone who wants a bound sets one here, or sends max_tokens.
+  maxTokens: 0,
+  // Literal, not SCHEMA_VERSION: that const is declared further down and this
+  // object is built at module init. Keep the two in step by hand.
+  schemaVersion: 2,
   kvOffload: false,
   kvDir: "",
   kvMaxMb: 1024,
@@ -201,7 +216,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   logLevel: "info",
   experimental: false,
 
-  uiScale: 1,
+  uiScale: 0, // auto
   density: "comfortable",
   reduceMotion: false,
   accent: "amber",
@@ -266,13 +281,93 @@ export const APP_VERSION = "0.1.0-pre";
 
 const KEY = "idletoken.settings";
 
+// Bump when a stored value must be discarded rather than merged. Absent in
+// blobs written before versioning existed, which reads as 0.
+const SCHEMA_VERSION = 2;
+
+// ---- UI scale --------------------------------------------------------------
+// The fixed factors the panel offers. `0` means auto; anything else must be one
+// of these so the select can round-trip the stored value.
+export const UI_SCALE_STEPS = [0.9, 1, 1.15, 1.3] as const;
+
+// Auto scale from the window size. Two rules decide the shape of this:
+//   - it only ever grows. Narrow windows are already handled by the responsive
+//     CSS (breakpoints down to 420px); zooming *out* on top of that would just
+//     make text tiny on a phone-sized control client.
+//   - it is banded, not continuous. A continuous function re-lays-out the whole
+//     document on every resize tick — which is precisely the flicker the old
+//     drag-a-slider control produced.
+// CSS px already include the OS display scaling, so DPI is not ours to correct.
+//
+// Bands are cut on ONE number — how much room the window has relative to the
+// reference layout below — because the hysteresis has to compare against a
+// single quantity. (Thresholds on width AND height separately look equivalent
+// and are not: a 1600x900 window is comfortably past the width edge but only
+// 4.6% past the height one, so a both-dimensions margin could never confirm the
+// step up and the scale stuck at 1.0 forever.)
+const REF_W = 1500;
+const REF_H = 860;
+const SCALE_BANDS: { fit: number; scale: number }[] = [
+  { fit: 1.25, scale: 1.2 },
+  { fit: 1, scale: 1.1 },
+  { fit: 0, scale: 1 },
+];
+const fitOf = (w: number, h: number) => Math.min(w / REF_W, h / REF_H);
+
+/** Scale to use when `uiScale === 0`. Pass the previous result to get the
+ *  hysteresis: a window edge parked exactly on a band boundary must not
+ *  oscillate while it is dragged. */
+export function autoUiScale(w: number, h: number, prev?: number): number {
+  const fit = fitOf(w, h);
+  const at = (margin: number) => SCALE_BANDS.find((b) => fit >= b.fit * margin)!.scale;
+  const next = at(1);
+  if (prev === undefined || next === prev) return next;
+  // Leave the current band only once the window is 2% clear of the edge (~30px
+  // at the 1500px reference) — enough dead zone that a resize drag cannot flip
+  // back and forth, small enough that a window can still reach the next band
+  // when only one dimension has room to spare.
+  return at(next > prev ? 1.02 : 0.98) === next ? next : prev;
+}
+
 // Merge stored settings over defaults so older saved shapes gain new fields.
 export function loadSettings(): AppSettings {
   try {
     const raw = localStorage.getItem(KEY);
     if (!raw) return { ...DEFAULT_SETTINGS };
     const parsed = JSON.parse(raw) as Partial<AppSettings>;
-    return { ...DEFAULT_SETTINGS, ...parsed };
+    const merged = { ...DEFAULT_SETTINGS, ...parsed };
+    // v0 → v1: maxTokens was a hollow setting — the engine's ceiling was a
+    // compiled-in 4096 and nothing read this field, so every stored value is a
+    // stale default (512, then 4096, then 8192), never a deliberate choice.
+    // Merging one would silently cap generation on exactly the machines that
+    // have been running longest. Reset it once; from v1 on it is honoured.
+    if ((parsed.schemaVersion ?? 0) < 1) merged.maxTokens = DEFAULT_SETTINGS.maxTokens;
+    // v1 → v2: uiScale went from a free 0.8–1.4 slider to auto (0) + four fixed
+    // steps. Exactly 1.0 was the old default, so it carries no intent — those
+    // machines move to auto. A value the user actually dragged to is intent, so
+    // it is kept, snapped to the nearest step it can now round-trip.
+    if ((parsed.schemaVersion ?? 0) < 2 && typeof parsed.uiScale === "number") {
+      merged.uiScale =
+        parsed.uiScale === 1 || parsed.uiScale <= 0
+          ? 0
+          : UI_SCALE_STEPS.reduce((a, b) => (Math.abs(b - parsed.uiScale!) < Math.abs(a - parsed.uiScale!) ? b : a));
+    }
+    // The picker only lists models the engine can run, so a stored id outside
+    // that set (hand-edited storage, a model withdrawn between releases) would
+    // leave the list with nothing selected and no way to select anything.
+    // Fall back rather than render a dead panel.
+    if (!isAvailable(merged.modelId)) {
+      merged.modelId = DEFAULT_MODEL_ID;
+      merged.quant = defaultQuant(DEFAULT_MODEL_ID);
+    }
+    // Same for precision: qwen3-8b's BF16 row was removed on 2026-08-11 (the
+    // file it named 404s), so a machine that had it selected would render a
+    // <select> with no matching option — blank, and unchanged until touched.
+    if (merged.quant && !quantOptions(merged.modelId).some((v) => v.quant === merged.quant)) {
+      merged.quant = defaultQuant(merged.modelId);
+    }
+    merged.schemaVersion = SCHEMA_VERSION;
+    return merged;
   } catch {
     return { ...DEFAULT_SETTINGS };
   }
@@ -314,6 +409,8 @@ export interface EngineTuning {
   modelId: string;
   quant: string;
   ctxSize: number;
+  /** Per-request generation ceiling → coord `--max-decode`. 0 = context-bound. */
+  maxDecode: number;
 }
 
 export function tierCtx(tier: Tier["id"]): number {
@@ -330,6 +427,10 @@ export function engineTuning(s: AppSettings): EngineTuning {
     modelId: s.modelId || DEFAULT_MODEL_ID,
     quant: s.quant ?? "",
     ctxSize: tierCtx(s.tier),
+    // The engine's per-request ceiling comes from the same setting the chat
+    // sends, so the number the user typed is the number that governs — for
+    // third-party API clients too, not just our own chat.
+    maxDecode: s.maxTokens,
   };
 }
 
