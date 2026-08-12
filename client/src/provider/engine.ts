@@ -21,6 +21,11 @@ export interface EngineStatus {
   startedAt: number | null; // epoch ms of the current process, null unless running
   restarts: number; // consecutive automatic restarts
   lastExitCode: number | null;
+  // Set when the engine refused to join for a reason retrying cannot fix: the
+  // hardware floor, or the coordinator turning this node away (a different OS
+  // family from the rest of the cluster, say). The state is "crashed" but the
+  // supervisor did NOT retry — show this sentence instead of the crash hint.
+  refusedReason: string | null;
   source: "engine" | "dev-fixture";
 }
 

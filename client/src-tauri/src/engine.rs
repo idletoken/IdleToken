@@ -91,6 +91,12 @@ pub struct EngineStatus {
     started_at: Option<u64>,
     restarts: u32,
     last_exit_code: Option<i32>,
+    /// Set when the engine refused to join for a reason retrying cannot fix —
+    /// the hardware floor, or the coordinator turning this node away (wrong OS
+    /// family, say). Carries the engine's own sentence so the UI can show it
+    /// instead of a bare "crashed". See IDLETOKEN_JOIN_REFUSED_MARK in
+    /// include/idletoken_resource.h.
+    refused_reason: Option<String>,
 }
 
 /// One supervised sidecar process (a role's lifecycle).
@@ -104,6 +110,9 @@ struct Slot {
     started_at: Option<u64>,
     restarts: u32,
     last_exit_code: Option<i32>,
+    /// The engine said "I will not join, and restarting will not help".
+    /// Suppresses the backoff loop; cleared on the next user-initiated start.
+    refused_reason: Option<String>,
     child: Option<CommandChild>,
     /// Bumped on every start/stop touching this slot. A supervisor loop that
     /// observes a generation different from the one it was spawned with is
@@ -122,10 +131,24 @@ impl Slot {
             started_at: None,
             restarts: 0,
             last_exit_code: None,
+            refused_reason: None,
             child: None,
             generation,
         }
     }
+}
+
+/// Marker the engine prints on the one refusal it wants the client to surface.
+/// Mirrors IDLETOKEN_JOIN_REFUSED_MARK in include/idletoken_resource.h — change
+/// both together.
+const JOIN_REFUSED_MARK: &str = "JOIN_REFUSED: ";
+
+/// Pull the reason out of an engine stderr line, if that line is a refusal.
+/// The engine prefixes its own name, so match on the marker anywhere in the
+/// line rather than at the start.
+fn refusal_reason(line: &str) -> Option<String> {
+    let reason = line.split_once(JOIN_REFUSED_MARK)?.1.trim();
+    if reason.is_empty() { None } else { Some(reason.to_string()) }
 }
 
 struct Inner {
@@ -164,6 +187,7 @@ fn aggregate_status(inner: &Inner) -> EngineStatus {
     let mut restarts = 0u32;
     let mut started_at: Option<u64> = None;
     let mut last_exit_code: Option<i32> = None;
+    let mut refused_reason: Option<String> = None;
     let mut roles: Vec<&str> = Vec::new();
 
     for (role, slot) in inner.slots.iter() {
@@ -187,6 +211,9 @@ fn aggregate_status(inner: &Inner) -> EngineStatus {
         if slot.last_exit_code.is_some() {
             last_exit_code = slot.last_exit_code;
         }
+        if refused_reason.is_none() {
+            refused_reason = slot.refused_reason.clone();
+        }
     }
     roles.sort_unstable();
     EngineStatus {
@@ -196,6 +223,7 @@ fn aggregate_status(inner: &Inner) -> EngineStatus {
         started_at,
         restarts,
         last_exit_code,
+        refused_reason,
     }
 }
 
@@ -209,6 +237,7 @@ fn slot_status(inner: &Inner, role: &str) -> EngineStatus {
             started_at: s.started_at,
             restarts: s.restarts,
             last_exit_code: s.last_exit_code,
+            refused_reason: s.refused_reason.clone(),
         },
         None => EngineStatus {
             state: EngineState::Stopped,
@@ -217,6 +246,7 @@ fn slot_status(inner: &Inner, role: &str) -> EngineStatus {
             started_at: None,
             restarts: 0,
             last_exit_code: None,
+            refused_reason: None,
         },
     }
 }
@@ -329,7 +359,21 @@ fn supervise(app: AppHandle, role: String, generation: u64) {
                         push_log(&app, &role, "stdout", String::from_utf8_lossy(&bytes).trim_end().to_string());
                     }
                     CommandEvent::Stderr(bytes) => {
-                        push_log(&app, &role, "stderr", String::from_utf8_lossy(&bytes).trim_end().to_string());
+                        let line = String::from_utf8_lossy(&bytes).trim_end().to_string();
+                        // A refusal must be caught HERE, not inferred from the
+                        // exit code: only this line carries the reason, and the
+                        // reason is the whole point (a bare "crashed" pill sent
+                        // the user to a log ring buffer they never open).
+                        if let Some(reason) = refusal_reason(&line) {
+                            let engine = app.state::<Engine>();
+                            let mut inner = engine.0.lock().unwrap();
+                            if let Some(s) = inner.slots.get_mut(&role) {
+                                if s.generation == generation {
+                                    s.refused_reason = Some(reason);
+                                }
+                            }
+                        }
+                        push_log(&app, &role, "stderr", line);
                     }
                     CommandEvent::Error(e) => {
                         push_log(&app, &role, "stderr", format!("process error: {e}"));
@@ -370,6 +414,16 @@ async fn should_retry_after_exit(
         s.last_exit_code = code;
         let uptime = s.started_at.map(|t| now_ms().saturating_sub(t)).unwrap_or(0);
         s.started_at = None;
+        // A refusal is a decision, not a crash. Restarting repeats it five
+        // times, ends in "crashed", and buries the one sentence that explains
+        // what the user has to change. Stop now and keep the reason.
+        if let Some(reason) = s.refused_reason.clone() {
+            s.state = EngineState::Crashed;
+            drop(inner);
+            emit_status(app);
+            push_log(app, role, "stderr", format!("not joining: {reason} (not retrying)"));
+            return false;
+        }
         if uptime >= STABLE_UPTIME_MS {
             s.restarts = 0;
         }

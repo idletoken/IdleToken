@@ -605,7 +605,15 @@ __global__ void matvec_q6k_kernel(const unsigned char *W, uint32_t n_in,
  * Threshold on n_in, not n_out: the defect is "too little work per thread",
  * which n_in alone decides. */
 static inline int q4k_narrow_shape(const ds4x_cuda_wt *w) {
-    return w->type == T_Q4_K && w->n_in <= 2048u && (w->n_in % QK_K) == 0;
+    /* IDLETOKEN_DS4X_NO_NARROW=1 forces the block-per-row kernel, so this
+     * choice can be A/B'd IN ONE BINARY like every other change in this file.
+     * It exists because the kernel was committed on a kernel-time improvement
+     * that never showed up in total time, and settling that needs a paired
+     * measurement rather than two builds an hour apart. */
+    static int off = -1;
+    if (off < 0) { const char *e = getenv("IDLETOKEN_DS4X_NO_NARROW");
+                   off = (e && e[0] == '1'); }
+    return !off && w->type == T_Q4_K && w->n_in <= 2048u && (w->n_in % QK_K) == 0;
 }
 
 /* One block per output row; threads stride over the row's 32-element units.
@@ -828,6 +836,20 @@ struct ds4x_cuda_gdn {
     uint32_t kh, vh, kdim, vdim;
     uint32_t cap_tokens;               /* staging capacity, grown on demand */
     size_t   state_n;
+    /* Pass-2 (conv + gates) inputs, for ds4x_cuda_gdn_pre_run.
+     *
+     * The four WEIGHT arrays are uploaded ONCE and kept: there is one handle
+     * per linear layer, so they are constant for the handle's lifetime. Sending
+     * them per call would dominate the transfer — conv1d_w alone is
+     * conv_ch*K floats (98 KB for Qwen3.5-0.8B), which at one call per layer
+     * per token is ~210 MB per 118 decoded tokens, more than the activations
+     * this whole exercise is trying to stop moving. */
+    float   *d_raw, *d_win, *d_bb, *d_ab;      /* per-call inputs */
+    float   *h_pre;                            /* pinned staging for the above */
+    size_t   pre_cap;                          /* floats in h_pre */
+    float   *d_cw, *d_cb, *d_alog, *d_dt;      /* per-layer weights, uploaded once */
+    float   *d_ssm;                            /* pass-4 gated-norm weight, likewise */
+    uint32_t conv_ch, K;                       /* 0 = weights not uploaded yet */
 };
 
 static double g_gdn_ms_kernel = 0.0, g_gdn_ms_total = 0.0;
@@ -1353,6 +1375,123 @@ extern "C" void ds4x_cuda_ffn_stats(double *ms_kernel, double *ms_total,
     if (rows)      *rows      = (uint64_t)g_ffn_rows;
 }
 
+/* ---- Gated-DeltaNet pass 2 on the device ---------------------------------
+ * conv + silu, the two gates, and the per-head L2 norm — everything between
+ * the input projections and the recurrence. All of it is per-token
+ * independent, which is exactly why it used to sit on the host: it was cheap
+ * arithmetic. It is not cheap POSITIONALLY, because it splits the layer into
+ * two device calls with a host round trip between them.
+ *
+ * Three small kernels rather than one: conv output is conv_ch floats per token
+ * (6144 for Qwen3.5-0.8B = 24 KB) which does not fit comfortably in shared
+ * memory, so it goes through global and the L2 norm re-reads it. Three launches
+ * inside ONE call still cost one round trip, which is the thing being paid for.
+ *
+ * Each mirrors the CPU loop in gdn_attn_cpu operation for operation; that loop
+ * stays the reference. */
+
+/* conv[c] = silu(bias[c] + Σ_j w[c][j] · src(t-(K-1-j), c)), where positions
+ * before the chunk come from the carried window. */
+__global__ void gdn_conv_kernel(const float *raw, const float *win,
+                                const float *cw, const float *cb,
+                                float *cnv, uint32_t n_tokens,
+                                uint32_t conv_ch, uint32_t K) {
+    const uint32_t t = blockIdx.y;
+    const uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= conv_ch || t >= n_tokens) return;
+    float acc = cb ? cb[c] : 0.0f;
+    for (uint32_t j = 0; j < K; j++) {
+        const int rel = (int)t - (int)(K - 1 - j);
+        const float src = (rel >= 0)
+            ? raw[(size_t)rel * conv_ch + c]
+            : win[(size_t)(K - 1 + rel) * conv_ch + c];
+        acc += cw[(size_t)c * K + j] * src;
+    }
+    cnv[(size_t)t * conv_ch + c] = acc / (1.0f + expf(-acc));   /* silu */
+}
+
+/* Per-k-head L2 norm on q and k, in place. One block per (token, head-slot);
+ * head-slot < kh is a q head, >= kh is the matching k head. eps 1e-6 inside the
+ * sqrt, matching the CPU. */
+__global__ void gdn_l2norm_kernel(float *cnv, uint32_t conv_ch,
+                                  uint32_t kh, uint32_t kdim) {
+    const uint32_t t = blockIdx.y;
+    const uint32_t slot = blockIdx.x;
+    const uint32_t is_k = slot >= kh;
+    const uint32_t h = is_k ? (slot - kh) : slot;
+    float *v = cnv + (size_t)t * conv_ch + (size_t)(is_k ? kh * kdim : 0)
+             + (size_t)h * kdim;
+    float ss = 0.0f;
+    for (uint32_t i = threadIdx.x; i < kdim; i += blockDim.x) ss += v[i] * v[i];
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) ss += __shfl_down_sync(0xffffffffu, ss, off);
+    extern __shared__ float sml[];
+    const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const uint32_t nwarps = (blockDim.x + 31u) / 32u;
+    if (lane == 0) sml[warp] = ss;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float s = 0.0f;
+        for (uint32_t k = 0; k < nwarps; k++) s += sml[k];
+        sml[0] = 1.0f / sqrtf(s + 1e-6f);
+    }
+    __syncthreads();
+    const float inv = sml[0];
+    for (uint32_t i = threadIdx.x; i < kdim; i += blockDim.x) v[i] *= inv;
+}
+
+/* beta = sigmoid(b); decay = exp(A_log · softplus(a + dt_bias)).
+ * softplus is the stable form log1p(exp(-|x|)) + max(x,0), same as the CPU.
+ * A_log is used DIRECTLY — it already stores the negative coefficient; there is
+ * no exp() on it (the comment in gdn_attn_cpu records why). */
+__global__ void gdn_gates_kernel(const float *bb, const float *ab,
+                                 const float *A_log, const float *dt_bias,
+                                 float *beta, float *decay,
+                                 uint32_t n_tokens, uint32_t vh) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)n_tokens * vh) return;
+    const uint32_t h = (uint32_t)(i % vh);
+    const float b = bb[i], a = ab[i];
+    beta[i] = 1.0f / (1.0f + expf(-b));
+    const float xa = a + dt_bias[h];
+    const float sp = log1pf(expf(-fabsf(xa))) + (xa > 0.0f ? xa : 0.0f);
+    decay[i] = expf(A_log[h] * sp);
+}
+
+/* Gated RMSNorm, PER v-HEAD over v_dim: core = core·ssm_norm·inv·silu(z).
+ *
+ * ssm_norm is only v_dim long and shared across heads — normalising over the
+ * whole vd would be wrong (design doc §4b). Multiply order matches the CPU
+ * exactly (c * ssm * inv * silu(z)); fp32 multiplication is not associative,
+ * so a different order is a different number. One block per (token, v-head). */
+__global__ void gdn_gatednorm_kernel(float *core, const float *z,
+                                     const float *ssm_norm,
+                                     uint32_t vh, uint32_t vdim, float eps) {
+    const uint32_t t = blockIdx.y, h = blockIdx.x;
+    float *c = core + (size_t)t * vh * vdim + (size_t)h * vdim;
+    const float *zh = z + (size_t)t * vh * vdim + (size_t)h * vdim;
+    float ss = 0.0f;
+    for (uint32_t i = threadIdx.x; i < vdim; i += blockDim.x) ss += c[i] * c[i];
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) ss += __shfl_down_sync(0xffffffffu, ss, off);
+    extern __shared__ float smg[];
+    const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const uint32_t nwarps = (blockDim.x + 31u) / 32u;
+    if (lane == 0) smg[warp] = ss;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float v = 0.0f;
+        for (uint32_t k = 0; k < nwarps; k++) v += smg[k];
+        smg[0] = 1.0f / sqrtf(v / (float)vdim + eps);
+    }
+    __syncthreads();
+    const float inv = smg[0];
+    for (uint32_t i = threadIdx.x; i < vdim; i += blockDim.x) {
+        const float zv = zh[i];
+        c[i] = c[i] * ssm_norm[i] * inv * (zv / (1.0f + expf(-zv)));
+    }
+}
+
 /* ---- fused attention-output + FFN tail -----------------------------------
  * The whole back half of a layer, in one call:
  *
@@ -1411,6 +1550,58 @@ static int tail_reserve(size_t n_attn, size_t n_h, size_t n_w, size_t n_io) {
     return 0;
 }
 
+/* The tail's DEVICE-SIDE sequence, every buffer already resident:
+ *   d_h  in: the residual   out: the finished layer output
+ *   d_n  scratch, n_tokens x n_embd
+ *   g_ffn.d_g / d_u must already be reserved for n_tokens x ff.
+ * No copies, no sync, no timing — the caller owns all three.
+ *
+ * Extracted so the linear-layer path can run the tail on a `core` that is
+ * already in VRAM rather than carrying a second copy of these eight launches. */
+static int launch_attn_ffn_tail(const ds4x_cuda_wt *Wo, const ds4x_cuda_wt *Wg,
+                                const ds4x_cuda_wt *Wu, const ds4x_cuda_wt *Wd,
+                                const float *d_attn, float *d_h, float *d_n,
+                                const float *d_normw, uint32_t nt,
+                                uint32_t n_embd, uint32_t ff, float eps) {
+    const size_t nh = (size_t)nt * n_embd, nff = (size_t)nt * ff;
+    cudaError_t e;
+        /* h = x + Wo·attn_in : project into d_n as scratch, then add into d_h */
+        if ((nt == 1 ? launch_matvec(Wo, d_attn, d_n)
+                     : launch_matmul(Wo, d_attn, d_n, nt)) != 0) return -1;
+        {
+            const uint32_t th = 256;
+            residual_add_kernel<<<(uint32_t)((nh + th - 1) / th), th>>>(d_h, d_n, nh);
+            if ((e = cudaGetLastError()) != cudaSuccess) { set_err("residual launch", e); return -1; }
+        }
+        /* n = rmsnorm(h) * ffn_norm_w */
+        {
+            const uint32_t th = 256;
+            const uint32_t sh = ((th + 31u) / 32u) * (uint32_t)sizeof(float);
+            rmsnorm_kernel<<<nt, th, sh>>>(d_h, d_normw, d_n, n_embd, eps);
+            if ((e = cudaGetLastError()) != cudaSuccess) { set_err("rmsnorm launch", e); return -1; }
+        }
+        /* swiglu(n) into d_attn (reused as scratch: it is >= nh only when
+         * ain >= n_embd, so use the ffn arena's d_g result path instead) */
+        if ((nt == 1 ? launch_matvec(Wg, d_n, g_ffn.d_g)
+                     : launch_matmul(Wg, d_n, g_ffn.d_g, nt)) != 0) return -1;
+        if ((nt == 1 ? launch_matvec(Wu, d_n, g_ffn.d_u)
+                     : launch_matmul(Wu, d_n, g_ffn.d_u, nt)) != 0) return -1;
+        {
+            const uint32_t th = 256;
+            silu_mul_kernel<<<(uint32_t)((nff + th - 1) / th), th>>>(g_ffn.d_g, g_ffn.d_u, nff);
+            if ((e = cudaGetLastError()) != cudaSuccess) { set_err("silu_mul launch", e); return -1; }
+        }
+        /* x = h + Wd·g : project into d_n, add into d_h, download d_h */
+        if ((nt == 1 ? launch_matvec(Wd, g_ffn.d_g, d_n)
+                     : launch_matmul(Wd, g_ffn.d_g, d_n, nt)) != 0) return -1;
+        {
+            const uint32_t th = 256;
+            residual_add_kernel<<<(uint32_t)((nh + th - 1) / th), th>>>(d_h, d_n, nh);
+            if ((e = cudaGetLastError()) != cudaSuccess) { set_err("residual2 launch", e); return -1; }
+        }
+    return 0;
+}
+
 extern "C" int ds4x_cuda_attn_ffn_tail(const ds4x_cuda_wt *Wo,
                                        const ds4x_cuda_wt *Wg, const ds4x_cuda_wt *Wu,
                                        const ds4x_cuda_wt *Wd,
@@ -1456,40 +1647,9 @@ extern "C" int ds4x_cuda_attn_ffn_tail(const ds4x_cuda_wt *Wo,
                 set_err("cudaMemcpyAsync(tail norm_w)", e); return -1; }
         }
         cudaEventRecord(g_mev0);
-        /* h = x + Wo·attn_in : project into d_n as scratch, then add into d_h */
-        if ((nt == 1 ? launch_matvec(Wo, g_tail.d_attn, g_tail.d_n)
-                     : launch_matmul(Wo, g_tail.d_attn, g_tail.d_n, nt)) != 0) return -1;
-        {
-            const uint32_t th = 256;
-            residual_add_kernel<<<(uint32_t)((nh + th - 1) / th), th>>>(g_tail.d_h, g_tail.d_n, nh);
-            if ((e = cudaGetLastError()) != cudaSuccess) { set_err("residual launch", e); return -1; }
-        }
-        /* n = rmsnorm(h) * ffn_norm_w */
-        {
-            const uint32_t th = 256;
-            const uint32_t sh = ((th + 31u) / 32u) * (uint32_t)sizeof(float);
-            rmsnorm_kernel<<<nt, th, sh>>>(g_tail.d_h, g_tail.d_w, g_tail.d_n, n_embd, eps);
-            if ((e = cudaGetLastError()) != cudaSuccess) { set_err("rmsnorm launch", e); return -1; }
-        }
-        /* swiglu(n) into d_attn (reused as scratch: it is >= nh only when
-         * ain >= n_embd, so use the ffn arena's d_g result path instead) */
-        if ((nt == 1 ? launch_matvec(Wg, g_tail.d_n, g_ffn.d_g)
-                     : launch_matmul(Wg, g_tail.d_n, g_ffn.d_g, nt)) != 0) return -1;
-        if ((nt == 1 ? launch_matvec(Wu, g_tail.d_n, g_ffn.d_u)
-                     : launch_matmul(Wu, g_tail.d_n, g_ffn.d_u, nt)) != 0) return -1;
-        {
-            const uint32_t th = 256;
-            silu_mul_kernel<<<(uint32_t)((nff + th - 1) / th), th>>>(g_ffn.d_g, g_ffn.d_u, nff);
-            if ((e = cudaGetLastError()) != cudaSuccess) { set_err("silu_mul launch", e); return -1; }
-        }
-        /* x = h + Wd·g : project into d_n, add into d_h, download d_h */
-        if ((nt == 1 ? launch_matvec(Wd, g_ffn.d_g, g_tail.d_n)
-                     : launch_matmul(Wd, g_ffn.d_g, g_tail.d_n, nt)) != 0) return -1;
-        {
-            const uint32_t th = 256;
-            residual_add_kernel<<<(uint32_t)((nh + th - 1) / th), th>>>(g_tail.d_h, g_tail.d_n, nh);
-            if ((e = cudaGetLastError()) != cudaSuccess) { set_err("residual2 launch", e); return -1; }
-        }
+        if (launch_attn_ffn_tail(Wo, Wg, Wu, Wd, g_tail.d_attn, g_tail.d_h,
+                                 g_tail.d_n, g_tail.d_w, nt, n_embd, ff, eps) != 0)
+            return -1;
         cudaEventRecord(g_mev1);
         if ((e = cudaMemcpyAsync(g_tail.h_io, g_tail.d_h, nh * sizeof(float),
                                  cudaMemcpyDeviceToHost, 0)) != cudaSuccess) {
@@ -1709,6 +1869,10 @@ extern "C" void ds4x_cuda_gdn_free(ds4x_cuda_gdn *g) {
     cudaFree(g->d_cnv); cudaFree(g->d_bet); cudaFree(g->d_dec); cudaFree(g->d_core);
     cudaFreeHost(g->h_cnv); cudaFreeHost(g->h_bet);
     cudaFreeHost(g->h_dec); cudaFreeHost(g->h_core);
+    cudaFree(g->d_raw); cudaFree(g->d_win); cudaFree(g->d_bb); cudaFree(g->d_ab);
+    cudaFree(g->d_cw);  cudaFree(g->d_cb);  cudaFree(g->d_alog); cudaFree(g->d_dt);
+    cudaFree(g->d_ssm);
+    cudaFreeHost(g->h_pre);
     free(g);
 }
 
@@ -1732,6 +1896,333 @@ extern "C" int ds4x_cuda_gdn_set_state(ds4x_cuda_gdn *g, const float *state) {
     cudaError_t e = cudaMemcpy(g->d_state, state, g->state_n * sizeof(float),
                                cudaMemcpyHostToDevice);
     if (e != cudaSuccess) { set_err("cudaMemcpy(gdn set)", e); return -1; }
+    return 0;
+}
+
+/* Upload the four per-layer pass-2 weights, once per handle. conv_ch doubles as
+ * the "already uploaded" flag. Shared by gdn_pre_run and gdn_layer. */
+static int gdn_pre_weights(ds4x_cuda_gdn *g, const float *cw, const float *cb,
+                           const float *A_log, const float *dt_bias,
+                           uint32_t conv_ch, uint32_t K) {
+    if (g->conv_ch != 0) return 0;
+    cudaError_t e;
+    const size_t cwn = (size_t)conv_ch * K * sizeof(float);
+    if ((e = cudaMalloc(&g->d_cw, cwn)) != cudaSuccess ||
+        (e = cudaMalloc(&g->d_cb, conv_ch * sizeof(float))) != cudaSuccess ||
+        (e = cudaMalloc(&g->d_alog, g->vh * sizeof(float))) != cudaSuccess ||
+        (e = cudaMalloc(&g->d_dt, g->vh * sizeof(float))) != cudaSuccess) {
+        set_err("cudaMalloc(gdn pre weights)", e); return -1;
+    }
+    if ((e = cudaMemcpy(g->d_cw, cw, cwn, cudaMemcpyHostToDevice)) != cudaSuccess ||
+        (e = cudaMemcpy(g->d_alog, A_log, g->vh * sizeof(float), cudaMemcpyHostToDevice)) != cudaSuccess ||
+        (e = cudaMemcpy(g->d_dt, dt_bias, g->vh * sizeof(float), cudaMemcpyHostToDevice)) != cudaSuccess) {
+        set_err("cudaMemcpy(gdn pre weights)", e); return -1;
+    }
+    if (cb) {
+        if ((e = cudaMemcpy(g->d_cb, cb, conv_ch * sizeof(float), cudaMemcpyHostToDevice)) != cudaSuccess) {
+            set_err("cudaMemcpy(gdn conv bias)", e); return -1; }
+    } else {
+        if ((e = cudaMemset(g->d_cb, 0, conv_ch * sizeof(float))) != cudaSuccess) {
+            set_err("cudaMemset(gdn conv bias)", e); return -1; }
+    }
+    g->conv_ch = conv_ch; g->K = K;
+    return 0;
+}
+
+/* pass-4's ssm_norm, cached like the rest (v_dim floats, shared across heads). */
+static int gdn_ssm_weight(ds4x_cuda_gdn *g, const float *ssm_norm) {
+    if (g->d_ssm) return 0;
+    cudaError_t e;
+    if ((e = cudaMalloc(&g->d_ssm, g->vdim * sizeof(float))) != cudaSuccess ||
+        (e = cudaMemcpy(g->d_ssm, ssm_norm, g->vdim * sizeof(float),
+                        cudaMemcpyHostToDevice)) != cudaSuccess) {
+        set_err("cudaMalloc(gdn ssm_norm)", e); return -1; }
+    return 0;
+}
+
+/* One call for pass 2 + pass 3: conv/silu, gates, L2 norm, then the recurrence.
+ *
+ * The conv writes straight into g->d_cnv — the buffer the recurrence kernel
+ * already reads — so the intermediate never touches the host. That is the whole
+ * point: unfused, pass 2 ran on the CPU between two device calls, which is one
+ * host round trip per linear layer per token spent on arithmetic that is
+ * per-token independent and trivially parallel.
+ *
+ * Per-layer weights are uploaded on the first call and kept (see the struct).
+ * `conv_win_out` receives the last K-1 raw rows for the next chunk, computed
+ * host-side by the caller as before — it is a few KB and needs the raw rows,
+ * which the caller already has. */
+extern "C" int ds4x_cuda_gdn_pre_run(ds4x_cuda_gdn *g, uint32_t n_tokens,
+                                     const float *raw, const float *win,
+                                     const float *cw, const float *cb,
+                                     const float *bb, const float *ab,
+                                     const float *A_log, const float *dt_bias,
+                                     uint32_t conv_ch, uint32_t K, float *core) {
+    if (!g || !raw || !win || !cw || !bb || !ab || !A_log || !dt_bias || !core ||
+        n_tokens == 0 || conv_ch == 0 || K == 0) return -1;
+    const uint32_t kd = g->kh * g->kdim, vd = g->vh * g->vdim;
+    if (conv_ch != kd * 2u + vd) {
+        snprintf(g_err, sizeof(g_err), "gdn_pre_run: conv_ch %u != 2*%u+%u",
+                 conv_ch, kd, vd);
+        return -1;
+    }
+    const double t0 = host_ms();
+    if (gdn_reserve(g, n_tokens) != 0) return -1;
+    if (!g_gev0) { cudaEventCreate(&g_gev0); cudaEventCreate(&g_gev1); }
+    cudaError_t e;
+
+    if (gdn_pre_weights(g, cw, cb, A_log, dt_bias, conv_ch, K) != 0) return -1;
+
+    /* Per-call inputs, packed into one pinned buffer so they upload without a
+     * synchronize between them. */
+    const size_t n_raw = (size_t)n_tokens * conv_ch;
+    const size_t n_win = (size_t)(K - 1) * conv_ch;
+    const size_t n_g   = (size_t)n_tokens * g->vh;
+    const size_t need  = n_raw + n_win + 2 * n_g;
+    if (need > g->pre_cap) {
+        cudaFree(g->d_raw); cudaFree(g->d_win); cudaFree(g->d_bb); cudaFree(g->d_ab);
+        cudaFreeHost(g->h_pre);
+        g->d_raw = g->d_win = g->d_bb = g->d_ab = NULL; g->h_pre = NULL; g->pre_cap = 0;
+        if ((e = cudaMalloc(&g->d_raw, n_raw * sizeof(float))) != cudaSuccess ||
+            (e = cudaMalloc(&g->d_win, (n_win ? n_win : 1) * sizeof(float))) != cudaSuccess ||
+            (e = cudaMalloc(&g->d_bb, n_g * sizeof(float))) != cudaSuccess ||
+            (e = cudaMalloc(&g->d_ab, n_g * sizeof(float))) != cudaSuccess ||
+            (e = cudaHostAlloc(&g->h_pre, need * sizeof(float), cudaHostAllocDefault)) != cudaSuccess) {
+            set_err("cudaMalloc(gdn pre staging)", e); return -1;
+        }
+        g->pre_cap = need;
+    }
+    memcpy(g->h_pre,                       raw, n_raw * sizeof(float));
+    if (n_win) memcpy(g->h_pre + n_raw,    win, n_win * sizeof(float));
+    memcpy(g->h_pre + n_raw + n_win,       bb,  n_g   * sizeof(float));
+    memcpy(g->h_pre + n_raw + n_win + n_g, ab,  n_g   * sizeof(float));
+    if ((e = cudaMemcpyAsync(g->d_raw, g->h_pre, n_raw * sizeof(float),
+                             cudaMemcpyHostToDevice, 0)) != cudaSuccess ||
+        (n_win && (e = cudaMemcpyAsync(g->d_win, g->h_pre + n_raw, n_win * sizeof(float),
+                             cudaMemcpyHostToDevice, 0)) != cudaSuccess) ||
+        (e = cudaMemcpyAsync(g->d_bb, g->h_pre + n_raw + n_win, n_g * sizeof(float),
+                             cudaMemcpyHostToDevice, 0)) != cudaSuccess ||
+        (e = cudaMemcpyAsync(g->d_ab, g->h_pre + n_raw + n_win + n_g, n_g * sizeof(float),
+                             cudaMemcpyHostToDevice, 0)) != cudaSuccess) {
+        set_err("cudaMemcpyAsync(gdn pre in)", e); return -1;
+    }
+
+    const size_t on = (size_t)n_tokens * vd * sizeof(float);
+    cudaEventRecord(g_gev0);
+    {
+        const uint32_t th = 256;
+        dim3 grid((conv_ch + th - 1u) / th, n_tokens);
+        gdn_conv_kernel<<<grid, th>>>(g->d_raw, g->d_win, g->d_cw, g->d_cb,
+                                      g->d_cnv, n_tokens, conv_ch, K);
+    }
+    {
+        const uint32_t th = 128;
+        const uint32_t sh = ((th + 31u) / 32u) * (uint32_t)sizeof(float);
+        dim3 grid(2u * g->kh, n_tokens);
+        gdn_l2norm_kernel<<<grid, th, sh>>>(g->d_cnv, conv_ch, g->kh, g->kdim);
+    }
+    {
+        const uint32_t th = 128;
+        const size_t n = (size_t)n_tokens * g->vh;
+        gdn_gates_kernel<<<(uint32_t)((n + th - 1) / th), th>>>(
+            g->d_bb, g->d_ab, g->d_alog, g->d_dt, g->d_bet, g->d_dec,
+            n_tokens, g->vh);
+    }
+    {
+        uint32_t threads = g->vdim < 256u ? g->vdim : 256u;
+        threads = ((threads + 31u) / 32u) * 32u;
+        if (threads == 0) threads = 32;
+        const uint32_t shmem = 2u * g->kdim * (uint32_t)sizeof(float);
+        const float oscale = 1.0f / sqrtf((float)g->vdim);
+        gdn_recur_kernel<<<g->vh, threads, shmem>>>(
+            g->d_state, n_tokens, g->kh, g->vh, g->kdim, g->vdim,
+            g->d_cnv, g->d_bet, g->d_dec, g->d_core, oscale);
+    }
+    cudaEventRecord(g_gev1);
+    if ((e = cudaGetLastError()) != cudaSuccess) { set_err("gdn pre launch", e); return -1; }
+    if ((e = cudaMemcpyAsync(g->h_core, g->d_core, on, cudaMemcpyDeviceToHost, 0)) != cudaSuccess) {
+        set_err("cudaMemcpyAsync(gdn pre out)", e); return -1;
+    }
+    if ((e = cudaStreamSynchronize(0)) != cudaSuccess) { set_err("gdn pre sync", e); return -1; }
+    memcpy(core, g->h_core, on);
+    float kms = 0.0f;
+    if (cudaEventElapsedTime(&kms, g_gev0, g_gev1) == cudaSuccess) g_gdn_ms_kernel += kms;
+    g_gdn_ms_total += host_ms() - t0;
+    g_gdn_calls++;
+    return 0;
+}
+
+/* A WHOLE linear layer's attention in one call: the four input projections,
+ * conv/silu, the gates, the L2 norm, and the recurrence.
+ *
+ * This is the last host round trip inside a linear layer. proj_fanout already
+ * wrote qkv/z/b/a into one contiguous device arena; gdn_pre_run then downloaded
+ * three of those slices only to upload them again. Here the conv reads the qkv
+ * slice where it already sits.
+ *
+ * What still comes back, and why:
+ *   core : pass 4 (the gated RMSNorm) is host code
+ *   z    : pass 4 needs it
+ *   raw  : the conv window carry needs the last K-1 pre-conv rows, and that
+ *          bookkeeping is host-side. raw and z are ADJACENT slices of the arena,
+ *          so both ride one download.
+ * b and a are consumed entirely on the device and never return. */
+extern "C" int ds4x_cuda_gdn_layer(ds4x_cuda_gdn *g,
+                                   const ds4x_cuda_wt *Wqkv, const ds4x_cuda_wt *Wz,
+                                   const ds4x_cuda_wt *Wb, const ds4x_cuda_wt *Wa,
+                                   const float *normed, const float *win,
+                                   const float *cw, const float *cb,
+                                   const float *A_log, const float *dt_bias,
+                                   uint32_t n_tokens, uint32_t conv_ch, uint32_t K,
+                                   float *raw_out, float *z_out, float *core_out,
+                                   const ds4x_gdn_tail *tail) {
+    if (!g || !Wqkv || !Wz || !Wb || !Wa || !normed || !win || !raw_out ||
+        !z_out || !core_out || n_tokens == 0 || n_tokens > MM_BLOCK) return -1;
+    const uint32_t kd = g->kh * g->kdim, vd = g->vh * g->vdim;
+    const uint32_t n_in = Wqkv->n_in;
+    if (conv_ch != kd * 2u + vd || Wqkv->n_out != conv_ch || Wz->n_out != vd ||
+        Wb->n_out != g->vh || Wa->n_out != g->vh ||
+        Wz->n_in != n_in || Wb->n_in != n_in || Wa->n_in != n_in) {
+        snprintf(g_err, sizeof(g_err), "gdn_layer: shape mismatch");
+        return -1;
+    }
+    const double t0 = host_ms();
+    if (gdn_reserve(g, n_tokens) != 0) return -1;
+    if (gdn_pre_weights(g, cw, cb, A_log, dt_bias, conv_ch, K) != 0) return -1;
+    if (tail && gdn_ssm_weight(g, tail->ssm_norm) != 0) return -1;
+    if (!g_gev0) { cudaEventCreate(&g_gev0); cudaEventCreate(&g_gev1); }
+    cudaError_t e;
+
+    /* Arena slices, in the order the download wants them: raw | z | b | a. */
+    const size_t n_raw = (size_t)n_tokens * conv_ch, n_z = (size_t)n_tokens * vd;
+    const size_t n_g = (size_t)n_tokens * g->vh;
+    const size_t total = n_raw + n_z + 2 * n_g;
+    const size_t nx = (size_t)n_tokens * n_in;
+    const size_t n_win = (size_t)(K - 1) * conv_ch;
+    if (stage_reserve(nx, 1) != 0 || proj_reserve(total) != 0) return -1;
+    if (n_win + nx > g->pre_cap) {
+        cudaFree(g->d_win); cudaFreeHost(g->h_pre);
+        g->d_win = NULL; g->h_pre = NULL; g->pre_cap = 0;
+        if ((e = cudaMalloc(&g->d_win, (n_win ? n_win : 1) * sizeof(float))) != cudaSuccess ||
+            (e = cudaHostAlloc(&g->h_pre, (n_win + nx) * sizeof(float), cudaHostAllocDefault)) != cudaSuccess) {
+            set_err("cudaMalloc(gdn layer staging)", e); return -1;
+        }
+        g->pre_cap = n_win + nx;
+    }
+    /* normed and the carried window in one pinned buffer, two async uploads. */
+    memcpy(g->h_pre, normed, nx * sizeof(float));
+    if (n_win) memcpy(g->h_pre + nx, win, n_win * sizeof(float));
+    if ((e = cudaMemcpyAsync(g_stage.d_x, g->h_pre, nx * sizeof(float),
+                             cudaMemcpyHostToDevice, 0)) != cudaSuccess ||
+        (n_win && (e = cudaMemcpyAsync(g->d_win, g->h_pre + nx, n_win * sizeof(float),
+                             cudaMemcpyHostToDevice, 0)) != cudaSuccess)) {
+        set_err("cudaMemcpyAsync(gdn layer in)", e); return -1;
+    }
+
+    float *d_raw = g_proj.d, *d_z = d_raw + n_raw;
+    float *d_b = d_z + n_z, *d_a = d_b + n_g;
+    cudaEventRecord(g_gev0);
+    {
+        const ds4x_cuda_wt *W[4] = { Wqkv, Wz, Wb, Wa };
+        float *Y[4] = { d_raw, d_z, d_b, d_a };
+        for (int i = 0; i < 4; i++) {
+            const int rc = (n_tokens == 1)
+                ? launch_matvec(W[i], g_stage.d_x, Y[i])
+                : launch_matmul(W[i], g_stage.d_x, Y[i], n_tokens);
+            if (rc != 0) return -1;
+        }
+    }
+    {
+        const uint32_t th = 256;
+        dim3 grid((conv_ch + th - 1u) / th, n_tokens);
+        gdn_conv_kernel<<<grid, th>>>(d_raw, g->d_win, g->d_cw, g->d_cb,
+                                      g->d_cnv, n_tokens, conv_ch, K);
+    }
+    {
+        const uint32_t th = 128;
+        const uint32_t sh = ((th + 31u) / 32u) * (uint32_t)sizeof(float);
+        dim3 grid(2u * g->kh, n_tokens);
+        gdn_l2norm_kernel<<<grid, th, sh>>>(g->d_cnv, conv_ch, g->kh, g->kdim);
+    }
+    {
+        const uint32_t th = 128;
+        gdn_gates_kernel<<<(uint32_t)((n_g + th - 1) / th), th>>>(
+            d_b, d_a, g->d_alog, g->d_dt, g->d_bet, g->d_dec, n_tokens, g->vh);
+    }
+    {
+        uint32_t threads = g->vdim < 256u ? g->vdim : 256u;
+        threads = ((threads + 31u) / 32u) * 32u;
+        if (threads == 0) threads = 32;
+        const uint32_t shmem = 2u * g->kdim * (uint32_t)sizeof(float);
+        const float oscale = 1.0f / sqrtf((float)g->vdim);
+        gdn_recur_kernel<<<g->vh, threads, shmem>>>(
+            g->d_state, n_tokens, g->kh, g->vh, g->kdim, g->vdim,
+            g->d_cnv, g->d_bet, g->d_dec, g->d_core, oscale);
+    }
+    if (tail) {
+        /* Pass 4 and the layer tail, still on the device: `core` is already
+         * here, so the only thing that has to come back is the finished layer
+         * output (and `raw`, for the conv window carry). */
+        const uint32_t n_embd = tail->Wo->n_out, ff = tail->Wg->n_out;
+        const size_t nh = (size_t)n_tokens * n_embd;
+        if (tail_reserve(n_z, nh, n_embd, nh) != 0) return -1;
+        if (ffn_reserve((size_t)n_tokens * ff) != 0) return -1;
+        /* ffn_norm and ssm_norm: ssm_norm is per-layer and cached; ffn_norm
+         * rides the per-call staging (it is n_embd floats). */
+        if ((e = cudaMemcpyAsync(g_tail.d_w, tail->ffn_norm_w, n_embd * sizeof(float),
+                                 cudaMemcpyHostToDevice, 0)) != cudaSuccess) {
+            set_err("cudaMemcpyAsync(gdn tail norm)", e); return -1; }
+        if ((e = cudaMemcpyAsync(g_tail.d_h, tail->x, nh * sizeof(float),
+                                 cudaMemcpyHostToDevice, 0)) != cudaSuccess) {
+            set_err("cudaMemcpyAsync(gdn tail resid)", e); return -1; }
+        {
+            const uint32_t th = 128;
+            const uint32_t sh = ((th + 31u) / 32u) * (uint32_t)sizeof(float);
+            dim3 grid(g->vh, n_tokens);
+            gdn_gatednorm_kernel<<<grid, th, sh>>>(g->d_core, d_z, g->d_ssm,
+                                                   g->vh, g->vdim, tail->eps);
+        }
+        if (launch_attn_ffn_tail(tail->Wo, tail->Wg, tail->Wu, tail->Wd,
+                                 g->d_core, g_tail.d_h, g_tail.d_n, g_tail.d_w,
+                                 n_tokens, n_embd, ff, tail->eps) != 0) return -1;
+    }
+    cudaEventRecord(g_gev1);
+    if ((e = cudaGetLastError()) != cudaSuccess) { set_err("gdn layer launch", e); return -1; }
+
+    if (tail) {
+        const uint32_t n_embd = tail->Wo->n_out;
+        const size_t nh = (size_t)n_tokens * n_embd;
+        if ((e = cudaMemcpyAsync(g_proj.h, d_raw, n_raw * sizeof(float),
+                                 cudaMemcpyDeviceToHost, 0)) != cudaSuccess ||
+            (e = cudaMemcpyAsync(g_tail.h_io, g_tail.d_h, nh * sizeof(float),
+                                 cudaMemcpyDeviceToHost, 0)) != cudaSuccess) {
+            set_err("cudaMemcpyAsync(gdn layer tail out)", e); return -1; }
+        if ((e = cudaStreamSynchronize(0)) != cudaSuccess) { set_err("gdn layer sync", e); return -1; }
+        memcpy(raw_out,  g_proj.h,     n_raw * sizeof(float));
+        memcpy(tail->x,  g_tail.h_io,  nh * sizeof(float));
+        float kms0 = 0.0f;
+        if (cudaEventElapsedTime(&kms0, g_gev0, g_gev1) == cudaSuccess) g_gdn_ms_kernel += kms0;
+        g_gdn_ms_total += host_ms() - t0;
+        g_gdn_calls++;
+        return 0;
+    }
+
+    /* raw|z ride one download (adjacent slices); core is a separate buffer. */
+    const size_t n_rz = n_raw + n_z;
+    if ((e = cudaMemcpyAsync(g_proj.h, g_proj.d, n_rz * sizeof(float),
+                             cudaMemcpyDeviceToHost, 0)) != cudaSuccess ||
+        (e = cudaMemcpyAsync(g->h_core, g->d_core, n_z * sizeof(float),
+                             cudaMemcpyDeviceToHost, 0)) != cudaSuccess) {
+        set_err("cudaMemcpyAsync(gdn layer out)", e); return -1;
+    }
+    if ((e = cudaStreamSynchronize(0)) != cudaSuccess) { set_err("gdn layer sync", e); return -1; }
+    memcpy(raw_out,  g_proj.h,         n_raw * sizeof(float));
+    memcpy(z_out,    g_proj.h + n_raw, n_z   * sizeof(float));
+    memcpy(core_out, g->h_core,        n_z   * sizeof(float));
+    float kms = 0.0f;
+    if (cudaEventElapsedTime(&kms, g_gev0, g_gev1) == cudaSuccess) g_gdn_ms_kernel += kms;
+    g_gdn_ms_total += host_ms() - t0;
+    g_gdn_calls++;
     return 0;
 }
 

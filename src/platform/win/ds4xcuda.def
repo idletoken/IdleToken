@@ -30,10 +30,14 @@ ds4x_cuda_swiglu
 ds4x_cuda_ffn_stats
 ds4x_cuda_proj_fanout
 ds4x_cuda_proj_stats
+ds4x_cuda_attn_ffn_tail
+ds4x_cuda_tail_stats
 ds4x_cuda_gdn_create
 ds4x_cuda_gdn_free
 ds4x_cuda_gdn_zero
 ds4x_cuda_gdn_run
+ds4x_cuda_gdn_pre_run
+ds4x_cuda_gdn_layer
 ds4x_cuda_gdn_get_state
 ds4x_cuda_gdn_set_state
 ds4x_cuda_gdn_stats

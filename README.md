@@ -5,9 +5,9 @@
   </picture>
 </p>
 
-**Share your idle tokens.**
+**Share when idle. Scale when busy.**
 
-IdleToken is an open-source local LLM client and inference engine.
+Put your idle compute to work, then tap into more Tokens when demand spikes.
 
 [中文](README.zh-CN.md)
 
@@ -49,7 +49,7 @@ curl http://<your-machine>:8000/v1/chat/completions \
   -d '{"model":"qwen3-8b","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-If one machine cannot hold the model, add another. Create a cluster on one machine to get a join code, and enter that code on the others. Node discovery, capacity probing, model splitting and weight download all happen automatically from there.
+If one machine cannot hold the model, add another **running the same OS**. Create a cluster on one machine to get a join code, and enter that code on the others. Node discovery, capacity probing, model splitting and weight download all happen automatically from there.
 
 If you have spare capacity, you can turn sharing on. Sharing earns Sparks, and when you need more compute you spend Sparks on what other people have shared. Sharing is off by default and can be turned off again at any time.
 
@@ -80,14 +80,27 @@ The full model list and its requirements will be maintained on a page of its own
 
 ## Requirements
 
-Compute nodes currently run on **Windows and Linux**. Each machine needs:
+Compute nodes run on **Windows, Linux and macOS**, one machine or several. Each machine needs a supported GPU:
 
-* an NVIDIA GPU with compute capability ≥ 7.5 (RTX 20-series or newer)
-* ≥ 4 GB of VRAM
-* Windows driver ≥ 527.41
-* Linux driver ≥ 580.65
+| Platform | GPU | Also needs |
+| --- | --- | --- |
+| Windows | NVIDIA, compute capability ≥ 7.5 (RTX 20-series or newer), ≥ 4 GB VRAM | driver ≥ 527.41 |
+| Linux | NVIDIA, compute capability ≥ 7.5 (RTX 20-series or newer), ≥ 4 GB VRAM | driver ≥ 580.65 |
+| macOS | Apple Silicon (Metal, unified memory) | — |
+
+**A cluster has to be homogeneous**: every compute node in one cluster runs the same
+OS family. A Windows cluster, a Linux cluster and a macOS cluster all work; mixing
+Windows and Linux machines in one cluster does not, and the coordinator refuses the
+join rather than running something it cannot verify. A single machine is just a
+one-node cluster, so single-machine use is the same software and the same path.
 
 CPU-only nodes are refused outright; there is no silent fallback to CPU inference.
+Intel Macs and AMD GPUs are not supported as compute nodes.
+
+The macOS line is newer and less exercised than the CUDA one: DeepSeek-V4-Flash has
+not yet been run on a Mac (we have no machine with enough memory), small models fall
+back to a CPU reference path because they have no Metal kernels yet, and multi-Mac
+clusters are unverified.
 
 ## Building from source
 

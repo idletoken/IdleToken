@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 # Topology × model matrix (acceptance G-TOPO).
 #
-# The product claims "any handful of Windows/Linux machines, any supported
+# The product claims "any handful of machines running the SAME OS, any supported
 # model". Every other gate proves ONE topology with ONE model. This walks the
 # claim: every non-empty subset of the real machines, times every model the
 # registry says is runnable, plus simulated 5-10 node clusters that no amount of
 # borrowed hardware would let us build.
+#
+# Since 2026-08-12 a cluster must be homogeneous (CLAUDE.md hard constraint #2),
+# so subsets that span OS families are recorded SKIP with that reason — they are
+# no longer a product configuration and the coordinator refuses them at HELLO.
+# On the usual testbed (a Linux coordinator + Windows workers) that removes most
+# of the multi-machine cells; what remains is the all-Windows household. Read
+# the SKIP reasons before reading the pass count.
 #
 # Design notes that matter when you rerun it:
 #   - RESUMABLE. Each cell appends to a TSV; a rerun skips cells already PASSed.
@@ -87,16 +94,31 @@ node_gguf_for() {  # node_gguf_for <node> <file>
 # default shell is cmd or powershell), so that is the test. Results are memoized
 # in a string (the bash 3.2 that ships with macOS has no associative arrays), so
 # each machine is asked only once.
-_WIN_NODES=" "
-_POSIX_NODES=" "
-is_win() {
-    case "$_WIN_NODES"   in *" $1 "*) return 0 ;; esac
-    case "$_POSIX_NODES" in *" $1 "*) return 1 ;; esac
-    if $SSH "$1" "uname -s" >/dev/null 2>&1; then
-        _POSIX_NODES="$_POSIX_NODES$1 "; return 1
-    fi
-    _WIN_NODES="$_WIN_NODES$1 "; return 0
+#
+# node_os distinguishes all three families (is_win only ever needed Windows vs
+# not; homogeneity needs Linux vs macOS too). It SETS a variable instead of
+# echoing: a `$(...)` call would memoize inside a subshell and re-ssh every time.
+#
+# Caveat inherited from the original: an unreachable machine also produces no
+# `uname` output and is therefore read as Windows. The sweep checks liveness
+# (subset_offline) before it consults the family, so this never decides a cell.
+_NODE_OS=" "
+NODE_OS=""
+node_os() {  # node_os <alias> -> sets NODE_OS to windows|linux|macos|unknown
+    local rest u
+    case "$_NODE_OS" in
+        *" $1:"*) rest="${_NODE_OS#*" $1:"}"; NODE_OS="${rest%% *}"; return 0 ;;
+    esac
+    u=$($SSH "$1" "uname -s" 2>/dev/null | tr -d '\r')
+    case "$u" in
+        Linux)  NODE_OS=linux ;;
+        Darwin) NODE_OS=macos ;;
+        "")     NODE_OS=windows ;;
+        *)      NODE_OS=unknown ;;
+    esac
+    _NODE_OS="$_NODE_OS$1:$NODE_OS "
 }
+is_win() { node_os "$1"; [ "$NODE_OS" = windows ]; }
 
 MODELS=""
 MAX_NODES=4
@@ -403,6 +425,22 @@ subset_offline() {   # subset_offline <node...>  -> prints the offline member
     return 1
 }
 
+# A subset spanning OS families is not a product configuration (CLAUDE.md hard
+# constraint #2, 2026-08-12): the coordinator refuses it at HELLO. Recorded as
+# SKIP with the reason rather than dropped, so the matrix cannot read as full
+# coverage of something the product no longer claims.
+subset_mixed_os() {  # subset_mixed_os <node...> -> prints "linux+windows" if mixed
+    local _m fams="" f
+    for _m in "$@"; do
+        node_os "$_m"; f="$NODE_OS"
+        case " $fams " in *" $f "*) ;; *) fams="$fams $f" ;; esac
+    done
+    set -- $fams
+    [ $# -le 1 ] && return 1
+    echo "$*" | tr ' ' '+'
+    return 0
+}
+
 fails=0
 for model in $MODELS; do
     for mask in $(seq 1 15); do
@@ -424,6 +462,12 @@ for model in $MODELS; do
         if off=$(subset_offline "${subset[@]}"); then
             record SKIP "$model" "$local_key" "$coord" real "$off is powered off / unreachable this run"
             echo "   SKIP $off offline"
+            continue
+        fi
+        if mixed=$(subset_mixed_os "${subset[@]}"); then
+            record SKIP "$model" "$local_key" "$coord" real \
+                "mixed-OS subset ($mixed): clusters must be homogeneous (CLAUDE.md #2) — refused at HELLO by design"
+            echo "   SKIP mixed-OS ($mixed)"
             continue
         fi
         echo "== $model on $local_key (coord $coord) =="

@@ -30,7 +30,12 @@ export const HW_NO_GPU = 1;
 export const HW_CC_TOO_LOW = 2;
 export const HW_DRIVER_TOO_OLD = 3;
 export const HW_VRAM_TOO_SMALL = 4;
-export type HwStatus = 0 | 1 | 2 | 3 | 4;
+// A GPU we have no backend for — an Intel Mac's AMD card, say. Added with the
+// Metal backend (2026-08-12); before that the enum stopped at 4 and this status
+// fell through the UI's chain of comparisons, leaving a **healthy-looking card
+// on a machine the engine had already refused**.
+export const HW_GPU_UNSUPPORTED = 5;
+export type HwStatus = 0 | 1 | 2 | 3 | 4 | 5;
 
 // Where a snapshot came from. `engine` = a real probe from the native worker;
 // `dev-fixture` = a placeholder used only when the client runs outside Tauri

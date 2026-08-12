@@ -238,6 +238,38 @@ static int send_hello_ack(int fd, uint64_t request_id) {
     return 0;
 }
 
+/* Refusing ACK: the accept path used to just close the socket, which left the
+ * rejected machine's operator staring at "connection reset" with no reason.
+ * docs/wire-protocol.md has always specified accepted/reject_message here; an
+ * empty payload still means "accepted" so older coordinators stay compatible. */
+static void send_hello_reject(int fd, uint64_t request_id, uint8_t reasoncode,
+                              const char *why) {
+    uint8_t p[512];
+    idletoken_buf b;
+    idletoken_buf_init(&b, p, sizeof(p));
+    idletoken_buf_put_u8 (&b, 0);            /* accepted = no */
+    idletoken_buf_put_u8 (&b, reasoncode);
+    idletoken_buf_put_u8 (&b, 0);
+    idletoken_buf_put_u8 (&b, 0);            /* reserved[2] */
+    idletoken_buf_put_u16(&b, (uint16_t)IDLETOKEN_PROTO_VERSION);
+    idletoken_buf_put_u16(&b, 0);            /* reserved */
+    idletoken_buf_put_u32(&b, 0);            /* heartbeat_secs: n/a, not joining */
+    idletoken_buf_put_str(&b, "idletoken-coord v0.1.0-pre");
+    idletoken_buf_put_str(&b, why);
+    if (b.err) return;
+
+    idletoken_msg_header h = {
+        .magic = IDLETOKEN_PROTO_MAGIC,
+        .version = IDLETOKEN_PROTO_VERSION,
+        .msg_type = IDLETOKEN_MSG_HELLO_ACK,
+        .payload_bytes = b.pos,
+        .request_id = request_id,
+        .stage_id = IDLETOKEN_STAGE_COORD,
+        .segment_id = IDLETOKEN_SEGMENT_NONE,
+    };
+    (void)idletoken_send_msg(fd, &h, p, b.pos);
+}
+
 static int recv_resource_report(int fd, idletoken_worker_info *w) {
     uint8_t rp[1024];
     idletoken_msg_header h;
@@ -3490,6 +3522,32 @@ int main(int argc, char **argv) {
 
         uint64_t rid = 0;
         if (do_hello(cfd, &ws[n], &rid) != 0)        { close(cfd); continue; }
+
+        /* A cluster must be homogeneous: same OS family on every compute node
+         * (CLAUDE.md hard constraint #2). The first worker to join sets the
+         * family — deliberately NOT the coordinator's own OS, because the
+         * coordinator may run on a control machine that computes nothing.
+         *
+         * This is refused rather than warned because a mixed cluster has no
+         * oracle: the numeric gates compare token ids against a single-machine
+         * ds4 baseline, and CUDA (--use_fast_math) vs Metal differ slightly per
+         * layer, so greedy decoding eventually flips an argmax. See
+         * docs/macos-node.md §5. */
+        if (n > 0 && ws[n].os_family != ws[0].os_family) {
+            char why[256];
+            snprintf(why, sizeof(why),
+                     "cluster is %s; this node is %s. IdleToken does not support "
+                     "mixed-OS clusters — run all compute nodes on one OS.",
+                     idletoken_os_family_name(ws[0].os_family),
+                     idletoken_os_family_name(ws[n].os_family));
+            fprintf(stderr, "coord: refused %s (%s): %s\n",
+                    ws[n].hostname, ws[n].bind_addr, why);
+            send_hello_reject(cfd, rid, /*reasoncode=*/1, why);
+            close(cfd); continue;
+        }
+        fprintf(stderr, "coord: worker %d is %s (%s)\n", n,
+                idletoken_os_family_name(ws[n].os_family), ws[n].hostname);
+
         if (send_hello_ack(cfd, rid) != 0)           { close(cfd); continue; }
         if (recv_resource_report(cfd, &ws[n]) != 0)  { close(cfd); continue; }
 

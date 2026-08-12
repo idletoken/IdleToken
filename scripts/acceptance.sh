@@ -213,6 +213,26 @@ gate_local() {  # gate_local <name> <function>
     FRONTIER="$saved"
 }
 
+# Needs no cluster node, but IS a product invariant. Two differences from
+# gate_local: it runs regardless of the FRONTIER (an offline laptop must not be
+# able to hide it), and it DOES set one on failure — a violated hard constraint
+# may never be written off as "remaining red is platform-layer only" by the §8
+# exit contract. fail() only claims an empty FRONTIER, so an earlier product
+# failure still keeps its place at the head of the ladder.
+#
+# Register these BEFORE G_FINAL: after it, a failure here would set the FRONTIER
+# too late to stop `PASS G_FINAL` from exiting 0.
+gate_always() {  # gate_always <name> <function>
+    local name="$1" fn="$2"
+    if [ -n "$ONLY_GATE" ]; then
+        case "$name" in
+            "$ONLY_GATE"|"$ONLY_GATE"_*) "$fn" "$name" ;;
+        esac
+        return
+    fi
+    "$fn" "$name"
+}
+
 # =====================================================================
 # G0 — SSH mesh: control node can reach every cluster node
 # =====================================================================
@@ -1443,6 +1463,146 @@ print("ok "+t.strip()[:40])' 2>&1)
 }
 
 # =====================================================================
+# G_HOMO — a cluster is homogeneous. The coordinator must REFUSE a worker whose
+#      OS family differs from the first worker that joined (CLAUDE.md hard
+#      constraint #2, 2026-08-12) — a mixed cluster has no oracle, so letting
+#      one form manufactures a green nobody can falsify (docs/macos-node.md §5).
+#
+# Runs entirely on the control machine: one coordinator + stub workers on
+# loopback. The mixed case cannot be staged with real binaries on one box —
+# every build reports the OS it was compiled for — so the stub takes
+# IDLETOKEN_MOCK_OS_FAMILY. That forced byte is the ONLY thing the gate feeds
+# the coordinator; accept-vs-refuse is entirely the coordinator's decision.
+#
+# Both halves are checked. The refusal alone would also pass if the coordinator
+# rejected *everything*, so a same-OS worker must still form the cluster.
+# =====================================================================
+g_homo() {
+    local name="$1" port="${IDLETOKEN_HOMO_PORT:-14311}"
+    local repo; repo=$(cd "$(dirname "$0")/.." && pwd)
+    command -v cc  >/dev/null 2>&1 || { skip "$name" "no C compiler on the control machine"; return; }
+    command -v python3 >/dev/null 2>&1 || { skip "$name" "python3 needed for the stub worker"; return; }
+    (cd "$repo" && make coord >/dev/null 2>&1) || { fail "$name" "make coord failed on the control machine"; return; }
+
+    # This host's family, and any *other* legal one to claim.
+    local self other
+    case "$(uname -s)" in
+        Linux)                self=1 ;;
+        Darwin)               self=3 ;;
+        MINGW*|MSYS*|CYGWIN*) self=2 ;;
+        *)                    self=0 ;;
+    esac
+    other=2; [ "$self" = 2 ] && other=1
+
+    local tmp; tmp=$(mktemp -d)
+    local cpid="" m1="" m2="" m3=""
+    _homo_cleanup() {
+        for p in $m1 $m2 $m3 $cpid; do kill "$p" 2>/dev/null; done
+        wait $m1 $m2 $m3 $cpid 2>/dev/null
+        rm -rf "$tmp"
+    }
+    # Wait up to 10 s for a pid to exit; 1 if it is still alive (the stub blocks
+    # forever on recv once accepted, so "still alive" IS the failure signal).
+    _homo_wait() {
+        local p="$1" i=0
+        while kill -0 "$p" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+        kill -0 "$p" 2>/dev/null && return 1 || return 0
+    }
+
+    "$repo/idletoken-coord" --bind "127.0.0.1:$port" --num-workers 2 --n-predict 0 \
+        >"$tmp/coord.log" 2>&1 &
+    cpid=$!
+    sleep 1
+
+    # 1. native-OS worker joins first and sets the cluster's family
+    python3 "$repo/scripts/mock_worker.py" "127.0.0.1:$port" >"$tmp/m1.log" 2>&1 &
+    m1=$!
+    sleep 1
+    if ! grep -q "^coord: worker 0 is " "$tmp/coord.log"; then
+        fail "$name" "the first stub worker never joined (see $tmp/coord.log)"; _homo_cleanup; return
+    fi
+
+    # 2. a worker claiming another OS must be refused, and be TOLD why
+    IDLETOKEN_MOCK_OS_FAMILY="$other" python3 "$repo/scripts/mock_worker.py" \
+        "127.0.0.1:$port" >"$tmp/m2.log" 2>&1 &
+    m2=$!
+    # Two ways a broken check shows up: the stub blocks forever on recv (still
+    # alive), or it gets an ASSIGN_PLAN. Name both — "was accepted" is a far more
+    # useful red than "no refusal in the log".
+    if ! _homo_wait "$m2"; then
+        fail "$name" "a $other-family worker was ACCEPTED into a $self-family cluster (still connected)"
+        _homo_cleanup; return
+    fi
+    if grep -q "plan received" "$tmp/m2.log"; then
+        fail "$name" "a $other-family worker was ACCEPTED into a $self-family cluster (got ASSIGN_PLAN)"
+        _homo_cleanup; return
+    fi
+    if ! grep -q "mixed-OS clusters" "$tmp/coord.log"; then
+        fail "$name" "coordinator logged no mixed-OS refusal (see $tmp/coord.log)"; _homo_cleanup; return
+    fi
+    if ! grep -q "REFUSED: cluster is" "$tmp/m2.log"; then
+        fail "$name" "the refused worker got no reason, only a dead socket (see $tmp/m2.log)"
+        _homo_cleanup; return
+    fi
+    vlog "mixed-OS join refused, and the refusal reached the worker"
+
+    # 3. positive control: same-OS worker still forms the cluster
+    python3 "$repo/scripts/mock_worker.py" "127.0.0.1:$port" >"$tmp/m3.log" 2>&1 &
+    m3=$!
+    local i=0
+    while [ $i -lt 100 ] && ! grep -q "cluster ready" "$tmp/coord.log"; do sleep 0.1; i=$((i + 1)); done
+    if ! grep -q "cluster ready" "$tmp/coord.log"; then
+        fail "$name" "same-OS worker did not complete the cluster — the check refuses everything"
+        _homo_cleanup; return
+    fi
+    vlog "same-OS worker joined; cluster ready"
+
+    # 4. The REAL worker binary, refused by the REAL coordinator. Everything
+    #    above drove stubs; this is the only step that proves the shipped binary
+    #    tells its user why it did not join, in the form the client's supervisor
+    #    parses (JOIN_REFUSED marker + exit 2 => show the reason, do not retry;
+    #    contract in include/idletoken_resource.h).
+    #
+    #    Staged by having the stub claim the OTHER family FIRST, so this machine's
+    #    own worker becomes the odd one out. A machine that cannot pass its own
+    #    hardware floor prints the same marker from the earlier gate, which is
+    #    equally valid evidence -- that is why the assertion is on the marker, not
+    #    on which of the two refusals produced it.
+    _homo_cleanup
+    tmp=$(mktemp -d); cpid=""; m1=""; m2=""; m3=""
+    if [ ! -x "$repo/idletoken-worker" ]; then
+        (cd "$repo" && make worker >/dev/null 2>&1) || true
+    fi
+    if [ ! -x "$repo/idletoken-worker" ]; then
+        vlog "no idletoken-worker on this machine -- real-binary half not run"
+    else
+        "$repo/idletoken-coord" --bind "127.0.0.1:$port" --num-workers 2 --n-predict 0 \
+            >"$tmp/coord.log" 2>&1 &
+        cpid=$!
+        sleep 1
+        IDLETOKEN_MOCK_OS_FAMILY="$other" python3 "$repo/scripts/mock_worker.py" \
+            "127.0.0.1:$port" >"$tmp/m1.log" 2>&1 &
+        m1=$!
+        sleep 1
+        "$repo/idletoken-worker" --coordinator "127.0.0.1:$port" \
+            --bind "127.0.0.1:$((port + 90))" >"$tmp/real.log" 2>&1
+        local rc=$?
+        if ! grep -q "JOIN_REFUSED: " "$tmp/real.log"; then
+            fail "$name" "the real worker was refused but printed no JOIN_REFUSED marker — the client cannot show a reason (see $tmp/real.log)"
+            _homo_cleanup; return
+        fi
+        if [ "$rc" != 2 ]; then
+            fail "$name" "refused worker exited $rc, expected 2 (IDLETOKEN_EXIT_JOIN_REFUSED)"
+            _homo_cleanup; return
+        fi
+        vlog "real worker refused: $(grep -o 'JOIN_REFUSED: .*' "$tmp/real.log" | head -1)"
+    fi
+
+    _homo_cleanup
+    pass "$name"
+}
+
+# =====================================================================
 # G_FINAL — the whole product (acceptance-criteria §128 / §5 G-FINAL): the
 #      GUI-driven end-to-end flow works AND the API serves real dual-protocol
 #      DSv4 replies. Composite gate: it re-checks the ladder's own RECORDS
@@ -1708,6 +1868,9 @@ gate P3_pairing        p3_pairing
 gate P4_orchestration  p4_orchestration
 gate P5_settings       p5_settings
 gate P6_api_exposure   p6_api_exposure
+# Cluster homogeneity: a hard-constraint invariant that needs no cluster node.
+# gate_always, and before G_FINAL — see the helper's comment.
+gate_always G_HOMO     g_homo
 gate G_FINAL           g_final
 # Both of these run AFTER G_FINAL and are independent of it: G_PLAT is the
 # platform business layer (spec decision 11), G_DSPARK is an optional

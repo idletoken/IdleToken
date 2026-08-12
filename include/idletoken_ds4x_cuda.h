@@ -177,6 +177,31 @@ int ds4x_cuda_proj_fanout(const ds4x_cuda_wt *const *W, float *const *Y,
 void ds4x_cuda_proj_stats(double *ms_kernel, double *ms_total,
                           uint64_t *calls, uint64_t *rows);
 
+/* ---- fused layer tail ----------------------------------------------------
+ * The whole back half of a layer in one call:
+ *     h = x + Wo·attn_in ;  n = rmsnorm(h)·ffn_norm_w
+ *     x = h + Wd·(silu(Wg·n) ⊙ (Wu·n))
+ * `x` is [n_tokens][n_embd] in-out: the pre-attention residual going in, the
+ * finished layer output coming back. `attn_in` is [n_tokens][Wo->n_in] —
+ * concat(heads) for GQA, the gated recurrence output for a linear layer.
+ *
+ * Unfused this is two device calls with the residual and the norm on the host
+ * between them, so the hidden state makes a full round trip to have two
+ * elementwise operations done to it. On a discrete card that round trip is the
+ * entire `matmuls` bucket: 2856 calls per 118 decoded tokens, 55% of it not
+ * kernel time.
+ *
+ * Dense FFN only — a MoE layer routes each token to different experts, so there
+ * is no single (Wg,Wu,Wd) to fuse against. Returns 0, or -1 (caller falls back). */
+int ds4x_cuda_attn_ffn_tail(const ds4x_cuda_wt *Wo,
+                            const ds4x_cuda_wt *Wg, const ds4x_cuda_wt *Wu,
+                            const ds4x_cuda_wt *Wd,
+                            const float *attn_in, const float *ffn_norm_w,
+                            float *x, uint32_t n_tokens, float eps);
+
+void ds4x_cuda_tail_stats(double *ms_kernel, double *ms_total,
+                          uint64_t *calls, uint64_t *rows);
+
 /* ---- Gated DeltaNet recurrence (linear-attention layers) -----------------
  * The delta-rule recurrence is strictly sequential in t and, once the
  * projections moved to the GPU, became the dominant term of a linear layer
@@ -217,6 +242,68 @@ int ds4x_cuda_gdn_zero(ds4x_cuda_gdn *g);
  * silently: the state may have advanced). */
 int ds4x_cuda_gdn_run(ds4x_cuda_gdn *g, uint32_t n_tokens, const float *cnv,
                       const float *beta, const float *decay, float *core);
+
+/* Pass 2 + pass 3 in one call: causal conv + silu, the two gates, the per-head
+ * L2 norm, then the recurrence — with the intermediate never leaving VRAM.
+ *   raw   : [n_tokens][conv_ch]  the qkv projection output, PRE-conv
+ *   win   : [K-1][conv_ch]       carried rows from the previous chunk
+ *   cw,cb : conv1d weight [conv_ch][K] and optional bias [conv_ch] (cb may be NULL)
+ *   bb,ab : [n_tokens][v_heads]  the b and a projection outputs, PRE-gate
+ *   A_log, dt_bias : [v_heads]
+ *   core  : [n_tokens][v_heads*v_dim] output
+ *
+ * Unfused, pass 2 sat on the CPU between two device calls, so every linear
+ * layer paid a host round trip per token for arithmetic that is per-token
+ * independent. cw/cb/A_log/dt_bias are uploaded on the FIRST call and kept —
+ * one handle per layer means they are constant, and conv1d_w alone would
+ * otherwise be ~210 MB of transfer per 118 decoded tokens.
+ *
+ * gdn_attn_cpu's pass-2 loop stays the reference. Returns 0, or -1 (the state
+ * may have advanced — treat the layer as failed, do not silently fall back). */
+int ds4x_cuda_gdn_pre_run(ds4x_cuda_gdn *g, uint32_t n_tokens,
+                          const float *raw, const float *win,
+                          const float *cw, const float *cb,
+                          const float *bb, const float *ab,
+                          const float *A_log, const float *dt_bias,
+                          uint32_t conv_ch, uint32_t K, float *core);
+
+/* A whole linear layer's attention in one call: the four input projections,
+ * conv/silu, gates, L2 norm, and the recurrence — with the projection outputs
+ * consumed where they are produced.
+ *
+ * This removes the last host round trip inside a linear layer: proj_fanout
+ * wrote qkv/z/b/a into one device arena and gdn_pre_run downloaded three of
+ * those slices only to upload them again.
+ *
+ * Only `raw`, `z` and `core` come back, because pass 4 (the gated RMSNorm) and
+ * the conv-window carry are still host code; b and a are consumed on the device
+ * and never return. n_tokens must fit the device staging block — a wider
+ * prefill chunk returns -1 and the caller uses the two-call path. */
+/* Optional continuation for ds4x_cuda_gdn_layer: pass 4 (the gated RMSNorm)
+ * and the layer tail, run on the `core` the recurrence just produced so it
+ * never comes back to the host at all.
+ *
+ * With this, a linear layer is ONE device call end to end: normed + residual
+ * in, finished layer output out. Only `raw` still returns, for the conv window
+ * carry. NULL keeps the previous behaviour (core and z come back and the caller
+ * does pass 4 and the tail itself). */
+typedef struct {
+    const ds4x_cuda_wt *Wo, *Wg, *Wu, *Wd;
+    const float *ffn_norm_w;   /* [n_embd] */
+    const float *ssm_norm;     /* [v_dim], shared across v-heads */
+    float       *x;            /* [n_tokens][n_embd] in: residual, out: output */
+    float        eps;
+} ds4x_gdn_tail;
+
+int ds4x_cuda_gdn_layer(ds4x_cuda_gdn *g,
+                        const ds4x_cuda_wt *Wqkv, const ds4x_cuda_wt *Wz,
+                        const ds4x_cuda_wt *Wb, const ds4x_cuda_wt *Wa,
+                        const float *normed, const float *win,
+                        const float *cw, const float *cb,
+                        const float *A_log, const float *dt_bias,
+                        uint32_t n_tokens, uint32_t conv_ch, uint32_t K,
+                        float *raw_out, float *z_out, float *core_out,
+                        const ds4x_gdn_tail *tail);
 
 /* Copy the state to/from host memory (tests, debugging, future migration). */
 int ds4x_cuda_gdn_get_state(const ds4x_cuda_gdn *g, float *state);

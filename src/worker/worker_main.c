@@ -869,8 +869,8 @@ int main(int argc, char **argv) {
         char why[256] = "";
         idletoken_hw_status hw = idletoken_hw_check(&rr, why, sizeof(why));
         if (hw != IDLETOKEN_HW_OK) {
-            fprintf(stderr, "idletoken-worker: refusing to join — %s\n", why);
-            return 2;
+            fprintf(stderr, "idletoken-worker: " IDLETOKEN_JOIN_REFUSED_MARK "%s\n", why);
+            return IDLETOKEN_EXIT_JOIN_REFUSED;
         }
     }
 
@@ -924,7 +924,11 @@ int main(int argc, char **argv) {
     idletoken_buf_put_str(&b, rr.hostname);
     idletoken_buf_put_str(&b, IDLETOKEN_WORKER_VERSION);
     idletoken_buf_put_str(&b, bind_addr);
-    idletoken_buf_put_u8(&b, 1);  /* os_family Linux */
+    /* Real OS family, not a hardcoded 1 — the coordinator refuses a cluster
+     * that mixes OS families (CLAUDE.md hard constraint #2). Until 2026-08-12
+     * this was a literal 1 (Linux) on every platform, so the Windows and macOS
+     * builds lied and the check could not exist. */
+    idletoken_buf_put_u8(&b, (uint8_t)IDLETOKEN_OS_FAMILY_SELF);
     uint8_t pad3[3] = {0};
     if (idletoken_buf_put_bytes(&b, pad3, 3) != 0 || b.err) {
         fprintf(stderr, "idletoken-worker: HELLO payload pack overflow\n");
@@ -958,6 +962,31 @@ int main(int argc, char **argv) {
         fprintf(stderr, "idletoken-worker: expected HELLO_ACK, got msg_type=0x%04x\n",
                 (unsigned)ack.msg_type);
         close(fd); return 1;
+    }
+    /* An empty payload means "accepted" (that is all a coordinator sent before
+     * 2026-08-12). A payload carries the docs/wire-protocol.md ACK layout; the
+     * only field we act on is `accepted`, so a refusal says why instead of
+     * showing up as a dead socket three messages later. */
+    if (ack.payload_bytes > 0) {
+        idletoken_buf ab;
+        idletoken_buf_init(&ab, ack_payload, ack.payload_bytes);
+        uint8_t accepted = 1, reasoncode = 0, ack_pad[2];
+        idletoken_buf_get_u8(&ab, &accepted);
+        idletoken_buf_get_u8(&ab, &reasoncode);
+        idletoken_buf_get_bytes(&ab, ack_pad, 2);
+        if (!ab.err && !accepted) {
+            uint16_t cver = 0, rsvd = 0; uint32_t hb = 0;
+            char coord_ver[128] = "", reject[256] = "";
+            idletoken_buf_get_u16(&ab, &cver);
+            idletoken_buf_get_u16(&ab, &rsvd);
+            idletoken_buf_get_u32(&ab, &hb);
+            idletoken_buf_get_str(&ab, coord_ver, sizeof(coord_ver));
+            idletoken_buf_get_str(&ab, reject, sizeof(reject));
+            fprintf(stderr, "idletoken-worker: " IDLETOKEN_JOIN_REFUSED_MARK
+                            "the coordinator refused this node%s%s\n",
+                    reject[0] ? ": " : " (no reason given)", reject);
+            close(fd); return IDLETOKEN_EXIT_JOIN_REFUSED;
+        }
     }
     fprintf(stderr, "idletoken-worker: got HELLO_ACK (request_id=0x%016llx)\n",
             (unsigned long long)ack.request_id);

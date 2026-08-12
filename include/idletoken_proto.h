@@ -86,6 +86,44 @@
 #define IDLETOKEN_PAIR_TAG_BYTES 16
 #define IDLETOKEN_SESSION_KEY_BYTES 32
 
+/* OS family, as reported by the worker in HELLO.
+ *
+ * A cluster MUST be homogeneous: every compute node runs the same OS family.
+ * The coordinator enforces this at handshake (see coord_main.c), because a
+ * mixed cluster has no oracle — the numeric gates compare token ids against a
+ * single-machine ds4 baseline, and CUDA (--use_fast_math) vs Metal differ
+ * slightly per layer, so greedy decoding eventually flips an argmax. A mixed
+ * cluster that "works" would be a green we cannot falsify. See CLAUDE.md
+ * hard constraint #2 and docs/macos-node.md §5. */
+typedef enum {
+    IDLETOKEN_OS_UNKNOWN = 0,
+    IDLETOKEN_OS_LINUX   = 1,
+    IDLETOKEN_OS_WINDOWS = 2,
+    IDLETOKEN_OS_MACOS   = 3
+} idletoken_os_family;
+
+/* This build's OS family — what a worker puts on the wire. Compile-time, not
+ * probed: the binary cannot run on an OS it was not built for. */
+#if defined(_WIN32)
+#  define IDLETOKEN_OS_FAMILY_SELF IDLETOKEN_OS_WINDOWS
+#elif defined(__APPLE__)
+#  define IDLETOKEN_OS_FAMILY_SELF IDLETOKEN_OS_MACOS
+#elif defined(__linux__)
+#  define IDLETOKEN_OS_FAMILY_SELF IDLETOKEN_OS_LINUX
+#else
+#  define IDLETOKEN_OS_FAMILY_SELF IDLETOKEN_OS_UNKNOWN
+#endif
+
+/* Human-readable name for log lines and reject messages. Never NULL. */
+static inline const char *idletoken_os_family_name(unsigned f) {
+    switch (f) {
+        case IDLETOKEN_OS_LINUX:   return "Linux";
+        case IDLETOKEN_OS_WINDOWS: return "Windows";
+        case IDLETOKEN_OS_MACOS:   return "macOS";
+        default:                   return "unknown";
+    }
+}
+
 typedef struct {
     uint32_t magic;          /* must be IDLETOKEN_PROTO_MAGIC */
     uint16_t version;        /* must be IDLETOKEN_PROTO_VERSION */

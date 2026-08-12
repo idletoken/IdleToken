@@ -371,9 +371,19 @@ void ds4x_gdn_recur_cpu(uint32_t n_tokens, uint32_t kh, uint32_t vh,
     free(owned);
 }
 
+/* `core_out` non-NULL: write the gated-normed recurrence output ([n_tokens][vd])
+ * there and DO NOT apply out_proj — the caller will fold that projection into
+ * the fused layer tail, so the hidden state does not travel to the host just to
+ * be projected and added. NULL keeps the original behaviour (out_proj into
+ * attn_out). */
+/* `resid_x` non-NULL AND the FFN weights resident: the device call also runs
+ * pass 4 and the whole layer tail, writing the finished layer output straight
+ * into resid_x. *tail_done is then 1 and the caller must do nothing further for
+ * this layer — no residual add, no FFN. NULL keeps the old split. */
 static int gdn_attn_cpu(const ds4x_config *cfg, const ds4x_layer_weights *w,
                         const float *normed, uint32_t n_tokens,
-                        ds4x_kv_cache *cache, float *attn_out) {
+                        ds4x_kv_cache *cache, float *attn_out, float *core_out,
+                        float *resid_x, uint32_t n_ff, int *tail_done) {
     const uint32_t n_embd = cfg->n_embd;
     const uint32_t kh = cfg->lin_k_heads, vh = cfg->lin_v_heads;
     const uint32_t kdim = cfg->lin_k_dim, vdim = cfg->lin_v_dim;
@@ -417,9 +427,56 @@ static int gdn_attn_cpu(const ds4x_config *cfg, const ds4x_layer_weights *w,
     const double t0 = prof ? now_s() : 0.0;
     /* All four read the same `normed`, so fused they cost one upload and one
      * download instead of four of each. */
-    int projected = 0;
+    int projected = 0, layer_fused = 0;
 #ifdef IDLETOKEN_DS4X_CUDA
+    /* Whole-layer attempt first: projections + conv/gates/L2 + recurrence in ONE
+     * call, so the projection outputs are consumed where they are produced
+     * instead of being downloaded and immediately re-uploaded. Falls through to
+     * the two-call path (fanout, then pre_run) on any mismatch — including a
+     * prefill chunk wider than the device staging block. */
     {
+        const ds4x_wt s4[4] = { w->in_proj_qkv, w->in_proj_z, w->in_proj_b, w->in_proj_a };
+        const ds4x_cuda_wt *d4[4];
+        /* gdn_dump_on() rather than the `dump` local, which is not declared
+         * until after the projections — same exclusion, available earlier. */
+        int ok = ds4x_fuse_wanted() && cache->dev_state && !gdn_check_on() &&
+                 !gdn_dump_on() && w->conv1d_w && w->A_log && w->dt_bias;
+        for (int i = 0; i < 4 && ok; i++) {
+            if (!s4[i].dev || s4[i].dev_elem_off) ok = 0;
+            else d4[i] = (const ds4x_cuda_wt *)s4[i].dev;
+        }
+        /* Whole layer including pass 4 and the tail, when the caller offered a
+         * residual and every FFN weight is resident. Then `core` never leaves
+         * VRAM and the layer costs ONE device call. */
+        ds4x_gdn_tail tl;
+        const ds4x_gdn_tail *tlp = NULL;
+        if (ok && resid_x && tail_done && w->ssm_norm && w->ffn_norm &&
+            w->out_proj.dev && !w->out_proj.dev_elem_off &&
+            w->gate.dev && w->up.dev && w->down.dev &&
+            !w->gate.dev_elem_off && !w->up.dev_elem_off && !w->down.dev_elem_off) {
+            tl.Wo = (const ds4x_cuda_wt *)w->out_proj.dev;
+            tl.Wg = (const ds4x_cuda_wt *)w->gate.dev;
+            tl.Wu = (const ds4x_cuda_wt *)w->up.dev;
+            tl.Wd = (const ds4x_cuda_wt *)w->down.dev;
+            tl.ffn_norm_w = w->ffn_norm;
+            tl.ssm_norm   = w->ssm_norm;
+            tl.x          = resid_x;
+            tl.eps        = DS4X_EPS;
+            tlp = &tl;
+            (void)n_ff;
+        }
+        if (ok && ds4x_cuda_gdn_layer((ds4x_cuda_gdn *)cache->dev_state,
+                                      d4[0], d4[1], d4[2], d4[3],
+                                      normed, cache->conv_win,
+                                      w->conv1d_w, w->conv1d_b,
+                                      w->A_log, w->dt_bias,
+                                      n_tokens, conv_ch, K,
+                                      raw, zbuf, core, tlp) == 0) {
+            projected = 1; layer_fused = 1;
+            if (tlp && tail_done) *tail_done = 1;
+        }
+    }
+    if (!projected) {
         const ds4x_wt src[4] = { w->in_proj_qkv, w->in_proj_z, w->in_proj_b, w->in_proj_a };
         float *dst[4] = { raw, zbuf, bbuf, abuf };
         const ds4x_cuda_wt *dw[4];
@@ -446,11 +503,40 @@ static int gdn_attn_cpu(const ds4x_config *cfg, const ds4x_layer_weights *w,
     if (prof) g_t_proj += now_s() - t0;
     const double t1 = prof ? now_s() : 0.0;
 
+    /* ---- pass 2 + 3 fused on the device ----
+     * When the layer has a device-resident state, conv/gates/L2-norm and the
+     * recurrence run as ONE call with the intermediate staying in VRAM. Pass 2
+     * is per-token-independent and trivially parallel, so leaving it on the
+     * host cost a round trip per linear layer per token for arithmetic that was
+     * never the expensive part. The CPU passes below stay the reference and
+     * still run when there is no device state (or under GDN_CHECK). */
+    int pre_fused = layer_fused;   /* the whole-layer call already did pass 2+3 */
+#ifdef IDLETOKEN_DS4X_CUDA
+    /* !dump: the per-tensor dumps below live inside the host pass-2 loop, so
+     * fusing would silently shorten a debug run's output. GDN_CHECK is excluded
+     * for the same reason it excludes the GPU recurrence — the check needs both
+     * paths to run from their own state. */
+    if (!pre_fused &&
+        ds4x_fuse_wanted() && cache->dev_state && !gdn_check_on() && !dump &&
+        w->conv1d_w && w->A_log && w->dt_bias &&
+        ds4x_cuda_gdn_pre_run((ds4x_cuda_gdn *)cache->dev_state, n_tokens,
+                              raw, cache->conv_win, w->conv1d_w, w->conv1d_b,
+                              bbuf, abuf, w->A_log, w->dt_bias,
+                              conv_ch, K, core) == 0)
+        pre_fused = 1;
+#endif
+    /* Attribute the fused call to the RECURRENCE bucket, not conv+gates. It is
+     * one device call and cannot be split, so whichever bucket gets it is a
+     * simplification — but putting it in conv left `recurrence 0.000s` in the
+     * breakdown, which reads as "the recurrence did not run". Name it after the
+     * dominant pass and say so in the label. */
+    if (prof && pre_fused) { g_t_rec += now_s() - t1; }
+
     /* ---- pass 2: causal conv + gates + L2 norm, for every token ----
      * All of this is per-token-independent given `raw`, so it runs over the
      * whole chunk before the (strictly sequential) recurrence. That split is
      * what lets the recurrence — and only the recurrence — move to the GPU. */
-    for (uint32_t t = 0; t < n_tokens; t++) {
+    for (uint32_t t = 0; !pre_fused && t < n_tokens; t++) {
         float *conv = cnv + (size_t)t * conv_ch;
         /* causal depthwise conv: tap j reads chunk-relative position
          * t-(K-1-j); anything before the chunk comes from the carried window
@@ -497,14 +583,18 @@ static int gdn_attn_cpu(const ds4x_config *cfg, const ds4x_layer_weights *w,
             for (uint32_t i = 0; i < kdim; i++) { qh[i] *= qn; kp[i] *= kn; }
         }
     }
-    if (prof) g_t_conv += now_s() - t1;
+    /* !pre_fused: the fused path already charged this span to g_t_rec above.
+     * Without the guard both buckets get the same duration and the breakdown
+     * silently double-counts it (spotted as conv and recurrence reporting
+     * identical times). */
+    if (prof && !pre_fused) g_t_conv += now_s() - t1;
 
     /* ---- pass 3: the delta-rule recurrence (GPU when the layer has a
      * device-resident state, else CPU — the CPU stays the reference) ---- */
     const double t2 = prof ? now_s() : 0.0;
-    int on_gpu = 0;
+    int on_gpu = pre_fused;   /* the fused call already advanced the state */
 #ifdef IDLETOKEN_DS4X_CUDA
-    if (cache->dev_state &&
+    if (!pre_fused && cache->dev_state &&
         ds4x_cuda_gdn_run((ds4x_cuda_gdn *)cache->dev_state, n_tokens,
                           cnv, bet, dec, core) == 0)
         on_gpu = 1;
@@ -527,7 +617,8 @@ static int gdn_attn_cpu(const ds4x_config *cfg, const ds4x_layer_weights *w,
 
     /* ---- pass 4: gated RMSNorm + out_proj, token by token ---- */
     const double t3 = prof ? now_s() : 0.0;
-    for (uint32_t t = 0; t < n_tokens; t++) {
+    const int p4_on_device = (tail_done && *tail_done);
+    for (uint32_t t = 0; !p4_on_device && t < n_tokens; t++) {
         float *ct = core + (size_t)t * vd;
         if (dump && t == 0) gdn_sum("attn_output(core)", ct, vd);
         /* Gated RMSNorm — PER HEAD over v_head_dim. The real GGUF's
@@ -545,8 +636,18 @@ static int gdn_attn_cpu(const ds4x_config *cfg, const ds4x_layer_weights *w,
         }
         if (dump && t == 0) gdn_sum("final_output", ct, vd);
     }
-    matmul_q(w->out_proj, core, attn_out, n_tokens, n_embd, vd, rowbuf);
-    if (dump) gdn_sum("linear_attn_out", attn_out, n_embd);
+    if (p4_on_device) {
+        /* nothing: the device produced the finished layer output. The conv
+         * window carry below still runs — it needs `raw`, which came back. */
+    } else if (core_out) {
+        /* Hand `core` back unprojected; the caller folds out_proj into the fused
+         * layer tail. Everything above this line is identical either way, so
+         * the two paths cannot diverge numerically before this point. */
+        memcpy(core_out, core, (size_t)n_tokens * vd * sizeof(float));
+    } else {
+        matmul_q(w->out_proj, core, attn_out, n_tokens, n_embd, vd, rowbuf);
+        if (dump) gdn_sum("linear_attn_out", attn_out, n_embd);
+    }
     if (prof) g_t_post += now_s() - t3;
 
     /* ---- carry the last K-1 raw rows for the next chunk ---- */
@@ -625,6 +726,32 @@ int ds4x_layer_forward_cpu(const ds4x_config *cfg, uint32_t il,
     const uint8_t lt = (il < DS4X_MAX_LAYERS && cfg->layer_types[il])
                        ? cfg->layer_types[il] : cfg->attn_kind;
 
+    /* ---- fused layer tail (attention output projection + residual + ffn
+     * norm + SwiGLU + residual, all on the device) ------------------------
+     * When it is on, the attention block does NOT apply its output projection
+     * or its residual; it leaves `pend_in` holding the projection's input and
+     * the tail below does everything from there in one device call. That
+     * removes the layer's remaining host round trip — the hidden state used to
+     * come back purely so the host could add a residual and take a norm.
+     *
+     * All-or-nothing on purpose: pend_* is set only when every condition for
+     * the tail holds, so the FFN below can consume it unconditionally and there
+     * is no half-fused state to reason about. */
+    const float *pend_in = NULL;    /* [n_tokens][pend_dim] */
+    float *pend_buf = NULL;         /* owned by us when non-NULL */
+#ifdef IDLETOKEN_DS4X_CUDA
+    const ds4x_wt *pend_wo = (lt == DS4X_ATTN_LINEAR) ? &w->out_proj : &w->attn_out;
+    const int tail_ok =
+        ds4x_fuse_wanted() && is_dense && n_tokens >= 1 &&
+        (lt == DS4X_ATTN_LINEAR || lt == DS4X_ATTN_GQA) &&
+        pend_wo->dev && !pend_wo->dev_elem_off &&
+        w->gate.dev && w->up.dev && w->down.dev &&
+        !w->gate.dev_elem_off && !w->up.dev_elem_off && !w->down.dev_elem_off &&
+        w->ffn_norm != NULL;
+#else
+    const int tail_ok = 0;
+#endif
+
   if (lt == DS4X_ATTN_LINEAR) {
     /* Gated DeltaNet: norm → GDN → residual. Uses its own scratch. */
     float *normed = (float *)malloc((size_t)n_tokens * n_embd * sizeof(float));
@@ -641,15 +768,35 @@ int ds4x_layer_forward_cpu(const ds4x_config *cfg, uint32_t il,
     if (il == 0) g_dump_layer = w;
     if (gdn_dump_on()) { char t[32]; snprintf(t, sizeof t, "l_in-%u", il);
                          gdn_sum(t, x, cfg->n_embd); }
-    const int rc = gdn_attn_cpu(cfg, w, normed, n_tokens, cache, aout);
-    if (rc == 0)
+    /* With the fused tail on, take `core` (width vd) instead of the projected
+     * output, and leave the residual to the tail. */
+    const uint32_t vd_lin = cfg->lin_v_heads * cfg->lin_v_dim;
+    float *core_buf = NULL;
+    if (tail_ok) {
+        core_buf = (float *)malloc((size_t)n_tokens * vd_lin * sizeof(float));
+        if (!core_buf) { free(normed); free(aout); free(scr);
+                         return fwd_fail("oom: linear-layer core buffer"); }
+    }
+    /* Offer the residual: if every FFN weight is resident the device runs pass 4
+     * and the tail too, and the layer is finished in one call. */
+    int gdn_tail_done = 0;
+    const int rc = gdn_attn_cpu(cfg, w, normed, n_tokens, cache, aout, core_buf,
+                                tail_ok ? out : NULL, cfg->n_ff_dense,
+                                tail_ok ? &gdn_tail_done : NULL);
+    if (gdn_tail_done) {
+        /* Whole layer already written into `out`. Nothing pending, no FFN. */
+        free(normed); free(aout); free(core_buf); free(scr);
+        return 0;
+    }
+    if (rc == 0 && !core_buf)
         for (uint32_t t = 0; t < n_tokens; t++) {
             float *xt = out + (size_t)t * n_embd;
             const float *at = aout + (size_t)t * n_embd;
             for (uint32_t i = 0; i < n_embd; i++) xt[i] += at[i];
         }
     free(normed); free(aout);
-    if (rc != 0) { free(scr); return -1; }   /* reason already recorded */
+    if (rc != 0) { free(core_buf); free(scr); return -1; }  /* reason already recorded */
+    if (core_buf) { pend_buf = core_buf; pend_in = core_buf; }
   } else if (lt == DS4X_ATTN_GQA) {
     /* ---- standard GQA attention (qwen3/llama): full K/V cache, optional
      * per-head Q/K RMSNorm (Qwen3), neox rope on the whole head_dim, KV heads
@@ -765,6 +912,13 @@ int ds4x_layer_forward_cpu(const ds4x_config *cfg, uint32_t il,
                     o_h[i] *= 1.0f / (1.0f + expf(-g_h[i]));
             }
     }
+    if (tail_ok) {
+        /* Hand concat(heads) to the fused tail, which applies attn_out and both
+         * residuals on the device. ho_all survives past this block, so it is
+         * handed over rather than freed here. */
+        pend_buf = ho_all; pend_in = ho_all;
+        free(nrm_all); free(q_all);
+    } else {
     /* One output projection for the whole chunk, into nrm_all (done with it). */
     matmul_q(w->attn_out, ho_all, nrm_all, n_tokens, n_embd,
              cfg->n_head * hdim, rowbuf);
@@ -774,6 +928,7 @@ int ds4x_layer_forward_cpu(const ds4x_config *cfg, uint32_t il,
         for (uint32_t i = 0; i < n_embd; i++) xt[i] += at[i];
     }
     free(nrm_all); free(q_all); free(ho_all);
+    }
   } else {
     /* ---- attention sublayer (sequential tokens, causal over the cache) -- */
     for (uint32_t t = 0; t < n_tokens; t++) {
@@ -843,6 +998,24 @@ int ds4x_layer_forward_cpu(const ds4x_config *cfg, uint32_t il,
   }
 
     /* ---- FFN sublayer (dense lead or MoE) ------------------------------- */
+#ifdef IDLETOKEN_DS4X_CUDA
+    if (pend_in) {
+        /* The whole back half of the layer in one device call: attention output
+         * projection, residual, ffn norm, SwiGLU, residual. `out` goes in as the
+         * pre-attention residual and comes back as the finished layer output. */
+        const int trc = ds4x_cuda_attn_ffn_tail(
+            (const ds4x_cuda_wt *)pend_wo->dev,
+            (const ds4x_cuda_wt *)w->gate.dev,
+            (const ds4x_cuda_wt *)w->up.dev,
+            (const ds4x_cuda_wt *)w->down.dev,
+            pend_in, w->ffn_norm, out, n_tokens, DS4X_EPS);
+        free(pend_buf);
+        free(scr);
+        if (trc != 0)
+            return fwd_fail("fused layer tail failed: %s", ds4x_cuda_last_error());
+        return 0;
+    }
+#endif
     if (is_dense && n_tokens > 1) {
         /* Whole chunk at once. This is the single biggest matvec consumer in a
          * dense model (3 of the ~8 projections per layer, and the widest), so

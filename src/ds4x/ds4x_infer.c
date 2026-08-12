@@ -207,11 +207,16 @@ int main(int argc, char **argv) {
         double pj = 0, cv = 0, rc = 0, po = 0;
         ds4x_prof_report(&pj, &cv, &rc, &po);
         const double tot = pj + cv + rc + po;
+        /* When conv+gates is fused into the recurrence call (the normal GPU
+         * path) it cannot be split out, so its time lands in `recurrence` and
+         * conv+gates reads 0. Say that in the label rather than leaving a
+         * breakdown that looks like the conv never ran. */
         fprintf(stderr, "ds4x prof (linear path %.3fs): projections %.3fs (%.1f%%), "
-                        "conv+gates %.3fs (%.1f%%), recurrence %.3fs (%.1f%%), "
+                        "conv+gates %.3fs (%.1f%%), recurrence%s %.3fs (%.1f%%), "
                         "norm+out_proj %.3fs (%.1f%%)\n",
                 tot, pj, tot > 0 ? 100.0 * pj / tot : 0.0,
                 cv, tot > 0 ? 100.0 * cv / tot : 0.0,
+                (cv == 0.0 && rc > 0.0) ? "(+conv,fused)" : "",
                 rc, tot > 0 ? 100.0 * rc / tot : 0.0,
                 po, tot > 0 ? 100.0 * po / tot : 0.0);
     }
@@ -258,6 +263,17 @@ int main(int argc, char **argv) {
         if (nc > 0)
             fprintf(stderr,
                     "ds4x cuda: %llu ffns (%llu token-rows)  kernel %.0f ms "
+                    "(%.3f ms/call)  total %.0f ms  overhead %.0f%%\n",
+                    (unsigned long long)nc, (unsigned long long)nrows, kms,
+                    kms / (double)nc, tms, tms > 0 ? 100.0 * (tms - kms) / tms : 0.0);
+        /* Must be printed: the fused tail ABSORBS the matmul and ffn buckets, so
+         * without this line the profile silently loses their time and the total
+         * looks like it halved. A breakdown that hides a bucket is worse than
+         * none. */
+        ds4x_cuda_tail_stats(&kms, &tms, &nc, &nrows);
+        if (nc > 0)
+            fprintf(stderr,
+                    "ds4x cuda: %llu tails (%llu token-rows)  kernel %.0f ms "
                     "(%.3f ms/call)  total %.0f ms  overhead %.0f%%\n",
                     (unsigned long long)nc, (unsigned long long)nrows, kms,
                     kms / (double)nc, tms, tms > 0 ? 100.0 * (tms - kms) / tms : 0.0);

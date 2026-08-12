@@ -152,6 +152,27 @@ typedef enum {
                                    * present, unified memory is not) */
 } idletoken_hw_status;
 
+/* --- "this machine will not join, and retrying will not help" contract -----
+ *
+ * Two refusals are deterministic: the hardware floor (idletoken_hw_check) and the
+ * coordinator turning this node away at HELLO (wrong OS family, say). Both are
+ * decisions, not crashes — restarting the worker just repeats them.
+ *
+ * The worker therefore exits with IDLETOKEN_EXIT_JOIN_REFUSED and prints ONE
+ * line carrying the reason:
+ *
+ *     idletoken-worker: JOIN_REFUSED: <one-line reason>
+ *
+ * The client's sidecar supervisor (client/src-tauri/src/engine.rs) scans stderr
+ * for that marker, shows the reason in the UI, and does NOT restart. Without it
+ * a refused machine burned five backoff restarts and ended as "crashed" with the
+ * reason buried in a log ring buffer nobody opens.
+ *
+ * Change the marker here and in engine.rs together; the gate that covers this
+ * is G_HOMO (see scripts/acceptance.sh). */
+#define IDLETOKEN_JOIN_REFUSED_MARK "JOIN_REFUSED: "
+#define IDLETOKEN_EXIT_JOIN_REFUSED 2
+
 /* Verdict on whether this machine can serve layers at all. Writes a one-line
  * explanation into `reason` (what is wrong AND what is required) — the product
  * promise is "say what you need", not "fail mysteriously later". Callers must

@@ -15,6 +15,7 @@ const STOPPED_STATUS: EngineStatus = {
   startedAt: null,
   restarts: 0,
   lastExitCode: null,
+  refusedReason: null,
   source: "dev-fixture",
 };
 

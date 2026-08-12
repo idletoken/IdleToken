@@ -4,7 +4,7 @@ import { getResourceProvider } from "./provider";
 import { getEngineProvider, type EngineLogLine, type EngineRole, type EngineStatus } from "./provider/engine";
 import { uiTestDirectives } from "./testHooks";
 import type { NodeSnapshot, ClusterState } from "./types";
-import { HW_NO_GPU, HW_CC_TOO_LOW, HW_DRIVER_TOO_OLD, HW_VRAM_TOO_SMALL } from "./types";
+import { HW_NO_GPU, HW_CC_TOO_LOW, HW_DRIVER_TOO_OLD, HW_VRAM_TOO_SMALL, HW_GPU_UNSUPPORTED } from "./types";
 import { getModel, getManifest, defaultQuant, estimateClusterCapacity, pickBestFittingModel, type ModelSpec } from "./models";
 import { resolveLocalWeights, fetchWeights, onFetchProgress, defaultModelDir, cancelFetch, resolveDownload, weightsState } from "./weights";
 import { loadSettings, saveSettings, settingsWerePersisted, effectiveCaps, engineTuning, autoUiScale, TIERS, type AppSettings } from "./settings";
@@ -199,6 +199,7 @@ function NodeCapacityCard(props: {
     : s.hw_status === HW_CC_TOO_LOW ? t("node.hw.ccLow")
     : s.hw_status === HW_DRIVER_TOO_OLD ? t("node.hw.driverOld")
     : s.hw_status === HW_VRAM_TOO_SMALL ? t("node.hw.vramSmall")
+    : s.hw_status === HW_GPU_UNSUPPORTED ? t("node.hw.gpuUnsupported")
     : "";
   return (
     <section className="card node-card">
@@ -354,7 +355,15 @@ function EngineCard() {
             {st.restarts > 0 ? <> · {t("engine.restarts", { n: st.restarts })}</> : null}
           </div>
         ) : null}
-        {st?.state === "crashed" ? (
+        {/* A refusal is not a crash: the engine decided this machine will not
+            join, and the supervisor did not retry. Showing the crash hint here
+            ("kept crashing, exit code 2") would describe the wrong problem and
+            hide the one sentence that says what to change. */}
+        {st?.refusedReason ? (
+          <div className="engine-meta engine-meta--bad">
+            <strong>{t("engine.refused")}</strong> {st.refusedReason}
+          </div>
+        ) : st?.state === "crashed" ? (
           <div className="engine-meta engine-meta--bad">
             {t("engine.crashedHint", { code: st.lastExitCode ?? "?" })}
           </div>

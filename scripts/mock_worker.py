@@ -18,6 +18,8 @@ The authority for the protocol layout is the send/receive code in
 src/coord/coord_main.c; the ASSIGN_PLAN section of docs/wire-protocol.md lags the
 v2 code, so the code is the source of truth.
 """
+import os
+import platform   # os_family in HELLO; without it the mock NameErrors at connect
 import socket
 import struct
 import sys
@@ -97,11 +99,27 @@ def main() -> None:
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
     # HELLO: uuid[16] + hostname + version + bind_addr + os_family + pad3
+    # os_family must be this host's, not a hardcoded Linux: the coordinator
+    # refuses a cluster that mixes OS families, and a mock is routinely run
+    # alongside a real worker on the same machine.
+    # IDLETOKEN_MOCK_OS_FAMILY forces a value: that is how G_HOMO stages a
+    # mixed-OS join on one machine, where every real process reports the same OS.
+    os_family = int(os.environ.get("IDLETOKEN_MOCK_OS_FAMILY") or
+                    {"Linux": 1, "Windows": 2, "Darwin": 3}.get(platform.system(), 0))
     hello = uuid.uuid4().bytes + pstr("mock-worker-py") + pstr("idletoken-mock-worker py1") \
-        + pstr("127.0.0.1:19999") + struct.pack("<B3x", 1)
+        + pstr("127.0.0.1:19999") + struct.pack("<B3x", os_family)
     send_msg(sock, MSG_HELLO, hello, request_id=1)
-    t, _, _ = recv_msg(sock)
+    t, _, ack = recv_msg(sock)
     assert t == MSG_HELLO_ACK, f"expected HELLO_ACK got {t:#x}"
+    # Empty payload = accepted (all a coordinator sent before 2026-08-12).
+    if ack and ack[0] == 0:
+        # accepted(u8) reasoncode(u8) rsvd[2] proto(u16) rsvd(u16) hb(u32)
+        # then str coord_version, str reject_message.
+        off = 12
+        (n,) = struct.unpack_from("<I", ack, off); off += 4 + n      # coord_version
+        (n,) = struct.unpack_from("<I", ack, off); off += 4
+        print("mock-worker: REFUSED: " + ack[off:off + n].decode(), flush=True)
+        sys.exit(3)
 
     # RESOURCE_REPORT: report a fake machine large enough for the plan and mode
     # decision to pass (GPU_ONLY).
