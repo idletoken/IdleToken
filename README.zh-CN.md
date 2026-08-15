@@ -71,7 +71,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 ## 模型
 
-IdleToken 可运行其固定版本 llama.cpp 支持的文本生成 GGUF 模型——内置列表、本地文件或 Hugging Face 链接均可，模型信息直接读取自 GGUF 文件头。暂不支持多模态输入。
+IdleToken 可运行 GGUF 格式的文本生成模型——内置列表、本地文件或 Hugging Face 链接均可，模型信息直接读取自 GGUF 文件头。暂不支持多模态输入。
 
 内置模型：
 

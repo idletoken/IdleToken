@@ -71,7 +71,7 @@ To earn Sparks, turn on sharing while your cluster is idle — it is off by defa
 
 ## Models
 
-IdleToken runs text-generation GGUF models supported by its pinned llama.cpp version — from the built-in list, a local file, or a Hugging Face link; model metadata is read from the GGUF header. Multimodal input is not supported.
+IdleToken runs text-generation models in GGUF format — from the built-in list, a local file, or a Hugging Face link; model metadata is read from the GGUF header. Multimodal input is not supported.
 
 The built-in models:
 
