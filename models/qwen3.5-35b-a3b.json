@@ -5,6 +5,7 @@
   "backend": "ds4x",
   "arch": "qwen35moe",
   "available": true,
+  "deployment": "single-node",
   "license": "Apache-2.0",
   "params_summary": "35B total / 3B active · 40 layers · hybrid linear attention + 256-expert MoE",
   "n_layers": 40,

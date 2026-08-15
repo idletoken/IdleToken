@@ -270,9 +270,13 @@ char *ds4x_tok_decode(const ds4x_tokenizer *t, const int32_t *ids, uint32_t n,
 
 /* Byte-BPE one plain-text run: map bytes → byte-unicode symbols, greedily
  * merge the lowest-rank adjacent pair until none remain, then emit ids.
- * Appends to out at *produced; only writes while *produced < cap. */
-static int encode_segment(const ds4x_tokenizer *t, const char *text, size_t tlen,
-                          int32_t *out, uint32_t cap, int64_t *produced) {
+ * Appends to out at *produced; only writes while *produced < cap.
+ *
+ * THIS IS THE REFERENCE, not the shipped path — encode_segment below picks.
+ * Kept because it is short enough to read as a definition of what byte-BPE
+ * means here, and because the fast version is asserted against it. */
+static int encode_segment_scan(const ds4x_tokenizer *t, const char *text, size_t tlen,
+                               int32_t *out, uint32_t cap, int64_t *produced) {
     if (tlen == 0) return 0;
     char **sym = (char **)malloc(tlen * sizeof(char *));
     if (!sym) return -1;
@@ -306,6 +310,162 @@ static int encode_segment(const ds4x_tokenizer *t, const char *text, size_t tlen
     }
     free(sym);
     return 0;
+}
+
+/* ---- byte-BPE, priority-queue form --------------------------------------
+ * The scan above rescans EVERY adjacent pair to find the lowest rank, merges
+ * one pair, and repeats: O(n) merges x an O(n) scan, with a snprintf and a hash
+ * lookup inside the inner loop. Measured on Qwen3.5's vocabulary (2026-08-13,
+ * GB10): 99 tokens 5 ms, 395 tokens 74 ms, 789 tokens 310 ms, 1578 tokens
+ * 1.183 s. That last one is 35% of the whole request — and being quadratic it
+ * would dominate everything else at 4K context, which is an ordinary prompt.
+ *
+ * A merge only changes the two pairs ADJACENT to it; the rest of the scan is
+ * rediscovering what it already knew. So keep the candidates in a heap: pop the
+ * best, merge it, push the at most two pairs that merge created. O(n log n).
+ *
+ * Symbols are SPANS of one converted buffer rather than individual strings,
+ * because merging adjacent spans is just "extend the left one" — no malloc per
+ * symbol and no copy per merge, which is most of the remaining constant.
+ *
+ * Stale heap entries are not removed; they are caught on pop by comparing each
+ * symbol's current length against the length recorded when the candidate was
+ * pushed. A symbol only ever grows, so a mismatch means the pair is gone. (Same
+ * trick as llama.cpp's BPE.)
+ *
+ * ⚠ TIE-BREAKING IS PART OF THE CONTRACT. The scan takes the FIRST pair of the
+ * lowest rank — strict `<` while walking left to right — so the heap orders by
+ * (rank, then left index) to match. Symbol indices stay in text order because a
+ * merge keeps the LEFT symbol's index, so "lowest index" still means "leftmost".
+ * Get this wrong and tokenization changes on real prose while every short test
+ * still passes. */
+typedef struct { size_t start, len; int prev, next; } bpe_sym;
+typedef struct { int32_t rank; int left, right; size_t lsz, rsz; } bpe_big;
+
+static int bpe_less(const bpe_big *a, const bpe_big *b) {
+    if (a->rank != b->rank) return a->rank < b->rank;
+    return a->left < b->left;
+}
+
+static void bpe_heap_push(bpe_big *h, size_t *n, bpe_big v) {
+    size_t i = (*n)++;
+    while (i > 0) {
+        const size_t p = (i - 1) / 2;
+        if (!bpe_less(&v, &h[p])) break;
+        h[i] = h[p];
+        i = p;
+    }
+    h[i] = v;
+}
+
+static bpe_big bpe_heap_pop(bpe_big *h, size_t *n) {
+    const bpe_big top = h[0];
+    const bpe_big last = h[--(*n)];
+    if (*n) {
+        size_t i = 0;
+        for (;;) {
+            const size_t l = 2 * i + 1, r = l + 1;
+            size_t best = i;
+            int have = 0;
+            bpe_big cand = last;
+            if (l < *n && bpe_less(&h[l], &cand)) { cand = h[l]; best = l; have = 1; }
+            if (r < *n && bpe_less(&h[r], &cand)) { best = r; have = 1; }
+            if (!have) break;
+            h[i] = h[best];
+            i = best;
+        }
+        h[i] = last;
+    }
+    return top;
+}
+
+/* Build "<left> <right>" exactly as the scan's snprintf(pair, 1024, "%s %s")
+ * did, TRUNCATION INCLUDED — a longer buffer here would look like a fix and
+ * would silently retokenize inputs that produce very long merged symbols. */
+static void bpe_add(const ds4x_tokenizer *t, const char *conv, const bpe_sym *sym,
+                    bpe_big *heap, size_t *nheap, int l, int r) {
+    char pair[1024];
+    size_t n = 0;
+    const bpe_sym *A = &sym[l], *B = &sym[r];
+    for (size_t i = 0; i < A->len && n + 1 < sizeof(pair); i++) pair[n++] = conv[A->start + i];
+    if (n + 1 < sizeof(pair)) pair[n++] = ' ';
+    for (size_t i = 0; i < B->len && n + 1 < sizeof(pair); i++) pair[n++] = conv[B->start + i];
+    pair[n] = '\0';
+    const int32_t rank = merge_get(t, pair);
+    if (rank < 0) return;
+    bpe_big v; v.rank = rank; v.left = l; v.right = r; v.lsz = A->len; v.rsz = B->len;
+    bpe_heap_push(heap, nheap, v);
+}
+
+static int encode_segment_heap(const ds4x_tokenizer *t, const char *text, size_t tlen,
+                               int32_t *out, uint32_t cap, int64_t *produced) {
+    if (tlen == 0) return 0;   /* the emit walk below starts at symbol 0 unconditionally */
+    /* Each initial pair pushes once, and each of the <= tlen-1 merges pushes at
+     * most two more; 3*tlen is a safe bound with room to spare. */
+    char    *conv = (char *)malloc(tlen * 4 + 1);
+    bpe_sym *sym  = (bpe_sym *)malloc(tlen * sizeof(bpe_sym));
+    bpe_big *heap = (bpe_big *)malloc((3 * tlen + 8) * sizeof(bpe_big));
+    if (!conv || !sym || !heap) { free(conv); free(sym); free(heap); return -1; }
+
+    size_t clen = 0;
+    for (size_t i = 0; i < tlen; i++) {
+        const int cp = t->byte_to_uni[(unsigned char)text[i]];
+        const size_t st = clen;
+        clen += (size_t)utf8_put(conv + clen, cp);
+        sym[i].start = st;
+        sym[i].len   = clen - st;
+        sym[i].prev  = (int)i - 1;
+        sym[i].next  = (i + 1 < tlen) ? (int)(i + 1) : -1;
+    }
+    conv[clen] = '\0';
+
+    size_t nheap = 0;
+    for (size_t i = 0; i + 1 < tlen; i++)
+        bpe_add(t, conv, sym, heap, &nheap, (int)i, (int)(i + 1));
+
+    while (nheap) {
+        const bpe_big b = bpe_heap_pop(heap, &nheap);
+        bpe_sym *L = &sym[b.left], *R = &sym[b.right];
+        if (L->len == 0 || R->len == 0) continue;            /* already consumed */
+        if (L->len != b.lsz || R->len != b.rsz) continue;    /* stale candidate  */
+        if (L->next != b.right) continue;                    /* no longer adjacent */
+        L->len += R->len;                                    /* spans are contiguous */
+        R->len = 0;
+        L->next = R->next;
+        if (R->next >= 0) sym[R->next].prev = b.left;
+        if (L->prev >= 0) bpe_add(t, conv, sym, heap, &nheap, L->prev, b.left);
+        if (L->next >= 0) bpe_add(t, conv, sym, heap, &nheap, b.left, L->next);
+    }
+
+    /* Emit in list order. ht_get needs a NUL-terminated key and the spans are
+     * contiguous, so borrow the following byte and put it back. */
+    for (int i = 0; i >= 0; i = sym[i].next) {
+        const size_t end = sym[i].start + sym[i].len;
+        const char saved = conv[end];
+        conv[end] = '\0';
+        const int32_t id = ht_get(t, conv + sym[i].start);
+        conv[end] = saved;
+        if (id >= 0 && *produced < (int64_t)cap) out[*produced] = id;
+        if (id >= 0) (*produced)++;
+    }
+
+    free(conv); free(sym); free(heap);
+    return 0;
+}
+
+/* IDLETOKEN_DS4X_TOK_SCAN=1 selects the reference loop. ds4x_tok_test asserts
+ * the two agree token for token, so the switch is what makes that assertion
+ * possible rather than a leftover. */
+static int encode_segment(const ds4x_tokenizer *t, const char *text, size_t tlen,
+                          int32_t *out, uint32_t cap, int64_t *produced) {
+    /* Read every call, not cached in a static: the differential test flips this
+     * between two encodes IN ONE PROCESS, and a cached value would make it
+     * compare the fast path against itself and pass unconditionally. The other
+     * runtime switches in this project (ds4x_dp4a_wanted and friends) re-read
+     * for the same reason. getenv is nothing next to a BPE segment. */
+    const char *e = getenv("IDLETOKEN_DS4X_TOK_SCAN");
+    return (e && e[0] == '1') ? encode_segment_scan(t, text, tlen, out, cap, produced)
+                              : encode_segment_heap(t, text, tlen, out, cap, produced);
 }
 
 /* Longest special/added token matching the input at `text` (verbatim), or -1.

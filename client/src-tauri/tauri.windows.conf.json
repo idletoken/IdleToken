@@ -3,7 +3,12 @@
   "bundle": {
     "resources": {
       "runtime/windows/ds4cuda.dll": "ds4cuda.dll",
-      "runtime/windows/ds4xcuda.dll": "ds4xcuda.dll"
+      "runtime/windows/ds4xcuda.dll": "ds4xcuda.dll",
+      "licenses/LICENSE.txt": "licenses/LICENSE.txt",
+      "licenses/NOTICE.txt": "licenses/NOTICE.txt",
+      "licenses/ds4-MIT.txt": "licenses/ds4-MIT.txt",
+      "licenses/rax-BSD-3-Clause.txt": "licenses/rax-BSD-3-Clause.txt",
+      "licenses/llamacpp-MIT.txt": "licenses/llamacpp-MIT.txt"
     },
     "windows": {
       "nsis": {

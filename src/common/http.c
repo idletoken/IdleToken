@@ -29,6 +29,31 @@ static ssize_t sock_read(int fd, void *buf, size_t n) {
 #endif
 }
 
+void idletoken_http_path_strip_query(char *path) {
+    /* Strip the query string so route matching sees the bare path. Real
+     * clients do send one — Claude Code POSTs /v1/messages?beta=true, which
+     * exact-match routing turned into a 404. No current route consumes query
+     * parameters, so they are dropped rather than stored. */
+    if (!path) return;
+    char *qmark = strchr(path, '?');
+    if (qmark) *qmark = 0;
+}
+
+int idletoken_http_auth_value_matches(const char *hval, const char *token) {
+    static const char scheme[] = "bearer ";
+    const char *v = hval;
+    size_t i = 0;
+    while (scheme[i]) {
+        char c = v[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if (c != scheme[i]) break;
+        i++;
+    }
+    if (!scheme[i]) v += sizeof(scheme) - 1;
+    while (*v == ' ') v++;
+    return strcmp(v, token) == 0;
+}
+
 /* Read bytes from fd into buf until we see CRLF CRLF (end of headers) or
  * the buffer fills. Returns the number of bytes read on success (always
  * includes the terminating CRLF CRLF), -1 with errno on error. Leaves the
@@ -125,6 +150,8 @@ int idletoken_http_read_request(int conn_fd, idletoken_http_req *out) {
     memcpy(out->path, buf + p_start, plen);
     out->path[plen] = 0;
 
+    idletoken_http_path_strip_query(out->path);
+
     /* Find end of request line to start scanning headers. */
     size_t line_end = p_end;
     while (line_end + 1 < head_len && !(buf[line_end] == '\r' && buf[line_end+1] == '\n')) line_end++;
@@ -175,7 +202,8 @@ int idletoken_http_read_request(int conn_fd, idletoken_http_req *out) {
         out->body_len = body_total;
     }
     /* If Content-Length absent, body_total = body_avail (whatever arrived
-     * with the header burst). Good enough for v0.1 stubs. */
+     * with the header burst). Every real client of these routes sends
+     * Content-Length; this branch only serves hand-typed probes. */
 
     free(buf);
     return 0;

@@ -1,0 +1,592 @@
+rpc: PSK-TLS encryption inside the RPC TCP transport (GGML_RPC_TLS)
+
+All bytes of the ggml-RPC TCP transport are encrypted with mbedTLS when the
+new CMake option GGML_RPC_TLS is ON (our builds always set it; default OFF
+keeps upstream behavior). All new code lives in transport.cpp behind
+socket_t's pimpl; ggml-rpc.cpp logic is untouched.
+
+Protocol choice (and why):
+  - TLS 1.2, ciphersuite pinned to TLS-PSK-WITH-AES-256-GCM-SHA384, mutual
+    authentication via a 32-byte pre-shared key. No X.509 anywhere.
+  - TLS 1.3 was considered and rejected for now: mbedTLS 3.6 binds external
+    PSKs to SHA-256, which caps the AEAD at AES-128-GCM and drags in
+    key-exchange-mode configuration surface. Both transport endpoints are
+    always our own binaries built from the same pinned source, so protocol
+    version negotiation buys nothing; one deterministic configuration is
+    easier to reason about and to test. Known trade-off: plain PSK key
+    exchange has no forward secrecy; the pairing flow can rotate the PSK.
+  - mbedTLS 3.6 LTS, pinned to the exact release tag v3.6.7, built static
+    via CMake FetchContent. Cache var IDLETOKEN_MBEDTLS_SRC points at a
+    local source tree for offline builds. The stock mbedTLS config is kept:
+    a hand-trimmed config (e.g. no X.509) would shave code size but adds a
+    maintenance surface; X.509 is compiled yet unreachable (PSK-only
+    ciphersuite, VERIFY_NONE).
+
+Fail-closed policy (no silent fallback in either direction):
+  - GGML_RPC_PSK set (64 hex chars): every connection is TLS; handshake
+    failure = connection refused, one clear log line per side.
+    GGML_RPC_PSK_IDENTITY optionally overrides the PSK identity hint
+    (default "idletoken").
+  - GGML_RPC_PSK unset: rpc-server refuses to start (exit 1) and outbound
+    connects are refused, both naming GGML_RPC_PSK - unless
+    GGML_RPC_ALLOW_PLAINTEXT=1 is set, which prints a loud multi-line
+    banner (acceptance/testing only).
+  - RDMA (GGML_RPC_RDMA) moves bytes outside the TCP stream, so when a
+    connection is TLS the RDMA probe is skipped entirely: no plaintext
+    side channel. (Our configs do not build RDMA; this is belt and braces.)
+
+Handshake placement:
+  - client side: eager, inside socket_t::connect() - a PSK mismatch surfaces
+    as a failed connect instead of an abort in the first RPC command.
+  - server side: lazy, on first send/recv of the accepted socket - a failed
+    handshake looks like a client that hung up, so the accept loop keeps
+    serving (it treats a null accept() as fatal).
+
+Performance: TLS fragments payloads into <=16 KiB records, so a naive BIO
+multiplies syscalls/wakeups per message. The BIO therefore corks encrypted
+records during tls_send (flushed in up-to-1-MiB writes) and reads ahead in
+256 KiB gulps on receive. Measured on an M4 (loopback, Qwen3.5-0.8B, default
+device placement): TLS decode throughput is within noise of plaintext. The
+all-layers-remote worst case pays the AES-GCM cost of the ~600 KB/token
+full-vocab logits fetch (~80% of plaintext on loopback); real deployments
+keep the embedding + first layer on the coordinator, and on LAN links the
+per-token budget dwarfs this cost.
+
+diff --git a/ggml/src/ggml-rpc/CMakeLists.txt b/ggml/src/ggml-rpc/CMakeLists.txt
+index 40e11fe..58eaff7 100644
+--- a/ggml/src/ggml-rpc/CMakeLists.txt
++++ b/ggml/src/ggml-rpc/CMakeLists.txt
+@@ -31,3 +31,36 @@ if (GGML_RPC_RDMA)
+ else()
+     message(STATUS "  RDMA transport disabled")
+ endif()
++
++# TLS (PSK) encryption for the TCP transport (see transport.cpp for the
++# protocol choice and the fail-closed policy).
++option(GGML_RPC_TLS "ggml: enable PSK-TLS encryption for the RPC TCP transport" OFF)
++
++if (GGML_RPC_TLS)
++    # mbedTLS, pinned to an exact 3.6 LTS release. IDLETOKEN_MBEDTLS_SRC
++    # overrides the download with a local source tree for offline builds.
++    set(GGML_RPC_TLS_MBEDTLS_TAG "v3.6.7")
++    set(IDLETOKEN_MBEDTLS_SRC "" CACHE PATH "local mbedTLS source dir overriding the pinned download")
++
++    include(FetchContent)
++    set(ENABLE_TESTING         OFF CACHE BOOL "" FORCE)
++    set(ENABLE_PROGRAMS        OFF CACHE BOOL "" FORCE)
++    set(MBEDTLS_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
++    if (IDLETOKEN_MBEDTLS_SRC)
++        FetchContent_Declare(mbedtls SOURCE_DIR ${IDLETOKEN_MBEDTLS_SRC})
++        message(STATUS "  TLS (PSK) transport enabled (mbedTLS from ${IDLETOKEN_MBEDTLS_SRC})")
++    else()
++        FetchContent_Declare(mbedtls
++            GIT_REPOSITORY https://github.com/Mbed-TLS/mbedtls
++            GIT_TAG        ${GGML_RPC_TLS_MBEDTLS_TAG}
++            GIT_SHALLOW    TRUE
++        )
++        message(STATUS "  TLS (PSK) transport enabled (mbedTLS ${GGML_RPC_TLS_MBEDTLS_TAG})")
++    endif()
++    FetchContent_MakeAvailable(mbedtls)
++
++    target_compile_definitions(ggml-rpc PRIVATE GGML_RPC_TLS)
++    target_link_libraries(ggml-rpc PRIVATE mbedtls mbedx509 mbedcrypto)
++else()
++    message(STATUS "  TLS (PSK) transport disabled")
++endif()
+diff --git a/ggml/src/ggml-rpc/transport.cpp b/ggml/src/ggml-rpc/transport.cpp
+index a728152..0013455 100644
+--- a/ggml/src/ggml-rpc/transport.cpp
++++ b/ggml/src/ggml-rpc/transport.cpp
+@@ -29,6 +29,17 @@
+ #  endif
+ #endif // GGML_RPC_RDMA
+ 
++#ifdef GGML_RPC_TLS
++#  include <mbedtls/ctr_drbg.h>
++#  include <mbedtls/entropy.h>
++#  include <mbedtls/error.h>
++#  include <mbedtls/net_sockets.h>
++#  include <mbedtls/ssl.h>
++#  include <cstring>
++#  include <string>
++#  include <vector>
++#endif // GGML_RPC_TLS
++
+ #ifdef _WIN32
+ typedef SOCKET sockfd_t;
+ using ssize_t = __int64;
+@@ -41,6 +52,181 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
+ #define LOG_DBG(...) \
+     do { if (RPC_DEBUG) GGML_LOG_DEBUG(__VA_ARGS__); } while (0)
+ 
++#ifdef GGML_RPC_TLS
++// TLS (pre-shared key) encryption for the TCP transport.
++//
++// Protocol choice: TLS 1.2 with TLS-PSK-WITH-AES-256-GCM-SHA384, pinned on
++// both sides. TLS 1.3 external PSKs in mbedTLS are bound to SHA-256, which
++// limits the AEAD to AES-128-GCM and adds key-exchange-mode configuration
++// surface; both endpoints of this transport are always our own binaries built
++// from the same pinned sources, so version negotiation flexibility buys
++// nothing. The PSK provides mutual authentication; no X.509 is involved.
++//
++// Fail-closed policy (evaluated once per process, from the environment):
++//   GGML_RPC_PSK set (64 hex chars = 32 bytes)
++//       -> every RPC connection is TLS; a failed handshake is a refused
++//          connection. GGML_RPC_PSK_IDENTITY optionally overrides the PSK
++//          identity hint (default "idletoken"); it is a routing label, not a
++//          secret, and both sides must agree on it.
++//   GGML_RPC_PSK unset
++//       -> refuse to serve or connect, naming GGML_RPC_PSK, unless
++//          GGML_RPC_ALLOW_PLAINTEXT=1 is set, which prints a loud banner.
++// There is no silent fallback in either direction.
++
++static constexpr size_t RPC_TLS_PSK_SIZE = 32;
++
++enum rpc_tls_mode {
++    RPC_TLS_MODE_PSK,        // encrypt every connection with the configured PSK
++    RPC_TLS_MODE_PLAINTEXT,  // explicit opt-out (acceptance/testing only)
++    RPC_TLS_MODE_REFUSE,     // no PSK and no explicit opt-out, or malformed PSK
++};
++
++enum rpc_tls_state {
++    RPC_TLS_STATE_OFF,      // plaintext connection (explicit opt-out)
++    RPC_TLS_STATE_PENDING,  // TLS required, handshake not performed yet
++    RPC_TLS_STATE_ACTIVE,   // handshake done, all bytes go through mbedTLS
++    RPC_TLS_STATE_FAILED,   // handshake failed, connection is unusable
++};
++
++struct rpc_tls_config {
++    rpc_tls_mode         mode = RPC_TLS_MODE_REFUSE;
++    std::vector<uint8_t> psk;
++    std::string          identity;
++};
++
++static bool rpc_tls_parse_psk_hex(const char * hex, std::vector<uint8_t> & out) {
++    auto nibble = [](char c) -> int {
++        if (c >= '0' && c <= '9') return c - '0';
++        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
++        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
++        return -1;
++    };
++    if (strlen(hex) != 2 * RPC_TLS_PSK_SIZE) {
++        return false;
++    }
++    out.resize(RPC_TLS_PSK_SIZE);
++    for (size_t i = 0; i < RPC_TLS_PSK_SIZE; i++) {
++        int hi = nibble(hex[2 * i]);
++        int lo = nibble(hex[2 * i + 1]);
++        if (hi < 0 || lo < 0) {
++            return false;
++        }
++        out[i] = (uint8_t) ((hi << 4) | lo);
++    }
++    return true;
++}
++
++static const rpc_tls_config & rpc_tls_get_config() {
++    static rpc_tls_config cfg = [] {
++        rpc_tls_config c;
++        const char * hex = std::getenv("GGML_RPC_PSK");
++        if (hex == nullptr || hex[0] == '\0') {
++            const char * allow = std::getenv("GGML_RPC_ALLOW_PLAINTEXT");
++            if (allow != nullptr && strcmp(allow, "1") == 0) {
++                c.mode = RPC_TLS_MODE_PLAINTEXT;
++                GGML_LOG_WARN("================================================================\n");
++                GGML_LOG_WARN("== PLAINTEXT RPC (acceptance/testing only)                    ==\n");
++                GGML_LOG_WARN("== GGML_RPC_ALLOW_PLAINTEXT=1 is set and GGML_RPC_PSK is not. ==\n");
++                GGML_LOG_WARN("== Tensor data and tensor names cross the wire unencrypted.   ==\n");
++                GGML_LOG_WARN("================================================================\n");
++            } else {
++                c.mode = RPC_TLS_MODE_REFUSE;
++            }
++            return c;
++        }
++        if (!rpc_tls_parse_psk_hex(hex, c.psk)) {
++            GGML_LOG_ERROR("RPC TLS: GGML_RPC_PSK is malformed (need %zu hex chars = %zu bytes)\n",
++                           2 * RPC_TLS_PSK_SIZE, RPC_TLS_PSK_SIZE);
++            c.mode = RPC_TLS_MODE_REFUSE;
++            return c;
++        }
++        const char * id = std::getenv("GGML_RPC_PSK_IDENTITY");
++        c.identity = (id != nullptr && id[0] != '\0') ? id : "idletoken";
++        c.mode = RPC_TLS_MODE_PSK;
++        return c;
++    }();
++    return cfg;
++}
++
++// BIO state. TLS fragments every payload into <=16 KiB records and mbedTLS
++// hands each record to the BIO separately; a naive BIO turns one large
++// send_data() into dozens of send() syscalls and per-packet peer wakeups,
++// which measurably drags down tokens/s on low-latency links. tls_send()
++// therefore "corks" the BIO: encrypted records accumulate in `pending` and
++// are flushed in large writes.
++static constexpr size_t RPC_TLS_CORK_FLUSH_SIZE = 1024 * 1024;
++static constexpr size_t RPC_TLS_READAHEAD_SIZE  = 256 * 1024;
++
++struct rpc_tls_bio_ctx {
++    sockfd_t             fd;
++    std::vector<uint8_t> pending;   // encrypted, not yet written to the socket
++    bool                 corked = false;
++    std::vector<uint8_t> rd_buf;    // encrypted read-ahead from the socket
++    size_t               rd_pos = 0;
++};
++
++static bool rpc_tls_bio_flush(rpc_tls_bio_ctx * bio) {
++    size_t off = 0;
++    while (off < bio->pending.size()) {
++        ssize_t n = send(bio->fd, (const char *) bio->pending.data() + off, bio->pending.size() - off, 0);
++        if (n < 0) {
++            return false;
++        }
++        off += (size_t) n;
++    }
++    bio->pending.clear();
++    return true;
++}
++
++static int rpc_tls_bio_send(void * ctx, const unsigned char * buf, size_t len) {
++    auto * bio = (rpc_tls_bio_ctx *) ctx;
++    if (bio->corked) {
++        bio->pending.insert(bio->pending.end(), buf, buf + len);
++        if (bio->pending.size() >= RPC_TLS_CORK_FLUSH_SIZE && !rpc_tls_bio_flush(bio)) {
++            return MBEDTLS_ERR_NET_SEND_FAILED;
++        }
++        return (int) len;
++    }
++    ssize_t n = send(bio->fd, (const char *) buf, len, 0);
++    if (n < 0) {
++        return MBEDTLS_ERR_NET_SEND_FAILED;
++    }
++    return (int) n;
++}
++
++static int rpc_tls_bio_recv(void * ctx, unsigned char * buf, size_t len) {
++    auto * bio = (rpc_tls_bio_ctx *) ctx;
++    // Never read while corked output is pending: the peer may be waiting for
++    // exactly those bytes.
++    if (!bio->pending.empty() && !rpc_tls_bio_flush(bio)) {
++        return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
++    }
++    // Read ahead in large gulps: mbedTLS requests a few bytes of record
++    // header, then the record body, for every <=16 KiB record. Serving those
++    // requests from a buffer filled by one big recv() keeps the syscall and
++    // wakeup count per message close to the plaintext path. recv() returns
++    // as soon as any data is available, so this adds no latency.
++    if (bio->rd_pos == bio->rd_buf.size()) {
++        bio->rd_buf.resize(RPC_TLS_READAHEAD_SIZE);
++        ssize_t n = recv(bio->fd, (char *) bio->rd_buf.data(), bio->rd_buf.size(), 0);
++        if (n < 0) {
++            bio->rd_buf.clear();
++            bio->rd_pos = 0;
++            return MBEDTLS_ERR_NET_RECV_FAILED;
++        }
++        bio->rd_buf.resize((size_t) n);
++        bio->rd_pos = 0;
++        if (n == 0) {
++            return 0;  // peer closed
++        }
++    }
++    size_t take = std::min(len, bio->rd_buf.size() - bio->rd_pos);
++    memcpy(buf, bio->rd_buf.data() + bio->rd_pos, take);
++    bio->rd_pos += take;
++    return (int) take;
++}
++#endif // GGML_RPC_TLS
++
+ #ifdef GGML_RPC_RDMA
+ static constexpr size_t RDMA_CHUNK    = 256 * 1024;   // 256 KiB per send/recv (fits default 8 MiB memlock)
+ static constexpr int    RDMA_RX_DEPTH = 24;            // pre-posted recv ring: 24 × 256 KiB = 6 MiB
+@@ -133,6 +319,22 @@ struct socket_t::impl {
+     std::unique_ptr<rdma_conn> rdma;
+     rdma_local_info            rdma_local = {};
+ #endif // GGML_RPC_RDMA
++#ifdef GGML_RPC_TLS
++    bool tls_ensure_active();
++    bool tls_start();
++    bool tls_log_fail(const char * what, int ret);
++    bool tls_send(const void * data, size_t size);
++    bool tls_recv(void * data, size_t size);
++
++    rpc_tls_state            tls_state    = RPC_TLS_STATE_OFF;
++    bool                     tls_server   = false;
++    bool                     tls_ctx_init = false;
++    rpc_tls_bio_ctx          tls_bio;
++    mbedtls_entropy_context  tls_entropy;
++    mbedtls_ctr_drbg_context tls_ctr_drbg;
++    mbedtls_ssl_config       tls_conf;
++    mbedtls_ssl_context      tls_ssl;
++#endif // GGML_RPC_TLS
+     bool     use_rdma;
+     sockfd_t fd;
+ };
+@@ -141,6 +343,14 @@ socket_t::impl::~impl() {
+ #ifdef GGML_RPC_RDMA
+     rdma.reset();
+ #endif // GGML_RPC_RDMA
++#ifdef GGML_RPC_TLS
++    if (tls_ctx_init) {
++        mbedtls_ssl_free(&tls_ssl);
++        mbedtls_ssl_config_free(&tls_conf);
++        mbedtls_ctr_drbg_free(&tls_ctr_drbg);
++        mbedtls_entropy_free(&tls_entropy);
++    }
++#endif // GGML_RPC_TLS
+     LOG_DBG("[%s] closing socket %d\n", __func__, this->fd);
+ #ifdef _WIN32
+     if (fd != INVALID_SOCKET) closesocket(this->fd);
+@@ -459,7 +669,151 @@ bool socket_t::impl::rdma_recv(void * data, size_t size) {
+ 
+ #endif // GGML_RPC_RDMA
+ 
++#ifdef GGML_RPC_TLS
++
++bool socket_t::impl::tls_log_fail(const char * what, int ret) {
++    char err[128];
++    mbedtls_strerror(ret, err, sizeof(err));
++    GGML_LOG_ERROR("RPC TLS: %s failed: -0x%04x %s\n", what, (unsigned) -ret, err);
++    return false;
++}
++
++// Set up the mbedTLS contexts for this connection and run the handshake.
++// Called once, lazily on the server side (see socket_t::accept) and eagerly
++// on the client side (see socket_t::connect).
++bool socket_t::impl::tls_start() {
++    const rpc_tls_config & cfg = rpc_tls_get_config();
++
++    mbedtls_ssl_init(&tls_ssl);
++    mbedtls_ssl_config_init(&tls_conf);
++    mbedtls_ctr_drbg_init(&tls_ctr_drbg);
++    mbedtls_entropy_init(&tls_entropy);
++    tls_ctx_init = true;
++
++    static const char * pers = "ggml-rpc-tls";
++    int ret = mbedtls_ctr_drbg_seed(&tls_ctr_drbg, mbedtls_entropy_func, &tls_entropy,
++                                    (const unsigned char *) pers, strlen(pers));
++    if (ret != 0) {
++        return tls_log_fail("mbedtls_ctr_drbg_seed", ret);
++    }
++    ret = mbedtls_ssl_config_defaults(&tls_conf,
++                                      tls_server ? MBEDTLS_SSL_IS_SERVER : MBEDTLS_SSL_IS_CLIENT,
++                                      MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
++    if (ret != 0) {
++        return tls_log_fail("mbedtls_ssl_config_defaults", ret);
++    }
++    mbedtls_ssl_conf_rng(&tls_conf, mbedtls_ctr_drbg_random, &tls_ctr_drbg);
++    // Mutual authentication comes from the PSK itself; no X.509 is involved.
++    mbedtls_ssl_conf_authmode(&tls_conf, MBEDTLS_SSL_VERIFY_NONE);
++    // Pin exactly TLS 1.2 + TLS-PSK-WITH-AES-256-GCM-SHA384 (rationale at top).
++    static const int suites[] = { MBEDTLS_TLS_PSK_WITH_AES_256_GCM_SHA384, 0 };
++    mbedtls_ssl_conf_ciphersuites(&tls_conf, suites);
++    mbedtls_ssl_conf_min_tls_version(&tls_conf, MBEDTLS_SSL_VERSION_TLS1_2);
++    mbedtls_ssl_conf_max_tls_version(&tls_conf, MBEDTLS_SSL_VERSION_TLS1_2);
++
++    ret = mbedtls_ssl_conf_psk(&tls_conf, cfg.psk.data(), cfg.psk.size(),
++                               (const unsigned char *) cfg.identity.data(), cfg.identity.size());
++    if (ret != 0) {
++        return tls_log_fail("mbedtls_ssl_conf_psk", ret);
++    }
++    ret = mbedtls_ssl_setup(&tls_ssl, &tls_conf);
++    if (ret != 0) {
++        return tls_log_fail("mbedtls_ssl_setup", ret);
++    }
++    tls_bio.fd = fd;
++    mbedtls_ssl_set_bio(&tls_ssl, &tls_bio, rpc_tls_bio_send, rpc_tls_bio_recv, nullptr);
++
++    while ((ret = mbedtls_ssl_handshake(&tls_ssl)) != 0) {
++        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
++            char err[128];
++            mbedtls_strerror(ret, err, sizeof(err));
++            GGML_LOG_ERROR("RPC TLS handshake failed (%s side): -0x%04x %s - connection refused (PSK mismatch?)\n",
++                           tls_server ? "server" : "client", (unsigned) -ret, err);
++            return false;
++        }
++    }
++    LOG_DBG("[%s] socket %d secured: %s %s\n", __func__, (int) fd,
++            mbedtls_ssl_get_version(&tls_ssl), mbedtls_ssl_get_ciphersuite(&tls_ssl));
++    return true;
++}
++
++bool socket_t::impl::tls_ensure_active() {
++    if (tls_state == RPC_TLS_STATE_ACTIVE) {
++        return true;
++    }
++    if (tls_state == RPC_TLS_STATE_FAILED) {
++        return false;
++    }
++    if (!tls_start()) {
++        tls_state = RPC_TLS_STATE_FAILED;
++        return false;
++    }
++    tls_state = RPC_TLS_STATE_ACTIVE;
++    return true;
++}
++
++bool socket_t::impl::tls_send(const void * data, size_t size) {
++    size_t bytes_sent = 0;
++    tls_bio.corked = true;
++    while (bytes_sent < size) {
++        int ret = mbedtls_ssl_write(&tls_ssl, (const unsigned char *) data + bytes_sent, size - bytes_sent);
++        if (ret > 0) {
++            bytes_sent += (size_t) ret;
++            continue;
++        }
++        if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
++            continue;
++        }
++        tls_bio.corked = false;
++        char err[128];
++        mbedtls_strerror(ret, err, sizeof(err));
++        GGML_LOG_ERROR("RPC TLS send failed (bytes_sent=%zu, size=%zu): -0x%04x %s\n",
++                       bytes_sent, size, (unsigned) -ret, err);
++        return false;
++    }
++    tls_bio.corked = false;
++    if (!rpc_tls_bio_flush(&tls_bio)) {
++        GGML_LOG_ERROR("RPC TLS send failed (flush, size=%zu)\n", size);
++        return false;
++    }
++    return true;
++}
++
++bool socket_t::impl::tls_recv(void * data, size_t size) {
++    size_t bytes_recv = 0;
++    while (bytes_recv < size) {
++        int ret = mbedtls_ssl_read(&tls_ssl, (unsigned char *) data + bytes_recv, size - bytes_recv);
++        if (ret > 0) {
++            bytes_recv += (size_t) ret;
++            continue;
++        }
++        if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
++            continue;
++        }
++        if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
++            LOG_DBG("RPC TLS recv: peer closed (bytes_recv=%zu, size=%zu)\n", bytes_recv, size);
++        } else {
++            char err[128];
++            mbedtls_strerror(ret, err, sizeof(err));
++            GGML_LOG_ERROR("RPC TLS recv failed (bytes_recv=%zu, size=%zu): -0x%04x %s\n",
++                           bytes_recv, size, (unsigned) -ret, err);
++        }
++        return false;
++    }
++    return true;
++}
++
++#endif // GGML_RPC_TLS
++
+ bool socket_t::impl::send_data(const void * data, size_t size) {
++#ifdef GGML_RPC_TLS
++    if (tls_state != RPC_TLS_STATE_OFF) {
++        if (!tls_ensure_active()) {
++            return false;
++        }
++        return tls_send(data, size);
++    }
++#endif
+ #ifdef GGML_RPC_RDMA
+     if (use_rdma) {
+         return rdma_send(data, size);
+@@ -480,6 +834,14 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
+ }
+ 
+ bool socket_t::impl::recv_data(void * data, size_t size) {
++#ifdef GGML_RPC_TLS
++    if (tls_state != RPC_TLS_STATE_OFF) {
++        if (!tls_ensure_active()) {
++            return false;
++        }
++        return tls_recv(data, size);
++    }
++#endif
+ #ifdef GGML_RPC_RDMA
+     if (use_rdma) {
+         return rdma_recv(data, size);
+@@ -505,6 +867,14 @@ bool socket_t::impl::recv_data(void * data, size_t size) {
+ 
+ void socket_t::impl::get_caps(uint8_t * local_caps) {
+     memset(local_caps, 0, RPC_CONN_CAPS_SIZE);
++#ifdef GGML_RPC_TLS
++    // RDMA moves bytes through queue-pair buffers, bypassing the encrypted
++    // stream entirely. When this connection is TLS, do not even probe for
++    // RDMA (fail closed: no plaintext side channel).
++    if (tls_state != RPC_TLS_STATE_OFF) {
++        return;
++    }
++#endif
+ #ifdef GGML_RPC_RDMA
+     rdma_local = {};
+     if (rdma_probe()) {
+@@ -594,10 +964,33 @@ socket_ptr socket_t::accept() {
+         GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
+         return nullptr;
+     }
+-    return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
++    socket_ptr client(new socket_t(std::make_unique<impl>(client_socket_fd)));
++#ifdef GGML_RPC_TLS
++    if (rpc_tls_get_config().mode == RPC_TLS_MODE_PSK) {
++        // The server-side handshake is deferred to the first send/recv on
++        // this socket: a failed handshake must look like a client that hung
++        // up (the serve loop returns and accepts the next client), not like
++        // a failed accept(), which the serve loop treats as fatal.
++        client->pimpl->tls_state  = RPC_TLS_STATE_PENDING;
++        client->pimpl->tls_server = true;
++    }
++#endif
++    return client;
+ }
+ 
+ socket_ptr socket_t::create_server(const char * host, int port) {
++#ifdef GGML_RPC_TLS
++    if (rpc_tls_get_config().mode == RPC_TLS_MODE_REFUSE) {
++        GGML_LOG_ERROR("RPC TLS: GGML_RPC_PSK is not set (or invalid); refusing to serve plaintext RPC\n");
++        GGML_LOG_ERROR("RPC TLS: set GGML_RPC_PSK (%zu hex chars) or GGML_RPC_ALLOW_PLAINTEXT=1 (testing only)\n",
++                       2 * RPC_TLS_PSK_SIZE);
++        // The caller (ggml_backend_rpc_start_server) swallows a null return
++        // and the rpc-server binary would still exit 0. A misconfigured
++        // secure endpoint must be loud, so treat this as a fatal startup
++        // error instead of returning nullptr.
++        exit(1);
++    }
++#endif
+     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
+     if (!is_valid_fd(sockfd)) {
+         return nullptr;
+@@ -625,6 +1018,16 @@ socket_ptr socket_t::create_server(const char * host, int port) {
+ }
+ 
+ socket_ptr socket_t::connect(const char * host, int port) {
++#ifdef GGML_RPC_TLS
++    const rpc_tls_config & tls_cfg = rpc_tls_get_config();
++    if (tls_cfg.mode == RPC_TLS_MODE_REFUSE) {
++        GGML_LOG_ERROR("RPC TLS: GGML_RPC_PSK is not set (or invalid); refusing plaintext RPC connect to %s:%d\n",
++                       host, port);
++        GGML_LOG_ERROR("RPC TLS: set GGML_RPC_PSK (%zu hex chars) or GGML_RPC_ALLOW_PLAINTEXT=1 (testing only)\n",
++                       2 * RPC_TLS_PSK_SIZE);
++        return nullptr;
++    }
++#endif
+     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
+     if (!is_valid_fd(sockfd)) {
+         return nullptr;
+@@ -645,7 +1048,19 @@ socket_ptr socket_t::connect(const char * host, int port) {
+     if (::connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+         return nullptr;
+     }
+-    return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
++    socket_ptr sock(new socket_t(std::make_unique<impl>(sockfd)));
++#ifdef GGML_RPC_TLS
++    if (tls_cfg.mode == RPC_TLS_MODE_PSK) {
++        sock->pimpl->tls_state = RPC_TLS_STATE_PENDING;
++        // The client-side handshake is eager: a PSK mismatch surfaces here
++        // as a failed connect instead of an abort deep inside the first RPC
++        // command (send_rpc_cmd failures are treated as a crashed server).
++        if (!sock->pimpl->tls_ensure_active()) {
++            return nullptr;
++        }
++    }
++#endif
++    return sock;
+ }
+ 
+ #ifdef _WIN32

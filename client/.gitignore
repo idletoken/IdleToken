@@ -3,6 +3,11 @@ dist/
 src-tauri/target/
 src-tauri/gen/
 src-tauri/binaries/
+# Staged by scripts/build_client_release.{sh,bat} from the repo's own LICENSE /
+# NOTICE / vendor licences, so the installer carries them (bundle.resources).
+# Generated, therefore ignored: a committed copy would be a second version of a
+# legal text, and the two would drift.
+src-tauri/licenses/
 # src-tauri/icons/ used to be ignored here, so those icons were never actually
 # committed -- they lived only on one maintainer's machine. tauri.conf.json
 # references them directly and generate_context! fails at compile time if it

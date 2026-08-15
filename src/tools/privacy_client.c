@@ -14,6 +14,7 @@
 #include "idletoken_privacy.h"
 #include "idletoken_privacy_http.h"
 #include "idletoken_net.h"
+#include "idletoken_http.h"   /* IDLETOKEN_PATH_PRIV_* — one spelling, shared with privacy_proxy.c */
 
 #include <errno.h>
 #include <stdint.h>
@@ -82,11 +83,11 @@ int main(int argc, char **argv) {
         else { fprintf(stderr, "client: unknown arg %s\n", a); return 2; }
     }
     const char *path = !strcmp(endpoint, "chat")
-                     ? "/v1/privacy/chat/completions" : "/v1/privacy/messages";
+                     ? IDLETOKEN_PATH_PRIV_CHAT : IDLETOKEN_PATH_PRIV_MSG;
 
     /* 1. fetch node pubkey */
     size_t plen = 0; int st = 0;
-    uint8_t *pk_json = http_do(proxy, "GET", "/v1/privacy/pubkey", NULL, 0, &plen, &st);
+    uint8_t *pk_json = http_do(proxy, "GET", IDLETOKEN_PATH_PRIV_PUBKEY, NULL, 0, &plen, &st);
     if (!pk_json || st != 200) { fprintf(stderr, "client: pubkey fetch failed (status %d)\n", st); return 1; }
     char hex[65] = {0};
     /* find "pubkey":"..." */

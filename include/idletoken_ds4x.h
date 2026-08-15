@@ -297,6 +297,10 @@ int ds4x_runner_run(ds4x_runner *r, float *hidden, uint32_t n_tokens,
  * over-reported itself; keep the buckets separate. All zero when profiling is
  * off. Any argument may be NULL. */
 void ds4x_prof_report(double *proj_s, double *conv_s, double *rec_s, double *post_s);
+/* Same split for the full-attention (GQA) layers: rope + per-head Q/K RMSNorm,
+ * the attention itself, and the sigmoid output gate. Only the middle one is on
+ * the device; the other two are host loops that looked too cheap to move. */
+void ds4x_prof_gqa_report(double *rope_s, double *attn_s, double *gate_s);
 
 /* The Gated DeltaNet delta-rule recurrence for one chunk, CPU reference —
  * exposed so the CUDA kernel is gated against the code that actually SHIPS

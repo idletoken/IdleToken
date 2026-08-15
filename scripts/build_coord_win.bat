@@ -37,11 +37,31 @@ gcc -c src/platform/win/win_compat.c -Isrc/platform/win -std=gnu11 -O2 -o c_win_
 if errorlevel 1 goto :fail
 
 echo === common ===>> coord_build.log
-REM advise.c = the capability table served by GET /v1/capability.
-for %%F in (net discovery model http plan gguf advise) do (
+REM advise.c = the capability table served by GET /idletoken/v1/capability.
+REM resource.c + model_auto.c joined the coordinator with the v2 llama.cpp mode
+REM (WS-B2/B4): the coord probes ITS OWN machine for the single-machine fit
+REM check and builds a runtime model spec from any GGUF header. resource.c loads
+REM nvml.dll at runtime on Windows, so this adds no toolkit dependency.
+REM This list is the Windows twin of COMMON_SRC_COORD in the Makefile. Adding a
+REM file there is NOT enough -- a file missing here surfaces only as a Windows
+REM link error, on a machine nobody builds on daily (it did: nodecrypt/privacy/
+REM resource/model_auto were all absent, so the coord had no Windows build at
+REM all after the pivot and the release gate died on a missing exe).
+for %%F in (net discovery model http plan gguf advise enginever resource model_auto apiconv) do (
     gcc -c src/common/%%F.c %CF% -o c_%%F.o >> coord_build.log 2>&1
     if errorlevel 1 goto :fail
 )
+REM node-crypto for the coord<->worker link (docs/inter-node-encryption.md):
+REM nodecrypt.c holds the counter-nonce framing, privacy.c the XSalsa20-Poly1305
+REM primitive, tweetnacl.c the vendored maths. Same three files as the worker's
+REM build_ds4x_win.bat.
+gcc -c src/common/nodecrypt.c -Iinclude -Ivendor/tweetnacl -std=gnu11 -O2 -o c_nodecrypt.o >> coord_build.log 2>&1
+if errorlevel 1 goto :fail
+gcc -c src/common/privacy.c %CF% -Ivendor/tweetnacl -o c_privacy.o >> coord_build.log 2>&1
+if errorlevel 1 goto :fail
+REM TweetNaCl is third-party: -w for the same reason the Makefile gives.
+gcc -c vendor/tweetnacl/tweetnacl.c -Ivendor/tweetnacl -std=gnu11 -O2 -w -o c_tweetnacl.o >> coord_build.log 2>&1
+if errorlevel 1 goto :fail
 
 echo === ds4x tokenizer ===>> coord_build.log
 gcc -c src/ds4x/ds4x_tokenizer.c %CF% -o c_ds4x_tokenizer.o >> coord_build.log 2>&1
@@ -50,11 +70,13 @@ if errorlevel 1 goto :fail
 echo === coord ===>> coord_build.log
 gcc -c src/coord/coord_main.c %CF% -o c_coord_main.o >> coord_build.log 2>&1
 if errorlevel 1 goto :fail
+gcc -c src/coord/llama_sidecar.c %CF% -o c_llama_sidecar.o >> coord_build.log 2>&1
+if errorlevel 1 goto :fail
 
 echo === link ===>> coord_build.log
 REM -static-libgcc + static winpthread: the exe must run on a machine with only
 REM the NVIDIA driver and no MinGW on PATH (same reason as the worker link).
-gcc -static-libgcc -o idletoken-coord.exe c_coord_main.o c_net.o c_discovery.o c_model.o c_http.o c_plan.o c_gguf.o c_advise.o c_ds4x_tokenizer.o c_ds4.o c_rax.o c_win_compat.o -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic -lws2_32 -lbcrypt >> coord_build.log 2>&1
+gcc -static-libgcc -o idletoken-coord.exe c_coord_main.o c_llama_sidecar.o c_net.o c_discovery.o c_model.o c_http.o c_plan.o c_gguf.o c_advise.o c_enginever.o c_resource.o c_model_auto.o c_apiconv.o c_nodecrypt.o c_privacy.o c_tweetnacl.o c_ds4x_tokenizer.o c_ds4.o c_rax.o c_win_compat.o -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic -lws2_32 -lbcrypt >> coord_build.log 2>&1
 if errorlevel 1 goto :fail
 
 echo COORD_WIN_OK

@@ -21,8 +21,19 @@
 _tb_pre_coord="${IDLETOKEN_COORD_NODE:-}"
 _tb_pre_workers="${IDLETOKEN_WORKER_NODES:-}"
 _tb_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+# `set -a` so every setting in the file is EXPORTED, not merely set in this
+# shell. Several gates delegate to a child script (ppl_gate.sh,
+# gpriv7_embedding_check.sh, model_fetch.sh...), and a child only inherits
+# exported variables: on 2026-08-15 the ladder had IDLETOKEN_SMOKE_GGUF set and
+# used it fine inline, while ppl_gate.sh saw nothing and skipped "because it is
+# not configured". A config file that only half-reaches its consumers is worse
+# than no config file -- it skips quietly.
 # shellcheck disable=SC1090
-[ -f "$_tb_dir/testbed.env" ] && . "$_tb_dir/testbed.env"
+if [ -f "$_tb_dir/testbed.env" ]; then
+    set -a
+    . "$_tb_dir/testbed.env"
+    set +a
+fi
 # It only counts as an override when the command-line value differs from the
 # file. Callers use this to decide whether to say so loudly -- the point of that
 # notice is to make **running less than usual** conspicuous, and printing it every
@@ -85,6 +96,98 @@ testbed_hint() {  # testbed_hint <alias>
     echo "no user directory configured for node $1. Add a line to scripts/testbed.env" >&2
     echo "(template: scripts/testbed.env.example):" >&2
     echo "    $key='C:/Users/<the username on that machine>'" >&2
+}
+
+# ---------------------------------------------------------------------------
+# Which OS family a node runs. Asked of the machine, never guessed from its name
+# -- the whole premise of the product is "any machines", and a wrong guess does
+# not report itself, it reports a probe failure far from the cause.
+#
+# `uname -s` succeeds on Linux and macOS and fails under Windows OpenSSH (whose
+# default shell is cmd or powershell), so that is the test. Memoized in a string
+# (the bash 3.2 macOS ships has no associative arrays), so each machine is asked
+# once. It SETS a variable instead of echoing: a `$(...)` call would memoize
+# inside a subshell and re-ssh every time.
+#
+# Caveat: an unreachable machine also produces no `uname` output and is therefore
+# read as Windows. Callers that care must check liveness first.
+_TB_NODE_OS=" "
+NODE_OS=""
+testbed_node_os() {  # testbed_node_os <alias> -> sets NODE_OS to windows|linux|macos|unknown
+    local rest u
+    case "$_TB_NODE_OS" in
+        *" $1:"*) rest="${_TB_NODE_OS#*" $1:"}"; NODE_OS="${rest%% *}"; return 0 ;;
+    esac
+    u=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$1" "uname -s" 2>/dev/null | tr -d '\r')
+    case "$u" in
+        Linux)  NODE_OS=linux ;;
+        Darwin) NODE_OS=macos ;;
+        "")     NODE_OS=windows ;;
+        *)      NODE_OS=unknown ;;
+    esac
+    _TB_NODE_OS="$_TB_NODE_OS$1:$NODE_OS "
+}
+
+# ---------------------------------------------------------------------------
+# The pair of machines used by the cross-machine benchmarks and concurrency
+# checks (xmachine_bench, xmachine_concurrent_check, fullchain_concurrent_check,
+# pair_xmachine_infer). First entry is the coordinator.
+#
+# Why this exists as its own setting rather than "the coordinator plus the first
+# worker": since 2026-08-12 a cluster must be HOMOGENEOUS, and on a typical
+# testbed the coordinator node is the one strong Linux box while the workers are
+# Windows. That combination is no longer a legal cluster -- the coordinator
+# refuses the second machine at HELLO -- so these scripts need a same-OS pair,
+# which is generally NOT the pair the rest of the ladder uses.
+#
+# Default: the first two IDLETOKEN_WORKER_NODES. The caller must still verify
+# they agree (testbed_xm_check below) -- a default that happens to be illegal
+# should say so, not fail somewhere downstream.
+testbed_xm_nodes() {
+    if [ -n "${IDLETOKEN_XM_NODES:-}" ]; then printf '%s' "$IDLETOKEN_XM_NODES"; return 0; fi
+    set -- ${IDLETOKEN_WORKER_NODES:-}
+    [ $# -ge 2 ] && printf '%s %s' "$1" "$2"
+    return 0
+}
+
+# Resolve + validate the pair. On success sets XM_COORD / XM_WORKER / XM_OS and
+# returns 0; otherwise explains which line to add and returns 1.
+testbed_xm_check() {
+    local nodes; nodes=$(testbed_xm_nodes)
+    set -- $nodes
+    if [ $# -lt 2 ]; then
+        echo "this check needs TWO compute nodes of the same OS family." >&2
+        echo "Add to scripts/testbed.env (template: testbed.env.example):" >&2
+        echo "    IDLETOKEN_XM_NODES=\"<coordinator-alias> <worker-alias>\"" >&2
+        return 1
+    fi
+    XM_COORD="$1"; XM_WORKER="$2"
+    testbed_node_os "$XM_COORD"; local a="$NODE_OS"
+    testbed_node_os "$XM_WORKER"; local b="$NODE_OS"
+    if [ "$a" != "$b" ]; then
+        echo "IDLETOKEN_XM_NODES is $XM_COORD ($a) + $XM_WORKER ($b) -- a cluster must be" >&2
+        echo "homogeneous (CLAUDE.md #2); the coordinator refuses a mixed-OS join at HELLO." >&2
+        echo "Name two machines of the same OS family in scripts/testbed.env." >&2
+        return 1
+    fi
+    XM_OS="$a"
+    return 0
+}
+
+# A node's LAN IPv4. Workers must be told an address their peers can dial, and
+# the control machine cannot know it -- it changes, and on Windows there may be
+# several adapters. Ask the machine.
+testbed_lan_ip() {  # testbed_lan_ip <alias>
+    testbed_node_os "$1"
+    if [ "$NODE_OS" = windows ]; then
+        ssh -o BatchMode=yes -o ConnectTimeout=10 "$1" \
+            "powershell -NoProfile -Command \"(Get-NetIPAddress -AddressFamily IPv4 | Where-Object { \$_.IPAddress -like '192.168.*' -or \$_.IPAddress -like '10.*' } | Select-Object -First 1).IPAddress\"" \
+            2>/dev/null | tr -d '\r ' | tail -1
+    else
+        ssh -o BatchMode=yes -o ConnectTimeout=10 "$1" \
+            "ip -4 -o addr show scope global | awk '{split(\$4,a,\"/\"); print a[1]}' | grep -E '^(192\.168\.|10\.)' | head -1" \
+            2>/dev/null | tr -d '\r'
+    fi
 }
 
 # ---------------------------------------------------------------------------

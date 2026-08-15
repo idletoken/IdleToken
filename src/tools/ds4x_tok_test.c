@@ -2,6 +2,8 @@
  * Fixture: build/fixtures/tokenizer.gguf (scripts/make_test_gguf.py).
  * Verifies vocab load, decode (byte-unicode reversal), special tokens, and the
  * BPE merge encode (round-trip). */
+/* setenv is POSIX, not C99 — the differential test below needs it. */
+#define _POSIX_C_SOURCE 200112L
 #include "idletoken_ds4x_tok.h"
 
 #include <stdio.h>
@@ -90,6 +92,45 @@ int main(int argc, char **argv) {
         ok(cd && !strcmp(cd, "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n"),
            "chat_apply renders the ChatML prompt");
         free(cd);
+    }
+
+    /* The shipped encoder is the heap one; the left-to-right scan is kept as the
+     * reference. They must agree TOKEN FOR TOKEN, because the thing that is easy
+     * to get wrong is not "does it merge" but WHICH pair wins a rank tie — and a
+     * tie-break bug retokenizes real prose while every short case above still
+     * passes. So: many inputs, both paths, exact comparison.
+     *
+     * The inputs are built to force ties and long merge chains out of a fixture
+     * vocabulary that only knows h+e, l+l, he+ll, hell+o: repeated and
+     * interleaved "hello" fragments give the scan several equal-rank candidates
+     * at once, which is exactly the case the heap has to order identically. */
+    {
+        static const char *cases[] = {
+            "", "h", "hello", "hellohello", "he ll o hello he",
+            "hhhheeeellllloooo", "lllllllllllllllll",
+            "hello hello hello hello hello hello hello hello",
+            "\xe4\xbd\xa0\xe5\xa5\xbd hello \xe4\xb8\x96\xe7\x95\x8c",  /* non-ASCII bytes */
+            "<|im_start|>hellohello<|im_end|>hello",
+        };
+        char big[4096];
+        for (size_t i = 0; i < sizeof(big) - 1; i++) big[i] = "hello "[i % 6];
+        big[sizeof(big) - 1] = '\0';
+
+        int mismatches = 0, ran = 0;
+        for (size_t ci = 0; ci <= sizeof(cases) / sizeof(cases[0]); ci++) {
+            const char *in = (ci == sizeof(cases) / sizeof(cases[0])) ? big : cases[ci];
+            int32_t a[8192], b[8192];
+            setenv("IDLETOKEN_DS4X_TOK_SCAN", "1", 1);
+            int64_t na = ds4x_tok_encode(t, in, a, 8192);
+            unsetenv("IDLETOKEN_DS4X_TOK_SCAN");
+            int64_t nb = ds4x_tok_encode(t, in, b, 8192);
+            ran++;
+            if (na != nb) { mismatches++; continue; }
+            for (int64_t k = 0; k < na; k++)
+                if (a[k] != b[k]) { mismatches++; break; }
+        }
+        ok(ran == 11, "differential encode ran every case");
+        ok(mismatches == 0, "heap encode == scan encode, token for token");
     }
 
     ds4x_tok_free(t);

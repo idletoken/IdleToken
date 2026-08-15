@@ -5,6 +5,7 @@
   "backend": "ds4x",
   "arch": "unknown",
   "available": false,
+  "deployment": "cluster",
   "license": "TBD (weights announced for 2026-07-27)",
   "params_summary": "2.8T · KDA+MLA · ~1.4 TB native",
   "n_layers": 0,

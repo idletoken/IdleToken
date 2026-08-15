@@ -135,7 +135,7 @@ $SSHF "$TARGET" "cd /d $APPDIR_WIN && set \"IDLETOKEN_HEADLESS_PAIR=join:$CODE:i
 
 status=""
 for _ in $(seq 1 "$READY_TRIES"); do
-    status=$($SSH "$COORD_NODE" "curl -s -m 3 http://127.0.0.1:8000/v1/cluster/status 2>/dev/null" | tr -d '\r')
+    status=$($SSH "$COORD_NODE" "curl -s -m 3 http://127.0.0.1:8000/idletoken/v1/cluster/status 2>/dev/null" | tr -d '\r')
     case "$status" in *'"phase":"ready"'*) break ;; esac
     sleep 15
 done

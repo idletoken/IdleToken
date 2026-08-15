@@ -5,6 +5,7 @@
   "backend": "ds4x",
   "arch": "GLM_DSA",
   "available": false,
+  "deployment": "cluster",
   "license": "MIT",
   "params_summary": "744B · 40B active · Q2 ≈ 238 GB",
   "n_layers": 78,

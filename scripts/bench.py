@@ -242,15 +242,15 @@ FILLER = "The quick brown fox jumps over the lazy dog. "   # coarse unit, roughl
 PAD = "word "                                              # fine unit, 1 token
 
 
-def make_prompt(n_filler, n_pad, nonce):
+def make_prompt(n_filler, n_pad, nonce, filler=FILLER):
     """The nonce goes **at the front**: KV prefix reuse compares prefixes, and only
     a leading nonce guarantees the prefixes differ. At the end, a common prefix of
     several thousand tokens still hits the cache and "cold cache" becomes a
     fiction."""
-    return f"[{nonce}] " + FILLER * n_filler + PAD * n_pad
+    return f"[{nonce}] " + filler * n_filler + PAD * n_pad
 
 
-def calibrate(client, model, target_pp, nonce_fn, verbose=True):
+def calibrate(client, model, target_pp, nonce_fn, verbose=True, filler=FILLER):
     """Calibrate (n_filler, n_pad) so that prompt_tokens lands as close to
     target_pp as possible.
 
@@ -271,7 +271,7 @@ def calibrate(client, model, target_pp, nonce_fn, verbose=True):
         r = client.post_json("/v1/chat/completions", {
             "model": model,
             "messages": [{"role": "user",
-                          "content": make_prompt(n_filler, n_pad, nonce_fn())}],
+                          "content": make_prompt(n_filler, n_pad, nonce_fn(), filler)}],
             "max_tokens": 1,
         })
         return r["usage"]["prompt_tokens"]
@@ -327,7 +327,7 @@ def calibrate(client, model, target_pp, nonce_fn, verbose=True):
 # ---------------------------------------------------------------------------
 
 def snapshot(client):
-    return client.get_json("/v1/stats")
+    return client.get_json("/idletoken/v1/stats")
 
 
 def check_env(before, after, expected_requests, cold_cache, strict):
@@ -482,7 +482,7 @@ def run_batch(base_url, api_token, model, prompt_maker, tg, concurrency,
     for e in errors:
         if e is not None:
             raise e
-    # Priming turns also occupy the cluster and are counted in /v1/stats requests
+    # Priming turns also occupy the cluster and are counted in /idletoken/v1/stats requests
     # -- the environment gate needs to know about them.
     return results, concurrency + n_primed
 
@@ -569,6 +569,8 @@ def main():
                     help="exercise the KV cache-hit path: each thread issues a priming turn first and the "
                          "measured request is its continuation (--pp then sets only the first turn's length); "
                          "cold cache by default")
+    ap.add_argument("--prompt-file",
+                    help="repeat this UTF-8 corpus instead of the default English filler; used by versioned pricing workloads")
     ap.add_argument("--no-strict", dest="strict", action="store_false",
                     help="warn instead of exiting when the environment gate fails")
     ap.add_argument("--json", dest="json_out", help="write the full result (environment snapshots included) to a file")
@@ -586,6 +588,17 @@ def main():
         raise SystemExit("--concurrency must be at least 1")
     if args.repeat < 1:
         raise SystemExit("--repeat must be at least 1")
+    filler = FILLER
+    if args.prompt_file:
+        try:
+            with open(args.prompt_file, encoding="utf-8") as f:
+                filler = f.read()
+        except OSError as exc:
+            raise SystemExit(f"cannot read --prompt-file {args.prompt_file}: {exc}")
+        if not filler.strip():
+            raise SystemExit(f"--prompt-file is empty: {args.prompt_file}")
+        if not filler.endswith("\n"):
+            filler += "\n"
 
     probe = Client(args.base_url, args.api_token)
     health = probe.get_json("/health")
@@ -610,15 +623,15 @@ def main():
         # A cold cache needs a distinct nonce per request, a warm one needs a fixed
         # prefix. Calibration and measurement share the same generator.
         nonce_fn = (lambda: "warm") if args.warm_cache else (lambda: uuid.uuid4().hex[:12])
-        n_filler, n_pad = calibrate(calib_client, args.model, pp, nonce_fn)
+        n_filler, n_pad = calibrate(calib_client, args.model, pp, nonce_fn, filler=filler)
 
         # Calibration issued a number of max_tokens=1 requests, and the environment
         # gate has to account for them. Rather than guess the count, take the
         # snapshot at the end of calibration as the new baseline.
         env_before_run = snapshot(probe)
 
-        def prompt_maker(i, _f=n_filler, _p=n_pad, _nf=nonce_fn):
-            return make_prompt(_f, _p, _nf())
+        def prompt_maker(i, _f=n_filler, _p=n_pad, _nf=nonce_fn, _fill=filler):
+            return make_prompt(_f, _p, _nf(), _fill)
 
         def batch(conc):
             return run_batch(args.base_url, args.api_token, args.model, prompt_maker,
@@ -643,7 +656,13 @@ def main():
         conc_samples = [s for b in batches for s in b]
 
         row = summarize(conc_samples, tg)
-        row.update({"pp_target": pp, "tg": tg, "concurrency": args.concurrency})
+        row.update({
+            "pp_target": pp,
+            "tg": tg,
+            "concurrency": args.concurrency,
+            "filler_repeats": n_filler,
+            "pad_repeats": n_pad,
+        })
         # Compare the target against the prompt length **actually sent**, not the
         # value calibration returned. Any inconsistency between calibration and
         # measurement (nonce shape, message template, chat template) surfaces only

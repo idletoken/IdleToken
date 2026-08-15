@@ -2,7 +2,7 @@
 name = "idletoken-client"
 version = "0.1.0"
 description = "IdleToken desktop/mobile client"
-authors = ["HomeAI"]
+authors = ["IdleToken"]
 edition = "2021"
 rust-version = "1.77"
 
@@ -10,8 +10,31 @@ rust-version = "1.77"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# tray-icon + image-png: the app has to keep serving after its window is closed
+# (a cluster node is a background service, not a document editor), so the tray
+# is the only remaining way back to it. image-png is what `Image::from_bytes`
+# needs to decode the bundled icon.
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-shell = "2"
+# Native open-file dialog for the open-model picker (WS-D1): picking a local
+# GGUF needs a real filesystem path, which the webview's own file input does
+# not expose. Same "three OS conventions we should not re-implement" reasoning
+# as autostart.
+tauri-plugin-dialog = "2"
+# In-app update: check a signed release manifest, download, verify the
+# signature, install, relaunch. The signature check is the reason to use the
+# plugin rather than a hand-rolled downloader — an updater that installs
+# whatever the endpoint served is a remote-code-execution channel, and minisign
+# verification against a pubkey baked into the binary is exactly the part we
+# must not get wrong ourselves.
+tauri-plugin-updater = "2"
+# "Launch at login" across the three platforms (registry Run key / .desktop
+# autostart entry / LaunchAgent plist). Same reasoning: three OS conventions we
+# would otherwise re-implement and get subtly wrong on one of them.
+tauri-plugin-autostart = "2"
+# Only for parsing the update feed URL into the `Url` the updater builder
+# wants; it is already in the tree as a transitive dependency of tauri.
+url = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Backoff sleeps in the engine supervisor; tauri's async runtime is tokio.

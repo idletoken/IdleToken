@@ -240,6 +240,19 @@ void ds4x_prof_report(double *proj_s, double *conv_s, double *rec_s, double *pos
     if (post_s) *post_s = g_t_post;
 }
 
+/* The GQA (full-attention) layers, split the same way and for the same reason.
+ * Attention itself went to the device, but rope, the per-head Q/K RMSNorm and
+ * the sigmoid output gate stayed on the host as "O(N), cheap". At 502 tokens
+ * over 8 such layers that is ~20M transcendentals, and nsys says ~194 ms of a
+ * 636 ms prefill is host time that is neither kernel nor copy. Whether those
+ * loops are that time is a measurement, not a guess. */
+static double g_t_rope = 0.0, g_t_attn = 0.0, g_t_gate = 0.0;
+void ds4x_prof_gqa_report(double *rope_s, double *attn_s, double *gate_s) {
+    if (rope_s) *rope_s = g_t_rope;
+    if (attn_s) *attn_s = g_t_attn;
+    if (gate_s) *gate_s = g_t_gate;
+}
+
 static const ds4x_layer_weights *g_dump_layer = NULL;
 static int gdn_dump_on(void) {
     static int v = -1;
@@ -857,15 +870,19 @@ int ds4x_layer_forward_cpu(const ds4x_config *cfg, uint32_t il,
         matmul_q(w->v_proj, nrm_all, cache->v + (size_t)pos0 * kv_dim,
                  n_tokens, kv_dim, n_embd, rowbuf);
     }
+    /* Q/K norm + rope for the WHOLE chunk before any attention runs.
+     *
+     * This used to sit at the top of the per-token attention loop, which was
+     * correct only because the loop was sequential: token t reads k[u] for
+     * u <= pos, and those rows were roped by earlier iterations. Splitting the
+     * loop is what lets the attention itself go to the device (or, later, be
+     * parallelised at all) — with the two fused, every position is a dependency
+     * of the ones before it for no reason. */
+    const double gq_t0 = gdn_prof_on() ? now_s() : 0.0;
     for (uint32_t t = 0; t < n_tokens; t++) {
         const uint32_t pos = pos0 + t;
-        /* qt/ht are this token's slices of the chunk buffers — deliberately
-         * NOT the `q`/`hout` scratch views, which stay untouched for the MLA
-         * branch below. */
         float *qt = q_all + (size_t)t * qn_all;
-        float *ht = ho_all + (size_t)t * cfg->n_head * hdim;
         float *k_t = cache->k + (size_t)pos * kv_dim;
-        /* per-head qk-norm (before rope) then rope */
         /* Partial rotary: qwen35 rotates only the first rope_dim of a 256-wide
          * head (rope.dimension_count=64); dims above it are left untouched.
          * rope_dim_partial == 0 means "rope the whole head" (plain qwen3). */
@@ -880,6 +897,29 @@ int ds4x_layer_forward_cpu(const ds4x_config *cfg, uint32_t il,
             if (w->k_norm) rmsnorm(k_h, w->k_norm, k_h, hdim);
             rope_neox(k_h, rdim, pos, cfg->rope_theta);
         }
+    }
+
+    if (gdn_prof_on()) g_t_rope += now_s() - gq_t0;
+
+    /* The quadratic part. On the device when it can be — see
+     * ds4x_cuda_attn_gqa's header for what this costs on the host. */
+    const double gq_t1 = gdn_prof_on() ? now_s() : 0.0;
+    int attn_done = 0;
+#ifdef IDLETOKEN_DS4X_CUDA
+    if (ds4x_gpu_attn_wanted() && n_tokens >= ds4x_gpu_attn_min_tokens() &&
+        ds4x_cuda_attn_gqa(q_all, cache->k, cache->v, ho_all, n_tokens, pos0,
+                           cfg->n_head, cfg->n_head_kv, hdim, qstride, gscale,
+                           cfg->attn_out_gate ? 1 : 0) == 0)
+        attn_done = 1;   /* the gate came with it -- see below */
+#endif
+
+    for (uint32_t t = 0; t < n_tokens && !attn_done; t++) {
+        const uint32_t pos = pos0 + t;
+        /* qt/ht are this token's slices of the chunk buffers — deliberately
+         * NOT the `q`/`hout` scratch views, which stay untouched for the MLA
+         * branch below. */
+        const float *qt = q_all + (size_t)t * qn_all;
+        float *ht = ho_all + (size_t)t * cfg->n_head * hdim;
         for (uint32_t hd = 0; hd < cfg->n_head; hd++) {
             const uint32_t kvh = hd / grp;
             const float *q_h = qt + (size_t)hd * qstride;
@@ -900,18 +940,35 @@ int ds4x_layer_forward_cpu(const ds4x_config *cfg, uint32_t il,
                 for (uint32_t i = 0; i < hdim; i++) o_h[i] += p * vv[i];
             }
         }
-        /* Gated Attention: elementwise gate on the concatenated heads. The gate
-         * is SIGMOID, not silu — verified in llama.cpp's graph for qwen35
-         * (gate_sigmoid = SIGMOID(...); attn_gated = MUL(...)). The GDN z-gate
-         * in the very same model IS silu; do not conflate the two. */
-        if (cfg->attn_out_gate)
+    }
+
+    /* Gated Attention: elementwise gate on the concatenated heads. The gate is
+     * SIGMOID, not silu — verified in llama.cpp's graph for qwen35
+     * (gate_sigmoid = SIGMOID(...); attn_gated = MUL(...)). The GDN z-gate in
+     * the very same model IS silu; do not conflate the two.
+     *
+     * Runs only for the HOST path: ds4x_cuda_attn_gqa applies the gate itself,
+     * because its input is indexed by the same (token, head, dim) the kernel
+     * already owns, on data already uploaded. Doing it here afterwards cost 36 ms
+     * of a 463 ms prefill.
+     *
+     * `attn_done` therefore means "attention AND its gate", and the two have to
+     * move together — a device path that produced ungated attention would still
+     * produce finite, plausible-looking numbers. */
+    if (gdn_prof_on()) g_t_attn += now_s() - gq_t1;
+    const double gq_t2 = gdn_prof_on() ? now_s() : 0.0;
+    if (cfg->attn_out_gate && !attn_done)
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            const float *qt = q_all + (size_t)t * qn_all;
+            float *ht = ho_all + (size_t)t * cfg->n_head * hdim;
             for (uint32_t hd = 0; hd < cfg->n_head; hd++) {
                 const float *g_h = qt + (size_t)hd * qstride + hdim;
                 float *o_h = ht + (size_t)hd * hdim;
                 for (uint32_t i = 0; i < hdim; i++)
                     o_h[i] *= 1.0f / (1.0f + expf(-g_h[i]));
             }
-    }
+        }
+    if (gdn_prof_on()) g_t_gate += now_s() - gq_t2;
     if (tail_ok) {
         /* Hand concat(heads) to the fused tail, which applies attn_out and both
          * residuals on the device. ho_all survives past this block, so it is

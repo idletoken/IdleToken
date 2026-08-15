@@ -16,13 +16,39 @@
 #ifndef IDLETOKEN_MODEL_H
 #define IDLETOKEN_MODEL_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* Which inference backend runs this model (ASSIGN_PLAN `backend` byte). */
 typedef enum {
     IDLETOKEN_BACKEND_DS4  = 1,   /* vendor/ds4 DSv4-Flash-only kernel path */
     IDLETOKEN_BACKEND_DS4X = 2,   /* runtime-config generic MLA-MoE path (Phase B) */
+    IDLETOKEN_BACKEND_LLAMACPP = 3, /* llama.cpp engine (v2 rebuild, 2026-08-14):
+                                   * coord drives a local llama-server sidecar.
+                                   * Registry migration to this backend is a
+                                   * separate step (WS-B4); the value exists so
+                                   * ASSIGN_PLAN and manifests can name it. */
 } idletoken_backend;
+
+/* How a model may be deployed (CLAUDE.md hard constraint: large models may be
+ * spread over a homogeneous LAN cluster; small models run on ONE machine only).
+ *
+ * The split is per-model and declared in models/<id>.json, NOT derived from the
+ * backend or from a weight-size threshold: `backend` would misfile GLM-5.2 and
+ * Kimi (large models that also run on ds4x), and a byte threshold is an
+ * arbitrary line that drifts every time a quant is added.
+ *
+ * Why forbid it rather than merely not recommend it: a 4 GiB model split across
+ * three houses' machines spends its whole per-token budget on pipeline
+ * round-trips, so the cluster is strictly slower than the single machine that
+ * could have held it. "Works" is not the bar (design philosophy 10). */
+typedef enum {
+    IDLETOKEN_DEPLOY_UNSPECIFIED = 0, /* never valid in the registry — see
+                                       * idletoken_model_may_cluster() */
+    IDLETOKEN_DEPLOY_SINGLE_NODE = 1, /* one machine; multi-node is refused */
+    IDLETOKEN_DEPLOY_CLUSTER     = 2, /* may span a homogeneous cluster (N=1 is
+                                       * the degenerate case, still allowed) */
+} idletoken_deployment;
 
 /* KV-cache shape family — drives the per-node overhead estimate. */
 typedef enum {
@@ -60,6 +86,11 @@ typedef struct {
     const char *label;         /* human name for logs/UI */
     uint8_t  backend;          /* idletoken_backend */
     uint8_t  available;        /* 0 = registered but not yet runnable */
+    uint8_t  deployment;       /* idletoken_deployment — mirrors the manifest's
+                                * "deployment"; 0 means somebody added a model
+                                * and forgot, which model_manifest_check.py
+                                * rejects and idletoken_model_may_cluster()
+                                * treats as "no" */
 
     uint16_t n_layers;
     uint32_t n_embd;
@@ -119,6 +150,15 @@ const idletoken_model_variant *idletoken_model_variant_get(const idletoken_model
  * Convenience for planners that must size the SELECTED precision. */
 void idletoken_model_weight_bytes(const idletoken_model_spec *m, const char *quant,
                                uint64_t *layer_out, uint64_t *shared_out);
+
+/* May this model be served by more than one node? False for single-node models
+ * AND for a model whose deployment was never declared — an undeclared model is
+ * a maintainer mistake, and the fail-closed answer is the one that cannot
+ * quietly produce a cluster nobody meant to allow. NULL is false.
+ *
+ * `why` (optional, may be NULL) receives a user-facing sentence explaining the
+ * refusal; it is left untouched when the answer is true. */
+int idletoken_model_may_cluster(const idletoken_model_spec *m, char *why, size_t why_cap);
 
 /* Per-node inference overhead (KV + activations + workspace + comms + CUDA
  * context + margin) for `layers_on_node` of this model at `ctx_size`.

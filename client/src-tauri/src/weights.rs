@@ -15,7 +15,7 @@
 //!
 //! # Relationship to model_fetch.sh
 //!
-//! Behaviour is deliberately identical (endpoint probing order, Range resumption,
+//! Behaviour is deliberately identical (endpoint preference order, Range resumption,
 //! size validation, an actionable reason for each of the three failure classes),
 //! so a file the script half-downloaded can be finished by the client and vice
 //! versa. **The one intentional divergence**: this downloads to `<file>.part` and
@@ -46,14 +46,14 @@ use tauri::{AppHandle, Emitter};
 /// and silently hanging for 30 minutes is the worst possible answer.
 const DEFAULT_ENDPOINTS: &[&str] = &["https://huggingface.co", "https://hf-mirror.com"];
 
-/// Downloads in progress: id -> cancellation flag.
-static ACTIVE: Mutex<Vec<(String, Arc<AtomicBool>)>> = Mutex::new(Vec::new());
+/// Downloads in progress: id -> (the `.part` being written, cancellation flag).
+static ACTIVE: Mutex<Vec<(String, PathBuf, Arc<AtomicBool>)>> = Mutex::new(Vec::new());
 
-fn register(id: &str) -> Arc<AtomicBool> {
+fn register(id: &str, part: PathBuf) -> Arc<AtomicBool> {
     let flag = Arc::new(AtomicBool::new(false));
     let mut a = ACTIVE.lock().unwrap();
-    a.retain(|(k, _)| k != id);
-    a.push((id.to_string(), flag.clone()));
+    a.retain(|(k, _, _)| k != id);
+    a.push((id.to_string(), part, flag.clone()));
     flag
 }
 
@@ -61,11 +61,21 @@ fn register(id: &str) -> Arc<AtomicBool> {
 /// actually exits, so "still winding down after a cancel" counts as active —
 /// which is exactly what the caller must not race against.
 fn is_active(id: &str) -> bool {
-    ACTIVE.lock().unwrap().iter().any(|(k, _)| k == id)
+    ACTIVE.lock().unwrap().iter().any(|(k, _, _)| k == id)
+}
+
+/// Is any download — under ANY id — already writing this `.part`? The per-id
+/// guard cannot see a second writer that arrives under a different id (the
+/// UI-test oracles run real downloads under their own ids), and two writers on
+/// one file is the 2026-08-10 corruption all over again. Best-effort: two
+/// spellings of the same directory can slip past a path comparison, but every
+/// caller in this codebase builds the path the same way.
+fn is_active_part(part: &Path) -> bool {
+    ACTIVE.lock().unwrap().iter().any(|(_, p, _)| p == part)
 }
 
 fn unregister(id: &str) {
-    ACTIVE.lock().unwrap().retain(|(k, _)| k != id);
+    ACTIVE.lock().unwrap().retain(|(k, _, _)| k != id);
 }
 
 /// Complete, partial or absent. The front end uses this to decide what the
@@ -151,8 +161,8 @@ pub fn weights_state(dest_dir: String, file: String, expect_bytes: u64) -> Weigh
 #[tauri::command]
 pub fn weights_cancel(id: String) -> bool {
     let a = ACTIVE.lock().unwrap();
-    match a.iter().find(|(k, _)| *k == id) {
-        Some((_, flag)) => {
+    match a.iter().find(|(k, _, _)| *k == id) {
+        Some((_, _, flag)) => {
             flag.store(true, Ordering::SeqCst);
             true
         }
@@ -164,6 +174,84 @@ fn part_of(final_path: &Path) -> PathBuf {
     let mut s = final_path.as_os_str().to_os_string();
     s.push(".part");
     PathBuf::from(s)
+}
+
+/// One weight file sitting in the model folder.
+#[derive(serde::Serialize)]
+pub struct StoredWeights {
+    /// File name without the `.part` suffix — i.e. the name the manifest knows,
+    /// so the front end can put a model label on it.
+    pub file: String,
+    pub bytes: u64,
+    /// An unfinished download (`.part`). Continuing resumes from these bytes.
+    pub partial: bool,
+}
+
+/// What is actually on disk in the model folder.
+///
+/// A **scan**, not a lookup of the models we know about: the folder fills up
+/// with precisions you tried once and moved away from, and with the leftovers
+/// of a switch. Asking the manifests "is qwen3-8b/Q4_K_M here?" can only ever
+/// find what we thought to ask for, which is exactly not the file you are
+/// hunting when the disk is full.
+#[tauri::command]
+pub fn weights_list(dest_dir: String) -> Vec<StoredWeights> {
+    let mut out: Vec<StoredWeights> = Vec::new();
+    let Ok(rd) = fs::read_dir(&dest_dir) else { return out };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let (base, partial) = match name.strip_suffix(".part") {
+            Some(b) => (b.to_string(), true),
+            None => (name.clone(), false),
+        };
+        if !base.ends_with(".gguf") {
+            continue;
+        }
+        let bytes = e.metadata().map(|m| m.len()).unwrap_or(0);
+        out.push(StoredWeights { file: base, bytes, partial });
+    }
+    out.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    out
+}
+
+/// Delete one model's weights from the folder — the finished file and any
+/// leftover `.part` of the same name.
+///
+/// `file` must be a bare file name. Anything with a separator (or `..`) is
+/// refused: this command exists to free disk space in ONE directory, and a
+/// caller that can steer it elsewhere turns "delete a model" into "delete any
+/// file the app can reach". Non-`.gguf` names are refused for the same reason.
+///
+/// Returns the bytes freed. A file the OS will not let go of (Windows keeps a
+/// loaded model open) comes back as an error the UI can show, rather than a
+/// silent no-op that leaves the row on screen.
+#[tauri::command]
+pub fn weights_delete(dest_dir: String, file: String) -> Result<u64, String> {
+    if file.is_empty()
+        || file.contains('/')
+        || file.contains('\\')
+        || file.contains("..")
+        || !file.ends_with(".gguf")
+    {
+        return Err(format!("refusing to delete {file:?}: not a weights file name"));
+    }
+    let final_path = PathBuf::from(&dest_dir).join(&file);
+    let part_path = part_of(&final_path);
+    let mut freed = 0u64;
+    let mut errs: Vec<String> = Vec::new();
+    for p in [final_path, part_path] {
+        let Ok(md) = fs::metadata(&p) else { continue };
+        let len = md.len();
+        match fs::remove_file(&p) {
+            Ok(()) => freed += len,
+            Err(e) => errs.push(format!("{}: {e}", p.display())),
+        }
+    }
+    if errs.is_empty() {
+        Ok(freed)
+    } else {
+        Err(errs.join("; "))
+    }
 }
 
 /// Download a set of weights. Progress is pushed to the front end through
@@ -197,7 +285,15 @@ pub async fn weights_fetch(
                 .into(),
         );
     }
-    let cancel = register(&id);
+    // Same file under a different id: still two writers on one .part.
+    let part = part_of(&PathBuf::from(&dest_dir).join(&file));
+    if is_active_part(&part) {
+        return Err(
+            "these weights are already being downloaded by another task — wait for it to finish or cancel it first"
+                .into(),
+        );
+    }
+    let cancel = register(&id, part);
     let id2 = id.clone();
     let cancel_probe = cancel.clone();
     let r = tauri::async_runtime::spawn_blocking(move || {
@@ -251,12 +347,70 @@ fn client() -> Result<reqwest::blocking::Client, String> {
         .map_err(|e| format!("failed to initialize the HTTP client: {e}"))
 }
 
-/// Probe the endpoints in order and return the first that can serve the file.
+/// One endpoint's failure to serve the file.
+enum ProbeFail {
+    /// Trying other endpoints cannot help: the repo/file name itself is wrong.
+    Fatal(String),
+    /// This endpoint is out; another may still work.
+    Soft(String),
+}
+
+/// Ask one endpoint whether it can serve the file, and for the total length.
 ///
 /// It uses `Range: bytes=0-0` rather than HEAD: `resolve/main` is a redirect to a
 /// CDN, and some CDNs answer HEAD with 405. Asking for the first byte works on
 /// both, and the total length can be read from `Content-Range`. (This matches
 /// model_fetch.sh, whose comments give the same reason.)
+fn probe_one(c: &reqwest::blocking::Client, ep: &str, repo: &str, file: &str) -> Result<u64, ProbeFail> {
+    let url = format!("{}/{}/resolve/main/{}", ep.trim_end_matches('/'), repo, file);
+    let resp = match c.get(&url).header("Range", "bytes=0-0").send() {
+        Ok(r) => r,
+        Err(_) => return Err(ProbeFail::Soft(format!("{ep}: unreachable (blocked or offline)"))),
+    };
+    let code = resp.status().as_u16();
+    match code {
+        200 | 206 => {
+            // A 206 carries Content-Range: bytes 0-0/<total>; a 200 means the
+            // server ignored the Range, and then Content-Length is the full
+            // length.
+            let total = resp
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.rsplit('/').next().map(|x| x.to_string()))
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .or_else(|| resp.content_length())
+                .unwrap_or(0);
+            Ok(total)
+        }
+        // A 404 is a configuration error and trying another endpoint will not
+        // help -- the repo or file name in the manifest is wrong.
+        404 => Err(ProbeFail::Fatal(format!(
+            "{ep} does not have this file ({repo}/{file}). The repo or file name in the model manifest is wrong; another mirror will not help."
+        ))),
+        401 | 403 => Err(ProbeFail::Soft(format!("{ep}: requires sign-in (gated repository)"))),
+        _ => Err(ProbeFail::Soft(format!("{ep}: HTTP {code}"))),
+    }
+}
+
+/// How long an earlier-listed endpoint may stay silent once a later one has
+/// already answered. Long enough for an origin that is merely slow to respond;
+/// short enough that an origin whose packets are silently dropped (that burns
+/// the full 20 s connect timeout) does not hold a working mirror hostage.
+const PROBE_GRACE: Duration = Duration::from_secs(3);
+
+/// Probe every endpoint at once and return the earliest-listed one that can
+/// serve the file.
+///
+/// Concurrently, not in order: probing in order meant everyone behind a network
+/// that silently drops the first endpoint sat through its whole connect timeout
+/// before the next was even tried — on every single download. List order still
+/// decides preference (an earlier endpoint that answers wins over a later one),
+/// but only within PROBE_GRACE of the first success.
+///
+/// Which endpoint won is not surfaced in the UI — where the bytes come from is
+/// an implementation detail, not something the user is asked to think about.
+/// The progress events keep it for diagnostics only.
 fn probe(
     c: &reqwest::blocking::Client,
     endpoints: &[String],
@@ -264,49 +418,101 @@ fn probe(
     file: &str,
     emit: &dyn Fn(serde_json::Value),
     id: &str,
+    cancel: &AtomicBool,
 ) -> Result<Probe, String> {
-    let mut tried: Vec<String> = Vec::new();
-    for ep in endpoints {
-        let url = format!("{}/{}/resolve/main/{}", ep.trim_end_matches('/'), repo, file);
-        emit(serde_json::json!({ "id": id, "kind": "probe", "endpoint": ep }));
-        let resp = match c.get(&url).header("Range", "bytes=0-0").send() {
-            Ok(r) => r,
-            Err(_) => {
-                tried.push(format!("{ep}: unreachable (blocked or offline)"));
-                continue;
+    emit(serde_json::json!({ "id": id, "kind": "probe" }));
+    let (tx, rx) = std::sync::mpsc::channel();
+    for (i, ep) in endpoints.iter().enumerate() {
+        let tx = tx.clone();
+        let c = c.clone();
+        let (ep, repo, file) = (ep.clone(), repo.to_string(), file.to_string());
+        std::thread::spawn(move || {
+            // The receiver may be gone already (probe returned early); the
+            // straggler's verdict is then simply dropped.
+            let _ = tx.send((i, probe_one(&c, &ep, &repo, &file)));
+        });
+    }
+    drop(tx);
+
+    // The earliest-listed success whose predecessors have all failed. With
+    // `forced`, predecessors still pending count as failed — used once their
+    // grace has run out.
+    let pick = |outcome: &[Option<Result<u64, String>>], forced: bool| -> Option<(usize, u64)> {
+        for (i, o) in outcome.iter().enumerate() {
+            match o {
+                Some(Ok(total)) => return Some((i, *total)),
+                Some(Err(_)) => continue,
+                None if forced => continue,
+                None => return None,
+            }
+        }
+        None
+    };
+
+    let mut outcome: Vec<Option<Result<u64, String>>> = vec![None; endpoints.len()];
+    let mut first_success: Option<Instant> = None;
+    loop {
+        // Waits are sliced so a cancel is noticed within ~300 ms even while
+        // every endpoint is still sitting in its connect timeout. The cancel
+        // flag used to go unchecked until the transfer loop, so cancelling (or
+        // switching models, which cancels) during a slow probe held the one
+        // download slot hostage for the whole connect timeout.
+        const SLICE: Duration = Duration::from_millis(300);
+        let msg = loop {
+            if cancel.load(Ordering::SeqCst) {
+                return Err("cancelled (what has been downloaded is kept; the next attempt resumes)".into());
+            }
+            let wait = match first_success {
+                // Nothing usable yet: keep waiting for the next verdict,
+                // however long its connect timeout takes.
+                None => SLICE,
+                // Something usable is in hand: the better-preferred stragglers
+                // get what is left of the grace, then we stop waiting for them.
+                Some(t0) => SLICE.min(PROBE_GRACE.saturating_sub(t0.elapsed())),
+            };
+            match rx.recv_timeout(wait) {
+                Ok(m) => break Some(m),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break None,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some(t0) = first_success {
+                        if t0.elapsed() >= PROBE_GRACE {
+                            break None;
+                        }
+                    }
+                    // No success yet (or grace remains): keep slicing.
+                }
             }
         };
-        let code = resp.status().as_u16();
-        match code {
-            200 | 206 => {
-                // A 206 carries Content-Range: bytes 0-0/<total>; a 200 means the
-                // server ignored the Range, and then Content-Length is the full
-                // length.
-                let total = resp
-                    .headers()
-                    .get(reqwest::header::CONTENT_RANGE)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.rsplit('/').next().map(|x| x.to_string()))
-                    .and_then(|s| s.trim().parse::<u64>().ok())
-                    .or_else(|| resp.content_length())
-                    .unwrap_or(0);
-                return Ok(Probe { endpoint: ep.clone(), total });
+        match msg {
+            Some((i, Ok(total))) => {
+                outcome[i] = Some(Ok(total));
+                first_success.get_or_insert_with(Instant::now);
             }
-            // A 404 is a configuration error and trying another endpoint will not
-            // help -- the repo or file name in the manifest is wrong.
-            404 => {
-                return Err(format!(
-                    "{ep} does not have this file ({repo}/{file}). The repo or file name in the model manifest is wrong; another mirror will not help."
-                ))
+            Some((_, Err(ProbeFail::Fatal(msg)))) => return Err(msg),
+            Some((i, Err(ProbeFail::Soft(msg)))) => outcome[i] = Some(Err(msg)),
+            // Grace expired on the stragglers, or every thread has reported.
+            None => {
+                if let Some((i, total)) = pick(&outcome, true) {
+                    return Ok(Probe { endpoint: endpoints[i].clone(), total });
+                }
+                break;
             }
-            401 | 403 => tried.push(format!("{ep}: requires sign-in (gated repository)")),
-            _ => tried.push(format!("{ep}: HTTP {code}")),
+        }
+        if let Some((i, total)) = pick(&outcome, false) {
+            return Ok(Probe { endpoint: endpoints[i].clone(), total });
+        }
+        if outcome.iter().all(|o| o.is_some()) {
+            break;
         }
     }
-    Err(format!(
-        "no usable download source. Tried: {}. Check the network, or set a mirror you can reach in settings.",
-        tried.join("；")
-    ))
+    // Every endpoint failed.
+    // "[CODE] detail" (client-error convention, ERROR_KEYS in i18n.ts): the UI
+    // renders a localized, actionable sentence — check the network / retry /
+    // put a hand-downloaded GGUF in the model folder — with this endpoint list
+    // as the detail. (The old text pointed at a "mirror" setting that does not
+    // exist.)
+    let tried: Vec<String> = outcome.into_iter().flatten().filter_map(|r| r.err()).collect();
+    Err(format!("[WEIGHTS_NO_SOURCE] tried: {}", tried.join("; ")))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -340,7 +546,7 @@ fn fetch_inner(
     };
 
     let c = client()?;
-    let p = probe(&c, &eps, repo, file, emit, id)?;
+    let p = probe(&c, &eps, repo, file, emit, id, cancel)?;
     let total = if p.total > 0 { p.total } else { expect_bytes };
 
     let mut have = fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
@@ -358,7 +564,8 @@ fn fetch_inner(
         let _ = fs::remove_file(&part_path);
         emit(serde_json::json!({
             "id": id, "kind": "progress",
-            "note": "the partial file was longer than the source and could not be a resume point; starting over",
+            // "[CODE] detail" — localized by the UI (ERROR_KEYS in i18n.ts).
+            "note": "[WEIGHTS_PART_OVERRUN] the partial file was longer than the source and could not be a resume point; starting over",
             "have": 0u64, "total": total
         }));
         have = 0;
@@ -372,7 +579,7 @@ fn fetch_inner(
 
     emit(serde_json::json!({
         "id": id, "kind": "progress", "endpoint": p.endpoint,
-        "have": have, "total": total, "mirror": p.endpoint != DEFAULT_ENDPOINTS[0]
+        "have": have, "total": total
     }));
 
     let url = format!(
@@ -396,7 +603,9 @@ fn fetch_inner(
     // wrong -- far worse than a failed download.
     if have > 0 && resp.status().as_u16() == 200 {
         emit(serde_json::json!({
-            "id": id, "kind": "progress", "note": "the server does not support resumption; restarting from the beginning",
+            "id": id, "kind": "progress",
+            // "[CODE] detail" — localized by the UI (ERROR_KEYS in i18n.ts).
+            "note": "[WEIGHTS_NO_RESUME] the server does not support resumption; restarting from the beginning",
             "have": 0u64, "total": total
         }));
         have = 0;
@@ -466,4 +675,105 @@ fn fetch_inner(
     fs::rename(&part_path, &final_path)
         .map_err(|e| format!("rename failed for {}: {e}", final_path.display()))?;
     Ok(final_path.to_string_lossy().into_owned())
+}
+
+/// Tests for the disk-facing half of "delete a model".
+///
+/// `weights_delete` takes a file name from the front end and removes it, so the
+/// guard on that name is the only thing between a housekeeping feature and an
+/// arbitrary-file-delete. It is pure string work plus the filesystem, which
+/// means it can be tested here rather than argued about.
+#[cfg(test)]
+mod delete_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering as O};
+
+    static N: AtomicU32 = AtomicU32::new(0);
+
+    /// A private directory for one test (no rand/time available here).
+    fn tmpdir() -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "idletoken-wtest-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, O::SeqCst)
+        ));
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn write(dir: &Path, name: &str, len: usize) {
+        fs::write(dir.join(name), vec![0u8; len]).unwrap();
+    }
+
+    #[test]
+    fn deletes_the_file_and_its_leftover_part() {
+        let d = tmpdir();
+        write(&d, "m.gguf", 10);
+        write(&d, "m.gguf.part", 5);
+        let freed = weights_delete(d.to_string_lossy().into(), "m.gguf".into()).unwrap();
+        assert_eq!(freed, 15, "both files count towards the space freed");
+        assert!(!d.join("m.gguf").exists());
+        assert!(!d.join("m.gguf.part").exists(), "a stale .part would keep the disk full");
+    }
+
+    #[test]
+    fn deleting_a_partial_only_download_works() {
+        let d = tmpdir();
+        write(&d, "m.gguf.part", 7);
+        let freed = weights_delete(d.to_string_lossy().into(), "m.gguf".into()).unwrap();
+        assert_eq!(freed, 7);
+        assert!(!d.join("m.gguf.part").exists());
+    }
+
+    #[test]
+    fn refuses_to_leave_the_folder() {
+        let outside = tmpdir();
+        write(&outside, "precious.gguf", 3);
+        let inside = tmpdir();
+        for name in ["../precious.gguf", "..\\precious.gguf", "sub/precious.gguf", "/tmp/precious.gguf"] {
+            let r = weights_delete(inside.to_string_lossy().into(), name.into());
+            assert!(r.is_err(), "{name:?} must be refused");
+        }
+        assert!(outside.join("precious.gguf").exists(), "nothing outside the folder may be touched");
+    }
+
+    #[test]
+    fn refuses_anything_that_is_not_weights() {
+        let d = tmpdir();
+        write(&d, "notes.txt", 3);
+        assert!(weights_delete(d.to_string_lossy().into(), "notes.txt".into()).is_err());
+        assert!(weights_delete(d.to_string_lossy().into(), "".into()).is_err());
+        assert!(d.join("notes.txt").exists());
+    }
+
+    #[test]
+    fn missing_files_are_not_an_error() {
+        // The row may already be gone (deleted in another window, or by hand).
+        let d = tmpdir();
+        assert_eq!(weights_delete(d.to_string_lossy().into(), "nope.gguf".into()).unwrap(), 0);
+    }
+
+    #[test]
+    fn list_reports_partials_under_their_final_name() {
+        let d = tmpdir();
+        write(&d, "done.gguf", 100);
+        write(&d, "half.gguf.part", 40);
+        write(&d, "notes.txt", 5);
+        let mut got = weights_list(d.to_string_lossy().into());
+        got.sort_by(|a, b| a.file.cmp(&b.file));
+        assert_eq!(got.len(), 2, "only weights files are listed");
+        assert_eq!(got[0].file, "done.gguf");
+        assert!(!got[0].partial);
+        assert_eq!(got[0].bytes, 100);
+        // The .part suffix is stripped so the front end can look the name up in
+        // a manifest — otherwise every unfinished download shows as unknown.
+        assert_eq!(got[1].file, "half.gguf");
+        assert!(got[1].partial);
+        assert_eq!(got[1].bytes, 40);
+    }
+
+    #[test]
+    fn list_of_a_missing_folder_is_empty_not_a_crash() {
+        assert!(weights_list("/nonexistent/idletoken/models".into()).is_empty());
+    }
 }

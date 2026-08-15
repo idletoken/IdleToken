@@ -5,6 +5,7 @@
   "backend": "ds4x",
   "arch": "qwen35",
   "available": true,
+  "deployment": "single-node",
   "license": "Apache-2.0",
   "params_summary": "4B · 32 layers · hybrid linear attention (Gated DeltaNet 3:1 full)",
   "n_layers": 32,

@@ -42,6 +42,12 @@ int main(void) {
         first = 0;
         jstr("label", m->label, 0);
         jnum("available", m->available, 0);
+        /* Emitted as the manifest's own spelling, so the checker compares the
+         * two sides literally instead of translating an enum and getting to
+         * decide what an unknown value means. */
+        jstr("deployment",
+             m->deployment == IDLETOKEN_DEPLOY_CLUSTER     ? "cluster" :
+             m->deployment == IDLETOKEN_DEPLOY_SINGLE_NODE ? "single-node" : "", 0);
         jnum("n_layers", m->n_layers, 0);
         jnum("n_embd", m->n_embd, 0);
         jnum("hc_streams", m->hc_streams, 0);

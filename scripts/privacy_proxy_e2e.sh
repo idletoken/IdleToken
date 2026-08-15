@@ -70,7 +70,7 @@ grep -q "PRIVACY_CLIENT_OK" /tmp/idletoken_e2e_client.err && ok "client reports 
 
 echo "== auth enforcement =="
 if command -v nc >/dev/null 2>&1; then
-    ST=$(printf 'POST /v1/privacy/messages HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\nConnection: close\r\n\r\n%0100d' 0 | nc -w2 127.0.0.1 $PROXY_PORT | head -1)
+    ST=$(printf 'POST /idletoken/v1/privacy/messages HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\nConnection: close\r\n\r\n%0100d' 0 | nc -w2 127.0.0.1 $PROXY_PORT | head -1)
     echo "$ST" | grep -q "401" && ok "forged/unauthenticated sealed request rejected (401)" || bad "forged request not rejected (got: $ST)"
 else
     echo "  [skip] nc not present — auth-rejection is covered by privacy_http_selftest EAUTH checks"

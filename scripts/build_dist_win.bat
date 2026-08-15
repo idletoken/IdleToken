@@ -72,6 +72,44 @@ for %%F in (cublas64_12.dll cublasLt64_12.dll cudart64_12.dll) do (
   )
 )
 
+REM === licences (MANDATORY) ===
+REM The .exe/.dll files above contain vendored third-party code whose licences
+REM require their notice to travel with a BINARY distribution: ds4 (MIT) and
+REM rax (BSD 3-Clause, clause 2), plus Apache-2.0 section 4(d) for our own
+REM NOTICE. Until 2026-08-13 this bundle shipped the binaries and none of the
+REM texts. Missing = hard fail, not a warning: a bundle that is silently
+REM non-compliant looks exactly like a good one.
+echo === licences ===
+if not exist dist\licenses mkdir dist\licenses
+for %%F in (LICENSE NOTICE) do (
+  if exist %%F (
+    copy /y %%F dist\%%F >nul
+  ) else (
+    echo DIST_FAIL: %%F missing in the repo root — refusing to ship binaries without it
+    exit /b 1
+  )
+)
+if exist vendor\ds4\LICENSE (
+  copy /y vendor\ds4\LICENSE dist\licenses\ds4-MIT.txt >nul
+) else (
+  echo DIST_FAIL: vendor\ds4\LICENSE missing — ds4 code is linked into these binaries
+  exit /b 1
+)
+REM rax keeps its terms in its own header; take them from the source we compile.
+REM findstr writes the whole header block; the check below proves it is the BSD
+REM text and not an empty file.
+if exist vendor\ds4\rax.c (
+  powershell -NoProfile -Command ^
+    "$t = Get-Content -Raw vendor\ds4\rax.c; $m = [regex]::Match($t, '(?s)^/\* Rax.*?\*/'); if (-not $m.Success -or $m.Value -notmatch 'Redistribution and use in source and binary forms') { exit 1 }; Set-Content -Path dist\licenses\rax-BSD-3-Clause.txt -Value $m.Value"
+  if errorlevel 1 (
+    echo DIST_FAIL: could not extract the rax BSD-3 licence from vendor\ds4\rax.c
+    exit /b 1
+  )
+) else (
+  echo DIST_FAIL: vendor\ds4\rax.c missing — rax is linked into these binaries
+  exit /b 1
+)
+
 REM Print every file WITH ITS TIMESTAMP. On 2026-07-29 a stale ds4cuda.dll went
 REM into a release and the installed worker fell back to MOCK after a
 REM cudaMemcpy error — the bundle looked fine, the answers were garbage. Dates

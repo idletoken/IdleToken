@@ -10,6 +10,7 @@
 #include "idletoken_discovery.h"
 #include "idletoken_net.h"
 #include "idletoken_sha256.h"
+#include "idletoken_http.h"   /* IDLETOKEN_PATH_RENDEZVOUS */
 
 #include <errno.h>
 #include <stdio.h>
@@ -67,7 +68,7 @@ static int ct_equal(const uint8_t *a, const uint8_t *b, size_t n) {
  * Randomness.
  * ========================================================================== */
 
-int idletoken_random_bytes(void *buf, size_t n) {
+int idletoken_disc_random_bytes(void *buf, size_t n) {
 #if defined(_WIN32)
     return BCryptGenRandom(NULL, (PUCHAR)buf, (ULONG)n,
                            BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0 ? 0 : -1;
@@ -96,7 +97,7 @@ const char IDLETOKEN_CODE_ALPHABET[] = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";  /* 3
 int idletoken_pair_code_mint(char *out, size_t cap) {
     if (!out || cap < IDLETOKEN_CODE_LEN + 1) { errno = EINVAL; return -1; }
     uint8_t r[IDLETOKEN_CODE_LEN];
-    if (idletoken_random_bytes(r, sizeof(r)) != 0) return -1;
+    if (idletoken_disc_random_bytes(r, sizeof(r)) != 0) return -1;
     for (int i = 0; i < IDLETOKEN_CODE_LEN; i++)
         out[i] = IDLETOKEN_CODE_ALPHABET[r[i] % 32];
     out[IDLETOKEN_CODE_LEN] = '\0';
@@ -189,7 +190,7 @@ static int pack_beacon(uint8_t *out, size_t cap, size_t *out_len,
     idletoken_buf_put_u8(&b, (uint8_t)id->mode);
     uint8_t z3[3] = {0}; idletoken_buf_put_bytes(&b, z3, 3);
     uint8_t nonce[IDLETOKEN_PAIR_NONCE_BYTES];
-    idletoken_random_bytes(nonce, sizeof(nonce));
+    idletoken_disc_random_bytes(nonce, sizeof(nonce));
     idletoken_buf_put_bytes(&b, nonce, sizeof(nonce));
     /* tag over group_id||coord_addr||nonce, keyed by psk */
     uint8_t macbuf[IDLETOKEN_GROUP_ID_BYTES + 128 + IDLETOKEN_PAIR_NONCE_BYTES], full[32];
@@ -268,7 +269,7 @@ static int pack_query(uint8_t *out, size_t cap, size_t *out_len, const idletoken
     uint8_t pay[64];
     idletoken_buf b; idletoken_buf_init(&b, pay, sizeof(pay));
     idletoken_buf_put_bytes(&b, id->group_id, IDLETOKEN_GROUP_ID_BYTES);
-    uint8_t nonce[IDLETOKEN_PAIR_NONCE_BYTES]; idletoken_random_bytes(nonce, sizeof(nonce));
+    uint8_t nonce[IDLETOKEN_PAIR_NONCE_BYTES]; idletoken_disc_random_bytes(nonce, sizeof(nonce));
     idletoken_buf_put_bytes(&b, nonce, sizeof(nonce));
     uint8_t z8[8] = {0}; idletoken_buf_put_bytes(&b, z8, 8);
     if (b.err) { errno = EOVERFLOW; return -1; }
@@ -576,15 +577,22 @@ static void hex32(const uint8_t *in, char out[65]) {
     out[64] = '\0';
 }
 
-/* POST `body` (JSON) to rendezvous_url ("host:port") path /v1/rendezvous with a
- * bearer token; return the response body (malloc'd, NUL-terminated) or NULL. */
+/* POST `body` (JSON) to rendezvous_url ("host:port") path /idletoken/v1/rendezvous
+ * with a bearer token; return the response body (malloc'd, NUL-terminated) or NULL.
+ *
+ * The path moved out of `/v1` with the rest of the control plane
+ * (docs/api-surface.md §4.3). Unlike the coordinator's own routes this one is a
+ * contract with a separately-deployed artifact, so the gateway answers on both
+ * spellings for one release — an engine built before the move keeps working, and
+ * this one works against a gateway that has not shipped the move yet. */
 static char *rdv_post(const char *addr, const char *token, const char *body) {
     int fd = idletoken_connect_tcp(addr);
     if (fd < 0) return NULL;
     char host[256] = ""; { const char *c = strrchr(addr, ':'); size_t hl = c ? (size_t)(c-addr) : strlen(addr); if (hl > 255) hl = 255; memcpy(host, addr, hl); host[hl] = '\0'; }
     char req[1536];
     int rl = snprintf(req, sizeof(req),
-        "POST /v1/rendezvous HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\n"
+        "POST " IDLETOKEN_PATH_RENDEZVOUS " HTTP/1.1\r\nHost: %s\r\n"
+        "Content-Type: application/json\r\n"
         "Authorization: Bearer %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s",
         host, token ? token : "", strlen(body), body);
     if (rl <= 0 || idletoken_sendall(fd, req, (size_t)rl) < 0) { idletoken_close_fd(fd); return NULL; }
@@ -829,7 +837,7 @@ static void auth_tag(const idletoken_pair_id *id, const char *label,
 int idletoken_pair_client_auth(int fd, const idletoken_pair_id *id,
                             uint8_t session_key[IDLETOKEN_SESSION_KEY_BYTES]) {
     uint8_t wnonce[IDLETOKEN_PAIR_NONCE_BYTES];
-    idletoken_random_bytes(wnonce, sizeof(wnonce));
+    idletoken_disc_random_bytes(wnonce, sizeof(wnonce));
     uint8_t wtag[IDLETOKEN_PAIR_TAG_BYTES];
     auth_tag(id, "pair-w", wnonce, NULL, wtag);
 
@@ -883,7 +891,7 @@ int idletoken_pair_server_auth(int fd, const idletoken_pair_id *id,
     }
 
     uint8_t cnonce[IDLETOKEN_PAIR_NONCE_BYTES];
-    idletoken_random_bytes(cnonce, sizeof(cnonce));
+    idletoken_disc_random_bytes(cnonce, sizeof(cnonce));
     uint8_t ctag[IDLETOKEN_PAIR_TAG_BYTES] = {0};
     if (ok) auth_tag(id, "pair-c", wnonce, cnonce, ctag);
 
@@ -901,5 +909,66 @@ int idletoken_pair_server_auth(int fd, const idletoken_pair_id *id,
 
     if (!ok) { errno = EACCES; return -1; }
     if (session_key) derive_session(id, wnonce, cnonce, session_key);
+    return 0;
+}
+
+/* ============================================================================
+ * Secret wrapping under the pairing session key (v2 WS-C2).
+ * ========================================================================== */
+
+/* keystream = HMAC(session_key, label || nonce); ct = secret XOR keystream.
+ * One HMAC block covers the whole 32-byte secret, so no counter is needed. */
+static void wrap_keystream(const uint8_t session_key[IDLETOKEN_SESSION_KEY_BYTES],
+                           const uint8_t nonce[IDLETOKEN_PAIR_NONCE_BYTES],
+                           uint8_t ks[32]) {
+    uint8_t m[24 + IDLETOKEN_PAIR_NONCE_BYTES];
+    memcpy(m, "idletoken-rpc-psk-v1", 20);
+    memcpy(m + 20, nonce, IDLETOKEN_PAIR_NONCE_BYTES);
+    idletoken_hmac_sha256(session_key, IDLETOKEN_SESSION_KEY_BYTES,
+                          m, 20 + IDLETOKEN_PAIR_NONCE_BYTES, ks);
+}
+
+static void wrap_tag(const uint8_t session_key[IDLETOKEN_SESSION_KEY_BYTES],
+                     const uint8_t nonce[IDLETOKEN_PAIR_NONCE_BYTES],
+                     const uint8_t ct[IDLETOKEN_SESSION_KEY_BYTES],
+                     uint8_t tag[IDLETOKEN_PAIR_TAG_BYTES]) {
+    uint8_t m[24 + IDLETOKEN_PAIR_NONCE_BYTES + IDLETOKEN_SESSION_KEY_BYTES], full[32];
+    memcpy(m, "idletoken-rpc-tag-v1", 20);
+    memcpy(m + 20, nonce, IDLETOKEN_PAIR_NONCE_BYTES);
+    memcpy(m + 20 + IDLETOKEN_PAIR_NONCE_BYTES, ct, IDLETOKEN_SESSION_KEY_BYTES);
+    idletoken_hmac_sha256(session_key, IDLETOKEN_SESSION_KEY_BYTES,
+                          m, 20 + IDLETOKEN_PAIR_NONCE_BYTES + IDLETOKEN_SESSION_KEY_BYTES,
+                          full);
+    memcpy(tag, full, IDLETOKEN_PAIR_TAG_BYTES);
+}
+
+void idletoken_pair_wrap_secret(const uint8_t session_key[IDLETOKEN_SESSION_KEY_BYTES],
+                                const uint8_t nonce[IDLETOKEN_PAIR_NONCE_BYTES],
+                                const uint8_t secret[IDLETOKEN_SESSION_KEY_BYTES],
+                                uint8_t ct[IDLETOKEN_SESSION_KEY_BYTES],
+                                uint8_t tag[IDLETOKEN_PAIR_TAG_BYTES]) {
+    uint8_t ks[32];
+    wrap_keystream(session_key, nonce, ks);
+    for (int i = 0; i < IDLETOKEN_SESSION_KEY_BYTES; i++) ct[i] = secret[i] ^ ks[i];
+    memset(ks, 0, sizeof(ks));
+    wrap_tag(session_key, nonce, ct, tag);
+}
+
+int idletoken_pair_unwrap_secret(const uint8_t session_key[IDLETOKEN_SESSION_KEY_BYTES],
+                                 const uint8_t nonce[IDLETOKEN_PAIR_NONCE_BYTES],
+                                 const uint8_t ct[IDLETOKEN_SESSION_KEY_BYTES],
+                                 const uint8_t tag[IDLETOKEN_PAIR_TAG_BYTES],
+                                 uint8_t secret[IDLETOKEN_SESSION_KEY_BYTES]) {
+    uint8_t expect[IDLETOKEN_PAIR_TAG_BYTES];
+    wrap_tag(session_key, nonce, ct, expect);
+    if (!ct_equal(expect, tag, IDLETOKEN_PAIR_TAG_BYTES)) {
+        memset(secret, 0, IDLETOKEN_SESSION_KEY_BYTES);
+        errno = EACCES;
+        return -1;
+    }
+    uint8_t ks[32];
+    wrap_keystream(session_key, nonce, ks);
+    for (int i = 0; i < IDLETOKEN_SESSION_KEY_BYTES; i++) secret[i] = ct[i] ^ ks[i];
+    memset(ks, 0, sizeof(ks));
     return 0;
 }

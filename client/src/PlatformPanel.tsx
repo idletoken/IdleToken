@@ -250,7 +250,7 @@ function ShareCard(props: {
   rel: (iso: string | null) => string;
   onChanged: () => void;
 }) {
-  const { t } = useI18n();
+  const { t, tErr } = useI18n();
   const tauri = inTauri();
   const [st, setSt] = useState<AgentStatus | null>(null);
   const [lines, setLines] = useState<AgentLogLine[]>([]);
@@ -312,7 +312,9 @@ function ShareCard(props: {
         });
       }
     } catch (e) {
-      setErr(String((e as Error)?.message ?? e));
+      // tErr: the supervisor's own precondition errors ("[PLATFORM_URL_EMPTY]"
+      // and friends) render localized; anything else passes through verbatim.
+      setErr(tErr(String((e as Error)?.message ?? e)));
     }
     setBusy(false);
   };

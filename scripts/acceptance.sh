@@ -17,9 +17,10 @@
 #         scripts/acceptance.sh -v         # verbose (show check output)
 #         scripts/acceptance.sh --gate G4  # run ONE gate (no earlier-gate skip)
 #
-# Node aliases resolve via ~/.ssh/config (see memory: real-cluster-topology).
-# Off-LAN (Tailscale) runs can override the route without touching checks:
-#   IDLETOKEN_COORD_NODE=DGX IDLETOKEN_API_HOST=100.97.254.63 scripts/acceptance.sh --gate G4
+# Node aliases resolve via ~/.ssh/config (configured in scripts/testbed.env;
+# template: testbed.env.example). Off-LAN runs can override the route without
+# touching checks:
+#   IDLETOKEN_COORD_NODE=<coord-alias> IDLETOKEN_API_HOST=192.168.1.x scripts/acceptance.sh --gate G4
 set -u
 
 VERBOSE=0
@@ -68,7 +69,7 @@ read -r -a WORKER_NODES <<< "${IDLETOKEN_WORKER_NODES:-}"
 # purely local and hardware-free -- exited 2 without a testbed.env. CI could not
 # run it, a stranger cloning the repo could not run it, and that README sentence
 # was false. Requiring something presupposes actually using it.
-LOCAL_ONLY_GATES=" G_MODEL G_SCHED "
+LOCAL_ONLY_GATES=" G_MODEL G_SCHED G_VERSION G_MAC_SMOKE G_PRIV7 G_PPL "
 needs_nodes=1
 if [ -n "$ONLY_GATE" ] && [[ "$LOCAL_ONLY_GATES" == *" $ONLY_GATE "* ]]; then needs_nodes=0; fi
 if [ "$needs_nodes" = 1 ] && { [ -z "$COORD_NODE" ] || [ ${#WORKER_NODES[@]} -eq 0 ]; }; then
@@ -89,6 +90,40 @@ acceptance.sh: no nodes are configured.
 NOCFG
     exit 2
 fi
+# --- temporarily unavailable nodes -----------------------------------------
+# IDLETOKEN_SKIP_NODES names machines that are configured but OUT OF SERVICE
+# for this run (powered off, lent out, or being driven by another agent whose
+# work an ssh-in would corrupt). They are removed from the node set LOUDLY:
+# gates that iterate the worker set see the reduced set, and gates whose whole
+# subject is a skipped node SKIP with the reason instead of failing after a
+# two-minute retry loop. This is the honest middle ground between "fail the
+# whole ladder at G0 because one laptop is off" and "quietly test fewer
+# machines while reporting a complete run" (2026-08-14, WS-F).
+read -r -a SKIP_NODES <<< "${IDLETOKEN_SKIP_NODES:-}"
+node_skipped() {
+    local s
+    for s in ${SKIP_NODES[@]+"${SKIP_NODES[@]}"}; do
+        [ "$s" = "$1" ] && return 0
+    done
+    return 1
+}
+if [ -n "$COORD_NODE" ] && node_skipped "$COORD_NODE"; then
+    echo "acceptance.sh: IDLETOKEN_SKIP_NODES contains the coordinator ($COORD_NODE) — nothing can run without it." >&2
+    exit 2
+fi
+if [ ${#SKIP_NODES[@]} -gt 0 ]; then
+    _kept=()
+    for _n in ${WORKER_NODES[@]+"${WORKER_NODES[@]}"}; do
+        if node_skipped "$_n"; then
+            echo "note: node $_n is OUT OF SERVICE this run (IDLETOKEN_SKIP_NODES) — gates that need it will SKIP, not fail" >&2
+        else
+            _kept+=("$_n")
+        fi
+    done
+    WORKER_NODES=(${_kept[@]+"${_kept[@]}"})
+    unset _kept
+fi
+
 ALL_NODES=("$COORD_NODE" ${WORKER_NODES[@]+"${WORKER_NODES[@]}"})
 # An override has to be stated loudly (principle 13, honest reporting): a run on
 # fewer or different machines must never read like a complete one.
@@ -141,16 +176,23 @@ for _n in ${WORKER_NODES[@]+"${WORKER_NODES[@]}"}; do
     fi
 done
 WIN_HOME="$(win_home "$WIN_BUILD_NODE")"   # the build node's repository checkout
-DGX_HOME='~/work/IdleToken'
+# The repository checkout on the coordinator node. Comes from testbed.env
+# (IDLETOKEN_COORD_HOME) like the other machine facts; the tilde stays literal
+# here and expands on the remote shell.
+DGX_HOME="${IDLETOKEN_COORD_HOME:-~/work/IdleToken}"
 # Coord API host: derive from ssh config so the ladder follows whatever address
 # actually reaches the coordinator (LAN at home, Tailscale off-LAN). Hardcoding
 # an IP here rotted once already (2026-07-22 DHCP reshuffle made .101 = win-a).
 API_HOST="${IDLETOKEN_API_HOST:-$(ssh -G "$COORD_NODE" 2>/dev/null | awk '/^hostname /{print $2; exit}')}"
 API_HOST="${API_HOST:-127.0.0.1}"
 API_PORT="${IDLETOKEN_API_PORT:-8000}"
-# Real DSv4-Flash Q2 GGUF on the coordinator node (P6 real-reply gate). Path is
-# resolved on the remote (DGX) shell, so $HOME expands there.
-GGUF_DGX="${IDLETOKEN_GGUF:-\$HOME/work/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf}"
+# Real large-model GGUF on the coordinator node (P6 real-reply gate). Where the
+# weights live is a property of YOUR machine, so it comes from testbed.env
+# (IDLETOKEN_GGUF; template: testbed.env.example). The path is resolved on the
+# remote shell, so $HOME expands there. The neutral default below only makes an
+# unconfigured run fail with "GGUF not found" at a visible path instead of
+# pointing at one maintainer's directory layout.
+GGUF_DGX="${IDLETOKEN_GGUF:-\$HOME/models/your-model.gguf}"
 
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 # Fire-and-forget variant. Backgrounding *inside* the remote shell does not
@@ -272,6 +314,13 @@ g0_ssh_mesh() {
 # =====================================================================
 g1_build() {
     local name="$1"
+    # The gate's subject is the WINDOWS build (the coord-node half is a two-file
+    # ls). With every Windows worker out of service, running the remainder and
+    # reporting PASS would certify a build nobody checked.
+    if [ ${#WORKER_NODES[@]} -eq 0 ]; then
+        skip "$name" "all Windows worker nodes are out of service this run (IDLETOKEN_SKIP_NODES) — the Windows build was not checked"
+        return
+    fi
     # --- rebuild from the CURRENT REPO TREE first -------------------------
     # Without this the gate only proves "a runnable file sits on the machine".
     # It stayed green for days while the Windows worker could not be built at
@@ -297,7 +346,17 @@ g1_build() {
         $SSH "$bn" "powershell -NoProfile -Command \"Get-Process idletoken-worker,idletoken-coord,idletoken-platform-agent -ErrorAction SilentlyContinue | Stop-Process -Force\"" >/dev/null 2>&1
         sleep 2
         before=$($SSH "$bn" "powershell -NoProfile -Command \"cd $bhome; if(Test-Path idletoken-worker.exe){(Get-Item idletoken-worker.exe).LastWriteTime.Ticks}else{0}\"" 2>/dev/null | tr -d '\r ')
-        $SSH "$bn" "cd /d ${bhome//\//\\} && build_ds4x_win.bat" >/dev/null 2>&1
+        # The MinGW worker imports ds4x CUDA through ds4xcuda.dll. Rebuilding
+        # only the .exe regenerates the import library from ds4xcuda.def but
+        # leaves the DLL itself stale; a newly exported entry point then links
+        # yet fails when Windows loads it. Build the DLL from the same synced
+        # tree first, and require the CUDA script's real exit status.
+        if ! $SSH "$bn" "cd /d ${bhome//\//\\} && call src\\platform\\win\\build_ds4xcuda.bat > ds4xcuda_build.log 2>&1" >/dev/null 2>&1; then
+            fail "$name" "$bn ds4xcuda.dll rebuild failed (see $bhome/ds4xcuda_build.log)"; return
+        fi
+        if ! $SSH "$bn" "cd /d ${bhome//\//\\} && call build_ds4x_win.bat" >/dev/null 2>&1; then
+            fail "$name" "$bn worker rebuild command failed (see $bhome/ds4x_build.log)"; return
+        fi
         after=$($SSH "$bn" "powershell -NoProfile -Command \"cd $bhome; if(Test-Path idletoken-worker.exe){(Get-Item idletoken-worker.exe).LastWriteTime.Ticks}else{0}\"" 2>/dev/null | tr -d '\r ')
         # `LINK_DONE` in the log is NOT a success marker — the script echoes it
         # unconditionally, so a failed link still writes it. A log that reads
@@ -351,8 +410,9 @@ g2_probe() {
     local dg; dg=$($SSH "$COORD_NODE" "cd $DGX_HOME && ./idletoken-worker --probe-only 2>&1" 2>/dev/null)
     echo "$dg" | grep -q "vram usable:" && echo "$dg" | grep -Eq "gpu:.*[A-Za-z]" || bad="$bad DGX"
     vlog "DGX probe: $(echo "$dg" | grep -E 'gpu:|vram usable' | tr '\n' ';')"
+    [ ${#WORKER_NODES[@]} -eq 0 ] && vlog "no Windows workers in this run's node set — only the coordinator was probed"
     # Windows workers: need GPU name + cc>0 + vram_total>0 (the current gap)
-    for n in "${WORKER_NODES[@]}"; do
+    for n in ${WORKER_NODES[@]+"${WORKER_NODES[@]}"}; do
         local home; home=$(win_home "$n")
         local p; p=$($SSH "$n" "powershell -NoProfile -Command \"cd $home; \$env:PATH='$WIN_CUDA_BIN;'+\$env:PATH; (& .\\idletoken-worker.exe --probe-only 2>&1)\"" 2>/dev/null)
         # accept when gpu name non-empty AND cc not 0.0 AND vram total not 0 B
@@ -367,17 +427,43 @@ g2_probe() {
 }
 
 # =====================================================================
-# G_TOPO — any-combination coverage. The sweep itself runs for hours
-#          (scripts/topology_matrix.sh, resumable), so the ladder does not
-#          re-run it: this gate AUDITS the recorded matrix. No matrix on disk
-#          is an honest SKIP, not a pass.
+# G_TOPO — any-combination coverage. The sweep itself runs for hours, so the
+#          ladder does not re-run it: this gate AUDITS the recorded matrix.
+#          No matrix on disk is an honest SKIP, not a pass.
+#
+# 2026-08-15 (llama.cpp pivot, WS-F migration this gate was missing from):
+# the ds4-line sweep (scripts/topology_matrix.sh -> build/topology-matrix.tsv)
+# is PARKED. Its oracle was per-cell token-id equality (`ids_sha`), retired with
+# decision #10, and its rules encode two invariants that no longer hold: "a
+# cluster must be homogeneous" and "DSv4 is the only runnable cluster model".
+# Running it would audit a product we no longer ship. `IDLETOKEN_DS4_TOPO_GATE=1`
+# still runs the parked assertions so the frozen line cannot rot unnoticed.
+#
+# The live gate audits the llama.cpp matrix (results/matrix-llamacpp-*.jsonl,
+# newest wins). What it demands is the v2 product claim, not a cell count:
+#   - no FAIL cell;
+#   - a REAL single-machine cell on EACH supported compute platform
+#     (linux / macos / windows) — "one binary, three platforms";
+#   - a REAL multi-machine cell — a single machine proves no topology;
+#   - a REAL cross-OS cell — heterogeneous clusters are the v2 claim (§1.4),
+#     and an unproven claim is the thing this gate exists to catch;
+#   - every PASS cell carries coherent output AND a decode number: a cell with
+#     no measurement is a note, not evidence.
+# Cells recorded PENDING are named in the failure so the frontier says which
+# machine to go and measure, rather than "coverage insufficient".
 # =====================================================================
 TOPO_RESULTS="${IDLETOKEN_TOPO_RESULTS:-$PWD/build/topology-matrix.tsv}"
+TOPO_MATRIX="${IDLETOKEN_TOPO_MATRIX:-}"
 
 g_topo() {
     local name="$1"
+    if [ "${IDLETOKEN_DS4_TOPO_GATE:-0}" != "1" ]; then
+        g_topo_llamacpp "$name"
+        return
+    fi
+    vlog "IDLETOKEN_DS4_TOPO_GATE=1 — running the parked ds4-line matrix audit"
     if [ ! -s "$TOPO_RESULTS" ] || [ "$(tail -n +2 "$TOPO_RESULTS" | wc -l | tr -d ' ')" = 0 ]; then
-        skip "$name" "no topology matrix recorded — run scripts/topology_matrix.sh (hours; resumable)"
+        skip "$name" "no ds4-line topology matrix recorded — run scripts/topology_matrix.sh (hours; resumable)"
         return
     fi
     local nfail; nfail=$(awk -F'\t' '$1=="FAIL"' "$TOPO_RESULTS" | wc -l | tr -d ' ')
@@ -406,6 +492,98 @@ print(" ".join(json.load(open(f))["id"] for f in sorted(glob.glob("models/*.json
     vlog "matrix: $npass pass, $nskip skip, 0 fail"
     vlog "simulated cells: $(awk -F'\t' '$1=="PASS" && $5=="simulated" {c++} END{print c+0}' "$TOPO_RESULTS") (labelled, not real hardware)"
     pass "$name"
+}
+
+# The live (llama.cpp) half of G_TOPO — see the block comment above for what it
+# demands and why. Pure audit of a recorded file: it starts no cluster, so it
+# stays cheap enough to run every round.
+g_topo_llamacpp() {
+    local name="$1" files
+    if [ -n "$TOPO_MATRIX" ]; then
+        files="$TOPO_MATRIX"
+    else
+        files=$(ls -1 "$REPO_ROOT"/results/matrix-llamacpp-*.jsonl 2>/dev/null | sort)
+    fi
+    if [ -z "$files" ]; then
+        skip "$name" "no llama.cpp topology matrix recorded (results/matrix-llamacpp-*.jsonl) — measure the cells and record them"
+        return
+    fi
+    local out
+    # shellcheck disable=SC2086
+    out=$(python3 - $files <<'PY' 2>&1
+import json, sys
+
+# EVERY recorded matrix file, oldest first, later record for a cell winning.
+# Reading only the newest file would silently drop every cell measured before
+# today the moment a new dated file appears -- the audit would then "not cover"
+# platforms that were in fact proven months ago.
+paths = sys.argv[1:]
+by_cell = {}
+for path in paths:
+    for n, line in enumerate(open(path), 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            c = json.loads(line)
+        except Exception as e:
+            print("BAD line %d of %s: %s" % (n, path, e)); raise SystemExit(1)
+        by_cell[c.get("cell")] = c
+cells = list(by_cell.values())
+if not cells:
+    print("BAD no cells in: " + " ".join(paths)); raise SystemExit(1)
+
+def is_real(c):   return c.get("kind") == "real"
+def passed(c):    return c.get("result") == "PASS"
+def oses(c):      return [c.get("coord_os", "")] + list(c.get("worker_os", []))
+
+bad = [c["cell"] for c in cells if c.get("result") == "FAIL"]
+if bad:
+    print("FAIL failing cell(s): " + " ".join(bad)); raise SystemExit(0)
+
+# A PASS with no measurement is a claim, not evidence.
+thin = [c["cell"] for c in cells
+        if passed(c) and is_real(c)
+        and not (c.get("coherent") is True and (c.get("decode_tps") or 0) > 0)]
+if thin:
+    print("FAIL PASS cell(s) with no coherent output or no decode number: "
+          + " ".join(thin)); raise SystemExit(0)
+
+pending = [c["cell"] for c in cells if c.get("result") == "PENDING"]
+missing = []
+
+for want in ("linux", "macos", "windows"):
+    if not any(passed(c) and is_real(c) and c.get("topology") == "single"
+               and c.get("coord_os") == want for c in cells):
+        missing.append("single-machine/" + want)
+if not any(passed(c) and is_real(c) and c.get("topology") == "cluster" for c in cells):
+    missing.append("multi-machine")
+if not any(passed(c) and is_real(c) and c.get("topology") == "cluster"
+           and len({o for o in oses(c) if o}) > 1 for c in cells):
+    missing.append("cross-OS cluster")
+# Inherited from the parked ds4 gate, and still a product claim: the
+# all-Windows household needs a Windows machine that can BE the coordinator.
+if not any(passed(c) and is_real(c) and c.get("topology") == "cluster"
+           and c.get("coord_os") == "windows" for c in cells):
+    missing.append("Windows-coordinated cluster")
+
+if missing:
+    msg = "FAIL matrix does not cover: " + " ".join(missing)
+    if pending:
+        msg += " — recorded PENDING: " + " ".join(pending)
+    print(msg); raise SystemExit(0)
+
+npass = sum(1 for c in cells if passed(c))
+nreal = sum(1 for c in cells if passed(c) and is_real(c))
+print("OK %d passing cell(s), %d on real hardware, %d pending; %d matrix file(s)"
+      % (npass, nreal, len(pending), len(paths)))
+PY
+)
+    case "$out" in
+        OK*)   vlog "${out#OK }"; pass "$name" ;;
+        FAIL*) fail "$name" "${out#FAIL }" ;;
+        *)     fail "$name" "could not audit $f: $out" ;;
+    esac
 }
 
 # =====================================================================
@@ -568,6 +746,13 @@ g_hw() {
 # =====================================================================
 g3_package() {
     local name="$1"
+    # Both Windows halves run on the build node; with it out of service the
+    # coord half alone cannot honestly certify E3 (the decision under test —
+    # "no cublas in the bundle, driver-only probe" — is a Windows fact).
+    if node_skipped "$WIN_BUILD_NODE" || [ ${#WORKER_NODES[@]} -eq 0 ]; then
+        skip "$name" "Windows build node $WIN_BUILD_NODE is out of service this run — the driver-only bundle was not checked"
+        return
+    fi
     # (1) coord-node dist: build + manifest + --help self-check, honest verdict.
     local pk
     pk=$($SSH "$COORD_NODE" "cd $DGX_HOME && bash scripts/package_dist.sh 2>&1 | tail -1" 2>/dev/null | tr -d '\r')
@@ -580,6 +765,16 @@ g3_package() {
     local mf
     mf=$($SSH "$COORD_NODE" "test -s $DGX_HOME/dist/MANIFEST.txt && echo yes || echo no" 2>/dev/null | tr -d '\r')
     [ "$mf" = "yes" ] || { fail "$name" "dist/MANIFEST.txt missing/empty on $COORD_NODE despite DIST_OK"; return; }
+
+    # The bundle ships binaries containing vendored ds4 (MIT) and rax (BSD-3);
+    # both licences require the notice to travel with a binary distribution, as
+    # does Apache-2.0 4(d) for our NOTICE. Asserted HERE and not only inside
+    # package_dist.sh, because what ships is the folder, not the script: this
+    # gate is the thing that looks at the artifact.
+    local lic
+    lic=$($SSH "$COORD_NODE" "cd $DGX_HOME/dist && for f in LICENSE NOTICE licenses/ds4-MIT.txt licenses/rax-BSD-3-Clause.txt; do test -s \"\$f\" || echo MISSING:\$f; done" 2>/dev/null | tr -d '\r')
+    [ -z "$lic" ] || { fail "$name" "dist/ ships binaries without their licence texts ($lic)"; return; }
+    vlog "coord-node dist/ carries LICENSE, NOTICE and the vendored licences"
 
     # (2) The Windows half: **repackage first, then assert** -- symmetrical with
     # the Linux half, where package_dist.sh rebuilds. This half used to inspect
@@ -594,6 +789,12 @@ g3_package() {
         *DIST_FAIL*) fail "$name" "repackaging failed on $WIN_BUILD_NODE: $pkw"; return ;;
         *) vlog "$WIN_BUILD_NODE dist\ rebuilt ($pkw)" ;;
     esac
+
+    # Same licence assertion on the Windows bundle (see the Linux half above).
+    local licw
+    licw=$($SSH "$WIN_BUILD_NODE" "powershell -NoProfile -Command \"cd $WIN_HOME/dist; @('LICENSE','NOTICE','licenses/ds4-MIT.txt','licenses/rax-BSD-3-Clause.txt') | ForEach-Object { if (-not (Test-Path \$_) -or (Get-Item \$_).Length -eq 0) { 'MISSING:' + \$_ } }\"" 2>/dev/null | tr -d '\r')
+    [ -z "$licw" ] || { fail "$name" "$WIN_BUILD_NODE dist\ ships binaries without their licence texts ($licw)"; return; }
+    vlog "$WIN_BUILD_NODE dist\ carries LICENSE, NOTICE and the vendored licences"
 
     # (3) Windows driver-only probe (no CUDA bin on PATH).
     local out; out=$($SSH "$WIN_BUILD_NODE" "powershell -NoProfile -Command \"cd $WIN_HOME/dist 2>&1; if(Test-Path idletoken-worker.exe){ (& .\\idletoken-worker.exe --probe-only 2>&1 | Select-Object -First 1) } else { 'NO_DIST' }\"" 2>/dev/null | tr -d '\r')
@@ -644,7 +845,7 @@ g3_package() {
 g_release() {
     local name="$1"
     local bn="$WIN_BUILD_NODE" bhome nsis
-    if ! printf '%s\n' "${WORKER_NODES[@]}" | grep -qx "$bn"; then
+    if ! printf '%s\n' ${WORKER_NODES[@]+"${WORKER_NODES[@]}"} | grep -qx "$bn"; then
         skip "$name" "build node $bn is not in this run's node set"; return
     fi
     bhome=$(win_home "$bn")
@@ -670,20 +871,83 @@ g_release() {
     # — with nothing in the diff to show why (2026-07-29).
     ( cd "$REPO_ROOT/client" && "$vite" build ) >/dev/null 2>&1
 
-    local before after out
+    local before after out key_path sign_bin sign_tmp updater_zip updater_sig zip_count
     before=$($SSH "$bn" "powershell -NoProfile -Command \"if(Test-Path '$nsis'){(Get-ChildItem '$nsis' -Filter *.exe | Sort-Object LastWriteTime | Select-Object -Last 1).LastWriteTime.Ticks}else{0}\"" 2>/dev/null | tr -d '\r ')
-    out=$($SSH "$bn" "cd /d ${bhome//\//\\} && scripts\\build_client_release.bat" 2>/dev/null | tr -d '\r' | tail -1)
+    # The only trusted updater private key lives on the control machine. Build
+    # the installer and updater zip on Windows, then sign the zip here. The key
+    # never reaches the build node, its filesystem, environment, or process
+    # list. This also supports the existing updater key's intentionally empty
+    # password without depending on Windows' treatment of empty env variables.
+    key_path="${IDLETOKEN_UPDATER_KEY:-$HOME/.idletoken/updater.key}"
+    [ -r "$key_path" ] || { fail "$name" "updater signing key missing at $key_path — restore the existing key; do not generate a replacement"; return; }
+    sign_bin="$REPO_ROOT/client/node_modules/.bin/tauri"
+    [ -x "$sign_bin" ] || { fail "$name" "local Tauri signer missing at $sign_bin"; return; }
+    out=$($SSH "$bn" "cd /d ${bhome//\//\\} && set \"IDLETOKEN_DEFER_UPDATER_SIGNING=1\" && scripts\\build_client_release.bat" \
+      2>/dev/null | tr -d '\r' | tail -1)
     case "$out" in
-        CLIENT_RELEASE_OK) ;;
+        CLIENT_RELEASE_DEFERRED_SIGNING) ;;
         *) fail "$name" "$bn could not produce an installer (last line '$out'; see the tauri output under client\\src-tauri)"; return ;;
     esac
     after=$($SSH "$bn" "powershell -NoProfile -Command \"if(Test-Path '$nsis'){(Get-ChildItem '$nsis' -Filter *.exe | Sort-Object LastWriteTime | Select-Object -Last 1).LastWriteTime.Ticks}else{0}\"" 2>/dev/null | tr -d '\r ')
     # A green last line alone would let the PREVIOUS installer stand in for this
     # one — the same way dist\ certified a three-week-old binary (see G3 (3)).
     if [ "${after:-0}" -le "${before:-0}" ]; then
-        fail "$name" "CLIENT_RELEASE_OK but the installer timestamp did not advance -- this certifies the previous artifact"; return
+        fail "$name" "CLIENT_RELEASE_DEFERRED_SIGNING but the installer timestamp did not advance -- this certifies the previous artifact"; return
     fi
-    vlog "$bn rebuilt the installer from the current tree (artifact timestamp refreshed)"
+
+    # --- what is actually INSIDE the installer ----------------------------
+    # A fresh timestamp says the build ran, not what it packed. Two ways that
+    # goes wrong, both seen on 2026-08-14: the v2 engine (llama-server +
+    # ggml-rpc-server) is what makes an installed client able to infer at all,
+    # and tauri.windows.conf.json REPLACES `bundle.resources` from
+    # tauri.conf.json rather than adding to it — so the Windows installer
+    # shipped with no LICENSE/NOTICE while every other platform had them.
+    # NSIS archives list with 7-Zip, so ask the artifact itself.
+    local listing missing f
+    listing=$($SSH "$bn" "powershell -NoProfile -Command \"\$z='C:\\Program Files\\7-Zip\\7z.exe'; if(-not (Test-Path \$z)){exit 3}; \$i=Get-ChildItem '$nsis' -Filter *.exe | Sort-Object LastWriteTime -Descending | Select-Object -First 1; & \$z l \$i.FullName\"" 2>/dev/null | tr -d '\r')
+    if [ -z "$listing" ]; then
+        fail "$name" "could not list the installer on $bn (is 7-Zip installed at C:\\Program Files\\7-Zip\\7z.exe? the gate refuses to certify a package it cannot open)"; return
+    fi
+    missing=""
+    # The engine halves first: llama-server serves, ggml-rpc-server is what a
+    # worker node runs. Shipping one without the other gives an installed
+    # client a cluster mode it cannot actually join.
+    for f in idletoken-client.exe idletoken-coord.exe idletoken-worker.exe \
+             llama-server.exe ggml-rpc-server.exe \
+             LICENSE.txt NOTICE.txt ds4-MIT.txt rax-BSD-3-Clause.txt llamacpp-MIT.txt; do
+        printf '%s\n' "$listing" | grep -qF "$f" || missing="$missing $f"
+    done
+    [ -z "$missing" ] || { fail "$name" "the installer $bn just built is missing:$missing"; return; }
+    vlog "installer carries both engine binaries and every licence text"
+
+    sign_tmp=$(mktemp -d "${TMPDIR:-/tmp}/idletoken-updater-sign.XXXXXX") || {
+        fail "$name" "could not create a local updater signing directory"; return;
+    }
+    if ! scp -q "${bn}:${nsis}/*.nsis.zip" "$sign_tmp/" 2>/dev/null; then
+        rm -rf "$sign_tmp"
+        fail "$name" "failed to fetch the updater archive from $bn"; return
+    fi
+    zip_count=$(find "$sign_tmp" -maxdepth 1 -type f -name '*.nsis.zip' | wc -l | tr -d ' ')
+    if [ "$zip_count" != "1" ]; then
+        rm -rf "$sign_tmp"
+        fail "$name" "expected exactly one updater archive from $bn, found $zip_count"; return
+    fi
+    updater_zip=$(find "$sign_tmp" -maxdepth 1 -type f -name '*.nsis.zip' -print)
+    if ! "$sign_bin" signer sign -f "$key_path" -p "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" "$updater_zip" >/dev/null 2>&1; then
+        rm -rf "$sign_tmp"
+        fail "$name" "local updater signing failed with the trusted key"; return
+    fi
+    updater_sig="$updater_zip.sig"
+    if [ ! -s "$updater_sig" ] || ! scp -q "$updater_sig" "${bn}:${nsis}/$(basename "$updater_sig")" 2>/dev/null; then
+        rm -rf "$sign_tmp"
+        fail "$name" "failed to return the updater signature to $bn"; return
+    fi
+    if ! $SSH "$bn" "powershell -NoProfile -Command \"if(-not (Test-Path '$nsis/$(basename "$updater_sig")' -PathType Leaf)){exit 1}; if((Get-Item '$nsis/$(basename "$updater_sig")').Length -le 0){exit 2}\"" >/dev/null 2>&1; then
+        rm -rf "$sign_tmp"
+        fail "$name" "the updater signature is missing or empty on $bn"; return
+    fi
+    rm -rf "$sign_tmp"
+    vlog "$bn rebuilt the installer from the current tree; updater archive signed on the control machine"
     pass "$name"
 }
 
@@ -692,8 +956,23 @@ g_release() {
 # =====================================================================
 g4_single_infer() {
     local name="$1"
-    # Placeholder oracle: a helper on DGX brings up a 1-node cluster and does a
-    # real decode step, printing SINGLE_INFER_OK on success. Not yet wired.
+    # RETIRED (2026-08-14, llama.cpp pivot, decision #10 in
+    # docs/v2-rebuild-plan-2026-08.md): this gate's oracle
+    # (scripts/run_single_infer.sh) judges by EXACT greedy token-id equality
+    # against the official single-node ds4 run. Measured the same day: two
+    # correct engines on the same GGUF, same template, greedy, agree for 3
+    # tokens and diverge at the 4th — token-for-token equality is not a valid
+    # correctness oracle across engine changes, and the engine it compares
+    # against (ds4) is itself frozen. Distribution-level replacement: G_PPL
+    # (perplexity band, scripts/ppl_gate.sh); single-machine serving is
+    # covered live by G_MAC_SMOKE and the llamacpp matrix
+    # (results/matrix-llamacpp-*.jsonl).
+    # The gate code stays runnable for the parked ds4 line — same contract as
+    # G_DSPARK: set IDLETOKEN_DS4_TOKEN_GATE=1 to exercise it.
+    if [ "${IDLETOKEN_DS4_TOKEN_GATE:-0}" != "1" ]; then
+        skip "$name" "retired 2026-08-14 (exact-token oracle, decision #10; see G_PPL) — set IDLETOKEN_DS4_TOKEN_GATE=1 to run the parked ds4 check"
+        return
+    fi
     local out; out=$($SSH "$COORD_NODE" "cd $DGX_HOME && test -x scripts/run_single_infer.sh && ./scripts/run_single_infer.sh 2>&1 | tail -1 || echo NO_HELPER" 2>/dev/null | tr -d '\r')
     [ "$out" = "SINGLE_INFER_OK" ] && pass "$name" || fail "$name" "single-node inference not proven (got '$out')"
 }
@@ -835,6 +1114,14 @@ g_pair() {
         *G_PAIR_OK*) vlog "two engine processes joined by code -> cluster_ready" ;;
         *) fail "$name" "engine code-pairing did not reach cluster_ready (got '$(echo "$out" | tail -1)')"; return ;;
     esac
+    # With no worker node available this run, the cross-machine half has no
+    # machine to run on. Say so and pass on the loopback evidence alone — the
+    # same honesty contract as the XMACHINE_PAIR_SKIP branch below.
+    if [ ${#WORKER_NODES[@]} -eq 0 ]; then
+        vlog "cross-machine half skipped: no worker node in service this run (loopback pairing only)"
+        pass "$name"
+        return
+    fi
     # CROSS-MACHINE, not just loopback. Everything above runs two processes on
     # ONE box, so it cannot see anything that only breaks over the physical LAN
     # (a firewall rule, a broadcast that does not leave the host, an address the
@@ -896,6 +1183,17 @@ g_model() {
     vlog "models/*.json agree with the compiled registry"
 
     # 2. ds4x config + forward (generates fixtures, incl. a tiny real GGUF)
+    #
+    # PARKED (2026-08-14, llama.cpp pivot — docs/v2-rebuild-plan-2026-08.md §1.1
+    # and pivot doc §6): the ds4x generic-kernel line is FROZEN; its bit-exact
+    # alignment channels (config/forward/tokenizer/dequant/GQA/GDN, sub-checks
+    # 2–2d below) are retired from the default ladder along with it, in the
+    # same style as G_DSPARK. The code stays runnable so bit-rot in the frozen
+    # line surfaces as a gate failure rather than a surprise: set
+    # IDLETOKEN_DS4X_GATE=1 before touching ds4x again. Sub-checks 1/1b
+    # (registry+planner), 3 (no-hardcode scan) and 4 (protocol carries model
+    # identity) are engine-agnostic orchestration properties and keep running.
+    if [ "${IDLETOKEN_DS4X_GATE:-0}" = "1" ]; then
     local cf ff
     cf=$(cd "$repo" && python3 scripts/make_test_gguf.py build/fixtures >/dev/null 2>&1 \
             && cc -Wall -Wextra -std=c99 -Iinclude src/common/gguf.c src/common/model.c \
@@ -964,14 +1262,28 @@ g_model() {
             && ./build/ds4x_gdn_test build/fixtures/ds4x_gdn.bin 2>&1 | tail -1)
     echo "$gd" | grep -q "DS4X_GDN_TEST_OK" || { fail "$name" "ds4x linear-attention (GDN) alignment failed ($gd)"; return; }
     vlog "ds4x GQA + hybrid linear-attention (state-carry + PP-split bit-exact) passed"
+    else
+        vlog "ds4x bit-exact channels parked (frozen line, 2026-08-14) — set IDLETOKEN_DS4X_GATE=1 to run them"
+    fi
 
     # 3. no-hardcode scan over the orchestration layer (vendor/ds4 excluded).
     #    The smell is a model name baked in as a VALUE (a quoted string literal
     #    "deepseek-v4-flash" in a response/assignment) or the old fixed
     #    layer-count macro. Help/usage text mentioning the default by name is
     #    fine — that is documentation, not a hardcoded code path.
+    #
+    #    Comments are documentation too. The scan strips C comment lines before
+    #    matching: a block-comment body line (`* ...`), a `//` line, or a
+    #    single-line `/* ... */` mentioning the default (e.g. WS-B4's comment
+    #    "reported \"deepseek-v4-flash\" while serving Qwen") is prose, not a
+    #    baked-in code path. A real value literal in a statement is not stripped
+    #    by any of these filters, so it still trips the gate.
     local bad=""
-    grep -RnE '"deepseek-v4-flash"' "$repo/src/coord" "$repo/src/worker" 2>/dev/null >/dev/null \
+    grep -RnE '"deepseek-v4-flash"' "$repo/src/coord" "$repo/src/worker" 2>/dev/null \
+        | grep -vE ':[[:space:]]*\*' \
+        | grep -vE ':[[:space:]]*//' \
+        | grep -vE ':[[:space:]]*/\*' \
+        | grep -q . \
         && bad="$bad model-name-value-literal"
     grep -Rn "IDLETOKEN_DS4_N_LAYER" "$repo/src" 2>/dev/null >/dev/null && bad="$bad DS4_N_LAYER-macro"
     grep -RnE '\b43\b' "$repo/src/common/plan.c" 2>/dev/null >/dev/null && bad="$bad plan.c-literal-43"
@@ -1086,10 +1398,13 @@ ensure_frontend() {
     return 1
 }
 
-# Run one client instance in the foreground with the given directives; prints
-# its log afterwards. $1=directives $2=logfile $3=timeout-guard(s)
-client_run() {
-    # Resolve the display once per run, and say so loudly when it is virtual.
+# Resolve the display in the CALLER shell before any client launch. In
+# particular, client_run is normally invoked inside `out=$(client_run ...)`;
+# resolving it only inside that command substitution loses CLIENT_ENV when the
+# subshell exits. P1/P2 then pass while P3's direct background launches fall
+# back to dead DISPLAY=:1 and wait ten minutes before reporting a pairing
+# failure, with the real GTK error hidden in the remote logs.
+ensure_client_display() {
     if [ -z "${CLIENT_DISPLAY_RESOLVED:-}" ]; then
         CLIENT_DISPLAY_RESOLVED="$(client_display)"
         CLIENT_ENV="$CLIENT_ENV_BASE DISPLAY=$CLIENT_DISPLAY_RESOLVED"
@@ -1098,6 +1413,12 @@ client_run() {
             echo "      The programmatic assertions still hold; a human visual walkthrough is not covered by this round." >&2
         fi
     fi
+}
+
+# Run one client instance in the foreground with the given directives; prints
+# its log afterwards. $1=directives $2=logfile $3=timeout-guard(s)
+client_run() {
+    ensure_client_display
     ensure_frontend
     # WebKit caches the frontend bundle, **index.html included**. A rebuilt dist
     # can therefore have no effect at all: on 2026-08-05 a newly added UI-test
@@ -1113,6 +1434,25 @@ client_run() {
 
 p1_client() {
     local name="$1"
+    ensure_client_display
+    # The shell itself must come from the current Rust sources too. The first
+    # WS-F full-suite run only compared the staged worker with the root worker;
+    # it therefore called the sidecars FRESH while running an Aug-08 client
+    # binary against Aug-14 sources. That stale shell produced both UI reports
+    # but never honoured the current graceful-quit path, blocking every product
+    # gate with a misleading teardown failure.
+    local shell_fresh
+    shell_fresh=$($SSH "$COORD_NODE" "cd $DGX_HOME && \
+        b=client/src-tauri/target/debug/idletoken-client; \
+        if [ ! -x \$b ]; then echo NO_CLIENT; \
+        elif find client/src-tauri/src client/src-tauri/Cargo.toml client/src-tauri/Cargo.lock \
+             -type f -newer \$b -print -quit 2>/dev/null | grep -q .; then echo STALE_CLIENT; \
+        else echo FRESH_CLIENT; fi" 2>/dev/null | tr -d '\r')
+    case "$shell_fresh" in
+        FRESH_CLIENT) vlog "client shell is not older than its Rust sources" ;;
+        NO_CLIENT) fail "$name" "no debug client on $COORD_NODE (cd client/src-tauri && cargo build)"; return ;;
+        *) fail "$name" "debug client is STALE on $COORD_NODE — run cd client/src-tauri && cargo build"; return ;;
+    esac
     # The client spawns the engine as SIDECARS from client/src-tauri/binaries/.
     # That directory is staged by hand (release script / stage_sidecars.sh), so
     # it drifts — and when it does, every P gate and G-FINAL certify an engine
@@ -1159,6 +1499,15 @@ p1_client() {
     # 2026-08-09: first report-diagnostics was suspected, then the missing window
     # manager (that one was real and fixed separately), and only then was the
     # actual cause measured.
+    # 2026-08-14, MEASURED AND RULED OUT: on the Xvfb fallback display this gate
+    # fails "client did not exit cleanly" **and the budget is not the cause** --
+    # raising it to 150s changed nothing while BOTH UI_TEST_REPORTs were produced
+    # correctly in the same run. Nor is it the tray (`quit:<ms>` goes through
+    # app_quit/app.exit(0), deliberately bypassing close-to-tray). What is left:
+    # the coordinator has **no logged-in desktop session** (:1 is dead), so the
+    # client renders through software WebKit (`libEGL: DRI3 error: Could not get
+    # DRI3 device`) and its teardown never completes. Environment, not stopwatch:
+    # do not "fix" this by growing the number again.
     out=$(client_run "report-probe,report-diagnostics:token=SENTINEL-acc,quit:25000" /tmp/idletoken-p1.log 90)
     client_cleanup
     echo "$out" | grep -q "CLIENT_EXIT=0" || { fail "$name" "client did not exit cleanly"; return; }
@@ -1193,6 +1542,7 @@ else: print('ok')" 2>/dev/null)
 
 p2_auth() {
     local name="$1"
+    ensure_client_display
     client_cleanup
     local out
     out=$(client_run "auth-flow,quit:20000" /tmp/idletoken-p2.log 40)
@@ -1216,6 +1566,7 @@ print('ok' if not bad else 'failed: '+','.join(bad)+' in '+json.dumps(r))" 2>/de
 
 p3_pairing() {
     local name="$1"
+    ensure_client_display
     client_cleanup
     ensure_frontend
     # Two instances on the coordinator node: A creates + auto-starts, B joins
@@ -1238,7 +1589,7 @@ p3_pairing() {
     # A REAL 80 GiB load takes minutes, not the 90s that sufficed for mock.
     local st="" i
     for i in $(seq 1 100); do
-        st=$($SSH "$COORD_NODE" "curl -s -m 2 http://127.0.0.1:$API_PORT/v1/cluster/status; true" 2>/dev/null | tr -d '\r')
+        st=$($SSH "$COORD_NODE" "curl -s -m 2 http://127.0.0.1:$API_PORT/idletoken/v1/cluster/status; true" 2>/dev/null | tr -d '\r')
         case "$st" in *'"phase":"ready"'*) break ;; esac
         st=""
         sleep 6
@@ -1250,16 +1601,37 @@ p3_pairing() {
     fi
     vlog "cluster status: $st"
     local ok
+    # Two status schemas, one verdict each. The llamacpp line has no per-member
+    # layer ranges (the split is a tensor-split share, not a layer table); its
+    # "this is a real cluster" facts are engine_state=ready + a worker with an
+    # rpc endpoint. The legacy branch keeps the 43-layer coverage check.
+    # 2026-08-15: the old single-schema assertion KeyError'd on the llamacpp
+    # payload and the swallowed stderr made the gate fail with an EMPTY reason
+    # — so this version never dies silently.
     ok=$(echo "$st" | python3 -c "
 import json,sys
-s=json.load(sys.stdin)
-m=sorted(s.get('members',[]),key=lambda x:x['stage'])
-cover=(m and m[0]['layer_lo']==0 and m[-1]['layer_hi']==43
-       and all(m[i]['layer_hi']==m[i+1]['layer_lo'] for i in range(len(m)-1)))
-print('ok' if s.get('phase')=='ready' and cover else 'bad: '+json.dumps(s))" 2>/dev/null)
+try:
+    s=json.load(sys.stdin)
+    if s.get('engine')=='llamacpp':
+        m=s.get('members',[])
+        coords=[x for x in m if x.get('role')=='coordinator']
+        workers=[x for x in m if x.get('role')=='worker']
+        good=(s.get('phase')=='ready' and s.get('engine_state')=='ready'
+              and s.get('cluster_size',0)>=2 and len(coords)==1
+              and len(workers)>=1
+              and all(x.get('state')=='ready' for x in m)
+              and all(w.get('rpc_endpoint') for w in workers))
+        print('ok' if good else 'bad: '+json.dumps(s))
+    else:
+        m=sorted(s.get('members',[]),key=lambda x:x['stage'])
+        cover=(m and m[0]['layer_lo']==0 and m[-1]['layer_hi']==43
+               and all(m[i]['layer_hi']==m[i+1]['layer_lo'] for i in range(len(m)-1)))
+        print('ok' if s.get('phase')=='ready' and cover else 'bad: '+json.dumps(s))
+except Exception as e:
+    print('bad: assertion error %s' % e)")
     client_cleanup
     if [ "$ok" = "ok" ]; then
-        vlog "UI-initiated pairing produced a real engine cluster (43 layers covered)"
+        vlog "UI-initiated pairing produced a real engine cluster (schema-checked for the running engine line)"
         pass "$name"
     else
         fail "$name" "$ok"
@@ -1272,6 +1644,7 @@ print('ok' if s.get('phase')=='ready' and cover else 'bad: '+json.dumps(s))" 2>/
 # $5=client-life-ms $6=poll-tries $7=poll-sleep-s
 pairing_pair_report() {
     local code="$1" tag="$2" cx="$3" jx="$4" life="$5" tries="$6" slp="$7"
+    ensure_client_display
     client_cleanup
     ensure_frontend
     $SSH "$COORD_NODE" "rm -f /tmp/idletoken-$tag-a.log /tmp/idletoken-$tag-b.log" >/dev/null 2>&1
@@ -1295,18 +1668,36 @@ pairing_pair_report() {
 #      is asserted by P3. Model is mock here — P4 tests orchestration, not
 #      inference.)
 # =====================================================================
+# The SMALL model on the coordinator node, resolved by the testbed convention
+# (basename of the control machine's smoke model, searched in that node's
+# configured gguf dirs). P4/P5 must NOT use $GGUF_DGX: that is the 80 GiB DSv4,
+# whose load time blows their 120 s ready windows — P3 survives it only because
+# its window is 600 s.
+coord_small_gguf() {
+    local fname dirs d
+    fname=$(basename "${IDLETOKEN_SMOKE_GGUF:-Qwen3.5-0.8B-Q4_K_M.gguf}")
+    eval "dirs=\${IDLETOKEN_GGUF_DIRS_${COORD_NODE}:-}"
+    for d in $dirs; do
+        if $SSH "$COORD_NODE" "test -r '$d/$fname'" >/dev/null 2>&1; then
+            echo "$d/$fname"; return 0
+        fi
+    done
+    return 1
+}
+
 p4_orchestration() {
     local name="$1"
-    # Mock is DELIBERATE here (see the header) — but it now has to be SAID.
-    # Until 2026-07-29 a worker silently fell back to mock whenever the model
-    # would not load, so this gate got one for free; since then the worker
-    # refuses unless asked. Declaring it is strictly better: the gate states
-    # which of its assertions are about orchestration rather than inference,
-    # exactly as P5 already does.
-    local saved_env="$CLIENT_ENV"
-    CLIENT_ENV="$CLIENT_ENV IDLETOKEN_MOCK_OK=1 IDLETOKEN_ALLOW_MOCK=1"
-    local rep; rep=$(pairing_pair_report ORCHES p4 "" "" 150000 40 3)
-    CLIENT_ENV="$saved_env"
+    # REAL model since 2026-08-15. Mock existed because the only model was an
+    # 80 GiB DSv4 (minutes to load); the smoke model loads in ~5 s, and the v2
+    # client deliberately has NO mock start path (no-silent-fallback) — it
+    # refuses "no GGUF file selected", which is exactly what killed this gate
+    # when it still declared IDLETOKEN_MOCK_OK.
+    local gguf_abs
+    gguf_abs=$(coord_small_gguf) || { fail "$name" "no small smoke GGUF on $COORD_NODE (searched IDLETOKEN_GGUF_DIRS_${COORD_NODE} for $(basename "${IDLETOKEN_SMOKE_GGUF:-Qwen3.5-0.8B-Q4_K_M.gguf}"))"; return; }
+    # XRCHES, not ORCHES: join codes use the no-O/0/I/1 alphabet and the v2
+    # engine VALIDATES it — 'O' was never noticed while the mock era stopped
+    # short of the engine (`invalid join code 'ORCHES'`, measured round 5).
+    local rep; rep=$(pairing_pair_report XRCHES p4 ":model=$gguf_abs" "" 150000 40 3)
     client_cleanup
     [ -n "$rep" ] || { fail "$name" "no pairing-phases report (see /tmp/idletoken-p4-{a,b}.log on $COORD_NODE)"; return; }
     vlog "pairing-phases: $rep"
@@ -1353,18 +1744,12 @@ p5_settings() {
     local name="$1"
     local port=18111 tok="p5-secret-token"
     local tune=":apiPort=$port:apiToken=$tok"
-    # Mock model: the coord has no engine, and a production coord must 503 on
-    # chat rather than fake a reply. The with-token 200 below therefore needs
-    # the LABELED mock-completion path — opt in via the test-only env, which
-    # the client passes down to its coord sidecar (env is inherited).
-    local saved_env="$CLIENT_ENV"
-    # Both switches are required: MOCK_OK is the coordinator's (return a mock
-    # completion) and ALLOW_MOCK is the worker's (permit a mock load). Similar
-    # names, different layers, and omitting either shows up as a cluster that will
-    # not start rather than as wrong content.
-    CLIENT_ENV="$CLIENT_ENV IDLETOKEN_MOCK_OK=1 IDLETOKEN_ALLOW_MOCK=1"
-    local rep; rep=$(pairing_pair_report P5SETT p5 "$tune" "$tune" 150000 40 3)
-    CLIENT_ENV="$saved_env"
+    # REAL model since 2026-08-15 (see p4_orchestration — the v2 client has no
+    # mock start path, by design). The smoke model loads in seconds, so the
+    # settings pipeline is proven against the same engine users run.
+    local gguf_abs
+    gguf_abs=$(coord_small_gguf) || { fail "$name" "no small smoke GGUF on $COORD_NODE (searched IDLETOKEN_GGUF_DIRS_${COORD_NODE})"; return; }
+    local rep; rep=$(pairing_pair_report P5SETT p5 "$tune:model=$gguf_abs" "$tune" 150000 40 3)
     if [ -z "$rep" ]; then
         client_cleanup
         fail "$name" "cluster with custom apiPort/apiToken never reached ready — settings→engine pipeline missing? (integration-plan 1.2; see /tmp/idletoken-p5-{a,b}.log on $COORD_NODE)"
@@ -1387,9 +1772,10 @@ p5_settings() {
     fi
     vlog "custom port $port healthy; default $API_PORT closed"
 
-    # (b) token enforced: with Bearer -> 200, without -> 401. (Mock model: only
-    # the status code is asserted here; reply coherence is G6/P6's job.)
-    local req='{"model":"deepseek-v4-flash","max_tokens":4,"messages":[{"role":"user","content":"ping"}]}'
+    # (b) token enforced: with Bearer -> 200, without -> 401. (Reply coherence
+    # at length is G6/P6's job; here the body only has to prove the ENGINE
+    # answered through the token-gated port.)
+    local req="{\"model\":\"${IDLETOKEN_SMOKE_MODEL_ID:-qwen3.5-0.8b}\",\"max_tokens\":4,\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}"
     local wresp; wresp=$($SSH "$COORD_NODE" "curl -s -m 60 -w '\n%{http_code}' http://127.0.0.1:$port/v1/chat/completions -H 'content-type: application/json' -H 'Authorization: Bearer $tok' -d '$req'; true" 2>/dev/null | tr -d '\r')
     local with; with=$(printf '%s' "$wresp" | tail -1)
     local wbody; wbody=$(printf '%s' "$wresp" | sed '$d')
@@ -1399,14 +1785,24 @@ p5_settings() {
         fail "$name" "apiToken not enforced (with token: http $with, expected 200; without: http $without, expected 401)"
         return
     fi
-    # Origin proof: the 200 body must be the coord's LABELED mock completion,
-    # not anything a middle layer could have fabricated.
-    case "$wbody" in
-        *"HOMEAI MOCK ENGINE"*)
-            vlog "apiToken enforced: with=200 (coord mock marker), without=401"
-            pass "$name" ;;
-        *)  fail "$name" "with-token 200 body lacks coord mock marker (got: ${wbody:0:80})" ;;
-    esac
+    # Origin proof, real-engine era: the 200 body must be a completion the
+    # ENGINE produced — a chat.completion object with non-empty content (the
+    # old check demanded the coord's mock marker, which no longer exists).
+    local origin
+    origin=$(printf '%s' "$wbody" | python3 -c "
+import json,sys
+try:
+    d=json.load(sys.stdin)
+    c=((d.get('choices') or [{}])[0].get('message') or {}).get('content','')
+    print('ok' if d.get('object')=='chat.completion' and c.strip() else 'bad: '+json.dumps(d)[:120])
+except Exception as e:
+    print('bad: %s' % e)")
+    if [ "$origin" = "ok" ]; then
+        vlog "apiToken enforced: with=200 (real engine completion), without=401"
+        pass "$name"
+    else
+        fail "$name" "with-token 200 body is not a real engine completion ($origin)"
+    fi
 }
 
 # =====================================================================
@@ -1414,9 +1810,20 @@ p5_settings() {
 #      UI advertises the address; an external client connects to THAT address
 #      and gets an E6-level DSv4 reply. Needs the real GGUF (honest fail if
 #      absent — P6 cannot pass on a mock model).
+#
+#      2026-08-14: the external client now presents the API token, because the
+#      product changed under this gate. A fresh install mints a random token and
+#      the API is CLOSED by default (the decision G_LOCAL_TOKEN asserts), so an
+#      unauthenticated request has been getting
+#      `{"error":{"type":"authentication_error"}}` — valid JSON with no content,
+#      which read as "empty text" and looked like a broken engine. What a real
+#      user does is copy the base URL AND the token out of the UI, so that is
+#      what the gate does; the no-token 401 is asserted here too, so "advertised
+#      address is reachable" can never quietly mean "advertised address is open".
 # =====================================================================
 p6_api_exposure() {
     local name="$1"
+    local tok="p6-external-client-token"
     local has; has=$($SSH "$COORD_NODE" "test -f $GGUF_DGX && echo yes || echo no" 2>/dev/null | tr -d '\r')
     [ "$has" = "yes" ] || { fail "$name" "GGUF not found on $COORD_NODE ($GGUF_DGX) — P6 needs the real model"; return; }
     # The path travels into the client as a UI directive and from there straight
@@ -1430,7 +1837,12 @@ p6_api_exposure() {
     esac
 
     # Model load across coord + 2 workers is slow; allow up to ~10 min.
-    local rep; rep=$(pairing_pair_report APIEXP p6 ":model=$gguf_abs" ":model=$gguf_abs" 600000 100 6)
+    # ORDER MATTERS: the UI-test pairing regex (client/src/App.tsx) ends with
+    # `(?::model=(\S+))?` — `\S+` swallows everything after it, so `:model=`
+    # must be LAST. Putting it first silently turned the token into part of the
+    # GGUF path and the worker refused to serve ("No such file or directory").
+    local spec=":apiToken=$tok:model=$gguf_abs"
+    local rep; rep=$(pairing_pair_report APEXPT p6 "$spec" "$spec" 600000 100 6)
     if [ -z "$rep" ]; then
         client_cleanup
         fail "$name" "real-model cluster never reached ready (see /tmp/idletoken-p6-{a,b}.log on $COORD_NODE)"
@@ -1441,16 +1853,27 @@ p6_api_exposure() {
     vlog "UI-advertised API address: $base"
 
     # External client hits the UI-advertised address (curl runs on the coord
-    # node so the advertised LAN ip resolves) and must get a real reply.
+    # node so the advertised LAN ip resolves) and must get a real reply — with
+    # the token the UI hands the user, since the API is closed by default.
+    local req='{"model":"deepseek-v4-flash","max_tokens":24,"messages":[{"role":"user","content":"Reply with the single word: pong"}]}'
     local reply
-    reply=$($SSH "$COORD_NODE" "curl -s -m 180 $base/v1/messages -H 'content-type: application/json' -d '{\"model\":\"deepseek-v4-flash\",\"max_tokens\":24,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word: pong\"}]}'" 2>/dev/null)
+    reply=$($SSH "$COORD_NODE" "curl -s -m 180 $base/v1/messages -H 'content-type: application/json' -H 'Authorization: Bearer $tok' -d '$req'" 2>/dev/null)
+    # Same address, no credentials: must be refused. Asserted BEFORE cleanup,
+    # while the cluster is still up.
+    local anon; anon=$($SSH "$COORD_NODE" "curl -s -m 30 -o /dev/null -w '%{http_code}' $base/v1/messages -H 'content-type: application/json' -d '$req'; true" 2>/dev/null | tr -d '\r')
     client_cleanup
+    if [ "$anon" != "401" ]; then
+        fail "$name" "the advertised address answered an UNAUTHENTICATED request with http $anon (expected 401) — a LAN-reachable API that anyone can drive"
+        return
+    fi
+    vlog "unauthenticated request to the advertised address: 401"
     local ok
     ok=$(printf '%s' "$reply" | python3 -c '
 import json,sys
 raw=sys.stdin.read()
 try: d=json.loads(raw)
 except Exception: sys.exit("not json: "+raw[:80])
+if "error" in d: sys.exit("api error: "+json.dumps(d["error"])[:120])
 t="".join(b.get("text","") for b in d.get("content",[]) if b.get("type")=="text")
 u=d.get("usage",{})
 if not t.strip(): sys.exit("empty text")
@@ -1458,7 +1881,10 @@ if not (u.get("input_tokens",0)>0 and u.get("output_tokens",0)>0): sys.exit("zer
 print("ok "+t.strip()[:40])' 2>&1)
     case "$ok" in
         ok*) vlog "external client reply via UI address: $ok"; pass "$name" ;;
-        *) fail "$name" "external client got no real reply from $base ($ok)" ;;
+        # Print the body, not just the verdict: the cluster is torn down by
+        # client_cleanup one line above, so "empty text" with no evidence costs
+        # a whole 5-minute rebuild to see what the API actually said.
+        *) fail "$name" "external client got no real reply from $base ($ok) — body: $(printf '%s' "$reply" | tr -d '\n' | cut -c1-300)" ;;
     esac
 }
 
@@ -1466,7 +1892,7 @@ print("ok "+t.strip()[:40])' 2>&1)
 # G_HOMO — a cluster is homogeneous. The coordinator must REFUSE a worker whose
 #      OS family differs from the first worker that joined (CLAUDE.md hard
 #      constraint #2, 2026-08-12) — a mixed cluster has no oracle, so letting
-#      one form manufactures a green nobody can falsify (docs/macos-node.md §5).
+#      one form manufactures a green nobody can falsify (docs/archive/macos-node.md §5).
 #
 # Runs entirely on the control machine: one coordinator + stub workers on
 # loopback. The mixed case cannot be staged with real binaries on one box —
@@ -1479,12 +1905,30 @@ print("ok "+t.strip()[:40])' 2>&1)
 # =====================================================================
 g_homo() {
     local name="$1" port="${IDLETOKEN_HOMO_PORT:-14311}"
+    # RETIRED (2026-08-14, llama.cpp pivot — v2 plan §1.4): heterogeneous
+    # clusters are ALLOWED now. The "no oracle for a mixed cluster" argument
+    # died with the exact-token oracle itself (decision #10: two correct
+    # engines diverge at token 4 even on one machine); the real cluster
+    # invariant is "every node runs the SAME llama.cpp build", enforced at
+    # HELLO and gated by G_VERSION below. The os_family refusal still exists
+    # in the legacy ds4 INFER path, so the parked assertions stay runnable:
+    # set IDLETOKEN_HOMO_GATE=1 to exercise them (G_DSPARK-style parking).
+    if [ "${IDLETOKEN_HOMO_GATE:-0}" != "1" ]; then
+        skip "$name" "retired 2026-08-14 (heterogeneous clusters allowed; the invariant is engine-version equality — see G_VERSION) — set IDLETOKEN_HOMO_GATE=1 to run the parked ds4-line check"
+        return
+    fi
     local repo; repo=$(cd "$(dirname "$0")/.." && pwd)
     command -v cc  >/dev/null 2>&1 || { skip "$name" "no C compiler on the control machine"; return; }
     command -v python3 >/dev/null 2>&1 || { skip "$name" "python3 needed for the stub worker"; return; }
     (cd "$repo" && make coord >/dev/null 2>&1) || { fail "$name" "make coord failed on the control machine"; return; }
 
-    # This host's family, and any *other* legal one to claim.
+    # Steps 1-3 stage Linux(1) against Windows(2) — never this host's family,
+    # and never macOS(3). macOS is sealed as a compute node (G_MACSEAL), so on
+    # a Mac control machine a stub claiming the native family gets refused by
+    # the seal and this gate would go red for a reason it is not testing.
+    local fam_a=1 fam_b=2
+    # Step 4 drives the REAL worker binary, which reports the family it was
+    # built for; the stub must therefore claim something else.
     local self other
     case "$(uname -s)" in
         Linux)                self=1 ;;
@@ -1514,8 +1958,9 @@ g_homo() {
     cpid=$!
     sleep 1
 
-    # 1. native-OS worker joins first and sets the cluster's family
-    python3 "$repo/scripts/mock_worker.py" "127.0.0.1:$port" >"$tmp/m1.log" 2>&1 &
+    # 1. the first worker joins and sets the cluster's family
+    IDLETOKEN_MOCK_OS_FAMILY="$fam_a" python3 "$repo/scripts/mock_worker.py" \
+        "127.0.0.1:$port" >"$tmp/m1.log" 2>&1 &
     m1=$!
     sleep 1
     if ! grep -q "^coord: worker 0 is " "$tmp/coord.log"; then
@@ -1523,18 +1968,18 @@ g_homo() {
     fi
 
     # 2. a worker claiming another OS must be refused, and be TOLD why
-    IDLETOKEN_MOCK_OS_FAMILY="$other" python3 "$repo/scripts/mock_worker.py" \
+    IDLETOKEN_MOCK_OS_FAMILY="$fam_b" python3 "$repo/scripts/mock_worker.py" \
         "127.0.0.1:$port" >"$tmp/m2.log" 2>&1 &
     m2=$!
     # Two ways a broken check shows up: the stub blocks forever on recv (still
     # alive), or it gets an ASSIGN_PLAN. Name both — "was accepted" is a far more
     # useful red than "no refusal in the log".
     if ! _homo_wait "$m2"; then
-        fail "$name" "a $other-family worker was ACCEPTED into a $self-family cluster (still connected)"
+        fail "$name" "a $fam_b-family worker was ACCEPTED into a $fam_a-family cluster (still connected)"
         _homo_cleanup; return
     fi
     if grep -q "plan received" "$tmp/m2.log"; then
-        fail "$name" "a $other-family worker was ACCEPTED into a $self-family cluster (got ASSIGN_PLAN)"
+        fail "$name" "a $fam_b-family worker was ACCEPTED into a $fam_a-family cluster (got ASSIGN_PLAN)"
         _homo_cleanup; return
     fi
     if ! grep -q "mixed-OS clusters" "$tmp/coord.log"; then
@@ -1547,7 +1992,8 @@ g_homo() {
     vlog "mixed-OS join refused, and the refusal reached the worker"
 
     # 3. positive control: same-OS worker still forms the cluster
-    python3 "$repo/scripts/mock_worker.py" "127.0.0.1:$port" >"$tmp/m3.log" 2>&1 &
+    IDLETOKEN_MOCK_OS_FAMILY="$fam_a" python3 "$repo/scripts/mock_worker.py" \
+        "127.0.0.1:$port" >"$tmp/m3.log" 2>&1 &
     m3=$!
     local i=0
     while [ $i -lt 100 ] && ! grep -q "cluster ready" "$tmp/coord.log"; do sleep 0.1; i=$((i + 1)); done
@@ -1599,6 +2045,1073 @@ g_homo() {
     fi
 
     _homo_cleanup
+    pass "$name"
+}
+
+# =====================================================================
+# G_VERSION — the ONE llama.cpp-cluster invariant (v2 plan §5.2, replaces
+#      G_HOMO's os_family rule): every node runs the SAME llama.cpp build.
+#      A version mismatch is refused at HELLO with a sentence that names the
+#      machine to upgrade; matching versions form a working cluster.
+#
+# Runs entirely on the control machine: the REAL coordinator (llamacpp cluster
+# mode) + the REAL idletoken-worker --rpc-supervisor on loopback, with the
+# pinned engine build in vendor/llama.cpp/build/bin. The mismatch cannot be
+# staged with two real builds on one box, so the worker's claimed version is
+# forced through IDLETOKEN_TEST_ENGINE_VERSION (src/common/enginever.c) — a
+# TEST-ONLY override that prints a loud banner; the gate asserts the banner is
+# present, so a silent removal of the override would surface here rather than
+# make the mismatch case vacuously green.
+#
+# Both halves are checked (same reasoning as the old G_HOMO): the refusal
+# alone would also pass if the coordinator refused everyone, so a matching
+# worker must still join and the cluster must actually answer.
+# =====================================================================
+g_version() {
+    local name="$1" repo; repo=$(cd "$(dirname "$0")/.." && pwd)
+    local base="${IDLETOKEN_VERSION_PORT:-14351}"
+    local wire_port="$base" api_port=$((base + 4000)) llama_port=$((base + 4200))
+    local rpc_port=$((base + 4400)) disc_port=$((base + 700))
+    local engine_dir="${IDLETOKEN_ENGINE_DIR:-$repo/vendor/llama.cpp/build/bin}"
+    local code="GVERSN"
+    command -v cc >/dev/null 2>&1 || { skip "$name" "no C compiler on the control machine"; return; }
+    if [ ! -x "$engine_dir/llama-server" ] || [ ! -x "$engine_dir/ggml-rpc-server" ]; then
+        skip "$name" "no pinned llama.cpp build in $engine_dir (scripts/build_llamacpp.sh) — the version invariant needs a real engine to version-probe"
+        return
+    fi
+    if [ -z "${IDLETOKEN_SMOKE_GGUF:-}" ] || [ -z "${IDLETOKEN_SMOKE_MODEL_ID:-}" ]; then
+        skip "$name" "set IDLETOKEN_SMOKE_GGUF + IDLETOKEN_SMOKE_MODEL_ID to a small local model — the positive half must load real weights across the loopback cluster"
+        return
+    fi
+    [ -r "$IDLETOKEN_SMOKE_GGUF" ] || { fail "$name" "IDLETOKEN_SMOKE_GGUF is set but unreadable: $IDLETOKEN_SMOKE_GGUF"; return; }
+    (cd "$repo" && make coord >/dev/null 2>&1)  || { fail "$name" "make coord failed on the control machine"; return; }
+    (cd "$repo" && make worker >/dev/null 2>&1) || { fail "$name" "make worker failed on the control machine"; return; }
+
+    local tmp; tmp=$(mktemp -d)
+    local cpid="" wpid=""
+    # $1=keep -> leave the logs on disk (failures must stay diagnosable; a
+    # message naming a path the gate then deletes is worse than no message).
+    _ver_cleanup() {
+        [ -n "$wpid" ] && kill "$wpid" 2>/dev/null
+        [ -n "$cpid" ] && kill "$cpid" 2>/dev/null
+        # wait before the backstop pkill so bash's job monitor does not print
+        # "Terminated" lines for the children as they die.
+        [ -n "$wpid" ] && wait "$wpid" 2>/dev/null
+        [ -n "$cpid" ] && wait "$cpid" 2>/dev/null
+        # Backstop for supervised grandchildren, scoped to this gate's ports.
+        pkill -f "ggml-rpc-serve[r].* -p $rpc_port" 2>/dev/null
+        pkill -f "llama-serve[r].*--port $llama_port" 2>/dev/null
+        [ "${1:-}" = keep ] || rm -rf "$tmp"
+    }
+    # Wait up to $2 x 0.2s for pid $1 to exit; return 1 if it is still alive.
+    _ver_wait_exit() {
+        local p="$1" i=0 lim="${2:-150}"
+        while kill -0 "$p" 2>/dev/null && [ "$i" -lt "$lim" ]; do sleep 0.2; i=$((i + 1)); done
+        kill -0 "$p" 2>/dev/null && return 1 || return 0
+    }
+
+    # Coordinator: llamacpp CLUSTER mode, one rpc worker, pairing by code.
+    # IDLETOKEN_ALLOW_SMALL_CLUSTER=1 is the documented test vehicle (G_SIZE
+    # claim 4): without it the scheduler would — correctly — release the
+    # worker because a 0.8B model fits one machine, and the positive half
+    # would never exercise the joined cluster.
+    (cd "$repo" && exec env IDLETOKEN_RPC_PSK_FILE="$tmp/psk_coord" \
+        IDLETOKEN_ALLOW_SMALL_CLUSTER=1 IDLETOKEN_LLAMA_LOG="$tmp/llama.log" \
+        ./idletoken-coord --bind "127.0.0.1:$wire_port" --num-workers 1 \
+        --pair-code "$code" --discovery-port "$disc_port" \
+        --model-id "$IDLETOKEN_SMOKE_MODEL_ID" \
+        --llama-server-bin "$engine_dir/llama-server" \
+        --llama-gguf "$IDLETOKEN_SMOKE_GGUF" --llama-port "$llama_port" \
+        --ctx-size 1024 \
+        --http --api-bind "127.0.0.1:$api_port" >"$tmp/coord.log" 2>&1) &
+    cpid=$!
+    sleep 2
+    if ! kill -0 "$cpid" 2>/dev/null; then
+        fail "$name" "the coordinator did not start in llamacpp cluster mode (see $tmp/coord.log)"
+        cpid=""; _ver_cleanup keep; return
+    fi
+
+    # --- 1. a worker claiming a DIFFERENT engine build must be refused ------
+    (cd "$repo" && exec env IDLETOKEN_RPC_PSK_FILE="$tmp/psk_bad" \
+        IDLETOKEN_TEST_ENGINE_VERSION='999 (fakesha0)' \
+        ./idletoken-worker --rpc-supervisor --engine-dir "$engine_dir" \
+        --pair-code "$code" --coordinator "127.0.0.1:$wire_port" \
+        --discovery-port "$disc_port" \
+        --rpc-host 127.0.0.1 --rpc-port "$rpc_port" >"$tmp/w_bad.log" 2>&1) &
+    wpid=$!
+    if ! _ver_wait_exit "$wpid" 150; then
+        fail "$name" "a worker with a mismatched engine version was ACCEPTED (still connected after 30s; see $tmp/w_bad.log)"
+        _ver_cleanup keep; return
+    fi
+    wait "$wpid" 2>/dev/null; local rc=$?
+    wpid=""
+    if ! grep -q "TEST OVERRIDE" "$tmp/w_bad.log"; then
+        fail "$name" "the version override banner is missing — the mismatch case never actually faked a version (see $tmp/w_bad.log)"
+        _ver_cleanup keep; return
+    fi
+    if ! grep -q "JOIN_REFUSED: " "$tmp/w_bad.log"; then
+        fail "$name" "the mismatched worker got no JOIN_REFUSED marker — the client cannot show the reason (see $tmp/w_bad.log)"
+        _ver_cleanup keep; return
+    fi
+    if ! grep -qi "upgrade" "$tmp/w_bad.log"; then
+        fail "$name" "the refusal does not tell the user to UPGRADE anything (see $tmp/w_bad.log)"
+        _ver_cleanup keep; return
+    fi
+    if [ "$rc" != 2 ]; then
+        fail "$name" "refused worker exited $rc, expected 2 (IDLETOKEN_EXIT_JOIN_REFUSED)"
+        _ver_cleanup keep; return
+    fi
+    if ! grep -qE "refused .*upgrade" "$tmp/coord.log"; then
+        fail "$name" "the coordinator log does not name the machine to upgrade (see $tmp/coord.log)"
+        _ver_cleanup keep; return
+    fi
+    vlog "mismatched engine version refused at HELLO; reason names the machine and says upgrade"
+
+    # --- 2. positive control: a matching worker joins and the cluster serves -
+    (cd "$repo" && exec env IDLETOKEN_RPC_PSK_FILE="$tmp/psk_good" \
+        ./idletoken-worker --rpc-supervisor --engine-dir "$engine_dir" \
+        --pair-code "$code" --coordinator "127.0.0.1:$wire_port" \
+        --discovery-port "$disc_port" \
+        --rpc-host 127.0.0.1 --rpc-port "$rpc_port" >"$tmp/w_good.log" 2>&1) &
+    wpid=$!
+    local i=0
+    while [ $i -lt 150 ] && ! grep -q "rpc worker 0 ready" "$tmp/coord.log"; do sleep 0.2; i=$((i + 1)); done
+    if ! grep -q "rpc worker 0 ready" "$tmp/coord.log"; then
+        fail "$name" "a matching-version worker did not join — the check refuses everyone (see $tmp/coord.log, $tmp/w_good.log)"
+        _ver_cleanup keep; return
+    fi
+    # /health is the coordinator's; readiness is its engine_state field (the
+    # raw llama-server 503-while-loading trap does not apply to this surface,
+    # but "ready" must still be asserted, not assumed).
+    local h="" ok=""
+    i=0
+    while [ $i -lt 240 ]; do
+        h=$(curl -s -m 3 "http://127.0.0.1:$api_port/health" 2>/dev/null)
+        case "$h" in *'"engine_state":"ready"'*) break ;; esac
+        # Resource refusal and sidecar startup errors terminate the
+        # coordinator. Do not spend four minutes polling a port whose owner is
+        # already dead; keep the evidence and report the scheduler/engine cause.
+        if ! kill -0 "$cpid" 2>/dev/null; then
+            fail "$name" "the joined cluster coordinator exited before engine ready: $(tail -2 "$tmp/coord.log" 2>/dev/null | tr '\n' ' ' | tail -c 240) (logs kept in $tmp)"
+            cpid=""; _ver_cleanup keep; return
+        fi
+        h=""
+        sleep 1; i=$((i + 1))
+    done
+    if [ -z "$h" ]; then
+        fail "$name" "the joined cluster's engine never reached ready (see $tmp/coord.log, $tmp/llama.log)"
+        _ver_cleanup keep; return
+    fi
+    ok=$(curl -s -m 120 "http://127.0.0.1:$api_port/v1/chat/completions" \
+        -H 'content-type: application/json' \
+        -d '{"model":"x","max_tokens":512,"messages":[{"role":"user","content":"Reply with the single word: pong"}]}' 2>/dev/null \
+        | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit("not json")
+ch=d.get("choices",[])
+t=ch[0]["message"]["content"] if ch else ""
+sys.exit(0) if t.strip() else sys.exit("empty content")' 2>&1) || {
+        fail "$name" "the matched-version cluster did not answer a chat request ($ok)"
+        _ver_cleanup keep; return; }
+    vlog "matching versions joined; the loopback rpc cluster served a real completion"
+    _ver_cleanup
+    pass "$name"
+}
+
+# =====================================================================
+# G_MACSEAL — macOS is sealed as a COMPUTE node (2026-08-13, user's call), and
+#      still first-class as a CONTROL machine. The Metal code stays in the tree
+#      and keeps compiling; what is refused is a Mac serving layers.
+#
+# Why a gate at all: a seal that only exists in prose decays into a half-truth
+# the moment someone touches the handshake, and the README will keep saying
+# "Windows and Linux" while a Mac quietly joins. Four assertions, and the last
+# two are the ones that keep this honest:
+#
+#   1. the coordinator refuses a macOS worker AS THE FIRST WORKER — a cluster
+#      of nothing but Macs is homogeneous, so G_HOMO would wave it through;
+#   2. it still accepts a non-macOS worker (else "refuse everything" passes);
+#   3. the hardware floor refuses Apple Silicon on the node's own side, so a
+#      Mac says no before it ever dials a coordinator;
+#   4. the escape hatch still lifts the seal. That hatch is how the parked
+#      path gets revived and measured later; if it silently stopped working,
+#      nothing else in the ladder would notice, and unsealing would start with
+#      an archaeology session instead of an experiment.
+#
+# Runs entirely on the control machine: stub workers on loopback plus the local
+# worker binary with its vendor byte forced (IDLETOKEN_FAKE_VENDOR=apple), so
+# the refusal can be exercised on the CUDA machines that run everything else.
+# =====================================================================
+g_macseal() {
+    local name="$1" repo; repo=$(cd "$(dirname "$0")/.." && pwd)
+    local port_a="${IDLETOKEN_MACSEAL_PORT:-14331}"
+    # RETIRED (2026-08-14, llama.cpp pivot — v2 plan §1.3): macOS is UNSEALED
+    # as a compute node. The compute layer is llama.cpp's own Metal backend
+    # now (not the ds4 line this seal guarded), and the mac compute path is
+    # gated positively by G_MAC_SMOKE below plus the cross-OS cluster cells in
+    # results/matrix-llamacpp-*.jsonl. The seal itself still exists in the
+    # legacy ds4 INFER path (deliberately: that line has no Metal kernels and
+    # no oracle), so the parked assertions stay runnable, G_DSPARK-style: set
+    # IDLETOKEN_MACSEAL_GATE=1 to exercise them.
+    if [ "${IDLETOKEN_MACSEAL_GATE:-0}" != "1" ]; then
+        skip "$name" "retired 2026-08-14 (macOS compute unsealed on the llama.cpp line — see G_MAC_SMOKE) — set IDLETOKEN_MACSEAL_GATE=1 to run the parked ds4-line seal check"
+        return
+    fi
+    command -v cc      >/dev/null 2>&1 || { skip "$name" "no C compiler on the control machine"; return; }
+    command -v python3 >/dev/null 2>&1 || { skip "$name" "python3 needed for the stub worker"; return; }
+    (cd "$repo" && make coord >/dev/null 2>&1) || { fail "$name" "make coord failed on the control machine"; return; }
+
+    # The enum value, read from the header instead of hardcoded: this number
+    # crosses into the client (client/src/types.ts) and onto users' screens, so
+    # the gate must break if the enum is ever renumbered.
+    local sealed_code
+    sealed_code=$(awk '/IDLETOKEN_HW_OK = 0/ {n = 0; seen = 1; next}
+                       seen && /^[[:space:]]+IDLETOKEN_HW_[A-Z_]+/ {
+                           n++
+                           if ($0 ~ /IDLETOKEN_HW_MACOS_SEALED/) { print n; exit }
+                       }' "$repo/include/idletoken_resource.h")
+    if [ -z "$sealed_code" ]; then
+        fail "$name" "IDLETOKEN_HW_MACOS_SEALED is not in include/idletoken_resource.h — the seal was removed without removing this gate"
+        return
+    fi
+
+    local tmp; tmp=$(mktemp -d)
+    local cpid="" s1="" s2="" s3=""
+    _mac_cleanup() {
+        for p in $s1 $s2 $s3 $cpid; do kill "$p" 2>/dev/null; done
+        wait $s1 $s2 $s3 $cpid 2>/dev/null
+        rm -rf "$tmp"
+    }
+    _mac_wait() {   # 1 if the pid is still alive after 10 s (= it was accepted)
+        local p="$1" i=0
+        while kill -0 "$p" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+        kill -0 "$p" 2>/dev/null && return 1 || return 0
+    }
+
+    # --- 1. a macOS worker is refused even with an empty cluster behind it ---
+    "$repo/idletoken-coord" --bind "127.0.0.1:$port_a" --num-workers 2 --n-predict 0 \
+        >"$tmp/coord_a.log" 2>&1 &
+    cpid=$!
+    sleep 1
+    IDLETOKEN_MOCK_OS_FAMILY=3 python3 "$repo/scripts/mock_worker.py" \
+        "127.0.0.1:$port_a" >"$tmp/mac.log" 2>&1 &
+    s1=$!
+    if ! _mac_wait "$s1"; then
+        fail "$name" "a macOS worker was ACCEPTED as the first node of a cluster (still connected)"
+        _mac_cleanup; return
+    fi
+    if grep -q "plan received" "$tmp/mac.log"; then
+        fail "$name" "a macOS worker was ACCEPTED as the first node of a cluster (got ASSIGN_PLAN)"
+        _mac_cleanup; return
+    fi
+    if ! grep -q "sealed" "$tmp/coord_a.log"; then
+        fail "$name" "coordinator logged no seal refusal (see $tmp/coord_a.log)"
+        _mac_cleanup; return
+    fi
+    if ! grep -q "REFUSED: macOS compute nodes are sealed" "$tmp/mac.log"; then
+        fail "$name" "the refused Mac got no reason, only a dead socket (see $tmp/mac.log)"
+        _mac_cleanup; return
+    fi
+    vlog "macOS join refused as first worker, and the refusal reached the node"
+
+    # --- 2. positive control: Linux workers still form a cluster ------------
+    IDLETOKEN_MOCK_OS_FAMILY=1 python3 "$repo/scripts/mock_worker.py" \
+        "127.0.0.1:$port_a" >"$tmp/s2.log" 2>&1 &
+    s2=$!
+    IDLETOKEN_MOCK_OS_FAMILY=1 python3 "$repo/scripts/mock_worker.py" \
+        "127.0.0.1:$port_a" >"$tmp/s3.log" 2>&1 &
+    s3=$!
+    local i=0
+    while [ $i -lt 100 ] && ! grep -q "cluster ready" "$tmp/coord_a.log"; do sleep 0.1; i=$((i + 1)); done
+    if ! grep -q "cluster ready" "$tmp/coord_a.log"; then
+        fail "$name" "non-macOS workers did not form a cluster — the seal refuses everything"
+        _mac_cleanup; return
+    fi
+    vlog "non-macOS workers still form a cluster"
+    _mac_cleanup
+
+    # --- 3/4. the node's own hardware floor, and the escape hatch ----------
+    if [ ! -x "$repo/idletoken-worker" ]; then
+        (cd "$repo" && make idletoken-worker >/dev/null 2>&1) || true
+    fi
+    if [ ! -x "$repo/idletoken-worker" ]; then
+        fail "$name" "no idletoken-worker on the control machine — the hardware-floor half of the seal cannot be checked, and a gate that skips its own subject is not a gate"
+        return
+    fi
+    local hw_sealed hw_lifted
+    hw_sealed=$(IDLETOKEN_FAKE_VENDOR=apple "$repo/idletoken-worker" --probe-json 2>/dev/null \
+                | sed -n 's/.*"hw_status":\([0-9]*\).*/\1/p')
+    if [ "$hw_sealed" != "$sealed_code" ]; then
+        fail "$name" "an Apple-vendor probe reported hw_status=$hw_sealed, expected $sealed_code (MACOS_SEALED) — a Mac would pass its own hardware floor"
+        return
+    fi
+    hw_lifted=$(IDLETOKEN_FAKE_VENDOR=apple IDLETOKEN_ALLOW_MACOS_NODE=1 \
+                "$repo/idletoken-worker" --probe-json 2>/dev/null \
+                | sed -n 's/.*"hw_status":\([0-9]*\).*/\1/p')
+    # Not "== OK": on a machine with other problems the lifted path may still
+    # refuse for a different reason, and that is a correct answer. What must
+    # change is that the SEAL is no longer the thing saying no.
+    if [ "$hw_lifted" = "$sealed_code" ]; then
+        fail "$name" "IDLETOKEN_ALLOW_MACOS_NODE did not lift the seal — the parked macOS path can no longer be revived or measured"
+        return
+    fi
+    vlog "hardware floor: sealed=$hw_sealed, with the hatch=$hw_lifted"
+
+    # --- 5. the client mirrors the same number ----------------------------
+    local ts_code
+    ts_code=$(sed -n 's/^export const HW_MACOS_SEALED = \([0-9]*\).*/\1/p' \
+              "$repo/client/src/types.ts" 2>/dev/null | head -1)
+    if [ "$ts_code" != "$sealed_code" ]; then
+        fail "$name" "client/src/types.ts says HW_MACOS_SEALED=${ts_code:-missing}, engine says $sealed_code — the UI would show the wrong reason"
+        return
+    fi
+
+    pass "$name"
+}
+
+# =====================================================================
+# G_MAC_SMOKE — macOS as a COMPUTE platform (2026-08-14 unsealing, v2 plan
+#      §1.3): the pinned llama.cpp Metal build plus the coordinator's llamacpp
+#      single-machine mode really serve inference on a Mac. This is the
+#      positive gate that replaces G_MACSEAL's refusal assertions — unsealing
+#      a platform without a gate would repeat the exact mistake the seal was
+#      created to prevent (claiming "supported" with nothing watching it).
+#
+# Runs on the control machine when it IS a Mac (the testbed's M4 is both the
+# control machine and the third compute platform). On a non-mac control
+# machine it SKIPs with the reason: the mac cell then lives in the cross-OS
+# matrix instead.
+# =====================================================================
+g_mac_smoke() {
+    local name="$1" repo; repo=$(cd "$(dirname "$0")/.." && pwd)
+    local base="${IDLETOKEN_MACSMOKE_PORT:-14371}"
+    local api_port=$((base + 4000)) llama_port=$((base + 4200))
+    local engine_dir="${IDLETOKEN_ENGINE_DIR:-$repo/vendor/llama.cpp/build/bin}"
+    if [ "$(uname -s)" != "Darwin" ]; then
+        skip "$name" "the control machine is not a Mac — mac compute is covered by the cross-OS matrix cells instead"
+        return
+    fi
+    command -v cc >/dev/null 2>&1 || { skip "$name" "no C compiler on the control machine"; return; }
+    if [ ! -x "$engine_dir/llama-server" ]; then
+        skip "$name" "no pinned llama.cpp Metal build in $engine_dir (scripts/build_llamacpp.sh)"
+        return
+    fi
+    if [ -z "${IDLETOKEN_SMOKE_GGUF:-}" ] || [ -z "${IDLETOKEN_SMOKE_MODEL_ID:-}" ]; then
+        skip "$name" "set IDLETOKEN_SMOKE_GGUF + IDLETOKEN_SMOKE_MODEL_ID to a small local model — mac compute cannot be smoked without weights"
+        return
+    fi
+    [ -r "$IDLETOKEN_SMOKE_GGUF" ] || { fail "$name" "IDLETOKEN_SMOKE_GGUF is set but unreadable: $IDLETOKEN_SMOKE_GGUF"; return; }
+    (cd "$repo" && make coord >/dev/null 2>&1) || { fail "$name" "make coord failed on the control machine"; return; }
+
+    local tmp; tmp=$(mktemp -d)
+    local cpid=""
+    # $1=keep -> leave the logs on disk. A gate that names a log path in its
+    # failure message and then deletes that path is not diagnosable: the first
+    # full-suite run of this gate failed with "see .../coord.log" pointing at an
+    # already-removed directory. Failures keep their evidence; successes clean up.
+    _msm_cleanup() {
+        [ -n "$cpid" ] && kill "$cpid" 2>/dev/null
+        [ -n "$cpid" ] && wait "$cpid" 2>/dev/null
+        pkill -f "llama-serve[r].*--port $llama_port" 2>/dev/null
+        [ "${1:-}" = keep ] || rm -rf "$tmp"
+    }
+    (cd "$repo" && exec env IDLETOKEN_LLAMA_LOG="$tmp/llama.log" \
+        ./idletoken-coord --model-id "$IDLETOKEN_SMOKE_MODEL_ID" \
+        --llama-server-bin "$engine_dir/llama-server" \
+        --llama-gguf "$IDLETOKEN_SMOKE_GGUF" --llama-port "$llama_port" \
+        --ctx-size 4096 \
+        --http --api-bind "127.0.0.1:$api_port" >"$tmp/coord.log" 2>&1) &
+    cpid=$!
+    local h="" i=0
+    while [ $i -lt 120 ]; do
+        h=$(curl -s -m 3 "http://127.0.0.1:$api_port/health" 2>/dev/null)
+        case "$h" in *'"engine_state":"ready"'*) break ;; esac
+        h=""
+        sleep 1; i=$((i + 1))
+    done
+    if [ -z "$h" ]; then
+        # Say WHY, not just "never reached ready". Three distinguishable causes,
+        # and the first full-suite run of this gate produced none of this detail:
+        #   - the coordinator died (its log has the reason);
+        #   - a FOREIGN process holds the engine port, so our child dies with
+        #     "couldn't bind" while the health probe may transiently see the
+        #     stale owner as ready (the hazard recorded in
+        #     results/llamacpp-b1-sidecar-20260814.md deviation #5);
+        #   - the engine is simply still loading.
+        local why="" owner
+        if ! kill -0 "$cpid" 2>/dev/null; then
+            why="the coordinator process exited"
+        fi
+        owner=$(lsof -nP -iTCP:"$llama_port" -sTCP:LISTEN 2>/dev/null | awk 'NR>1{print $2}' | sort -u | tr '\n' ' ')
+        [ -n "$owner" ] && why="${why:+$why; }engine port $llama_port is held by pid(s) $owner"
+        why="${why:-the engine never became ready in 120s}"
+        fail "$name" "$why — last engine state: $(grep -o '\"engine_state\":\"[a-z]*\"' <<<"$(curl -s -m 3 "http://127.0.0.1:$api_port/health" 2>/dev/null)" | tail -1), coord log: $(tail -2 "$tmp/coord.log" 2>/dev/null | tr '\n' ' ' | tail -c 200) (logs kept in $tmp)"
+        _msm_cleanup keep; return
+    fi
+    # Both API faces, decidable prompt — same bar as G6, small model. The
+    # generous max_tokens is deliberate: this model family thinks before it
+    # answers, and a tight budget yields an empty content with
+    # finish_reason=length (that is the model, not the serving path).
+    local o a
+    o=$(curl -s -m 120 "http://127.0.0.1:$api_port/v1/chat/completions" \
+        -H 'content-type: application/json' \
+        -d '{"model":"x","max_tokens":512,"messages":[{"role":"user","content":"Reply with the single word: pong"}]}' 2>/dev/null \
+        | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+ch=d.get("choices",[])
+t=ch[0]["message"]["content"] if ch else ""
+u=d.get("usage",{})
+if not t.strip(): sys.exit("empty content")
+if not (u.get("prompt_tokens",0)>0 and u.get("completion_tokens",0)>0): sys.exit("zero usage")
+if "pong" not in t.lower(): sys.exit("off-topic reply: "+t.strip()[:80])
+print("OK "+t.strip()[:40])' 2>&1)
+    case "$o" in OK*) vlog "openai face on Metal: $o" ;; *)
+        fail "$name" "OpenAI face on the mac engine: $o (logs kept in $tmp)"; _msm_cleanup keep; return ;; esac
+    a=$(curl -s -m 120 "http://127.0.0.1:$api_port/v1/messages" \
+        -H 'content-type: application/json' \
+        -d '{"model":"x","max_tokens":512,"messages":[{"role":"user","content":"Reply with the single word: pong"}]}' 2>/dev/null \
+        | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+t="".join(b.get("text","") for b in d.get("content",[]) if b.get("type")=="text")
+if not t.strip(): sys.exit("empty text")
+if "pong" not in t.lower(): sys.exit("off-topic reply: "+t.strip()[:80])
+print("OK "+t.strip()[:40])' 2>&1)
+    case "$a" in OK*) vlog "anthropic face on Metal: $a" ;; *)
+        fail "$name" "Anthropic face on the mac engine: $a (logs kept in $tmp)"; _msm_cleanup keep; return ;; esac
+    _msm_cleanup
+    pass "$name"
+}
+
+# =====================================================================
+# G_API_NS — the route namespace split (docs/api-surface.md §4).
+#
+#   /v1            carries SOMEBODY ELSE'S protocol (OpenAI, Anthropic) only
+#   /idletoken/v1  carries ours, spelled the same on coordinator and gateway
+#
+# Two halves, and BOTH are needed:
+#
+#   1. Live routing. New paths answer, the pre-migration spellings are gone, and
+#      the vendor routes are untouched. The oracle is **404 vs anything else**,
+#      not 200: with a mock cluster the vendor routes legitimately answer 503
+#      (routed, no real model). 404 means the route is absent; 503 means it is
+#      present and cannot serve. Asserting 200 here would force the gate to
+#      carry real weights, and a gate that needs 80 GiB gets skipped forever.
+#
+#   2. A source sweep. This is the half that actually earns its keep. The paths
+#      cross five artifacts (engine C, client Rust, client TS, gateway TS, shell
+#      scripts) and only the C is type-checked against the header — a leftover
+#      "/v1/stats" in a .sh or .rs file compiles, runs, and quietly 404s. The
+#      client dashboard would simply stop showing numbers; nothing turns red.
+#      So the sweep fails on ANY pre-migration spelling outside the legacy
+#      allowlist, which is short and deliberate (§4.3): the gateway and nginx
+#      answer the old rendezvous path for one release because already-installed
+#      engines hardcode it, and the metering client falls back to the old
+#      tokenize path because that is a billing count, not a dashboard number.
+# =====================================================================
+g_api_ns() {
+    local name="$1" repo; repo=$(cd "$(dirname "$0")/.." && pwd)
+    local wire_port="${IDLETOKEN_NS_PORT:-14411}" api_port=$((${IDLETOKEN_NS_PORT:-14411} + 4000))
+    command -v cc >/dev/null 2>&1 || { skip "$name" "no C compiler on the control machine"; return; }
+    (cd "$repo" && make coord >/dev/null 2>&1) || { fail "$name" "make coord failed on the control machine"; return; }
+
+    # ---- half 2 first: it needs no processes, so a stale reference is reported
+    #      even on a machine where the mock cluster cannot come up. -----------
+    local stale
+    # -I skips binaries. Without it the built coordinator matches: the new
+    # spelling /idletoken/v1/stats CONTAINS the old one as a substring, and
+    # grep's "Binary file ... matches" line survives the /idletoken/v1 filter
+    # below (the line has no path in it), so every green build reported itself.
+    stale=$(cd "$repo" && grep -rnI \
+        -e '/v1/stats' -e '/v1/capability' -e '/v1/cluster/status' \
+        -e '/v1/tokenize' -e '/v1/rendezvous' -e '/v1/privacy' \
+        --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=build \
+        --exclude-dir=vendor --exclude-dir=results --exclude-dir=baseline \
+        --exclude-dir=docs --exclude-dir=dist --exclude-dir=target \
+        . 2>/dev/null \
+        | grep -v '/idletoken/v1' \
+        | grep -v 'platform/packages/gateway/src/metering/tokenizer.service.ts' \
+        | grep -v 'platform/packages/gateway/src/rendezvous/rendezvous.controller.ts' \
+        | grep -v 'platform/packages/gateway/test/rendezvous.e2e.spec.ts' \
+        | grep -v 'platform/ops/nginx-idletoken.conf' \
+        | grep -v 'scripts/acceptance.sh')
+    if [ -n "$stale" ]; then
+        fail "$name" "pre-migration route spelling still referenced (these 404 silently at runtime): $(printf '%s' "$stale" | head -3 | tr '\n' ' ')"
+        return
+    fi
+    vlog "no pre-migration route spellings outside the documented legacy allowlist"
+
+    # ---- half 1: live routing against a mock cluster -----------------------
+    local tmp; tmp=$(mktemp -d)
+    local cpid="" wpid=""
+    _ns_cleanup() {
+        [ -n "$wpid" ] && { kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null; }
+        [ -n "$cpid" ] && { kill "$cpid" 2>/dev/null; wait "$cpid" 2>/dev/null; }
+        rm -rf "$tmp"
+    }
+    (cd "$repo" && exec ./idletoken-coord --bind "127.0.0.1:$wire_port" --num-workers 1 \
+        --n-predict 0 --http --api-bind "127.0.0.1:$api_port" >"$tmp/coord.log" 2>&1) &
+    cpid=$!
+    sleep 1
+    # os_family=1 (Linux): on a Mac control machine the macOS seal (G_MACSEAL)
+    # would refuse the mock worker and the cluster would never form -- a red for
+    # an unrelated reason.
+    (cd "$repo" && IDLETOKEN_MOCK_OS_FAMILY=1 exec python3 scripts/mock_worker.py \
+        "127.0.0.1:$wire_port" >"$tmp/mock.log" 2>&1) &
+    wpid=$!
+    local i=0
+    while [ $i -lt 100 ] && ! grep -q "cluster ready" "$tmp/coord.log"; do sleep 0.2; i=$((i + 1)); done
+    if ! grep -q "cluster ready" "$tmp/coord.log"; then
+        fail "$name" "the mock cluster never came up — cannot check routing (see $tmp/coord.log)"
+        _ns_cleanup; return
+    fi
+
+    local code
+    _ns_code() {  # _ns_code <method> <path> [body]
+        if [ "$1" = POST ]; then
+            curl -s -o /dev/null -w '%{http_code}' -m 10 -X POST \
+                 "http://127.0.0.1:$api_port$2" -H 'content-type: application/json' -d "$3"
+        else
+            curl -s -o /dev/null -w '%{http_code}' -m 5 "http://127.0.0.1:$api_port$2"
+        fi
+    }
+
+    # new control-plane paths must answer
+    for p in /idletoken/v1/stats /idletoken/v1/capability /idletoken/v1/cluster/status; do
+        code=$(_ns_code GET "$p")
+        if [ "$code" != 200 ]; then
+            fail "$name" "GET $p returned $code, expected 200 — the control plane did not move"
+            _ns_cleanup; return
+        fi
+    done
+    code=$(_ns_code POST /idletoken/v1/tokenize '{"text":"hello"}')
+    if [ "$code" = 404 ]; then
+        fail "$name" "POST /idletoken/v1/tokenize is 404 — the metering route did not move"
+        _ns_cleanup; return
+    fi
+    vlog "control plane answers on /idletoken/v1 (tokenize: $code, 503 = routed but no vocab)"
+
+    # pre-migration spellings must be GONE (the decision was delete, not alias)
+    for p in /v1/stats /v1/capability /v1/cluster/status; do
+        code=$(_ns_code GET "$p")
+        if [ "$code" != 404 ]; then
+            fail "$name" "GET $p still answers ($code) — the old control-plane path was not removed"
+            _ns_cleanup; return
+        fi
+    done
+    code=$(_ns_code POST /v1/tokenize '{"text":"hello"}')
+    if [ "$code" != 404 ]; then
+        fail "$name" "POST /v1/tokenize still answers ($code) — the old metering path was not removed"
+        _ns_cleanup; return
+    fi
+    vlog "pre-migration control-plane paths all 404"
+
+    # vendor-compatible routes must be untouched. 503 here is correct (mock
+    # cluster, no weights); 404 would mean the migration ate somebody else's
+    # protocol, which is the one thing this split must never do.
+    for p in /v1/chat/completions /v1/messages; do
+        code=$(_ns_code POST "$p" '{"model":"x","messages":[{"role":"user","content":"hi"}],"max_tokens":1}')
+        if [ "$code" = 404 ]; then
+            fail "$name" "POST $p is 404 — the namespace split removed a vendor-compatible route"
+            _ns_cleanup; return
+        fi
+    done
+    code=$(_ns_code GET /health)
+    if [ "$code" != 200 ]; then
+        fail "$name" "GET /health returned $code — the liveness probe moved or broke"
+        _ns_cleanup; return
+    fi
+    vlog "vendor routes (/v1/chat/completions, /v1/messages) and /health unaffected"
+
+    _ns_cleanup
+    pass "$name"
+}
+
+# =====================================================================
+# G_NO_PROMPT_LOG — a shared machine does not write other people's prompts
+#      to its own disk (docs/privacy-design.md; audit of 2026-08-13).
+#
+# The coordinator is the one plaintext window in the sealed path: the agent
+# opens the envelope and hands it over loopback. That window is by design. What
+# was NOT by design is that the chat handler printed the first 40 characters of
+# every prompt to stderr -- which the client captures and the scripts redirect
+# to files. The envelope kept the prompt off the wire and the log copied it
+# straight back out, onto the disk of a stranger who is renting out compute.
+#
+# Three assertions, and the middle one is what makes the other two mean
+# anything:
+#
+#   1. by default, a request's text does NOT appear in the log;
+#   2. with IDLETOKEN_LOG_PROMPTS=1 and a LOCAL request, it DOES -- the
+#      positive control. Without it, a build that logged nothing at all (or
+#      one whose log went somewhere else entirely) would pass assertion 1 and
+#      the gate would be worthless;
+#   3. with IDLETOKEN_LOG_PROMPTS=1 and a PLATFORM-origin request, it does NOT.
+#      The operator's debug switch may expose their own prompts; it may never
+#      expose a consumer's.
+#
+# Uses a mock cluster with IDLETOKEN_MOCK_OK: the assertion is about what the
+# handler prints before inference, so no weights are needed.
+# =====================================================================
+g_no_prompt_log() {
+    local name="$1" repo; repo=$(cd "$(dirname "$0")/.." && pwd)
+    local wire_port="${IDLETOKEN_PROMPTLOG_PORT:-14431}" api_port=$((${IDLETOKEN_PROMPTLOG_PORT:-14431} + 4000))
+    command -v cc >/dev/null 2>&1 || { skip "$name" "no C compiler on the control machine"; return; }
+    (cd "$repo" && make coord >/dev/null 2>&1) || { fail "$name" "make coord failed on the control machine"; return; }
+
+    # Needs a REAL vocabulary. Under IDLETOKEN_MOCK_OK the request short-circuits
+    # into the mock-completion branch and never reaches the tokenize step that
+    # owns the log line -- the first version of this gate did exactly that, and
+    # its own "was anything logged at all?" sentinel caught it. Rather than
+    # assert against a path that cannot leak, skip loudly and name what is
+    # unchecked (same contract as G_API_MODELS/count_tokens).
+    if [ -z "${IDLETOKEN_SMOKE_GGUF:-}" ] || [ -z "${IDLETOKEN_SMOKE_MODEL_ID:-}" ]; then
+        skip "$name" "set IDLETOKEN_SMOKE_GGUF + IDLETOKEN_SMOKE_MODEL_ID to a small local model — without a real vocabulary the request never reaches the line under test"
+        return
+    fi
+    if [ ! -r "$IDLETOKEN_SMOKE_GGUF" ]; then
+        fail "$name" "IDLETOKEN_SMOKE_GGUF is set but unreadable: $IDLETOKEN_SMOKE_GGUF"; return
+    fi
+    local vocab
+    vocab=$(cd "$repo" && python3 -c "import json,sys;print(json.load(open('models/${IDLETOKEN_SMOKE_MODEL_ID}.json'))['n_vocab'])" 2>/dev/null)
+    [ -n "$vocab" ] || { fail "$name" "no models/${IDLETOKEN_SMOKE_MODEL_ID}.json"; return; }
+
+    # A phrase that could not plausibly appear in the engine's own output.
+    local secret="zzq-canary-prompt-9f3a1c"
+    local tmp cpid wpid
+    _pl_up() {   # _pl_up <logfile> [extra env]
+        tmp=$(mktemp -d)
+        # `exec env ...`, not `env ... exec ...`: the latter hands the literal
+        # word "exec" to env as the program to run, which fails before the
+        # coordinator is ever started -- and the symptom is an unhelpful
+        # "cluster did not come up".
+        (cd "$repo" && exec env $2 ./idletoken-coord --model-id "$IDLETOKEN_SMOKE_MODEL_ID" \
+            --model-path "$IDLETOKEN_SMOKE_GGUF" --bind "127.0.0.1:$wire_port" \
+            --num-workers 1 --n-predict 0 --http --api-bind "127.0.0.1:$api_port" >"$1" 2>&1) &
+        cpid=$!
+        sleep 2
+        (cd "$repo" && IDLETOKEN_MOCK_OS_FAMILY=1 IDLETOKEN_ALLOW_MOCK=1 exec python3 scripts/mock_worker.py \
+            "127.0.0.1:$wire_port" "$vocab" >"$tmp/mock.log" 2>&1) &
+        wpid=$!
+        local i=0
+        while [ $i -lt 150 ] && ! grep -q "cluster ready" "$1"; do sleep 0.2; i=$((i + 1)); done
+        grep -q "cluster ready" "$1"
+    }
+    # Kill by PID *and* by the port in the command line. `( ... ) &` does not
+    # always leave $! pointing at the process that ends up holding the socket,
+    # and a leaked coordinator makes the NEXT sub-run fail with "Address already
+    # in use" -- which reads exactly like the gate's own failure message. The
+    # pattern is scoped to this gate's ports so it cannot disturb other gates.
+    _pl_kill_stray() {
+        pkill -f "idletoken-coord --bind 127.0.0.1:$wire_port" 2>/dev/null
+        pkill -f "mock_worker.py 127.0.0.1:$wire_port" 2>/dev/null
+        sleep 0.3
+    }
+    _pl_down() {
+        [ -n "$wpid" ] && { kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null; }
+        [ -n "$cpid" ] && { kill "$cpid" 2>/dev/null; wait "$cpid" 2>/dev/null; }
+        _pl_kill_stray
+        rm -rf "$tmp"
+    }
+    _pl_ask() {  # _pl_ask [origin-header]
+        # `${hdr[@]+...}`: under `set -u` on macOS's bash 3.2 a bare "${hdr[@]}"
+        # on an EMPTY array is an unbound-variable error, not an empty list.
+        # Same idiom the ladder already uses for RESULTS.
+        local hdr=()
+        [ -n "$1" ] && hdr=(-H "X-IdleToken-Origin: $1")
+        curl -s -o /dev/null -m 30 -X POST "http://127.0.0.1:$api_port/v1/chat/completions" \
+             -H 'content-type: application/json' ${hdr[@]+"${hdr[@]}"} \
+             -d "{\"model\":\"x\",\"messages\":[{\"role\":\"user\",\"content\":\"$secret\"}],\"max_tokens\":4}"
+    }
+
+    _pl_kill_stray   # a leftover from an interrupted earlier run would look like a gate failure
+
+    local log
+    # --- 1. default: the text must not be in the log ------------------------
+    log=$(mktemp)
+    if ! _pl_up "$log" ""; then fail "$name" "mock cluster did not come up (see $log)"; _pl_down; return; fi
+    _pl_ask ""
+    sleep 0.3
+    if grep -q "$secret" "$log"; then
+        fail "$name" "the prompt text was written to the coordinator log by default (see $log)"
+        _pl_down; rm -f "$log"; return
+    fi
+    if ! grep -q "tokenized .*-tok prompt" "$log"; then
+        fail "$name" "no request was logged at all — assertion 1 would pass for the wrong reason (see $log)"
+        _pl_down; rm -f "$log"; return
+    fi
+    _pl_down; rm -f "$log"
+    vlog "default: request logged, text absent"
+
+    # --- 2. positive control: opt-in + LOCAL origin must quote it -----------
+    log=$(mktemp)
+    if ! _pl_up "$log" "IDLETOKEN_LOG_PROMPTS=1"; then fail "$name" "mock cluster did not come up (see $log)"; _pl_down; return; fi
+    _pl_ask ""
+    sleep 0.3
+    if ! grep -q "$secret" "$log"; then
+        fail "$name" "IDLETOKEN_LOG_PROMPTS=1 did not quote a LOCAL prompt — assertion 1 proves nothing if the gate cannot see the text even when it is meant to be there (see $log)"
+        _pl_down; rm -f "$log"; return
+    fi
+    _pl_down; rm -f "$log"
+    vlog "opt-in + local origin: text present (the gate can see it when it is there)"
+
+    # --- 3. opt-in must NOT quote a platform-dispatched prompt --------------
+    log=$(mktemp)
+    if ! _pl_up "$log" "IDLETOKEN_LOG_PROMPTS=1"; then fail "$name" "mock cluster did not come up (see $log)"; _pl_down; return; fi
+    _pl_ask "platform"
+    sleep 0.3
+    if grep -q "$secret" "$log"; then
+        fail "$name" "a PLATFORM-dispatched prompt was quoted in the log — the operator's debug switch exposed a consumer's content (see $log)"
+        _pl_down; rm -f "$log"; return
+    fi
+    if ! grep -q "origin=platform" "$log"; then
+        fail "$name" "the request was not recognised as platform-origin, so assertion 3 tested nothing (see $log)"
+        _pl_down; rm -f "$log"; return
+    fi
+    _pl_down; rm -f "$log"
+    vlog "opt-in + platform origin: text absent, and the origin really was recognised"
+
+    pass "$name"
+}
+
+# =====================================================================
+# G_LOCAL_TOKEN — the local API is closed on a fresh install
+#      (docs/api-surface.md §3 decision 3, §5.3).
+#
+# The engine has always accepted `--api-token` and always defaulted to open;
+# what changed is that the client now generates one for a new install. That is a
+# behaviour of `loadSettings()`, so the gate runs the real function rather than
+# grepping for it: bundle settings.ts with the vite that already builds the
+# client, then drive it against a fake localStorage.
+#
+# Four claims, and the last two matter as much as the first:
+#
+#   1. a fresh install gets a token, 32 hex chars;
+#   2. two fresh installs get DIFFERENT tokens (a constant baked into the
+#      defaults object would satisfy claim 1 and be worthless — same token on
+#      every machine we ship);
+#   3. an UPGRADED install with an empty token keeps it empty. Filling one in
+#      would 401 every curl, script and Claude Code config that machine already
+#      had working, with no visible cause;
+#   4. a token the user actually set is preserved.
+#
+# Claims 3 and 4 are not hypothetical: while writing this gate the harness used
+# the wrong storage key, every case took the fresh-install branch, and the run
+# said a user's own token had been overwritten. The check caught its own setup
+# — which is the point of asserting behaviour instead of matching source text.
+# =====================================================================
+g_local_token() {
+    local name="$1" repo; repo=$(cd "$(dirname "$0")/.." && pwd)
+    [ -d "$repo/client/node_modules/vite" ] || { skip "$name" "client deps not installed (npm i in client/)"; return; }
+    local out; out=$(mktemp -d)
+    if ! (cd "$repo/client" && node -e "
+const {build}=require('vite');
+build({configFile:false,logLevel:'error',build:{lib:{entry:'src/settings.ts',formats:['cjs'],fileName:()=>'settings.cjs'},outDir:'$out',emptyOutDir:true,minify:false}})
+  .then(()=>process.exit(0)).catch(e=>{console.error(e.message);process.exit(1)});
+" >"$out/build.log" 2>&1); then
+        fail "$name" "could not bundle client/src/settings.ts (see $out/build.log)"
+        return
+    fi
+    local verdict
+    verdict=$(node -e "
+const store = new Map();
+globalThis.localStorage = {
+  getItem: k => store.has(k) ? store.get(k) : null,
+  setItem: (k,v) => store.set(k,v),
+  removeItem: k => store.delete(k),
+};
+const S = require('$out/settings.cjs');
+// The real storage key, read from the module's own behaviour: save a settings
+// object and see which key it lands under. Hardcoding a guess here is exactly
+// how this gate first fooled itself.
+S.saveSettings({ probe: 1 });
+const K = [...store.keys()][0];
+store.clear();
+const fail = m => { console.log('FAIL ' + m); process.exit(0); };
+const a = S.loadSettings();
+if (!/^[0-9a-f]{32}\$/.test(a.apiToken || '')) fail('a fresh install got apiToken=' + JSON.stringify(a.apiToken) + ', expected 32 hex chars');
+const b = S.loadSettings();
+if (a.apiToken === b.apiToken) fail('two fresh installs got the SAME token — it is a constant, not a secret');
+store.set(K, JSON.stringify({ schemaVersion: 99, apiToken: '' }));
+if (S.loadSettings().apiToken !== '') fail('an upgraded install with no token had one filled in — every existing client config on that machine starts 401ing');
+store.set(K, JSON.stringify({ schemaVersion: 99, apiToken: 'user-chose-this' }));
+if (S.loadSettings().apiToken !== 'user-chose-this') fail('a user-set token was not preserved');
+console.log('OK ' + K);
+" 2>&1)
+    case "$verdict" in
+        OK\ *) vlog "fresh install closed by default; upgrades and user tokens untouched (key ${verdict#OK })" ;;
+        FAIL\ *) fail "$name" "${verdict#FAIL }"; rm -rf "$out"; return ;;
+        *) fail "$name" "could not run the settings check: $(printf '%s' "$verdict" | head -3 | tr '\n' ' ')"; rm -rf "$out"; return ;;
+    esac
+    rm -rf "$out"
+    pass "$name"
+}
+
+# =====================================================================
+# G_API_MODELS — the two vendor routes a "use it like any other API" client
+#      needs (docs/api-surface.md §6): GET /v1/models and
+#      POST /v1/messages/count_tokens.
+#
+# The coordinator half. The platform half lives in the gateway's own suite
+# (test/models-endpoint.e2e.spec.ts) because it needs a database.
+#
+# Two claims, and the second one is the reason this gate exists at all:
+#
+#   1. /v1/models lists EXACTLY the loaded model. Not the registry — the chat
+#      handler never reads body.model, so any extra id we listed would accept a
+#      request and answer with a different model's output.
+#
+#   2. count_tokens equals what a real request actually prefills. Its only use
+#      is context budgeting; a number that disagrees with the prefill is worse
+#      than no number. Both paths call coord_encode_request_prompt, so today
+#      they agree by construction — this assertion is what stops someone from
+#      later "simplifying" count_tokens into a second implementation.
+#
+# Claim 2 needs a real vocabulary, which the mock cluster has not got. Rather
+# than let it pass quietly on a machine that never checked it, it is reported as
+# its own SKIP line naming the two variables that enable it. A gate that silently
+# drops half its coverage is how this repo gets green ladders that mean nothing.
+# =====================================================================
+g_api_models() {
+    local name="$1" repo; repo=$(cd "$(dirname "$0")/.." && pwd)
+    local wire_port="${IDLETOKEN_MODELS_PORT:-14421}" api_port=$((${IDLETOKEN_MODELS_PORT:-14421} + 4000))
+    command -v cc >/dev/null 2>&1 || { skip "$name" "no C compiler on the control machine"; return; }
+    (cd "$repo" && make coord >/dev/null 2>&1) || { fail "$name" "make coord failed on the control machine"; return; }
+
+    local tmp; tmp=$(mktemp -d)
+    local cpid="" wpid=""
+    _gm_cleanup() {
+        [ -n "$wpid" ] && { kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null; }
+        [ -n "$cpid" ] && { kill "$cpid" 2>/dev/null; wait "$cpid" 2>/dev/null; }
+        rm -rf "$tmp"
+    }
+
+    # ---- claim 1: /v1/models on a mock cluster (no weights needed) ---------
+    (cd "$repo" && exec ./idletoken-coord --bind "127.0.0.1:$wire_port" --num-workers 1 \
+        --n-predict 0 --http --api-bind "127.0.0.1:$api_port" >"$tmp/coord.log" 2>&1) &
+    cpid=$!
+    sleep 1
+    (cd "$repo" && IDLETOKEN_MOCK_OS_FAMILY=1 exec python3 scripts/mock_worker.py \
+        "127.0.0.1:$wire_port" >"$tmp/mock.log" 2>&1) &
+    wpid=$!
+    local i=0
+    while [ $i -lt 100 ] && ! grep -q "cluster ready" "$tmp/coord.log"; do sleep 0.2; i=$((i + 1)); done
+    if ! grep -q "cluster ready" "$tmp/coord.log"; then
+        fail "$name" "the mock cluster never came up (see $tmp/coord.log)"
+        _gm_cleanup; return
+    fi
+
+    local body served n_ids
+    body=$(curl -s -m 5 "http://127.0.0.1:$api_port/v1/models")
+    # The id the coordinator says it is serving, from its own stats endpoint —
+    # not a literal here, or the gate would pin one model forever.
+    served=$(curl -s -m 5 "http://127.0.0.1:$api_port/idletoken/v1/stats" \
+             | sed -n 's/.*"model":"\([^"]*\)".*/\1/p')
+    n_ids=$(printf '%s' "$body" | grep -o '"object":"model"' | wc -l | tr -d ' ')
+    if [ "$n_ids" != 1 ]; then
+        fail "$name" "GET /v1/models listed $n_ids models, expected exactly 1 (the loaded one); body: $(printf '%s' "$body" | cut -c1-160)"
+        _gm_cleanup; return
+    fi
+    case "$body" in
+        *'"object":"list"'*) : ;;
+        *) fail "$name" "GET /v1/models is not an OpenAI list envelope: $(printf '%s' "$body" | cut -c1-160)"; _gm_cleanup; return ;;
+    esac
+    if [ -z "$served" ] || ! printf '%s' "$body" | grep -q "\"id\":\"$served\""; then
+        fail "$name" "GET /v1/models does not name the loaded model ('$served'): $(printf '%s' "$body" | cut -c1-160)"
+        _gm_cleanup; return
+    fi
+    vlog "/v1/models lists exactly the loaded model ($served)"
+    _gm_cleanup
+
+    # ---- claim 2: count_tokens == the real prefill (needs a vocabulary) ----
+    if [ -z "${IDLETOKEN_SMOKE_GGUF:-}" ] || [ -z "${IDLETOKEN_SMOKE_MODEL_ID:-}" ]; then
+        pass "$name"
+        skip "$name/count_tokens" "set IDLETOKEN_SMOKE_GGUF + IDLETOKEN_SMOKE_MODEL_ID to a small local model to check count_tokens against the real prefill"
+        return
+    fi
+    if [ ! -r "$IDLETOKEN_SMOKE_GGUF" ]; then
+        fail "$name" "IDLETOKEN_SMOKE_GGUF is set but unreadable: $IDLETOKEN_SMOKE_GGUF"
+        return
+    fi
+
+    local vocab p2 a2
+    vocab=$(cd "$repo" && python3 -c "import json,sys;print(json.load(open('models/${IDLETOKEN_SMOKE_MODEL_ID}.json'))['n_vocab'])" 2>/dev/null)
+    if [ -z "$vocab" ]; then
+        fail "$name" "no models/${IDLETOKEN_SMOKE_MODEL_ID}.json (IDLETOKEN_SMOKE_MODEL_ID must name a registry model)"
+        return
+    fi
+    tmp=$(mktemp -d); cpid=""; wpid=""
+    p2=$((wire_port + 2)); a2=$((api_port + 2))
+    (cd "$repo" && exec ./idletoken-coord --model-id "$IDLETOKEN_SMOKE_MODEL_ID" \
+        --model-path "$IDLETOKEN_SMOKE_GGUF" --num-workers 1 --n-predict 0 --http \
+        --bind "127.0.0.1:$p2" --api-bind "127.0.0.1:$a2" >"$tmp/coord.log" 2>&1) &
+    cpid=$!
+    sleep 2
+    (cd "$repo" && IDLETOKEN_MOCK_OS_FAMILY=1 IDLETOKEN_ALLOW_MOCK=1 exec python3 scripts/mock_worker.py \
+        "127.0.0.1:$p2" "$vocab" >"$tmp/mock.log" 2>&1) &
+    wpid=$!
+    i=0
+    while [ $i -lt 150 ] && ! grep -q "cluster ready" "$tmp/coord.log"; do sleep 0.2; i=$((i + 1)); done
+    if ! grep -q "cluster ready" "$tmp/coord.log"; then
+        fail "$name" "the $IDLETOKEN_SMOKE_MODEL_ID cluster never came up (see $tmp/coord.log)"
+        _gm_cleanup; return
+    fi
+
+    # A multi-turn body with a system prompt: the chat template's framing is the
+    # whole point, so a single bare message would not distinguish the two
+    # implementations this assertion exists to keep welded together.
+    local cbody='{"model":"x","system":"You are terse.","messages":[{"role":"user","content":"hello world"},{"role":"assistant","content":"hi"},{"role":"user","content":"and now a longer follow-up question"}]}'
+    local counted prefilled
+    counted=$(curl -s -m 20 -X POST "http://127.0.0.1:$a2/v1/messages/count_tokens" \
+              -H 'content-type: application/json' -d "$cbody" \
+              | sed -n 's/.*"input_tokens":\([0-9]*\).*/\1/p')
+    local before; before=$(wc -l < "$tmp/coord.log")
+    curl -s -m 120 -o /dev/null -X POST "http://127.0.0.1:$a2/v1/messages" \
+         -H 'content-type: application/json' -d "$cbody"
+    prefilled=$(tail -n +$((before + 1)) "$tmp/coord.log" \
+                | sed -n 's/.*tokenized \([0-9]*\)-tok prompt.*/\1/p' | head -1)
+    if [ -z "$counted" ] || [ -z "$prefilled" ]; then
+        fail "$name" "could not read both numbers (count_tokens='$counted', prefill='$prefilled'; see $tmp/coord.log)"
+        _gm_cleanup; return
+    fi
+    if [ "$counted" != "$prefilled" ]; then
+        fail "$name" "count_tokens says $counted but the request prefilled $prefilled — the two encoders have drifted apart"
+        _gm_cleanup; return
+    fi
+    vlog "count_tokens == real prefill ($counted tokens, $IDLETOKEN_SMOKE_MODEL_ID)"
+    _gm_cleanup
+    pass "$name"
+}
+
+# =====================================================================
+# G_SIZE — large models cluster, small models do not. The coordinator must
+#      REFUSE to serve a single-node model on more than one machine (CLAUDE.md
+#      hard constraint, 2026-08-12), and must still serve a cluster model
+#      across many.
+#
+# Runs on the control machine with no cluster and no weights: every assertion
+# is about a startup decision the coordinator makes before it opens a socket,
+# so `--num-workers 2` never has to be satisfied.
+#
+# BOTH halves are checked, for the same reason G_HOMO checks both: a build that
+# refused every multi-node start would pass the negative half on its own. And
+# the escape hatch is checked too — the cross-machine gates depend on it, so a
+# silent change to its name would disable them without turning anything red.
+# =====================================================================
+g_size() {
+    local name="$1" repo; repo=$(cd "$(dirname "$0")/.." && pwd)
+    # One port per step. Reusing one made step 3 fail with "Address already in
+    # use" from step 2's just-killed listener, which reads exactly like the
+    # policy check refusing the model -- a red for the wrong reason.
+    local base="${IDLETOKEN_SIZE_PORT:-14321}"
+    local port_a=$base port_b=$((base + 1)) port_c=$((base + 2)) port_d=$((base + 3))
+    command -v cc >/dev/null 2>&1 || { skip "$name" "no C compiler on the control machine"; return; }
+    (cd "$repo" && make coord >/dev/null 2>&1) || { fail "$name" "make coord failed on the control machine"; return; }
+
+    # Pick the models from the manifests rather than naming them here: the
+    # registry decides which are small, and a hardcoded id here would keep
+    # passing after that model was retired.
+    local small large
+    small=$(python3 - <<'PY'
+import glob, json
+for f in sorted(glob.glob("models/*.json")):
+    m = json.load(open(f))
+    if m.get("available") and m.get("deployment") == "single-node":
+        print(m["id"]); break
+PY
+)
+    large=$(python3 - <<'PY'
+import glob, json
+for f in sorted(glob.glob("models/*.json")):
+    m = json.load(open(f))
+    if m.get("available") and m.get("deployment") == "cluster":
+        print(m["id"]); break
+PY
+)
+    [ -n "$small" ] && [ -n "$large" ] || {
+        fail "$name" "need one available single-node and one available cluster model in models/*.json (got '$small' / '$large')"
+        return
+    }
+
+    # 1. small model + 2 nodes => refused, with a reason the client can show.
+    #
+    # Backgrounded with a log rather than `out=$(...)`: a coordinator that does
+    # NOT refuse goes on to wait for workers forever, and the command
+    # substitution would block on its stdout — the gate would HANG instead of
+    # failing. A check that cannot report the very thing it is looking for is
+    # not a check. (Found by running this gate with the override exported.)
+    local log; log=$(mktemp)
+    (cd "$repo" && exec ./idletoken-coord --model-id "$small" --num-workers 2 --n-predict 0 \
+        --bind "127.0.0.1:$port_a" >"$log" 2>&1) &
+    local pid=$!
+    local i=0
+    while [ $i -lt 100 ] && ! grep -qE "JOIN_REFUSED: |waiting for worker" "$log"; do sleep 0.1; i=$((i + 1)); done
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    if grep -q "waiting for worker" "$log"; then
+        fail "$name" "coordinator accepted a 2-node start for the single-node model $small (see $log)"
+        rm -f "$log"; return
+    fi
+    if ! grep -q "JOIN_REFUSED: " "$log"; then
+        fail "$name" "$small was refused without the JOIN_REFUSED marker — the client cannot show a reason (see $log)"
+        rm -f "$log"; return
+    fi
+    vlog "$small refused on 2 nodes: $(grep -o 'JOIN_REFUSED: .*' "$log" | head -1 | cut -c1-90)"
+    rm -f "$log"
+
+    # 2. ...but one node is fine. Reaching the "waiting for worker" line means
+    #    the deployment check let it through; we kill it there rather than
+    #    supply a worker, because a worker would need real weights.
+    log=$(mktemp)
+    (cd "$repo" && exec ./idletoken-coord --model-id "$small" --num-workers 1 --n-predict 0 \
+        --bind "127.0.0.1:$port_b" >"$log" 2>&1) &
+    pid=$!
+    i=0
+    while [ $i -lt 60 ] && ! grep -q "waiting for worker" "$log"; do sleep 0.1; i=$((i + 1)); done
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    if ! grep -q "waiting for worker" "$log"; then
+        fail "$name" "$small was blocked on ONE machine too — the check refuses everything (see $log)"
+        rm -f "$log"; return
+    fi
+    rm -f "$log"
+    vlog "$small starts fine on one machine"
+
+    # 3. a cluster model on 2 nodes must NOT be refused by this check.
+    log=$(mktemp)
+    (cd "$repo" && exec ./idletoken-coord --model-id "$large" --num-workers 2 --n-predict 0 \
+        --bind "127.0.0.1:$port_c" >"$log" 2>&1) &
+    pid=$!
+    i=0
+    while [ $i -lt 60 ] && ! grep -q "waiting for worker" "$log"; do sleep 0.1; i=$((i + 1)); done
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    if grep -q "JOIN_REFUSED" "$log"; then
+        fail "$name" "the cluster model $large was refused a 2-node start (see $log)"; rm -f "$log"; return
+    fi
+    if ! grep -q "waiting for worker" "$log"; then
+        fail "$name" "$large never reached the worker wait on 2 nodes (see $log)"; rm -f "$log"; return
+    fi
+    rm -f "$log"
+    vlog "$large accepted on 2 nodes"
+
+    # 4. the escape hatch the cross-machine gates rely on still opens. Same
+    #    background-and-kill shape as above rather than `timeout`, which the
+    #    control machine may not have (macOS ships none).
+    log=$(mktemp)
+    (cd "$repo" && export IDLETOKEN_ALLOW_SMALL_CLUSTER=1 && exec ./idletoken-coord \
+        --model-id "$small" --num-workers 2 --n-predict 0 \
+        --bind "127.0.0.1:$port_d" >"$log" 2>&1) &
+    pid=$!
+    i=0
+    while [ $i -lt 60 ] && ! grep -q "waiting for worker" "$log"; do sleep 0.1; i=$((i + 1)); done
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    if ! grep -q "IDLETOKEN_ALLOW_SMALL_CLUSTER=1" "$log" || ! grep -q "waiting for worker" "$log"; then
+        fail "$name" "IDLETOKEN_ALLOW_SMALL_CLUSTER=1 did not let $small start on 2 nodes — the cross-machine gates have lost their vehicle (see $log)"
+        rm -f "$log"; return
+    fi
+    rm -f "$log"
+    vlog "override still works, and says so"
+
     pass "$name"
 }
 
@@ -1764,6 +3277,64 @@ g_dspark() {
 }
 
 # =====================================================================
+# G_UPDATE / G_TRAY -- the two shell-level promises of the desktop client:
+# it can update itself safely, and it keeps serving when its window is closed.
+#
+# Both delegate to their own scripts (scripts/client_update_gate.sh /
+# client_tray_gate.sh) for the same reason G_SCHED does: the assertions are long
+# enough to deserve a file, and that file is runnable by hand while working on
+# the feature.
+#
+# WHICH MACHINE. A GUI client is being driven, so it needs a machine with a
+# desktop. `IDLETOKEN_CLIENT_NODE` names it; when it is unset, the first Windows
+# worker node in the testbed is used, because Windows is where these two
+# features actually mean something (the notification area, and an NSIS
+# installer handover). With no Windows node configured the gate falls back to
+# the control machine and SAYS SO -- a macOS pass is a smoke test, not the
+# promise.
+# =====================================================================
+
+# Echo the node these two gates should drive, or nothing for "this machine".
+client_gui_node() {
+    if [ -n "${IDLETOKEN_CLIENT_NODE:-}" ]; then printf '%s' "$IDLETOKEN_CLIENT_NODE"; return; fi
+    local n prof
+    for n in ${WORKER_NODES[@]+"${WORKER_NODES[@]}"}; do
+        prof="$(testbed_profile "$n")"
+        case "$prof" in [A-Za-z]:/*) printf '%s' "$n"; return ;; esac
+    done
+}
+
+g_update() {
+    local name="$1" node out
+    node="$(client_gui_node)"
+    [ -n "$node" ] || vlog "no Windows client node configured -- running the update gate on this machine (smoke test only)"
+    out=$(IDLETOKEN_CLIENT_NODE="$node" bash scripts/client_update_gate.sh 2>&1 | grep -E "^UPDATE_GATE_(OK|FAIL|SKIP)" | tail -1)
+    case "$out" in
+        UPDATE_GATE_OK)
+            vlog "update check/download/signature verified on ${node:-this machine} (5 cases incl. tampered artifact refused)"
+            pass "$name" ;;
+        UPDATE_GATE_SKIP*) skip "$name" "${out#UPDATE_GATE_SKIP: }" ;;
+        "") fail "$name" "scripts/client_update_gate.sh reached no conclusion" ;;
+        *) fail "$name" "${out#UPDATE_GATE_FAIL: }" ;;
+    esac
+}
+
+g_tray() {
+    local name="$1" node out
+    node="$(client_gui_node)"
+    [ -n "$node" ] || vlog "no Windows client node configured -- running the tray gate on this machine (smoke test only)"
+    out=$(IDLETOKEN_CLIENT_NODE="$node" bash scripts/client_tray_gate.sh 2>&1 | grep -E "^TRAY_GATE_(OK|FAIL|SKIP)" | tail -1)
+    case "$out" in
+        TRAY_GATE_OK)
+            vlog "close-to-tray, geometry and start-in-tray verified on ${node:-this machine}"
+            pass "$name" ;;
+        TRAY_GATE_SKIP*) skip "$name" "${out#TRAY_GATE_SKIP: }" ;;
+        "") fail "$name" "scripts/client_tray_gate.sh reached no conclusion" ;;
+        *) fail "$name" "${out#TRAY_GATE_FAIL: }" ;;
+    esac
+}
+
+# =====================================================================
 # G_SCHED -- the scheduler platform (the seven assertions of
 # docs/scheduler-design.md §9 plus the two added after E3).
 #
@@ -1777,10 +3348,53 @@ g_dspark() {
 # DGX): it needs only the gateway's node_modules, no real cluster and no GPU.
 # Missing dependencies -> SKIP.
 # =====================================================================
+# Run a command with a wall-clock deadline, collecting output in a FILE.
+#
+# Two separate hazards, both observed on 2026-08-14 running the full ladder:
+#   1. `cmd | grep | tail` blocks until the write end of the pipe is closed by
+#      EVERY holder -- so a daemonized descendant that outlives the script (jest
+#      "Force exiting" leaves such handles) hangs the whole ladder forever, long
+#      after the gate itself has finished. Writing to a file removes the pipe.
+#   2. macOS ships no coreutils `timeout`, so the ladder had no local deadline
+#      primitive at all.
+# The killer targets the process GROUP so leaked descendants go too.
+run_deadline() {  # run_deadline <seconds> <outfile> <command...>
+    local secs="$1" outf="$2"; shift 2
+    ( "$@" >"$outf" 2>&1 ) &
+    local pid=$! i=0
+    while kill -0 "$pid" 2>/dev/null && [ "$i" -lt "$secs" ]; do sleep 1; i=$((i + 1)); done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -TERM "$pid" 2>/dev/null; sleep 2; kill -KILL "$pid" 2>/dev/null
+        return 124
+    fi
+    wait "$pid" 2>/dev/null
+    return 0
+}
+
 g_sched() {
     local name="$1"
-    local out
-    out=$(bash scripts/scheduler_gate.sh 2>&1 | grep -E "^G_SCHED_(OK|FAIL|SKIP)" | tail -1)
+    # The scheduler gate script belongs to the platform business layer and is
+    # deliberately not shipped in the public mirror. Its absence is a fact
+    # about this checkout, not a failure of anything under test.
+    if [ ! -f "$REPO_ROOT/scripts/scheduler_gate.sh" ]; then
+        skip "$name" "scripts/scheduler_gate.sh is not present in this checkout (platform business layer, not shipped publicly)"
+        return
+    fi
+    local out log; log=$(mktemp)
+    if ! run_deadline "${IDLETOKEN_SCHED_TIMEOUT:-900}" "$log" bash scripts/scheduler_gate.sh; then
+        out=$(grep -E "^G_SCHED_(OK|FAIL|SKIP)" "$log" | tail -1)
+        if [ -n "$out" ]; then
+            # It DID reach a verdict; only the cleanup overstayed (a leaked
+            # descendant kept running). Honour the verdict and say so.
+            vlog "scheduler_gate.sh reached a verdict but did not exit within the deadline (leaked background handle); using the verdict"
+        else
+            fail "$name" "scripts/scheduler_gate.sh did not finish within ${IDLETOKEN_SCHED_TIMEOUT:-900}s (see $log)"
+            return
+        fi
+    else
+        out=$(grep -E "^G_SCHED_(OK|FAIL|SKIP)" "$log" | tail -1)
+    fi
+    rm -f "$log"
     case "$out" in
         G_SCHED_OK)
             vlog "scheduler gates green (breaker/blacklist/failure classification/no stampede/affinity/anti-starvation/honest congestion + agent concurrency + cross-instance slots)"
@@ -1797,6 +3411,12 @@ g_sched() {
 g_plat() {
     local name="$1"
     local out
+    # Same rule as G_SCHED: the platform e2e script is business-layer and not
+    # shipped in the public mirror, so a checkout without it SKIPs honestly.
+    if [ ! -f "$REPO_ROOT/scripts/platform_e2e_real_coord.sh" ]; then
+        skip "$name" "scripts/platform_e2e_real_coord.sh is not present in this checkout (platform business layer, not shipped publicly)"
+        return
+    fi
     # Grep the explicit result markers, NOT the last combined line: the
     # script's EXIT trap prints a "logs kept in ..." note to stderr AFTER
     # G_PLAT_OK, so `tail -1` of 2>&1 reads the cleanup note instead.
@@ -1815,6 +3435,49 @@ g_plat() {
 }
 
 # =====================================================================
+# G_PRIV7 — raw embeddings never leave the coordinator (v2 plan §5.1, the
+#      layer-0 privacy invariant). Delegates to
+#      scripts/gpriv7_embedding_check.sh, which taps the RPC byte stream and
+#      FIRST proves it can recover embedding rows from a deliberately bad
+#      configuration (all layers remote, plaintext) before certifying that
+#      the product configuration leaks none. A checker that has not shown it
+#      can go red proves nothing — that lesson is the whole design.
+# =====================================================================
+g_priv7() {
+    local name="$1" out
+    out=$(bash scripts/gpriv7_embedding_check.sh 2>&1 | grep -E "^G_PRIV7_(OK|FAIL|SKIP)" | tail -1)
+    case "$out" in
+        G_PRIV7_OK*)
+            vlog "${out#G_PRIV7_OK }"
+            pass "$name" ;;
+        G_PRIV7_SKIP*) skip "$name" "${out#G_PRIV7_SKIP: }" ;;
+        "") fail "$name" "scripts/gpriv7_embedding_check.sh reached no conclusion" ;;
+        *) fail "$name" "${out#G_PRIV7_FAIL: }" ;;
+    esac
+}
+
+# =====================================================================
+# G_PPL — distribution-level numeric gate (v2 plan §1.10 / F3): the engine's
+#      perplexity over a fixed committed corpus stays inside a recorded band.
+#      Replaces the exact-token-match oracles (G4's token-id equality, the
+#      ds4x bit-exact channels) that decision #10 retired. Delegates to
+#      scripts/ppl_gate.sh; the reference band lives in
+#      test-assets/ppl/<model>.<quant>.json.
+# =====================================================================
+g_ppl() {
+    local name="$1" out
+    out=$(bash scripts/ppl_gate.sh 2>&1 | grep -E "^G_PPL_(OK|FAIL|SKIP)" | tail -1)
+    case "$out" in
+        G_PPL_OK*)
+            vlog "${out#G_PPL_OK }"
+            pass "$name" ;;
+        G_PPL_SKIP*) skip "$name" "${out#G_PPL_SKIP: }" ;;
+        "") fail "$name" "scripts/ppl_gate.sh reached no conclusion" ;;
+        *) fail "$name" "${out#G_PPL_FAIL: }" ;;
+    esac
+}
+
+# =====================================================================
 echo "======================================================"
 echo " IdleToken acceptance ladder   $(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo)"
 echo "======================================================"
@@ -1823,9 +3486,10 @@ echo "======================================================"
 # as a flaky G4. Kill leftovers on the coord node and let memory settle.
 # ([b]racket patterns keep pkill from matching this ssh command itself.)
 #
-# 2026-08-08: this line used to hardcode `homeai-*`, while after the 08-04 rename
-# the binaries are called `idletoken-*` -- so **from the day of the rename it
-# matched no process at all**, "succeeding" every round while doing nothing.
+# 2026-08-08: this line used to hardcode the pre-08-04-rename binary names,
+# while the binaries are now called `idletoken-*` -- so **from the day of the
+# rename it matched no process at all**, "succeeding" every round while doing
+# nothing.
 # Four days later a 7-hour experiment leftover holding 80 GB of unified memory
 # surfaced it: G4 went red, which is exactly what the scrub was supposed to
 # prevent. `pkill` returns 1 when it matches nothing, that was swallowed by
@@ -1868,9 +3532,43 @@ gate P3_pairing        p3_pairing
 gate P4_orchestration  p4_orchestration
 gate P5_settings       p5_settings
 gate P6_api_exposure   p6_api_exposure
-# Cluster homogeneity: a hard-constraint invariant that needs no cluster node.
-# gate_always, and before G_FINAL — see the helper's comment.
+# The client's own two shell promises. Registered after P6 and deliberately NOT
+# part of G_FINAL's composition: G_FINAL is defined in
+# docs/acceptance-criteria.md as P1-P6 + G6, and quietly widening a gate that
+# owns the exit code would change what a green ladder claims. They are reported
+# on their own line, where a red one is visible.
+gate G_UPDATE          g_update
+gate G_TRAY            g_tray
+# Cluster invariants that need no cluster node. gate_always, and before
+# G_FINAL — see the helper's comment.
+# 2026-08-14 migration (WS-F1): G_HOMO and G_MACSEAL are retired-in-place
+# (each prints a dated SKIP and keeps its parked assertions behind an env,
+# G_DSPARK-style); their successors are G_VERSION (engine-version equality is
+# the one llama.cpp-cluster invariant) and G_MAC_SMOKE (macOS compute,
+# positively gated instead of sealed).
 gate_always G_HOMO     g_homo
+gate_always G_VERSION  g_version
+gate_always G_SIZE     g_size
+gate_always G_MACSEAL  g_macseal
+gate_always G_MAC_SMOKE g_mac_smoke
+# The API route namespace (docs/api-surface.md). Needs no cluster node, and its
+# source-sweep half is the only thing standing between a rename and a silent 404
+# in the client dashboard -- so it must not be hideable by an offline laptop.
+gate_always G_API_NS   g_api_ns
+# The two vendor routes a third-party client needs (docs/api-surface.md §6).
+# Also gate_always: it needs no cluster node, and "/v1/models lists something we
+# cannot actually serve" is a product-level lie, not a platform-layer nicety.
+gate_always G_API_MODELS g_api_models
+# "The local API is closed on a fresh install" is a security posture, not a
+# platform nicety — gate_always so an offline laptop cannot hide it.
+gate_always G_LOCAL_TOKEN g_local_token
+# "a shared machine does not write other people's prompts to its own disk" is a
+# privacy invariant, not a platform-layer nicety -- gate_always.
+gate_always G_NO_PROMPT_LOG g_no_prompt_log
+# Raw embeddings stay on the coordinator (privacy invariant, WS-F2) and the
+# distribution-level numeric band (WS-F3) — both local, both product-level.
+gate_always G_PRIV7    g_priv7
+gate_always G_PPL      g_ppl
 gate G_FINAL           g_final
 # Both of these run AFTER G_FINAL and are independent of it: G_PLAT is the
 # platform business layer (spec decision 11), G_DSPARK is an optional
@@ -1883,8 +3581,26 @@ gate_local G_SCHED     g_sched
 echo "------------------------------------------------------"
 if [ -n "$ONLY_GATE" ]; then
     # Single-gate mode: report just that gate; no ladder-wide claims.
-    if [ -z "$FRONTIER" ]; then echo " GATE $ONLY_GATE: PASS"; exit 0
-    else echo " GATE $ONLY_GATE: FAIL"; exit 1; fi
+    #
+    # A SKIP is NOT a PASS. This printed "GATE X: PASS" for a gate that had
+    # skipped for want of its inputs (2026-08-15: G_PPL skipped because the
+    # smoke GGUF never reached the child process, and the summary line called it
+    # PASS) -- the exact false green the ladder exists to prevent. Exit 2 keeps
+    # it distinguishable from both a pass and a real failure.
+    _only_verdict=""
+    for _r in ${RESULTS[@]+"${RESULTS[@]}"}; do
+        case "$_r" in
+            "PASS $ONLY_GATE"|"PASS $ONLY_GATE"_*) _only_verdict="PASS" ;;
+            "FAIL $ONLY_GATE"|"FAIL $ONLY_GATE"_*) _only_verdict="FAIL" ;;
+            "SKIP $ONLY_GATE"|"SKIP $ONLY_GATE"_*) [ -n "$_only_verdict" ] || _only_verdict="SKIP" ;;
+        esac
+    done
+    case "$_only_verdict" in
+        PASS) echo " GATE $ONLY_GATE: PASS"; exit 0 ;;
+        SKIP) echo " GATE $ONLY_GATE: SKIP (not run — this is not a pass)"; exit 2 ;;
+        FAIL) echo " GATE $ONLY_GATE: FAIL"; exit 1 ;;
+        *)    echo " GATE $ONLY_GATE: NO SUCH GATE (nothing ran)"; exit 2 ;;
+    esac
 fi
 if [ -z "$FRONTIER" ]; then
     echo -e " \033[32mALL GATES PASS — project goal met.\033[0m"

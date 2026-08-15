@@ -73,9 +73,40 @@ if [ -n "$ok" ] \
    && grep -q "passed pairing auth" "$COORD_LOG" \
    && grep -q "pairing auth OK" "$WORKER_LOG" \
    && grep -q "discovered coordinator" "$WORKER_LOG"; then
-    echo G_PAIR_OK
-    exit 0
+    :
 else
     echo G_PAIR_FAIL
     exit 1
 fi
+
+# --- N0: both ends KEPT the derived session key, and it is the SAME key -------
+#
+# The pairing preamble has always derived a session key; until 2026-08-13 both
+# sides then dropped it on the floor as a local variable. Token-id encryption
+# (docs/inter-node-encryption.md N1) needs it to survive to where the INFER
+# messages are sent, so N0 stores it -- and this is the assertion that says so.
+#
+# Comparing the two FINGERPRINTS is the point. "the coordinator logged a
+# session" alone would pass on a build where each side kept a different key,
+# which is precisely the bug that would make N1 fail with an unhelpful
+# "decryption failed" on the first token instead of here.
+#
+# The fingerprint is sha256(key)[:4]; the key itself is never logged.
+COORD_FP=$(grep -o 'session=[0-9a-f]\{8\}' "$COORD_LOG" | head -1 | cut -d= -f2)
+WORKER_FP=$(grep -o 'session=[0-9a-f]\{8\}' "$WORKER_LOG" | head -1 | cut -d= -f2)
+if [ -z "$COORD_FP" ] || [ -z "$WORKER_FP" ]; then
+    echo "pair_selftest: no session-key fingerprint logged (coord='$COORD_FP' worker='$WORKER_FP')" >&2
+    echo "  the pairing preamble derived a key but at least one side did not keep it (N0)" >&2
+    echo G_PAIR_FAIL
+    exit 1
+fi
+if [ "$COORD_FP" != "$WORKER_FP" ]; then
+    echo "pair_selftest: the two ends kept DIFFERENT session keys ($COORD_FP vs $WORKER_FP)" >&2
+    echo "  N1 would then fail on the first encrypted token, far from the cause" >&2
+    echo G_PAIR_FAIL
+    exit 1
+fi
+echo "pair_selftest: session key kept on both ends and identical ($COORD_FP)"
+
+echo G_PAIR_OK
+exit 0

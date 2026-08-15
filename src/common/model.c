@@ -3,6 +3,7 @@
  */
 #include "idletoken_model.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #define GiB (1024ull * 1024 * 1024)
@@ -101,6 +102,7 @@ static const idletoken_model_spec MODELS[] = {
         .label   = "DeepSeek V4 Flash",
         .backend = IDLETOKEN_BACKEND_DS4,
         .available = 1,
+        .deployment = IDLETOKEN_DEPLOY_CLUSTER,  /* 304B at Q2 = 80.76 GiB; no single home machine holds it */
         .n_layers = 43,
         .n_embd   = 4096,
         .hc_streams = 4,           /* mHC 4-stream hyper-connections */
@@ -133,6 +135,7 @@ static const idletoken_model_spec MODELS[] = {
                                     * Qwen3.5-0.8B Q4_K_M GGUF (DGX): output
                                     * matches llama.cpp token-for-token on
                                     * greedy prompts (design doc §4d) */
+        .deployment = IDLETOKEN_DEPLOY_SINGLE_NODE,
         .n_layers = 24,
         .n_embd   = 1024,
         .hc_streams = 1,
@@ -167,6 +170,7 @@ static const idletoken_model_spec MODELS[] = {
                                     * CUDA agree token-for-token, and the
                                     * cpu/gpu recurrence check stays at 6e-08
                                     * over 168 chunks (design doc §4j) */
+        .deployment = IDLETOKEN_DEPLOY_SINGLE_NODE,
         .n_layers = 32,
         .n_embd   = 2560,
         .hc_streams = 1,
@@ -199,6 +203,7 @@ static const idletoken_model_spec MODELS[] = {
         .available = 1,            /* validated 2026-07-28 on the real
                                     * Qwen3.5-9B Q4_K_M GGUF (DGX): greedy
                                     * output matches llama.cpp word for word */
+        .deployment = IDLETOKEN_DEPLOY_SINGLE_NODE,
         .n_layers = 32,
         .n_embd   = 4096,
         .hc_streams = 1,
@@ -230,6 +235,7 @@ static const idletoken_model_spec MODELS[] = {
                                     * counting prompt matches llama.cpp word
                                     * for word; layer-0 attn_output/final_output
                                     * agree to <0.1% (design doc §4j) */
+        .deployment = IDLETOKEN_DEPLOY_SINGLE_NODE,
         .n_layers = 64,
         .n_embd   = 5120,
         .hc_streams = 1,
@@ -261,6 +267,7 @@ static const idletoken_model_spec MODELS[] = {
                                     * Qwen3.5-35B-A3B Q4_K_M GGUF (DGX): the
                                     * counting prompt matches llama.cpp word
                                     * for word and layer-0 agrees (§4n) */
+        .deployment = IDLETOKEN_DEPLOY_SINGLE_NODE,
         .n_layers = 40,
         .n_embd   = 2048,
         .hc_streams = 1,
@@ -286,6 +293,7 @@ static const idletoken_model_spec MODELS[] = {
         .available = 1,            /* validated 2026-07-27 on real Qwen3-8B
                                     * Q4_K_M GGUF (DGX): coherent output, and
                                     * the CUDA path matches CPU token-for-token */
+        .deployment = IDLETOKEN_DEPLOY_SINGLE_NODE,
         .n_layers = 36,
         .n_embd   = 4096,
         .hc_streams = 1,           /* plain residual */
@@ -310,6 +318,7 @@ static const idletoken_model_spec MODELS[] = {
         .label   = "GLM-5.2",
         .backend = IDLETOKEN_BACKEND_DS4X,
         .available = 0,
+        .deployment = IDLETOKEN_DEPLOY_CLUSTER,  /* ~240 GiB at Q2 */
         .n_layers = 78,            /* 3 dense + 75 MoE */
         .n_embd   = 6144,
         .hc_streams = 1,           /* plain residual */
@@ -330,6 +339,7 @@ static const idletoken_model_spec MODELS[] = {
         .label   = "Kimi K2.5",
         .backend = IDLETOKEN_BACKEND_DS4X,
         .available = 0,
+        .deployment = IDLETOKEN_DEPLOY_CLUSTER,
         .n_layers = 61,
         .n_embd   = 7168,
         .hc_streams = 1,
@@ -351,6 +361,7 @@ static const idletoken_model_spec MODELS[] = {
         .label   = "Kimi K3",
         .backend = IDLETOKEN_BACKEND_DS4X,
         .available = 0,
+        .deployment = IDLETOKEN_DEPLOY_CLUSTER,
         .n_layers = 0,
         .n_embd   = 0,
         .hc_streams = 1,
@@ -384,6 +395,31 @@ int idletoken_model_count(void) {
 const idletoken_model_spec *idletoken_model_at(int index) {
     if (index < 0 || index >= idletoken_model_count()) return NULL;
     return &MODELS[index];
+}
+
+int idletoken_model_may_cluster(const idletoken_model_spec *m, char *why, size_t why_cap) {
+    if (!m) {
+        if (why && why_cap) snprintf(why, why_cap, "unknown model");
+        return 0;
+    }
+    if (m->deployment == IDLETOKEN_DEPLOY_CLUSTER) return 1;
+    if (why && why_cap) {
+        if (m->deployment == IDLETOKEN_DEPLOY_SINGLE_NODE)
+            snprintf(why, why_cap,
+                     "%s runs on ONE machine only. Small models fit a single node, "
+                     "and splitting one across a LAN spends more time on pipeline "
+                     "round-trips than on compute. Serve it standalone, or pick a "
+                     "model marked for clusters.", m->label);
+        else
+            /* Only reachable if a model was added without declaring
+             * "deployment" — a build-time mistake, so name it as one instead
+             * of blaming the user's setup. */
+            snprintf(why, why_cap,
+                     "%s does not declare how it may be deployed (models/%s.json "
+                     "\"deployment\"), so this build refuses to cluster it.",
+                     m->label, m->id);
+    }
+    return 0;
 }
 
 const idletoken_model_variant *idletoken_model_variant_get(const idletoken_model_spec *m,

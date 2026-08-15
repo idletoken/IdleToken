@@ -4,9 +4,9 @@ import { getResourceProvider } from "./provider";
 import { getEngineProvider, type EngineLogLine, type EngineRole, type EngineStatus } from "./provider/engine";
 import { uiTestDirectives } from "./testHooks";
 import type { NodeSnapshot, ClusterState } from "./types";
-import { HW_NO_GPU, HW_CC_TOO_LOW, HW_DRIVER_TOO_OLD, HW_VRAM_TOO_SMALL, HW_GPU_UNSUPPORTED } from "./types";
-import { getModel, getManifest, defaultQuant, estimateClusterCapacity, pickBestFittingModel, type ModelSpec } from "./models";
-import { resolveLocalWeights, fetchWeights, onFetchProgress, defaultModelDir, cancelFetch, resolveDownload, weightsState } from "./weights";
+import { HW_NO_GPU, HW_CC_TOO_LOW, HW_DRIVER_TOO_OLD, HW_VRAM_TOO_SMALL, HW_GPU_UNSUPPORTED, HW_MACOS_SEALED } from "./types";
+import { getModel, getManifest, defaultQuant, estimateClusterCapacity, isSingleNode, isLocalGguf, localGgufSpec, LOCAL_GGUF_ID, pickBestFittingModel, type ModelSpec } from "./models";
+import { resolveLocalWeights, resolveCustomWeights, customGgufName, fetchWeights, onFetchProgress, defaultModelDir, cancelFetch, resolveDownload, weightsState, isWeightsCancelled, WeightsCancelled, type CustomModelSource, type DownloadTarget } from "./weights";
 import { loadSettings, saveSettings, settingsWerePersisted, effectiveCaps, engineTuning, autoUiScale, TIERS, type AppSettings } from "./settings";
 import { buildDiagnosticsBundle } from "./diagnostics";
 import { getAuthProvider, type Session } from "./auth";
@@ -14,15 +14,26 @@ import SettingsPanel from "./SettingsPanel";
 import AuthScreen from "./AuthScreen";
 import PairingPanel from "./PairingPanel";
 import Chat from "./Chat";
+import ModelPicker from "./ModelPicker";
 import WeightsRow, { type WeightsInfo } from "./WeightsRow";
 import { inTauri, platformGate, getMe } from "./platform";
 import { identityFrom, type UserIdentity } from "./Avatar";
 import { accountPairSecret, getPairingProvider, type PairingSnapshot, type ClusterApi } from "./pairing";
+import { recordProblem } from "./problems";
+import { useClusterStats, servedModelOf, type ClusterStats } from "./clusterStats";
 import { fmtBytes, fmtGiB, pct } from "./format";
+import UpdateDialog, { type UpdateResult } from "./UpdateDialog";
+import { getUpdateProvider } from "./provider/update";
+import { quitApp, setAutostart, syncTray, syncWindowPrefs, windowState } from "./system";
 
 type Theme = "dark" | "light";
 
 let uiTestRan = false;
+// Identifies THIS JS context in UI-test reports. Diagnostic for the one class
+// of double-execution the module guard above cannot stop: the webview loading
+// the page twice (fresh module state each time). Two reports with different
+// ids = two page loads, not a re-run within one.
+const uiTestCtx = Math.random().toString(36).slice(2, 8);
 
 // Ship a UI-test assertion result to the shell's stderr (see ui_test_report
 // in src-tauri/src/main.rs). No-op outside Tauri.
@@ -122,8 +133,10 @@ function TopBar(props: {
   onSignOut: () => void;
 }) {
   const { t } = useI18n();
+  // "pill.serving", not "cluster.ready": in single-machine mode there is no
+  // cluster, and the pill's claim is about the service, not the topology.
   const clusterKey =
-    props.cluster === "ready" ? "cluster.ready" : props.cluster === "joining" ? "cluster.joining" : "cluster.standalone";
+    props.cluster === "ready" ? "pill.serving" : props.cluster === "joining" ? "cluster.joining" : "cluster.standalone";
   return (
     <header className="topbar">
       <div className="brand">
@@ -182,7 +195,12 @@ function NodeCapacityCard(props: {
 }) {
   const { t } = useI18n();
   const s = props.snap;
-  const cap = estimateClusterCapacity(props.model, s, props.tier.ctx, props.nNodes, props.quant);
+  // An open GGUF has no manifest, so there is nothing honest to estimate from:
+  // the engine measures this machine at start and refuses with a reason when
+  // the model does not fit (WS-B2). The card says exactly that instead of
+  // rendering figures derived from another model's manifest.
+  const open = isLocalGguf(props.model.id);
+  const cap = open ? null : estimateClusterCapacity(props.model, s, props.tier.ctx, props.nNodes, props.quant);
   const GB = (b: number) => Math.round(b / 1024 ** 3);
   const vUsable = fmtGiB(s.vram_usable);
   const vTotal = fmtGiB(s.vram_total);
@@ -200,6 +218,7 @@ function NodeCapacityCard(props: {
     : s.hw_status === HW_DRIVER_TOO_OLD ? t("node.hw.driverOld")
     : s.hw_status === HW_VRAM_TOO_SMALL ? t("node.hw.vramSmall")
     : s.hw_status === HW_GPU_UNSUPPORTED ? t("node.hw.gpuUnsupported")
+    : s.hw_status === HW_MACOS_SEALED ? t("node.hw.macosSealed")
     : "";
   return (
     <section className="card node-card">
@@ -251,7 +270,9 @@ function NodeCapacityCard(props: {
         </div>
       </div>
 
-      {props.compact ? (
+      {cap === null ? (
+        <p className="capacity__text">{t("capacity.custom")}</p>
+      ) : props.compact ? (
         <p className="capacity__text capacity__text--compact">
           {t("capacity.have", { have: GB(cap.haveBytes) })}
         </p>
@@ -260,7 +281,12 @@ function NodeCapacityCard(props: {
         <div className="capacity__head">
           <span className="card__label">{t("capacity.title")}</span>
           <span className="capacity__need">
-            {t("capacity.need", { need: GB(cap.needBytes), model: props.model.label, tier: ctxLabel, n: props.nNodes })}
+            {/* cap.nodes, not props.nNodes: a single-node model is sized for
+                one machine however many are paired, and quoting the roster
+                size here would describe a cluster the engine will not form. */}
+            {props.model.singleNode
+              ? t("capacity.need.single", { need: GB(cap.needBytes), model: props.model.label, tier: ctxLabel })
+              : t("capacity.need", { need: GB(cap.needBytes), model: props.model.label, tier: ctxLabel, n: cap.nodes })}
           </span>
         </div>
         <div className="spine" role="img" aria-label={t("spine.caption", { n: cap.hostableLayers, total })}>
@@ -269,13 +295,15 @@ function NodeCapacityCard(props: {
           ))}
         </div>
         <div className="spine-scale">
-          <span>layer 0</span>
+          <span>{t("spine.layer0")}</span>
           <span>{total - 1}</span>
         </div>
         <p className="capacity__text">
           {t("capacity.have", { have: GB(cap.haveBytes) })}{" "}
           {cap.gapBytes > 0 ? (
-            <span className="capacity__gap">{t("capacity.gap", { gap: GB(cap.gapBytes) })}</span>
+            <span className="capacity__gap">
+              {t(props.model.singleNode ? "capacity.gap.single" : "capacity.gap", { gap: GB(cap.gapBytes) })}
+            </span>
           ) : (
             <span className="capacity__ok">{t("capacity.enough")}</span>
           )}
@@ -293,7 +321,7 @@ function NodeCapacityCard(props: {
 const LOG_TAIL = 6;
 
 function EngineCard() {
-  const { t } = useI18n();
+  const { t, tErr } = useI18n();
   const [st, setSt] = useState<EngineStatus | null>(null);
   const [lines, setLines] = useState<EngineLogLine[]>([]);
   const [busy, setBusy] = useState(false);
@@ -361,7 +389,9 @@ function EngineCard() {
             hide the one sentence that says what to change. */}
         {st?.refusedReason ? (
           <div className="engine-meta engine-meta--bad">
-            <strong>{t("engine.refused")}</strong> {st.refusedReason}
+            {/* tErr: client-authored refusals carry a code and localize;
+                engine verbatim sentences pass through untouched. */}
+            <strong>{t("engine.refused")}</strong> {tErr(st.refusedReason)}
           </div>
         ) : st?.state === "crashed" ? (
           <div className="engine-meta engine-meta--bad">
@@ -392,94 +422,10 @@ function FixtureBanner() {
   );
 }
 
-// ---- cluster activity row (engine GET /v1/stats) ---------------------------
+// ---- cluster activity row (engine GET /idletoken/v1/stats) ---------------------------
 // "What did my cluster do" at a glance: served requests, total tokens, last
-// decode speed, uptime. Polled from the engine's stats endpoint in Tauri; the
-// browser dev build synthesizes numbers only inside the already-simulated
-// dev-sim cluster (consistent with its labeling).
-interface ClusterStats {
-  requests: number;
-  input_tokens: number;
-  output_tokens: number;
-  cache_hits?: number;     // KV prefix reuse hits (undefined on older engines)
-  cached_tokens?: number;  // cumulative prefill tokens saved
-  uptime_s: number;
-  last_tok_per_s: number;
-  // What the cluster is ACTUALLY serving, straight from the coordinator that
-  // loaded it. Absent on older engines — the UI then says nothing rather than
-  // falling back to the local setting, which is a different claim.
-  model?: string;
-  model_label?: string;
-  quant?: string;
-}
-
-/**
- * Poll the cluster's serving counters.
- *
- * A hook, not an effect inside ActivityRow, because two things on the cluster
- * card need it: the activity numbers and the served-model row. The coordinator
- * executes requests **serially**, so a second independent 5s poll is not free —
- * it is another connection competing with generation. One poll, shared.
- */
-/** Dev-sim: the model the simulated cluster "loaded". Module scope, not effect
- *  scope, because a real coordinator latches this once at startup and keeps
- *  reporting it — navigating between pages must not silently re-latch it, or
- *  the setting and the cluster can never disagree in the browser build and the
- *  mismatch path goes untested until it reaches a real machine. */
-let g_simLoadedModel: { id: string; label: string; quant: string } | null = null;
-
-function useClusterStats(
-  api: ClusterApi | null,
-  source: "engine" | "dev-sim",
-  /** Dev-sim only: what to claim is loaded. Latched on the first tick, the way
-   *  a real coordinator latches it at startup — so changing the setting
-   *  afterwards diverges in the browser build exactly as it does on a machine. */
-  simModel?: { id: string; label: string; quant: string }
-): ClusterStats | null {
-  const [stats, setStats] = useState<ClusterStats | null>(null);
-  const props = { api, source };
-
-  useEffect(() => {
-    if (!props.api || props.api.status !== "online") return;
-    let live = true;
-    let simBase = { requests: 0, tokens: 0 };
-    const tick = async () => {
-      if (!live) return;
-      if (inTauri()) {
-        try {
-          const { invoke } = await import("@tauri-apps/api/core");
-          const v = await invoke<ClusterStats>("api_stats", { baseUrl: props.api!.baseUrl });
-          if (live) setStats(v);
-        } catch {
-          /* stats are best-effort; the row just stays as-is */
-        }
-      } else if (props.source === "dev-sim") {
-        simBase = { requests: simBase.requests + (Math.random() < 0.4 ? 1 : 0), tokens: simBase.tokens + 40 };
-        if (!g_simLoadedModel && simModel) g_simLoadedModel = { ...simModel };
-        if (live)
-          setStats({
-            requests: simBase.requests,
-            input_tokens: Math.floor(simBase.tokens * 0.6),
-            output_tokens: Math.floor(simBase.tokens * 0.4),
-            uptime_s: Math.floor(performance.now() / 1000) + 60,
-            last_tok_per_s: 9.5,
-            model: g_simLoadedModel?.id,
-            model_label: g_simLoadedModel?.label,
-            quant: g_simLoadedModel?.quant,
-          });
-      }
-    };
-    tick();
-    const timer = setInterval(tick, 5000);
-    return () => {
-      live = false;
-      clearInterval(timer);
-    };
-  }, [props.api?.status, props.api?.baseUrl, props.source]);
-
-  return stats;
-}
-
+// decode speed, uptime. The poll itself lives in ./clusterStats — the chat page
+// needs the served model out of the same endpoint.
 function ActivityRow(props: { stats: ClusterStats | null }) {
   const { t } = useI18n();
   const stats = props.stats;
@@ -497,7 +443,7 @@ function ActivityRow(props: { stats: ClusterStats | null }) {
         <b>{stats.requests.toLocaleString()}</b> {t("stats.requests")}
       </span>
       <span className="activity__item">
-        <b>{(stats.input_tokens + stats.output_tokens).toLocaleString()}</b> tokens
+        <b>{(stats.input_tokens + stats.output_tokens).toLocaleString()}</b> {t("stats.tokens")}
       </span>
       {stats.last_tok_per_s > 0 ? (
         <span className="activity__item">
@@ -537,6 +483,9 @@ function ClusterCard(props: {
   // questions, and two nearly-equal numbers side by side just read as a bug.
   // The card owns the quantities; this row owns the choice.
   fitsStandalone?: boolean;
+  /** The selection is a user-supplied GGUF (open intake): the local option is
+   *  the llama.cpp engine and the cluster options do not apply (WS-C). */
+  openModel?: boolean;
   onServeStandalone?: () => void;
   // "Run it here" downloads the weights first when they are missing — 4.7 GB
   // for an 8B, 80 GB for DSv4. Without this the button looked broken: it really
@@ -551,36 +500,45 @@ function ClusterCard(props: {
   // The LOCAL setting, used only to detect disagreement with what the cluster
   // reports it is serving. Never used as the displayed value.
   settingModelId: string;
+  /** Display label for the setting — getModel() cannot name an open GGUF. */
+  settingModelLabel: string;
   settingQuant: string;
   onOpenModelSetting: () => void;
+  // Save a pick and rebuild whatever is running around it (App.switchModel).
+  onSwitchModel: (modelId: string, quant: string) => void;
+  /** Open-intake pick (local file / HF) — threaded into the picker. */
+  onPickCustom: (c: CustomModelSource) => void;
+  customName: string;
 }) {
-  const { t } = useI18n();
+  const { t, tErr } = useI18n();
   const [copiedApi, setCopiedApi] = useState(false);
   const [copiedCode, setCopiedCode] = useState(false);
+  const [pickOpen, setPickOpen] = useState(false);
+  // A refused start ("need at least 2 machines", …) used to be an unhandled
+  // rejection: the button did nothing on screen. Rendered under the button.
+  const [startErr, setStartErr] = useState<string | null>(null);
   const snap = props.pair;
   // Before the early return below: hooks cannot be conditional.
   const stats = useClusterStats(snap?.api ?? null, snap?.source ?? "engine", {
-    id: props.settingModelId,
-    label: getModel(props.settingModelId).label,
-    quant: props.settingQuant,
+    simModel: {
+      id: props.settingModelId,
+      label: props.settingModelLabel,
+      quant: props.settingQuant,
+    },
   });
   const active = snap !== null && snap.peers.length > 0;
   // Reported by the coordinator. Absent on an older engine -> show nothing;
   // substituting the local setting would answer a different question.
-  const served = stats?.model_label
-    ? { id: stats.model ?? "", label: stats.model_label, quant: stats.quant ?? "" }
-    : null;
-  // Compare precision only when both sides state one, so a model with no
-  // variant menu never looks like a disagreement.
-  const mismatch =
-    !!served &&
-    (served.id !== props.settingModelId ||
-      (!!served.quant && !!props.settingQuant && served.quant !== props.settingQuant));
-  const mismatchLabel = `${getModel(props.settingModelId).label}${
-    props.settingQuant ? ` · ${props.settingQuant}` : ""
-  }`;
+  const served = servedModelOf(stats);
   const anyError = active && snap.peers.some((p) => p.stage === "error");
   const fits = !!props.fitsStandalone;
+  // The selected model decides whether "across several machines" is even a
+  // path. Offering it for a single-node model would walk the user through
+  // pairing, downloading and starting, only for the coordinator to refuse the
+  // second worker — so the option stays visible (it explains itself) but its
+  // buttons do not. An open GGUF is single-machine too, for now (WS-C wires
+  // open models across machines).
+  const clusterable = !props.openModel && !isSingleNode(props.settingModelId);
 
   if (!active) {
     return (
@@ -590,6 +548,36 @@ function ClusterCard(props: {
       <section className="card cluster-card cluster-card--empty">
         <h2 className="cluster-empty__title">{t("cluster.emptyTitle")}</h2>
 
+        {/* WHICH model both options below are about. Every sentence on this
+            card ("the selected model and precision fit on this machine") and
+            every figure on the capacity card next to it is a consequence of
+            this one choice, and it was the only thing on screen that never
+            named it — the user had to open Settings to find out what "the
+            selected model" currently is. Nothing is running yet, so unlike the
+            served row further down this is the local setting, and it says so. */}
+        <div className="cluster-model cluster-model--pick">
+          <span className="cluster-model__label">{t("model.selected")}</span>
+          <span className="cluster-model__name">{props.settingModelLabel}</span>
+          {props.settingQuant ? <span className="cluster-model__quant">{props.settingQuant}</span> : null}
+          {props.openModel ? <span className="cluster-model__quant">{t("model.open.badge")}</span> : null}
+          {/* Nothing is running yet, so this pick is free: it writes the
+              setting and the two options below re-read it. */}
+          <button className="linkbtn cluster-model__change" onClick={() => setPickOpen((v) => !v)}>
+            {t("model.change")}
+          </button>
+          {pickOpen ? (
+            <ModelPicker
+              modelId={props.settingModelId}
+              quant={props.settingQuant}
+              running={null}
+              onPick={props.onSwitchModel}
+              onPickCustom={props.onPickCustom}
+              customName={props.customName}
+              onClose={() => setPickOpen(false)}
+            />
+          ) : null}
+        </div>
+
         {/* Two ways to deploy, always both on screen. They used to be one
             either/or row driven by fitsStandalone, which meant a machine big
             enough to go solo was never offered "join someone else's cluster",
@@ -598,8 +586,15 @@ function ClusterCard(props: {
         <div className="deploy-opt">
           <div className="deploy-opt__text">
             <h3 className="deploy-opt__title">{t("deploy.local")}</h3>
+            {/* Both branches promise something about the OTHER option ("add
+                machines later", "or pool machines below"), and neither is true
+                for a single-node model — so each has a solo wording. */}
             <p className="deploy-opt__body">
-              {fits ? t("deploy.local.fits") : t("deploy.local.tooBig")}
+              {props.openModel
+                ? t("deploy.local.open")
+                : fits
+                  ? t(clusterable ? "deploy.local.fits" : "deploy.local.fitsSolo")
+                  : t(clusterable ? "deploy.local.tooBig" : "deploy.local.tooBigSolo")}
             </p>
           </div>
           <button
@@ -609,23 +604,40 @@ function ClusterCard(props: {
             disabled={!fits || !!props.weights?.dl}
             onClick={props.onServeStandalone}
           >
-            {props.weights?.dl && !props.weights.dl.error ? t("weights.downloading") : t("cluster.serveLocal")}
+            {props.weights?.dl ? t("weights.downloading") : t("cluster.serveLocal")}
           </button>
-          {/* Progress / failure for the download this button starts. `idle=hide`:
-              "no weights yet" is already implied by the button next to it. */}
+          {/* Progress for the download this button starts, plus anything the
+              button does not already imply (a resumable partial, why the last
+              attempt stopped). `idle=hide` drops the plain "no weights yet",
+              which the button next to it already says. */}
           {props.weights ? <WeightsRow w={props.weights} idle="hide" /> : null}
         </div>
 
         <div className="deploy-opt">
           <div className="deploy-opt__text">
             <h3 className="deploy-opt__title">{t("deploy.cluster")}</h3>
-            <p className="deploy-opt__body">{t("deploy.cluster.body")}</p>
+            <p className="deploy-opt__body">
+              {clusterable
+                ? t("deploy.cluster.body")
+                : props.openModel
+                  ? t("deploy.cluster.openGguf")
+                  : t("deploy.cluster.singleNode", { model: props.settingModelLabel })}
+            </p>
+            {!clusterable && (
+              <button className="linkbtn" onClick={props.onOpenModelSetting}>
+                {t("deploy.cluster.pickOther")}
+              </button>
+            )}
           </div>
           <div className="deploy-opt__actions">
-            <button className={fits ? "btn-secondary" : "btn-primary"} onClick={props.onCreate}>
+            <button
+              className={fits || !clusterable ? "btn-secondary" : "btn-primary"}
+              disabled={!clusterable}
+              onClick={props.onCreate}
+            >
               {t("cluster.create")}
             </button>
-            <button className="btn-secondary" onClick={props.onJoin}>
+            <button className="btn-secondary" disabled={!clusterable} onClick={props.onJoin}>
               {t("cluster.joinCode")}
             </button>
           </div>
@@ -692,27 +704,55 @@ function ClusterCard(props: {
           <span className="cluster-model__label">{t("cluster.serving")}</span>
           <span className="cluster-model__name">{served.label}</span>
           {served.quant ? <span className="cluster-model__quant">{served.quant}</span> : null}
+          {/* Switching from here is a cluster operation — it stops what is
+              running and builds it again — so the row is still read-only until
+              you ask, and the picker spells out the cost before it acts. */}
+          <button className="linkbtn cluster-model__change" onClick={() => setPickOpen((v) => !v)}>
+            {t("model.change")}
+          </button>
+          {pickOpen ? (
+            <ModelPicker
+              modelId={props.settingModelId}
+              quant={props.settingQuant}
+              running={{ modelId: served.id, quant: served.quant, machines: snap.peers.length }}
+              onPick={props.onSwitchModel}
+              onPickCustom={props.onPickCustom}
+              customName={props.customName}
+              onClose={() => setPickOpen(false)}
+            />
+          ) : null}
         </div>
       ) : null}
-      {/* The setting and reality disagree: the model is chosen at launch, so
-          changing it later does nothing until the cluster restarts. Saying so
-          beats letting someone believe they switched models. */}
-      {served && mismatch ? (
-        <p className="cluster-hint cluster-hint--warn">
-          {t("cluster.modelMismatch", { chosen: mismatchLabel })}{" "}
-          <button className="linkbtn" onClick={props.onOpenModelSetting}>
-            {t("cluster.modelSettingLink")}
-          </button>
+      {/* Inference-engine health (v2, llamacpp mode): mirrored from the
+          coordinator's /health via stats. Chat answers 503 until "ready", so a
+          quiet panel over a 503ing API would be a lie; absent on the legacy
+          path, where per-peer stages carry the same news. */}
+      {stats?.engine_state && stats.engine_state !== "ready" ? (
+        <p
+          className={`cluster-hint ${
+            stats.engine_state === "failed" ? "cluster-hint--bad" : "cluster-hint--warn"
+          }`}
+        >
+          {t(`cluster.engine.${stats.engine_state}` as const)}
+          {(stats.engine_restarts ?? 0) > 0
+            ? ` · ${t("cluster.engine.restarts", { n: stats.engine_restarts! })}`
+            : ""}
         </p>
       ) : null}
+      {/* No "setting disagrees with the cluster" hint here any more
+          (2026-08-15): selecting a model IS the switch, everywhere — Settings
+          included — so the disagreement the hint warned about can no longer be
+          reached by picking; it only ever flickers mid-rebuild. One semantic,
+          one path, nothing to warn about. */}
 
       <div className="cluster-peers">
         {snap.peers.map((p) => (
-          <div key={p.id} className="cpeer">
+          <div key={p.id} className={`cpeer${p.online === false ? " cpeer--offline" : ""}`}>
             <span className={`cpeer__dot cpeer__dot--${p.stage}`} />
             <span className="cpeer__host">
               {p.hostname}
               {p.self ? <span className="cpeer__you"> · {t("pairing.you")}</span> : null}
+              {p.online === false ? <span className="offline-tag">{t("pairing.offline")}</span> : null}
             </span>
             {p.role === "coordinator" ? <span className="role-tag">{t("pairing.coordinator")}</span> : null}
             <span className="cpeer__meta">
@@ -724,15 +764,39 @@ function ClusterCard(props: {
         ))}
       </div>
 
+      {/* Joiner side: the CREATOR stopped answering. Every row is grayed by
+          the same event, so the member-offline hint below would only repeat
+          it — this one names the machine that matters. */}
+      {snap.lastError?.code === "creatorLost" ? (
+        <p className="cluster-hint cluster-hint--warn">{t("pairing.err.creatorLost")}</p>
+      ) : null}
+
+      {/* A member stopped answering while the cluster is up: the all-green
+          card was a lie (audit 2.8). Point at the machine, not the cluster. */}
+      {snap.lastError?.code !== "creatorLost" &&
+      snap.phase !== "idle" &&
+      snap.peers.some((p) => p.online === false) ? (
+        <p className="cluster-hint cluster-hint--warn">{t("cluster.offlineHint")}</p>
+      ) : null}
+
       {anyError ? <p className="cluster-hint cluster-hint--bad">{t("cluster.errorHint")}</p> : null}
 
       {snap.phase === "loading" ? <p className="cluster-hint">{t("cluster.loadingHint")}</p> : null}
 
       {snap.canStart ? (
-        <button className="btn-primary btn-block cluster-start" onClick={() => getPairingProvider().start()}>
+        <button
+          className="btn-primary btn-block cluster-start"
+          onClick={() => {
+            setStartErr(null);
+            getPairingProvider()
+              .start()
+              .catch((e) => setStartErr(tErr(String(e))));
+          }}
+        >
           {t("pairing.startCluster", { n: snap.peers.length })} →
         </button>
       ) : null}
+      {startErr ? <p className="cluster-hint cluster-hint--bad">{startErr}</p> : null}
 
       {snap.api ? (
         <div className="cluster-api">
@@ -773,6 +837,177 @@ function ClusterCard(props: {
   );
 }
 
+// ---- local llama.cpp engine card (v2 WS-D1/D2) -----------------------------
+// Shown in the cluster column while THIS machine serves a user-supplied GGUF
+// through the coordinator's llamacpp single-machine mode. Three truths it must
+// carry, all from the engine rather than guessed client-side:
+//   - the scheduler's verdict (the "fits / how" sentence the coordinator
+//     prints at start) and the auto-manifest line (what the GGUF header says);
+//   - live engine health from /idletoken/v1/stats (engine_state mirrors
+//     /health; chat 503s until "ready" — no fake green);
+//   - a refusal, verbatim (exit 3 + worded stderr, latched by the supervisor).
+function LocalEngineCard(props: {
+  label: string; // the file the user picked
+  api: ClusterApi | null;
+  engStatus: EngineStatus | null;
+  settingModelId: string;
+  settingQuant: string;
+  customName: string;
+  onSwitchModel: (modelId: string, quant: string) => void;
+  onPickCustom: (c: CustomModelSource) => void;
+  onStop: () => void;
+  /** Polled app-level (App owns one poll shared with the topbar pill — the
+   *  coordinator serves requests serially, so pollers are not free). */
+  stats: ClusterStats | null;
+  weights?: WeightsInfo;
+}) {
+  const { t, tErr } = useI18n();
+  const [pickOpen, setPickOpen] = useState(false);
+  const [copiedApi, setCopiedApi] = useState(false);
+  // The coordinator's startup sentences, latched from the supervisor's log
+  // stream. Scraping a log is deliberate: the verdict is printed once at
+  // start, exists nowhere else, and IS the scheduler's answer (B2 contract).
+  const [verdict, setVerdict] = useState<string | null>(null);
+  const [manifest, setManifest] = useState<string | null>(null);
+  useEffect(() => {
+    const latch = (l: EngineLogLine) => {
+      const v = l.line.indexOf("coord: scheduler: ");
+      if (v >= 0) setVerdict(l.line.slice(v + "coord: scheduler: ".length));
+      const m = l.line.indexOf("coord: auto manifest: ");
+      if (m >= 0) setManifest(l.line.slice(m + "coord: auto manifest: ".length));
+    };
+    const eng = getEngineProvider();
+    eng.logs(100).then((ls) => ls.forEach(latch)).catch(() => {});
+    return eng.onLog(latch);
+  }, []);
+
+  const stats = props.stats;
+  const refused = props.engStatus?.refusedReason ?? null;
+  // Engine health, most specific source first: the coordinator's own
+  // engine_state once the API answers, the supervisor's process state before.
+  const es = stats?.engine_state ?? null;
+  const stateKey = refused
+    ? ("local.state.failed" as const)
+    : es
+      ? (`local.state.${es}` as const)
+      : props.engStatus?.state === "crashed"
+        ? ("local.state.failed" as const)
+        : props.engStatus?.state === "restarting"
+          ? ("local.state.restarting" as const)
+          : ("local.starting" as const);
+  const tone = refused || es === "failed" || props.engStatus?.state === "crashed"
+    ? "bad"
+    : es === "ready"
+      ? "ready"
+      : "busy";
+
+  const copyApi = async () => {
+    if (!props.api) return;
+    try {
+      await navigator.clipboard.writeText(props.api.baseUrl);
+      setCopiedApi(true);
+      setTimeout(() => setCopiedApi(false), 1500);
+    } catch {
+      /* shown regardless */
+    }
+  };
+
+  return (
+    <section className="card cluster-card">
+      <div className="cluster-head">
+        <span className="card__label">{t("local.title")}</span>
+        <span className={`stage-tag stage-tag--${tone}`}>
+          <span className="stage-tag__dot" />
+          {t(stateKey)}
+        </span>
+        {(stats?.engine_restarts ?? 0) > 0 ? (
+          <span className="cluster-head__count">{t("local.restarts", { n: stats!.engine_restarts! })}</span>
+        ) : null}
+      </div>
+
+      <div className="cluster-model">
+        <span className="cluster-model__label">{t("cluster.serving")}</span>
+        {/* The engine's own id once it has read the GGUF header; the picked
+            file name until then. */}
+        <span className="cluster-model__name">{stats?.model_label || stats?.model || props.label}</span>
+        <span className="cluster-model__quant">{t("model.open.badge")}</span>
+        <button className="linkbtn cluster-model__change" onClick={() => setPickOpen((v) => !v)}>
+          {t("model.change")}
+        </button>
+        {pickOpen ? (
+          <ModelPicker
+            modelId={props.settingModelId}
+            quant={props.settingQuant}
+            running={{ modelId: props.settingModelId, quant: "", machines: 1 }}
+            onPick={props.onSwitchModel}
+            onPickCustom={props.onPickCustom}
+            customName={props.customName}
+            onClose={() => setPickOpen(false)}
+          />
+        ) : null}
+      </div>
+
+      {/* Download progress for an HF-sourced GGUF lives next to the card that
+          started it, like every other weight download. */}
+      {props.weights ? <WeightsRow w={props.weights} idle="hide" /> : null}
+
+      {refused ? (
+        <div className="hw-blocked" role="alert">
+          <strong>{t("local.refusedTitle")}</strong>
+          <span className="hw-blocked__detail">{tErr(refused)}</span>
+        </div>
+      ) : null}
+
+      {es === "failed" ? <p className="cluster-hint cluster-hint--bad">{t("cluster.engine.failed")}</p> : null}
+      {es === "starting" ? <p className="cluster-hint">{t("cluster.engine.starting")}</p> : null}
+      {es === "restarting" ? <p className="cluster-hint cluster-hint--warn">{t("cluster.engine.restarting")}</p> : null}
+
+      {verdict ? (
+        <p className="cluster-hint local-verdict">
+          <b>{t("local.verdict")}:</b> {verdict}
+        </p>
+      ) : null}
+      {manifest ? <p className="cluster-hint local-manifest">{manifest}</p> : null}
+
+      {props.api && !refused ? (
+        <div className="cluster-api">
+          <div className="cluster-api__label">
+            {t("cluster.api")}
+            <span
+              className={`stage-tag stage-tag--${
+                props.api.status === "online" ? "ready" : props.api.status === "offline" ? "bad" : "busy"
+              }`}
+            >
+              <span className="stage-tag__dot" />
+              {props.api.status === "online"
+                ? t("pairing.api.online")
+                : props.api.status === "offline"
+                  ? t("cluster.apiOffline")
+                  : t("pairing.api.starting")}
+            </span>
+          </div>
+          <div className="cluster-api__row">
+            <code className="cluster-api__url">{props.api.baseUrl}</code>
+            <button className="iconbtn" onClick={copyApi}>
+              {copiedApi ? t("pairing.copied") : t("pairing.copy")}
+            </button>
+          </div>
+          <p className="cluster-api__hint">{t("cluster.apiHint")}</p>
+          <ActivityRow stats={stats} />
+        </div>
+      ) : null}
+
+      <p className="cluster-hint">{t("local.note")}</p>
+
+      <div className="cluster-share">
+        <button className="linkbtn" onClick={props.onStop}>
+          {t("local.stop")}
+        </button>
+      </div>
+    </section>
+  );
+}
+
 // ---- dashboard ------------------------------------------------------------
 // The cluster leads; this machine + engine diagnostics sit beside it on wide
 // windows (>=1180px two-column grid) and below it on narrow ones.
@@ -782,31 +1017,74 @@ function Dashboard(props: {
   quant: string;
   tier: { id: number; ctx: number };
   pair: PairingSnapshot | null;
+  /** Local llama.cpp engine (open-GGUF serving) — replaces the cluster card
+   *  while it runs; this machine IS the whole deployment. */
+  localEngine: { gguf: string; label: string } | null;
+  localApi: ClusterApi | null;
+  localStats: ClusterStats | null;
+  engStatus: EngineStatus | null;
+  customName: string;
+  onStopLocal: () => void;
+  onPickCustom: (c: CustomModelSource) => void;
   onServeStandalone: () => void;
   onCreateCluster: () => void;
   onJoinCluster: () => void;
   onManageCluster: () => void;
   onOpenSharing: () => void;
-  /** Jump to the model picker in settings (the cluster card only reads). */
+  /** Jump to the full model section in Settings (the cluster card's picker
+   *  covers the common case; Settings still owns weights paths and the rest). */
   onOpenModelSetting: () => void;
+  onSwitchModel: (modelId: string, quant: string) => void;
   weights?: WeightsInfo;
 }) {
-  const { t } = useI18n();
+  const { t, tErr } = useI18n();
   const s = props.snap;
   const nNodes = props.pair && props.pair.peers.length > 0 ? props.pair.peers.length : 3;
+  const open = isLocalGguf(props.model.id);
   // Single-node-first: does the selected model+precision fit THIS machine alone
   // (N=1)? If so the empty-state leads with "serve locally" instead of pairing.
   // The shortfall goes down with it — the local row reports how far off it is
-  // rather than just going quiet.
-  const standalone = estimateClusterCapacity(props.model, s, props.tier.ctx, 1, props.quant);
+  // rather than just going quiet. An open GGUF has no client-side estimate:
+  // the button stays live and the ENGINE rules on fit at start (worded
+  // refusal on the local-engine card), per hard invariant "no client guess
+  // overrides the scheduler".
+  const standalone = open ? null : estimateClusterCapacity(props.model, s, props.tier.ctx, 1, props.quant);
+  // The generic refusal surface (D2): whatever sentence the engine sent
+  // through the JOIN_REFUSED / exit-3 channel, verbatim, where the user is
+  // looking. WS-C's "upgrade machine X" (version mismatch) arrives through
+  // the same channel and needs no client change. The local-engine card
+  // carries its own copy, so this banner covers the cluster/legacy paths.
+  const refused = !props.localEngine ? props.engStatus?.refusedReason ?? null : null;
   return (
     <main className="main main--wide">
       {s.source === "dev-fixture" ? <FixtureBanner /> : null}
       <div className="dash-grid">
         <div className="dash-col dash-col--cluster">
+          {refused ? (
+            <div className="hw-blocked" role="alert">
+              <strong>{t("cluster.refusedTitle")}</strong>
+              <span className="hw-blocked__detail">{tErr(refused)}</span>
+            </div>
+          ) : null}
+          {props.localEngine ? (
+            <LocalEngineCard
+              label={props.localEngine.label}
+              api={props.localApi}
+              stats={props.localStats}
+              engStatus={props.engStatus}
+              settingModelId={props.model.id}
+              settingQuant={props.quant}
+              customName={props.customName}
+              onSwitchModel={props.onSwitchModel}
+              onPickCustom={props.onPickCustom}
+              onStop={props.onStopLocal}
+              weights={props.weights}
+            />
+          ) : (
           <ClusterCard
             pair={props.pair}
-            fitsStandalone={standalone.gapBytes === 0}
+            fitsStandalone={standalone === null ? true : standalone.gapBytes === 0}
+            openModel={open}
             onServeStandalone={props.onServeStandalone}
             weights={props.weights}
             onCreate={props.onCreateCluster}
@@ -814,9 +1092,14 @@ function Dashboard(props: {
             onManage={props.onManageCluster}
             onOpenSharing={props.onOpenSharing}
             settingModelId={props.model.id}
+            settingModelLabel={props.model.label}
             settingQuant={props.quant}
             onOpenModelSetting={props.onOpenModelSetting}
+            onSwitchModel={props.onSwitchModel}
+            onPickCustom={props.onPickCustom}
+            customName={props.customName}
           />
+          )}
         </div>
         <div className="dash-col">
           <div className="node-section__head">
@@ -890,39 +1173,107 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [nonce, setNonce] = useState(0);
 
-  const model = getModel(settings.modelId);
+  // ---- open model intake + local llama.cpp engine (v2 WS-D1) ---------------
+  // The selection may be a user-supplied GGUF (LOCAL_GGUF_ID sentinel): then
+  // there is no manifest, the display spec is synthesized from the file name,
+  // and serving goes through the coordinator's llamacpp single-machine mode
+  // instead of the pairing path.
+  const customSel: CustomModelSource | null = isLocalGguf(settings.modelId)
+    ? {
+        source: settings.customSource,
+        path: settings.customGgufPath,
+        repo: settings.customHfRepo,
+        file: settings.customHfFile,
+      }
+    : null;
+  const customName = customSel ? customGgufName(customSel) : "";
+  const model = customSel ? localGgufSpec(customName) : getModel(settings.modelId);
+
+  // The local llama.cpp engine this client started (llamacpp_serve). Not
+  // persisted: the sidecar dies with the client, so a fresh launch starts
+  // clean. `label` is what the user picked; the AUTO id the coordinator read
+  // from the GGUF header arrives later via /idletoken/v1/stats.
+  const [localEngine, setLocalEngine] = useState<{ gguf: string; label: string } | null>(null);
+
+  // Aggregate engine-supervisor status, held app-level: the local-engine card,
+  // the chat gating and the generic refusal banner all read it. (EngineCard
+  // keeps its own subscription — it also wants the log tail.)
+  const [engStatus, setEngStatus] = useState<EngineStatus | null>(null);
+  useEffect(() => {
+    const eng = getEngineProvider();
+    let live = true;
+    eng.status().then((s) => live && setEngStatus(s)).catch(() => {});
+    const un = eng.onStatus(setEngStatus);
+    return () => {
+      live = false;
+      un();
+    };
+  }, []);
 
   // --- Getting the weights in place (B1/B2) --------------------------------
-  // `weightsSource: "auto"` used to pass an empty string to the engine in every
-  // case, and on the engine side an empty string takes the mock branch, which no
-  // longer falls back automatically -- so a freshly installed client was certain
-  // to fail loading once a model was picked, with nobody telling the user where to
-  // get the weights. "auto" now has three real paths; see resolveLocalWeights in
+  // The client used to pass an empty string to the engine in every case, and on
+  // the engine side an empty string takes the mock branch, which no longer falls
+  // back automatically -- so a freshly installed client was certain to fail
+  // loading once a model was picked, with nobody telling the user where to get
+  // the weights. Resolution now has three real paths; see resolveLocalWeights in
   // weights.ts.
   const [weightsPath, setWeightsPath] = useState("");
   const [needsWeights, setNeedsWeights] = useState(false);
+  // Bytes of an unfinished copy on disk. The download resumes from it, so this
+  // is the difference between "4.7 GB to fetch" and "600 MB to go".
+  const [partialBytes, setPartialBytes] = useState(0);
   const [dl, setDl] = useState<{
-    have: number; total: number; endpoint?: string; note?: string; error?: string;
+    have: number; total: number; note?: string;
   } | null>(null);
+  /**
+   * Why the last attempt stopped — a footnote, never a state.
+   *
+   * A download that did not finish leaves the machine in exactly the state it
+   * was in before: no weights. That is what the row now says, with the button
+   * that fixes it, because "Download failed" as a state of its own is a dead
+   * end the user has to clear before the normal affordance comes back — and it
+   * is not even true after a resume, which starts from what is already there.
+   * The reason still ships, quietly, so a download that keeps dying is not a
+   * button that silently does nothing.
+   */
+  const [lastError, setLastError] = useState<string | null>(null);
 
   const refreshWeights = useCallback(async () => {
     try {
-      const r = await resolveLocalWeights({
-        weightsSource: settings.weightsSource === "local" ? "local" : "auto",
-        ggufPath: settings.ggufPath,
-        modelDir: settings.modelDir,
-        manifest: getManifest(settings.modelId),
-        quant: settings.quant,
-      });
+      const r = isLocalGguf(settings.modelId)
+        ? await resolveCustomWeights({
+            modelDir: settings.modelDir,
+            custom: {
+              source: settings.customSource,
+              path: settings.customGgufPath,
+              repo: settings.customHfRepo,
+              file: settings.customHfFile,
+            },
+          })
+        : await resolveLocalWeights({
+            modelDir: settings.modelDir,
+            manifest: getManifest(settings.modelId),
+            quant: settings.quant,
+          });
       setWeightsPath(r.path);
       setNeedsWeights(r.needsDownload);
+      setPartialBytes(r.haveBytes);
     } catch {
       // A failed probe must not block the UI: treat it as "needs downloading", and
       // the user gets the real error when they press download.
       setWeightsPath("");
       setNeedsWeights(true);
+      setPartialBytes(0);
     }
-  }, [settings.weightsSource, settings.ggufPath, settings.modelDir, settings.modelId, settings.quant]);
+  }, [
+    settings.modelDir,
+    settings.modelId,
+    settings.quant,
+    settings.customSource,
+    settings.customGgufPath,
+    settings.customHfRepo,
+    settings.customHfFile,
+  ]);
 
   useEffect(() => { void refreshWeights(); }, [refreshWeights]);
 
@@ -934,6 +1285,38 @@ export default function App() {
   // says afterwards.
   const cancelled = useRef<Set<string>>(new Set());
 
+  /** The in-flight `primary` fetch, if any. There is one download slot, and
+   *  the engine refuses a second writer on the same id (two writers on one
+   *  .part once blessed a corrupt file as complete — see weights_fetch), so
+   *  everything that starts or abandons a download coordinates through this. */
+  const fetchInFlight = useRef<Promise<void> | null>(null);
+
+  /** What a download "belongs to": one selection, one key. `dl` is a single
+   *  app-wide value and the row renders wherever the selection is — so without
+   *  an owner, whatever download happens to be running paints the row of
+   *  whatever model happens to be selected (this is exactly how "I picked B
+   *  and it showed A's progress" looked). */
+  const ownerKeyOf = useCallback(
+    (modelId: string, quant: string, custom?: CustomModelSource) =>
+      isLocalGguf(modelId) && custom
+        ? `custom:${custom.source}:${custom.source === "file" ? custom.path : `${custom.repo}/${custom.file}`}`
+        : `${modelId}:${quant}`,
+    []
+  );
+  /** Owner of the current/last `primary` download. */
+  const dlOwner = useRef<string | null>(null);
+  /** Owner key of the selection on screen, readable from event callbacks. */
+  const curSelKey = ownerKeyOf(settings.modelId, settings.quant, {
+    source: settings.customSource,
+    path: settings.customGgufPath,
+    repo: settings.customHfRepo,
+    file: settings.customHfFile,
+  });
+  const curSelRef = useRef(curSelKey);
+  useEffect(() => {
+    curSelRef.current = curSelKey;
+  });
+
   const cancelDownload = useCallback(() => {
     cancelled.current.add("primary");
     setDl(null);
@@ -941,13 +1324,86 @@ export default function App() {
     void refreshWeights();
   }, [refreshWeights]);
 
+  /**
+   * Show a failed download — or say nothing, when the "failure" is the user's
+   * own Cancel.
+   *
+   * `weights_fetch` rejects for a cancel too (correctly: there are no usable
+   * weights and the caller must not continue), and every catch here used to
+   * turn that rejection into a red row. It appeared SECONDS after the click,
+   * because the download only notices the flag when its blocked read returns —
+   * long enough that it read as an unrelated failure. And since `dl` is one
+   * app-wide value with no model attached, the stale error then followed the
+   * user from model to model, which is what "all of them say download failed"
+   * was.
+   */
+  const reportWeightsError = useCallback((e: unknown, kind: "download" | "cluster" = "download") => {
+    setDl(null);
+    // A cancel leaves no footnote at all: the user knows why it stopped, they
+    // stopped it.
+    if (isWeightsCancelled(e)) {
+      setLastError(null);
+    } else {
+      const msg = String(e);
+      setLastError(msg);
+      // The footnote is cleared by the next attempt or a model switch; the
+      // problem log is what remains for "this keeps failing, here is what it
+      // says" (Settings -> Data & about).
+      recordProblem({
+        at: new Date().toISOString(),
+        kind,
+        message: msg,
+        detail: { model: settings.modelId, quant: settings.quant },
+      });
+    }
+    void refreshWeights();
+  }, [refreshWeights, settings.modelId, settings.quant]);
+
+  // What the download row is showing right now, readable from the UI-test
+  // directives — those run in a mount-time effect and would otherwise see the
+  // first render's value forever.
+  const errRef = useRef(lastError);
+  useEffect(() => {
+    errRef.current = lastError;
+  });
+
+  // A download report belongs to the model that was being downloaded. Switching
+  // model (or precision) makes it answer a question nobody asked — clear it, and
+  // let refreshWeights say what THIS model's state is.
+  //
+  // The download itself is abandoned too, not just its report. Clearing alone
+  // was not enough: the old model's fetch kept running, and its next progress
+  // event resurrected the cleared row — so a freshly selected model whose
+  // weights were already complete on disk still said "downloading" until the
+  // abandoned download ended. The cancel keeps the `.part`, so switching back
+  // resumes from where it stopped.
+  useEffect(() => {
+    if (fetchInFlight.current) {
+      cancelled.current.add("primary");
+      void cancelFetch("primary");
+    }
+    setDl(null);
+    setLastError(null);
+  }, [
+    settings.modelId,
+    settings.quant,
+    settings.customSource,
+    settings.customGgufPath,
+    settings.customHfRepo,
+    settings.customHfFile,
+  ]);
+
   // Progress event subscription. Subscribed once for the whole application;
-  // filtering by id is left for future multi-download support.
+  // only the `primary` slot reaches the row (see below).
   useEffect(() => {
     let un: (() => void) | null = null;
     let dead = false;
     onFetchProgress((p) => {
       const id = p.id || "primary";
+      // Only the `primary` slot drives the row. Other ids run real downloads
+      // too (the UI-test oracles), and their progress must not paint the row
+      // of whatever model happens to be selected.
+      if (id !== "primary") return;
       if (cancelled.current.has(id)) {
         // The download is winding down. Only its final word clears the mark —
         // anything before that (a last progress tick) is stale by definition.
@@ -957,11 +1413,20 @@ export default function App() {
         }
         return;
       }
+      // Ownership: the download knows which selection started it, and its
+      // progress may only paint the row when that selection is still the one
+      // on screen. Cancel-on-switch already stops the abandoned download; this
+      // is the second lock, for any event that arrives inside that window (or
+      // any path that forgot to cancel).
+      const owned = dlOwner.current === curSelRef.current;
       if (p.kind === "progress" || p.kind === "probe") {
+        if (!owned) return;
+        // The event still says which endpoint is serving the bytes, but that
+        // stays out of the row on purpose: where the download comes from is an
+        // implementation detail the user is not asked to think about.
         setDl((prev) => ({
           have: p.have ?? prev?.have ?? 0,
           total: p.total ?? prev?.total ?? 0,
-          endpoint: p.endpoint ?? prev?.endpoint,
           note: p.note ?? prev?.note,
         }));
       } else if (p.kind === "done") {
@@ -973,35 +1438,233 @@ export default function App() {
         setDl(null);
         void refreshWeights();
       } else if (p.kind === "error") {
-        setDl({ have: 0, total: 0, error: p.message ?? "download failed" });
+        setDl(null);
+        // The footnote goes on the row the failure belongs to; a model the
+        // user already left keeps its story out of the new row. The problem
+        // log still gets it through the command-rejection path.
+        if (owned) setLastError(p.message ?? "download failed");
+        void refreshWeights();
       }
     }).then((f) => (dead ? f() : (un = f)));
     return () => { dead = true; un?.(); };
   }, [refreshWeights]);
 
+  /**
+   * Start (or take over) the one `primary` download. An older fetch still in
+   * flight — the user abandoned it by switching models, or pressed Download
+   * again — is cancelled and awaited out first, so the new one does not bounce
+   * off the engine's one-writer-per-id guard with "a download is already
+   * running". Its `.part` survives the cancel; a later return to that model
+   * resumes from it.
+   */
+  const runPrimaryFetch = useCallback(async (target: DownloadTarget, destDir: string, owner: string) => {
+    dlOwner.current = owner;
+    setLastError(null); // this attempt speaks for itself
+    // Optimistic row, but only on the row it belongs to — the caller may be a
+    // switch flow whose selection has already moved on again.
+    if (curSelRef.current === owner) setDl({ have: 0, total: target.expectBytes });
+    const prev = fetchInFlight.current;
+    if (prev) {
+      cancelled.current.add("primary");
+      void cancelFetch("primary");
+      await prev.catch(() => {});
+      // The wound-down fetch's final event normally clears the mark; delete it
+      // again in case that event was already processed before the mark landed,
+      // or the new download's own progress would be swallowed with it.
+      cancelled.current.delete("primary");
+    }
+    const p = fetchWeights({ id: "primary", target, destDir });
+    fetchInFlight.current = p;
+    try {
+      await p;
+    } catch (e) {
+      // A failure of a download the user has already walked away from (the
+      // selection changed while it ran, which also requested its cancel) is
+      // not the on-screen model's story — classify it with the cancels so no
+      // caller paints it as that model's failure.
+      if (!isWeightsCancelled(e) && dlOwner.current === owner && owner !== curSelRef.current) {
+        throw new WeightsCancelled(String(e));
+      }
+      throw e;
+    } finally {
+      if (fetchInFlight.current === p) fetchInFlight.current = null;
+    }
+  }, []);
+
   /** Ensure usable weights are present locally, downloading them when needed, and
    *  return the final path (an empty string means the cluster feeds the shards). */
-  const ensureWeights = useCallback(async (): Promise<string> => {
+  // Preset caps derive from the machine's totals (learned from the first probe);
+  // "custom" uses the precise sliders directly. Declared HERE, above the launch
+  // paths, because every engine this client starts has to be told the cap —
+  // see engineTuning(). It used to sit below them, which is why it could only
+  // ever reach the probe.
+  const caps = useMemo(
+    () => effectiveCaps(settings, totals),
+    [settings.resourcePreset, settings.maxVramMb, settings.maxRamMb, totals]
+  );
+
+  /**
+   * Resolve (downloading if necessary) the weights for the selected model.
+   *
+   * `over` overrides the model/precision for THIS call. switchModel needs it:
+   * it saves the new selection and immediately acts on it, and `settings` in
+   * this closure is still the old value until React re-renders — without the
+   * override the switch would faithfully download and start the model the user
+   * just moved away from.
+   */
+  const ensureWeights = useCallback(async (over?: { modelId: string; quant: string }): Promise<string> => {
+    const modelId = over?.modelId ?? settings.modelId;
+    const quant = over?.quant ?? settings.quant;
     const r = await resolveLocalWeights({
-      weightsSource: settings.weightsSource === "local" ? "local" : "auto",
-      ggufPath: settings.ggufPath,
       modelDir: settings.modelDir,
-      manifest: getManifest(settings.modelId),
-      quant: settings.quant,
+      manifest: getManifest(modelId),
+      quant,
     });
     if (!r.needsDownload || !r.target) return r.path;
     const dir = settings.modelDir || (await defaultModelDir());
-    setDl({ have: 0, total: r.target.expectBytes });
-    await fetchWeights({ id: "primary", target: r.target, destDir: dir });
+    await runPrimaryFetch(r.target, dir, ownerKeyOf(modelId, quant));
     const after = await resolveLocalWeights({
-      weightsSource: "auto",
-      ggufPath: "",
       modelDir: dir,
-      manifest: getManifest(settings.modelId),
-      quant: settings.quant,
+      manifest: getManifest(modelId),
+      quant,
     });
     return after.path;
-  }, [settings.weightsSource, settings.ggufPath, settings.modelDir, settings.modelId, settings.quant]);
+  }, [settings.modelDir, settings.modelId, settings.quant, runPrimaryFetch, ownerKeyOf]);
+
+  /** Resolve (downloading if necessary) a user-supplied GGUF, returning the
+   *  local path the engine will load. HF picks reuse the exact weights
+   *  machinery curated models use (weights_fetch is manifest-agnostic);
+   *  local-file picks are only re-verified — a moved file is a one-sentence
+   *  answer here instead of a load failure later. */
+  const ensureCustomWeights = useCallback(
+    async (c: CustomModelSource): Promise<string> => {
+      const r = await resolveCustomWeights({ modelDir: settings.modelDir, custom: c });
+      if (r.path) return r.path;
+      if (!r.needsDownload || !r.target) {
+        throw new Error(`GGUF file not found: ${c.source === "file" ? c.path : `${c.repo}/${c.file}`}`);
+      }
+      const dir = settings.modelDir || (await defaultModelDir());
+      await runPrimaryFetch(r.target, dir, ownerKeyOf(LOCAL_GGUF_ID, "", c));
+      const after = await resolveCustomWeights({ modelDir: dir, custom: c });
+      if (!after.path) throw new Error("download finished but the file did not verify — try again");
+      return after.path;
+    },
+    [settings.modelDir, runPrimaryFetch, ownerKeyOf]
+  );
+
+  /**
+   * Serve a user-supplied GGUF on this machine: coordinator in llamacpp
+   * single-machine mode (WS-D1). The scheduler verdict — fits / refuses with a
+   * worded reason, exit 3 — comes back through the engine supervisor's
+   * log/refusal channels and renders on the local-engine card.
+   *
+   * ctxSize 0 on purpose: the coordinator sizes the context from measured
+   * memory (32K ask, 16K floor, worded refusal below it). Passing the legacy
+   * tier here would turn "it fits at 16K" into a refusal at 128K nobody asked
+   * for.
+   *
+   * The "this machine's usage" caps ride along as --max-vram-mb/--max-ram-mb
+   * (0 = uncapped): the coordinator probes the machine itself, then caps what
+   * the probe reports before planning — same contract as the worker flag.
+   */
+  const serveOpenModel = useCallback(
+    async (over?: CustomModelSource): Promise<void> => {
+      const sel = over ?? customSel;
+      if (!sel) return;
+      const label = customGgufName(sel);
+      try {
+        if (!inTauri()) {
+          // Browser dev build: no engine to start; show the card in fixture mode.
+          setLocalEngine({ gguf: sel.path || sel.file, label });
+          setView("cluster");
+          return;
+        }
+        const path = await ensureCustomWeights(sel);
+        const { invoke } = await import("@tauri-apps/api/core");
+        await invoke("llamacpp_serve", {
+          ggufPath: path,
+          apiHost: settings.apiHost || "0.0.0.0",
+          apiPort: settings.apiPort || 8000,
+          apiToken: settings.apiToken,
+          ctxSize: 0,
+          maxDecode: settings.maxTokens,
+          maxVramMb: caps.maxVramMb,
+          maxRamMb: caps.maxRamMb,
+        });
+        setLocalEngine({ gguf: path, label });
+        setView("cluster");
+      } catch (e) {
+        if (!isWeightsCancelled(e)) console.error("serve-open-model:", e);
+        reportWeightsError(e, "cluster");
+      }
+    },
+    [customSel, ensureCustomWeights, settings.apiHost, settings.apiPort, settings.apiToken, settings.maxTokens, caps, reportWeightsError]
+  );
+
+  const stopLocalEngine = useCallback(async () => {
+    try {
+      await getEngineProvider().stop();
+    } catch {
+      /* stopping a dead engine is still stopped */
+    }
+    setLocalEngine(null);
+  }, []);
+
+  /**
+   * Rebuilds are serialized, and stale ones are skipped. "Selecting a model IS
+   * the switch" (2026-08-15) made quick successive picks easy — the Settings
+   * radios are a list of one-click switches — and two rebuilds running
+   * concurrently race each other through leave/create/start on the pairing
+   * provider. Each pick bumps the sequence; a queued rebuild that is no longer
+   * the newest does not run. The last pick wins, in one line of teardown.
+   */
+  const switchSeq = useRef(0);
+  const switchChain = useRef<Promise<void>>(Promise.resolve());
+  const queueRebuild = useCallback((job: () => Promise<void>): Promise<void> => {
+    const seq = ++switchSeq.current;
+    const chained = switchChain.current.then(async () => {
+      if (seq !== switchSeq.current) return;
+      await job();
+    });
+    // The chain must survive a failed job, or one refused start would wedge
+    // every switch after it.
+    switchChain.current = chained.catch(() => {});
+    return chained;
+  }, []);
+
+  /**
+   * Switch to a user-supplied GGUF from wherever the picker is open. Same
+   * restart semantics as switchModel: save the choice; when something is
+   * running, tear it down and serve the new file through the local engine
+   * (llamacpp_serve stops any engine sidecars itself — a model switch is a
+   * rebuild, never a hot swap).
+   */
+  const switchToCustom = useCallback(
+    async (c: CustomModelSource) => {
+      updateSettings({
+        ...settings,
+        modelId: LOCAL_GGUF_ID,
+        quant: "",
+        customSource: c.source,
+        customGgufPath: c.path,
+        customHfRepo: c.repo,
+        customHfFile: c.file,
+      });
+      const clusterRunning = pairSnap && pairSnap.peers.length > 0;
+      if (!clusterRunning && !localEngine) return; // nothing running: the pick is the whole operation
+      setView("cluster");
+      return queueRebuild(async () => {
+        try {
+          if (clusterRunning) await getPairingProvider().leave();
+          await serveOpenModel(c);
+        } catch (e) {
+          if (!isWeightsCancelled(e)) console.error("switch-to-custom:", e);
+          reportWeightsError(e, "cluster");
+        }
+      });
+    },
+    [settings, pairSnap, localEngine, serveOpenModel, reportWeightsError, queueRebuild]
+  );
 
   // One object, two renderers: the model row in Settings → Quick, and the
   // "run on this machine" row on Cluster. Both start the same download, so
@@ -1012,10 +1675,34 @@ export default function App() {
       needs: needsWeights,
       path: weightsPath,
       dl,
-      onDownload: () => void ensureWeights().catch((e) => setDl({ have: 0, total: 0, error: String(e) })),
+      partialBytes,
+      lastError,
+      onDownload: () =>
+        void (customSel && customSel.source === "hf"
+          ? ensureCustomWeights(customSel).then(() => refreshWeights())
+          : ensureWeights()
+        ).catch((e) => reportWeightsError(e)),
       onCancel: cancelDownload,
     }),
-    [needsWeights, weightsPath, dl, ensureWeights, cancelDownload]
+    // customSel is derived from settings each render; its fields (not its
+    // identity) are what matter here, and they are covered by refreshWeights'
+    // own deps — spelling the primitives out again keeps the memo honest.
+    [
+      needsWeights,
+      weightsPath,
+      dl,
+      partialBytes,
+      lastError,
+      ensureWeights,
+      ensureCustomWeights,
+      refreshWeights,
+      cancelDownload,
+      reportWeightsError,
+      settings.modelId,
+      settings.customSource,
+      settings.customHfRepo,
+      settings.customHfFile,
+    ]
   );
 
   /**
@@ -1034,19 +1721,19 @@ export default function App() {
    * instead of a lookalike copy — headless_pair's "create" is not equivalent,
    * it waits for a second peer before starting.
    */
-  const serveStandalone = useCallback(async (): Promise<boolean> => {
+  const serveStandalone = useCallback(async (over?: { modelId: string; quant: string }): Promise<boolean> => {
     // Returns false when the hardware probe has not landed yet — there is no
     // hostname/GPU to register. A user cannot hit this (the button only exists
     // once the dashboard has a probe), but the UI-test channel fires on mount,
     // and a silent no-op there reads as "serving is broken".
     if (!snap) return false;
     try {
-      const path = await ensureWeights();
+      const path = await ensureWeights(over);
       await getPairingProvider().create({
         hostname: snap.hostname,
         gpu: snap.gpu_name,
         modelPath: path,
-        tuning: engineTuning(settings),
+        tuning: engineTuning(over ? { ...settings, ...over } : settings, caps),
       });
       // allowSolo: this IS the one-machine flow. Without it the engine's
       // 2-machine pairing floor rejects the start and the button dies after
@@ -1054,11 +1741,86 @@ export default function App() {
       await getPairingProvider().start(true);
       return true;
     } catch (e) {
-      console.error("serve-standalone:", e);
-      setDl({ have: 0, total: 0, error: String(e) });
+      // Cancelling the weights download cancels serving too — that is the same
+      // decision, not a second failure to report.
+      if (!isWeightsCancelled(e)) console.error("serve-standalone:", e);
+      reportWeightsError(e, "cluster");
       return true; // it ran; it failed. Distinct from "could not run yet".
     }
-  }, [snap, ensureWeights, settings]);
+  }, [snap, ensureWeights, settings, caps, reportWeightsError]);
+
+  /**
+   * Switch the model from wherever it is displayed (chat header, cluster card).
+   *
+   * The engine has no hot swap — a model is fixed when the coordinator loads it
+   * — so this is "save the choice, and rebuild whatever is running around it":
+   *
+   *   nothing running  save only. The next start picks it up.
+   *   one machine      leave (stops the engine) -> serveStandalone with the new
+   *                    selection, downloading its weights first if needed.
+   *   several machines leave, then re-create the roster **under the same join
+   *                    code** and stop there. The other machines rejoin (their
+   *                    client re-registers when it finds itself missing from
+   *                    the roster) and the user presses Start — the same
+   *                    forming flow as any other cluster, so nothing new has to
+   *                    be explained. Minting a fresh code here would strand
+   *                    every machine still holding the old one.
+   *
+   * It also jumps to the Cluster page whenever it restarts something: the
+   * download bar, the per-machine stages and the failure messages all live
+   * there, and a switch started from chat would otherwise be a page that goes
+   * quiet for however long an 80 GB model takes.
+   */
+  const switchModel = useCallback(
+    async (modelId: string, quant: string) => {
+      // The setting is written immediately — the radio/picker must reflect the
+      // choice now, not after whatever rebuild is currently winding down.
+      updateSettings({ ...settings, modelId, quant });
+      return queueRebuild(async () => {
+      // Switching AWAY from a running local llama.cpp engine: stop it, then
+      // serve the curated pick the single-machine way (same restart promise
+      // the picker made — nothing keeps running under the old model).
+      if (localEngine) {
+        await stopLocalEngine();
+        if (snap) await serveStandalone({ modelId, quant });
+        return;
+      }
+      const running = pairSnap && pairSnap.peers.length > 0;
+      if (!running || !snap) return;
+      const machines = pairSnap.peers.length;
+      const code = pairSnap.code;
+      const account = !!pairSnap.accountMode;
+      setView("cluster");
+      try {
+        await getPairingProvider().leave();
+        if (machines <= 1) {
+          await serveStandalone({ modelId, quant });
+          return;
+        }
+        const path = await ensureWeights({ modelId, quant });
+        const self = {
+          hostname: snap.hostname,
+          gpu: snap.gpu_name,
+          modelPath: path,
+          tuning: engineTuning({ ...settings, modelId, quant }, caps),
+        };
+        // Account mode has no typed code: the secret is derived from the
+        // account, so every machine re-derives the same one and finds us again.
+        if (account) {
+          const g = platformGate();
+          const secret = g.ok && g.session.userId ? await accountPairSecret(g.session.userId, g.url, settings.clusterName.trim() || "home") : null;
+          if (secret) await getPairingProvider().createAccount(self, secret);
+        } else {
+          await getPairingProvider().create(self, code ?? undefined);
+        }
+      } catch (e) {
+        if (!isWeightsCancelled(e)) console.error("switch-model:", e);
+        reportWeightsError(e, "cluster");
+      }
+      });
+    },
+    [settings, pairSnap, snap, localEngine, stopLocalEngine, serveStandalone, ensureWeights, caps, reportWeightsError, queueRebuild]
+  );
 
   // The UI-test effect runs once on mount, so it captures the FIRST render's
   // closure — where snap is still null. A ref keeps the directive pointed at
@@ -1067,13 +1829,10 @@ export default function App() {
   useEffect(() => {
     serveStandaloneRef.current = serveStandalone;
   });
-
-  // Preset caps derive from the machine's totals (learned from the first probe);
-  // "custom" uses the precise sliders directly.
-  const caps = useMemo(
-    () => effectiveCaps(settings, totals),
-    [settings.resourcePreset, settings.maxVramMb, settings.maxRamMb, totals]
-  );
+  const serveOpenRef = useRef(serveOpenModel);
+  useEffect(() => {
+    serveOpenRef.current = serveOpenModel;
+  });
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
@@ -1086,14 +1845,19 @@ export default function App() {
     if (uiTestRan) return;
     uiTestRan = true;
     uiTestDirectives().then((list) => {
+      // Echo the list to the launcher's log first: whether this loop ran at
+      // all (and with what) must be observable from a headless run.
+      if (list.length) reportTest("directives", list);
       for (const d of list) {
         const m = d.match(/^engine-start:(worker|coordinator)$/);
         if (m) getEngineProvider().start(m[1] as EngineRole).catch(() => {});
-        const q = d.match(/^quit:(\d+)$/); // close the window after N ms (graceful-exit tests)
-        if (q)
-          setTimeout(() => {
-            import("@tauri-apps/api/window").then(({ getCurrentWindow }) => getCurrentWindow().close());
-          }, Number(q[1]));
+        // Quit after N ms (graceful-exit tests). It goes through app_quit, not
+        // through the window's close button: with "close to tray" on — the
+        // default — closing the window HIDES it, and every gate that ends with
+        // this directive would hang waiting for a process that is still
+        // happily serving in the background.
+        const q = d.match(/^quit:(\d+)$/);
+        if (q) setTimeout(() => void quitApp(), Number(q[1]));
 
         // Pairing flow (P3/P4/P5/P6 gates). `:as=<name>` overrides the advertised
         // hostname so two instances on one test box get distinct roster ids;
@@ -1107,7 +1871,7 @@ export default function App() {
         if (pm) {
           const [, op, code, as, apiPort, apiToken, model] = pm;
           const tuning = {
-            ...engineTuning(settings),
+            ...engineTuning(settings, caps),
             ...(apiPort ? { apiPort: Number(apiPort) } : {}),
             ...(apiToken ? { apiToken } : {}),
           };
@@ -1118,7 +1882,13 @@ export default function App() {
               gpu: "test",
               modelPath: model || "",
               tuning,
-            }).catch((e) => console.error("uiTest pairing:", e))
+            }).catch((e) => {
+              // Surface to the launcher's log too: a directive failure that
+              // only reaches the webview console is invisible to every
+              // headless run (cost a whole debugging round, 2026-08-15).
+              console.error("uiTest pairing:", e);
+              reportTest("pairing-invoke-error", { op, error: String(e) });
+            })
           );
         }
         // Account-mode pairing (integration plan 3.3): derive the pair secret
@@ -1150,7 +1920,7 @@ export default function App() {
                 hostname: as || window.location.hostname || "test-node",
                 gpu: "test",
                 modelPath: "",
-                tuning: engineTuning(settings),
+                tuning: engineTuning(settings, caps),
                 account: true,
               });
               reportTest("pairing-account", { ok: true, op, email: gate.session.email });
@@ -1215,6 +1985,80 @@ export default function App() {
             // The test sentinel token is not left behind in the user's settings.
             .finally(() => { if (dg[1]) saveSettings(original); });
         }
+        // ---- update (gate G-UPDATE) ------------------------------------
+        // `update-check` asks the real feed through the real provider; the
+        // gate points IDLETOKEN_UPDATE_URL/PUBKEY at a manifest it signed
+        // itself, so what runs here is the production path, not a copy of it.
+        if (d === "update-check") {
+          const provider = getUpdateProvider();
+          provider
+            .check(loadSettings().updateChannel)
+            .then(async (info) => {
+              const st = await provider.state(loadSettings().updateChannel);
+              reportTest("update", {
+                found: info !== null,
+                version: info?.version ?? null,
+                current: st.currentVersion,
+                feed: st.feed,
+                feedOverridden: st.feedOverridden,
+                error: null,
+              });
+            })
+            // The distinction the gate exists to protect: a check that could
+            // not run reports an error, never "up to date".
+            .catch((e) => reportTest("update", { found: null, error: String(e) }));
+        }
+        // Download + verify WITHOUT installing (installing would replace the
+        // binary the harness is running). The signature check happens inside
+        // the download, so this is the assertion that a tampered artifact is
+        // refused — the gate runs it both ways.
+        if (d === "update-download") {
+          const provider = getUpdateProvider();
+          provider
+            .check(loadSettings().updateChannel)
+            .then(async (info) => {
+              if (!info) {
+                reportTest("update-download", { ok: false, reason: "no update offered by the feed" });
+                return;
+              }
+              const bytes = await provider.download();
+              reportTest("update-download", { ok: true, version: info.version, bytes });
+            })
+            .catch((e) => reportTest("update-download", { ok: false, reason: String(e) }));
+        }
+        // ---- tray / background residency (gate G-TRAY) -------------------
+        // What the shell believes about the tray and the window, straight from
+        // Rust: whether an icon actually exists (it can fail to on Linux) and
+        // therefore whether hiding the window is allowed at all.
+        if (d === "report-shell-window") {
+          windowState()
+            .then((st) => reportTest("shell-window", st ?? { error: "not running in the shell" }))
+            .catch((e) => reportTest("shell-window", { error: String(e) }));
+        }
+        // Close the window the way the X button does and report what happened.
+        // The report arriving at all is half the assertion: it is printed by a
+        // process that closing the window did not kill.
+        const ct = d.match(/^close-to-tray:(\d+)$/);
+        if (ct) {
+          (async () => {
+            // Directives run before the settings-sync effect below, so the
+            // shell is told explicitly rather than tested against whatever
+            // window.json happened to be left behind by an earlier run.
+            await syncWindowPrefs(loadSettings());
+            const before = await windowState();
+            const { getCurrentWindow } = await import("@tauri-apps/api/window");
+            await getCurrentWindow().close();
+            await new Promise((r) => setTimeout(r, Number(ct[1])));
+            const after = await windowState();
+            reportTest("close-to-tray", {
+              hideAllowed: before?.hideAllowed ?? null,
+              trayAlive: before?.trayAlive ?? null,
+              visibleBefore: before?.visible ?? null,
+              visibleAfter: after?.visible ?? null,
+              stillRunning: after !== null,
+            });
+          })().catch((e) => reportTest("close-to-tray", { error: String(e) }));
+        }
         // Report a fresh probe through the real provider path so acceptance
         // can diff it against `--probe-json` (P1: no fake data in the UI).
         // An executable oracle for weight downloading (B1). The product gate
@@ -1263,7 +2107,11 @@ export default function App() {
               const target = resolveDownload(man, defaultQuant(wc[1]));
               if (!target) { reportTest("weightsCancel", { error: "manifest has no repo/gguf" }); return; }
               const dir = await defaultModelDir();
-              void fetchWeights({ id: "primary", target, destDir: dir }).catch(() => {});
+              // Route the rejection the way a user's click does. Swallowing it
+              // here (`.catch(() => {})`) is what let the bug hide: the command
+              // rejects on a cancel too, and in the app that rejection landed
+              // in a catch that painted "Download failed — cancelled …".
+              void fetchWeights({ id: "primary", target, destDir: dir }).catch(reportWeightsError);
               await new Promise((r) => setTimeout(r, Number(wc[2])));
               const tCancel = Date.now();
               cancelDownload();
@@ -1274,6 +2122,12 @@ export default function App() {
                 kindsAfterStart: seen,
                 sawError: seen.includes("error"),
                 sawCancelled: seen.includes("cancelled"),
+                // What the user is left looking at. The event stream had been
+                // right about this for a while and the screen still said
+                // "Download failed — cancelled (...)", because the failure came
+                // in on the command's rejection instead. An oracle that only
+                // watches the events cannot see that; this one asks the UI.
+                errorShownAfterCancel: errRef.current,
               });
             } catch (e) {
               reportTest("weightsCancel", { error: String(e) });
@@ -1355,6 +2209,49 @@ export default function App() {
               });
             } catch (e) {
               reportTest("serveStandalone", { error: String(e), seconds: Math.round((Date.now() - t0) / 1000) });
+            }
+          })();
+        }
+        // Open-model oracle (v2 WS-D1): serve an arbitrary local GGUF through
+        // the REAL handler (coordinator llamacpp mode), then report what the
+        // coordinator said — auto-manifest id + engine state on success, the
+        // worded refusal on refusal. Both outcomes are reportable on purpose:
+        // the refusal path is a feature, not a failure of the test.
+        //   serve-open-gguf:<absolute-path.gguf>
+        const sg = d.match(/^serve-open-gguf:(\S+)$/);
+        if (sg) {
+          (async () => {
+            const t0 = Date.now();
+            try {
+              await serveOpenRef.current({ source: "file", path: sg[1], repo: "", file: "" });
+              const { invoke } = await import("@tauri-apps/api/core");
+              const base = `http://127.0.0.1:${loadSettings().apiPort || 8000}`;
+              let stats: Record<string, unknown> | null = null;
+              let refused: string | null = null;
+              for (let i = 0; i < 60; i++) {
+                await new Promise((r) => setTimeout(r, 2000));
+                const st = await getEngineProvider().status();
+                if (st.refusedReason) {
+                  refused = st.refusedReason;
+                  break;
+                }
+                try {
+                  stats = await invoke<Record<string, unknown>>("api_stats", { baseUrl: base });
+                } catch {
+                  /* API not up yet */
+                }
+                if (stats && (stats.engine_state === "ready" || stats.engine_state === "failed")) break;
+              }
+              reportTest("serveOpenGguf", {
+                ctx: uiTestCtx,
+                seconds: Math.round((Date.now() - t0) / 1000),
+                refused,
+                engine: (stats?.engine as string) ?? null,
+                engineState: (stats?.engine_state as string) ?? null,
+                model: (stats?.model as string) ?? null,
+              });
+            } catch (e) {
+              reportTest("serveOpenGguf", { error: String(e) });
             }
           })();
         }
@@ -1577,14 +2474,178 @@ export default function App() {
     saveSettings(s);
   };
 
+  // The local llama.cpp engine's API, shaped like the cluster's so chat and
+  // stats consume either without caring which. "online" = the coordinator
+  // process is up and answering its API (it 503s honestly while the model
+  // loads — that message reaches the user through chat and the engine card).
+  const localApi: ClusterApi | null = localEngine
+    ? {
+        baseUrl: `http://127.0.0.1:${settings.apiPort || 8000}`,
+        status:
+          engStatus === null || engStatus.state === "starting"
+            ? "starting"
+            : engStatus.state === "running" || engStatus.state === "restarting"
+              ? "online"
+              : "offline",
+      }
+    : null;
+
+  // One poll for the local engine's counters/health, shared by the topbar pill
+  // and the local-engine card (the coordinator serves requests serially — a
+  // second poller would compete with generation for nothing).
+  const localStats = useClusterStats(localApi, "engine", {});
+
   const cluster: ClusterState =
     pairSnap === null || pairSnap.phase === "idle"
       ? pairSnap && pairSnap.peers.length > 0
         ? "joining"
-        : "standalone"
+        : localEngine
+          ? // "ready" only once the engine reports ready — the API 503s while
+            // the model loads, and a green pill over a 503 is a fake green.
+            localStats?.engine_state === "ready"
+            ? "ready"
+            : "joining"
+          : "standalone"
       : pairSnap.phase === "ready"
         ? "ready"
         : "joining";
+
+  // ---- shell integration: tray, window behaviour, launch at login ----------
+  // These four settings are the only ones the Rust side needs a copy of: it
+  // acts on them before the webview exists (start minimized) and after it may
+  // be gone (the window's X). Pushing them on every change is what keeps its
+  // mirror from drifting; see system.ts.
+  useEffect(() => {
+    void syncWindowPrefs(settings);
+  }, [settings.trayIcon, settings.closeToTray, settings.startMinimized, settings.rememberWindow]);
+
+  // Settings are the source of truth for "launch at login", and this enforces
+  // them on the OS every launch — self-healing when something else (an
+  // uninstall/reinstall, a cleanup tool) removed the entry behind our back.
+  useEffect(() => {
+    void setAutostart(settings.autostart).catch(() => {
+      /* the OS refused; the setting stays as the user's intent */
+    });
+  }, [settings.autostart]);
+
+  // Tray menu text + the one line of status it shows. Rebuilt on language and
+  // on cluster changes rather than translated in Rust — the language and the
+  // cluster state both live here, and a second copy of either is a second
+  // thing that can go stale.
+  const trayMachines = pairSnap?.peers.length ?? 0;
+  useEffect(() => {
+    const status =
+      cluster === "ready"
+        ? t2("tray.statusServing", lang).replace("{n}", String(Math.max(1, trayMachines)))
+        : cluster === "joining"
+          ? t2("tray.statusStarting", lang)
+          : t2("tray.statusIdle", lang);
+    void syncTray({
+      open: t2("tray.open", lang),
+      status,
+      check_update: t2("tray.checkUpdate", lang),
+      quit: t2("tray.quit", lang),
+    });
+  }, [lang, cluster, trayMachines, settings.trayIcon]);
+
+  // ---- one-time "still running in the tray" notice -------------------------
+  // The first close-to-tray is otherwise indistinguishable from the app having
+  // quit. The shell emits `tray:hidden` after hiding the window (main.rs); the
+  // webview stays alive while hidden, so an in-app toast is waiting when the
+  // window comes back — and the flag in settings keeps it to exactly once.
+  const [trayToast, setTrayToast] = useState(false);
+  useEffect(() => {
+    if (!inTauri()) return;
+    let un: (() => void) | null = null;
+    let dead = false;
+    void import("@tauri-apps/api/event").then(({ listen }) =>
+      listen("tray:hidden", () => {
+        setSettings((prev) => {
+          if (prev.trayHintShown) return prev;
+          const next = { ...prev, trayHintShown: true };
+          saveSettings(next);
+          setTrayToast(true);
+          return next;
+        });
+      }).then((f) => (dead ? f() : (un = f)))
+    );
+    return () => {
+      dead = true;
+      un?.();
+    };
+  }, []);
+  // Dismiss only after the window has been VISIBLE for a while — a timer that
+  // runs out while the window is hidden would remove the notice before anyone
+  // could have read it.
+  useEffect(() => {
+    if (!trayToast) return;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const arm = () => {
+      if (timer) clearTimeout(timer);
+      timer = null;
+      if (document.visibilityState === "visible") timer = setTimeout(() => setTrayToast(false), 8000);
+    };
+    arm();
+    document.addEventListener("visibilitychange", arm);
+    return () => {
+      if (timer) clearTimeout(timer);
+      document.removeEventListener("visibilitychange", arm);
+    };
+  }, [trayToast]);
+
+  // ---- update ------------------------------------------------------------
+  const [update, setUpdate] = useState<UpdateResult | null>(null);
+
+  /**
+   * One check, two ways of reporting it.
+   *
+   * `announce: "always"` is a check the user asked for (Settings button, tray
+   * menu): every outcome opens the dialog, including "you are current" and
+   * "could not reach the feed" — a button that answers nothing reads as
+   * broken, and the two answers are not the same fact.
+   *
+   * `announce: "found"` is the automatic check at startup: it interrupts only
+   * when there is something to install. A failed check there is deliberately
+   * silent — an unreachable feed four seconds after launch is not worth a
+   * modal — which is exactly why the manual path must never be.
+   */
+  const checkUpdate = useCallback(
+    async (announce: "always" | "found") => {
+      try {
+        const info = await getUpdateProvider().check(settings.updateChannel);
+        if (info) setUpdate({ kind: "found", info });
+        else if (announce === "always") {
+          const st = await getUpdateProvider().state(settings.updateChannel);
+          setUpdate({ kind: "upToDate", current: st.currentVersion });
+        }
+      } catch (e) {
+        if (announce === "always") setUpdate({ kind: "error", message: String(e) });
+      }
+    },
+    [settings.updateChannel]
+  );
+
+  // Automatic check: once per launch, a few seconds in so it never competes
+  // with the probe and the cluster rejoin.
+  useEffect(() => {
+    if (!settings.autoUpdate) return;
+    const timer = setTimeout(() => void checkUpdate("found"), 4000);
+    return () => clearTimeout(timer);
+    // Once per launch: re-running it on every settings edit would nag.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // "Check for updates…" from the tray menu, through the same path as the
+  // Settings button.
+  useEffect(() => {
+    if (!inTauri()) return;
+    const un = import("@tauri-apps/api/event").then(({ listen }) =>
+      listen("tray-check-update", () => void checkUpdate("always"))
+    );
+    return () => {
+      un.then((f) => f());
+    };
+  }, [checkUpdate]);
 
   return (
     <LangContext.Provider value={{ lang, setLang }}>
@@ -1621,13 +2682,19 @@ export default function App() {
               </div>
             ) : view === "chat" ? (
               <Chat
-                api={pairSnap?.api ?? null}
+                api={pairSnap?.api ?? localApi}
+                source={pairSnap?.source ?? "engine"}
                 apiToken={settings.apiToken}
                 modelId={settings.modelId}
+                modelLabel={model.label}
                 quant={settings.quant}
                 maxTokens={settings.maxTokens}
                 identity={identity}
                 onGoCluster={() => setView("cluster")}
+                machines={pairSnap?.peers.length ?? (localEngine ? 1 : 0)}
+                onSwitchModel={(id, q) => void switchModel(id, q)}
+                onPickCustomModel={(c) => void switchToCustom(c)}
+                customName={customName}
               />
             ) : view === "settings" ? (
               <SettingsPanel
@@ -1644,6 +2711,9 @@ export default function App() {
                 onSignIn={() => setShowAuth(true)}
                 initialCategory={settingsCategory}
                 weights={weightsInfo}
+                onSwitchModel={(id, q) => void switchModel(id, q)}
+                onWeightsChanged={() => void refreshWeights()}
+                onCheckUpdate={() => checkUpdate("always")}
                 onClose={() => setView("cluster")}
               />
             ) : (
@@ -1653,7 +2723,18 @@ export default function App() {
                 quant={settings.quant}
                 tier={TIERS.find((x) => x.id === settings.tier) ?? TIERS[1]}
                 pair={pairSnap}
-                onServeStandalone={serveStandalone}
+                localEngine={localEngine}
+                localApi={localApi}
+                localStats={localStats}
+                engStatus={engStatus}
+                customName={customName}
+                onStopLocal={() => void stopLocalEngine()}
+                onPickCustom={(c) => void switchToCustom(c)}
+                // Wrapped, not passed through: serveStandalone now takes an
+                // optional {modelId,quant} override, and a bare handler would
+                // hand it the click event as that argument. An open GGUF's
+                // "run it here" is the local llama.cpp engine, not pairing.
+                onServeStandalone={() => void (customSel ? serveOpenModel() : serveStandalone())}
                 onCreateCluster={() => {
                   setPairingView("choose");
                   setShowPairing(true);
@@ -1668,6 +2749,7 @@ export default function App() {
                 }}
                 onOpenSharing={() => openSettings("platform")}
                 onOpenModelSetting={() => openSettings("quick")}
+                onSwitchModel={(id, q) => void switchModel(id, q)}
                 weights={weightsInfo}
               />
             )}
@@ -1693,9 +2775,10 @@ export default function App() {
             hostname: snap.hostname,
             gpu: snap.gpu_name,
             modelPath: weightsPath,
-            tuning: engineTuning(settings),
+            tuning: engineTuning(settings, caps),
           }}
           session={session}
+          modelId={settings.modelId}
           initialView={pairingView}
           onSignIn={() => {
             setShowPairing(false);
@@ -1703,6 +2786,18 @@ export default function App() {
           }}
           onClose={() => setShowPairing(false)}
         />
+      ) : null}
+      {update ? (
+        <UpdateDialog
+          result={update}
+          onClose={() => setUpdate(null)}
+          onOutcome={(o) => reportTest("update-install", o)}
+        />
+      ) : null}
+      {trayToast ? (
+        <div className="toast" role="status" onClick={() => setTrayToast(false)}>
+          {t2("tray.hidden", lang)}
+        </div>
       ) : null}
     </LangContext.Provider>
   );

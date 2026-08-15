@@ -73,6 +73,15 @@ def main(argv):
         if bool(man.get("available")) != bool(r["available"]):
             problems.append("%s: available manifest=%r registry=%r"
                             % (mid, man.get("available"), bool(r["available"])))
+        # `deployment` decides whether the coordinator will let this model span
+        # more than one machine. Both copies must say the same thing, and BOTH
+        # must say something: a model added without it is refused at runtime,
+        # which is a fine failure mode but a terrible way to discover the typo.
+        md, rd = man.get("deployment"), r.get("deployment")
+        if md not in ("single-node", "cluster"):
+            problems.append("%s: manifest deployment=%r (want 'single-node' or 'cluster')" % (mid, md))
+        elif md != rd:
+            problems.append("%s: deployment manifest=%r registry=%r" % (mid, md, rd))
         mv = {v["quant"]: v for v in man.get("variants", [])}
         rv = {v["quant"]: v for v in r.get("variants", [])}
         if set(mv) != set(rv):

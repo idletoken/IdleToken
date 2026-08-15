@@ -23,6 +23,12 @@
 #   - Simulated cells are LABELLED simulated. They prove the split/protocol/
 #     roster hold at N=10; they do not prove ten real GPUs work (design
 #     philosophy 13 — never let a simulation read as real hardware).
+#   - Since 2026-08-12 small models are single-node-only: the coordinator
+#     refuses to spread one over several machines. Those cells still RUN (with
+#     IDLETOKEN_ALLOW_SMALL_CLUSTER=1), because DSv4 is the only runnable
+#     cluster model and dropping them would leave the multi-machine half of the
+#     matrix nearly empty — but they are recorded under kind=vehicle, so a PASS
+#     there means "the plumbing works", never "this topology is supported".
 #
 # Usage:
 #   scripts/topology_matrix.sh                 # everything not yet passed
@@ -220,6 +226,16 @@ PY
 fi
 echo "models under test: $MODELS"
 
+# "cluster" | "single-node" -- may this model be spread over several machines?
+# Straight from the manifest, the same field the engine registry mirrors, so
+# this script cannot develop its own opinion about which models are small.
+model_deployment() {
+    python3 - "models/$1.json" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1])).get("deployment", ""))
+PY
+}
+
 # Resolve a model's GGUF filename (default precision) from its manifest.
 gguf_name() {
     python3 - "models/$1.json" <<'PY'
@@ -310,6 +326,24 @@ run_cell() {  # run_cell <model> <coord> <all-nodes...>
     local coord_gguf; coord_gguf=$(node_gguf_for "$coord" "$file") || coord_gguf=""
     local code; code=$(mint_code)
 
+    # A single-node model on more than one machine is not a product
+    # configuration -- the coordinator exits rather than accept a second worker.
+    # We still run the cell, because DSv4 is the only runnable cluster model and
+    # without a small one there would be almost no multi-machine coverage left
+    # at all. The override says "test vehicle", and the row is recorded as one
+    # (see the `kind` column) so nobody reads it as a supported topology.
+    #
+    # ⚠ The cmd form below is `set VAR=1&& prog`, with NO space before the `&&`.
+    # In cmd, `set VAR=1 & prog` puts the space INSIDE the value ("1 "), and the
+    # engine would then not recognise it -- the override would silently not
+    # apply and every multi-node small-model cell would fail with JOIN_REFUSED
+    # on Windows only. The same idiom is used for IDLETOKEN_DS4X_CUDA elsewhere
+    # in scripts/ for exactly this reason.
+    local ovr=""
+    if [ "$n" -gt 1 ] && [ "$(model_deployment "$model")" != "cluster" ]; then
+        ovr=1
+    fi
+
     cleanup_all
     sleep 2
 
@@ -325,13 +359,16 @@ run_cell() {  # run_cell <model> <coord> <all-nodes...>
         local cwin="${chome//\//\\}" gwin="${coord_gguf//\//\\}"
         ssh -f -o BatchMode=yes "$coord" "cmd /c \"cd /d $cwin & idletoken-worker.exe --serve-weights $gwin\\$file --weights-port 8001 > tm-weights.log 2>&1\"" >/dev/null 2>&1
         sleep 2
-        ssh -f -o BatchMode=yes "$coord" "cmd /c \"cd /d $cwin & idletoken-coord.exe --pair-code $code --num-workers $n --http --model-id $model --model-path $gwin\\$file --gguf-dir $gwin --n-predict 0 --ctx-size 8192 > tm-coord.log 2>&1\"" >/dev/null 2>&1
+        ssh -f -o BatchMode=yes "$coord" "cmd /c \"cd /d $cwin & ${ovr:+set IDLETOKEN_ALLOW_SMALL_CLUSTER=1&& }idletoken-coord.exe --pair-code $code --num-workers $n --http --model-id $model --model-path $gwin\\$file --gguf-dir $gwin --n-predict 0 --ctx-size 8192 > tm-coord.log 2>&1\"" >/dev/null 2>&1
         sleep 3
         ssh -f -o BatchMode=yes "$coord" "cmd /c \"cd /d $cwin & idletoken-worker.exe --pair-code $code --model $gwin\\$file --gguf-dir $gwin --bind 0.0.0.0:14102 > tm-w0.log 2>&1\"" >/dev/null 2>&1
     else
         ssh -f -o BatchMode=yes "$coord" "cd $chome && exec ./idletoken-worker --serve-weights '$coord_gguf/$file' --weights-port 8001 > /tmp/tm-weights.log 2>&1" >/dev/null 2>&1
         sleep 2
-        ssh -f -o BatchMode=yes "$coord" "cd $chome && exec ./idletoken-coord --pair-code $code --num-workers $n --http --model-id $model --model-path '$coord_gguf/$file' --gguf-dir '$coord_gguf' --n-predict 0 --ctx-size 8192 > /tmp/tm-coord.log 2>&1" >/dev/null 2>&1
+        # `export ... &&`, not a `VAR=1 exec` prefix: assignments in front of a
+        # special builtin persist in the shell but are NOT exported, so the
+        # engine would never see it.
+        ssh -f -o BatchMode=yes "$coord" "cd $chome && ${ovr:+export IDLETOKEN_ALLOW_SMALL_CLUSTER=1 && }exec ./idletoken-coord --pair-code $code --num-workers $n --http --model-id $model --model-path '$coord_gguf/$file' --gguf-dir '$coord_gguf' --n-predict 0 --ctx-size 8192 > /tmp/tm-coord.log 2>&1" >/dev/null 2>&1
         sleep 3
         ssh -f -o BatchMode=yes "$coord" "cd $chome && exec ./idletoken-worker --pair-code $code --model '$coord_gguf/$file' --gguf-dir '$coord_gguf' --bind 0.0.0.0:14102 > /tmp/tm-w0.log 2>&1" >/dev/null 2>&1
     fi
@@ -362,7 +399,7 @@ run_cell() {  # run_cell <model> <coord> <all-nodes...>
     # Wait for ready, then ask something with one right answer.
     local ready="" i
     for i in $(seq 1 "${IDLETOKEN_TOPO_TRIES:-80}"); do
-        local st; st=$(node_get "$coord" /v1/cluster/status)
+        local st; st=$(node_get "$coord" /idletoken/v1/cluster/status)
         case "$st" in *'"phase":"ready"'*) ready="$st"; break ;; esac
         sleep 10
     done
@@ -382,7 +419,7 @@ print("%d-%d%s" % (spans[0][0], spans[-1][1], " GAP" if gap else ""))' 2>/dev/nu
     # An empty result means the extractor itself broke — treat that as a failure
     # rather than silently "no gap found" (a check that cannot fail is not a check).
     case "$covered" in
-        ""|*NOMEMBERS*) echo "FAILREASON:could not read the layer plan from /v1/cluster/status"; return 1 ;;
+        ""|*NOMEMBERS*) echo "FAILREASON:could not read the layer plan from /idletoken/v1/cluster/status"; return 1 ;;
         *GAP*)          echo "FAILREASON:layer plan has a gap ($covered)"; return 1 ;;
     esac
 
@@ -470,7 +507,15 @@ for model in $MODELS; do
             echo "   SKIP mixed-OS ($mixed)"
             continue
         fi
-        echo "== $model on $local_key (coord $coord) =="
+        # A single-node model spread over several machines is plumbing coverage,
+        # not a topology the product offers (the coordinator refuses it without
+        # IDLETOKEN_ALLOW_SMALL_CLUSTER). It is recorded under its own `kind` so
+        # the pass count cannot be read as "this configuration is supported".
+        kind=real
+        if [ ${#subset[@]} -gt 1 ] && [ "$(model_deployment "$model")" != "cluster" ]; then
+            kind=vehicle
+        fi
+        echo "== $model on $local_key (coord $coord)${kind:+ [$kind]} =="
         # Idle the machines BEFORE asking the advisor: it reports what is free
         # right now, so a leftover cluster from the previous cell makes every
         # verdict read "would not fit" (this produced a table claiming DGX alone
@@ -481,18 +526,18 @@ for model in $MODELS; do
         [ -n "${IDLETOKEN_TOPO_DEBUG:-}" ] && echo "   [debug] advisor verdict: '$verdict'"
         case "$verdict" in
             no\ *)
-                record SKIP "$model" "$local_key" "$coord" real "advisor: would not fit, needs ${verdict#no } GB more"
+                record SKIP "$model" "$local_key" "$coord" "$kind" "advisor: would not fit, needs ${verdict#no } GB more"
                 echo "   SKIP advisor says it would not fit (needs ${verdict#no } GB more)"
                 continue ;;
             unavailable*)
-                record SKIP "$model" "$local_key" "$coord" real "backend not implemented in this build"
+                record SKIP "$model" "$local_key" "$coord" "$kind" "backend not implemented in this build"
                 echo "   SKIP backend not implemented"; continue ;;
         esac
         out=$(run_cell "$model" "$coord" "${subset[@]}"); rc=$?
         case "$rc" in
-            0) record PASS "$model" "$local_key" "$coord" real "${out#OKDETAIL:}"; echo "   PASS ${out#OKDETAIL:}" ;;
-            2) record SKIP "$model" "$local_key" "$coord" real "${out#SKIPREASON:}"; echo "   SKIP ${out#SKIPREASON:}" ;;
-            *) record FAIL "$model" "$local_key" "$coord" real "${out#FAILREASON:}"; echo "   FAIL ${out#FAILREASON:}"; fails=$((fails + 1)) ;;
+            0) record PASS "$model" "$local_key" "$coord" "$kind" "${out#OKDETAIL:}"; echo "   PASS ${out#OKDETAIL:}" ;;
+            2) record SKIP "$model" "$local_key" "$coord" "$kind" "${out#SKIPREASON:}"; echo "   SKIP ${out#SKIPREASON:}" ;;
+            *) record FAIL "$model" "$local_key" "$coord" "$kind" "${out#FAILREASON:}"; echo "   FAIL ${out#FAILREASON:}"; fails=$((fails + 1)) ;;
         esac
     done
 done
@@ -500,10 +545,18 @@ done
 # --- simulated 5..10 --------------------------------------------------------
 # Multiple worker processes on the coordinator machine. Real protocol, real
 # split, real load — simulated only in that the GPUs are the same one.
+#
+# The default sim model is a small one for the obvious reason (ten copies of a
+# 81 GiB model fit nowhere), which makes every one of these cells a single-node
+# model on N nodes — the override applies here too. What they prove is that the
+# split, the roster and the protocol hold at N=10; that was never a claim about
+# a supported way to serve a 0.8B model.
 if [ "$DO_SIM" = 1 ]; then
     sim_model="${IDLETOKEN_TOPO_SIM_MODEL:-qwen3.5-0.8b}"
     file=$(gguf_name "$sim_model")
     cg=$(node_gguf_for "$COORD_NODE" "$file") || cg=""
+    sim_ovr=""
+    [ "$(model_deployment "$sim_model")" != "cluster" ] && sim_ovr=1
     for n in 5 6 7 8 9 10; do
         key="sim-${n}x"
         if done_already "$sim_model" "$key" "$COORD_NODE"; then
@@ -512,7 +565,7 @@ if [ "$DO_SIM" = 1 ]; then
         echo "== $sim_model on $key (simulated) =="
         cleanup_all; sleep 2
         code=$(mint_code)
-        ssh -f -o BatchMode=yes "$COORD_NODE" "cd $COORD_HOME && exec ./idletoken-coord --pair-code $code --num-workers $n --http --model-id $sim_model --model-path '$cg/$file' --gguf-dir '$cg' --n-predict 0 --ctx-size 8192 > /tmp/tm-sim-coord.log 2>&1" >/dev/null 2>&1
+        ssh -f -o BatchMode=yes "$COORD_NODE" "cd $COORD_HOME && ${sim_ovr:+export IDLETOKEN_ALLOW_SMALL_CLUSTER=1 && }exec ./idletoken-coord --pair-code $code --num-workers $n --http --model-id $sim_model --model-path '$cg/$file' --gguf-dir '$cg' --n-predict 0 --ctx-size 8192 > /tmp/tm-sim-coord.log 2>&1" >/dev/null 2>&1
         sleep 3
         for w in $(seq 1 "$n"); do
             ssh -f -o BatchMode=yes "$COORD_NODE" "cd $COORD_HOME && exec ./idletoken-worker --pair-code $code --model '$cg/$file' --gguf-dir '$cg' --bind 0.0.0.0:$((14200 + w)) > /tmp/tm-sim-w$w.log 2>&1" >/dev/null 2>&1
@@ -520,7 +573,7 @@ if [ "$DO_SIM" = 1 ]; then
         done
         ready=""
         for i in $(seq 1 40); do
-            st=$(node_get "$COORD_NODE" /v1/cluster/status)
+            st=$(node_get "$COORD_NODE" /idletoken/v1/cluster/status)
             case "$st" in *'"phase":"ready"'*) ready="$st"; break ;; esac
             sleep 10
         done

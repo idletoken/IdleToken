@@ -7,11 +7,15 @@
 #include "idletoken_proto.h"
 #include "idletoken_net.h"
 #include "idletoken_discovery.h"
+#include "idletoken_sha256.h"   /* session-key fingerprint for logs (never the key) */
+#include "idletoken_nodecrypt.h"
+#include "idletoken_privacy.h"   /* idletoken_secure_zero */
 #include "idletoken_model.h"
 #include "idletoken_resource.h"
 #include "idletoken_advise.h"
 #include "idletoken_weights.h"
 #include "idletoken_gguf.h"   /* idletoken_gguf_identity — model identity check */
+#include "idletoken_enginever.h"   /* engine version for HELLO (WS-C3) */
 #include "idletoken_ds4x.h"   /* generic GQA/MLA CPU backend (small models) */
 #ifdef IDLETOKEN_DS4X_CUDA
   #include "idletoken_ds4x_cuda.h"   /* ds4x_cuda_set_budget */
@@ -53,11 +57,15 @@ void ds4_gpu_set_moe_cache(uint64_t bytes, uint32_t n_layers);
   #define getrandom(b, n, f) idletoken_getrandom((b), (n))
 #else
   #include <dirent.h>
+  #include <poll.h>
   #include <sys/random.h>
+  #include <sys/wait.h>
   #include <unistd.h>
 #endif
-#ifdef __linux__
+#ifndef _WIN32
   #include <signal.h>
+#endif
+#ifdef __linux__
   #include <sys/prctl.h>
 #endif
 #ifdef __APPLE__
@@ -72,6 +80,47 @@ void ds4_gpu_set_moe_cache(uint64_t bytes, uint32_t n_layers);
  * come from here — never from DS4_* compile-time constants. Set right after
  * the plan is parsed, before any buffer sizing. */
 static const idletoken_model_spec *g_model;
+
+/* Session key from the pairing preamble (docs/inter-node-encryption.md N0).
+ * File scope because it is derived in main() at connect time and consumed far
+ * away, where the INFER messages are handled. Zero + has=0 means this cluster
+ * was formed with a plain --coordinator and has no shared secret at all, which
+ * N2 turns into a refusal to serve platform traffic rather than a silent
+ * cleartext fallback. Nothing encrypts yet: N0 only stops throwing it away. */
+static uint8_t g_session_key[IDLETOKEN_SESSION_KEY_BYTES];
+static int     g_has_session_key;
+
+/* Token-encryption key for the node links (proto v7). Derived from the pairing
+ * psk plus the cluster salt in ASSIGN_PLAN, so every node arrives at the same
+ * value independently. Zero + ok=0 means this cluster has no shared secret and
+ * therefore cannot encrypt. */
+static uint8_t g_cluster_key[IDLETOKEN_SESSION_KEY_BYTES];
+static int     g_cluster_key_ok;
+
+/* Token-field crypto on the link to the coordinator (proto v7). Bound once the
+ * cluster key and this worker's stage_id are both known -- the stage id goes
+ * into every nonce, so it cannot be set before ASSIGN_PLAN arrives. */
+static idletoken_nodecrypt g_nc_coord;
+/* The stage links. `prev` is who sends us HC_FORWARD, `next` is who we send it
+ * to; both are bound when ASSIGN_PLAN names the neighbours. Separate states
+ * because each link carries its own counters. */
+static idletoken_nodecrypt g_nc_prev;
+static idletoken_nodecrypt g_nc_next;
+
+/* Short, non-reversible fingerprint for logs — never the key itself. Must agree
+ * byte for byte with the coordinator's session_key_fp(): the N0 gate compares
+ * the two ends' log lines, and that comparison is the only evidence that both
+ * sides kept the SAME key. */
+static void session_key_fp(const uint8_t *key, char out[9]) {
+    uint8_t d[32];
+    idletoken_sha256_ctx c;
+    idletoken_sha256_init(&c);
+    idletoken_sha256_update(&c, key, IDLETOKEN_SESSION_KEY_BYTES);
+    idletoken_sha256_final(&c, d);
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < 4; i++) { out[i * 2] = hex[d[i] >> 4]; out[i * 2 + 1] = hex[d[i] & 15]; }
+    out[8] = '\0';
+}
 
 static void fill_uuid(uint8_t uuid[16]) {
 #if defined(__APPLE__)
@@ -222,6 +271,21 @@ static void usage(FILE *out) {
 "  --kv-clear          wipe the on-disk KV warm cache and exit\n"
 "  --kv-dir DIR        KV cache directory (default: platform cache dir)\n"
 "  -h, --help          show this help\n"
+"\n"
+"llama.cpp rpc-supervisor mode (v2 WS-C1; pairs, then supervises a local\n"
+"ggml-rpc-server the coordinator's llama-server computes through):\n"
+"  --rpc-supervisor    join as an rpc worker instead of the legacy INFER loop.\n"
+"                      Requires pairing (--pair-code / account mode): the\n"
+"                      cluster TLS PSK arrives through the pairing channel.\n"
+"  --engine-dir DIR    llama.cpp build bin dir holding ggml-rpc-server and\n"
+"                      llama-server (env IDLETOKEN_ENGINE_DIR)\n"
+"  --rpc-host H        LAN ip to bind the rpc-server to (default: this\n"
+"                      machine's primary LAN ipv4; NEVER 0.0.0.0; overlay\n"
+"                      addresses (100.64/10) are refused — tensor traffic\n"
+"                      must stay on the real LAN)  (env IDLETOKEN_RPC_HOST)\n"
+"  --rpc-port N        rpc-server port (default 50052; env IDLETOKEN_RPC_PORT)\n"
+"  --rpc-device D      ggml device for the rpc-server (-d), default CUDA0 on\n"
+"                      Windows/Linux, MTL0 on macOS (env IDLETOKEN_RPC_DEVICE)\n"
 "\n"
 "v0.1 only runs PP (segment_id always 0). v0.2 will add SP=2.\n");
 }
@@ -467,6 +531,784 @@ static int seq_resolve(uint8_t seq_id,
     return 0;   /* MOCK: no sequence state needed */
 }
 
+/* ============================================================================
+ * llama.cpp rpc-supervisor mode (v2 WS-C1/C2/C3).
+ *
+ * The worker's new job on the llama.cpp line: pair with the coordinator,
+ * prove its engine version, receive the cluster's ggml-RPC TLS PSK through
+ * the pairing channel, then spawn and supervise a local `ggml-rpc-server`
+ * bound to this machine's REAL LAN interface. The legacy INFER_* loop is not
+ * used in this mode. POSIX uses fork/exec; Windows uses CreateProcess and a
+ * kill-on-close Job so a dead supervisor cannot leave an open compute port.
+ * ========================================================================== */
+
+/* Same file the coordinator persists its PSK to; on a worker it holds the
+ * credential received via pairing. Re-read at every (re)spawn so an operator
+ * can rotate/repair it without restarting the worker. */
+static void worker_rpc_psk_path(char *out, size_t cap) {
+    const char *env = getenv("IDLETOKEN_RPC_PSK_FILE");
+    if (env && env[0]) { snprintf(out, cap, "%s", env); return; }
+#ifdef _WIN32
+    const char *base = getenv("LOCALAPPDATA");
+    snprintf(out, cap, "%s\\IdleToken\\rpc_psk", base && base[0] ? base : ".");
+#else
+    const char *home = getenv("HOME");
+    snprintf(out, cap, "%s/.idletoken/rpc_psk", home && home[0] ? home : ".");
+#endif
+}
+
+/* The rpc-server child's pid, mirrored for signal-time cleanup: a SIGTERM'd
+ * worker must not orphan its child. Linux children carry pdeathsig, but macOS
+ * has no equivalent — killing the worker there left ggml-rpc-server holding
+ * the port (measured during the WS-C rehearsal). */
+#ifdef _WIN32
+static HANDLE g_rpc_child_handle;
+static HANDLE g_rpc_job;
+#else
+static volatile long long g_rpc_child_pid = 0;
+static void rpc_supervisor_on_signal(int sig) {
+    long long p = g_rpc_child_pid;
+    if (p > 0) kill((pid_t)p, SIGTERM);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+#endif
+
+/* TCP-connect probe: the rpc-server is "up" once it accepts. TLS handshakes
+ * happen after accept, so this cannot validate the credential — it is a
+ * liveness probe, not an auth probe. */
+static int rpc_endpoint_up(const char *endpoint) {
+    int fd = idletoken_connect_tcp(endpoint);
+    if (fd < 0) return 0;
+    close(fd);
+    return 1;
+}
+
+static int rpc_coord_readable(int fd, int timeout_ms) {
+#ifdef _WIN32
+    fd_set rd;
+    struct timeval tv = { timeout_ms / 1000, (timeout_ms % 1000) * 1000 };
+    FD_ZERO(&rd);
+    FD_SET((SOCKET)fd, &rd);
+    return select(0, &rd, NULL, NULL, &tv) > 0;
+#else
+    struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+    int pr = poll(&pfd, 1, timeout_ms);
+    return pr > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR));
+#endif
+}
+
+/* Spawn ggml-rpc-server. GGML_RPC_PSK comes from the persisted credential
+ * file, re-read here on purpose (see worker_rpc_psk_path). Returns 0 and sets
+ * *pid_out, or -1. */
+static int rpc_spawn(const char *rpc_bin, const char *host, int port,
+                     const char *device, const char *log_path,
+                     long long *pid_out) {
+    char psk_path[512], psk[80] = "";
+    worker_rpc_psk_path(psk_path, sizeof(psk_path));
+    FILE *f = fopen(psk_path, "r");
+    if (f) {
+        size_t n = fread(psk, 1, sizeof(psk) - 1, f);
+        fclose(f);
+        psk[n] = '\0';
+        char *e = psk + strlen(psk);
+        while (e > psk && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ')) *--e = '\0';
+    }
+    {
+        const char *plain = getenv("GGML_RPC_ALLOW_PLAINTEXT");
+        if (plain && !strcmp(plain, "1")) {
+            /* The engine-side patch prints its own banner, but that lands in
+             * the rpc-server's log — repeat it HERE so nobody reading only the
+             * worker log mistakes this node for a TLS one. */
+            fprintf(stderr,
+                    "idletoken-worker: ==========================================================\n"
+                    "idletoken-worker: == GGML_RPC_ALLOW_PLAINTEXT=1 is set: the rpc-server may ==\n"
+                    "idletoken-worker: == serve tensor traffic WITHOUT TLS. Testing only —      ==\n"
+                    "idletoken-worker: == never run a real cluster this way.                    ==\n"
+                    "idletoken-worker: ==========================================================\n");
+        }
+    }
+    if (idletoken_hex64_valid(psk)) {
+        setenv("GGML_RPC_PSK", psk, 1);
+    } else {
+        /* Fail closed in the child: the TLS-patched rpc-server refuses to
+         * serve without a PSK (unless GGML_RPC_ALLOW_PLAINTEXT=1, which is
+         * its own loud decision). Do not invent a key here. */
+        fprintf(stderr, "idletoken-worker: %s does not hold a valid 64-hex PSK — "
+                        "the rpc-server will refuse to start (fail-closed)\n",
+                psk_path);
+        unsetenv("GGML_RPC_PSK");
+    }
+    memset(psk, 0, sizeof(psk));
+
+    char portstr[16];
+    snprintf(portstr, sizeof(portstr), "%d", port);
+#ifdef _WIN32
+    char cmd[3072];
+    int cn = snprintf(cmd, sizeof(cmd), "\"%s\" -H %s -p %s -d %s",
+                      rpc_bin, host, portstr, device);
+    if (cn < 0 || (size_t)cn >= sizeof(cmd)) {
+        fprintf(stderr, "idletoken-worker: rpc-server command line is too long\n");
+        return -1;
+    }
+    SECURITY_ATTRIBUTES sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE log = CreateFileA(log_path, FILE_APPEND_DATA,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                             OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (log == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "idletoken-worker: cannot open rpc log %s (winerr %lu)\n",
+                log_path, (unsigned long)GetLastError());
+        return -1;
+    }
+    SetFilePointer(log, 0, NULL, FILE_END);
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si));
+    memset(&pi, 0, sizeof(pi));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = log;
+    si.hStdError = log;
+    BOOL ok = CreateProcessA(rpc_bin, cmd, NULL, NULL, TRUE,
+                             CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    DWORD werr = ok ? 0 : GetLastError();
+    CloseHandle(log);
+    if (!ok) {
+        fprintf(stderr, "idletoken-worker: CreateProcess %s failed (winerr %lu)\n",
+                rpc_bin, (unsigned long)werr);
+        return -1;
+    }
+    CloseHandle(pi.hThread);
+    if (!g_rpc_job) {
+        g_rpc_job = CreateJobObjectA(NULL, NULL);
+        if (g_rpc_job) {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION ji;
+            memset(&ji, 0, sizeof(ji));
+            ji.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if (!SetInformationJobObject(g_rpc_job,
+                                         JobObjectExtendedLimitInformation,
+                                         &ji, sizeof(ji))) {
+                CloseHandle(g_rpc_job);
+                g_rpc_job = NULL;
+            }
+        }
+    }
+    if (g_rpc_job && !AssignProcessToJobObject(g_rpc_job, pi.hProcess))
+        fprintf(stderr, "idletoken-worker: warning: could not attach rpc-server "
+                        "to kill-on-close job (winerr %lu)\n",
+                (unsigned long)GetLastError());
+    g_rpc_child_handle = pi.hProcess;
+    *pid_out = (long long)pi.dwProcessId;
+    return 0;
+#else
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "idletoken-worker: fork: %s\n", strerror(errno));
+        return -1;
+    }
+    if (pid == 0) {
+#ifdef __linux__
+        prctl(PR_SET_PDEATHSIG, SIGKILL);
+#endif
+        int lg = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+        if (lg >= 0) {
+            dup2(lg, 1);
+            dup2(lg, 2);
+            if (lg > 2) close(lg);
+        }
+        char *cargv[10];
+        int ca = 0;
+        cargv[ca++] = (char *)rpc_bin;
+        cargv[ca++] = "-H"; cargv[ca++] = (char *)host;
+        cargv[ca++] = "-p"; cargv[ca++] = portstr;
+        cargv[ca++] = "-d"; cargv[ca++] = (char *)device;
+        cargv[ca] = NULL;
+        execv(rpc_bin, cargv);
+        dprintf(2, "idletoken-worker: execv %s: %s\n", rpc_bin, strerror(errno));
+        _exit(127);
+    }
+    *pid_out = (long long)pid;
+    g_rpc_child_pid = (long long)pid;
+    return 0;
+#endif
+}
+
+static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
+                              int rpc_port, const char *rpc_device,
+                              const char *coord_addr, const char *pair_code,
+                              const char *pair_acct, const char *acct_token,
+                              const char *rendezvous, int disc_port,
+                              uint64_t max_vram_bytes, uint64_t max_ram_bytes,
+                              const char *gguf_dir) {
+    if (!engine_dir || !engine_dir[0]) {
+        fprintf(stderr, "idletoken-worker: --rpc-supervisor needs --engine-dir "
+                        "(or IDLETOKEN_ENGINE_DIR) pointing at the llama.cpp "
+                        "build bin directory\n");
+        return 2;
+    }
+    char rpc_bin[1024], llsrv_bin[1024];
+#ifdef _WIN32
+    snprintf(rpc_bin, sizeof(rpc_bin), "%s/ggml-rpc-server.exe", engine_dir);
+    snprintf(llsrv_bin, sizeof(llsrv_bin), "%s/llama-server.exe", engine_dir);
+#else
+    snprintf(rpc_bin, sizeof(rpc_bin), "%s/ggml-rpc-server", engine_dir);
+    snprintf(llsrv_bin, sizeof(llsrv_bin), "%s/llama-server", engine_dir);
+#endif
+    struct stat st;
+    if (stat(rpc_bin, &st) != 0 || !S_ISREG(st.st_mode)) {
+        fprintf(stderr, "idletoken-worker: no ggml-rpc-server in %s — build the "
+                        "engine first (scripts/build_llamacpp.sh)\n", engine_dir);
+        return 2;
+    }
+
+#ifndef _WIN32
+    signal(SIGTERM, rpc_supervisor_on_signal);
+    signal(SIGINT,  rpc_supervisor_on_signal);
+    /* SIGHUP too: an ssh-held worker (the cluster matrix lane, remote admin
+     * by hand) dies by session close, and the default disposition would skip
+     * the handler and orphan the rpc-server. */
+    signal(SIGHUP,  rpc_supervisor_on_signal);
+#endif
+
+    /* WS-C3: the version this node will claim in HELLO. Unprovable = refuse
+     * (the coordinator would refuse us anyway; better to say why here). */
+    char engine_ver[IDLETOKEN_ENGINE_VERSION_MAX] = "";
+    if (idletoken_engine_version(llsrv_bin, engine_ver, sizeof(engine_ver)) != 0) {
+        fprintf(stderr, "idletoken-worker: cannot determine the engine version "
+                        "(`%s --version` failed) — the cluster requires every "
+                        "node to prove its llama.cpp build\n", llsrv_bin);
+        return 2;
+    }
+
+    /* WS-C1: bind the rpc-server to a REAL LAN address. Never the wildcard
+     * (tensor traffic must not be reachable from arbitrary interfaces), never
+     * an overlay (hard invariant #3 — Tailscale's MTU + reordering deadlocks
+     * the transfer; measured). Loopback stays allowed: it is the two-process
+     * rehearsal configuration. */
+    char rpc_host[64] = "";
+    if (rpc_host_arg && rpc_host_arg[0]) {
+        snprintf(rpc_host, sizeof(rpc_host), "%s", rpc_host_arg);
+    } else if (idletoken_local_ipv4(rpc_host, sizeof(rpc_host)) != 0) {
+        fprintf(stderr, "idletoken-worker: could not determine this machine's "
+                        "LAN ipv4 — pass --rpc-host explicitly\n");
+        return 2;
+    }
+    if (!strcmp(rpc_host, "0.0.0.0") || rpc_host[0] == '\0') {
+        fprintf(stderr, "idletoken-worker: refusing to bind the rpc-server to "
+                        "0.0.0.0 — it must listen on ONE chosen LAN interface\n");
+        return 2;
+    }
+    if (idletoken_ip_is_overlay(rpc_host)) {
+        fprintf(stderr, "idletoken-worker: %s is an overlay address "
+                        "(Tailscale/CGNAT — 100.64.0.0/10 or "
+                        "fd7a:115c:a1e0::/48). Tensor traffic "
+                        "must use the real LAN (invariant: compute traffic "
+                        "never crosses an overlay — MTU 1280 + packet reorder "
+                        "deadlocks it). Pass --rpc-host with this machine's "
+                        "real LAN ip (192.168.x.x or similar).\n", rpc_host);
+        return 2;
+    }
+    char endpoint[80];
+    snprintf(endpoint, sizeof(endpoint), "%s:%d", rpc_host, rpc_port);
+
+#ifdef _WIN32
+    /* Self-provision the inbound rules this mode needs, same as the legacy
+     * worker path. Without the TCP rule the rpc-server binds and reports
+     * ready, the coordinator's connect times out, and the failure reads as a
+     * coordinator-side problem (measured on win_PC2, 2026-08-15) — the one
+     * machine that can fix it is this one. */
+    {
+        char rule[64];
+        snprintf(rule, sizeof rule, "IdleToken ggml-rpc-server TCP %d", rpc_port);
+        idletoken_win_ensure_firewall_rule(rule, "TCP", rpc_port);
+        snprintf(rule, sizeof rule, "IdleToken discovery UDP %d", disc_port);
+        idletoken_win_ensure_firewall_rule(rule, "UDP", disc_port);
+    }
+#endif
+
+    /* Resource probe: same numbers as the legacy path, so the coordinator's
+     * planner sees the same machine either way. */
+    idletoken_resource_report rr;
+    if (idletoken_resource_probe(&rr, gguf_dir) != 0)
+        fprintf(stderr, "idletoken-worker: probe encountered errors; continuing "
+                        "with a partial report\n");
+    idletoken_resource_apply_caps(&rr, max_vram_bytes, max_ram_bytes);
+    {
+        char why[256] = "";
+        idletoken_hw_status hw = idletoken_hw_check(&rr, why, sizeof(why));
+        if (hw == IDLETOKEN_HW_MACOS_SEALED) {
+            /* The seal is a ds4-era gate (no Metal kernels, no oracle for the
+             * in-house engine). This mode computes through llama.cpp's own
+             * Metal backend, which the 2026-08-14 pivot un-sealed; the formal
+             * G-MACSEAL retirement is WS-F1. Loud, not silent. */
+            fprintf(stderr, "idletoken-worker: NOTE: macOS ds4 compute seal "
+                            "does not apply to the llama.cpp rpc line (v2 plan "
+                            "2026-08-14); proceeding on %s\n", rr.gpu_name);
+        } else if (hw != IDLETOKEN_HW_OK) {
+            fprintf(stderr, "idletoken-worker: " IDLETOKEN_JOIN_REFUSED_MARK "%s\n", why);
+            return IDLETOKEN_EXIT_JOIN_REFUSED;
+        }
+    }
+
+    /* Pairing is MANDATORY: the TLS PSK travels wrapped under the pairing
+     * session key. A plain --coordinator join has no shared secret, so there
+     * would be nothing to wrap with — refuse rather than send it bare. */
+    idletoken_pair_id pair_id;
+    if (pair_acct) {
+        if (!acct_token || !rendezvous) {
+            fprintf(stderr, "idletoken-worker: --pair-account needs "
+                            "--account-token and --rendezvous\n");
+            return 1;
+        }
+        if (idletoken_pair_id_from_account(&pair_id, pair_acct, acct_token,
+                                           rendezvous) != 0) {
+            fprintf(stderr, "idletoken-worker: bad account pairing spec\n");
+            return 1;
+        }
+    } else if (pair_code) {
+        if (!idletoken_pair_code_valid(pair_code)) {
+            fprintf(stderr, "idletoken-worker: invalid join code '%s'\n", pair_code);
+            return 1;
+        }
+        if (idletoken_pair_id_from_code(&pair_id, pair_code) != 0) {
+            fprintf(stderr, "idletoken-worker: bad join code\n");
+            return 1;
+        }
+    } else {
+        fprintf(stderr, "idletoken-worker: --rpc-supervisor requires pairing "
+                        "(--pair-code or account mode): the cluster TLS "
+                        "credential is delivered through the authenticated "
+                        "pairing channel and must never cross the LAN in the "
+                        "clear. --coordinator alone is not enough here.\n");
+        return 2;
+    }
+
+    /* Find the coordinator (LAN discovery; --coordinator is the instant
+     * manual fallback), then authenticate. */
+    char resolved[80] = "";
+    {
+        idletoken_discovery *disc =
+            idletoken_discovery_multi((uint16_t)disc_port, coord_addr);
+        if (!disc) { fprintf(stderr, "idletoken-worker: discovery init failed\n"); return 1; }
+        fprintf(stderr, "idletoken-worker: discovering coordinator for %s pairing "
+                        "(udp/%d, up to 60s)...\n",
+                pair_id.mode == IDLETOKEN_PAIR_MODE_ACCOUNT ? "account" : "code",
+                disc_port);
+        int rc = disc->resolve(disc, &pair_id, resolved, sizeof(resolved), 60000);
+        disc->destroy(disc);
+        if (rc != 0) {
+            fprintf(stderr, "idletoken-worker: no coordinator found for that "
+                            "code/account on this LAN\n");
+            return 1;
+        }
+    }
+    fprintf(stderr, "idletoken-worker: dialing coord at %s\n", resolved);
+    int fd = idletoken_connect_tcp(resolved);
+    if (fd < 0) {
+        fprintf(stderr, "idletoken-worker: connect: %s\n", strerror(errno));
+        return 1;
+    }
+    if (idletoken_pair_client_auth(fd, &pair_id, g_session_key) != 0) {
+        fprintf(stderr, "idletoken-worker: pairing auth failed (%s) — wrong code?\n",
+                strerror(errno));
+        memset(g_session_key, 0, sizeof(g_session_key));
+        close(fd);
+        return 1;
+    }
+    g_has_session_key = 1;
+    {
+        char fp[9];
+        session_key_fp(g_session_key, fp);
+        fprintf(stderr, "idletoken-worker: pairing auth OK (mutual, session=%s)\n", fp);
+    }
+
+    /* --- HELLO (rpc flavor: bind_addr = the rpc endpoint; engine version
+     * appended as the optional trailing field the coordinator checks) ------ */
+    uint8_t uuid[16];
+    fill_uuid(uuid);
+    uint8_t hello_payload[1024];
+    idletoken_buf b;
+    idletoken_buf_init(&b, hello_payload, sizeof(hello_payload));
+    idletoken_buf_put_bytes(&b, uuid, 16);
+    idletoken_buf_put_str(&b, rr.hostname);
+    idletoken_buf_put_str(&b, IDLETOKEN_WORKER_VERSION " (rpc-supervisor)");
+    idletoken_buf_put_str(&b, endpoint);
+    idletoken_buf_put_u8(&b, (uint8_t)IDLETOKEN_OS_FAMILY_SELF);
+    uint8_t pad3[3] = {0};
+    idletoken_buf_put_bytes(&b, pad3, 3);
+    idletoken_buf_put_str(&b, engine_ver);
+    if (b.err) {
+        fprintf(stderr, "idletoken-worker: HELLO payload pack overflow\n");
+        close(fd);
+        return 1;
+    }
+    idletoken_msg_header hello = {
+        .magic         = IDLETOKEN_PROTO_MAGIC,
+        .version       = IDLETOKEN_PROTO_VERSION,
+        .msg_type      = IDLETOKEN_MSG_HELLO,
+        .payload_bytes = b.pos,
+        .request_id    = (uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32),
+        .stage_id      = 0,
+        .segment_id    = IDLETOKEN_SEGMENT_NONE,
+    };
+    if (idletoken_send_msg(fd, &hello, hello_payload, b.pos) != 0) {
+        fprintf(stderr, "idletoken-worker: send HELLO: %s\n", strerror(errno));
+        close(fd);
+        return 1;
+    }
+    fprintf(stderr, "idletoken-worker: sent HELLO (engine=%s, rpc endpoint=%s)\n",
+            engine_ver, endpoint);
+
+    /* --- HELLO_ACK (a refusal carries the reason; surface it verbatim) ---- */
+    {
+        uint8_t ack_payload[1024];
+        idletoken_msg_header ack;
+        if (idletoken_recv_msg(fd, &ack, ack_payload, sizeof(ack_payload)) != 0) {
+            fprintf(stderr, "idletoken-worker: recv HELLO_ACK: %s\n", strerror(errno));
+            close(fd);
+            return 1;
+        }
+        if (ack.msg_type != IDLETOKEN_MSG_HELLO_ACK) {
+            fprintf(stderr, "idletoken-worker: expected HELLO_ACK, got 0x%04x\n",
+                    (unsigned)ack.msg_type);
+            close(fd);
+            return 1;
+        }
+        if (ack.payload_bytes > 0) {
+            idletoken_buf ab;
+            idletoken_buf_init(&ab, ack_payload, ack.payload_bytes);
+            uint8_t accepted = 1, reasoncode = 0, ack_pad[2];
+            idletoken_buf_get_u8(&ab, &accepted);
+            idletoken_buf_get_u8(&ab, &reasoncode);
+            idletoken_buf_get_bytes(&ab, ack_pad, 2);
+            if (!ab.err && !accepted) {
+                uint16_t cver = 0, rsvd = 0;
+                uint32_t hb = 0;
+                char coord_ver[128] = "", reject[256] = "";
+                idletoken_buf_get_u16(&ab, &cver);
+                idletoken_buf_get_u16(&ab, &rsvd);
+                idletoken_buf_get_u32(&ab, &hb);
+                idletoken_buf_get_str(&ab, coord_ver, sizeof(coord_ver));
+                idletoken_buf_get_str(&ab, reject, sizeof(reject));
+                fprintf(stderr, "idletoken-worker: " IDLETOKEN_JOIN_REFUSED_MARK
+                                "the coordinator refused this node%s%s\n",
+                        reject[0] ? ": " : " (no reason given)", reject);
+                close(fd);
+                return IDLETOKEN_EXIT_JOIN_REFUSED;
+            }
+        }
+    }
+    fprintf(stderr, "idletoken-worker: got HELLO_ACK\n");
+
+    /* --- RESOURCE_REPORT (same layout as the legacy path) ----------------- */
+    {
+        uint8_t rep[512];
+        idletoken_buf rb;
+        idletoken_buf_init(&rb, rep, sizeof(rep));
+        idletoken_buf_put_str(&rb, rr.gpu_name);
+        idletoken_buf_put_u8 (&rb, rr.cc_major);
+        idletoken_buf_put_u8 (&rb, rr.cc_minor);
+        idletoken_buf_put_u8 (&rb, rr.unified_memory ? 1 : 0);
+        idletoken_buf_put_u8 (&rb, 0);
+        idletoken_buf_put_u64(&rb, rr.vram_total);
+        idletoken_buf_put_u64(&rb, rr.vram_used_other);
+        idletoken_buf_put_u64(&rb, rr.vram_usable);
+        idletoken_buf_put_u64(&rb, rr.ram_total);
+        idletoken_buf_put_u64(&rb, rr.ram_used_other);
+        idletoken_buf_put_u64(&rb, rr.ram_usable);
+        idletoken_buf_put_u32(&rb, rr.cpu_count);
+        idletoken_buf_put_u32(&rb, (uint32_t)(rr.ram_pinnable >> 20));
+        idletoken_buf_put_u64(&rb, rr.disk_avail);
+        idletoken_buf_put_u32(&rb, 0);
+        idletoken_buf_put_u32(&rb, 0);
+        idletoken_buf_put_u8 (&rb, 0);
+        uint8_t pad7[7] = {0};
+        if (idletoken_buf_put_bytes(&rb, pad7, 7) != 0 || rb.err) {
+            fprintf(stderr, "idletoken-worker: RESOURCE_REPORT pack overflow\n");
+            close(fd);
+            return 1;
+        }
+        idletoken_msg_header rep_hdr = {
+            .magic         = IDLETOKEN_PROTO_MAGIC,
+            .version       = IDLETOKEN_PROTO_VERSION,
+            .msg_type      = IDLETOKEN_MSG_RESOURCE_REPORT,
+            .payload_bytes = rb.pos,
+            .request_id    = hello.request_id,
+            .stage_id      = 0,
+            .segment_id    = IDLETOKEN_SEGMENT_NONE,
+        };
+        if (idletoken_send_msg(fd, &rep_hdr, rep, rb.pos) != 0) {
+            fprintf(stderr, "idletoken-worker: send RESOURCE_REPORT: %s\n",
+                    strerror(errno));
+            close(fd);
+            return 1;
+        }
+    }
+
+    /* --- RPC_ASSIGN: the wrapped cluster TLS PSK (WS-C2) ------------------ */
+    {
+        uint8_t ap[512];
+        idletoken_msg_header ah;
+        if (idletoken_recv_msg(fd, &ah, ap, sizeof(ap)) != 0) {
+            fprintf(stderr, "idletoken-worker: recv RPC_ASSIGN: %s\n", strerror(errno));
+            close(fd);
+            return 1;
+        }
+        if (ah.msg_type != IDLETOKEN_MSG_RPC_ASSIGN) {
+            fprintf(stderr, "idletoken-worker: expected RPC_ASSIGN, got 0x%04x — "
+                            "is the coordinator running in llamacpp cluster "
+                            "mode (--num-workers with --llama-server-bin)?\n",
+                    (unsigned)ah.msg_type);
+            close(fd);
+            return 1;
+        }
+        idletoken_buf abuf;
+        idletoken_buf_init(&abuf, ap, ah.payload_bytes);
+        uint8_t pver = 0, z3[3];
+        uint8_t nonce[IDLETOKEN_PAIR_NONCE_BYTES];
+        uint8_t ct[IDLETOKEN_SESSION_KEY_BYTES];
+        uint8_t tag[IDLETOKEN_PAIR_TAG_BYTES];
+        idletoken_buf_get_u8(&abuf, &pver);
+        idletoken_buf_get_bytes(&abuf, z3, 3);
+        idletoken_buf_get_bytes(&abuf, nonce, sizeof(nonce));
+        idletoken_buf_get_bytes(&abuf, ct, sizeof(ct));
+        idletoken_buf_get_bytes(&abuf, tag, sizeof(tag));
+        if (abuf.err || pver != 1) {
+            fprintf(stderr, "idletoken-worker: RPC_ASSIGN payload malformed\n");
+            close(fd);
+            return 1;
+        }
+        uint8_t psk_raw[IDLETOKEN_SESSION_KEY_BYTES];
+        if (idletoken_pair_unwrap_secret(g_session_key, nonce, ct, tag,
+                                         psk_raw) != 0) {
+            fprintf(stderr, "idletoken-worker: could not unwrap the cluster TLS "
+                            "PSK (tag mismatch) — refusing to continue\n");
+            close(fd);
+            return 1;
+        }
+        /* Persist (0600) — the spawn path reads it back from disk. */
+        char psk_path[512];
+        worker_rpc_psk_path(psk_path, sizeof(psk_path));
+        {
+            char dir[512];
+            snprintf(dir, sizeof(dir), "%s", psk_path);
+            char *slash = strrchr(dir, '/');
+#ifdef _WIN32
+            { char *bs = strrchr(dir, '\\'); if (!slash || (bs && bs > slash)) slash = bs; }
+            if (slash) { *slash = '\0'; CreateDirectoryA(dir, NULL); }
+#else
+            if (slash) { *slash = '\0'; mkdir(dir, 0700); }
+#endif
+        }
+        FILE *pf = fopen(psk_path, "w");
+        if (!pf) {
+            fprintf(stderr, "idletoken-worker: cannot persist the TLS credential "
+                            "to %s: %s\n", psk_path, strerror(errno));
+            idletoken_secure_zero(psk_raw, sizeof(psk_raw));
+            close(fd);
+            return 1;
+        }
+        static const char hx[] = "0123456789abcdef";
+        for (int i = 0; i < (int)sizeof(psk_raw); i++)
+            fprintf(pf, "%c%c", hx[psk_raw[i] >> 4], hx[psk_raw[i] & 15]);
+        fprintf(pf, "\n");
+        fclose(pf);
+#ifndef _WIN32
+        chmod(psk_path, 0600);
+#endif
+        char fp[9];
+        session_key_fp(psk_raw, fp);
+        idletoken_secure_zero(psk_raw, sizeof(psk_raw));
+        fprintf(stderr, "idletoken-worker: cluster TLS PSK received via pairing "
+                        "(psk=%s) and persisted to %s\n", fp, psk_path);
+    }
+
+    /* --- spawn + supervise ggml-rpc-server --------------------------------
+     * Same state machine as the coordinator's llama-server sidecar
+     * (src/coord/llama_sidecar.c): backoff 2/4/8/16/30s, 5 consecutive quick
+     * crashes latch FAILED. Readiness = the endpoint accepts TCP (rpc-server
+     * has no /health; it serves the ggml-RPC protocol directly). */
+    char log_path[512];
+    {
+        const char *log_env = getenv("IDLETOKEN_RPC_LOG");
+        if (log_env && log_env[0])
+            snprintf(log_path, sizeof(log_path), "%s", log_env);
+        else
+            snprintf(log_path, sizeof(log_path), "idletoken-rpc-server-%d.log",
+                     rpc_port);
+    }
+
+    long long pid = 0;
+    if (rpc_spawn(rpc_bin, rpc_host, rpc_port, rpc_device, log_path, &pid) != 0) {
+        close(fd);
+        return 1;
+    }
+    fprintf(stderr, "idletoken-worker: spawned ggml-rpc-server (pid %lld) on %s "
+                    "(-d %s), log: %s\n", pid, endpoint, rpc_device, log_path);
+
+    int ever_ready = 0, starting = 1, quick_restarts = 0;
+    long long restart_due_ms = 0, became_ready_ms = 0;
+    /* The coordinator sends a HEARTBEAT every 15 s. Silence is meaningful:
+     * a coordinator that crashed, hung, or lost the network keeps its socket
+     * open in the kernel, so EOF alone cannot tell "gone" from "idle". Four
+     * missed beats = gone. (Coordinator and worker ship in the same installer;
+     * a pre-heartbeat coordinator was never released, so the timeout cannot
+     * misfire against a real peer.) */
+    const long long coord_silence_limit_ms = 60000;
+    long long last_coord_ms = (long long)(now_monotonic_s() * 1000.0);
+    for (;;) {
+        /* Watch the coordinator link: EOF/error = cluster is over, stop the
+         * rpc-server with us (a dangling rpc-server is an open compute port
+         * with nobody accountable for it). */
+        if (rpc_coord_readable(fd, 300)) {
+            uint8_t mp[512];
+            idletoken_msg_header mh;
+            if (idletoken_recv_msg(fd, &mh, mp, sizeof(mp)) != 0) {
+                fprintf(stderr, "idletoken-worker: coordinator disconnected — "
+                                "stopping the rpc-server\n");
+                break;
+            }
+            /* HEARTBEAT and anything else: liveness, nothing else to do. */
+            last_coord_ms = (long long)(now_monotonic_s() * 1000.0);
+        }
+
+        long long now = (long long)(now_monotonic_s() * 1000.0);
+        if (now - last_coord_ms > coord_silence_limit_ms) {
+            fprintf(stderr, "idletoken-worker: no traffic from the coordinator "
+                            "for %llds (it heartbeats every 15s — that machine "
+                            "is gone, hung, or the network dropped) — stopping "
+                            "the rpc-server. Pair again once the coordinator "
+                            "is back.\n", coord_silence_limit_ms / 1000);
+            break;
+        }
+
+        if (pid > 0) {
+#ifdef _WIN32
+            DWORD code = STILL_ACTIVE;
+            int dead = g_rpc_child_handle &&
+                       WaitForSingleObject(g_rpc_child_handle, 0) == WAIT_OBJECT_0;
+            char how[48];
+            if (dead) {
+                GetExitCodeProcess(g_rpc_child_handle, &code);
+                snprintf(how, sizeof(how), "exit code %lu", (unsigned long)code);
+                CloseHandle(g_rpc_child_handle);
+                g_rpc_child_handle = NULL;
+            }
+#else
+            int stt = 0;
+            pid_t r = waitpid((pid_t)pid, &stt, WNOHANG);
+            int dead = r == (pid_t)pid;
+            char how[48];
+            if (dead) {
+                if (WIFSIGNALED(stt))
+                    snprintf(how, sizeof(how), "killed by signal %d", WTERMSIG(stt));
+                else
+                    snprintf(how, sizeof(how), "exit code %d", WEXITSTATUS(stt));
+            }
+#endif
+            if (dead) {
+                long long ready_uptime =
+                    (!starting && became_ready_ms > 0) ? now - became_ready_ms : 0;
+                pid = 0;
+#ifndef _WIN32
+                g_rpc_child_pid = 0;
+#endif
+                if (ready_uptime >= 60000) quick_restarts = 0;
+                if (quick_restarts >= 5) {
+                    fprintf(stderr, "idletoken-worker: ggml-rpc-server kept "
+                                    "crashing (%d quick restarts, last: %s) — "
+                                    "giving up; check %s\n",
+                            quick_restarts, how, log_path);
+                    close(fd);
+                    return 1;
+                }
+                quick_restarts++;
+                long long delay_s = 1LL << (quick_restarts < 5 ? quick_restarts : 5);
+                if (delay_s > 30) delay_s = 30;
+                restart_due_ms = now + delay_s * 1000;
+                starting = 0;   /* not probing while down */
+                fprintf(stderr, "idletoken-worker: ggml-rpc-server exited (%s); "
+                                "restarting in %llds (attempt %d/5)\n",
+                        how, delay_s, quick_restarts);
+            }
+        }
+
+        if (pid == 0 && restart_due_ms > 0 && now >= restart_due_ms) {
+            restart_due_ms = 0;
+            if (rpc_spawn(rpc_bin, rpc_host, rpc_port, rpc_device, log_path,
+                          &pid) == 0) {
+                starting = 1;
+                fprintf(stderr, "idletoken-worker: respawned ggml-rpc-server "
+                                "(pid %lld)\n", pid);
+            } else {
+                fprintf(stderr, "idletoken-worker: respawn failed — giving up\n");
+                close(fd);
+                return 1;
+            }
+        }
+
+        if (starting && pid > 0 && rpc_endpoint_up(endpoint)) {
+            starting = 0;
+            became_ready_ms = now;
+            fprintf(stderr, "idletoken-worker: ggml-rpc-server ready on %s\n",
+                    endpoint);
+            if (!ever_ready) {
+                ever_ready = 1;
+                uint8_t rp[128];
+                idletoken_buf rb2;
+                idletoken_buf_init(&rb2, rp, sizeof(rp));
+                idletoken_buf_put_str(&rb2, endpoint);
+                idletoken_msg_header rh = {
+                    .magic         = IDLETOKEN_PROTO_MAGIC,
+                    .version       = IDLETOKEN_PROTO_VERSION,
+                    .msg_type      = IDLETOKEN_MSG_RPC_READY,
+                    .payload_bytes = rb2.pos,
+                    .request_id    = hello.request_id,
+                    .stage_id      = 0,
+                    .segment_id    = IDLETOKEN_SEGMENT_NONE,
+                };
+                if (idletoken_send_msg(fd, &rh, rp, rb2.pos) != 0) {
+                    fprintf(stderr, "idletoken-worker: send RPC_READY: %s\n",
+                            strerror(errno));
+                    break;
+                }
+            }
+        }
+    }
+
+    if (pid > 0) {
+#ifdef _WIN32
+        if (g_rpc_child_handle) {
+            TerminateProcess(g_rpc_child_handle, 0);
+            if (WaitForSingleObject(g_rpc_child_handle, 2000) == WAIT_TIMEOUT)
+                TerminateProcess(g_rpc_child_handle, 1);
+            WaitForSingleObject(g_rpc_child_handle, INFINITE);
+            CloseHandle(g_rpc_child_handle);
+            g_rpc_child_handle = NULL;
+        }
+#else
+        kill((pid_t)pid, SIGTERM);
+        for (int i = 0; i < 20; i++) {
+            if (waitpid((pid_t)pid, NULL, WNOHANG) == (pid_t)pid) { pid = 0; break; }
+            usleep(100000);
+        }
+        if (pid > 0) {
+            kill((pid_t)pid, SIGKILL);
+            waitpid((pid_t)pid, NULL, 0);
+        }
+#endif
+    }
+#ifdef _WIN32
+    if (g_rpc_job) { CloseHandle(g_rpc_job); g_rpc_job = NULL; }
+#endif
+    close(fd);
+    return 0;
+}
+
 #ifdef __APPLE__
 /* Point the ds4 Metal backend at its shader sources.
  *
@@ -515,6 +1357,12 @@ static void mac_locate_metal_sources(void) {
 #endif /* __APPLE__ */
 
 int main(int argc, char **argv) {
+    /* Tail-able logs while alive: redirected stdio is fully buffered (the
+     * MinGW CRT buffers even stderr), which made a live process look dead to
+     * anything reading its log (2026-08-15, coordinator side). Same contract
+     * here — the rpc-supervisor's log is how joins are diagnosed. */
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
 #ifdef __APPLE__
     mac_locate_metal_sources();
 #endif
@@ -561,6 +1409,17 @@ int main(int argc, char **argv) {
      * their layers. Runs as an isolated idletoken-worker sidecar. */
     const char *serve_weights = NULL;   /* GGUF file to serve (its dir is the repo) */
     int weights_port = 8001;
+    /* llama.cpp rpc-supervisor mode (v2 WS-C1). Env fallbacks follow the
+     * existing pattern so the Tauri sidecar can avoid arg quoting. */
+    int         rpc_supervisor = 0;
+    const char *engine_dir     = getenv("IDLETOKEN_ENGINE_DIR");
+    const char *rpc_host       = getenv("IDLETOKEN_RPC_HOST");
+    const char *rpc_device     = getenv("IDLETOKEN_RPC_DEVICE");
+    int         rpc_port       = 50052;
+    {
+        const char *rp = getenv("IDLETOKEN_RPC_PORT");
+        if (rp && atoi(rp) > 0) rpc_port = atoi(rp);
+    }
     int probe_only = 0;
     int probe_json = 0;
     int advise = 0;       /* --advise: "what can this machine run?" table */
@@ -608,6 +1467,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--account-token")&& i + 1 < argc) acct_token = argv[++i];
         else if (!strcmp(a, "--rendezvous")  && i + 1 < argc) rendezvous  = argv[++i];
         else if (!strcmp(a, "--discovery-port") && i + 1 < argc) disc_port = atoi(argv[++i]);
+        else if (!strcmp(a, "--rpc-supervisor"))              rpc_supervisor = 1;
+        else if (!strcmp(a, "--engine-dir")  && i + 1 < argc) engine_dir  = argv[++i];
+        else if (!strcmp(a, "--rpc-host")    && i + 1 < argc) rpc_host    = argv[++i];
+        else if (!strcmp(a, "--rpc-port")    && i + 1 < argc) rpc_port    = atoi(argv[++i]);
+        else if (!strcmp(a, "--rpc-device")  && i + 1 < argc) rpc_device  = argv[++i];
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(stdout); return 0; }
         else { fprintf(stderr, "idletoken-worker: unknown argument: %s\n\n", a); usage(stderr); return 2; }
     }
@@ -620,6 +1484,29 @@ int main(int argc, char **argv) {
             kv_dir = defdir;
         }
         return idletoken_kv_clear(kv_dir);
+    }
+
+    /* llama.cpp rpc-supervisor mode (v2 WS-C1): pair, receive the TLS PSK,
+     * supervise a ggml-rpc-server. No legacy INFER loop, no model load here —
+     * the coordinator's llama-server pushes tensors over authenticated RPC. */
+    if (rpc_supervisor) {
+        if (rpc_port < 1 || rpc_port > 65535) {
+            fprintf(stderr, "idletoken-worker: --rpc-port must be 1..65535\n");
+            return 2;
+        }
+        if (!rpc_device || !rpc_device[0]) {
+#ifdef __APPLE__
+            rpc_device = "MTL0";   /* the BLAS device gets scheduled RMS_NORM
+                                    * and aborts — known quirk of this pin */
+#else
+            rpc_device = "CUDA0";
+#endif
+        }
+        return run_rpc_supervisor(engine_dir, rpc_host, rpc_port, rpc_device,
+                                  coord_addr, pair_code, pair_acct, acct_token,
+                                  rendezvous, disc_port,
+                                  max_vram_mb * 1024ull * 1024ull,
+                                  max_ram_mb  * 1024ull * 1024ull, gguf_dir);
     }
 
     /* Weight repo server mode: generate the .idx if missing, then serve the
@@ -904,13 +1791,18 @@ int main(int argc, char **argv) {
     /* Pairing auth preamble: prove both sides know the shared secret and derive
      * a session key, before the normal HELLO. Rejected => wrong code/account. */
     if (pairing) {
-        uint8_t session_key[IDLETOKEN_SESSION_KEY_BYTES];
-        if (idletoken_pair_client_auth(fd, &pair_id, session_key) != 0) {
+        /* N0: keep the derived key instead of dropping it with the stack frame. */
+        if (idletoken_pair_client_auth(fd, &pair_id, g_session_key) != 0) {
             fprintf(stderr, "idletoken-worker: pairing auth failed (%s) — wrong code?\n",
                     strerror(errno));
+            memset(g_session_key, 0, sizeof(g_session_key));
             close(fd); return 1;
         }
-        fprintf(stderr, "idletoken-worker: pairing auth OK (mutual)\n");
+        g_has_session_key = 1;
+        char fp[9]; session_key_fp(g_session_key, fp);
+        fprintf(stderr, "idletoken-worker: pairing auth OK (mutual, session=%s)\n", fp);
+    } else {
+        fprintf(stderr, "idletoken-worker: joined without pairing (session=none)\n");
     }
 
     /* --- HELLO ----------------------------------------------------------- */
@@ -1096,9 +1988,42 @@ int main(int argc, char **argv) {
     idletoken_buf_get_str  (&pb, prev_addr,       sizeof(prev_addr));
     idletoken_buf_get_str  (&pb, next_addr,       sizeof(next_addr));
     idletoken_buf_get_str  (&pb, coord_inbox,     sizeof(coord_inbox));
+    /* v7: cluster salt, last field. Combined with the pairing psk this worker
+     * already holds, it yields the same token-encryption key every other node
+     * derives — no distribution, and it covers the stage<->stage links that the
+     * pairwise session keys never reached (docs/inter-node-encryption.md §3). */
+    uint8_t cluster_salt[IDLETOKEN_CLUSTER_SALT_BYTES];
+    idletoken_buf_get_bytes(&pb, cluster_salt, sizeof(cluster_salt));
     if (pb.err) {
         fprintf(stderr, "idletoken-worker: ASSIGN_PLAN payload malformed\n");
         close(fd); return 1;
+    }
+    {
+        uint8_t zero[IDLETOKEN_CLUSTER_SALT_BYTES] = {0};
+        if (pairing && memcmp(cluster_salt, zero, sizeof(zero)) != 0) {
+            idletoken_nodecrypt_cluster_key(pair_id.psk, sizeof(pair_id.psk),
+                                            cluster_salt, sizeof(cluster_salt),
+                                            g_cluster_key);
+            g_cluster_key_ok = 1;
+            char fp[9]; session_key_fp(g_cluster_key, fp);
+            /* Bind the coordinator link now: stage_id is known (it came in this
+             * same ASSIGN_PLAN) and it goes into every nonce. */
+            idletoken_nodecrypt_init(&g_nc_coord, g_cluster_key, stage_id, IDLETOKEN_NC_ID_COORD);
+            if (stage_id > 0)
+                idletoken_nodecrypt_init(&g_nc_prev, g_cluster_key, stage_id, (uint8_t)(stage_id - 1));
+            /* Only a non-last stage has a downstream link; next_addr is empty
+             * on the last one, and binding a state it can never use would leave
+             * a live key sitting in a process that has no peer for it. */
+            if (next_addr[0])
+                idletoken_nodecrypt_init(&g_nc_next, g_cluster_key, stage_id, (uint8_t)(stage_id + 1));
+            fprintf(stderr, "idletoken-worker: cluster token key ready (cluster=%s, stage=%u)\n",
+                    fp, stage_id);
+        } else {
+            /* No pairing secret, or a coordinator that minted no salt: this
+             * cluster cannot encrypt its node links. Say so plainly rather than
+             * leaving the reader to infer it from silence. */
+            fprintf(stderr, "idletoken-worker: node links cannot be encrypted (cluster=none)\n");
+        }
     }
 
     fprintf(stderr,
@@ -1835,10 +2760,45 @@ int main(int argc, char **argv) {
                         n_tokens, chunk_cap);
                 loop_rc = 1; break;
             }
-            for (uint32_t ti = 0; ti < n_tokens; ti++) {
-                uint32_t t = 0;
-                idletoken_buf_get_u32(&pb2, &t);
-                chunk_tokens[ti] = (int)t;
+            /* Token ids: ciphertext when this cluster has a key (proto v7).
+             * No flag on the wire -- we derived the same key from the same salt
+             * the coordinator shipped, so we already know which form to expect.
+             * A decrypt failure is fatal for the round rather than something to
+             * fall back from: falling back to a cleartext read would turn a
+             * tampered or replayed frame into a silently wrong prompt. */
+            if (g_nc_coord.ready) {
+                size_t plain_len = (size_t)n_tokens * 4;
+                size_t wire_len = plain_len + IDLETOKEN_NODECRYPT_OVERHEAD;
+                uint8_t *wire = malloc(wire_len);
+                uint8_t *plain = malloc(plain_len);
+                if (!wire || !plain) { free(wire); free(plain); loop_rc = 1; break; }
+                idletoken_buf_get_bytes(&pb2, wire, wire_len);
+                size_t got = 0;
+                idletoken_nc_rc nrc = pb2.err ? IDLETOKEN_NC_EINVAL
+                    : idletoken_nodecrypt_unwrap(&g_nc_coord, wire, wire_len,
+                                                 plain, plain_len, &got);
+                if (nrc != IDLETOKEN_NC_OK || got != plain_len) {
+                    fprintf(stderr, "idletoken-worker: INFER_BEGIN token ids failed to "
+                                    "decrypt (rc=%d) — refusing the round\n", (int)nrc);
+                    idletoken_secure_zero(plain, plain_len);
+                    free(wire); free(plain);
+                    loop_rc = 1; break;
+                }
+                idletoken_buf tb;
+                idletoken_buf_init(&tb, plain, plain_len);
+                for (uint32_t ti = 0; ti < n_tokens; ti++) {
+                    uint32_t t = 0;
+                    idletoken_buf_get_u32(&tb, &t);
+                    chunk_tokens[ti] = (int)t;
+                }
+                idletoken_secure_zero(plain, plain_len);
+                free(wire); free(plain);
+            } else {
+                for (uint32_t ti = 0; ti < n_tokens; ti++) {
+                    uint32_t t = 0;
+                    idletoken_buf_get_u32(&pb2, &t);
+                    chunk_tokens[ti] = (int)t;
+                }
             }
             in_token = (uint32_t)chunk_tokens[0];
             if (pb2.err) {
@@ -1917,8 +2877,14 @@ int main(int argc, char **argv) {
                  * after the HC data (MoE router is token-aware). */
                 const uint64_t want_hc =
                     (uint64_t)n_tokens * (size_t)g_model->hc_streams * g_model->n_embd * 4;
+                /* The trailing token field is 4*n_tokens in the clear and
+                 * that plus the overhead when encrypted (proto v7). Using the
+                 * cleartext size for an encrypted frame would pass this check
+                 * and then read past the tokens. */
+                const uint64_t want_tok =
+                    4ull * n_tokens + (g_nc_prev.ready ? IDLETOKEN_NODECRYPT_OVERHEAD : 0);
                 if (in_hc_bytes != want_hc ||
-                    (uint64_t)16 + in_hc_bytes + 4ull * n_tokens > in_hdr.payload_bytes) {
+                    (uint64_t)16 + in_hc_bytes + want_tok > in_hdr.payload_bytes) {
                     fprintf(stderr,
                             "idletoken-worker: HC_FORWARD prefill payload malformed "
                             "(hc_bytes=%u want=%llu payload=%llu)\n",
@@ -1927,12 +2893,29 @@ int main(int argc, char **argv) {
                     loop_rc = 1; break;
                 }
                 const uint8_t *tp = msg_buf + 16 + in_hc_bytes;
+                uint8_t *tdec = NULL;
+                if (g_nc_prev.ready) {
+                    size_t plain_len = (size_t)n_tokens * 4;
+                    tdec = malloc(plain_len);
+                    size_t got = 0;
+                    if (!tdec) { loop_rc = 1; break; }
+                    if (idletoken_nodecrypt_unwrap(&g_nc_prev, tp,
+                                                   plain_len + IDLETOKEN_NODECRYPT_OVERHEAD,
+                                                   tdec, plain_len, &got) != IDLETOKEN_NC_OK
+                        || got != plain_len) {
+                        fprintf(stderr, "idletoken-worker: HC_FORWARD tokens failed to "
+                                        "decrypt — refusing the round\n");
+                        free(tdec); loop_rc = 1; break;
+                    }
+                    tp = tdec;
+                }
                 for (uint32_t ti = 0; ti < n_tokens; ti++) {
                     chunk_tokens[ti] = (int)((uint32_t)tp[4*ti] |
                                              ((uint32_t)tp[4*ti+1] << 8) |
                                              ((uint32_t)tp[4*ti+2] << 16) |
                                              ((uint32_t)tp[4*ti+3] << 24));
                 }
+                if (tdec) { idletoken_secure_zero(tdec, (size_t)n_tokens * 4); free(tdec); }
                 in_token = (uint32_t)chunk_tokens[0];
                 if (cur_session) {
                     if (!ds4_session_batch_hc_write(cur_session, msg_buf + 16, n_tokens)) {
@@ -2086,8 +3069,25 @@ int main(int argc, char **argv) {
                 idletoken_buf_init(&lb, msg_buf, msg_buf_cap);
                 idletoken_buf_put_u32(&lb, pos0);
                 idletoken_buf_put_u32(&lb, 0u);        /* n_vocab == 0 = short form */
-                idletoken_buf_put_u32(&lb, best_i);
-                logits_wire_bytes = 4;
+                /* The generated token is the ANSWER — as recoverable from the
+                 * public vocabulary as the prompt, and just as much the
+                 * consumer's content. Encrypted on the same terms (proto v7). */
+                if (g_nc_coord.ready) {
+                    uint8_t tp[4], tw[4 + IDLETOKEN_NODECRYPT_OVERHEAD];
+                    idletoken_buf tb; idletoken_buf_init(&tb, tp, sizeof(tp));
+                    idletoken_buf_put_u32(&tb, best_i);
+                    size_t twl = 0;
+                    if (idletoken_nodecrypt_wrap(&g_nc_coord, tp, tb.pos,
+                                                 tw, sizeof(tw), &twl) != IDLETOKEN_NC_OK) {
+                        fprintf(stderr, "idletoken-worker: could not encrypt INFER_LOGITS token\n");
+                        loop_rc = 1; break;
+                    }
+                    idletoken_buf_put_bytes(&lb, tw, twl);
+                    logits_wire_bytes = twl;
+                } else {
+                    idletoken_buf_put_u32(&lb, best_i);
+                    logits_wire_bytes = 4;
+                }
             } else {
                 lb.pos = logits_payload_bytes;
             }
@@ -2111,8 +3111,14 @@ int main(int argc, char **argv) {
             /* Send INFER_HC_FORWARD to next stage (zero-filled cur_hc in mock).
              * Prefill chunks (n_tokens > 1) append the chunk token ids after
              * the batch HC rows for the next stage's token-aware kernels. */
-            const size_t hc_payload_bytes =
-                16 + hc_bytes + (n_tokens > 1 ? 4ull * n_tokens : 0);
+            /* The trailing token field grows by the wrap overhead when this
+             * link is encrypted (proto v7). Counted here rather than added
+             * after the fact, so the msg_buf_cap check below sees the real
+             * size instead of one that fits only the cleartext form. */
+            const size_t hc_tok_bytes = (n_tokens > 1)
+                ? 4ull * n_tokens + (g_nc_next.ready ? IDLETOKEN_NODECRYPT_OVERHEAD : 0)
+                : 0;
+            const size_t hc_payload_bytes = 16 + hc_bytes + hc_tok_bytes;
             if (hc_payload_bytes > msg_buf_cap) {
                 fprintf(stderr, "idletoken-worker: HC payload (%zu B) > buffer; bump msg_buf_cap\n",
                         hc_payload_bytes);
@@ -2163,6 +3169,27 @@ int main(int argc, char **argv) {
                     tp[4*ti+1] = (uint8_t)((t >> 8) & 0xff);
                     tp[4*ti+2] = (uint8_t)((t >> 16) & 0xff);
                     tp[4*ti+3] = (uint8_t)((t >> 24) & 0xff);
+                }
+                /* Encrypt in place over the trailing token array (proto v7).
+                 * This is the stage<->stage link the pairwise session keys never
+                 * reached -- the reason the key is cluster-wide at all. The hc
+                 * payload before it stays in the clear: recovering text from
+                 * hidden states needs the weights and an inversion attack, which
+                 * privacy-design.md puts out of scope. */
+                if (g_nc_next.ready) {
+                    size_t plain_len = (size_t)n_tokens * 4;
+                    uint8_t *wrapped = malloc(plain_len + IDLETOKEN_NODECRYPT_OVERHEAD);
+                    size_t wl = 0;
+                    if (!wrapped) { loop_rc = 1; break; }
+                    if (idletoken_nodecrypt_wrap(&g_nc_next, tp, plain_len, wrapped,
+                                                 plain_len + IDLETOKEN_NODECRYPT_OVERHEAD,
+                                                 &wl) != IDLETOKEN_NC_OK) {
+                        fprintf(stderr, "idletoken-worker: could not encrypt HC_FORWARD tokens\n");
+                        free(wrapped); loop_rc = 1; break;
+                    }
+                    memcpy(tp, wrapped, wl);
+                    idletoken_secure_zero(wrapped, wl);
+                    free(wrapped);
                 }
             }
             hb.pos = hc_payload_bytes;

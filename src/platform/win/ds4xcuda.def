@@ -30,6 +30,7 @@ ds4x_cuda_swiglu
 ds4x_cuda_ffn_stats
 ds4x_cuda_proj_fanout
 ds4x_cuda_proj_stats
+ds4x_cuda_attn_gqa
 ds4x_cuda_attn_ffn_tail
 ds4x_cuda_tail_stats
 ds4x_cuda_gdn_create

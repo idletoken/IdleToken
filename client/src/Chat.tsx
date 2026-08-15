@@ -14,7 +14,10 @@ import { UserAvatar, type UserIdentity } from "./Avatar";
 import { useI18n } from "./i18n";
 import { inTauri } from "./platform";
 import type { ClusterApi } from "./pairing";
-import { recordChatFailure } from "./chatErrors";
+import { recordProblem } from "./problems";
+import { useClusterStats, servedModelOf } from "./clusterStats";
+import type { CustomModelSource } from "./weights";
+import ModelPicker from "./ModelPicker";
 
 interface ChatMsg {
   role: "user" | "assistant";
@@ -237,6 +240,9 @@ function Bubble(props: {
 
 export default function Chat(props: {
   api: ClusterApi | null;
+  /** Where `api` comes from, so the browser dev-sim can answer "what is loaded"
+   *  the way a coordinator would. Defaults to the real engine. */
+  source?: "engine" | "dev-sim";
   apiToken: string;
   modelId: string;
   /** Selected precision — stamped on a recorded failure so a report says which
@@ -248,8 +254,20 @@ export default function Chat(props: {
    *  signed out or on a local-only identity — then a neutral glyph is used. */
   identity: UserIdentity | null;
   onGoCluster: () => void;
+  /** Machines in the running cluster (0 when nothing is running) — a switch has
+   *  to restart them, so the picker says so before it does. */
+  machines?: number;
+  /** Save the pick and rebuild whatever is running around it (App.switchModel).
+   *  Absent = the header shows the model but cannot change it. */
+  onSwitchModel?: (modelId: string, quant: string) => void;
+  /** Display label for modelId — getModel() cannot name an open GGUF
+   *  (LOCAL_GGUF_ID), so the caller supplies the name it knows. */
+  modelLabel: string;
+  /** Open-intake pick (local file / HF), threaded into the picker. */
+  onPickCustomModel?: (c: CustomModelSource) => void;
+  customName?: string;
 }) {
-  const { t } = useI18n();
+  const { t, tErr } = useI18n();
   const [convos, setConvos] = useState<Conversation[]>(loadConversations);
   const [activeId, setActiveId] = useState<string | null>(() => loadConversations()[0]?.id ?? null);
   const [input, setInput] = useState("");
@@ -265,9 +283,34 @@ export default function Chat(props: {
   // run for minutes; without this the only way out is quitting the app.
   const [liveId, setLiveId] = useState<string | null>(null);
   const [prefill, setPrefill] = useState<{ done: number; total: number; reused: number } | null>(null);
+  const [pickOpen, setPickOpen] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
+  // "Follow the stream." A ref, not state: every delta reads it, and it must be
+  // the value as of THIS scroll event, not as of the last render.
+  const stickRef = useRef(true);
+  // The same fact as state, for the one thing that has to re-render on it: the
+  // jump-to-latest button.
+  const [atBottom, setAtBottom] = useState(true);
   const online = props.api?.status === "online";
+
+  // Who is actually answering. `modelOnly` stops the poll the moment the
+  // coordinator has said — the model is fixed when it loads, so one answer is
+  // the whole truth, and a repeating poll here would compete with generation on
+  // a coordinator that serves requests serially.
+  const stats = useClusterStats(props.api ?? null, props.source ?? "engine", {
+    modelOnly: true,
+    simModel: { id: props.modelId, label: props.modelLabel, quant: props.quant },
+  });
+  const served = servedModelOf(stats);
+  // Falling back to the local setting is a WEAKER claim, so it is labeled
+  // differently: the cluster loads its model at startup, so after changing the
+  // setting the local value names a model nothing is running. Older engines do
+  // not report one at all — then "selected" is all we can honestly say.
+  const shownModel = served ?? { id: props.modelId, label: props.modelLabel, quant: props.quant };
+  // No mismatch warning on the chip any more (2026-08-15): selecting a model
+  // IS the switch, everywhere — the setting and the served model can only
+  // disagree for the moments a rebuild is in flight.
 
   const active = convos.find((c) => c.id === activeId) ?? null;
   const msgs = active?.msgs ?? [];
@@ -282,11 +325,30 @@ export default function Chat(props: {
     }
   }, [convos]);
 
-  // Keep the newest message in view while streaming.
+  // Opening a conversation always starts at its newest message, whatever the
+  // previous one's scroll position was. Declared BEFORE the pin effect so the
+  // re-attach lands before the pin that follows it in the same commit.
+  useEffect(() => {
+    stickRef.current = true;
+    setAtBottom(true);
+  }, [activeId]);
+
+  // Keep the newest message in view while streaming — but only while the reader
+  // is ALREADY at the bottom. Scrolling up during a generation is how you re-read
+  // what was just said, and this effect used to slam the view back down on every
+  // delta, i.e. several times a second: the thread could not be read at all until
+  // the reply finished. Following the stream is a default, not a policy.
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
+    // The check is INSIDE pin, not around the effect: the deferred pin below
+    // runs a frame later, and by then the reader may have scrolled away. When
+    // that pin fired anyway it scrolled to the bottom, the browser reported a
+    // scroll at the bottom, and this component read that as "the reader is
+    // following again" — one stale frame was enough to re-arm the auto-scroll
+    // permanently, which is the bug the whole check exists to prevent.
     const pin = () => {
+      if (!stickRef.current) return;
       el.scrollTop = el.scrollHeight;
     };
     pin();
@@ -297,6 +359,26 @@ export default function Chat(props: {
     const raf = requestAnimationFrame(pin);
     return () => cancelAnimationFrame(raf);
   }, [msgs, busy]);
+
+  /** Re-arm following and go there. */
+  const jumpToLatest = () => {
+    const el = scrollRef.current;
+    stickRef.current = true;
+    setAtBottom(true);
+    if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+  };
+
+  // Whether we follow the stream is decided here, by where the reader is.
+  // The threshold is generous on purpose: a line of text is ~26px, so "within
+  // one or two lines of the end" still counts as watching the live text, and a
+  // stream that grows the page by a line does not detach the view by itself.
+  const onScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const near = el.scrollHeight - el.scrollTop - el.clientHeight <= 96;
+    stickRef.current = near;
+    setAtBottom((prev) => (prev === near ? prev : near));
+  };
 
   // Grow the composer with its content, up to the max-height CSS sets (then it
   // scrolls). Reset to "auto" first or scrollHeight only ever ratchets upwards.
@@ -354,6 +436,10 @@ export default function Chat(props: {
     setBusy(true);
     setLiveConvo(convoId);
     setInput("");
+    // Sending is an explicit "I am at the live end again", so it re-arms
+    // following even if you had scrolled up to re-read something first.
+    stickRef.current = true;
+    setAtBottom(true);
     const history = [...(convos.find((c) => c.id === convoId)?.msgs ?? []), { role: "user" as const, text: q }];
     setConvos((cs) =>
       cs.map((c) =>
@@ -455,7 +541,10 @@ export default function Chat(props: {
         }
       }
     } catch (e) {
-      const msg = String((e as Error)?.message ?? e);
+      const raw = String((e as Error)?.message ?? e);
+      // Client-authored errors (the "[CODE] detail" convention, e.g. the two
+      // stream timeouts) render localized; engine verbatim text passes through.
+      const msg = tErr(raw);
       // Mark the turn as failed and KEEP it, partial text and all. It used to be
       // deleted, which threw away both the evidence and the fact that anything
       // had been attempted.
@@ -469,13 +558,21 @@ export default function Chat(props: {
         }
         return out;
       }, convoId);
-      recordChatFailure({
+      recordProblem({
         at: new Date().toISOString(),
-        message: msg,
-        modelId: props.modelId,
-        quant: props.quant,
-        turn: Math.ceil(history.length / 2),
-        hadPartialReply: partial,
+        kind: "chat",
+        // The raw (English, code-prefixed) form: the problem log is a
+        // diagnostic artifact and must not vary with the UI language.
+        message: raw,
+        detail: {
+          model: props.modelId,
+          quant: props.quant,
+          // Turn number within the conversation (1 = first). A failure that only
+          // ever happens from turn 2 onward points somewhere very different from
+          // one that happens on turn 1.
+          turn: Math.ceil(history.length / 2),
+          partialReply: partial,
+        },
       });
     }
     setLiveId(null);
@@ -539,7 +636,53 @@ export default function Chat(props: {
       </aside>
 
       <div className="chat__main">
-        <div className="chat__scroll" ref={scrollRef}>
+        {/* Which model is answering. It used to be nowhere on this page: the
+            reply's tone, speed and quality all come from a choice made on
+            another screen, and going back to Settings was the only way to find
+            out which one — a saved conversation could not even be read back
+            knowing what wrote it. The two claims are kept apart: "serving" is
+            the coordinator reporting what it loaded, "selected" is this
+            machine's setting when the cluster has not said. */}
+        <div className="chat__head">
+          {/* The chip IS the picker's trigger — the model is the one setting
+              this page is about, so it is edited where it is shown rather than
+              two screens away. Switching restarts the cluster (no hot swap in
+              the engine), which the picker states before doing it. */}
+          <button
+            className={`modelchip modelchip--btn${served ? " modelchip--live" : ""}`}
+            disabled={!props.onSwitchModel}
+            onClick={() => setPickOpen((v) => !v)}
+            aria-haspopup="dialog"
+            aria-expanded={pickOpen}
+            title={served ? t("chat.model.servingTitle") : t("chat.model.selectedTitle")}
+          >
+            <span className="modelchip__label">{t(served ? "model.serving" : "model.selected")}</span>
+            <span className="modelchip__name">{shownModel.label}</span>
+            {shownModel.quant ? <span className="modelchip__quant">{shownModel.quant}</span> : null}
+            {props.onSwitchModel ? (
+              <svg className="modelchip__chev" viewBox="0 0 24 24" width="12" height="12" aria-hidden="true">
+                <path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" strokeWidth="2.4"
+                      strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            ) : null}
+          </button>
+          {pickOpen && props.onSwitchModel ? (
+            <ModelPicker
+              modelId={props.modelId}
+              quant={props.quant}
+              running={
+                (props.machines ?? 0) > 0
+                  ? { modelId: served?.id ?? "", quant: served?.quant ?? "", machines: props.machines! }
+                  : null
+              }
+              onPick={props.onSwitchModel}
+              onPickCustom={props.onPickCustomModel}
+              customName={props.customName}
+              onClose={() => setPickOpen(false)}
+            />
+          ) : null}
+        </div>
+        <div className="chat__scroll" ref={scrollRef} onScroll={onScroll}>
           <div className="chat__thread">
             {msgs.length === 0 ? <p className="chat-hint">{t("chat.hint")}</p> : null}
             {msgs.map((m, i) => (
@@ -587,6 +730,19 @@ export default function Chat(props: {
                 same thing twice and then delete its copy on the next send. */}
           </div>
         </div>
+        {/* The way back. Once you have scrolled up, the stream no longer drags
+            the view along — so there has to be one click that returns to it,
+            or catching up means scrolling against text that keeps growing.
+            Only shown when detached AND there is something to come back to. */}
+        {!atBottom && msgs.length > 0 ? (
+          <button className={`tolatest${liveHere ? " tolatest--live" : ""}`} onClick={jumpToLatest}>
+            <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+              <path d="M12 5v14M5 12l7 7 7-7" fill="none" stroke="currentColor" strokeWidth="2.2"
+                    strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+            {t(liveHere ? "chat.toLive" : "chat.toLatest")}
+          </button>
+        ) : null}
         {!online ? (
           <div className="chat__composer">
             <div className="chat-offline">

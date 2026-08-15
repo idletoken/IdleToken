@@ -36,6 +36,11 @@ export interface ModelManifest {
   backend: "ds4" | "ds4x";
   arch: string;
   available: boolean;
+  // "cluster" = may be spread over a homogeneous LAN cluster; "single-node" =
+  // served by one machine, and the coordinator REFUSES --num-workers > 1 for it
+  // (src/common/model.c idletoken_model_may_cluster). Mirrors the engine
+  // registry; model_manifest_check.py fails the build if the two disagree.
+  deployment: "single-node" | "cluster";
   license: string;
   params_summary: string;
   n_layers: number;
@@ -69,6 +74,7 @@ export interface ModelSpec {
   available: boolean; // false = shown greyed out, backend not implemented yet
   backend: "ds4" | "ds4x";
   contextMax: number;
+  singleNode: boolean; // served by one machine; clustering it is refused
   note?: string;
 }
 
@@ -96,6 +102,7 @@ function toSpec(m: ModelManifest): ModelSpec {
     available: m.available,
     backend: m.backend,
     contextMax: m.context_max,
+    singleNode: m.deployment !== "cluster",
     note: m.note,
   };
 }
@@ -116,6 +123,44 @@ export const AVAILABLE_MODELS: ModelSpec[] = MODELS.filter((m) => m.available);
 
 export const DEFAULT_MODEL_ID = "deepseek-v4-flash";
 
+// ---- open model intake (v2 rebuild WS-D1) ----------------------------------
+// The registry above is the CURATED list — default recommendations. Since the
+// llama.cpp pivot (docs/v2-rebuild-plan-2026-08.md §1.6) any GGUF the engine
+// can load is selectable: the user points at a local file or an HF repo+file,
+// and the COORDINATOR builds the manifest from the GGUF header (WS-B4) — the
+// client deliberately knows nothing about such a model beyond where it lives.
+// One sentinel id marks that selection; the file/repo details ride in settings
+// (customGguf*), not here, because there is no manifest to register.
+
+/** settings.modelId value meaning "a user-supplied GGUF, not a curated model". */
+export const LOCAL_GGUF_ID = "local-gguf";
+
+/** Is this the open-intake selection (user-supplied GGUF)? */
+export function isLocalGguf(id: string): boolean {
+  return id === LOCAL_GGUF_ID;
+}
+
+/**
+ * A display-only ModelSpec for the open-intake selection, so components that
+ * render "the selected model" need no second code path. Capacity fields are
+ * zero on purpose: the client has no manifest for this model, and the honest
+ * fit answer is the coordinator's startup verdict (shown on the engine card),
+ * not a client-side estimate built from another model's numbers.
+ */
+export function localGgufSpec(label: string): ModelSpec {
+  return {
+    id: LOCAL_GGUF_ID,
+    label: label || "Local GGUF",
+    params: "GGUF",
+    totalLayers: 0,
+    approxWeightsBytes: 0,
+    available: true,
+    backend: "ds4x", // unused on this path; the coordinator drives llama.cpp
+    contextMax: 0,
+    singleNode: true, // networked serving of open models arrives with WS-C
+  };
+}
+
 /** Is this id something the engine can run today? Unknown ids are not. */
 export function isAvailable(id: string): boolean {
   return MODELS.some((m) => m.id === id && m.available);
@@ -127,6 +172,37 @@ export function getModel(id: string): ModelSpec {
 
 export function getManifest(id: string): ModelManifest {
   return MANIFESTS.find((m) => m.id === id) ?? MANIFESTS[0];
+}
+
+/**
+ * Put a human name on a GGUF file found on disk.
+ *
+ * Searches every manifest AND every variant, not just the models currently
+ * offered: the files that pile up in the model folder are precisely the ones
+ * nobody has selected in a while. Returns null for a file no manifest claims —
+ * the caller shows the raw name rather than hiding it, because it is occupying
+ * the disk regardless of whether we can explain it.
+ */
+export function describeGguf(file: string): { label: string; quant?: string } | null {
+  for (const m of MANIFESTS) {
+    for (const v of m.variants ?? []) {
+      if (v.gguf === file) return { label: m.label, quant: v.quant };
+    }
+    if (m.default_gguf === file) return { label: m.label };
+  }
+  return null;
+}
+
+/**
+ * Is this model served by a single machine?
+ *
+ * Small models are: they fit one node, and splitting one over a LAN spends more
+ * time on pipeline round-trips than on compute. The coordinator enforces it
+ * (it exits rather than accept a second worker), so the UI must not offer a
+ * path that ends in that refusal.
+ */
+export function isSingleNode(id: string): boolean {
+  return getManifest(id).deployment !== "cluster";
 }
 
 // ---- precision (quant) selection -------------------------------------------
@@ -207,6 +283,12 @@ export interface CapacityEstimate {
   haveBytes: number; // this machine's usable contribution (VRAM+RAM aware)
   gapBytes: number; // max(0, need - have)
   hostableLayers: number; // layers THIS machine could hold (incl. RAM offload)
+  // Node count the estimate was actually computed for. Equals the `nNodes`
+  // argument for cluster models and is always 1 for single-node ones — the UI
+  // must quote THIS number, not what it asked for, or it would tell the user
+  // "needs 5 GB across 3 machines" about a model the engine will only ever run
+  // on one.
+  nodes: number;
 }
 
 // `nNodes`: the known cluster size when paired; pass the nominal typical
@@ -220,7 +302,10 @@ export function estimateClusterCapacity(
   quant?: string // selected precision; changes the weight bytes → feasibility
 ): CapacityEstimate {
   const man = getManifest(model.id);
-  const n = Math.max(1, nNodes);
+  // A single-node model is sized for ONE machine no matter how many are
+  // paired — pooling their memory would promise a configuration the
+  // coordinator refuses to start (engine parity: src/common/advise.c).
+  const n = man.deployment === "cluster" ? Math.max(1, nNodes) : 1;
   const avgLayers = man.n_layers > 0 ? Math.ceil(man.n_layers / n) : 1;
   const overhead = overheadBytes(man, ctx, avgLayers);
   // Size the SELECTED precision (falls back to the manifest scalars when the
@@ -239,7 +324,13 @@ export function estimateClusterCapacity(
     perLayer > 0
       ? Math.max(0, Math.min(man.n_layers, Math.floor(usableForLayers / perLayer)))
       : 0;
-  return { needBytes, haveBytes, gapBytes: Math.max(0, needBytes - haveBytes), hostableLayers };
+  return {
+    needBytes,
+    haveBytes,
+    gapBytes: Math.max(0, needBytes - haveBytes),
+    hostableLayers,
+    nodes: n,
+  };
 }
 
 /**

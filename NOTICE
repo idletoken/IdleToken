@@ -8,11 +8,31 @@ licensed under the Apache License, Version 2.0 (see LICENSE).
 Third-party components vendored in this repository
 --------------------------------------------------------------------------
 
-vendor/ds4/ — ds4.c, the DeepSeek V4 Flash single-machine reference engine
+vendor/llama.cpp/ — llama.cpp, the inference engine (pinned commit recorded in
+    scripts/llamacpp-patches/UPSTREAM, built with the patches in that
+    directory). Not linked into IdleToken binaries: llama-server and the
+    ggml rpc-server are spawned as separate processes and are shipped inside
+    the installers.
+    Copyright (c) 2023-2026 The ggml authors
+    MIT License — full text in vendor/llama.cpp/LICENSE
+    Upstream: https://github.com/ggml-org/llama.cpp
+
+vendor/ds4/ — ds4.c, the DeepSeek V4 Flash single-machine reference engine.
+    Compiled into and linked with both idletoken-worker and idletoken-coord
+    (ds4.c, ds4_cuda.cu / ds4_metal.m); the Metal shader sources are also read
+    at runtime. Not merely a reference.
     Copyright (c) 2026 The ds4.c authors
     Copyright (c) 2023-2026 The ggml authors
     MIT License — full text in vendor/ds4/LICENSE
     Upstream: https://github.com/antirez/ds4 (pinned commit in vendor/ds4/UPSTREAM)
+
+vendor/ds4/rax.c, rax.h, rax_malloc.h — Rax, a radix tree implementation.
+    Also linked into both binaries. It sits inside vendor/ds4/ but is NOT
+    covered by that directory's MIT LICENSE, which is why it is listed
+    separately: the BSD 3-clause terms require this notice in binary
+    redistributions too.
+    Copyright (c) 2017-2026, Salvatore Sanfilippo <antirez at gmail dot com>
+    BSD 3-Clause — full text in the header of vendor/ds4/rax.c
 
 vendor/tweetnacl/ — TweetNaCl, "a crypto library in 100 tweets"
     Public domain, dedicated by D. J. Bernstein, Bernard van Gastel,

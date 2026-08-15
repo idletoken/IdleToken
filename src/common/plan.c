@@ -5,6 +5,7 @@
 #include "idletoken_plan.h"
 
 #include <stdio.h>
+#include <string.h>
 
 #define GiB (1024ull * 1024 * 1024)
 
@@ -250,6 +251,206 @@ int idletoken_plan_layers(const idletoken_model_spec *model,
             }
             /* neither direction legal — leave the ragged boundary */
         }
+    }
+    return 0;
+}
+
+/* ===== llama.cpp-engine scheduling (v2 rebuild WS-B2) ======================
+ * Contracts + the usable-memory formula: include/idletoken_plan.h. */
+
+/* Per-node engine overhead beyond weights + KV. CALIBRATED 2026-08-15 on all
+ * three backends (Qwen3.5-0.8B Q4_K_M, ctx 4096, llama-server -lv 5 buffer
+ * report + nvidia-smi / RSS; results/resource-calibration-20260815.md):
+ *   - CUDA context on a discrete card:      ~550 MiB (win_PC RTX 5060 Ti:
+ *     1171 GPU-MiB used − 497 weights − 122 engine buffers)
+ *   - engine buffers (RS+compute+output):   ~133 MiB on every backend at 0.8B,
+ *     and they scale with model width — so a fixed constant alone is wrong in
+ *     both directions (overcharges a phone-sized model, undercharges DSv4).
+ *   - Metal has no CUDA-context analogue (~0): the fixed term is conservative
+ *     there, which is the safe direction on a 16 GiB unified Mac.
+ * Formula: 768 MiB fixed (CUDA context + small-model buffers, ~15% margin
+ * over the worst measurement) + weights/64 (~1.6%, covers the width-scaled
+ * compute buffers; 80 GiB DSv4 → ~2 GiB/node total).
+ * Deliberately shared between the fit check and the ctx sizing so the two
+ * cannot disagree about what "fits" means. */
+#define IDLETOKEN_LLAMA_NODE_OVERHEAD_FIXED (768ull * 1024 * 1024)
+#define idletoken_llama_node_overhead(model_bytes) \
+    (IDLETOKEN_LLAMA_NODE_OVERHEAD_FIXED + (model_bytes) / 64)
+
+uint64_t idletoken_llama_node_usable(const idletoken_node_mem *node) {
+    if (!node) return 0;
+    if (node->unified)   /* one physical pool — count it once */
+        return node->vram_usable > node->ram_usable ? node->vram_usable
+                                                    : node->ram_usable;
+    return node->vram_usable + node->ram_usable;
+}
+
+/* Bytes this model needs on `n_nodes` machines at `ctx_size`:
+ * weights (whole file — llama.cpp keeps everything resident) + KV cache for
+ * the requested context + fixed per-node engine overhead. */
+static uint64_t llplan_needed(const idletoken_llm_model_size *model,
+                              uint32_t ctx_size, int n_nodes) {
+    if (n_nodes < 1) n_nodes = 1;
+    return model->total_bytes +
+           model->kv_bytes_per_token * (uint64_t)ctx_size +
+           (uint64_t)n_nodes * idletoken_llama_node_overhead(model->total_bytes);
+}
+
+uint32_t idletoken_llama_fit_ctx(uint64_t usable_bytes,
+                                 const idletoken_llm_model_size *model,
+                                 uint32_t ctx_want, uint32_t ctx_floor) {
+    if (!model || ctx_want == 0) return 0;
+    if (model->kv_bytes_per_token == 0) return ctx_want;  /* unknown ≠ free; the
+                                                           * engine still fails
+                                                           * loudly if wrong */
+    const uint64_t fixed = model->total_bytes +
+                           idletoken_llama_node_overhead(model->total_bytes);
+    if (usable_bytes <= fixed) return 0;
+    uint64_t tokens = (usable_bytes - fixed) / model->kv_bytes_per_token;
+    if (tokens > ctx_want) tokens = ctx_want;
+    tokens -= tokens % 1024;             /* engine-friendly granularity */
+    if (tokens < ctx_floor) return 0;
+    return (uint32_t)tokens;
+}
+
+int idletoken_plan_llamacpp(const idletoken_llm_model_size *model,
+                            const idletoken_node_mem *nodes, int n,
+                            int coordinator, uint32_t ctx_size,
+                            int allow_small_cluster,
+                            idletoken_llama_plan *out) {
+    if (!model || !nodes || !out || n <= 0 || n > IDLETOKEN_LLPLAN_MAX_NODES ||
+        coordinator < 0 || coordinator >= n || model->total_bytes == 0)
+        return -1;
+    memset(out, 0, sizeof(*out));
+    out->single_node = -1;
+    out->layer0_node = -1;
+
+    const uint64_t need1 = llplan_needed(model, ctx_size, 1);
+    const uint64_t coord_usable = idletoken_llama_node_usable(&nodes[coordinator]);
+
+    /* ---- hard invariant #1 first: layer 0 + the embedding lookup stay with
+     * the coordinator. That rules out BOTH "cluster around a memoryless
+     * coordinator" and "run single on a strong worker instead" — either way
+     * the raw prompt would leave the machine that decrypted it, and a remote
+     * layer 0 lets any worker recover it from the public GGUF. */
+    if (coord_usable == 0) {
+        out->kind = IDLETOKEN_LLPLAN_REFUSE;
+        snprintf(out->why, sizeof(out->why),
+                 "refuse: the coordinator machine has no usable compute memory, "
+                 "but layer 0 and the embedding table must stay on the "
+                 "coordinator (privacy invariant — a remote layer 0 lets any "
+                 "worker recover the prompt from the public GGUF). Run the "
+                 "coordinator on a machine with a supported GPU, or free "
+                 "memory on this one.");
+        return 0;
+    }
+
+    /* ---- hard invariant #5: fits the coordinator alone → don't cluster.
+     * "The best single node" is the coordinator by construction: a lone
+     * worker could hold the bytes, but layer 0 may not move there (above),
+     * so the only machine that can legally run single IS the coordinator. */
+    if (coord_usable >= need1 && !(allow_small_cluster && n > 1)) {
+        out->kind = IDLETOKEN_LLPLAN_SINGLE;
+        out->single_node = coordinator;
+        out->layer0_node = coordinator;
+        snprintf(out->why, sizeof(out->why),
+                 "SINGLE: %.2f GiB needed (weights %.2f + KV@%u + overhead) fits "
+                 "the coordinator's %.2f GiB usable — clustering would only add "
+                 "round-trip cost",
+                 (double)need1 / (double)GiB,
+                 (double)model->total_bytes / (double)GiB, ctx_size,
+                 (double)coord_usable / (double)GiB);
+        return 0;
+    }
+
+    /* ---- cluster path ---------------------------------------------------- */
+    if (n == 1) {
+        out->kind = IDLETOKEN_LLPLAN_REFUSE;
+        snprintf(out->why, sizeof(out->why),
+                 "refuse: this model needs %.2f GiB at ctx %u (weights %.2f GiB "
+                 "+ KV cache + overhead) but this machine has %.2f GiB usable — "
+                 "%.2f GiB short. Free memory, pick a smaller quantization, "
+                 "lower the context size, or add machines to form a cluster.",
+                 (double)need1 / (double)GiB, ctx_size,
+                 (double)model->total_bytes / (double)GiB,
+                 (double)coord_usable / (double)GiB,
+                 (double)(need1 - coord_usable) / (double)GiB);
+        return 0;
+    }
+
+    uint64_t total_usable = 0;
+    for (int i = 0; i < n; i++) total_usable += idletoken_llama_node_usable(&nodes[i]);
+    const uint64_t need_n = llplan_needed(model, ctx_size, n);
+    if (total_usable < need_n) {
+        out->kind = IDLETOKEN_LLPLAN_REFUSE;
+        snprintf(out->why, sizeof(out->why),
+                 "refuse: this model needs %.2f GiB at ctx %u (weights %.2f GiB "
+                 "+ KV cache + per-node overhead) but the %d machine(s) have "
+                 "%.2f GiB usable in total — %.2f GiB short. Add machines, "
+                 "free memory, pick a smaller quantization, or lower the "
+                 "context size.",
+                 (double)need_n / (double)GiB, ctx_size,
+                 (double)model->total_bytes / (double)GiB,
+                 n, (double)total_usable / (double)GiB,
+                 (double)(need_n - total_usable) / (double)GiB);
+        return 0;
+    }
+
+    /* Participation order: coordinator first (see the header for why that IS
+     * the layer-0 pin), then the rest strongest-first. */
+    out->kind = IDLETOKEN_LLPLAN_CLUSTER;
+    out->n_nodes = n;
+    out->order[0] = coordinator;
+    int k = 1;
+    for (int i = 0; i < n; i++) if (i != coordinator) out->order[k++] = i;
+    for (int i = 1; i < n - 1; i++)          /* insertion sort, strongest first */
+        for (int j = i + 1; j < n; j++)
+            if (idletoken_llama_node_usable(&nodes[out->order[j]]) >
+                idletoken_llama_node_usable(&nodes[out->order[i]])) {
+                int t = out->order[i]; out->order[i] = out->order[j]; out->order[j] = t;
+            }
+    out->layer0_node = coordinator;
+
+    double sum = 0.0;
+    for (int i = 0; i < n; i++) {
+        out->tensor_split[i] =
+            (double)idletoken_llama_node_usable(&nodes[out->order[i]]);
+        sum += out->tensor_split[i];
+    }
+    for (int i = 0; i < n; i++) out->tensor_split[i] /= sum;
+
+    /* The coordinator's slice must cover layer 0 in practice, not just in
+     * intent: bump it to at least one layer's share and renormalize. */
+    if (model->n_layers > 0) {
+        const double min_frac = 1.0 / (double)model->n_layers;
+        if (out->tensor_split[0] < min_frac) {
+            const double deficit = min_frac - out->tensor_split[0];
+            const double others = 1.0 - out->tensor_split[0];
+            for (int i = 1; i < n; i++)
+                out->tensor_split[i] -= deficit * (out->tensor_split[i] / others);
+            out->tensor_split[0] = min_frac;
+        }
+    }
+
+    if (coord_usable >= need1) {
+        /* Only reachable through the small-cluster override: the model fits
+         * the coordinator, so say that — the generic wording below would
+         * claim need > usable with the numbers contradicting it. */
+        snprintf(out->why, sizeof(out->why),
+                 "CLUSTER (forced): %.2f GiB needed FITS the coordinator's "
+                 "%.2f GiB usable — clustering anyway because "
+                 "IDLETOKEN_ALLOW_SMALL_CLUSTER=1 (acceptance override); "
+                 "splitting across %d nodes (%.2f GiB total), layer 0 pinned "
+                 "to the coordinator (node %d).",
+                 (double)need1 / (double)GiB, (double)coord_usable / (double)GiB,
+                 n, (double)total_usable / (double)GiB, coordinator);
+    } else {
+        snprintf(out->why, sizeof(out->why),
+                 "CLUSTER: %.2f GiB needed exceeds the coordinator's %.2f GiB "
+                 "usable; splitting across %d nodes (%.2f GiB total), layer 0 "
+                 "pinned to the coordinator (node %d).",
+                 (double)need1 / (double)GiB, (double)coord_usable / (double)GiB,
+                 n, (double)total_usable / (double)GiB, coordinator);
     }
     return 0;
 }

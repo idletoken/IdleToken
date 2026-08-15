@@ -6,7 +6,7 @@
 // planner and starts promising models the cluster then refuses to load.
 //
 // Source of rows:
-//   - paired cluster  → coordinator GET /v1/capability (the whole pool)
+//   - paired cluster  → coordinator GET /idletoken/v1/capability (the whole pool)
 //   - standalone      → `idletoken-worker --advise-json` via the Tauri sidecar
 import { useEffect, useState } from "react";
 import { useI18n } from "./i18n";
@@ -23,6 +23,12 @@ export interface CapabilityRow {
   weight_bytes: number;
   shortfall_bytes: number;
   available: boolean;
+  // Engine-side flag (src/common/advise.c): this model is served by ONE
+  // machine, so its verdict was measured against the best single node rather
+  // than the roster's pooled memory. Optional because an older coordinator
+  // does not send it — absent reads as "clusterable", which is what every
+  // model meant before the field existed.
+  single_node?: boolean;
 }
 
 export interface CapabilityReport {
@@ -118,12 +124,15 @@ export default function Capability(props: { apiBaseUrl?: string | null }) {
                 <td>{ctxLabel(r.max_ctx)}</td>
                 <td className="cap-note">
                   {r.mode === "no" && r.shortfall_bytes > 0
-                    ? t("cap.needMore").replace("{gb}", String(Math.ceil(r.shortfall_bytes / 1024 ** 3)))
+                    ? t(r.single_node ? "cap.needMoreSingle" : "cap.needMore")
+                        .replace("{gb}", String(Math.ceil(r.shortfall_bytes / 1024 ** 3)))
                     : r.mode === "hybrid"
                       ? t("cap.hybridNote")
                       : r.mode === "unavailable"
                         ? t("cap.notInBuildNote")
-                        : ""}
+                        : r.single_node
+                          ? t("cap.singleNodeNote")
+                          : ""}
                 </td>
               </tr>
             );

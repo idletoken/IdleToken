@@ -80,19 +80,20 @@ static int read_bundle_record(const char *path, const char *want,
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: %s <model.gguf> --tokens 1,2,3 [--n-predict N] "
-                        "[--ctx C] [--quiet] | --selftest <vectors.bin>\n", argv[0]);
+                        "[--ctx C] [--quiet] [--warmup] | --selftest <vectors.bin>\n", argv[0]);
         return 2;
     }
     const char *path = argv[1];
     const char *tokspec = NULL, *selftest = NULL, *textspec = NULL;
     uint32_t n_predict = 8, ctx = 0;
-    int quiet = 0;
+    int quiet = 0, warmup = 0;
     for (int i = 2; i < argc; i++) {
         if      (!strcmp(argv[i], "--tokens") && i + 1 < argc) tokspec = argv[++i];
         else if (!strcmp(argv[i], "--text") && i + 1 < argc) textspec = argv[++i];
         else if (!strcmp(argv[i], "--n-predict") && i + 1 < argc) n_predict = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--quiet")) quiet = 1;
+        else if (!strcmp(argv[i], "--warmup")) warmup = 1;
         else if (!strcmp(argv[i], "--selftest") && i + 1 < argc) selftest = argv[++i];
         else { fprintf(stderr, "unknown arg: %s\n", argv[i]); return 2; }
     }
@@ -136,9 +137,18 @@ int main(int argc, char **argv) {
     float *ref_logits = NULL; uint64_t ref_n = 0;
     if (textspec) {
         if (!tok) { fprintf(stderr, "--text needs tokenizer.ggml.* in the GGUF (%s)\n", err); return 1; }
+        /* Timed separately because encode is a prime suspect whenever "prefill"
+         * looks superlinear: BPE merge loops are easy to write as O(n^2), and
+         * this repo has already lost 30 s once to exactly that, hidden behind
+         * what looked like weight loading. */
+        struct timespec te0, te1;
+        clock_gettime(CLOCK_MONOTONIC, &te0);
         int64_t ne = ds4x_tok_encode(tok, textspec, toks, 4096);
+        clock_gettime(CLOCK_MONOTONIC, &te1);
         if (ne <= 0) { fprintf(stderr, "encode produced no tokens\n"); return 1; }
         n_tok = (uint32_t)ne;
+        fprintf(stderr, "ds4x bench: encode %u tok in %.3f s\n", n_tok,
+                (double)(te1.tv_sec - te0.tv_sec) + 1e-9 * (double)(te1.tv_nsec - te0.tv_nsec));
     } else if (selftest) {
         float *tf = NULL; uint64_t tn = 0;
         if (read_bundle_record(selftest, "tokens", &tf, &tn) != 0 ||
@@ -165,13 +175,44 @@ int main(int argc, char **argv) {
     float *logits = malloc((size_t)c->n_vocab * sizeof(float));
     if (!hid || !logits) { fprintf(stderr, "oom\n"); return 1; }
 
-    /* prefill */
+    /* prefill
+     *
+     * Timed, because this is the ONLY apples-to-apples comparison against
+     * llama-bench's pp/tg columns. scripts/bench.py measures the product --
+     * HTTP, tokenizer, coordinator scheduling, worker RPC and then the engine --
+     * which is the right number for "how fast is IdleToken" and the wrong one
+     * for "how fast is the engine". Here the whole prompt goes through
+     * ds4x_runner_run in ONE call with nothing in front of it, exactly like
+     * llama-bench. Every ds4x_cuda entry point ends in a synchronous copy, so
+     * host-side wall time is real GPU time. */
+    /* --warmup runs one untimed prefill first. Without it the timed pass also
+     * pays for every lazy allocation in the CUDA layer -- the cuBLAS handle, the
+     * MMQ activation scratch, the attention arena, the staging buffers -- which
+     * on a 128-token prompt was more than half the measured time (407 tok/s cold
+     * against 887 warm). llama-bench warms up, and scripts/bench.py warms up, so
+     * a cold number here is not comparable to either. */
+    if (warmup) {
+        if (ds4x_embed_tokens(m, toks, n_tok, hid) != 0) { fprintf(stderr, "embed\n"); return 1; }
+        if (ds4x_runner_run(r, hid, n_tok, 0) != 0) { fprintf(stderr, "prefill\n"); return 1; }
+        if (ds4x_output_logits(m, hid + (size_t)(n_tok - 1) * c->n_embd, logits) != 0) {
+            fprintf(stderr, "output\n"); return 1;
+        }
+    }
+    struct timespec tp0, tp1;
+    clock_gettime(CLOCK_MONOTONIC, &tp0);
     if (ds4x_embed_tokens(m, toks, n_tok, hid) != 0) { fprintf(stderr, "embed\n"); return 1; }
     if (ds4x_runner_run(r, hid, n_tok, 0) != 0) { fprintf(stderr, "prefill\n"); return 1; }
     if (ds4x_output_logits(m, hid + (size_t)(n_tok - 1) * c->n_embd, logits) != 0) {
         fprintf(stderr, "output\n"); return 1;
     }
+    clock_gettime(CLOCK_MONOTONIC, &tp1);
+    const double pf_s = (double)(tp1.tv_sec - tp0.tv_sec)
+                      + 1e-9 * (double)(tp1.tv_nsec - tp0.tv_nsec);
+    fprintf(stderr, "ds4x bench: prefill %u tok in %.3f s = %.1f tok/s\n",
+            n_tok, pf_s, pf_s > 0 ? (double)n_tok / pf_s : 0.0);
     int next = argmax(logits, c->n_vocab);
+    struct timespec td0, td1;
+    clock_gettime(CLOCK_MONOTONIC, &td0);
 
     if (selftest) {
         int ref_arg = argmax(ref_logits, (uint32_t)ref_n);
@@ -203,6 +244,13 @@ int main(int argc, char **argv) {
         if (!quiet) printf("  step %u @pos %u → %d\n", step, pos, next);
         pos++;
     }
+    clock_gettime(CLOCK_MONOTONIC, &td1);
+    if (pos > n_tok) {
+        const double dc_s = (double)(td1.tv_sec - td0.tv_sec)
+                          + 1e-9 * (double)(td1.tv_nsec - td0.tv_nsec);
+        fprintf(stderr, "ds4x bench: decode %u tok in %.3f s = %.2f tok/s\n",
+                pos - n_tok, dc_s, dc_s > 0 ? (double)(pos - n_tok) / dc_s : 0.0);
+    }
     if (getenv("IDLETOKEN_DS4X_PROF")) {
         double pj = 0, cv = 0, rc = 0, po = 0;
         ds4x_prof_report(&pj, &cv, &rc, &po);
@@ -211,6 +259,10 @@ int main(int argc, char **argv) {
          * path) it cannot be split out, so its time lands in `recurrence` and
          * conv+gates reads 0. Say that in the label rather than leaving a
          * breakdown that looks like the conv never ran. */
+        double rp = 0, at = 0, gt = 0;
+        ds4x_prof_gqa_report(&rp, &at, &gt);
+        fprintf(stderr, "ds4x prof (full-attn layers): rope+qknorm %.3fs, "
+                        "attention %.3fs, out-gate %.3fs\n", rp, at, gt);
         fprintf(stderr, "ds4x prof (linear path %.3fs): projections %.3fs (%.1f%%), "
                         "conv+gates %.3fs (%.1f%%), recurrence%s %.3fs (%.1f%%), "
                         "norm+out_proj %.3fs (%.1f%%)\n",

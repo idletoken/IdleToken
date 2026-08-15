@@ -10,6 +10,9 @@
 #   dist/idletoken-worker             per-node worker
 #   dist/idletoken-platform-agent     marketplace agent (from build/, Makefile.platform)
 #   dist/scripts/*                 run scripts that expect binaries at ../
+#   dist/LICENSE, dist/NOTICE      our own Apache-2.0 terms + attributions
+#   dist/licenses/*                the third-party texts the binaries oblige us
+#                                  to carry (see below)
 #   dist/MANIFEST.txt              sha256 + size of every file in the bundle
 #
 # Layout invariant: the bundled run scripts cd to "$(dirname $0)/.." and expect
@@ -68,6 +71,36 @@ for b in "$COORD" "$WORKER" "$AGENT"; do
     PACKAGED_BINS+=("$(basename "$b")")
 done
 
+# --- licences (MANDATORY, fail closed) ---------------------------------------
+# The binaries above contain vendored third-party code, and both licences
+# involved require their notice to travel with a BINARY distribution:
+#
+#   ds4  (vendor/ds4/ds4.c, ds4_cuda.cu / ds4_metal.m)  MIT
+#   rax  (vendor/ds4/rax.c)                             BSD 3-Clause, clause 2
+#
+# plus Apache-2.0 §4(d) for our own NOTICE. Until 2026-08-13 this bundle shipped
+# the binaries and none of the texts — the repo was compliant and the thing we
+# actually hand people was not.
+#
+# `die` rather than "skip if missing": a licence file that quietly fails to copy
+# produces exactly the bundle this block exists to prevent, and it would look
+# identical to a good one.
+mkdir -p "$DIST/licenses" || { echo "DIST_FAIL"; exit 1; }
+for f in LICENSE NOTICE; do
+    cp "$f" "$DIST/$f" || { echo "package_dist: copy $f failed" >&2; echo "DIST_FAIL"; exit 1; }
+done
+cp vendor/ds4/LICENSE "$DIST/licenses/ds4-MIT.txt" || {
+    echo "package_dist: copy vendor/ds4/LICENSE failed" >&2; echo "DIST_FAIL"; exit 1; }
+# rax carries its terms in its own header (there is no separate file upstream),
+# so the text is extracted from the source we actually compile — it cannot go
+# stale against a licence file nobody updates.
+awk '/^\/\* Rax/,/^ \*\/$/' vendor/ds4/rax.c > "$DIST/licenses/rax-BSD-3-Clause.txt" || {
+    echo "package_dist: extracting the rax licence failed" >&2; echo "DIST_FAIL"; exit 1; }
+grep -q "Redistribution and use in source and binary forms" "$DIST/licenses/rax-BSD-3-Clause.txt" || {
+    echo "package_dist: extracted rax licence does not contain the BSD terms" >&2
+    echo "package_dist: (rax.c's header changed shape — fix the extraction, do not ship without it)" >&2
+    echo "DIST_FAIL"; exit 1; }
+
 # Run scripts the bundle needs (they resolve binaries at ../ relative to
 # themselves, so they work unchanged from dist/scripts/).
 RUN_SCRIPTS="run_cluster.sh run_single_infer.sh pair_selftest.sh weight_server.py"
@@ -107,6 +140,6 @@ ok=1
     done
 } > "$DIST/MANIFEST.txt" || { echo "DIST_FAIL"; exit 1; }
 
-echo "package_dist: bundled [${PACKAGED_BINS[*]}] + scripts + MANIFEST.txt -> $DIST/"
+echo "package_dist: bundled [${PACKAGED_BINS[*]}] + scripts + licences + MANIFEST.txt -> $DIST/"
 echo "DIST_OK"
 exit 0

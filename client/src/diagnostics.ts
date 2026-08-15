@@ -5,7 +5,7 @@
 // whether an access token goes out, the last place that should have two
 // implementations.
 import type { AppSettings } from "./settings";
-import { readChatFailures } from "./chatErrors";
+import { problemsShared, readProblems } from "./problems";
 
 // The settings fields that go into the bundle (an **allowlist**). Anything that
 // could carry a credential is excluded: apiToken, the platform session, any
@@ -14,11 +14,11 @@ import { readChatFailures } from "./chatErrors";
 // a denylist is a leak, a missed entry in an allowlist is just a blank field --
 // the same trade-off as the public mirror.
 export const DIAG_SETTING_KEYS = [
-  "modelId", "quant", "tier", "weightsSource", "ggufPath", "kvDir",
+  "modelId", "quant", "tier", "kvDir",
   "apiHost", "apiPort", "interStagePort", "discoveryPort",
   "resourcePreset", "maxVramMb", "maxRamMb", "computeMode",
   "clusterName", "preferCoordinator", "sameSubnetOnly", "bindNic",
-  "platformUrl", "logLevel", "experimental",
+  "platformUrl",
 ] as const satisfies readonly (keyof AppSettings)[];
 
 /** The engine-side report plus the allowlisted settings = the file the user downloads. */
@@ -28,12 +28,23 @@ export function buildDiagnosticsBundle(
 ): Record<string, unknown> {
   const picked: Record<string, unknown> = {};
   for (const k of DIAG_SETTING_KEYS) picked[k] = settings[k];
-  // Recent chat failures. The bundle exists so a user does not have to open a
-  // console, and it used to carry hardware and settings but not one word about
-  // what actually went wrong — the error lived in a banner the next send wiped,
-  // so "what did it say?" had no answer. No prompts or replies go in: see
-  // chatErrors.ts for what is deliberately excluded.
-  return { ...report, settings: picked, recent_chat_failures: readChatFailures() };
+  // Recent problems (chat, downloads, cluster). The bundle exists so a user does
+  // not have to open a console, and it used to carry hardware and settings but
+  // not one word about what actually went wrong — the error lived in a banner
+  // the next send wiped, so "what did it say?" had no answer. No prompts or
+  // replies go in: see problems.ts for what is deliberately excluded.
+  //
+  // The switch in Settings decides whether they travel. `problems_shared` is
+  // reported either way and the list is OMITTED rather than emptied when it is
+  // off: an empty array would read as "nothing has ever failed on this machine",
+  // which is the one wrong conclusion a withheld log must not produce.
+  const shared = problemsShared();
+  return {
+    ...report,
+    settings: picked,
+    problems_shared: shared,
+    ...(shared ? { recent_problems: readProblems() } : {}),
+  };
 }
 
 /** The filename carries a UTC timestamp: users often send several in a row, and identically named files have overwritten each other. */

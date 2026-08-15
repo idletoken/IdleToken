@@ -2,13 +2,14 @@
 // to a PairingProvider. Two entry modes — same account, or a one-time code —
 // both funnel into one LAN cluster. The real provider talks to the coordinator
 // over the local RPC and reflects the actual engine cluster (members + stage
-// topology); until the LAN discovery + engine wiring land on-intranet, a
-// clearly-labeled dev-sim drives the UI so the flow can be built and reviewed.
+// topology); in a plain browser (no Tauri, so no LAN access) a clearly-labeled
+// dev-sim drives the UI so the flow can be built and reviewed.
 //
 // Anything from the sim is marked `source: "dev-sim"` and the UI badges it, so
 // simulated peers can never be mistaken for a real cluster (philosophy 9/15).
 
 import type { EngineTuning } from "./settings";
+import { forgetSimLoadedModel } from "./clusterStats";
 
 export type NodeRole = "coordinator" | "worker";
 
@@ -25,13 +26,19 @@ export interface PeerNode {
   stage: NodeStage;
   layerLo?: number; // assigned pipeline layer range [lo, hi)
   layerHi?: number;
+  /** false = the creator has not heard this member's roster poll within its
+   *  timeout (audit 2.8). Optional so absence (older snapshot shapes) reads as
+   *  online — which is what absence used to mean. */
+  online?: boolean;
 }
 
 export interface SelfInfo {
   hostname: string;
   gpu: string;
-  // This machine's local GGUF path (settings.ggufPath). Empty = mock load
-  // (P3). Non-empty = real DSv4 weights the engines should load (P4/P6).
+  // This machine's local GGUF, as resolved by weights.resolveLocalWeights.
+  // Empty = nothing local, which is correct for a joiner (the coordinator's
+  // shard service feeds its layers) and a mock load in P3. Non-empty = real
+  // weights the engines should load from disk (P4/P6).
   modelPath?: string;
   // Settings-derived engine tuning (API bind/token, inter-stage port,
   // discovery port). Omitted = the Rust side's defaults (the historical
@@ -46,6 +53,15 @@ export type ApiStatus = "offline" | "starting" | "online";
 export interface ClusterApi {
   baseUrl: string;
   status: ApiStatus;
+}
+
+/** Why the last join attempt failed (pairing.rs `last_error`). `code` maps to
+ *  a localized sentence in the UI (pairing.err.*); `detail` carries the
+ *  variable part — the discovery port for "notFound", the creator's verbatim
+ *  rejection for "rejected". */
+export interface PairingError {
+  code: string;
+  detail: string;
 }
 
 export interface PairingSnapshot {
@@ -63,6 +79,9 @@ export interface PairingSnapshot {
   // launch — the UI shows the "start cluster" button. (Real provider only;
   // the dev-sim auto-orchestrates.)
   canStart?: boolean;
+  // Why the last join attempt failed; null/absent while nothing has. (Real
+  // provider only — the dev-sim never fails.)
+  lastError?: PairingError | null;
 }
 
 export const DS4_TOTAL_LAYERS = 43;
@@ -85,7 +104,11 @@ export function splitLayers(n: number, total = DS4_TOTAL_LAYERS): Array<[number,
 }
 
 export interface PairingProvider {
-  create(self: SelfInfo): Promise<void>; // start a cluster here, mint a join code
+  // Start a cluster here. `code` reuses an existing join code instead of
+  // minting a fresh one — the model-switch restart (App.switchModel) needs it:
+  // switching means tearing the cluster down and building it again, and a new
+  // code would strand every other machine, which is holding the old one.
+  create(self: SelfInfo, code?: string): Promise<void>;
   join(code: string, self: SelfInfo): Promise<void>; // join an existing cluster
   // Account mode (integration plan 3.3): same LAN mechanics as create/join, but
   // the join proof is `secret` — derived from the signed-in platform account
@@ -171,13 +194,13 @@ class DevSimPairing implements PairingProvider {
   }
 
   private selfPeer(self: SelfInfo, role: NodeRole): PeerNode {
-    return { id: "self", hostname: self.hostname, gpu: self.gpu, role, self: true, stage: "joined" };
+    return { id: "self", hostname: self.hostname, gpu: self.gpu, role, self: true, stage: "joined", online: true };
   }
 
-  async create(self: SelfInfo): Promise<void> {
+  async create(self: SelfInfo, code?: string): Promise<void> {
     this.clearTimers();
     this.state = {
-      code: mintCode(),
+      code: code ?? mintCode(),
       peers: [this.selfPeer(self, "coordinator")],
       coordinatorId: "self",
       phase: "idle",
@@ -199,7 +222,7 @@ class DevSimPairing implements PairingProvider {
     this.state = {
       code: _code.trim().toUpperCase(),
       peers: [
-        { id: "peer-coord", hostname: "win-pc-01", gpu: "RTX 5060 Ti", role: "coordinator", self: false, stage: "joined" },
+        { id: "peer-coord", hostname: "win-pc-01", gpu: "RTX 5060 Ti", role: "coordinator", self: false, stage: "joined", online: true },
         this.selfPeer(self, "worker"),
       ],
       coordinatorId: "peer-coord",
@@ -239,6 +262,10 @@ class DevSimPairing implements PairingProvider {
 
   async leave(): Promise<void> {
     this.clearTimers();
+    // The simulated coordinator is gone, so what it "loaded" is gone with it —
+    // the next create latches the model that is selected then. (A real
+    // coordinator gets this for free by exiting.)
+    forgetSimLoadedModel();
     this.state = { code: null, peers: [], coordinatorId: null, phase: "idle", api: null, source: "dev-sim" };
     this.emit();
   }
@@ -254,7 +281,7 @@ class DevSimPairing implements PairingProvider {
 
   private addSimPeer(hostname: string, gpu: string) {
     this.seq += 1;
-    this.state.peers.push({ id: `sim-${this.seq}`, hostname, gpu, role: "worker", self: false, stage: "joined" });
+    this.state.peers.push({ id: `sim-${this.seq}`, hostname, gpu, role: "worker", self: false, stage: "joined", online: true });
     this.emit();
   }
 
@@ -330,9 +357,9 @@ class EnginePairing implements PairingProvider {
     return invoke<T>(cmd, args);
   }
 
-  async create(self: SelfInfo): Promise<void> {
+  async create(self: SelfInfo, code?: string): Promise<void> {
     await this.call("pairing_create", {
-      code: mintCode(),
+      code: code || mintCode(),
       hostname: self.hostname,
       gpu: self.gpu,
       modelPath: self.modelPath ?? "",

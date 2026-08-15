@@ -791,7 +791,7 @@ static uint8_t *http_get_json(const char *addr, const char *path,
  * that from the **end-to-end round trip** it observed itself, which mixes in
  * network, sealing and queueing, producing a service time that is both too
  * large and jittery. The coordinator already knows the exact numbers
- * (`avg_service_ms` / `queue_depth` / `seq_slots` from `/v1/stats`), so we
+ * (`avg_service_ms` / `queue_depth` / `seq_slots` from `/idletoken/v1/stats`), so we
  * simply bring them along.
  *
  * They are keyed per context size (`{"<ctx_size>": v}`) because the platform
@@ -808,7 +808,7 @@ static int coord_stats_json(const char *coord_addr, char *out, size_t out_cap) {
     out[0] = '\0';
     if (!coord_addr || !coord_addr[0]) return -1;
     int status = 0; size_t rlen = 0;
-    uint8_t *resp = http_get_json(coord_addr, "/v1/stats", &status, &rlen, 5);
+    uint8_t *resp = http_get_json(coord_addr, IDLETOKEN_PATH_STATS, &status, &rlen, 5);
     if (!resp) return -1;
     if (status < 200 || status >= 300) { free(resp); return -1; }
     const char *j = (const char *)resp;

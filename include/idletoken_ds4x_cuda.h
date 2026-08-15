@@ -68,6 +68,67 @@ static inline int ds4x_fuse_wanted(void) {
     return !(n && n[0] == '1');
 }
 
+/* Tensor-core (cuBLAS BF16) batched matmul, for weights already stored as bf16.
+ *
+ * On by default because it is the whole prefill story: on a GB10 at this model's
+ * shape it is 4x the FP32 rate at 128 tokens and 6x at 512, while cuBLAS in FP32
+ * merely matches our own kernel. The cost is that it rounds inputs to 8 mantissa
+ * bits and lets cuBLAS pick a per-M algorithm, so a token's result stops being
+ * independent of how many tokens shared the launch -- i.e. it cannot hold the
+ * `chunk==1-by-1` bit-identity that the hand-written kernels do.
+ *
+ * IDLETOKEN_DS4X_NO_TC=1 restores the bit-exact path. That is what the parity
+ * gate uses to keep testing the exact kernels, and what to set first when a
+ * numerical result looks wrong. */
+static inline int ds4x_tc_wanted(void) {
+    const char *n = getenv("IDLETOKEN_DS4X_NO_TC");
+    return !(n && n[0] == '1');
+}
+
+/* Integer-domain matvec: quantize the activation to int8 and contract with DP4A
+ * instead of dequantizing the weights to fp32. This is decode's version of the
+ * same trade the tensor-core path makes for prefill, and it is what llama.cpp
+ * does -- measured on the same Q4_K_M file it reaches 174 GB/s of effective
+ * bandwidth against our 68.
+ *
+ * The activation loses precision (int8, ~7 bits) so this path is not bit-exact
+ * with the fp32 kernels. IDLETOKEN_DS4X_NO_DP4A=1 restores them. */
+static inline int ds4x_dp4a_wanted(void) {
+    const char *n = getenv("IDLETOKEN_DS4X_NO_DP4A");
+    return !(n && n[0] == '1');
+}
+
+/* MMQ: prefill's version of the same idea -- contract a whole token tile against
+ * K-quant weights in the integer domain, so the weights are never expanded to a
+ * floating type at all. It replaces both of the paths it competes with: the tiled
+ * fp32 GEMM (which dequantizes into shared memory every M block) and the
+ * dequantize-to-bf16 + cuBLAS route (whose expansion pass cost more than the
+ * tensor cores saved -- 197 ms against 205 ms, measured 2026-08-13).
+ *
+ * Unlike the cuBLAS path this one KEEPS `chunk==1-by-1` bit-identity: k advances
+ * in a fixed order, each output's sum lives in one thread, and a token's
+ * activation scale comes from that token's own 32 values. Nothing about a
+ * token's result depends on how many tokens shared the launch.
+ *
+ * IDLETOKEN_DS4X_NO_MMQ=1 falls back to whatever would have run before it. */
+static inline int ds4x_mmq_wanted(void) {
+    const char *n = getenv("IDLETOKEN_DS4X_NO_MMQ");
+    return !(n && n[0] == '1');
+}
+
+/* Within MMQ, contract with int8 TENSOR CORES (mma.m16n8k16.s32.s8.s8.s32)
+ * rather than DP4A on the ALU. Same shared-memory tiles, same scales, same
+ * arithmetic -- only the instruction that consumes the tiles changes, because
+ * the tile layout MMQ already uses (4 consecutive k packed per int) is exactly
+ * the mma fragment layout.
+ *
+ * IDLETOKEN_DS4X_NO_MMA=1 falls back to the DP4A inner loop, which is the
+ * comparison point the gate and the bench both need. */
+static inline int ds4x_mma_wanted(void) {
+    const char *n = getenv("IDLETOKEN_DS4X_NO_MMA");
+    return !(n && n[0] == '1');
+}
+
 /* Cap on how many bytes of weights this process may keep in VRAM. 0 = no cap
  * (the standalone CLI tools, which own the whole card). The worker always sets
  * it from its probed usable VRAM minus headroom, so the per-machine limit the
@@ -123,6 +184,62 @@ int ds4x_cuda_matmul(const ds4x_cuda_wt *w, const float *X, float *Y,
  * it is comparable with the matvec call count. */
 void ds4x_cuda_matmul_stats(double *ms_kernel, double *ms_total,
                             uint64_t *calls, uint64_t *rows);
+
+/* ---- GQA attention for a whole chunk -------------------------------------
+ * The ONE part of a forward pass that is quadratic in sequence length, and
+ * until now the one part that had no GPU kernel at all: nsys on a 430-token
+ * prefill (2026-08-13) listed matmuls, GDN, norms and elementwise work and
+ * nothing else, because full attention ran in scalar C on the host. Fitting
+ * bench.py's TTFT to aN + bN² gave a = 1.13 ms/token and b = 0.0039 ms/token²,
+ * i.e. at N=511 the quadratic term was 64% of prefill. Qwen3.5-4B has 8 such
+ * layers (full_attention_interval 4 over 32 blocks).
+ *
+ *   q  : [n_tok][n_head * qstride]  — head hd starts at hd*qstride. qstride is
+ *        2*hdim for Gated Attention, where each head is [q | gate].
+ *   gated: apply Gated Attention's SIGMOID gate (the head's second half) to the
+ *        output. Done here because the gate is indexed by the same (token, head,
+ *        dim) the kernel already owns, on data already uploaded — as a host loop
+ *        afterwards it was 36 ms of a 463 ms prefill. Requires qstride >= 2*hdim.
+ *   k,v: [n_kv][n_head_kv * hdim], n_kv = pos0 + n_tok
+ *   o  : [n_tok][n_head * hdim]
+ * Token t attends causally to positions 0..pos0+t. All pointers are host.
+ *
+ * Softmax is the online (running max) form rather than the host path's
+ * max-then-exp two passes: same value, different rounding, and it needs no
+ * O(n_kv) scratch per query. hdim must be a multiple of 32 and at most 512.
+ * Returns 0, or -1 if unsupported / a CUDA call failed (caller falls back). */
+int ds4x_cuda_attn_gqa(const float *q, const float *k, const float *v, float *o,
+                       uint32_t n_tok, uint32_t pos0,
+                       uint32_t n_head, uint32_t n_head_kv, uint32_t hdim,
+                       uint32_t qstride, float scale, int gated);
+
+/* IDLETOKEN_DS4X_NO_GPU_ATTN=1 keeps full attention on the host. That path is
+ * the numerical reference the parity gate asserts against, so it has to stay
+ * reachable. */
+static inline int ds4x_gpu_attn_wanted(void) {
+    const char *n = getenv("IDLETOKEN_DS4X_NO_GPU_ATTN");
+    return !(n && n[0] == '1');
+}
+
+/* Below this many tokens the device path LOSES, and it lost by 22% before this
+ * threshold existed (decode 43.18 -> 33.78 tok/s at ctx 512, measured
+ * 2026-08-13). The reason is that ds4x_cuda_attn_gqa re-uploads the whole K/V
+ * history every call, which is O(n_kv) no matter how few queries are asking:
+ * one decode step ships ~33 MB across 8 full-attention layers to replace ~4 ms
+ * of host arithmetic.
+ *
+ * The threshold is the cheap half of the fix. The real one is a DEVICE-RESIDENT
+ * K/V cache that only uploads the rows just written -- 4 KB per layer per token
+ * instead of the whole history -- which would make decode faster than the host
+ * path rather than merely not slower. Not done: it needs per-sequence cache
+ * identity so a rewind or a second sequence on the same slot cannot silently
+ * read someone else's history, and a stale-cache bug there produces plausible
+ * text rather than a crash. */
+static inline unsigned ds4x_gpu_attn_min_tokens(void) {
+    const char *n = getenv("IDLETOKEN_DS4X_ATTN_MIN_TOKENS");
+    if (n && n[0]) { long v = strtol(n, NULL, 10); if (v >= 0) return (unsigned)v; }
+    return 8u;
+}
 
 /* ---- fused SwiGLU FFN ----------------------------------------------------
  * Y = Wd · (silu(Wg·X) ⊙ (Wu·X)) for a whole chunk. X is [n_tokens][n_in],

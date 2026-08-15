@@ -60,7 +60,7 @@ export default function AuthScreen(props: {
             <h2>{t("auth.title")}</h2>
             <p className="auth-subtitle">{t("auth.subtitle")}</p>
           </div>
-          <button className="iconbtn" onClick={props.onClose} aria-label="✕">
+          <button className="iconbtn" onClick={props.onClose} aria-label={t("a11y.close")}>
             ✕
           </button>
         </div>

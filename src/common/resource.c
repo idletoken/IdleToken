@@ -7,6 +7,8 @@
 /* _GNU_SOURCE comes via Makefile. */
 
 #include "idletoken_resource.h"
+#include "idletoken_proto.h"   /* idletoken_macos_node_sealed() — the seal is
+                                * shared with the coordinator's handshake */
 
 #include <errno.h>
 #include <stdio.h>
@@ -249,15 +251,17 @@ static int probe_gpu(idletoken_resource_report *r) {
      * use memory the host probe has already ruled out (other processes, the
      * 4 GiB safety floor, the 70% proportional ceiling). Take the smaller.
      *
-     * Only the workspace reserve is subtracted, not IDLETOKEN_VRAM_SAFETY_BYTES:
-     * that 1 GiB stands for the CUDA context, which has no Metal counterpart.
-     * The workspace reserve stays — Metal heaps, command buffers and kernel
-     * scratch are real. This is a reasoned reuse of a CUDA-derived constant,
-     * not a measured one; it wants calibrating on a big-memory Mac. */
+     * Only the Metal workspace reserve is subtracted, not
+     * IDLETOKEN_VRAM_SAFETY_BYTES: that 1 GiB stands for the CUDA context,
+     * which has no Metal counterpart. The reserve itself is CALIBRATED
+     * (2026-08-15, this machine): the llamacpp engine's whole non-weight
+     * footprint is ~133 MiB and the width-scaled part is charged by the
+     * scheduler — the earlier 1.5 GiB CUDA-derived guess stacked with that
+     * into a ~2.3 GiB double reservation on a 16 GiB Mac. */
     uint64_t budget = g.recommended_working_set;
     if (r->ram_usable < budget) budget = r->ram_usable;
-    r->vram_usable = budget > IDLETOKEN_VRAM_WORKSPACE_BYTES
-                         ? budget - IDLETOKEN_VRAM_WORKSPACE_BYTES
+    r->vram_usable = budget > IDLETOKEN_METAL_WORKSPACE_BYTES
+                         ? budget - IDLETOKEN_METAL_WORKSPACE_BYTES
                          : 0;
     /* No `ram_usable > 0` guard on that clamp, deliberately. The first version
      * had one — meaning "only clamp if the host probe produced something" — and
@@ -582,13 +586,36 @@ int idletoken_resource_probe(idletoken_resource_report *out, const char *gguf_di
         if (fake_cc && *fake_cc) {
             unsigned mj = 0, mn = 0;
             if (sscanf(fake_cc, "%u.%u", &mj, &mn) >= 1) {
+                fprintf(stderr,
+                        "*** TEST OVERRIDE *** IDLETOKEN_FAKE_CC=%s replaces the "
+                        "real compute capability of this GPU. Never set this "
+                        "outside a test harness.\n", fake_cc);
                 out->cc_major = (uint8_t)mj;
                 out->cc_minor = (uint8_t)mn;
             }
         }
         const char *fake_drv = getenv("IDLETOKEN_FAKE_DRIVER");
-        if (fake_drv && *fake_drv)
+        if (fake_drv && *fake_drv) {
+            fprintf(stderr,
+                    "*** TEST OVERRIDE *** IDLETOKEN_FAKE_DRIVER=%s replaces the "
+                    "real driver version of this node. Never set this outside a "
+                    "test harness.\n", fake_drv);
             snprintf(out->driver_version, sizeof(out->driver_version), "%s", fake_drv);
+        }
+        /* G_MACSEAL needs an Apple-vendor report, and the only machines that
+         * produce one are the ones the seal keeps out of the ladder. Forcing
+         * the vendor byte lets the refusal be exercised on the CUDA nodes that
+         * actually run the gates. */
+        const char *fake_vendor = getenv("IDLETOKEN_FAKE_VENDOR");
+        if (fake_vendor && !strcmp(fake_vendor, "apple")) {
+            fprintf(stderr,
+                    "*** TEST OVERRIDE *** IDLETOKEN_FAKE_VENDOR=apple replaces "
+                    "the real GPU vendor of this node. Never set this outside a "
+                    "test harness.\n");
+            out->gpu_vendor = IDLETOKEN_GPU_VENDOR_APPLE;
+            if (out->gpu_name[0] == '\0')
+                snprintf(out->gpu_name, sizeof(out->gpu_name), "Apple M-series (forced)");
+        }
     }
 
     return (r1 == 0 && r2 == 0 && r3 == 0) ? 0 : -1;
@@ -615,6 +642,17 @@ idletoken_hw_status idletoken_hw_check(const idletoken_resource_report *r,
      * capability and driver version below are CUDA concepts and are zero here;
      * running the NVIDIA checks on a Mac would refuse every Mac ever made. */
     if (r->gpu_vendor == IDLETOKEN_GPU_VENDOR_APPLE) {
+        /* Sealed before the size floor on purpose: "this Mac is too small" is
+         * the wrong sentence to tell someone whose Mac is plenty big. */
+        if (idletoken_macos_node_sealed()) {
+            /* Keep this under ~250 chars: every caller's `reason` buffer is
+             * 256, and the half that gets truncated is the actionable half. */
+            SAY("%s runs Metal, but macOS compute nodes are sealed in this build "
+                "(no numerical baseline of its own, no Metal kernels for small "
+                "models, unverified multi-Mac clusters). This Mac can still run "
+                "the client and control a Windows or Linux cluster.", r->gpu_name);
+            return IDLETOKEN_HW_MACOS_SEALED;
+        }
         if (r->vram_total < IDLETOKEN_MIN_APPLE_WORKING_SET_BYTES) {
             SAY("%s can keep only %.1f GB resident for the GPU; IdleToken needs "
                 "at least %.0f GB (roughly an 8 GB Mac). This machine can still "
@@ -623,7 +661,8 @@ idletoken_hw_status idletoken_hw_check(const idletoken_resource_report *r,
                 (double)IDLETOKEN_MIN_APPLE_WORKING_SET_BYTES / 1073741824.0);
             return IDLETOKEN_HW_VRAM_TOO_SMALL;
         }
-        SAY("%s (Metal, unified memory, %.1f GB working set) meets the hardware floor.",
+        SAY("SEALED PATH (" IDLETOKEN_MACOS_UNSEAL_ENV " is set): %s (Metal, %.1f GB "
+            "working set) meets the floor, but no gate covers anything it does.",
             r->gpu_name, (double)r->vram_total / 1073741824.0);
         return IDLETOKEN_HW_OK;   /* SAY is #undef'd once, at the end of the function */
     }
@@ -634,7 +673,7 @@ idletoken_hw_status idletoken_hw_check(const idletoken_resource_report *r,
     if (r->gpu_vendor == IDLETOKEN_GPU_VENDOR_UNKNOWN && r->gpu_name[0] != '\0' &&
         r->cc_major == 0 && r->cc_minor == 0) {
         SAY("%s is not a GPU IdleToken can compute on — it needs either an "
-            "NVIDIA card (RTX 20 series or newer) or an Apple Silicon Mac. "
+            "NVIDIA card (RTX 20 series or newer) on Windows or Linux. "
             "This machine can still run the client and control the cluster.",
             r->gpu_name);
         return IDLETOKEN_HW_GPU_UNSUPPORTED;
@@ -714,7 +753,7 @@ void idletoken_resource_print(const idletoken_resource_report *r) {
     if (r->gpu_vendor == IDLETOKEN_GPU_VENDOR_APPLE) {
         printf("  vram total : %s   (Metal recommended working set, unified pool)\n", vt);
         printf("  vram other : %s   (not queryable; already charged to ram other)\n", vo);
-        printf("  vram usable: %s   (min(working set, ram usable) - 1.5G workspace)\n", vu);
+        printf("  vram usable: %s   (min(working set, ram usable) - 0.5G Metal workspace)\n", vu);
     } else if (r->unified_memory) {
         printf("  vram total : %s   (aliased to host RAM, unified pool)\n", vt);
         printf("  vram other : %s\n", vo);

@@ -5,6 +5,7 @@
   "backend": "ds4",
   "arch": "deepseek4",
   "available": true,
+  "deployment": "cluster",
   "license": "MIT",
   "params_summary": "304B · 13B active · Q2",
   "release": "0731",

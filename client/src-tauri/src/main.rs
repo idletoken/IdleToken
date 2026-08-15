@@ -2,11 +2,63 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde_json::Value;
+use tauri::Manager;
 use tauri_plugin_shell::ShellExt;
 
 mod engine;
 mod pairing;
+mod tray;
+mod update;
 mod weights;
+mod window;
+
+/// Set once a quit has been decided (tray "Quit", the front end's quit path,
+/// or an OS-level exit request). It is what tells the window's close handler
+/// that this close is a real exit rather than "hide to the tray": without it,
+/// `app.exit()` triggers a close event that we would then cancel, and the app
+/// would refuse to die.
+static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Quit for real, from wherever the request came. Sidecars are stopped by the
+/// `RunEvent::Exit` handler at the bottom of this file, which every path here
+/// goes through.
+pub fn quit(app: &tauri::AppHandle) {
+    QUITTING.store(true, std::sync::atomic::Ordering::SeqCst);
+    window::remember_geometry(app);
+    app.exit(0);
+}
+
+/// Quit from the front end (menu/keyboard, and the acceptance channel's
+/// `quit:<ms>` directive). Distinct from closing the window, which with
+/// "close to tray" on means "keep serving, get out of the way".
+#[tauri::command]
+fn app_quit(app: tauri::AppHandle) {
+    quit(&app);
+}
+
+/// "Launch at login", through the OS mechanism for each platform. Kept next to
+/// the other window/tray shell concerns because it is the same promise: this
+/// machine contributes to the cluster without anyone having to remember to
+/// start it.
+#[tauri::command]
+fn autostart_set(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let manager = app.autolaunch();
+    if enabled {
+        manager.enable().map_err(|e| e.to_string())
+    } else {
+        manager.disable().map_err(|e| e.to_string())
+    }
+}
+
+/// What the OS actually reports — not what the settings file believes. The two
+/// can differ (another tool cleared the registry key, the .desktop file was
+/// removed), and the honest answer is the one the OS gives.
+#[tauri::command]
+fn autostart_get(app: tauri::AppHandle) -> bool {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().unwrap_or(false)
+}
 
 /// Run the native engine's hardware probe as a sidecar and return the parsed
 /// JSON report. This is the local RPC boundary between the GUI (web frontend)
@@ -235,20 +287,20 @@ fn engine_get_json_blocking(base_url: &str, path: &str) -> Result<Value, String>
     serde_json::from_str::<Value>(payload.trim()).map_err(|e| format!("bad JSON from {path}: {e}"))
 }
 
-/// The cluster's capability table (engine `GET /v1/capability`).
+/// The cluster's capability table (engine `GET /idletoken/v1/capability`).
 #[tauri::command]
 async fn api_capability(base_url: String) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || engine_get_json_blocking(&base_url, "/v1/capability"))
+    tauri::async_runtime::spawn_blocking(move || engine_get_json_blocking(&base_url, "/idletoken/v1/capability"))
         .await
         .map_err(|e| e.to_string())?
 }
 
-/// GET the cluster's serving counters (engine `GET /v1/stats`) for the
+/// GET the cluster's serving counters (engine `GET /idletoken/v1/stats`) for the
 /// dashboard activity row. Rust-side for the usual reason: the engine speaks
 /// plain LAN HTTP without CORS headers.
 #[tauri::command]
 async fn api_stats(base_url: String) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || engine_get_json_blocking(&base_url, "/v1/stats"))
+    tauri::async_runtime::spawn_blocking(move || engine_get_json_blocking(&base_url, "/idletoken/v1/stats"))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -350,6 +402,9 @@ async fn api_chat_stream(
 /// How long a streaming socket may stay completely silent before we call it
 /// dead. Named because the error message quotes it — a number the user is told
 /// and a number the code enforces must not be able to drift apart.
+/// ⚠ Also quoted by the localized copies of the two timeout sentences
+/// (`chat.err.timeoutMid` / `chat.err.timeoutNone` in client/src/i18n.ts) —
+/// change both together.
 const READ_TIMEOUT_S: u64 = 300;
 
 /// Blocking SSE consumer: connect → POST with stream:true → parse
@@ -426,10 +481,13 @@ fn stream_chat_inner(
             // cluster really did stall — say that, in words, instead of
             // surfacing "os error 10060", which is what the user actually saw.
             Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {
+                // "[CODE] detail" (client-error convention, ERROR_KEYS in
+                // i18n.ts): the UI shows a localized sentence for the code;
+                // the English detail survives in logs and the problem record.
                 return Err(if got_bytes {
-                    format!("the cluster went silent for {READ_TIMEOUT_S}s mid-reply, so this generation was cut off (what arrived is kept). Check the coordinator — it is most likely stuck, not merely slow.")
+                    format!("[CHAT_TIMEOUT_MID] the cluster went silent for {READ_TIMEOUT_S}s mid-reply, so this generation was cut off (what arrived is kept). Check the coordinator — it is most likely stuck, not merely slow.")
                 } else {
-                    format!("no response from the cluster in {READ_TIMEOUT_S}s. Check that the coordinator is running and not stuck loading the model.")
+                    format!("[CHAT_TIMEOUT_NONE] no response from the cluster in {READ_TIMEOUT_S}s. Check that the coordinator is running and not stuck loading the model.")
                 });
             }
             Err(e) => return Err(format!("read: {e}")),
@@ -632,7 +690,7 @@ async fn collect_diagnostics(
     // Current cluster state (the coordinator's HTTP). With no cluster running
     // this is an error, not an empty value -- the two must stay distinguishable.
     if let Some(base) = base_url.as_ref().filter(|b| !b.trim().is_empty()) {
-        let url = format!("{}/v1/cluster/status", base.trim_end_matches('/'));
+        let url = format!("{}/idletoken/v1/cluster/status", base.trim_end_matches('/'));
         out.insert(
             "cluster".into(),
             match http_get_json(&url).await {
@@ -666,9 +724,48 @@ async fn http_get_json(url: &str) -> Result<Value, String> {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        // Native file dialog for the open-model picker (WS-D1: "any GGUF").
+        // A dialog is the only honest way to take a local path: the old free-
+        // text box handed unchecked strings to the engine (see settings.ts v4
+        // migration note), and the webview's <input type=file> hides real paths.
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        // No launch arguments: the app is started at login the same way the
+        // user starts it, and "start minimized" is a setting rather than a
+        // second startup mode (see window.rs).
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .manage(engine::Engine::default())
         .manage(pairing::Pairing::default())
+        .manage(window::SysPrefs::default())
+        .manage(tray::TrayState::default())
+        .manage(update::Updates::default())
         .setup(|app| {
+            // One line about how the shell came up. It is the first thing
+            // asked for in every support conversation, and on Windows it is
+            // the only way to tell "the webview never loaded" apart from "the
+            // app never started" — the two look identical from outside.
+            eprintln!(
+                "idletoken-client: starting v{} on {}",
+                app.package_info().version,
+                std::env::consts::OS
+            );
+            // The tray comes first: window.rs refuses to hide a window when
+            // there is no tray to bring it back, so it has to know by the time
+            // it decides whether to honour "start minimized".
+            let handle = app.handle().clone();
+            if window::load(&handle).tray_icon {
+                tray::install(&handle);
+            }
+            window::apply_startup(&handle);
+            eprintln!(
+                "idletoken-client: shell ready — tray={} window_visible={:?}",
+                app.state::<window::SysPrefs>().tray_alive(),
+                window::main_window(&handle).and_then(|w| w.is_visible().ok())
+            );
+
             // Headless pairing trigger (acceptance §8): drive the real LAN
             // pairing path without the webview, for harnesses on machines whose
             // GUI can't run (e.g. a locked Windows session). No-op if unset.
@@ -678,6 +775,33 @@ fn main() {
                 }
             }
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // Closing the window is not quitting. A node holds model layers in
+            // VRAM and answers API requests; pressing X while a cluster is
+            // serving must not take it down, and on Windows in particular the
+            // X button is how most people put an app away.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let app = window.app_handle();
+                let prefs = app.state::<window::SysPrefs>().get();
+                if !QUITTING.load(std::sync::atomic::Ordering::SeqCst)
+                    && prefs.close_to_tray
+                    && window::hide_allowed(app)
+                {
+                    api.prevent_close();
+                    window::remember_geometry(app);
+                    let _ = window.hide();
+                    // The webview stays alive while hidden; it shows a one-time
+                    // "still running in the tray" notice on this signal (the
+                    // first close-to-tray otherwise looks exactly like a quit).
+                    let _ = tauri::Emitter::emit(app, "tray:hidden", ());
+                } else {
+                    // Real close: keep the geometry for next launch. (Also the
+                    // path taken when the tray is unavailable, which is why
+                    // "close to tray" can never strand the app.)
+                    window::remember_geometry(app);
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             probe_resources,
@@ -692,6 +816,7 @@ fn main() {
             collect_diagnostics,
             engine::engine_start,
             engine::engine_stop,
+            engine::llamacpp_serve,
             engine::engine_status,
             engine::engine_logs,
             engine::clear_kv_cache,
@@ -708,6 +833,18 @@ fn main() {
             weights::weights_default_dir,
             weights::weights_state,
             weights::weights_cancel,
+            weights::weights_list,
+            weights::weights_delete,
+            app_quit,
+            autostart_set,
+            autostart_get,
+            tray::tray_sync,
+            window::window_prefs_set,
+            window::window_prefs_get,
+            update::update_check,
+            update::update_download,
+            update::update_install,
+            update::update_state,
         ])
         .build(tauri::generate_context!())
         .expect("error while building IdleToken client")
@@ -718,6 +855,10 @@ fn main() {
             // engine is the follow-up for that.)
             match event {
                 tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
+                    // Whatever asked for this (Cmd-Q, the session ending, our
+                    // own tray Quit), the window must stop trying to hide
+                    // itself from here on.
+                    QUITTING.store(true, std::sync::atomic::Ordering::SeqCst);
                     eprintln!("idletoken-client: shutdown event — stopping all sidecars");
                     let res = engine::stop_all(app);
                     eprintln!("idletoken-client: stop_all -> {res:?}");

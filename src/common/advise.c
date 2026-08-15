@@ -87,7 +87,20 @@ int idletoken_advise(const idletoken_node_mem *nodes, int n_nodes,
                 row->mode = IDLETOKEN_MODE_REFUSE;
                 continue;
             }
-            judge(m, quant, nodes, n_nodes, row);
+            /* A single-node model is judged against the BEST ONE machine, not
+             * the roster's sum — that is the only verdict the coordinator will
+             * honour (it refuses --num-workers > 1 for these). "Best" is by
+             * total usable memory, which is what the planner spends. */
+            if (!idletoken_model_may_cluster(m, NULL, 0)) {
+                int best = 0;
+                for (int i = 1; i < n_nodes; i++)
+                    if (nodes[i].vram_usable + nodes[i].ram_usable >
+                        nodes[best].vram_usable + nodes[best].ram_usable) best = i;
+                row->single_node = 1;
+                judge(m, quant, &nodes[best], 1, row);
+            } else {
+                judge(m, quant, nodes, n_nodes, row);
+            }
         }
     }
     return n;
@@ -127,21 +140,34 @@ void idletoken_advise_print(const idletoken_advice_row *rows, int n,
         const idletoken_advice_row *r = &rows[i];
         char ctx[16]; ctx_word(r->max_ctx, ctx);
         char size[16]; size_word(r->weight_bytes, size);
-        char note[64] = "";
+        char note[80] = "";
         if (r->unavailable)
             snprintf(note, sizeof note, "backend not implemented yet");
         else if (r->mode == IDLETOKEN_MODE_REFUSE && r->shortfall > 0)
-            snprintf(note, sizeof note, "needs %.0f GB more memory",
-                     (double)r->shortfall / GiB);
+            /* For a single-node model the shortfall is measured against ONE
+             * machine and more machines will not close it, so name the remedy
+             * that actually works instead of letting the footer's "add a
+             * machine" advice be read as applying to this row. */
+            snprintf(note, sizeof note, "needs %.0f GB more%s",
+                     (double)r->shortfall / GiB,
+                     r->single_node ? " on one machine — try a lower precision" : "");
         else if (r->mode == IDLETOKEN_MODE_HYBRID)
             snprintf(note, sizeof note, "slower: part of the model sits in RAM");
+        if (r->single_node && !r->unavailable && r->mode != IDLETOKEN_MODE_REFUSE) {
+            const size_t used = strlen(note);
+            snprintf(note + used, sizeof note - used, "%sruns on one machine",
+                     used ? "; " : "");
+        }
         printf("  %-22s %-8s %8s  %-18s %-8s %s\n",
                r->model_id, r->quant[0] ? r->quant : "-", size,
                mode_word(r), ctx, note);
     }
     printf("\n  \"yes (GPU only)\" is the fast path. \"yes (GPU + RAM)\" works but is\n"
-           "  slower. \"no\" tells you how much memory is missing — adding another\n"
-           "  machine to the cluster adds its memory to the pool.\n");
+           "  slower. \"no\" tells you how much memory is missing — for a cluster\n"
+           "  model, adding another machine adds its memory to the pool.\n"
+           "  Models marked \"runs on one machine\" are served by a single node:\n"
+           "  they are small enough that splitting them over a LAN would cost more\n"
+           "  in round-trips than it saves, so extra machines do not help them.\n");
 }
 
 /* JSON writer shared by the printing and buffer forms. `emit` appends to buf. */
@@ -160,7 +186,7 @@ int idletoken_advise_json(const idletoken_advice_row *rows, int n, int n_nodes,
         const idletoken_advice_row *r = &rows[i];
         EMIT("%s{\"id\":\"%s\",\"label\":\"%s\",\"quant\":\"%s\","
              "\"mode\":\"%s\",\"max_ctx\":%u,\"weight_bytes\":%llu,"
-             "\"shortfall_bytes\":%llu,\"available\":%s}",
+             "\"shortfall_bytes\":%llu,\"available\":%s,\"single_node\":%s}",
              i ? "," : "", r->model_id, r->label, r->quant,
              r->unavailable ? "unavailable"
                : r->mode == IDLETOKEN_MODE_GPU_ONLY ? "gpu_only"
@@ -168,7 +194,8 @@ int idletoken_advise_json(const idletoken_advice_row *rows, int n, int n_nodes,
              r->max_ctx,
              (unsigned long long)r->weight_bytes,
              (unsigned long long)r->shortfall,
-             r->unavailable ? "false" : "true");
+             r->unavailable ? "false" : "true",
+             r->single_node ? "true" : "false");
     }
     EMIT("]}");
     #undef EMIT

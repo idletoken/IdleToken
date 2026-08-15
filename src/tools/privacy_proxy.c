@@ -13,9 +13,9 @@
  * putting this proxy in front; turn it off by not running it.
  *
  * Endpoints (consumer-facing):
- *   GET  /v1/privacy/pubkey            -> {"pubkey":"<64-hex>","alg":"x25519"}
- *   POST /v1/privacy/messages          -> sealed; forwards to coord /v1/messages
- *   POST /v1/privacy/chat/completions  -> sealed; forwards to /v1/chat/completions
+ *   GET  /idletoken/v1/privacy/pubkey            -> {"pubkey":"<64-hex>","alg":"x25519"}
+ *   POST /idletoken/v1/privacy/messages          -> sealed; forwards to coord /v1/messages
+ *   POST /idletoken/v1/privacy/chat/completions  -> sealed; forwards to /v1/chat/completions
  *   (any other)                        -> 404
  *
  * The request body of the POSTs is a sealed request envelope (see
@@ -130,8 +130,8 @@ static void handle_conn(int conn_fd, const idletoken_keypair *node,
         return;
     }
 
-    /* GET /v1/privacy/pubkey — hand the consumer our public key. */
-    if (!strcmp(req.method, "GET") && !strcmp(req.path, "/v1/privacy/pubkey")) {
+    /* GET /idletoken/v1/privacy/pubkey — hand the consumer our public key. */
+    if (!strcmp(req.method, "GET") && !strcmp(req.path, IDLETOKEN_PATH_PRIV_PUBKEY)) {
         char hex[65]; idletoken_phttp_pk_to_hex(node->pk, hex);
         char body[128];
         int bl = snprintf(body, sizeof(body),
@@ -143,10 +143,10 @@ static void handle_conn(int conn_fd, const idletoken_keypair *node,
 
     /* Map the privacy path to the upstream coord path. */
     const char *upstream_path = NULL;
-    if (!strcmp(req.method, "POST") && !strcmp(req.path, "/v1/privacy/messages"))
-        upstream_path = "/v1/messages";
-    else if (!strcmp(req.method, "POST") && !strcmp(req.path, "/v1/privacy/chat/completions"))
-        upstream_path = "/v1/chat/completions";
+    if (!strcmp(req.method, "POST") && !strcmp(req.path, IDLETOKEN_PATH_PRIV_MSG))
+        upstream_path = IDLETOKEN_PATH_ANTHROPIC;
+    else if (!strcmp(req.method, "POST") && !strcmp(req.path, IDLETOKEN_PATH_PRIV_CHAT))
+        upstream_path = IDLETOKEN_PATH_OPENAI;
 
     if (!upstream_path) {
         idletoken_http_send_error(conn_fd, 404, "no such endpoint");

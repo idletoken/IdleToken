@@ -93,6 +93,19 @@ ssize_t idletoken_udp_recvfrom(int fd, void *buf, size_t cap,
  * to "127.0.0.1". Returns 0 / -1. */
 int idletoken_local_ipv4(char *out, size_t cap);
 
+/* True when `ip` (numeric IPv4 optionally with a ":port" suffix, or numeric
+ * IPv6) belongs to an overlay/VPN network that tensor traffic must NEVER
+ * cross (v2 plan hard invariant #3 — Tailscale's 100.64.0.0/10 CGNAT range:
+ * MTU 1280 plus packet reorder deadlocked a measured transfer after 353 MB).
+ * Also matches Tailscale's IPv6 range fd7a:115c:a1e0::/48; other ULA space
+ * (fc00::/7) is NOT matched — legitimate LANs use it. Compute traffic goes
+ * over the real LAN; discovery/pairing may go anywhere. */
+int idletoken_ip_is_overlay(const char *ip);
+
+/* True when `h` is exactly 64 hex chars followed by NUL (a 32-byte key in hex
+ * — the cluster RPC PSK format both the coord and the worker persist). */
+int idletoken_hex64_valid(const char *h);
+
 /* ---- Payload (de)serialization helpers --------------------------------
  *
  * `idletoken_buf` is a fixed-capacity bump cursor over a caller-owned buffer.

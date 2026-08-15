@@ -96,6 +96,35 @@ int idletoken_http_sse_event(int conn_fd, const char *event,
 #define IDLETOKEN_HDR_ORIGIN       "X-IdleToken-Origin"
 #define IDLETOKEN_ORIGIN_PLATFORM  "platform"
 
+/* Canonical route paths (docs/api-surface.md §4).
+ *
+ * The rule: everything under `/v1` carries SOMEBODY ELSE'S protocol (OpenAI,
+ * Anthropic) and nothing else; everything of ours lives under `/idletoken/v1`,
+ * spelled the same way on the coordinator and the cloud gateway. Before the
+ * prefix meant two different things on the two sides — the coordinator kept its
+ * control plane inside `/v1`, the gateway kept its outside — so "where does this
+ * new route go" had to be re-decided every time.
+ *
+ * Defined here rather than at each call site because the paths cross binaries:
+ * the platform agent polls the coordinator's stats, the privacy client dials the
+ * privacy proxy. Two copies of a string that must match is how a rename becomes
+ * a 404 nobody notices until a real-machine gate turns red. */
+#define IDLETOKEN_NS               "/idletoken/v1"
+#define IDLETOKEN_PATH_STATS       IDLETOKEN_NS "/stats"
+#define IDLETOKEN_PATH_CAPABILITY  IDLETOKEN_NS "/capability"
+#define IDLETOKEN_PATH_CLUSTER     IDLETOKEN_NS "/cluster/status"
+#define IDLETOKEN_PATH_TOKENIZE    IDLETOKEN_NS "/tokenize"
+#define IDLETOKEN_PATH_RENDEZVOUS  IDLETOKEN_NS "/rendezvous"
+#define IDLETOKEN_PATH_PRIV_PUBKEY IDLETOKEN_NS "/privacy/pubkey"
+#define IDLETOKEN_PATH_PRIV_MSG    IDLETOKEN_NS "/privacy/messages"
+#define IDLETOKEN_PATH_PRIV_CHAT   IDLETOKEN_NS "/privacy/chat/completions"
+/* Vendor-compatible routes (unchanged; listed so the split is visible in one
+ * place and nobody "tidies" them into the namespace above). */
+#define IDLETOKEN_PATH_OPENAI      "/v1/chat/completions"
+#define IDLETOKEN_PATH_ANTHROPIC   "/v1/messages"
+#define IDLETOKEN_PATH_MODELS      "/v1/models"
+#define IDLETOKEN_PATH_COUNT_TOK   "/v1/messages/count_tokens"
+
 /* Extract one header value by name (case-insensitive) from `req->headers`.
  * Copies the value (leading/trailing whitespace trimmed) into `out`.
  * Returns 0 on success, -1 if the header is absent (or was truncated away).
@@ -103,11 +132,23 @@ int idletoken_http_sse_event(int conn_fd, const char *event,
 int idletoken_http_header_get(const idletoken_http_req *req, const char *name,
                            char *out, size_t out_cap);
 
-/* --- tiny JSON helpers (just enough for v0.1 stubs) ----------------------
+/* Cut a "?query" suffix off `path` in place (route matching is exact-match;
+ * no current route consumes query parameters). NULL-safe. */
+void idletoken_http_path_strip_query(char *path);
+
+/* Does an `Authorization` header value carry `token`? Accepts the RFC form
+ * `Bearer <token>` (scheme case-insensitive) or the bare token. Plain strcmp
+ * is fine here — this guards a home LAN, not a hostile network (the privacy
+ * design's mTLS/envelope layers handle the latter). */
+int idletoken_http_auth_value_matches(const char *hval, const char *token);
+
+/* --- tiny JSON helpers ---------------------------------------------------
  *
- * We write JSON manually rather than pull a parser/emitter. v0.1 endpoints
- * have fixed-shape responses; switch to a real JSON library when scope
- * grows. */
+ * We write JSON manually rather than pull a parser/emitter: the coordinator's
+ * routes move fixed-shape bodies and raw still-escaped string spans, so a
+ * first-occurrence scan is the tolerance level throughout (see the relay code
+ * in coord_main.c and src/common/apiconv.c). Switch to a real JSON library if
+ * scope ever outgrows that. */
 
 /* Extract a UTF-8 string field from a flat JSON object. Returns 0/-1.
  * Naive — doesn't handle nested objects, escape sequences beyond \" and \\,

@@ -9,6 +9,7 @@
     "core:default",
     "core:window:allow-close",
     "core:window:allow-destroy",
+    "dialog:allow-open",
     "shell:allow-open",
     {
       "identifier": "shell:allow-execute",

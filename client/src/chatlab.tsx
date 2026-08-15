@@ -140,7 +140,7 @@ function Lab() {
             {lang === "en" ? "中文" : "EN"}
           </button>
         </header>
-        <Chat api={api} apiToken="" modelId="qwen3.5-4b" quant="Q4_K_M" maxTokens={0} identity={{ name: "Zhidong Gao", hue: 268 }} onGoCluster={() => {}} />
+        <Chat api={api} apiToken="" modelId="qwen3.5-4b" modelLabel="Qwen3.5 4B" quant="Q4_K_M" maxTokens={0} identity={{ name: "Ada Lovelace", hue: 268 }} onGoCluster={() => {}} />
       </div>
     </LangContext.Provider>
   );

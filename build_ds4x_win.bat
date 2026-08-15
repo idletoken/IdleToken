@@ -35,12 +35,22 @@ gcc -c src/common/weights.c -Isrc/platform/win -Iinclude -std=gnu11 -O2 -o weigh
 gcc -c src/common/model.c -Iinclude -std=gnu11 -O2 -o model.o >> ds4x_build.log 2>&1
 gcc -c src/common/gguf.c -Iinclude -std=gnu11 -O2 -o gguf.o >> ds4x_build.log 2>&1
 gcc -c src/common/discovery.c -D_GNU_SOURCE -Isrc/platform/win -Iinclude -include src/platform/win/win_compat.h -std=gnu11 -O2 -o discovery.o >> ds4x_build.log 2>&1
+REM node-crypto for the coord<->worker link (docs/inter-node-encryption.md):
+REM nodecrypt.c holds the counter-nonce framing, privacy.c the XSalsa20-Poly1305
+REM primitive, tweetnacl.c the vendored maths. Adding these to the Makefile is
+REM NOT enough — this script has its own list, and a file missing here shows up
+REM only as a Windows link error, on a machine nobody builds on daily.
+gcc -c src/common/nodecrypt.c -Iinclude -Ivendor/tweetnacl -std=gnu11 -O2 -o nodecrypt.o >> ds4x_build.log 2>&1
+gcc -c src/common/privacy.c -Isrc/platform/win -Iinclude -Ivendor/tweetnacl -include src/platform/win/win_compat.h -std=gnu11 -O2 -o privacy.o >> ds4x_build.log 2>&1
+REM TweetNaCl is third-party: -w for the same reason the Makefile gives.
+gcc -c vendor/tweetnacl/tweetnacl.c -Ivendor/tweetnacl -std=gnu11 -O2 -w -o tweetnacl.o >> ds4x_build.log 2>&1
 REM plan.c + advise.c: the worker's --advise / --advise-json capability report
 REM (and plan.c, which advise.c builds on). The Linux Makefile has always linked
 REM these into the worker; this script did not, so the moment worker_main.c
 REM actually called idletoken_advise* the Windows link died on three undefined
 REM references. Keep the two build paths in step.
 gcc -c src/common/plan.c -Iinclude -std=gnu11 -O2 -o plan.o >> ds4x_build.log 2>&1
+gcc -c src/common/enginever.c -Iinclude -std=gnu11 -O2 -o enginever.o >> ds4x_build.log 2>&1
 gcc -c src/common/advise.c -Iinclude -std=gnu11 -O2 -o advise.o >> ds4x_build.log 2>&1
 
 echo === ds4x ===>> ds4x_build.log
@@ -69,5 +79,5 @@ echo === link ===>> ds4x_build.log
 REM -static-libgcc + static winpthread: so the exe can be copied to another
 REM Windows box that has no MinGW on PATH (the 2070 laptop). Without it the
 REM process dies before main() with NO output at all — not even --help.
-gcc -static-libgcc -o idletoken-worker.exe worker_main.o ds4.o rax.o win_compat.o net.o resource.o weights.o model.o gguf.o discovery.o plan.o advise.o ds4x_config.o ds4x_quant.o ds4x_forward.o ds4x_model.o ds4x_runner.o -L. -lds4cuda -lds4xcuda -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic -lws2_32 -lbcrypt >> ds4x_build.log 2>&1
+gcc -static-libgcc -o idletoken-worker.exe worker_main.o ds4.o rax.o win_compat.o net.o resource.o weights.o model.o gguf.o discovery.o nodecrypt.o privacy.o tweetnacl.o plan.o advise.o enginever.o ds4x_config.o ds4x_quant.o ds4x_forward.o ds4x_model.o ds4x_runner.o -L. -lds4cuda -lds4xcuda -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic -lws2_32 -lbcrypt >> ds4x_build.log 2>&1
 echo LINK_DONE >> ds4x_build.log

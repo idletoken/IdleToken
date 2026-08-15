@@ -25,12 +25,21 @@ if "%CUDAVER%"=="" set "CUDAVER=v12.8"
 cd /d "%USERPROFILE%\IdleToken"
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
 set "PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\%CUDAVER%\bin;%PATH%"
+REM cuBLAS is DELAY-LOADED, same as build_ds4cuda.ps1 (product decision
+REM 2026-08-04: cublas64_12.dll is Toolkit-only, not driver). A normal import
+REM kills a driver-only machine at 0xC0000135 before main() — measured on the
+REM installed package, win_PC2, 2026-08-16, after this bat drifted from the
+REM ps1 (two copies of the same link line; this one lacked the flags).
 nvcc -O3 --use_fast_math -shared -o ds4xcuda.dll src\ds4x\ds4x_cuda.cu ^
   -I include ^
   -gencode arch=compute_75,code=sm_75 ^
   -gencode arch=compute_120,code=sm_120 ^
   -gencode arch=compute_120,code=compute_120 ^
   -Xlinker /DEF:src\platform\win\ds4xcuda.def ^
+  -Xlinker /DELAYLOAD:cublas64_12.dll ^
+  -Xlinker delayimp.lib ^
+  -lcublas ^
   -cudart static
-echo NVCC_EXIT=%ERRORLEVEL%
-endlocal
+set "NVCC_RC=%ERRORLEVEL%"
+echo NVCC_EXIT=%NVCC_RC%
+endlocal & exit /b %NVCC_RC%

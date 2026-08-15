@@ -83,7 +83,13 @@ void idletoken_hmac_sha256(const uint8_t *key, size_t key_len,
                         uint8_t out[32]);
 
 /* Fill `buf` with `n` cryptographically-strong random bytes. Returns 0 / -1. */
-int idletoken_random_bytes(void *buf, size_t n);
+/* Renamed from idletoken_random_bytes (2026-08-13). That name is ALSO a public
+ * function in idletoken_privacy.h, with a different signature (void vs int,
+ * uint8_t* vs void*). The two never landed in one binary, so the clash sat
+ * there unnoticed until the coordinator started linking both for the node-crypto
+ * layer -- at which point it was a duplicate-symbol link error, which is the
+ * lucky outcome. Discovery-scoped name so it cannot happen again. */
+int idletoken_disc_random_bytes(void *buf, size_t n);
 
 /* ---- discovery provider vtable ------------------------------------------- */
 
@@ -168,5 +174,26 @@ int idletoken_pair_client_auth(int fd, const idletoken_pair_id *id,
  * auth failure (a rejecting PAIR_ACCEPT is still sent so the worker learns why). */
 int idletoken_pair_server_auth(int fd, const idletoken_pair_id *id,
                             uint8_t session_key[IDLETOKEN_SESSION_KEY_BYTES]);
+
+/* ---- secret wrapping under the pairing session key ----------------------
+ *
+ * Carries a 32-byte secret (the cluster's ggml-RPC TLS PSK, v2 WS-C2) over
+ * the already-authenticated pairing channel without ever putting it on the
+ * LAN in the clear. Keystream and tag are HMAC-SHA256 under the session key
+ * with domain-separated labels; `nonce` must be fresh per wrap (caller mints
+ * it with idletoken_disc_random_bytes and sends it alongside). */
+void idletoken_pair_wrap_secret(const uint8_t session_key[IDLETOKEN_SESSION_KEY_BYTES],
+                                const uint8_t nonce[IDLETOKEN_PAIR_NONCE_BYTES],
+                                const uint8_t secret[IDLETOKEN_SESSION_KEY_BYTES],
+                                uint8_t ct[IDLETOKEN_SESSION_KEY_BYTES],
+                                uint8_t tag[IDLETOKEN_PAIR_TAG_BYTES]);
+
+/* Reverse of the above. Returns 0 and fills `secret` when the tag verifies,
+ * -1 (secret zeroed) otherwise. */
+int idletoken_pair_unwrap_secret(const uint8_t session_key[IDLETOKEN_SESSION_KEY_BYTES],
+                                 const uint8_t nonce[IDLETOKEN_PAIR_NONCE_BYTES],
+                                 const uint8_t ct[IDLETOKEN_SESSION_KEY_BYTES],
+                                 const uint8_t tag[IDLETOKEN_PAIR_TAG_BYTES],
+                                 uint8_t secret[IDLETOKEN_SESSION_KEY_BYTES]);
 
 #endif /* IDLETOKEN_DISCOVERY_H */

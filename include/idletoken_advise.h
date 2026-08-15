@@ -35,6 +35,12 @@ typedef struct {
     uint64_t    weight_bytes;   /* download size at this precision */
     uint64_t    shortfall;  /* bytes of memory still missing (REFUSE only) */
     int         unavailable;/* model not runnable in this build (manifest flag) */
+    /* 1 = this model is single-node-only, so the verdict was computed against
+     * the BEST ONE machine in the roster rather than their sum. Without this
+     * the advisor would answer "yes" for a 20 GiB model on four 8 GiB machines
+     * and the coordinator would then refuse to start it — a capability table
+     * that disagrees with the planner is worse than none. */
+    int         single_node;
 } idletoken_advice_row;
 
 /* Fill `out` with one row per (model, precision). Returns the number of rows
@@ -50,7 +56,7 @@ void idletoken_advise_print(const idletoken_advice_row *rows, int n,
                          int n_nodes, const char *hw_line);
 
 /* One JSON object: {"nodes":N,"models":[{...}]}. Consumed by the client and by
- * the coordinator's GET /v1/capability. */
+ * the coordinator's GET /idletoken/v1/capability. */
 void idletoken_advise_print_json(const idletoken_advice_row *rows, int n, int n_nodes);
 
 /* Same JSON, into a caller-provided buffer (the coordinator serves it over

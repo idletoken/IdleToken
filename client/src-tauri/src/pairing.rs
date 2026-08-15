@@ -10,12 +10,11 @@
 //   join    → listen for a beacon whose hash matches the typed code, then
 //             register over TCP (the full code is the proof) and poll the
 //             roster.
-//   start   → the creator freezes the roster: the chosen coordinator machine
-//             starts `idletoken-coord --num-workers N --http`, every other
-//             machine starts `idletoken-worker --coordinator <addr>`. The engine
-//             supervisor's backoff restart makes start order irrelevant —
-//             workers that dial too early simply retry.
-//   ready   → everyone polls the coordinator's `GET /v1/cluster/status` and
+//   start   → the creator freezes the roster: the chosen coordinator starts
+//             idletoken-coord in llama.cpp mode; every other machine starts
+//             idletoken-worker --rpc-supervisor. Pairing transports the RPC
+//             TLS credential and the coordinator drives one llama-server.
+//   ready   → everyone polls the coordinator's `GET /idletoken/v1/cluster/status` and
 //             merges the real stage/layer plan into the roster.
 //
 // State is pushed to the webview as `pairing:status` events mirroring the TS
@@ -38,15 +37,10 @@ const ROSTER_PORT: u16 = 14098;
 /// Engine defaults (worker-facing coord port / coord HTTP API port).
 const COORD_PORT: u16 = 14100;
 const API_PORT: u16 = 8000;
-/// Default inter-stage (HC) port a worker binds (settings.interStagePort).
-/// The coordinator machine's co-located worker binds this + 1 so it never
-/// collides with a worker sharing the same host — e.g. two test instances on
-/// one box, or any future same-machine layout.
+/// Default ggml-RPC port a worker binds (the setting retains its historical
+/// interStagePort name for storage compatibility).
 const INTER_STAGE_PORT: u16 = 14101;
-/// Port the coordinator serves the layer-shard weight repo on (an isolated
-/// `idletoken-worker --serve-weights` sidecar). Remote workers fetch only their
-/// assigned layers from here instead of holding the whole 80GB GGUF.
-const WEIGHT_PORT: u16 = 8001;
+const LLAMA_PORT: u16 = 18081;
 
 /// Engine tuning derived from the client's settings panel and passed along
 /// with `pairing_create` / `pairing_join` (task 1.2: AppSettings → engine CLI
@@ -63,7 +57,7 @@ pub struct Tuning {
     /// Coord HTTP API bind host (settings.apiHost) → `--api-bind host:port`.
     api_host: String,
     /// Coord HTTP API port (settings.apiPort). The creator broadcasts it via
-    /// the roster so joiners poll /v1/cluster/status on the right port.
+    /// the roster so joiners poll /idletoken/v1/cluster/status on the right port.
     api_port: u16,
     /// Coord API access token (settings.apiToken) → `--api-token`. Empty =
     /// no auth (LAN default). Never broadcast over the roster.
@@ -90,6 +84,51 @@ pub struct Tuning {
     /// 0 = bounded only by the remaining context.
     #[serde(default = "default_max_decode")]
     max_decode: u32,
+    /// How much of THIS machine IdleToken may use (settings "This machine's
+    /// usage") → worker `--max-vram-mb` / `--max-ram-mb`, MiB, 0 = no cap.
+    ///
+    /// Per-machine, so it is never adopted from the roster the way model_id and
+    /// quant are: the creator's "conservative" says nothing about how much of
+    /// YOUR computer you are lending. Until 2026-08-13 these never left the
+    /// client — the probe was told, the serving worker was not, so the setting
+    /// changed the dashboard's numbers and nothing else.
+    #[serde(default)]
+    max_vram_mb: u64,
+    #[serde(default)]
+    max_ram_mb: u64,
+    // ---- pairing behaviour (settings "Pairing & discovery") ------------------
+    // Wired on 2026-08-13. Before that these six were rendered as live controls
+    // and read by nobody; settings.ts resets stored values once (schema v3)
+    // because a value nothing obeyed is not a choice.
+    /// Announce (creator) / listen for (joiner) the UDP discovery beacon.
+    /// False = this machine pairs only through `manual_peers`.
+    #[serde(default = "default_true")]
+    lan_discovery: bool,
+    /// Comma-separated IPs to dial directly when the beacon finds nothing.
+    #[serde(default)]
+    manual_peers: String,
+    /// Roster poll interval in seconds (clamped 1..=60 at use).
+    #[serde(default = "default_heartbeat")]
+    heartbeat_sec: u32,
+    /// Joiner asks the creator to hand it the coordinator role.
+    #[serde(default)]
+    prefer_coordinator: bool,
+    /// Refuse peers outside this machine's /24.
+    #[serde(default)]
+    same_subnet_only: bool,
+    /// "auto"/empty, or an IPv4 this machine binds to and advertises.
+    #[serde(default)]
+    bind_nic: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// 1s — what the roster loop has always slept, so a payload that omits the
+/// field behaves exactly as before it existed.
+fn default_heartbeat() -> u32 {
+    1
 }
 
 /// 0 = context-bound, matching DEFAULT_SETTINGS.maxTokens. A different number
@@ -112,11 +151,19 @@ impl Default for Tuning {
             quant: String::new(),
             ctx_size: 8192,
             max_decode: default_max_decode(),
+            max_vram_mb: 0,
+            max_ram_mb: 0,
+            lan_discovery: true,
+            manual_peers: String::new(),
+            heartbeat_sec: default_heartbeat(),
+            prefer_coordinator: false,
+            same_subnet_only: false,
+            bind_nic: String::new(),
         }
     }
 }
 
-const BEACON_MAGIC: &str = "HOMEAI1";
+const BEACON_MAGIC: &str = "IDLETOKEN1";
 
 /// Windows only: allow the pairing traffic *inbound* before we start listening.
 ///
@@ -174,6 +221,13 @@ fn ensure_pairing_firewall(discovery_port: u16) {
 #[cfg(not(windows))]
 fn ensure_pairing_firewall(_discovery_port: u16) {}
 
+/// A member that has not polled the creator's roster for this long is marked
+/// offline (audit 2.8: a dead/unplugged machine used to stay green in the
+/// member list forever — the protocol only knew a voluntary "leave"). The
+/// effective timeout per member is `max(OFFLINE_AFTER_S, 3 × its poll
+/// interval)`, so a deliberately slow heartbeat setting does not flap.
+const OFFLINE_AFTER_S: u64 = 30;
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")] // TS PeerNode: layerLo / layerHi
 pub struct Peer {
@@ -188,6 +242,19 @@ pub struct Peer {
     layer_lo: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     layer_hi: Option<u32>,
+    /// false = no roster poll from this member within its timeout (creator
+    /// side; joiners adopt the flag from the roster broadcast). Not removal:
+    /// the machine may come back, and a re-register under the same id — the
+    /// joiner loop re-joins on its own — flips it online again.
+    online: bool,
+    /// When the creator last heard this member (join or roster poll). None on
+    /// the creator's own entry and on joiner-side mirrors — never swept.
+    #[serde(skip)]
+    last_seen: Option<std::time::Instant>,
+    /// The member's own roster poll interval (from its "hb" field), seconds.
+    /// 0 = not reported → the default timeout applies.
+    #[serde(skip)]
+    hb_secs: u32,
     #[serde(skip)]
     ip: String,
 }
@@ -202,6 +269,10 @@ enum Mode {
 struct Inner {
     mode: Mode,
     code: Option<String>,
+    /// Six-character engine pairing identity. Kept separately because joiners
+    /// hide the presentation code and account-mode secrets are not themselves
+    /// valid `--pair-code` values.
+    engine_code: String,
     self_id: String,
     self_host: String,
     self_gpu: String,
@@ -211,14 +282,9 @@ struct Inner {
     phase: String,
     /// ip of the machine running idletoken-coord (set at start)
     coord_ip: Option<String>,
-    /// this machine's local GGUF path (from settings.ggufPath). Empty = mock
-    /// load (P3: no model needed). Non-empty = real DSv4 weights → passed to
-    /// this machine's coord/worker so they load the model (P4/P6, task #5).
+    /// The GGUF is required on the coordinator. rpc workers do not open it;
+    /// llama-server streams their assigned tensors over authenticated RPC.
     model_path: String,
-    /// URL of the coordinator's layer-shard weight repo (set by the creator
-    /// when it has a model, propagated to joiners via the roster). Remote
-    /// workers fetch only their layers from here.
-    shard_repo: String,
     engine_started: bool,
     /// Account-mode pairing (integration plan 3.3): the "code" is a secret
     /// derived on the JS side from stable account material (platform user id +
@@ -228,6 +294,13 @@ struct Inner {
     /// the snapshot hides `code` (nothing to read aloud) and sets
     /// `accountMode` so the UI labels the cluster as account-formed.
     account_mode: bool,
+    /// Last pairing failure, as (code, detail), surfaced in the snapshot so the
+    /// UI can say WHY a join died instead of silently resetting to idle (which
+    /// looked exactly like the button doing nothing). `code` is a stable
+    /// identifier the front end maps to a localized sentence; `detail` carries
+    /// the variable part (the discovery port, or the creator's verbatim
+    /// rejection). Cleared on every new create/join/leave.
+    last_error: Option<(String, String)>,
     generation: u64,
     /// Settings-derived engine tuning (defaults = historical hard-coded
     /// ports). On a joiner, `api_port` is overwritten by the roster so it
@@ -242,6 +315,7 @@ impl Default for Pairing {
         Pairing(Mutex::new(Inner {
             mode: Mode::Off,
             code: None,
+            engine_code: String::new(),
             self_id: String::new(),
             self_host: String::new(),
             self_gpu: String::new(),
@@ -250,9 +324,9 @@ impl Default for Pairing {
             phase: "idle".into(),
             coord_ip: None,
             model_path: String::new(),
-            shard_repo: String::new(),
             engine_started: false,
             account_mode: false,
+            last_error: None,
             generation: 0,
             tuning: Tuning::default(),
         }))
@@ -268,6 +342,26 @@ fn code_hash(code: &str) -> String {
         h = h.wrapping_mul(0x100000001b3);
     }
     format!("{h:016x}")
+}
+
+/// Convert the roster proof into the native engine's six-character pairing
+/// alphabet. Human code mode remains byte-for-byte identical. Account mode
+/// starts from a SHA-256-derived secret and maps its FNV digest to 30 bits —
+/// the same online guessing bar as a normal join code, without exposing the
+/// account secret to the engine command line.
+fn engine_pair_code(proof: &str, account_mode: bool) -> String {
+    if !account_mode {
+        return proof.trim().to_uppercase();
+    }
+    const ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in proof.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    (0..6)
+        .map(|i| ALPHABET[((h >> (i * 5)) & 31) as usize] as char)
+        .collect()
 }
 
 fn snapshot_json(inner: &Inner) -> Value {
@@ -287,6 +381,12 @@ fn snapshot_json(inner: &Inner) -> Value {
         } else { None },
         "source": "engine",
         "canStart": inner.mode == Mode::Creator && inner.phase == "idle" && inner.peers.len() >= 2,
+        // Why the last join attempt failed (see Inner::last_error). null while
+        // nothing has failed, or after a new attempt started.
+        "lastError": inner
+            .last_error
+            .as_ref()
+            .map(|(code, detail)| json!({ "code": code, "detail": detail })),
     })
 }
 
@@ -304,9 +404,8 @@ fn roster_reply(inner: &Inner) -> Value {
         "phase": inner.phase,
         "coordinatorId": inner.coordinator_id,
         "coordIp": inner.coord_ip,
-        "shardRepo": inner.shard_repo,
         // The creator's configured API port, so a joiner with different (or
-        // default) settings still polls /v1/cluster/status on the right port.
+        // default) settings still polls /idletoken/v1/cluster/status on the right port.
         // The token itself is NOT broadcast — status stays unauthenticated.
         "apiPort": inner.tuning.api_port,
         // The cluster's model is the CREATOR's choice; joiners adopt it so
@@ -318,6 +417,9 @@ fn roster_reply(inner: &Inner) -> Value {
         "members": inner.peers.iter().map(|p| json!({
             "id": p.id, "hostname": p.hostname, "gpu": p.gpu, "ip": p.ip,
             "stage": p.stage,
+            // Liveness travels with the roster so every member's UI shows the
+            // same offline states the creator sees.
+            "online": p.online,
         })).collect::<Vec<_>>(),
     })
 }
@@ -332,18 +434,29 @@ fn stage_for_engine(state: &str) -> &'static str {
     }
 }
 
-/// Apply a roster reply on the joiner side. Returns true when the engine for
-/// this machine must be started now (phase flipped to starting).
-fn apply_roster(inner: &mut Inner, v: &Value) -> bool {
+/// What the joiner must do after a roster reply.
+#[derive(Default)]
+struct RosterEffect {
+    /// The cluster flipped to "starting": launch this machine's engine.
+    start_engine: bool,
+    /// The cluster was torn down and is forming again (the coordinator switched
+    /// model, or restarted for any other reason). Our worker is loaded with the
+    /// OLD weights, so it has to go before the next start can bring up the new
+    /// ones.
+    stop_engine: bool,
+    /// We are not in the roster any more — re-send "join". Without this a
+    /// coordinator restart silently strands every other machine: the joiner
+    /// keeps polling with op="roster", which the new creator answers politely
+    /// and ignores, so the machine never reappears in anyone's list.
+    rejoin: bool,
+}
+
+/// Apply a roster reply on the joiner side.
+fn apply_roster(inner: &mut Inner, v: &Value) -> RosterEffect {
     let members = v["members"].as_array().cloned().unwrap_or_default();
     let coordinator_id = v["coordinatorId"].as_str().map(String::from);
     let phase = v["phase"].as_str().unwrap_or("idle").to_string();
     let coord_ip = v["coordIp"].as_str().map(String::from);
-    if let Some(sr) = v["shardRepo"].as_str() {
-        if !sr.is_empty() {
-            inner.shard_repo = sr.to_string();
-        }
-    }
     // Adopt the creator's API port (see roster_reply): the coordinator's
     // engine binds it, so status polling and the exposed baseUrl must match.
     if let Some(p) = v["apiPort"].as_u64() {
@@ -378,40 +491,117 @@ fn apply_roster(inner: &mut Inner, v: &Value) -> bool {
                 gpu: m["gpu"].as_str().unwrap_or("").to_string(),
                 layer_lo: None,
                 layer_hi: None,
+                // Adopted from the creator's sweep; absent (older creator)
+                // reads as online, which is what the field's absence meant.
+                online: m["online"].as_bool().unwrap_or(true),
+                last_seen: None,
+                hb_secs: 0,
                 ip: m["ip"].as_str().unwrap_or("").to_string(),
             }
         })
         .collect();
     inner.coordinator_id = coordinator_id;
-    let must_start = phase == "starting" && inner.phase == "idle" && !inner.engine_started;
-    if inner.phase != "ready" {
+    let mut eff = RosterEffect::default();
+    eff.rejoin = !inner.peers.iter().any(|p| p.is_self);
+    eff.start_engine = phase == "starting" && inner.phase == "idle" && !inner.engine_started;
+    // Back to "idle" after we had already started means the cluster we belong
+    // to no longer exists in the form we joined. Drop our engine and re-arm, so
+    // the next "starting" launches a worker for whatever model the coordinator
+    // has now (its weight server is the source, so nothing local to update).
+    eff.stop_engine = phase == "idle" && inner.engine_started;
+    if eff.stop_engine {
+        inner.engine_started = false;
+    }
+    // `!= "ready"` keeps a locally-ready worker from regressing to the
+    // coordinator's "starting"; "idle" is the exception, because that is the
+    // teardown above and pinning ready through it would freeze the UI on a
+    // cluster that is gone.
+    if inner.phase != "ready" || phase == "idle" {
         inner.phase = phase;
     }
     inner.coord_ip = coord_ip;
-    must_start
+    eff
 }
 
-/// Model-path args for one of this machine's engines (empty = mock load, P3).
-/// The coord and worker binaries spell the flag differently: coord takes
-/// `--model-path` (it propagates the path to workers via ASSIGN_PLAN), the
-/// worker takes `--model`.
-fn model_args(role: &str, model_path: &str) -> Vec<String> {
-    if model_path.is_empty() {
-        Vec::new()
-    } else if role == "coordinator" {
-        vec!["--model-path".into(), model_path.to_string()]
-    } else {
-        vec!["--model".into(), model_path.to_string()]
+/// The address this machine binds cluster traffic to and advertises to the
+/// others: the "Bind interface / IP" setting when it is a usable IPv4,
+/// otherwise whatever the OS routes from (`local_lan_ip`).
+///
+/// One function for both jobs on purpose. Binding to a specific NIC while
+/// still telling peers the auto-detected address is the multi-homed failure
+/// mode that produces "connection refused" against a machine that is plainly
+/// up — the two answers have to come from the same place.
+fn self_ip(tuning: &Tuning) -> String {
+    let nic = tuning.bind_nic.trim();
+    if !nic.is_empty() && nic != "auto" && nic.parse::<std::net::Ipv4Addr>().is_ok() {
+        return nic.to_string();
+    }
+    local_lan_ip()
+}
+
+/// Bind host for listeners: a chosen NIC, else every interface.
+fn bind_host(tuning: &Tuning) -> String {
+    let nic = tuning.bind_nic.trim();
+    if !nic.is_empty() && nic != "auto" && nic.parse::<std::net::Ipv4Addr>().is_ok() {
+        return nic.to_string();
+    }
+    "0.0.0.0".into()
+}
+
+/// Same /24? Used by "Only same subnet" on both sides of the handshake.
+/// IPv6 and unparseable addresses are treated as "not the same subnet": the
+/// setting is a restriction, and a restriction that silently passes whatever it
+/// cannot classify is not one.
+fn same_subnet(a: &str, b: &str) -> bool {
+    match (a.parse::<std::net::Ipv4Addr>(), b.parse::<std::net::Ipv4Addr>()) {
+        (Ok(x), Ok(y)) => x.octets()[..3] == y.octets()[..3],
+        _ => false,
     }
 }
 
+/// The manual peer list, cleaned up. Accepts commas, spaces or newlines so a
+/// pasted list works whatever it was copied from.
+fn manual_peer_list(tuning: &Tuning) -> Vec<String> {
+    tuning
+        .manual_peers
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// Roster poll interval. Clamped: 0 would spin, and anything past a minute
+/// makes the member list look frozen.
+fn heartbeat(tuning: &Tuning) -> Duration {
+    Duration::from_secs(tuning.heartbeat_sec.clamp(1, 60) as u64)
+}
+
+/// "This machine's usage" as rpc-supervisor flags. The worker probes and sends
+/// these capped resources in HELLO; the llama.cpp planner consumes them.
+///
+/// 0 = no cap, and then no flag at all: an explicit `--max-vram-mb 0` and a
+/// missing flag mean the same thing to the worker, but the shorter command line
+/// is the one that reads correctly in a log.
+fn usage_cap_args(tuning: &Tuning) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    if tuning.max_vram_mb > 0 {
+        v.push("--max-vram-mb".into());
+        v.push(tuning.max_vram_mb.to_string());
+    }
+    if tuning.max_ram_mb > 0 {
+        v.push("--max-ram-mb".into());
+        v.push(tuning.max_ram_mb.to_string());
+    }
+    v
+}
+
 /// Start this machine's engine(s) per its role in the frozen roster. The
-/// coordinator machine runs BOTH idletoken-coord AND a co-located idletoken-worker so
-/// it also contributes compute (task #4); a plain worker machine runs one
-/// worker. `--num-workers` therefore counts every non-coordinator machine plus
-/// the coordinator's own worker.
+/// coordinator's llama-server uses local compute directly; only other machines
+/// run rpc-supervisors. There is deliberately no co-located RPC worker and no
+/// legacy layer-shard server in this topology.
 fn materialize_engine(app: &AppHandle) {
-    let (is_coord, coord_ip, workers, model_path, shard_repo, tuning) = {
+    let (is_coord, coord_ip, remote_workers, model_path, engine_code, tuning) = {
         let pairing = app.state::<Pairing>();
         let mut inner = pairing.0.lock().unwrap();
         if inner.engine_started {
@@ -419,82 +609,71 @@ fn materialize_engine(app: &AppHandle) {
         }
         inner.engine_started = true;
         let is_coord = inner.coordinator_id.as_deref() == Some(inner.self_id.as_str());
-        // one worker per non-coordinator machine + one on the coordinator itself
-        let workers = inner.peers.iter().filter(|p| p.role != "coordinator").count() + 1;
+        let remote_workers = inner.peers.iter().filter(|p| p.role != "coordinator").count();
         (
             is_coord,
             inner.coord_ip.clone().unwrap_or_default(),
-            workers,
+            remote_workers,
             inner.model_path.clone(),
-            inner.shard_repo.clone(),
+            inner.engine_code.clone(),
             inner.tuning.clone(),
         )
     };
     if is_coord {
-        // 0) the layer-shard weight repo: an isolated idletoken-worker sidecar
-        //    serving the master GGUF over HTTP byte-range so remote workers
-        //    fetch only their layers. Only when we actually have the model.
-        if !model_path.is_empty() {
-            let weights_args = vec![
-                "--serve-weights".into(), model_path.clone(),
-                "--weights-port".into(), WEIGHT_PORT.to_string(),
-            ];
-            if let Err(e) = crate::engine::start_engine(app, "weights".into(), weights_args, Vec::new()) {
-                eprintln!("[pairing] weight server start failed: {e}");
-            }
+        if model_path.is_empty() {
+            eprintln!("[pairing] coordinator start refused: no GGUF file selected");
+            return;
         }
-        // 1) the coordinator process (loads the model locally for the tokenizer)
+        let engine_bin = match crate::engine::llama_server_bin() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[pairing] coordinator start refused: {e}");
+                return;
+            }
+        };
+        let host = bind_host(&tuning);   // "Bind interface / IP", else 0.0.0.0
         let mut coord_args = vec![
-            "--bind".into(), format!("0.0.0.0:{COORD_PORT}"),
-            "--num-workers".into(), workers.to_string(),
+            "--bind".into(), format!("{host}:{COORD_PORT}"),
+            "--llama-server-bin".into(), engine_bin.to_string_lossy().into_owned(),
+            "--llama-gguf".into(), model_path,
+            "--llama-port".into(), LLAMA_PORT.to_string(),
             "--http".into(),
             "--api-bind".into(), format!("{}:{}", tuning.api_host, tuning.api_port),
-            "--n-predict".into(), "0".into(),
-            "--model-id".into(), tuning.model_id.clone(),
             "--ctx-size".into(), tuning.ctx_size.to_string(),
             "--max-decode".into(), tuning.max_decode.to_string(),
         ];
+        if remote_workers > 0 {
+            coord_args.push("--num-workers".into());
+            coord_args.push(remote_workers.to_string());
+            coord_args.push("--pair-code".into());
+            coord_args.push(engine_code);
+        }
         if !tuning.api_token.is_empty() {
             coord_args.push("--api-token".into());
             coord_args.push(tuning.api_token.clone());
         }
-        // Selected precision (small models). Empty = coord uses the model's
-        // default variant, so only pass the flag when a quant was chosen.
-        if !tuning.quant.is_empty() {
-            coord_args.push("--quant".into());
-            coord_args.push(tuning.quant.clone());
-        }
-        coord_args.extend(model_args("coordinator", &model_path));
         if let Err(e) = crate::engine::start_engine(app, "coordinator".into(), coord_args, Vec::new()) {
             eprintln!("[pairing] coord start failed: {e}");
         }
-        // 2) a co-located worker so the coordinator machine also serves layers,
-        //    dialing the coord over loopback. It has the model locally, so it
-        //    loads from disk (no shard fetch). Binds interStagePort+1 (default
-        //    14102) so it never collides with a plain worker on the same host.
-        let mut worker_args = vec![
-            "--coordinator".into(), format!("127.0.0.1:{COORD_PORT}"),
-            "--bind".into(), format!("0.0.0.0:{}", tuning.inter_stage_port.saturating_add(1)),
-        ];
-        worker_args.extend(model_args("worker", &model_path));
-        if let Err(e) = crate::engine::start_engine(app, "worker".into(), worker_args, Vec::new()) {
-            eprintln!("[pairing] co-located worker start failed: {e}");
-        }
     } else {
-        // Remote worker: fetch only our layers from the coordinator's repo when
-        // one was advertised (no local 80GB GGUF needed); else fall back to a
-        // local model path if this machine happens to have one.
-        let mut worker_args = vec![
-            "--coordinator".into(), format!("{coord_ip}:{COORD_PORT}"),
-            "--bind".into(), format!("0.0.0.0:{}", tuning.inter_stage_port),
-        ];
-        let env = if !shard_repo.is_empty() {
-            vec![("IDLETOKEN_SHARD_REPO".into(), shard_repo.clone())]
-        } else {
-            worker_args.extend(model_args("worker", &model_path));
-            Vec::new()
+        let engine_dir = match crate::engine::llama_engine_dir() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[pairing] rpc worker start refused: {e}");
+                return;
+            }
         };
-        if let Err(e) = crate::engine::start_engine(app, "worker".into(), worker_args, env) {
+        let mut worker_args = vec![
+            "--rpc-supervisor".into(),
+            "--engine-dir".into(), engine_dir.to_string_lossy().into_owned(),
+            "--pair-code".into(), engine_code,
+            "--coordinator".into(), format!("{coord_ip}:{COORD_PORT}"),
+            "--discovery-port".into(), tuning.discovery_port.to_string(),
+            "--rpc-host".into(), self_ip(&tuning),
+            "--rpc-port".into(), tuning.inter_stage_port.to_string(),
+        ];
+        worker_args.extend(usage_cap_args(&tuning));
+        if let Err(e) = crate::engine::start_engine(app, "worker".into(), worker_args, Vec::new()) {
             eprintln!("[pairing] worker start failed: {e}");
         }
     }
@@ -569,12 +748,20 @@ fn merge_engine_status(app: &AppHandle) -> bool {
             _ => return false,
         }
     };
-    let Some(body) = http_get_body(&coord_ip, api_port, "/v1/cluster/status") else {
+    let Some(body) = http_get_body(&coord_ip, api_port, "/idletoken/v1/cluster/status") else {
         return false;
     };
     let Ok(v) = serde_json::from_str::<Value>(&body) else {
         return false;
     };
+    if v["phase"].as_str() != Some("ready") {
+        return false;
+    }
+    if let Some(state) = v["engine_state"].as_str() {
+        if state != "ready" {
+            return false;
+        }
+    }
     let members = v["members"].as_array().cloned().unwrap_or_default();
     let pairing = app.state::<Pairing>();
     let mut inner = pairing.0.lock().unwrap();
@@ -613,11 +800,25 @@ fn handle_roster_conn(app: &AppHandle, stream: TcpStream, generation: u64) {
     }
     let reply = match req["op"].as_str() {
         Some("join") => {
-            if req["code"].as_str() != inner.code.as_deref() {
+            // "Only same subnet": refuse before the code is even considered, and
+            // say why. A silent drop here is indistinguishable from a firewall
+            // and would send someone hunting the wrong problem.
+            if inner.tuning.same_subnet_only && !same_subnet(&peer_ip, &self_ip(&inner.tuning)) {
+                json!({"ok": false, "err": "different subnet (this cluster is restricted to one subnet)"})
+            } else if req["code"].as_str() != inner.code.as_deref() {
                 json!({"ok": false, "err": "bad code"})
             } else {
                 let id = req["hostname"].as_str().unwrap_or("?").to_string();
-                if !inner.peers.iter().any(|p| p.id == id) {
+                let hb = req["hb"].as_u64().unwrap_or(0) as u32;
+                if let Some(p) = inner.peers.iter_mut().find(|p| p.id == id) {
+                    // Re-register under a known id: the machine is back (or
+                    // re-joined after a creator restart). Refresh liveness and
+                    // its address — a reboot may have changed the IP.
+                    p.online = true;
+                    p.last_seen = Some(std::time::Instant::now());
+                    p.hb_secs = hb;
+                    p.ip = peer_ip.clone();
+                } else {
                     inner.peers.push(Peer {
                         id: id.clone(),
                         hostname: id.clone(),
@@ -627,8 +828,23 @@ fn handle_roster_conn(app: &AppHandle, stream: TcpStream, generation: u64) {
                         stage: "joined".into(),
                         layer_lo: None,
                         layer_hi: None,
+                        online: true,
+                        last_seen: Some(std::time::Instant::now()),
+                        hb_secs: hb,
                         ip: peer_ip.clone(),
                     });
+                }
+                // The joiner asked to be the coordinator ("Prefer this machine
+                // as coordinator" on ITS settings page). Same effect as the
+                // creator picking it by hand in Manage cluster, so the roles
+                // stay in one place — and only while the roster is still open:
+                // moving the coordinator after the engines are up would point
+                // half the cluster at a coord that is not running.
+                if req["prefer"].as_bool() == Some(true) && inner.phase == "idle" {
+                    inner.coordinator_id = Some(id.clone());
+                    for p in inner.peers.iter_mut() {
+                        p.role = if p.id == id { "coordinator" } else { "worker" };
+                    }
                 }
                 let mut r = roster_reply(&inner);
                 r["id"] = json!(id);
@@ -639,9 +855,15 @@ fn handle_roster_conn(app: &AppHandle, stream: TcpStream, generation: u64) {
             // Live per-node progress: a member's poll carries its engine state.
             let id = req["id"].as_str().unwrap_or("");
             let eng = req["engine"].as_str().unwrap_or("");
-            if !id.is_empty() && !eng.is_empty() && inner.phase != "idle" {
+            if !id.is_empty() {
+                let forming = inner.phase == "idle"; // read before the &mut borrow below
                 if let Some(p) = inner.peers.iter_mut().find(|p| p.id == id) {
-                    if p.stage != "ready" {
+                    // The poll IS the liveness signal: hearing it revives a
+                    // member the sweep had marked offline.
+                    p.online = true;
+                    p.last_seen = Some(std::time::Instant::now());
+                    p.hb_secs = req["hb"].as_u64().unwrap_or(0) as u32;
+                    if !eng.is_empty() && !forming && p.stage != "ready" {
                         p.stage = stage_for_engine(eng).to_string();
                     }
                 }
@@ -662,10 +884,23 @@ fn handle_roster_conn(app: &AppHandle, stream: TcpStream, generation: u64) {
 }
 
 fn spawn_creator_tasks(app: AppHandle, generation: u64, code: String, discovery_port: u16) {
-    // UDP beacon: `HOMEAI1|<fnv1a(code)>|<roster_port>` once a second.
+    // "LAN auto-discovery" off: stay silent and let the roster service below do
+    // the work — machines that were given our IP by hand still get in. Read
+    // once here, not per tick: the cluster's discovery mode is decided when it
+    // is created, and a beacon that stops mid-forming would be a worse setting
+    // than one that never started.
+    let announce = {
+        let pairing = app.state::<Pairing>();
+        let inner = pairing.0.lock().unwrap();
+        inner.tuning.lan_discovery
+    };
+    // UDP beacon: `IDLETOKEN1|<fnv1a(code)>|<roster_port>` once a second.
     let beacon_app = app.clone();
     let hash = code_hash(&code);
     std::thread::spawn(move || {
+        if !announce {
+            return;
+        }
         let Ok(sock) = UdpSocket::bind(("0.0.0.0", 0)) else { return };
         let _ = sock.set_broadcast(true);
         let msg = format!("{BEACON_MAGIC}|{hash}|{ROSTER_PORT}");
@@ -703,15 +938,53 @@ fn spawn_creator_tasks(app: AppHandle, generation: u64, code: String, discovery_
         }
         let Some(listener) = listener else {
             eprintln!("[pairing] roster port {ROSTER_PORT} busy");
+            // Without the roster service the cluster can never form — tell the
+            // UI instead of leaving a beacon inviting joiners to a port nobody
+            // answers. Bumping the generation ends that beacon thread too.
+            let pairing = app.state::<Pairing>();
+            let mut inner = pairing.0.lock().unwrap();
+            if inner.generation == generation {
+                inner.generation += 1;
+                inner.mode = Mode::Off;
+                inner.phase = "idle".into();
+                inner.code = None;
+                inner.peers.clear();
+                inner.coordinator_id = None;
+                inner.last_error = Some(("portBusy".into(), ROSTER_PORT.to_string()));
+            }
+            drop(inner);
+            emit_snapshot(&app);
             return;
         };
         let _ = listener.set_nonblocking(true);
         loop {
             {
                 let pairing = app.state::<Pairing>();
-                let inner = pairing.0.lock().unwrap();
+                let mut inner = pairing.0.lock().unwrap();
                 if inner.generation != generation {
                     return;
+                }
+                // Liveness sweep: a member that stopped polling is marked
+                // offline, not removed — the machine may come back, and its
+                // joiner loop re-registers under the same id when it does
+                // (which flips it online again above). The creator's own
+                // entry has no last_seen and is never swept.
+                let now = std::time::Instant::now();
+                let mut changed = false;
+                for p in inner.peers.iter_mut() {
+                    let Some(seen) = p.last_seen else { continue };
+                    let timeout = Duration::from_secs(
+                        (p.hb_secs.clamp(1, 60) as u64 * 3).max(OFFLINE_AFTER_S),
+                    );
+                    if p.online && now.duration_since(seen) > timeout {
+                        p.online = false;
+                        changed = true;
+                        eprintln!("[pairing] member {} went silent — marked offline", p.id);
+                    }
+                }
+                drop(inner);
+                if changed {
+                    emit_snapshot(&app);
                 }
             }
             match listener.accept() {
@@ -730,29 +1003,82 @@ fn spawn_creator_tasks(app: AppHandle, generation: u64, code: String, discovery_
 /// joiner must be configured alike for the beacon to be heard.
 fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_port: u16) {
     std::thread::spawn(move || {
-        // 1) discover the creator via beacon
+        // This machine's own pairing settings (the creator's are irrelevant
+        // here — every one of these answers a question about THIS computer).
+        let (listen, manual, prefer, subnet_only, my_ip, poll) = {
+            let pairing = app.state::<Pairing>();
+            let inner = pairing.0.lock().unwrap();
+            (
+                inner.tuning.lan_discovery,
+                manual_peer_list(&inner.tuning),
+                inner.tuning.prefer_coordinator,
+                inner.tuning.same_subnet_only,
+                self_ip(&inner.tuning),
+                heartbeat(&inner.tuning),
+            )
+        };
+
+        // 1) discover the creator via beacon — unless LAN auto-discovery is off,
+        //    in which case we go straight to the addresses we were given.
         let hash = code_hash(&code);
-        let creator_ip: Option<String> = (|| {
-            let sock = UdpSocket::bind(("0.0.0.0", discovery_port)).ok()?;
-            sock.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
-            let mut buf = [0u8; 256];
-            for _ in 0..8 {
-                {
-                    let pairing = app.state::<Pairing>();
-                    if pairing.0.lock().unwrap().generation != generation {
-                        return None;
-                    }
-                }
-                if let Ok((n, src)) = sock.recv_from(&mut buf) {
-                    let msg = String::from_utf8_lossy(&buf[..n]);
-                    let parts: Vec<&str> = msg.trim().split('|').collect();
-                    if parts.len() == 3 && parts[0] == BEACON_MAGIC && parts[1] == hash {
-                        return Some(src.ip().to_string());
-                    }
-                }
-            }
+        let beacon_ip: Option<String> = if !listen {
             None
-        })();
+        } else {
+            (|| {
+                let sock = UdpSocket::bind(("0.0.0.0", discovery_port)).ok()?;
+                sock.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
+                let mut buf = [0u8; 256];
+                for _ in 0..8 {
+                    {
+                        let pairing = app.state::<Pairing>();
+                        if pairing.0.lock().unwrap().generation != generation {
+                            return None;
+                        }
+                    }
+                    if let Ok((n, src)) = sock.recv_from(&mut buf) {
+                        let msg = String::from_utf8_lossy(&buf[..n]);
+                        let parts: Vec<&str> = msg.trim().split('|').collect();
+                        if parts.len() == 3 && parts[0] == BEACON_MAGIC && parts[1] == hash {
+                            let ip = src.ip().to_string();
+                            // "Only same subnet" also filters what we LISTEN to,
+                            // not just what we accept: on a bridged VM or a VPN
+                            // the beacon can arrive from a network the user
+                            // deliberately excluded.
+                            if subnet_only && !same_subnet(&ip, &my_ip) {
+                                eprintln!("[pairing] ignoring beacon from {ip}: different subnet");
+                                continue;
+                            }
+                            return Some(ip);
+                        }
+                    }
+                }
+                None
+            })()
+        };
+
+        // 2) manual peers are the fallback the beacon cannot be: broadcast does
+        //    not cross subnets and plenty of networks drop it entirely. Each
+        //    candidate is tried by simply attempting the join below.
+        let creator_ip: Option<String> = beacon_ip.or_else(|| {
+            manual
+                .iter()
+                .find(|ip| {
+                    if subnet_only && !same_subnet(ip, &my_ip) {
+                        eprintln!("[pairing] skipping manual peer {ip}: different subnet");
+                        return false;
+                    }
+                    let ok = format!("{ip}:{ROSTER_PORT}")
+                        .parse::<SocketAddr>()
+                        .ok()
+                        .and_then(|a| TcpStream::connect_timeout(&a, Duration::from_secs(2)).ok())
+                        .is_some();
+                    if !ok {
+                        eprintln!("[pairing] manual peer {ip} did not answer on {ROSTER_PORT}");
+                    }
+                    ok
+                })
+                .cloned()
+        });
 
         let Some(creator_ip) = creator_ip else {
             let pairing = app.state::<Pairing>();
@@ -761,20 +1087,40 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
                 inner.mode = Mode::Off;
                 inner.phase = "idle".into();
                 inner.code = None;
+                // Tell the UI, not just stderr: a silent reset to idle is
+                // indistinguishable from the Join button doing nothing.
+                inner.last_error = Some(if listen {
+                    ("notFound".into(), discovery_port.to_string())
+                } else {
+                    ("notFoundManual".into(), String::new())
+                });
             }
             drop(inner);
             emit_snapshot(&app);
-            eprintln!("[pairing] no cluster found for that code on this LAN");
+            eprintln!(
+                "[pairing] no cluster found for that code{}",
+                if listen { " on this LAN" } else { " (LAN auto-discovery is off; add the host's IP under Manual peer IPs)" }
+            );
             return;
         };
 
-        // 2) join + poll loop over the roster protocol
+        // 3) join + poll loop over the roster protocol
         let (self_host, self_gpu) = {
             let pairing = app.state::<Pairing>();
             let inner = pairing.0.lock().unwrap();
             (inner.self_host.clone(), inner.self_gpu.clone())
         };
         let mut joined = false;
+        // Creator-loss detection (the inverse of the member sweep): the polls
+        // this loop already sends are the liveness probe. Silence longer than
+        // max(30s, 3×interval) flips the snapshot to "creator lost" — members
+        // kept but grayed, last_error = creatorLost — and the loop keeps
+        // polling; the first successful reply clears it and apply_roster
+        // restores the live member states from the wire.
+        let mut last_ok = std::time::Instant::now();
+        let mut lost = false;
+        let lost_after =
+            Duration::from_secs(poll.as_secs().saturating_mul(3).max(OFFLINE_AFTER_S));
         loop {
             {
                 let pairing = app.state::<Pairing>();
@@ -782,13 +1128,21 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
                     return;
                 }
             }
+            // "hb": this machine's own poll interval, so the creator can size
+            // the liveness timeout instead of guessing (a slow deliberate
+            // heartbeat must not read as a dead machine).
             let req = if joined {
                 // report this machine's live engine state so the whole roster
                 // sees per-node progress (P4)
                 json!({"op": "roster", "id": self_host,
-                       "engine": crate::engine::current_state_str(&app)})
+                       "engine": crate::engine::current_state_str(&app),
+                       "hb": poll.as_secs()})
             } else {
-                json!({"op": "join", "code": code, "hostname": self_host, "gpu": self_gpu})
+                // `prefer`: this machine's own "Prefer this machine as
+                // coordinator". Sent on every (re)join so it survives the
+                // creator restarting the roster.
+                json!({"op": "join", "code": code, "hostname": self_host, "gpu": self_gpu,
+                       "prefer": prefer, "hb": poll.as_secs()})
             };
             let reply: Option<Value> = (|| {
                 let addr: SocketAddr = format!("{creator_ip}:{ROSTER_PORT}").parse().ok()?;
@@ -801,26 +1155,86 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
             })();
             if let Some(v) = reply {
                 if v["ok"].as_bool() == Some(false) {
-                    eprintln!("[pairing] join rejected: {}", v["err"]);
+                    let err = v["err"].as_str().unwrap_or("").to_string();
+                    eprintln!("[pairing] join rejected: {err}");
+                    // Surface the rejection and reset to idle, mirroring the
+                    // not-found path: the roster said no, and retrying with the
+                    // same request would only repeat the answer.
+                    let pairing = app.state::<Pairing>();
+                    let mut inner = pairing.0.lock().unwrap();
+                    if inner.generation == generation {
+                        inner.mode = Mode::Off;
+                        inner.phase = "idle".into();
+                        inner.code = None;
+                        inner.last_error = Some(if err == "bad code" {
+                            ("badCode".into(), String::new())
+                        } else if err.starts_with("different subnet") {
+                            ("subnet".into(), String::new())
+                        } else {
+                            ("rejected".into(), err)
+                        });
+                    }
+                    drop(inner);
+                    emit_snapshot(&app);
                     return;
                 }
                 joined = true;
-                let must_start = {
+                let eff = {
                     let pairing = app.state::<Pairing>();
                     let mut inner = pairing.0.lock().unwrap();
                     if inner.generation != generation {
                         return;
                     }
+                    // Recovery: the creator answered again. Clear the lost
+                    // flag (only our own error — a fresher one is not ours to
+                    // erase); apply_roster below restores every member's live
+                    // online state from the wire.
+                    if lost && inner.last_error.as_ref().is_some_and(|(c, _)| c == "creatorLost") {
+                        inner.last_error = None;
+                    }
                     apply_roster(&mut inner, &v)
                 };
+                if lost {
+                    eprintln!("[pairing] creator at {creator_ip} is back — resyncing");
+                }
+                lost = false;
+                last_ok = std::time::Instant::now();
                 emit_snapshot(&app);
-                if must_start {
+                // Order matters: stop before rejoining. The engine we are
+                // holding belongs to the cluster that just went away, and the
+                // "join" below can be answered by a coordinator already
+                // forming the next one.
+                if eff.stop_engine {
+                    let _ = crate::engine::stop_engine(&app);
+                }
+                if eff.rejoin {
+                    joined = false;
+                }
+                if eff.start_engine {
                     materialize_engine(&app);
                 }
                 // after starting, also watch the engine coordinator for readiness
                 merge_engine_status(&app);
+            } else if !lost && last_ok.elapsed() > lost_after {
+                // The creator has not answered for the whole window: say so
+                // instead of polling silently forever. Members are kept as the
+                // last known state, grayed — not cleared: the cluster may well
+                // still exist, we just cannot see it from here.
+                lost = true;
+                let pairing = app.state::<Pairing>();
+                let mut inner = pairing.0.lock().unwrap();
+                if inner.generation != generation {
+                    return;
+                }
+                for p in inner.peers.iter_mut() {
+                    p.online = false;
+                }
+                inner.last_error = Some(("creatorLost".into(), String::new()));
+                drop(inner);
+                emit_snapshot(&app);
+                eprintln!("[pairing] lost contact with the cluster creator at {creator_ip} — still retrying");
             }
-            std::thread::sleep(Duration::from_secs(1));
+            std::thread::sleep(poll);
         }
     });
 }
@@ -876,6 +1290,7 @@ pub fn pairing_create(
         inner.mode = Mode::Creator;
         inner.account_mode = account.unwrap_or(false);
         inner.code = Some(code.clone());
+        inner.engine_code = engine_pair_code(&code, inner.account_mode);
         inner.self_id = hostname.clone();
         inner.self_host = hostname.clone();
         inner.self_gpu = gpu.clone();
@@ -883,8 +1298,8 @@ pub fn pairing_create(
         inner.phase = "idle".into();
         inner.coord_ip = None;
         inner.model_path = model_path.unwrap_or_default();
-        inner.shard_repo = String::new();
         inner.engine_started = false;
+        inner.last_error = None;
         inner.tuning = tuning.unwrap_or_default();
         discovery_port = inner.tuning.discovery_port;
         inner.peers = vec![Peer {
@@ -896,6 +1311,10 @@ pub fn pairing_create(
             stage: "joined".into(),
             layer_lo: None,
             layer_hi: None,
+            // The creator is this process: always online, never swept.
+            online: true,
+            last_seen: None,
+            hb_secs: 0,
             ip: String::new(),
         }];
     }
@@ -925,6 +1344,7 @@ pub fn pairing_join(
         inner.mode = Mode::Joiner;
         inner.account_mode = account.unwrap_or(false);
         inner.code = None; // only the creator shows the code
+        inner.engine_code = engine_pair_code(&code, inner.account_mode);
         inner.self_id = hostname.clone();
         inner.self_host = hostname;
         inner.self_gpu = gpu;
@@ -932,8 +1352,8 @@ pub fn pairing_join(
         inner.phase = "idle".into();
         inner.coord_ip = None;
         inner.model_path = model_path.unwrap_or_default();
-        inner.shard_repo = String::new();
         inner.engine_started = false;
+        inner.last_error = None;
         inner.peers = Vec::new();
         inner.tuning = tuning.unwrap_or_default();
         discovery_port = inner.tuning.discovery_port;
@@ -956,7 +1376,10 @@ pub fn pairing_start(
     {
         let mut inner = state.0.lock().unwrap();
         if inner.mode != Mode::Creator {
-            return Err("only the cluster creator can start it".into());
+            // The "[CODE] detail" prefix is the client-error convention (see
+            // ERROR_KEYS in client/src/i18n.ts): the UI translates the code,
+            // logs keep the English sentence.
+            return Err("[PAIR_NOT_CREATOR] only the cluster creator can start it".into());
         }
         // Two machines is the right floor for the PAIRING flow — pressing Start
         // before anyone joined is a mistake there. It is the wrong floor for the
@@ -969,28 +1392,19 @@ pub fn pairing_start(
         // "need at least 2 machines" — the headline single-node feature could
         // not start at all.
         if inner.peers.len() < 2 && allow_solo != Some(true) {
-            return Err("need at least 2 machines".into());
+            return Err("[PAIR_NEED_TWO] need at least 2 machines".into());
         }
         generation = inner.generation;
         let coord_id = inner.coordinator_id.clone().unwrap_or_else(|| inner.self_id.clone());
+        // self_ip, not local_lan_ip: on a machine with a chosen NIC the address
+        // we hand out has to be the one we are listening on.
+        let mine = self_ip(&inner.tuning);
         let coord_ip = inner
             .peers
             .iter()
             .find(|p| p.id == coord_id)
-            .map(|p| if p.is_self || p.ip.is_empty() { local_lan_ip() } else { p.ip.clone() })
-            .unwrap_or_else(local_lan_ip);
-        // When the coordinator has the model, advertise its layer-shard repo so
-        // remote workers fetch only their layers. URL = the master's basename
-        // under the coordinator's weight server.
-        if !inner.model_path.is_empty() {
-            let base = inner
-                .model_path
-                .rsplit(|c| c == '/' || c == '\\')
-                .next()
-                .unwrap_or(&inner.model_path)
-                .to_string();
-            inner.shard_repo = format!("http://{coord_ip}:{WEIGHT_PORT}/{base}");
-        }
+            .map(|p| if p.is_self || p.ip.is_empty() { mine.clone() } else { p.ip.clone() })
+            .unwrap_or_else(|| mine.clone());
         inner.coord_ip = Some(coord_ip);
         inner.phase = "starting".into();
         for p in inner.peers.iter_mut() {
@@ -1012,13 +1426,13 @@ pub fn pairing_set_coordinator(
     {
         let mut inner = state.0.lock().unwrap();
         if inner.mode != Mode::Creator {
-            return Err("only the cluster creator can pick the coordinator".into());
+            return Err("[PAIR_NOT_CREATOR] only the cluster creator can pick the coordinator".into());
         }
         if inner.phase != "idle" {
-            return Err("cluster already started".into());
+            return Err("[PAIR_ALREADY_STARTED] cluster already started".into());
         }
         if !inner.peers.iter().any(|p| p.id == peer_id) {
-            return Err("no such member".into());
+            return Err("[PAIR_NO_MEMBER] no such member".into());
         }
         inner.coordinator_id = Some(peer_id.clone());
         for p in inner.peers.iter_mut() {
@@ -1036,13 +1450,14 @@ pub fn pairing_leave(app: AppHandle, state: State<'_, Pairing>) -> Result<(), St
         inner.generation += 1; // ends beacon/roster/poll threads
         inner.mode = Mode::Off;
         inner.code = None;
+        inner.engine_code.clear();
         inner.peers.clear();
         inner.coordinator_id = None;
         inner.phase = "idle".into();
         inner.coord_ip = None;
-        inner.shard_repo = String::new();
         inner.engine_started = false;
         inner.account_mode = false;
+        inner.last_error = None;
     }
     // Leaving the cluster also stops this machine's engine process.
     let _ = crate::engine::stop_engine(&app);
@@ -1139,4 +1554,127 @@ fn local_lan_ip() -> String {
         .map(|a: SocketAddr| a.ip())
         .map(|ip: IpAddr| ip.to_string())
         .unwrap_or_else(|_| "127.0.0.1".into())
+}
+
+/// Tests for the pairing settings helpers.
+///
+/// These six settings were rendered for months as controls nothing read, so the
+/// first thing their wiring owes anyone is evidence that the reading part is
+/// right. Every helper here is pure, which is the reason the parsing lives in
+/// one: the parts that need a LAN (the beacon, the roster handshake) cannot be
+/// tested from here, so as much decision-making as possible was pushed into
+/// functions that can be.
+#[cfg(test)]
+mod pairing_settings_tests {
+    use super::*;
+
+    fn tuning(f: impl FnOnce(&mut Tuning)) -> Tuning {
+        let mut t = Tuning::default();
+        f(&mut t);
+        t
+    }
+
+    #[test]
+    fn same_subnet_compares_the_first_three_octets() {
+        assert!(same_subnet("192.168.1.10", "192.168.1.250"));
+        assert!(!same_subnet("192.168.1.10", "192.168.2.10"));
+        // Tailscale-style CGNAT peers are a different subnet, which is exactly
+        // why "Only same subnet" defaults to off.
+        assert!(!same_subnet("100.101.1.2", "192.168.1.10"));
+    }
+
+    #[test]
+    fn same_subnet_refuses_what_it_cannot_classify() {
+        // A restriction that passes everything it fails to parse is not one.
+        assert!(!same_subnet("fe80::1", "fe80::2"));
+        assert!(!same_subnet("", "192.168.1.10"));
+        assert!(!same_subnet("not-an-ip", "192.168.1.10"));
+    }
+
+    #[test]
+    fn manual_peers_accept_commas_spaces_and_newlines() {
+        let t = tuning(|t| t.manual_peers = " 192.168.1.50, 192.168.1.51\n192.168.1.52 ".into());
+        assert_eq!(
+            manual_peer_list(&t),
+            vec!["192.168.1.50", "192.168.1.51", "192.168.1.52"]
+        );
+        assert!(manual_peer_list(&tuning(|t| t.manual_peers = " , ,\n".into())).is_empty());
+        assert!(manual_peer_list(&Tuning::default()).is_empty());
+    }
+
+    #[test]
+    fn heartbeat_is_clamped_to_a_sane_range() {
+        // 0 would spin the roster loop; an hour would look like a frozen UI.
+        assert_eq!(heartbeat(&tuning(|t| t.heartbeat_sec = 0)), Duration::from_secs(1));
+        assert_eq!(heartbeat(&tuning(|t| t.heartbeat_sec = 5)), Duration::from_secs(5));
+        assert_eq!(heartbeat(&tuning(|t| t.heartbeat_sec = 9999)), Duration::from_secs(60));
+        // The default must equal what the loop slept before the setting existed.
+        assert_eq!(heartbeat(&Tuning::default()), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn bind_nic_governs_both_the_bind_and_the_advertised_address() {
+        let t = tuning(|t| t.bind_nic = "10.0.0.7".into());
+        assert_eq!(bind_host(&t), "10.0.0.7");
+        assert_eq!(self_ip(&t), "10.0.0.7", "peers must be told the address we listen on");
+    }
+
+    #[test]
+    fn bind_nic_falls_back_when_it_is_not_a_usable_address() {
+        for v in ["", "auto", " AUTO-ish ", "eth0", "999.1.1.1"] {
+            let t = tuning(|t| t.bind_nic = v.into());
+            assert_eq!(bind_host(&t), "0.0.0.0", "{v:?} must not become a bind host");
+            assert_ne!(self_ip(&t), v.trim(), "{v:?} must not be advertised verbatim");
+        }
+    }
+
+    #[test]
+    fn usage_caps_become_flags_only_when_set() {
+        assert!(usage_cap_args(&Tuning::default()).is_empty());
+        let t = tuning(|t| {
+            t.max_vram_mb = 8192;
+            t.max_ram_mb = 16384;
+        });
+        assert_eq!(
+            usage_cap_args(&t),
+            vec!["--max-vram-mb", "8192", "--max-ram-mb", "16384"]
+        );
+        let only_vram = tuning(|t| t.max_vram_mb = 4096);
+        assert_eq!(usage_cap_args(&only_vram), vec!["--max-vram-mb", "4096"]);
+    }
+
+    /// The client sends camelCase; a rename on either side must fail loudly
+    /// here rather than silently deserialize to a default (which is how a
+    /// setting goes back to doing nothing).
+    #[test]
+    fn tuning_deserializes_the_clients_field_names() {
+        let t: Tuning = serde_json::from_value(serde_json::json!({
+            "apiHost": "0.0.0.0", "apiPort": 8000, "apiToken": "",
+            "interStagePort": 14101, "discoveryPort": 14099,
+            "modelId": "qwen3-8b", "quant": "Q4_K_M", "ctxSize": 32768, "maxDecode": 0,
+            "maxVramMb": 8192, "maxRamMb": 16384,
+            "lanDiscovery": false, "manualPeers": "192.168.1.50",
+            "heartbeatSec": 3, "preferCoordinator": true,
+            "sameSubnetOnly": true, "bindNic": "192.168.1.9",
+        }))
+        .expect("client payload must deserialize");
+        assert_eq!(t.max_vram_mb, 8192);
+        assert!(!t.lan_discovery);
+        assert_eq!(manual_peer_list(&t), vec!["192.168.1.50"]);
+        assert_eq!(heartbeat(&t), Duration::from_secs(3));
+        assert!(t.prefer_coordinator);
+        assert!(t.same_subnet_only);
+        assert_eq!(bind_host(&t), "192.168.1.9");
+    }
+
+    /// An older/hand-written payload without the new keys must behave exactly
+    /// as the client did before they existed.
+    #[test]
+    fn missing_new_fields_keep_the_old_behaviour() {
+        let t: Tuning = serde_json::from_value(serde_json::json!({ "apiPort": 8000 })).unwrap();
+        assert!(t.lan_discovery, "the beacon must still run");
+        assert!(!t.same_subnet_only, "no restriction anyone did not ask for");
+        assert_eq!(heartbeat(&t), Duration::from_secs(1));
+        assert!(usage_cap_args(&t).is_empty());
+    }
 }

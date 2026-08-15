@@ -35,7 +35,13 @@ MAGIC = 0x31494148
 # purpose -- the coordinator must go on accepting it, both because that is what
 # IDLETOKEN_FULL_LOGITS=1 produces and because non-greedy sampling will need it
 # again. So this file is also the regression test for that acceptance path.
-VERSION = 6
+# v7 (cluster salt, 2026-08-13): ASSIGN_PLAN grew a trailing 16-byte salt for
+# node-link token encryption. This mock only reads the first two payload bytes,
+# so the field costs it nothing -- but the VERSION below is NOT optional: the
+# coordinator rejects a mismatched worker at HELLO, and four gates went red the
+# moment the engine moved to v7 while this file still said 6. The wire protocol
+# has a fourth implementation and it lives here.
+VERSION = 7
 MSG_HELLO = 0x0001
 MSG_HELLO_ACK = 0x0002
 MSG_RESOURCE_REPORT = 0x0010

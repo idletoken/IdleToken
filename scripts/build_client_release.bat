@@ -14,7 +14,10 @@ REM The build node has no node/pnpm, so the frontend must already be built into
 REM client\dist (sync it from a machine that has node). beforeBuildCommand is
 REM therefore overridden to nothing.
 REM
-REM Contract: prints CLIENT_RELEASE_OK or CLIENT_RELEASE_FAIL: <reason>.
+REM Contract: prints CLIENT_RELEASE_OK, CLIENT_RELEASE_DEFERRED_SIGNING, or
+REM CLIENT_RELEASE_FAIL: <reason>. Set IDLETOKEN_DEFER_UPDATER_SIGNING=1 when
+REM the trusted updater key lives on another machine: this builds the NSIS
+REM installer and its updater zip without asking Tauri to sign it.
 setlocal enabledelayedexpansion
 cd /d "%~dp0.."
 set ROOT=%CD%
@@ -66,6 +69,42 @@ if exist "%ROOT%\idletoken-platform-agent.exe" (
     copy /y "%ROOT%\idletoken-coord.exe" "%ROOT%\client\src-tauri\binaries\idletoken-platform-agent-%TRIPLE%.exe" >nul
 )
 
+REM llama.cpp sidecars are the v2 compute engine: llama-server serves local
+REM models and drives clusters; ggml-rpc-server is supervised on worker nodes.
+REM Both must come from the same pinned checkout/build or an installed client
+REM can offer cluster mode while carrying only half of the engine.
+set "LLAMA_BIN=%ROOT%\vendor\llama.cpp\build\bin\Release"
+if not exist "%LLAMA_BIN%\llama-server.exe" set "LLAMA_BIN=%ROOT%\vendor\llama.cpp\build\bin"
+for %%E in (llama-server ggml-rpc-server) do (
+    if not exist "%LLAMA_BIN%\%%E.exe" (
+        echo CLIENT_RELEASE_FAIL: no pinned %%E.exe ^(run scripts\build_llamacpp_win.bat first^)
+        exit /b 1
+    )
+    copy /y "%LLAMA_BIN%\%%E.exe" "%ROOT%\client\src-tauri\binaries\%%E-%TRIPLE%.exe" >nul
+)
+
+REM --- licences ----------------------------------------------------------
+REM The sidecars staged above contain vendored third-party code (ds4 = MIT,
+REM rax = BSD 3-Clause); both require the notice to travel with a BINARY
+REM distribution, and Apache-2.0 section 4(d) says the same about our NOTICE.
+REM An installer IS a binary distribution. Staged into src-tauri\licenses so
+REM tauri.conf.json `bundle.resources` puts them inside the installer.
+if not exist "%ROOT%\client\src-tauri\licenses" mkdir "%ROOT%\client\src-tauri\licenses"
+copy /y "%ROOT%\LICENSE" "%ROOT%\client\src-tauri\licenses\LICENSE.txt" >nul || (
+    echo CLIENT_RELEASE_FAIL: cannot stage LICENSE & exit /b 1)
+copy /y "%ROOT%\NOTICE" "%ROOT%\client\src-tauri\licenses\NOTICE.txt" >nul || (
+    echo CLIENT_RELEASE_FAIL: cannot stage NOTICE & exit /b 1)
+copy /y "%ROOT%\vendor\ds4\LICENSE" "%ROOT%\client\src-tauri\licenses\ds4-MIT.txt" >nul || (
+    echo CLIENT_RELEASE_FAIL: cannot stage the ds4 licence & exit /b 1)
+copy /y "%ROOT%\vendor\llama.cpp\LICENSE" "%ROOT%\client\src-tauri\licenses\llamacpp-MIT.txt" >nul || (
+    echo CLIENT_RELEASE_FAIL: cannot stage the llama.cpp licence & exit /b 1)
+powershell -NoProfile -Command ^
+  "$t = Get-Content -Raw '%ROOT%\vendor\ds4\rax.c'; $m = [regex]::Match($t, '(?s)^/\* Rax.*?\*/'); if (-not $m.Success -or $m.Value -notmatch 'Redistribution and use in source and binary forms') { exit 1 }; Set-Content -Path '%ROOT%\client\src-tauri\licenses\rax-BSD-3-Clause.txt' -Value $m.Value"
+if errorlevel 1 (
+    echo CLIENT_RELEASE_FAIL: could not extract the rax BSD-3 licence from vendor\ds4\rax.c
+    exit /b 1
+)
+
 REM --- CUDA runtime DLLs -------------------------------------------------
 if not exist "%ROOT%\client\src-tauri\runtime\windows" mkdir "%ROOT%\client\src-tauri\runtime\windows"
 REM Repo root FIRST, dist\ only as a fallback: the build scripts write their
@@ -91,7 +130,13 @@ for %%D in (ds4cuda.dll ds4xcuda.dll) do (
     )
 )
 
-REM tauri.windows.conf.json lists ONLY ds4cuda.dll + ds4xcuda.dll as resources.
+REM tauri.windows.conf.json lists ONLY ds4cuda.dll + ds4xcuda.dll as RUNTIME
+REM resources — plus, since 2026-08-14, the licence texts. That platform file
+REM does not ADD to `bundle.resources` from tauri.conf.json, it REPLACES it
+REM (base = a glob array, Windows = a source->target map), so the Windows
+REM installer shipped with no LICENSE/NOTICE at all while every other platform
+REM had them. Found by listing the built NSIS installer with 7-Zip; G_RELEASE
+REM now asserts the installer's file list so it cannot regress silently.
 REM cudart/cublas/cublasLt were removed on 2026-08-04: cuBLAS alone was 769 MB of
 REM a 790 MB payload (97%), and it comes from the CUDA Toolkit, not the display
 REM driver, so the user installs it (acceptance-criteria philosophy 12, E3).
@@ -126,11 +171,30 @@ REM from PowerShell — so route it through a mirror unless the caller set one.
 REM Override with your own mirror (or point it at https://github.com to try
 REM direct) by setting TAURI_BUNDLER_TOOLS_GITHUB_MIRROR before running.
 if not defined TAURI_BUNDLER_TOOLS_GITHUB_MIRROR set "TAURI_BUNDLER_TOOLS_GITHUB_MIRROR=https://ghfast.top/https://github.com"
+set "BUNDLE=%ROOT%\client\src-tauri\target\release\bundle\nsis"
 cd /d "%ROOT%\client"
-cargo tauri build --bundles nsis --config "{\"build\":{\"beforeBuildCommand\":\"\"}}"
+if "%IDLETOKEN_DEFER_UPDATER_SIGNING%"=="1" (
+    cargo tauri build --bundles nsis --config "{\"build\":{\"beforeBuildCommand\":\"\"},\"bundle\":{\"createUpdaterArtifacts\":false}}"
+) else (
+    cargo tauri build --bundles nsis --config "{\"build\":{\"beforeBuildCommand\":\"\"}}"
+)
 if errorlevel 1 (
     echo CLIENT_RELEASE_FAIL: tauri build failed
     exit /b 1
+)
+
+if "%IDLETOKEN_DEFER_UPDATER_SIGNING%"=="1" (
+    REM Tauri's updater artifact for NSIS is the installer in a .nsis.zip.
+    REM It will be signed on the trusted control machine and the detached .sig
+    REM copied back next to it; the private key never reaches this build node.
+    if exist "%BUNDLE%\*.nsis.zip" del /q "%BUNDLE%\*.nsis.zip"
+    if exist "%BUNDLE%\*.nsis.zip.sig" del /q "%BUNDLE%\*.nsis.zip.sig"
+    powershell -NoProfile -Command ^
+      "$i = Get-ChildItem '%BUNDLE%' -Filter *.exe | Sort-Object LastWriteTime -Descending | Select-Object -First 1; if (-not $i) { exit 2 }; $z = Join-Path $i.DirectoryName ($i.BaseName + '.nsis.zip'); Compress-Archive -LiteralPath $i.FullName -DestinationPath $z -Force"
+    if errorlevel 1 (
+        echo CLIENT_RELEASE_FAIL: could not create the deferred updater archive
+        exit /b 1
+    )
 )
 
 echo --- artifacts ---
@@ -144,9 +208,8 @@ REM exist, and it has to be produced by the build, not by hand at upload time.
 REM Signing proves WHO shipped it; a checksum proves the file was not swapped.
 REM Publish SHA256SUMS.txt next to the installer on the release page, and see
 REM docs/user-guide.md §2.1 for the Get-FileHash line users are told to run.
-set "BUNDLE=%ROOT%\client\src-tauri\target\release\bundle\nsis"
 powershell -NoProfile -Command ^
-  "Get-ChildItem '%BUNDLE%' -Filter *.exe | ForEach-Object { ($_ | Get-FileHash -Algorithm SHA256).Hash.ToLower() + '  ' + $_.Name } | Set-Content -Encoding ascii '%BUNDLE%\SHA256SUMS.txt'"
+  "Get-ChildItem '%BUNDLE%' | Where-Object { $_.Extension -eq '.exe' -or $_.Name.EndsWith('.nsis.zip') } | ForEach-Object { ($_ | Get-FileHash -Algorithm SHA256).Hash.ToLower() + '  ' + $_.Name } | Set-Content -Encoding ascii '%BUNDLE%\SHA256SUMS.txt'"
 if exist "%BUNDLE%\SHA256SUMS.txt" (
     echo --- sha256 ---
     type "%BUNDLE%\SHA256SUMS.txt"
@@ -154,4 +217,8 @@ if exist "%BUNDLE%\SHA256SUMS.txt" (
     echo CLIENT_RELEASE_FAIL: could not write SHA256SUMS.txt
     exit /b 1
 )
-echo CLIENT_RELEASE_OK
+if "%IDLETOKEN_DEFER_UPDATER_SIGNING%"=="1" (
+    echo CLIENT_RELEASE_DEFERRED_SIGNING
+) else (
+    echo CLIENT_RELEASE_OK
+)

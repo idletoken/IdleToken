@@ -17,6 +17,13 @@
 
 #define IDLETOKEN_VRAM_SAFETY_BYTES     (1ull * 1024ull * 1024ull * 1024ull)  /* 1.0 GB */
 #define IDLETOKEN_VRAM_WORKSPACE_BYTES  (3ull * 1024ull * 1024ull * 1024ull / 2ull) /* 1.5 GB */
+/* Metal working-set reserve, CALIBRATED 2026-08-15 (M4 16 GiB; the llamacpp
+ * engine's whole non-weight footprint measured ~133 MiB, and the scheduler
+ * charges width-scaled engine buffers separately — plan.c). The old value
+ * reused the 1.5 GiB CUDA workspace guess, which double-reserved ~2.3 GiB on
+ * a 16 GiB Mac and pushed fitting models into refusals.
+ * results/resource-calibration-20260815.md. */
+#define IDLETOKEN_METAL_WORKSPACE_BYTES (512ull * 1024ull * 1024ull)          /* 0.5 GB */
 #define IDLETOKEN_RAM_SAFETY_BYTES      (4ull * 1024ull * 1024ull * 1024ull)  /* 4.0 GB */
 
 /* Blunt proportional ceiling on `ram_usable`, applied on top of the
@@ -150,6 +157,13 @@ typedef enum {
     IDLETOKEN_HW_GPU_UNSUPPORTED, /* a GPU, but not one we have a backend for
                                    * (e.g. an Intel Mac's AMD card: Metal is
                                    * present, unified memory is not) */
+    /* Append-only: the client mirrors these numbers (client/src/types.ts) and
+     * old builds keep sending the old ones. Inserting in the middle would
+     * relabel every refusal already in the field. */
+    IDLETOKEN_HW_MACOS_SEALED,    /* Apple Silicon: capable, but the macOS
+                                   * compute-node line is parked before v0.1.
+                                   * See idletoken_macos_node_sealed() in
+                                   * idletoken_proto.h for why and how to lift. */
 } idletoken_hw_status;
 
 /* --- "this machine will not join, and retrying will not help" contract -----

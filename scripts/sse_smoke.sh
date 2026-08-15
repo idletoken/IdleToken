@@ -109,7 +109,7 @@ grep -q '^data: \[DONE\]'                  "$OAI" || die "OpenAI stream: missing
 if [ "$REAL_MODEL" != 1 ]; then
     # Marker is word-chunked ACROSS frames — reassemble deltas before asserting.
     FULL=$(sed -n 's/.*"delta":{"content":"\(.*\)"}.*/\1/p' "$OAI" | tr -d '\n')
-    printf '%s' "$FULL" | grep -q 'HOMEAI MOCK ENGINE' \
+    printf '%s' "$FULL" | grep -q 'IDLETOKEN MOCK ENGINE' \
         || die "OpenAI stream: coord mock marker absent in reassembled deltas (got: ${FULL:0:80}) — origin unproven"
 fi
 echo "   $ND data frames + [DONE] ok"
@@ -132,7 +132,7 @@ grep -q '"text_delta"'    "$ANT" || die "Anthropic stream: deltas are not text_d
 grep -q '"output_tokens"' "$ANT" || die "Anthropic stream: message_delta carries no usage"
 if [ "$REAL_MODEL" != 1 ]; then
     FULL=$(sed -n 's/.*"text_delta","text":"\(.*\)"}}.*/\1/p' "$ANT" | tr -d '\n')
-    printf '%s' "$FULL" | grep -q 'HOMEAI MOCK ENGINE' \
+    printf '%s' "$FULL" | grep -q 'IDLETOKEN MOCK ENGINE' \
         || die "Anthropic stream: coord mock marker absent in reassembled deltas (got: ${FULL:0:80}) — origin unproven"
 fi
 echo "   full event sequence ($NDD deltas) + message_stop ok"
@@ -144,7 +144,7 @@ NS=$(curl -s -m "$TIMEOUT" "http://127.0.0.1:${API_PORT}/v1/chat/completions" \
 printf '%s' "$NS" | grep -q '"object":"chat.completion"' || die "non-stream: not a chat.completion (got: ${NS:0:120})"
 printf '%s' "$NS" | grep -q '"finish_reason":"'          || die "non-stream: no finish_reason"
 if [ "$REAL_MODEL" != 1 ]; then
-    printf '%s' "$NS" | grep -q 'HOMEAI MOCK ENGINE' || die "non-stream: coord mock marker absent"
+    printf '%s' "$NS" | grep -q 'IDLETOKEN MOCK ENGINE' || die "non-stream: coord mock marker absent"
 fi
 echo "   non-stream JSON reply intact"
 

@@ -141,13 +141,32 @@ impl Slot {
 /// Marker the engine prints on the one refusal it wants the client to surface.
 /// Mirrors IDLETOKEN_JOIN_REFUSED_MARK in include/idletoken_resource.h — change
 /// both together.
+///
+/// This is the GENERIC refusal channel: whatever sentence the engine sends
+/// through it is displayed verbatim (hardware floor, mixed-OS cluster, and —
+/// WS-C — "upgrade machine X" for a llama.cpp version mismatch). New refusal
+/// kinds on the engine side need no client change.
 const JOIN_REFUSED_MARK: &str = "JOIN_REFUSED: ";
+
+/// Second refusal spelling (v2, llamacpp mode): the coordinator's scheduler
+/// prints `idletoken-coord: refuse: <reason>` and exits 3 when the model does
+/// not fit / the context floor cannot be met. Same contract as the marker —
+/// the sentence is the whole point (results/llamacpp-b2b4-20260814.md).
+const COORD_REFUSE_MARK: &str = "idletoken-coord: refuse: ";
+
+/// Exit code the coordinator uses for a scheduler refusal (llamacpp mode).
+/// A refusal is a decision, not a crash: retrying repeats it verbatim.
+const COORD_REFUSE_EXIT: i32 = 3;
 
 /// Pull the reason out of an engine stderr line, if that line is a refusal.
 /// The engine prefixes its own name, so match on the marker anywhere in the
 /// line rather than at the start.
 fn refusal_reason(line: &str) -> Option<String> {
-    let reason = line.split_once(JOIN_REFUSED_MARK)?.1.trim();
+    let after = line
+        .split_once(JOIN_REFUSED_MARK)
+        .or_else(|| line.split_once(COORD_REFUSE_MARK))
+        .map(|x| x.1)?;
+    let reason = after.trim();
     if reason.is_empty() { None } else { Some(reason.to_string()) }
 }
 
@@ -279,6 +298,31 @@ fn push_log(app: &AppHandle, role: &str, stream: &'static str, line: String) {
     let _ = app.emit("engine:log", &entry);
 }
 
+/// NO_PROXY value for every child process this supervisor spawns.
+///
+/// A local HTTP proxy (Clash and friends) that intercepts loopback traffic
+/// hijacks the coordinator's SSE stream and swallows the end-of-stream signal,
+/// leaving clients hung forever (known trap, documented in the user guide).
+/// The engine talks to itself over 127.0.0.1, so loopback must always bypass
+/// the proxy. The user's own NO_PROXY entries are kept — loopback is appended,
+/// never substituted.
+fn merged_no_proxy() -> String {
+    let existing = std::env::var("NO_PROXY")
+        .or_else(|_| std::env::var("no_proxy"))
+        .unwrap_or_default();
+    let mut parts: Vec<String> = existing
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    for needed in ["127.0.0.1", "localhost"] {
+        if !parts.iter().any(|p| p.eq_ignore_ascii_case(needed)) {
+            parts.push(needed.to_string());
+        }
+    }
+    parts.join(",")
+}
+
 fn sidecar_name(role: &str) -> &'static str {
     // "worker" and "weights" (the repo server) are both the worker binary.
     if role == "coordinator" {
@@ -317,6 +361,11 @@ fn supervise(app: AppHandle, role: String, generation: u64) {
                     c = c
                         .env("IDLETOKEN_DIE_WITH_PARENT", "1")
                         .env("IDLETOKEN_PARENT_PID", std::process::id().to_string());
+                    // Loopback must bypass any local HTTP proxy (Clash et al.
+                    // hijack 127.0.0.1 SSE and eat the stream end); set every
+                    // spelling libraries look at. See merged_no_proxy.
+                    let no_proxy = merged_no_proxy();
+                    c = c.env("NO_PROXY", &no_proxy).env("no_proxy", &no_proxy);
                     for (k, v) in &extra_env {
                         c = c.env(k, v);
                     }
@@ -353,6 +402,11 @@ fn supervise(app: AppHandle, role: String, generation: u64) {
             };
 
             let mut exit_code: Option<i32> = None;
+            // Last non-empty stderr line: the fallback reason when the engine
+            // exits with the refusal code without printing either marker (e.g.
+            // "could not measure this machine's memory" before a llamacpp-mode
+            // start). The marker lines stay authoritative when present.
+            let mut last_stderr = String::new();
             while let Some(ev) = rx.recv().await {
                 match ev {
                     CommandEvent::Stdout(bytes) => {
@@ -373,6 +427,9 @@ fn supervise(app: AppHandle, role: String, generation: u64) {
                                 }
                             }
                         }
+                        if !line.trim().is_empty() {
+                            last_stderr = line.clone();
+                        }
                         push_log(&app, &role, "stderr", line);
                     }
                     CommandEvent::Error(e) => {
@@ -383,6 +440,28 @@ fn supervise(app: AppHandle, role: String, generation: u64) {
                         break;
                     }
                     _ => {}
+                }
+            }
+
+            // Exit 3 IS the coordinator saying "this configuration cannot run"
+            // (llamacpp scheduler refusal). If no marker line supplied the
+            // sentence, the last stderr line is the best available one — a
+            // backoff loop here would re-print the same refusal five times and
+            // end in "crashed" with the reason buried.
+            if exit_code == Some(COORD_REFUSE_EXIT) {
+                let engine = app.state::<Engine>();
+                let mut inner = engine.0.lock().unwrap();
+                if let Some(s) = inner.slots.get_mut(&role) {
+                    if s.generation == generation && s.refused_reason.is_none() {
+                        s.refused_reason = Some(if last_stderr.is_empty() {
+                            // Client-authored sentence (not engine verbatim), so
+                            // it carries a code the UI can localize — the
+                            // "[CODE] detail" convention (ERROR_KEYS, i18n.ts).
+                            "[ENGINE_REFUSED_SILENT] the engine refused to start (exit 3) with no reason on stderr — check the engine log".to_string()
+                        } else {
+                            last_stderr.clone()
+                        });
+                    }
                 }
             }
 
@@ -525,7 +604,37 @@ fn stop_matching(app: &AppHandle, want: impl Fn(&str) -> bool) {
         emit_status(app);
     }
     for c in children {
-        let _ = c.kill();
+        // SIGTERM first, hard kill as the backstop (unix). CommandChild::kill
+        // is SIGKILL, and a SIGKILLed coordinator in llamacpp mode cannot take
+        // its llama-server child down — on macOS (no PR_SET_PDEATHSIG) that
+        // orphaned a llama-server holding the model in RAM after every clean
+        // client quit (seen live 2026-08-14; the gap is documented in
+        // results/llamacpp-b1-sidecar-20260814.md deviations #4). The
+        // coordinator handles SIGTERM by shutting the sidecar down cleanly.
+        #[cfg(unix)]
+        {
+            let pid = c.pid();
+            let terminated = std::process::Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if terminated {
+                // Grace period, then make sure. If the app is exiting, this
+                // task dies with it — the SIGTERM is already delivered, which
+                // is the part that matters.
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(2500)).await;
+                    let _ = c.kill();
+                });
+                continue;
+            }
+            let _ = c.kill();
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = c.kill();
+        }
     }
 }
 
@@ -597,10 +706,10 @@ pub fn platform_agent_start(
 ) -> Result<(), String> {
     let platform_url = platform_url.trim().to_string();
     if platform_url.is_empty() {
-        return Err("platform URL is empty — set it in Settings first".into());
+        return Err("[PLATFORM_URL_EMPTY] platform URL is empty — set it in Settings first".into());
     }
     if jwt.trim().is_empty() {
-        return Err("not signed in to the platform (no session token)".into());
+        return Err("[PLATFORM_NO_SESSION] not signed in to the platform (no session token)".into());
     }
     let name = if name.trim().is_empty() { "home".to_string() } else { name.trim().to_string() };
     let args: Vec<String> = vec![
@@ -629,6 +738,180 @@ pub fn platform_agent_stop(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub fn platform_agent_status(state: State<'_, Engine>) -> EngineStatus {
     slot_status(&state.0.lock().unwrap(), ROLE_PLATFORM_AGENT)
+}
+
+/// Resolve the llama-server engine binary the coordinator will spawn.
+///
+/// It is staged NEXT TO the client executable — scripts/stage_sidecars.sh puts
+/// it in target/debug/ for dev runs, and the bundler ships it beside the app
+/// binary (tauri.conf.json externalBin) — the same resolution Tauri itself
+/// uses for sidecars. `IDLETOKEN_LLAMA_SERVER_BIN` overrides for experiments,
+/// matching the env var the coordinator reads.
+///
+/// A missing binary is a hard, worded error, not a silent fallback: hard
+/// invariant 4 (docs/v2-rebuild-plan-2026-08.md §5) — if the engine cannot
+/// start, the answer is red, never a mock.
+pub(crate) fn llama_server_bin() -> Result<std::path::PathBuf, String> {
+    if let Ok(p) = std::env::var("IDLETOKEN_LLAMA_SERVER_BIN") {
+        if !p.is_empty() {
+            let pb = std::path::PathBuf::from(&p);
+            if pb.is_file() {
+                return Ok(pb);
+            }
+            return Err(format!("IDLETOKEN_LLAMA_SERVER_BIN points at {p}, which does not exist"));
+        }
+    }
+    let exe = std::env::current_exe().map_err(|e| format!("cannot locate this app's executable: {e}"))?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| "cannot locate this app's directory".to_string())?;
+    let name = if cfg!(windows) { "llama-server.exe" } else { "llama-server" };
+    let p = dir.join(name);
+    if p.is_file() {
+        return Ok(p);
+    }
+    // "[CODE] detail": the UI localizes the sentence (with the fix-it steps)
+    // and keeps the path as the variable detail; logs read fine as-is.
+    Err(format!(
+        "[ENGINE_BIN_MISSING] looked for {}",
+        p.display()
+    ))
+}
+
+/// Directory containing the pinned llama.cpp executables used by cluster
+/// mode. The coordinator and every rpc worker must resolve their binaries from
+/// one directory so the engine-version handshake compares like with like.
+pub(crate) fn llama_engine_dir() -> Result<std::path::PathBuf, String> {
+    if let Ok(p) = std::env::var("IDLETOKEN_ENGINE_DIR") {
+        if !p.trim().is_empty() {
+            let dir = std::path::PathBuf::from(p.trim());
+            let rpc = dir.join(if cfg!(windows) {
+                "ggml-rpc-server.exe"
+            } else {
+                "ggml-rpc-server"
+            });
+            let server = dir.join(if cfg!(windows) { "llama-server.exe" } else { "llama-server" });
+            if rpc.is_file() && server.is_file() {
+                return Ok(dir);
+            }
+            return Err(format!(
+                "IDLETOKEN_ENGINE_DIR must contain llama-server and ggml-rpc-server (checked {})",
+                dir.display()
+            ));
+        }
+    }
+    let server = llama_server_bin()?;
+    let dir = server
+        .parent()
+        .ok_or_else(|| "cannot locate the llama.cpp engine directory".to_string())?
+        .to_path_buf();
+    let rpc = dir.join(if cfg!(windows) {
+        "ggml-rpc-server.exe"
+    } else {
+        "ggml-rpc-server"
+    });
+    if !rpc.is_file() {
+        return Err(format!(
+            "the ggml-rpc-server engine binary is missing (looked for {})",
+            rpc.display()
+        ));
+    }
+    Ok(dir)
+}
+
+/// Serve one GGUF on this machine through the coordinator's llamacpp
+/// single-machine mode (v2 rebuild WS-D1; coordinator contract in
+/// results/llamacpp-b1-sidecar-20260814.md / -b2b4-):
+///
+///   idletoken-coord --llama-server-bin P --llama-gguf P --http
+///                   --api-bind H:P [--api-token T] [--ctx-size N] [--max-decode N]
+///
+/// No `--model-id`: the coordinator builds the manifest from the GGUF header
+/// and /v1/models reports the auto id. The scheduler verdict (or refusal, exit
+/// 3 + stderr) comes back through the supervisor's log/refusal channels.
+///
+/// Any engine sidecar already running is stopped first: a model switch is a
+/// restart, never a hot swap (repo memory: a model switch tears the cluster
+/// down and rebuilds it).
+#[tauri::command]
+pub fn llamacpp_serve(
+    app: AppHandle,
+    gguf_path: String,
+    api_host: String,
+    api_port: u16,
+    api_token: String,
+    ctx_size: u32,
+    max_decode: u32,
+    max_vram_mb: u32,
+    max_ram_mb: u32,
+) -> Result<(), String> {
+    let gguf = gguf_path.trim().to_string();
+    if gguf.is_empty() {
+        return Err("no GGUF file selected".into());
+    }
+    if !std::path::Path::new(&gguf).is_file() {
+        return Err(format!("GGUF file not found: {gguf}"));
+    }
+    let engine_bin = llama_server_bin()?;
+    let host = if api_host.trim().is_empty() { "0.0.0.0" } else { api_host.trim() };
+    let mut args: Vec<String> = vec![
+        "--llama-server-bin".into(),
+        engine_bin.to_string_lossy().into_owned(),
+        "--llama-gguf".into(),
+        gguf,
+        "--http".into(),
+        "--api-bind".into(),
+        format!("{host}:{api_port}"),
+    ];
+    if !api_token.is_empty() {
+        args.push("--api-token".into());
+        args.push(api_token);
+    }
+    // 0 = let the coordinator size the context from available memory (its
+    // default asks for 32K and refuses below the 16K floor with a worded
+    // reason). An explicit value is passed through and fit-checked engine-side.
+    if ctx_size > 0 {
+        args.push("--ctx-size".into());
+        args.push(ctx_size.to_string());
+    }
+    if max_decode > 0 {
+        args.push("--max-decode".into());
+        args.push(max_decode.to_string());
+    }
+    // The "this machine's usage" sliders: cap what the coordinator's own
+    // probe reports before it plans (0 = uncapped, same as the worker flag).
+    if max_vram_mb > 0 {
+        args.push("--max-vram-mb".into());
+        args.push(max_vram_mb.to_string());
+    }
+    if max_ram_mb > 0 {
+        args.push("--max-ram-mb".into());
+        args.push(max_ram_mb.to_string());
+    }
+    // Idempotent for an IDENTICAL request: serving the same GGUF with the same
+    // flags while that exact serve is already up (or still loading) is a no-op,
+    // not a restart. Without this, a doubled trigger — a double-click, or the
+    // macOS webview loading the page twice and re-running a UI-test directive —
+    // killed a coordinator mid-load and re-measured a machine whose memory the
+    // dying engine still held, which turned a fitting model into a refusal
+    // (seen live, 2026-08-14). A DIFFERENT request still restarts below.
+    {
+        let engine = app.state::<Engine>();
+        let inner = engine.0.lock().unwrap();
+        if let Some(s) = inner.slots.get("coordinator") {
+            if matches!(
+                s.state,
+                EngineState::Starting | EngineState::Running | EngineState::Restarting
+            ) && s.args == args
+            {
+                return Ok(());
+            }
+        }
+    }
+    // Restart semantics: stop whatever engine sidecars run (the platform agent
+    // keeps going — sharing compute is an independent lifecycle).
+    stop_matching(&app, |r| r != ROLE_PLATFORM_AGENT);
+    start_engine(&app, "coordinator".into(), args, Vec::new())
 }
 
 /// "Clear my cache now" (acceptance P5): one-shot `idletoken-worker --kv-clear`.
@@ -661,4 +944,38 @@ pub async fn clear_kv_cache(app: AppHandle, kv_dir: Option<String>) -> Result<()
         ));
     }
     Ok(())
+}
+
+/// The refusal latch is the client's whole understanding of "the engine said
+/// no, and why" — worth pinning both spellings, because a marker that stops
+/// matching does not fail loudly: it degrades into a bare "crashed" pill.
+#[cfg(test)]
+mod refusal_tests {
+    use super::refusal_reason;
+
+    #[test]
+    fn join_refused_marker_yields_the_reason() {
+        let line = "idletoken-worker: JOIN_REFUSED: this cluster runs linux; this machine runs macos";
+        assert_eq!(
+            refusal_reason(line).as_deref(),
+            Some("this cluster runs linux; this machine runs macos")
+        );
+    }
+
+    #[test]
+    fn llamacpp_scheduler_refusal_yields_the_reason() {
+        // Real shape from results/llamacpp-b2b4-20260814.md.
+        let line = "idletoken-coord: refuse: this model needs 1.87 GiB at ctx 32768 but this machine has 1.60 GiB usable — 0.27 GiB short.";
+        assert_eq!(
+            refusal_reason(line).as_deref(),
+            Some("this model needs 1.87 GiB at ctx 32768 but this machine has 1.60 GiB usable — 0.27 GiB short.")
+        );
+    }
+
+    #[test]
+    fn ordinary_stderr_is_not_a_refusal() {
+        assert_eq!(refusal_reason("coord: scheduler: SINGLE: fits"), None);
+        assert_eq!(refusal_reason("coord: refused 1.2.3.4 (worker): version"), None);
+        assert_eq!(refusal_reason("idletoken-coord: JOIN_REFUSED: "), None); // empty reason
+    }
 }

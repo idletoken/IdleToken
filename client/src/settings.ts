@@ -2,7 +2,7 @@
 // Split into a Simple set (what a home user needs) and an Advanced set (precise
 // control). Persisted to localStorage and restored on launch. Theme + language
 // live separately (pure UI state) but are surfaced in the Simple tab.
-import { DEFAULT_MODEL_ID, defaultQuant, isAvailable, quantOptions } from "./models";
+import { DEFAULT_MODEL_ID, LOCAL_GGUF_ID, defaultQuant, isAvailable, quantOptions } from "./models";
 
 const MiB = 1024 ** 2;
 
@@ -28,9 +28,7 @@ export const PRESET_FRACTION: Record<Exclude<ResourcePreset, "custom">, number> 
 };
 
 export type ComputeMode = "auto" | "gpu_only" | "hybrid";
-export type WeightsSource = "auto" | "local";
 export type KvEviction = "lru" | "fifo";
-export type LogLevel = "error" | "info" | "debug";
 export type Density = "comfortable" | "compact";
 export type Accent = "amber" | "teal" | "violet" | "rose";
 export type UpdateChannel = "stable" | "beta";
@@ -39,15 +37,28 @@ export interface AppSettings {
   // ---- simple ----
   modelId: string;
   quant: string; // selected precision ("" = model's default variant / single-precision models)
+  // ---- open model intake (v2 WS-D1; modelId === LOCAL_GGUF_ID) -------------
+  // Where the user-supplied GGUF comes from. Unlike the removed v3 "GGUF file
+  // path" box, these are never handed to the engine unchecked: the file path
+  // comes from a native dialog (a real, existing file), and the HF pair goes
+  // through the same verified download machinery as curated weights.
+  customSource: "file" | "hf";
+  customGgufPath: string; // absolute path picked in the native dialog ("" = none)
+  customHfRepo: string; // e.g. "unsloth/Qwen3.5-4B-GGUF" ("" = none)
+  customHfFile: string; // exact .gguf file name inside the repo
   tier: Tier["id"];
   resourcePreset: ResourcePreset;
   // ---- advanced: resources (precise; used when resourcePreset === "custom") ----
   maxVramMb: number; // 0 = no cap
   maxRamMb: number; // 0 = no cap
   computeMode: ComputeMode; // reserved — engine auto-determines GPU_ONLY/HYBRID, no override flag yet
-  // ---- advanced: model / weights ----
-  weightsSource: WeightsSource;
-  ggufPath: string;
+  // No "weights source" / "GGUF file path" any more (2026-08-13). Resolution is
+  // policy, not preference — see resolveLocalWeights: a complete local copy is
+  // used, a joiner streams its layers from the coordinator, everyone else
+  // downloads. The removed "local file" box handed an unchecked path to the
+  // engine, so a typo (or the empty box you get the moment you pick it) read as
+  // "weights ready" and failed at load. Point `modelDir` at an existing folder
+  // instead; that one is verified.
   // ---- advanced: API exposure (P6) ----
   apiHost: string;
   apiPort: number;
@@ -80,9 +91,12 @@ export interface AppSettings {
   autostart: boolean;
   autoRejoin: boolean;
   // ---- advanced: privacy / diagnostics ----
-  telemetry: boolean; // default off — local-first (philosophy 16)
-  logLevel: LogLevel;
-  experimental: boolean;
+  // No `telemetry` field (removed 2026-08-13): nothing in this product collects
+  // or sends anything, so there was nothing for it to gate. See SettingsPanel's
+  // privacy category.
+  // No `logLevel` / `experimental` (removed 2026-08-13): nothing read either.
+  // The log level was worse than inert — it rode into the diagnostics bundle,
+  // describing an engine that had never been told about it.
 
   // ---- appearance / UI details (client-side, real) ----
   uiScale: number; // 0 = auto (follow the window); otherwise a fixed factor, 1.0 = 100%
@@ -98,6 +112,9 @@ export interface AppSettings {
   idleUnloadMin: number;
 
   // ---- cluster & discovery ----
+  // Storage key kept as `mdns` (renaming it would drop the stored value for no
+  // gain); everything user-facing and the engine tuning call it what it is —
+  // LAN auto-discovery over a UDP broadcast beacon. It was never mDNS.
   mdns: boolean;
   discoveryPort: number;
   manualPeers: string; // comma-separated IPs
@@ -136,13 +153,16 @@ export interface AppSettings {
   startMinimized: boolean;
   rememberWindow: boolean;
   trayIcon: boolean;
+  /** The one-time "still running in the tray" notice has been shown. Not a
+   *  user-facing control — it only keeps the notice from repeating. */
+  trayHintShown: boolean;
 
   // ---- updates ----
   autoUpdate: boolean;
   updateChannel: UpdateChannel;
 
-  // ---- data ----
-  dataDir: string;
+  // No `dataDir` (removed 2026-08-13): the app-data location is Tauri's, and
+  // the box never moved anything.
 
   // ---- account / platform (P2 cloud auth + P3 account-mode pairing) ----
   // Base URL of the platform gateway. Empty = local identity, fully offline
@@ -174,13 +194,15 @@ const BUILT_IN_PLATFORM_URL: string =
 export const DEFAULT_SETTINGS: AppSettings = {
   modelId: DEFAULT_MODEL_ID,
   quant: defaultQuant(DEFAULT_MODEL_ID),
+  customSource: "file",
+  customGgufPath: "",
+  customHfRepo: "",
+  customHfFile: "",
   tier: 2,
   resourcePreset: "balanced",
   maxVramMb: 0,
   maxRamMb: 0,
   computeMode: "auto",
-  weightsSource: "auto",
-  ggufPath: "",
   apiHost: "0.0.0.0",
   apiPort: 8000,
   apiOpenAI: true,
@@ -202,7 +224,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   maxTokens: 0,
   // Literal, not SCHEMA_VERSION: that const is declared further down and this
   // object is built at module init. Keep the two in step by hand.
-  schemaVersion: 2,
+  schemaVersion: 4,
   kvOffload: false,
   kvDir: "",
   kvMaxMb: 1024,
@@ -212,9 +234,6 @@ export const DEFAULT_SETTINGS: AppSettings = {
   interStagePort: 14101,
   autostart: false,
   autoRejoin: false,
-  telemetry: false,
-  logLevel: "info",
-  experimental: false,
 
   uiScale: 0, // auto
   density: "comfortable",
@@ -231,9 +250,16 @@ export const DEFAULT_SETTINGS: AppSettings = {
   discoveryPort: 14099,
   manualPeers: "",
   clusterName: "home",
-  heartbeatSec: 5,
+  // 1s, not the 5 it used to say: these six were hollow until 2026-08-13, so
+  // the stored numbers described nothing. Now that the poll really uses it, the
+  // default has to be the interval the client has always polled at — otherwise
+  // wiring the setting would silently make every roster five times laggier.
+  heartbeatSec: 1,
   preferCoordinator: false,
-  sameSubnetOnly: true,
+  // Off, for the same reason: enforcing it now would start rejecting the
+  // cross-subnet meshes (Tailscale et al.) that pair fine today. It is a
+  // restriction you opt into, not one that appears on upgrade.
+  sameSubnetOnly: false,
 
   apiStreaming: true,
   apiCors: "*",
@@ -261,11 +287,11 @@ export const DEFAULT_SETTINGS: AppSettings = {
   startMinimized: false,
   rememberWindow: true,
   trayIcon: true,
+  trayHintShown: false,
 
   autoUpdate: true,
   updateChannel: "stable",
 
-  dataDir: "",
 
   platformUrl: BUILT_IN_PLATFORM_URL,
 
@@ -277,13 +303,17 @@ export const DEFAULT_SETTINGS: AppSettings = {
   privacyDummyTokens: false,
 };
 
-export const APP_VERSION = "0.1.0-pre";
+// Displayed version. Source of truth is src-tauri/tauri.conf.json (`version`),
+// which package.json mirrors — keep this literal in step with it. (Not read
+// from the Tauri API because it renders synchronously in the About note and
+// must also work in the browser dev build, where there is no shell to ask.)
+export const APP_VERSION = "0.1.0";
 
 const KEY = "idletoken.settings";
 
 // Bump when a stored value must be discarded rather than merged. Absent in
 // blobs written before versioning existed, which reads as 0.
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 4;
 
 // ---- UI scale --------------------------------------------------------------
 // The fixed factors the panel offers. `0` means auto; anything else must be one
@@ -330,10 +360,36 @@ export function autoUiScale(w: number, h: number, prev?: number): number {
 }
 
 // Merge stored settings over defaults so older saved shapes gain new fields.
+/**
+ * A fresh local API token: 32 hex chars from the platform CSPRNG.
+ *
+ * Not Math.random: this is the only thing between a machine that can spend
+ * Sparks and everyone else on the LAN (docs/api-surface.md §5.3). Falls back to
+ * Math.random ONLY where crypto is unavailable, which in Tauri and every
+ * browser we ship to is nowhere — the branch exists so a test harness without
+ * webcrypto degrades instead of throwing on launch.
+ */
+export function generateApiToken(): string {
+  const c: Crypto | undefined = typeof crypto !== "undefined" ? crypto : undefined;
+  if (c?.getRandomValues) {
+    const b = new Uint8Array(16);
+    c.getRandomValues(b);
+    return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  }
+  let s = "";
+  while (s.length < 32) s += Math.floor(Math.random() * 16).toString(16);
+  return s.slice(0, 32);
+}
+
 export function loadSettings(): AppSettings {
   try {
     const raw = localStorage.getItem(KEY);
-    if (!raw) return { ...DEFAULT_SETTINGS };
+    // Fresh install: give the local API a token instead of leaving it open on
+    // the LAN (docs/api-surface.md §3 decision 3). Generated here rather than
+    // in DEFAULT_SETTINGS because that object is a shared constant — one token
+    // baked into it would be the same token on every machine, which is worse
+    // than none.
+    if (!raw) return { ...DEFAULT_SETTINGS, apiToken: generateApiToken() };
     const parsed = JSON.parse(raw) as Partial<AppSettings>;
     const merged = { ...DEFAULT_SETTINGS, ...parsed };
     // v0 → v1: maxTokens was a hollow setting — the engine's ceiling was a
@@ -352,11 +408,46 @@ export function loadSettings(): AppSettings {
           ? 0
           : UI_SCALE_STEPS.reduce((a, b) => (Math.abs(b - parsed.uiScale!) < Math.abs(a - parsed.uiScale!) ? b : a));
     }
+    // v2 → v3: the six pairing/discovery settings (mdns, manualPeers,
+    // heartbeatSec, preferCoordinator, sameSubnetOnly, bindNic) became real on
+    // 2026-08-13. Until then nothing read them, so a stored value is a stale
+    // default and not a choice — the same reasoning as maxTokens in v0 → v1,
+    // and the same fix. Honouring them would be worse than ignoring them ever
+    // was: a machine that has been running since v1 would suddenly poll every
+    // 5s and refuse peers from another subnet, neither of which anyone asked
+    // for. Reset once; from v3 on they are obeyed.
+    if ((parsed.schemaVersion ?? 0) < 3) {
+      merged.mdns = DEFAULT_SETTINGS.mdns;
+      merged.manualPeers = DEFAULT_SETTINGS.manualPeers;
+      merged.heartbeatSec = DEFAULT_SETTINGS.heartbeatSec;
+      merged.preferCoordinator = DEFAULT_SETTINGS.preferCoordinator;
+      merged.sameSubnetOnly = DEFAULT_SETTINGS.sameSubnetOnly;
+      merged.bindNic = DEFAULT_SETTINGS.bindNic;
+    }
+    // v3 → v4: "weights source" is gone. Someone running with "local file" had
+    // a GGUF somewhere the automatic path does not look, so send the folder
+    // along instead of quietly telling them their weights are missing — the
+    // directory is what the resolver searches now, and unlike the old free-text
+    // path it is verified before anything is claimed about it.
+    if ((parsed.schemaVersion ?? 0) < 4) {
+      const legacy = parsed as { weightsSource?: string; ggufPath?: string };
+      if (legacy.weightsSource === "local" && legacy.ggufPath && !merged.modelDir) {
+        const cut = Math.max(legacy.ggufPath.lastIndexOf("/"), legacy.ggufPath.lastIndexOf("\\"));
+        if (cut > 0) merged.modelDir = legacy.ggufPath.slice(0, cut);
+      }
+    }
     // The picker only lists models the engine can run, so a stored id outside
     // that set (hand-edited storage, a model withdrawn between releases) would
     // leave the list with nothing selected and no way to select anything.
-    // Fall back rather than render a dead panel.
-    if (!isAvailable(merged.modelId)) {
+    // Fall back rather than render a dead panel. The open-intake sentinel is
+    // valid exactly when its source details survived — a bare sentinel with no
+    // file/repo would render a selection that cannot start anything.
+    const customOk =
+      merged.modelId === LOCAL_GGUF_ID &&
+      (merged.customSource === "hf"
+        ? !!(merged.customHfRepo && merged.customHfFile)
+        : !!merged.customGgufPath);
+    if (!isAvailable(merged.modelId) && !customOk) {
       merged.modelId = DEFAULT_MODEL_ID;
       merged.quant = defaultQuant(DEFAULT_MODEL_ID);
     }
@@ -366,10 +457,19 @@ export function loadSettings(): AppSettings {
     if (merged.quant && !quantOptions(merged.modelId).some((v) => v.quant === merged.quant)) {
       merged.quant = defaultQuant(merged.modelId);
     }
+    // Deliberately NOT migrated: an existing install with an empty apiToken
+    // keeps it empty. Filling one in on upgrade would 401 every curl, script
+    // and Claude Code config that machine already had working, and the user
+    // would have no idea why — the app they left running overnight simply
+    // stopped answering. New installs are closed by default (above); old ones
+    // get closed the moment it actually matters, when overflow routing is
+    // switched on and the box can spend Sparks (docs/api-surface.md §5.3).
     merged.schemaVersion = SCHEMA_VERSION;
     return merged;
   } catch {
-    return { ...DEFAULT_SETTINGS };
+    // Unreadable storage is a fresh start in every way that matters, so it gets
+    // a token too — otherwise a corrupt file silently reopens the API.
+    return { ...DEFAULT_SETTINGS, apiToken: generateApiToken() };
   }
 }
 
@@ -411,14 +511,60 @@ export interface EngineTuning {
   ctxSize: number;
   /** Per-request generation ceiling → coord `--max-decode`. 0 = context-bound. */
   maxDecode: number;
+  /** This machine's usage caps (MiB, 0 = no cap) → worker `--max-vram-mb` /
+   *  `--max-ram-mb`. Per-machine, unlike the model/ctx settings: it is the
+   *  answer to "how much of MY computer may IdleToken use", so each node
+   *  passes its own and joiners never adopt the creator's. */
+  maxVramMb: number;
+  maxRamMb: number;
+  // ---- pairing behaviour (client-side, consumed by src-tauri/src/pairing.rs) --
+  /** Announce/listen for the UDP discovery beacon. Off = this machine is found
+   *  (or finds others) only through `manualPeers`. */
+  lanDiscovery: boolean;
+  /** Comma-separated IPs to try directly when the beacon finds nothing. */
+  manualPeers: string;
+  /** Roster poll interval, seconds. Lower = the member list and the per-machine
+   *  progress update faster; higher = less LAN chatter. */
+  heartbeatSec: number;
+  /** Ask the creator to hand this machine the coordinator role on join. */
+  preferCoordinator: boolean;
+  /** Refuse peers whose IPv4 is outside this machine's /24. */
+  sameSubnetOnly: boolean;
+  /** "auto" or an IPv4: which interface cluster traffic binds to and which
+   *  address this machine advertises to the others. */
+  bindNic: string;
 }
 
 export function tierCtx(tier: Tier["id"]): number {
   return TIERS.find((t) => t.id === tier)?.ctx ?? 8192;
 }
 
-export function engineTuning(s: AppSettings): EngineTuning {
+/**
+ * The settings the engine is actually told about.
+ *
+ * `caps` is a REQUIRED argument rather than something derived from `s` here,
+ * because the presets are a fraction of the machine's totals and only the
+ * caller knows them (they come from the probe). Making it optional would let a
+ * call site quietly launch an uncapped engine, which is exactly the bug this
+ * parameter was added to fix: until 2026-08-13 the caps reached the probe and
+ * nothing else, so "This machine's usage" moved the numbers on the dashboard
+ * while the running cluster helped itself to the whole machine.
+ */
+export function engineTuning(
+  s: AppSettings,
+  caps: { maxVramMb: number; maxRamMb: number }
+): EngineTuning {
   return {
+    maxVramMb: caps.maxVramMb,
+    maxRamMb: caps.maxRamMb,
+    lanDiscovery: s.mdns,
+    manualPeers: s.manualPeers,
+    // Clamped where it is read (pairing.rs) too; here it just keeps a 0 from a
+    // hand-edited store out of a sleep loop.
+    heartbeatSec: Math.max(1, Math.min(60, s.heartbeatSec || 1)),
+    preferCoordinator: s.preferCoordinator,
+    sameSubnetOnly: s.sameSubnetOnly,
+    bindNic: s.bindNic,
     apiHost: s.apiHost || "0.0.0.0",
     apiPort: s.apiPort || 8000,
     apiToken: s.apiToken,

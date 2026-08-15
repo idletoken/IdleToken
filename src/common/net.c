@@ -438,6 +438,57 @@ int idletoken_local_ipv4(char *out, size_t cap) {
     return rc;
 }
 
+int idletoken_ip_is_overlay(const char *ip) {
+    if (!ip || !ip[0]) return 0;
+    unsigned a = 0, b = 0;
+    if (sscanf(ip, "%u.%u.", &a, &b) == 2)
+        /* 100.64.0.0/10 — the CGNAT range Tailscale (and most overlay meshes)
+         * hand out: second octet 64..127. */
+        return (a == 100 && b >= 64 && b <= 127) ? 1 : 0;
+    /* Tailscale IPv6: fd7a:115c:a1e0::/48. Compare the first three hextets
+     * value by value, NOT as a string prefix — "fd7a:115c:a1e00::" (a longer
+     * fourth-nibble hextet) must not match, while case and leading zeros must
+     * not matter. The rest of ULA space (fc00::/7) is deliberately left
+     * alone: legitimate LANs use it. */
+    static const unsigned want[3] = { 0xfd7a, 0x115c, 0xa1e0 };
+    const char *p = ip;
+    if (*p == '[') p++;                       /* "[addr]:port" form */
+    for (int seg = 0; seg < 3; seg++) {
+        unsigned v = 0;
+        int digits = 0;
+        for (;; p++) {
+            char c = *p;
+            unsigned d;
+            if      (c >= '0' && c <= '9') d = (unsigned)(c - '0');
+            else if (c >= 'a' && c <= 'f') d = (unsigned)(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') d = (unsigned)(c - 'A' + 10);
+            else break;
+            if (++digits > 4) return 0;       /* not a valid hextet */
+            v = v * 16 + d;
+        }
+        /* digits == 0 covers "::" compression here — the target prefix has
+         * no zero hextet, so a compressed run can never satisfy it. */
+        if (digits == 0 || v != want[seg]) return 0;
+        if (seg < 2) {
+            if (*p != ':') return 0;
+            p++;
+        }
+    }
+    /* Prefix matched; a real address in the /48 always continues with ':'. */
+    return *p == ':' ? 1 : 0;
+}
+
+int idletoken_hex64_valid(const char *h) {
+    if (!h) return 0;
+    for (int i = 0; i < 64; i++) {
+        char c = h[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+              (c >= 'A' && c <= 'F')))
+            return 0;
+    }
+    return h[64] == '\0';
+}
+
 /* ============================================================================
  * Payload (de)serialization — idletoken_buf cursor.
  * ========================================================================== */

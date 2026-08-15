@@ -379,7 +379,36 @@ int main(void) {
             if (rows4[i].mode == IDLETOKEN_MODE_REFUSE && rows[i].mode != IDLETOKEN_MODE_REFUSE) regressed = 1;
         }
         ok(!regressed, "adding machines never turns a yes into a no");
-        ok(improved, "adding machines turns at least one no into a yes");
+        ok(!improved, "extra machines do NOT unlock a single-node model");
+
+        /* ...but they must still unlock a CLUSTER model. This used to be one
+         * assertion ("adding machines turns some no into a yes") over the whole
+         * table; since single-node models stopped pooling memory, the only
+         * model that can flip is a cluster one, and it takes a roster big
+         * enough to hold 81 GiB. Asserting it on the specific model keeps the
+         * check honest instead of letting it pass on whatever happens to flip. */
+        idletoken_node_mem big[8];
+        for (int i = 0; i < 8; i++) { big[i].vram_usable = g(12); big[i].ram_usable = g(12); big[i].ram_pinnable = 0; big[i].unified = 0; }
+        idletoken_advice_row rows8[IDLETOKEN_ADVISE_MAX_ROWS];
+        int n8 = idletoken_advise(big, 8, rows8, IDLETOKEN_ADVISE_MAX_ROWS);
+        int dsv4_flipped = 0;
+        for (int i = 0; i < n8; i++)
+            if (!strcmp(rows8[i].model_id, "deepseek-v4-flash") &&
+                rows8[i].mode != IDLETOKEN_MODE_REFUSE) dsv4_flipped = 1;
+        ok(dsv4_flipped, "a big enough cluster unlocks the cluster model");
+
+        /* The flag the UI reads, and the invariant behind it: a single-node
+         * model's verdict must not depend on how many machines are present. */
+        int flag_ok = 1, verdict_stable = 1;
+        for (int i = 0; i < n1; i++) {
+            const idletoken_model_spec *m = idletoken_model_get(rows[i].model_id);
+            if (rows[i].single_node != !idletoken_model_may_cluster(m, NULL, 0)) flag_ok = 0;
+            if (rows[i].single_node &&
+                (rows4[i].mode != rows[i].mode || rows4[i].max_ctx != rows[i].max_ctx))
+                verdict_stable = 0;
+        }
+        ok(flag_ok, "single_node flag matches the registry's deployment field");
+        ok(verdict_stable, "a single-node model's verdict ignores the roster size");
 
         /* Halving the cap must not increase the context tier anywhere. */
         idletoken_node_mem tight[] = { NM(g(2), g(3), 0) };
@@ -395,6 +424,140 @@ int main(void) {
         int len = idletoken_advise_json(rows, n1, 1, buf, sizeof buf);
         ok(len > 0 && buf[0] == '{' && buf[len - 1] == '}',
            "capability JSON is complete");
+    }
+
+    /* ==== llama.cpp-engine scheduling (v2 WS-B2) =========================
+     * Four quadrants (fits/doesn't × single/multi) + layer-0 pinning +
+     * refusal message quality, per the WS-B2 acceptance criterion. */
+    {
+        /* An 8 GiB model with a known KV shape (64 KiB/token — big enough
+         * that ctx sizing is visible in the numbers). */
+        idletoken_llm_model_size small_m = {
+            .total_bytes = g(8), .n_layers = 32, .kv_bytes_per_token = 65536,
+        };
+        idletoken_llm_model_size big_m = {
+            .total_bytes = g(80), .n_layers = 43, .kv_bytes_per_token = 65536,
+        };
+        idletoken_llama_plan p;
+
+        /* Q1: fits one machine, several present → SINGLE (invariant #5). */
+        idletoken_node_mem trio[] = {
+            NM(g(12), g(20), 0),   /* coordinator */
+            NM(g(24), g(24), 0),
+            NM(g(6), g(10), 0),
+        };
+        ok(idletoken_plan_llamacpp(&small_m, trio, 3, 0, 32768, 0, &p) == 0 &&
+               p.kind == IDLETOKEN_LLPLAN_SINGLE,
+           "fits-one + multi roster → SINGLE, never cluster");
+        ok(p.single_node == 0 && p.layer0_node == 0,
+           "SINGLE prefers the coordinator when the coordinator fits");
+        ok(strstr(p.why, "SINGLE") != NULL, "single decision explains itself");
+
+        /* Q1b: escape hatch (acceptance vehicle) flips the same input to
+         * CLUSTER — without it every cross-machine gate loses its vehicle. */
+        ok(idletoken_plan_llamacpp(&small_m, trio, 3, 0, 32768, 1, &p) == 0 &&
+               p.kind == IDLETOKEN_LLPLAN_CLUSTER,
+           "allow_small_cluster=1 forces CLUSTER on a fitting model");
+        ok(p.order[0] == 0 && p.layer0_node == 0,
+           "escape-hatch cluster still pins layer 0 to the coordinator");
+        ok(strstr(p.why, "FITS") != NULL && strstr(p.why, "ALLOW_SMALL_CLUSTER") != NULL,
+           "forced cluster says the model fits and names the override");
+        ok(strstr(p.why, "exceeds") == NULL,
+           "forced cluster does not claim need exceeds usable (it does not)");
+
+        /* Q2: fits one machine, single-node roster → SINGLE (trivial). */
+        idletoken_node_mem one[] = { NM(g(12), g(20), 0) };
+        ok(idletoken_plan_llamacpp(&small_m, one, 1, 0, 32768, 0, &p) == 0 &&
+               p.kind == IDLETOKEN_LLPLAN_SINGLE && p.single_node == 0,
+           "single roster + fitting model → SINGLE");
+
+        /* Q3: doesn't fit any single machine, fits the roster → CLUSTER. */
+        idletoken_node_mem four[] = {
+            NM(g(12), g(20), 0),   /* coordinator: 32 usable */
+            NM(g(24), g(24), 0),   /* strongest:   48 usable */
+            NM(g(6), g(10), 0),    /* 16 usable */
+            NM(g(4), g(8), 0),     /* 12 usable */
+        };                          /* total 108 > 80+KV+4, best 48 < need1 */
+        ok(idletoken_plan_llamacpp(&big_m, four, 4, 0, 32768, 0, &p) == 0 &&
+               p.kind == IDLETOKEN_LLPLAN_CLUSTER && p.n_nodes == 4,
+           "doesn't-fit-one + big roster → CLUSTER");
+        ok(p.order[0] == 0 && p.layer0_node == 0,
+           "cluster order starts at the coordinator = layer 0 pinned there");
+        ok(p.order[1] == 1,
+           "remaining nodes ordered strongest-first after the coordinator");
+        {
+            double s = 0;
+            int positive = 1;
+            for (int i = 0; i < p.n_nodes; i++) {
+                s += p.tensor_split[i];
+                if (p.tensor_split[i] <= 0) positive = 0;
+            }
+            ok(positive && s > 0.999 && s < 1.001,
+               "tensor-split ratios are positive and sum to 1");
+            ok(p.tensor_split[0] >= 1.0 / (double)big_m.n_layers - 1e-9,
+               "coordinator's slice covers at least one layer (layer 0)");
+        }
+
+        /* Q3b: strong workers cannot rescue a memoryless coordinator —
+         * layer 0 + embedding may not leave it (privacy invariant #1). */
+        idletoken_node_mem headless[] = {
+            NM(0, 0, 0),           /* coordinator with no usable memory */
+            NM(g(64), g(64), 0),
+            NM(g(64), g(64), 0),
+        };
+        ok(idletoken_plan_llamacpp(&big_m, headless, 3, 0, 32768, 0, &p) == 0 &&
+               p.kind == IDLETOKEN_LLPLAN_REFUSE,
+           "coordinator without compute memory → refuse, workers don't count");
+        ok(strstr(p.why, "coordinator") != NULL &&
+               strstr(p.why, "layer 0") != NULL,
+           "headless-coordinator refusal names the invariant");
+
+        /* Q4: doesn't fit anywhere → REFUSE with need/have/shortfall in GiB. */
+        idletoken_node_mem tiny2[] = { NM(g(6), g(10), 0), NM(g(4), g(8), 0) };
+        ok(idletoken_plan_llamacpp(&big_m, tiny2, 2, 0, 32768, 0, &p) == 0 &&
+               p.kind == IDLETOKEN_LLPLAN_REFUSE,
+           "roster too small in total → REFUSE");
+        ok(strstr(p.why, "GiB") != NULL && strstr(p.why, "short") != NULL &&
+               strstr(p.why, "Add machines") != NULL,
+           "refusal names the numbers and suggests remedies");
+
+        /* Unified pool counted once (the M4/DGX case): 50 GiB vram aliasing
+         * 50 GiB ram must NOT pass for a model needing ~82 GiB on one node. */
+        idletoken_node_mem uni1[] = { NM(g(50), g(50), 1) };
+        ok(idletoken_plan_llamacpp(&big_m, uni1, 1, 0, 32768, 0, &p) == 0 &&
+               p.kind == IDLETOKEN_LLPLAN_REFUSE,
+           "unified 50/50 single node counts once → refuse the 80 GiB model");
+
+        /* ---- ctx sizing (idletoken_llama_fit_ctx) ---------------------- */
+        /* Overhead is the calibrated 768 MiB + weights/64 (2026-08-15):
+         * for 8 GiB weights that is 896 MiB. */
+        /* Inside 12 GiB → ~3.1 GiB KV budget → well past the 32K ask. */
+        ok(idletoken_llama_fit_ctx(g(12), &small_m, 32768, 16384) == 32768,
+           "roomy machine grants the full 32K ask");
+        /* 10 GiB usable → 10 − 8 − 0.875 = 1.125 GiB KV budget
+         * = 18432 tokens at 64 KiB/token (already 1024-aligned). */
+        ok(idletoken_llama_fit_ctx(g(10), &small_m, 32768, 16384) == 18432,
+           "tight machine grants a smaller (floor-respecting) context");
+        /* 9.5 GiB usable → 0.5 GiB KV = 8192 tokens < 16K floor → 0 (refuse
+         * loudly rather than silently under-serve Claude Code). */
+        ok(idletoken_llama_fit_ctx((uint64_t)(9.5 * (double)GiB), &small_m,
+                                   32768, 16384) == 0,
+           "below the ctx floor → 0 (caller must refuse, not shrink silently)");
+        /* Weights alone exceed the machine → 0. */
+        ok(idletoken_llama_fit_ctx(g(6), &small_m, 32768, 16384) == 0,
+           "weights don't fit → 0");
+        /* Unknown KV shape grants the ask unchanged (never invents a cost). */
+        idletoken_llm_model_size nokv = { .total_bytes = g(8), .n_layers = 32,
+                                          .kv_bytes_per_token = 0 };
+        ok(idletoken_llama_fit_ctx(g(12), &nokv, 32768, 16384) == 32768,
+           "unknown KV shape passes the ask through");
+
+        /* usable-metric helper: unified counts once, discrete sums. */
+        idletoken_node_mem um = NM(g(10), g(12), 1);
+        idletoken_node_mem dm = NM(g(10), g(12), 0);
+        ok(idletoken_llama_node_usable(&um) == g(12) &&
+               idletoken_llama_node_usable(&dm) == g(22),
+           "usable metric: unified=max(once), discrete=vram+ram");
     }
 
     printf("\n%d checks, %d failures\n", checks, failures);

@@ -18,6 +18,7 @@
 #define IDLETOKEN_PROTO_H
 
 #include <stdint.h>
+#include <stdlib.h>
 
 #define IDLETOKEN_PROTO_MAGIC   0x31494148u  /* 'HAI1' in little-endian bytes */
 /* v2 (multi-model, 2026-07): ASSIGN_PLAN carries the model identity
@@ -45,6 +46,17 @@
  * NOT send it: a stray ACK would land where the worker expects the next
  * INFER_BEGIN and be rejected as a protocol error. See scheduler-design.md
  * §6-E3.
+ * v7 (cluster salt, 2026-08-13): ASSIGN_PLAN gains a trailing
+ * IDLETOKEN_CLUSTER_SALT_BYTES field. Every node combines it with the pairing
+ * psk it already holds to derive the key that encrypts token ids on the node
+ * links (docs/inter-node-encryption.md). All-zero = no shared secret, i.e. a
+ * --coordinator cluster, which cannot be encrypted.
+ *
+ * Bumping the version is safe here in a way it was NOT for the rendezvous HTTP
+ * path: coordinator and worker ship in the same release, so there is no
+ * already-installed peer to stay compatible with. A version mismatch is
+ * rejected at HELLO, which is the wanted behaviour.
+ *
  * v6 (argmax at the last stage, 2026-08-11): INFER_LOGITS gains a SHORT FORM.
  * `n_vocab == 0` means "the last stage already took the argmax"; the payload is
  * then `u32 pos, u32 0, u32 token_id` — 12 bytes instead of 8 + 4*n_vocab.
@@ -61,7 +73,7 @@
  * top-p / logprobs are all future callers), and IDLETOKEN_FULL_LOGITS=1 forces
  * it for debugging. A v6 coordinator accepts both forms; that is what makes
  * adding sampling later a coordinator-side change instead of a wire change. */
-#define IDLETOKEN_PROTO_VERSION 6u
+#define IDLETOKEN_PROTO_VERSION 7u
 
 /* Upper bound on persistent sequence slots per cluster. seq_id is a single
  * byte on the wire; the platform scheduler caps concurrency at 64 anyway
@@ -86,6 +98,13 @@
 #define IDLETOKEN_PAIR_TAG_BYTES 16
 #define IDLETOKEN_SESSION_KEY_BYTES 32
 
+/* Bytes of cluster salt carried at the end of ASSIGN_PLAN (proto v7). The
+ * coordinator mints it once per cluster formation; every node derives the
+ * token-encryption key from it plus the pairing psk it already holds
+ * (docs/inter-node-encryption.md §3). All-zero means "this cluster has no
+ * shared secret" -- a --coordinator cluster, which cannot be encrypted. */
+#define IDLETOKEN_CLUSTER_SALT_BYTES 16
+
 /* OS family, as reported by the worker in HELLO.
  *
  * A cluster MUST be homogeneous: every compute node runs the same OS family.
@@ -94,7 +113,12 @@
  * single-machine ds4 baseline, and CUDA (--use_fast_math) vs Metal differ
  * slightly per layer, so greedy decoding eventually flips an argmax. A mixed
  * cluster that "works" would be a green we cannot falsify. See CLAUDE.md
- * hard constraint #2 and docs/macos-node.md §5. */
+ * hard constraint #2 and docs/archive/macos-node.md §5.
+ *
+ * MACOS is still on the wire but is SEALED as a compute node (2026-08-13):
+ * see idletoken_macos_node_sealed() below. The value must keep its number —
+ * removing it would silently turn a macOS HELLO into "unknown", which the
+ * coordinator would refuse for the wrong reason and log as the wrong thing. */
 typedef enum {
     IDLETOKEN_OS_UNKNOWN = 0,
     IDLETOKEN_OS_LINUX   = 1,
@@ -113,6 +137,24 @@ typedef enum {
 #else
 #  define IDLETOKEN_OS_FAMILY_SELF IDLETOKEN_OS_UNKNOWN
 #endif
+
+/* --- macOS compute seal: RETIRED (2026-08-15; unsealed by the 2026-08-14
+ * pivot, decision #2) ------------------------------------------------------
+ *
+ * The 2026-08-13 seal existed because the ds4 line had no Mac oracle. The v2
+ * compute layer is llama.cpp (Metal is its home turf), the Mac oracle exists
+ * (G_MAC_SMOKE + the PPL band, both green on real hardware), and the legacy
+ * INFER wire protocol the seal guarded is itself retired. The function stays
+ * so every caller keeps compiling and the wire enum keeps its number, but it
+ * now answers "not sealed", unconditionally — the 2026-08-15 hunt for why a
+ * Mac client refused to pair found THIS as the root cause: the client's probe
+ * still consulted the seal while the product line it guards no longer exists.
+ * The old IDLETOKEN_ALLOW_MACOS_NODE hatch is accepted and ignored. */
+#define IDLETOKEN_MACOS_UNSEAL_ENV "IDLETOKEN_ALLOW_MACOS_NODE"
+
+static inline int idletoken_macos_node_sealed(void) {
+    return 0;
+}
 
 /* Human-readable name for log lines and reject messages. Never NULL. */
 static inline const char *idletoken_os_family_name(unsigned f) {
@@ -157,6 +199,19 @@ typedef enum {
                                               * u16 layer range, model path, ctx */
     IDLETOKEN_MSG_LOAD_MODEL         = 0x0021,  /* coord -> worker: begin model load */
     IDLETOKEN_MSG_LOAD_MODEL_DONE    = 0x0022,  /* worker -> coord */
+
+    /* --- llama.cpp RPC cluster (v2 WS-C) --------------------------------
+     * Sent instead of ASSIGN_PLAN when the worker joined in --rpc-supervisor
+     * mode. RPC_ASSIGN carries the cluster's ggml-RPC TLS PSK wrapped under
+     * the pairing session key (idletoken_pair_wrap_secret) — the PSK itself
+     * never crosses the LAN in the clear:
+     *   RPC_ASSIGN: u8 version(=1), u8 reserved[3],
+     *               nonce[IDLETOKEN_PAIR_NONCE_BYTES],
+     *               ct[IDLETOKEN_SESSION_KEY_BYTES],
+     *               tag[IDLETOKEN_PAIR_TAG_BYTES]
+     *   RPC_READY:  str endpoint ("lan_ip:port" the rpc-server listens on) */
+    IDLETOKEN_MSG_RPC_ASSIGN         = 0x0023,  /* coord -> worker: wrapped RPC TLS PSK */
+    IDLETOKEN_MSG_RPC_READY          = 0x0024,  /* worker -> coord: rpc-server is listening */
 
     /* --- inference -----------------------------------------------------
      * Payload prefixes (v4). Both carry seq_id at byte 3 — the slot whose KV

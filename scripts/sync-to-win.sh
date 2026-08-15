@@ -67,18 +67,55 @@ COPYFILE_DISABLE=1 tar czf "$TAR" \
     vendor/ds4/rax.c vendor/ds4/rax.h vendor/ds4/rax_malloc.h \
     vendor/tweetnacl vendor/blake2 \
     client \
-    Makefile \
+    LICENSE NOTICE Makefile \
     build_ds4x_win.bat runworker-ds4x-win.bat
 
 echo "shipping $(du -h "$TAR" | cut -f1) to $NODE:$WHOME"
-scp -q "$TAR" "$NODE:$WHOME/idletoken-sync.tar.gz"
-ssh "$NODE" "cd /d ${WHOME//\//\\} && tar xzf idletoken-sync.tar.gz && del /q idletoken-sync.tar.gz && echo SYNC_OK" | tr -d '\r' | tail -1
+# The archive travels over STDIN and never touches the node's disk. With an
+# on-disk archive, Windows bsdtar's "am I overwriting my own input?" check
+# (pseudo dev/inode comparison) intermittently matched UNRELATED extracted
+# files and refused with "Refusing to overwrite archive" — first with the
+# archive inside the destination tree (robocopy staging worked around that),
+# then, 2026-08-16, against a FRESH stage directory too (client/src/pairing.ts;
+# a filter driver zeroing FileIndex makes every file look identical to the
+# archive). No archive file, no comparison, no flake. cmd.exe hosts the
+# extraction because PowerShell mangles binary stdin.
+win_stage_path="${WHOME//\//\\}\\idletoken-sync-stage"
+ssh "$NODE" "cmd /c \"rmdir /s /q $win_stage_path 2>nul & mkdir $win_stage_path && tar xzf - -C $win_stage_path\"" < "$TAR"
+tar_rc=$?
+if [ "$tar_rc" -ne 0 ]; then
+    echo "sync-to-win.sh: streamed extraction failed on $NODE (exit $tar_rc)" >&2
+    rm -f "$TAR"
+    exit 1
+fi
+# Merge stage -> checkout. Robocopy uses 0..7 for success and >=8 for failure,
+# so translate that contract explicitly.
+remote_ps="\$ErrorActionPreference='Stop'; \
+Set-Location '$WHOME'; \
+\$stage='idletoken-sync-stage'; \
+& robocopy \$stage . /E /IS /IT /NFL /NDL /NJH /NJS /NP; \
+\$copyRc=\$LASTEXITCODE; \
+if (\$copyRc -ge 8) { exit \$copyRc }; \
+Remove-Item -Recurse -Force \$stage; \
+Write-Output 'SYNC_OK'"
+if sync_out=$(ssh "$NODE" "powershell -NoProfile -Command \"$remote_ps\"" 2>&1); then
+    sync_rc=0
+else
+    sync_rc=$?
+fi
+printf '%s\n' "$sync_out" | tr -d '\r' | tail -1
+if [ "$sync_rc" -ne 0 ] || ! printf '%s\n' "$sync_out" | tr -d '\r' | grep -qx 'SYNC_OK'; then
+    echo "sync-to-win.sh: remote extraction failed on $NODE (ssh/tar exit $sync_rc)" >&2
+    printf '%s\n' "$sync_out" >&2
+    rm -f "$TAR"
+    exit 1
+fi
 rm -f "$TAR"
 
 # --- Drift check against the historical copy -------------------------------
 # build_ds4x.bat on the machine is the old name of build_ds4x_win.bat. As long as
 # it is there, somebody (myself included) will run that one and get stale compile
-# flags -- and a missing `-DHOMEAI_DS4X_CUDA` **silently** falls back to CPU (28x
+# flags -- and a missing `-DIDLETOKEN_DS4X_CUDA` **silently** falls back to CPU (28x
 # slower), which looks like "poor performance" rather than a fault. So this
 # reports and does not touch anything.
 legacy=$(ssh "$NODE" "cd /d ${WHOME//\//\\} && if exist build_ds4x.bat (fc /b build_ds4x.bat build_ds4x_win.bat >nul 2>&1 && echo SAME || echo DIFF) else echo ABSENT" 2>/dev/null | tr -d '\r' | tail -1)
