@@ -179,6 +179,17 @@ if [ "$MODE" = debug ]; then
 fi
 
 echo "== [4/4] cargo tauri build (nsis) =="
+# ⚠ KNOWN-BROKEN SIGNING PATH (2026-08-20). The inline-signing below wedges
+# forever at Tauri's password prompt: cmd cannot represent an empty-valued
+# environment variable (`set "X="` DELETES it), so the updater key's
+# intentionally-empty password never reaches Tauri and it prompts — over a
+# non-tty ssh that is an infinite hang, and no stdin trick reliably feeds it
+# (the password reader flushes pending input). Use the DEFERRED-SIGNING flow
+# instead: `IDLETOKEN_DEFER_UPDATER_SIGNING=1 scripts\build_client_release.bat`
+# on the node, then sign the updater zip on the control machine and push the
+# sig back — acceptance.sh's g_release() is the reference implementation and
+# the certified path. This inline path is kept only for keys that carry a
+# real, non-empty password.
 # THE SIGNING KEY.
 #
 # `createUpdaterArtifacts` is on in tauri.conf.json, so this build also produces

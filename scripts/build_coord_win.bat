@@ -27,6 +27,17 @@ del coord_build.log 2>nul
 
 REM Same flags as CFLAGS_COORD in the Makefile, plus the Windows shim.
 set CF=-D_GNU_SOURCE -DDS4_NO_GPU -Isrc/platform/win -Ivendor/ds4 -Iinclude -std=gnu11 -O2 -include src/platform/win/win_compat.h
+REM Release builds pin the platform's ed25519 verify key (overflow.c); same
+REM contract as `make coord IDLETOKEN_PLATFORM_VERIFY_KEY_B64=...` on POSIX.
+REM Optional on purpose: a dev build without the pin still works behind the
+REM loud IDLETOKEN_PLATFORM_VERIFY_KEY escape hatch.
+REM Injected via a generated header, NOT -D on the command line: cmd's quote
+REM handling shreds a -DX="..." into a bare " that gcc reads as a linker input
+REM (seen 2026-08-20: ': linker input file not found').
+if defined IDLETOKEN_PLATFORM_VERIFY_KEY_B64 (
+    echo #define IDLETOKEN_PLATFORM_VERIFY_KEY_B64 "%IDLETOKEN_PLATFORM_VERIFY_KEY_B64%"> vk_pin.h
+    set CF=%CF% -include vk_pin.h
+)
 
 echo === vendor ===> coord_build.log
 gcc -c vendor/ds4/ds4.c %CF% -o c_ds4.o >> coord_build.log 2>&1
@@ -67,16 +78,31 @@ echo === ds4x tokenizer ===>> coord_build.log
 gcc -c src/ds4x/ds4x_tokenizer.c %CF% -o c_ds4x_tokenizer.o >> coord_build.log 2>&1
 if errorlevel 1 goto :fail
 
+REM Overflow (B2B forwarding) and its crypto: sealed envelopes ride on
+REM sodium_seal + b64 + blake2b, exactly the objects the Makefile's coord link
+REM carries. All four were missing here — the coord had no Windows build since
+REM overflow landed, and the stale exe on the build node masked it (the same
+REM "this list is the Windows twin" warning above, proven right again
+REM 2026-08-20).
+gcc -c src/common/b64.c %CF% -o c_b64.o >> coord_build.log 2>&1
+if errorlevel 1 goto :fail
+gcc -c src/common/sodium_seal.c %CF% -Ivendor/tweetnacl -Ivendor/blake2 -o c_sodium_seal.o >> coord_build.log 2>&1
+if errorlevel 1 goto :fail
+gcc -c vendor/blake2/blake2b.c -Ivendor/blake2 -std=gnu11 -O2 -w -o c_blake2b.o >> coord_build.log 2>&1
+if errorlevel 1 goto :fail
+
 echo === coord ===>> coord_build.log
 gcc -c src/coord/coord_main.c %CF% -o c_coord_main.o >> coord_build.log 2>&1
 if errorlevel 1 goto :fail
 gcc -c src/coord/llama_sidecar.c %CF% -o c_llama_sidecar.o >> coord_build.log 2>&1
 if errorlevel 1 goto :fail
+gcc -c src/coord/overflow.c %CF% -Ivendor/tweetnacl -Ivendor/blake2 -o c_overflow.o >> coord_build.log 2>&1
+if errorlevel 1 goto :fail
 
 echo === link ===>> coord_build.log
 REM -static-libgcc + static winpthread: the exe must run on a machine with only
 REM the NVIDIA driver and no MinGW on PATH (same reason as the worker link).
-gcc -static-libgcc -o idletoken-coord.exe c_coord_main.o c_llama_sidecar.o c_net.o c_discovery.o c_model.o c_http.o c_plan.o c_gguf.o c_advise.o c_enginever.o c_resource.o c_model_auto.o c_apiconv.o c_nodecrypt.o c_privacy.o c_tweetnacl.o c_ds4x_tokenizer.o c_ds4.o c_rax.o c_win_compat.o -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic -lws2_32 -lbcrypt >> coord_build.log 2>&1
+gcc -static-libgcc -o idletoken-coord.exe c_coord_main.o c_llama_sidecar.o c_overflow.o c_net.o c_discovery.o c_model.o c_modelsize.o c_http.o c_plan.o c_gguf.o c_advise.o c_enginever.o c_resource.o c_model_auto.o c_apiconv.o c_b64.o c_sodium_seal.o c_blake2b.o c_nodecrypt.o c_privacy.o c_tweetnacl.o c_ds4x_tokenizer.o c_ds4.o c_rax.o c_win_compat.o -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic -lws2_32 -lbcrypt >> coord_build.log 2>&1
 if errorlevel 1 goto :fail
 
 echo COORD_WIN_OK
