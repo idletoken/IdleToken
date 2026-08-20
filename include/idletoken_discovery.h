@@ -175,6 +175,19 @@ int idletoken_pair_client_auth(int fd, const idletoken_pair_id *id,
 int idletoken_pair_server_auth(int fd, const idletoken_pair_id *id,
                             uint8_t session_key[IDLETOKEN_SESSION_KEY_BYTES]);
 
+/* How long a source must wait after `fails` consecutive failed joins.
+ *
+ * A six-character code is ~30 bits: fine for something a person types, but
+ * only while guesses cost something. The first few failures are free (typos);
+ * past that the wait grows exponentially to a ceiling, which is what turns an
+ * afternoon of LAN brute force into an impractical one. Exposed for the unit
+ * test — the curve is the security property, so it gets asserted directly
+ * rather than inferred from timing. */
+long long idletoken_pair_backoff_ms(int fails);
+
+/* Forget every recorded source (test/maintenance hook). */
+void idletoken_pair_throttle_reset(void);
+
 /* ---- secret wrapping under the pairing session key ----------------------
  *
  * Carries a 32-byte secret (the cluster's ggml-RPC TLS PSK, v2 WS-C2) over

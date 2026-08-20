@@ -112,4 +112,22 @@ uint64_t idletoken_gguf_data_offset(const idletoken_gguf_meta *m);
 int idletoken_gguf_identity(const char *path, uint8_t out[32],
                          char *err, size_t errlen);
 
+/* SHA-256 of the WHOLE file — the digest curated manifests pin (the `sha256`
+ * field in models/<id>.json, which is also the value Hugging Face publishes as
+ * the LFS oid), so this is the one that can be reconciled with them by eye or
+ * by script.
+ *
+ * Distinct from idletoken_gguf_identity above on purpose, and NOT a substitute
+ * for it: this reads every byte (minutes on an 80 GiB model) and needs a
+ * complete file, so it must never sit on a startup path. It exists for the
+ * development channel — record what a machine actually loaded — while the
+ * cheap metadata identity keeps doing the per-start cluster agreement check.
+ *
+ * `progress_mib`, when > 0, prints a line to stderr every that many MiB, so a
+ * multi-minute hash of a large model does not look like a hang.
+ * Returns 0 and fills `out`; -1 with `err` on failure. */
+int idletoken_gguf_file_sha256(const char *path, uint8_t out[32],
+                               unsigned progress_mib,
+                               char *err, size_t errlen);
+
 #endif /* IDLETOKEN_GGUF_H */

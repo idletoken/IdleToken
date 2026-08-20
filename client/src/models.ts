@@ -6,11 +6,13 @@
 // (src/common/model.c) mirrors. Adding a model = adding a manifest (+ an
 // engine backend that can run it); no UI or planner changes.
 import dsv4 from "../../models/deepseek-v4-flash.json";
+import dsv4pro from "../../models/deepseek-v4-pro.json";
 import qwen38b from "../../models/qwen3-8b.json";
 import qwen3508b from "../../models/qwen3.5-0.8b.json";
 import qwen354b from "../../models/qwen3.5-4b.json";
 import qwen359b from "../../models/qwen3.5-9b.json";
 import qwen3527b from "../../models/qwen3.5-27b.json";
+import qwen3827b from "../../models/qwen3.8-27b.json";
 import qwen3535ba3b from "../../models/qwen3.5-35b-a3b.json";
 import glm52 from "../../models/glm-5.2.json";
 import kimiK25 from "../../models/kimi-k2.5.json";
@@ -25,6 +27,29 @@ export interface ModelVariant {
   shared_weight_bytes: number;
   repo: string;
   gguf: string;
+  // Content hash of the GGUF (integrity gate; scripts/manifest_sha256.py fills
+  // it from the HF API). Absent only during curation — a shipped variant
+  // without a hash downloads unverified, which the gate treats as "nothing to
+  // verify", not as failure.
+  sha256?: string;
+  // HF repo commit the hash was observed at. Downloads resolve against it, so
+  // a force-push cannot swap the bytes under the same name. Absent = use the
+  // moving branch (`main`).
+  revision?: string;
+  /** Split GGUF (2026-08-15): the parts AFTER `gguf`, in repo order. Every
+   *  model past ~50 GB ships this way on HF (`*-00002-of-00006.gguf` …), so a
+   *  precision is "present" only when all of its parts are. `gguf` stays the
+   *  first part — the one the engine is handed; llama.cpp finds the rest by
+   *  name in the same directory. Absent/empty = a single-file precision. */
+  parts?: SplitPart[];
+}
+
+/** One extra file of a split GGUF. `bytes` is that part's own size (0 =
+ *  unknown, the server's length decides); `sha256` gates that part alone. */
+export interface SplitPart {
+  file: string;
+  bytes?: number;
+  sha256?: string;
 }
 
 // Shape of a models/<id>.json manifest (planning-time metadata; the GGUF is
@@ -33,7 +58,7 @@ export interface ModelManifest {
   id: string;
   label: string;
   family: string;
-  backend: "ds4" | "ds4x";
+  backend: "ds4" | "ds4x" | "llamacpp";
   arch: string;
   available: boolean;
   // "cluster" = may be spread over a homogeneous LAN cluster; "single-node" =
@@ -54,6 +79,12 @@ export interface ModelManifest {
   kv: { kind: string; bytes_per_token_per_layer: number };
   overhead_base_bytes: number;
   default_gguf: string;
+  // Content hash of default_gguf for models WITHOUT a variants table (the
+  // large MLA-MoE family). Variant models carry the hash per variant instead.
+  sha256?: string;
+  revision?: string;
+  /** Split GGUF parts for `default_gguf` (models without a variants table). */
+  parts?: SplitPart[];
   chat_template: string;
   sources: { repo: string; quant: string }[];
   // Small dense models (GQA) carry a precision menu; large MLA-MoE models omit
@@ -68,11 +99,13 @@ export interface ModelManifest {
 export interface ModelSpec {
   id: string;
   label: string;
+  /** Manifest family ("qwen3.5", "kimi", …) — the raw grouping key. */
+  family: string;
   params: string; // human summary, e.g. "304B · 13B active"
   totalLayers: number;
   approxWeightsBytes: number;
   available: boolean; // false = shown greyed out, backend not implemented yet
-  backend: "ds4" | "ds4x";
+  backend: "ds4" | "ds4x" | "llamacpp";
   contextMax: number;
   singleNode: boolean; // served by one machine; clustering it is refused
   note?: string;
@@ -87,16 +120,52 @@ export interface ModelSpec {
 // (model_manifest_check.py compares models/*.json against model.c and does not
 // cover this file).
 const MANIFESTS = [
-  dsv4,
-  qwen3508b, qwen354b, qwen38b, qwen359b, qwen3527b, qwen3535ba3b,
+  dsv4, dsv4pro,
+  qwen3508b, qwen354b, qwen38b, qwen359b, qwen3527b, qwen3827b, qwen3535ba3b,
   glm52, kimiK25, kimiK3,
 ] as ModelManifest[];
+
+/** Parameter counts only — "304B · 13B active", nothing else. The manifest's
+ *  params_summary also carries layer counts (rendered separately by every list
+ *  that wants them), architecture jargon ("hybrid linear attention", "GQA",
+ *  "KDA+MLA") and quantized sizes; none of that helps a home user pick a
+ *  model, and it made the list read like a spec sheet (2026-08-15). Segments
+ *  are kept iff they lead with a parameter count (12B / 2.8T), so "total /
+ *  active" MoE splits survive and everything else drops.
+ *
+ *  `label` suppresses the whole thing when the NAME already carries the size
+ *  (2026-08-16): every Qwen is named after its parameter count, so the row read
+ *  "Qwen3 8B … 8.2B" and "Qwen3.5 35B-A3B … 35B total / 3B active" — the same
+ *  fact twice, the second time in more words. Models whose name says nothing
+ *  about size (DeepSeek V4 Flash, GLM-5.2, Kimi K2.5) keep it, because there it
+ *  is the only place the number appears. */
+function paramsOnly(summary: string, label?: string): string {
+  const kept = summary
+    .split("·")
+    .map((seg) => seg.replace(/\bdense\b/, "").replace(/\s+/g, " ").trim())
+    .filter((seg) => /^[\d.]+\s*[BT]\b/.test(seg));
+  if (kept.length === 0) return summary;
+  // Redundant with the name? Compare the leading size token only, ignoring
+  // separators and case: "35B" is in "Qwen3.5 35B-A3B", and "8.2B" counts as
+  // covered by "Qwen3 8B" — the tenth of a billion is not what anyone reads
+  // that column for.
+  const lead = kept[0].match(/^([\d.]+)\s*([BT])\b/);
+  if (label && lead) {
+    const norm = label.toLowerCase().replace(/[\s\-_.]/g, "");
+    const n = lead[1];
+    const unit = lead[2].toLowerCase();
+    const forms = new Set([n + unit, Math.round(Number(n)) + unit]);
+    for (const f of forms) if (norm.includes(f.replace(/[.]/g, ""))) return "";
+  }
+  return kept.join(" · ");
+}
 
 function toSpec(m: ModelManifest): ModelSpec {
   return {
     id: m.id,
     label: m.label,
-    params: m.params_summary,
+    family: m.family,
+    params: paramsOnly(m.params_summary, m.label),
     totalLayers: m.n_layers,
     approxWeightsBytes: m.layer_weight_bytes + m.shared_weight_bytes,
     available: m.available,
@@ -121,45 +190,75 @@ export const MODELS: ModelSpec[] = MANIFESTS.map(toSpec);
  */
 export const AVAILABLE_MODELS: ModelSpec[] = MODELS.filter((m) => m.available);
 
+/**
+ * Models grouped by BRAND for the picker (2026-08-15).
+ *
+ * Flat, the catalogue is now ~10 models × up to 26 precisions — a single list
+ * ran off the screen and buried the choice that actually matters first ("whose
+ * model?"), then second ("how big?"), then last ("how precise?"). Brand is
+ * coarser than the manifest's `family`: "qwen3" and "qwen3.5" are one vendor
+ * to a reader, and splitting them into two cards would reproduce the problem
+ * this grouping exists to solve.
+ */
+/** The model's name WITHOUT its brand: "DeepSeek V4 Flash" inside the DeepSeek
+ *  card is just "V4 Flash", "Qwen3.5 4B" inside Qwen is "3.5 4B". The brand is
+ *  already the card's title, and repeating it on every chip is noise the eye
+ *  has to filter (2026-08-15). */
+export function shortModelLabel(label: string, brandLabel: string): string {
+  const l = label.trim();
+  const b = brandLabel.trim();
+  if (b && l.toLowerCase().startsWith(b.toLowerCase())) {
+    const rest = l.slice(b.length).replace(/^[\s·:-]+/, "").trim();
+    if (rest) return rest;
+  }
+  return l;
+}
+
+export interface ModelBrand {
+  /** Stable key for React lists and the open/closed state. */
+  id: string;
+  label: string;
+  /** Smallest first — the ladder a user scans to find something that fits. */
+  models: ModelSpec[];
+}
+
+const BRAND_OF: { match: (family: string) => boolean; id: string; label: string }[] = [
+  { match: (f) => f.startsWith("qwen"), id: "qwen", label: "Qwen" },
+  { match: (f) => f.startsWith("deepseek"), id: "deepseek", label: "DeepSeek" },
+  { match: (f) => f.startsWith("kimi"), id: "kimi", label: "Kimi" },
+  { match: (f) => f.startsWith("glm"), id: "glm", label: "GLM" },
+];
+
+export function brandOf(family: string): { id: string; label: string } {
+  const hit = BRAND_OF.find((b) => b.match(family));
+  // An unknown family becomes its own brand rather than a catch-all "Other":
+  // a new vendor should appear under its own name the day its manifest lands,
+  // without anybody remembering to edit this table.
+  return hit ?? { id: family || "other", label: family || "Other" };
+}
+
+/** The picker's data: one card per brand, models smallest-first inside it. */
+export const MODEL_BRANDS: ModelBrand[] = (() => {
+  const by = new Map<string, ModelBrand>();
+  for (const m of AVAILABLE_MODELS) {
+    const b = brandOf(m.family);
+    if (!by.has(b.id)) by.set(b.id, { id: b.id, label: b.label, models: [] });
+    by.get(b.id)!.models.push(m);
+  }
+  for (const b of by.values()) b.models.sort((x, y) => x.approxWeightsBytes - y.approxWeightsBytes);
+  return [...by.values()];
+})();
+
 export const DEFAULT_MODEL_ID = "deepseek-v4-flash";
 
-// ---- open model intake (v2 rebuild WS-D1) ----------------------------------
-// The registry above is the CURATED list — default recommendations. Since the
-// llama.cpp pivot (docs/v2-rebuild-plan-2026-08.md §1.6) any GGUF the engine
-// can load is selectable: the user points at a local file or an HF repo+file,
-// and the COORDINATOR builds the manifest from the GGUF header (WS-B4) — the
-// client deliberately knows nothing about such a model beyond where it lives.
-// One sentinel id marks that selection; the file/repo details ride in settings
-// (customGguf*), not here, because there is no manifest to register.
-
-/** settings.modelId value meaning "a user-supplied GGUF, not a curated model". */
-export const LOCAL_GGUF_ID = "local-gguf";
-
-/** Is this the open-intake selection (user-supplied GGUF)? */
-export function isLocalGguf(id: string): boolean {
-  return id === LOCAL_GGUF_ID;
-}
-
-/**
- * A display-only ModelSpec for the open-intake selection, so components that
- * render "the selected model" need no second code path. Capacity fields are
- * zero on purpose: the client has no manifest for this model, and the honest
- * fit answer is the coordinator's startup verdict (shown on the engine card),
- * not a client-side estimate built from another model's numbers.
- */
-export function localGgufSpec(label: string): ModelSpec {
-  return {
-    id: LOCAL_GGUF_ID,
-    label: label || "Local GGUF",
-    params: "GGUF",
-    totalLayers: 0,
-    approxWeightsBytes: 0,
-    available: true,
-    backend: "ds4x", // unused on this path; the coordinator drives llama.cpp
-    contextMax: 0,
-    singleNode: true, // networked serving of open models arrives with WS-C
-  };
-}
+// The curated registry is the WHOLE selectable set. The open intake (WS-D1:
+// pick any GGUF file / HF repo, sentinel id "local-gguf") was removed on
+// 2026-08-15 — a product decision, not a technical limit: shared endpoints
+// must run models whose quality we can vouch for, and serving arbitrary GGUFs
+// is what generic local-inference tools already do. Users who want another
+// model file a GitHub issue; adding one = adding a manifest here.
+// (settings.ts still recognizes the stored sentinel and migrates it back to
+// the default model.)
 
 /** Is this id something the engine can run today? Unknown ids are not. */
 export function isAvailable(id: string): boolean {
@@ -184,12 +283,32 @@ export function getManifest(id: string): ModelManifest {
  * the disk regardless of whether we can explain it.
  */
 export function describeGguf(file: string): { label: string; quant?: string } | null {
+  // Compare LEAF names. Manifest entries carry the repo's directory prefix
+  // ("UD-IQ1_S/GLM-5.2-…-00001-of-00006.gguf") while the model folder holds
+  // the bare file, so a whole-string compare recognised nothing that came from
+  // a split repo — every part of a 200 GB download listed as an unknown file.
+  const leaf = (p: string) => p.split(/[\\/]/).pop() ?? p;
+  const want = leaf(file);
   for (const m of MANIFESTS) {
     for (const v of m.variants ?? []) {
-      if (v.gguf === file) return { label: m.label, quant: v.quant };
+      if (leaf(v.gguf) === want) return { label: m.label, quant: v.quant };
+      // A part of a split precision is that precision — the user downloaded
+      // one thing and should see one name, not six mystery files.
+      for (const part of v.parts ?? []) {
+        if (leaf(part.file) === want) return { label: m.label, quant: v.quant };
+      }
     }
-    if (m.default_gguf === file) return { label: m.label };
+    if (leaf(m.default_gguf) === want) return { label: m.label };
+    for (const part of m.parts ?? []) {
+      if (leaf(part.file) === want) return { label: m.label };
+    }
   }
+  // Engine-produced layer shards ("L26-38.gguf": layers 26 through 38 of a
+  // model, written by the weight-sharding tooling). They are not models and
+  // never appear in a manifest, but they DO sit in the model folder — saying
+  // what they are beats listing them as if a model had that name.
+  const shard = /^L(\d+)[-_](\d+)\.gguf$/i.exec(want);
+  if (shard) return { label: `Layer shard ${shard[1]}–${shard[2]}` };
   return null;
 }
 
@@ -289,6 +408,41 @@ export interface CapacityEstimate {
   // "needs 5 GB across 3 machines" about a model the engine will only ever run
   // on one.
   nodes: number;
+}
+
+/** One machine's contribution to the pool, in the shape the estimator takes. */
+export interface NodeMemory {
+  vramFree?: number;
+  ramFree?: number;
+  unifiedMemory?: boolean;
+}
+
+/**
+ * Add up what a whole cluster brings (2026-08-15).
+ *
+ * Every machine measures its own memory and sends it with its join, so the
+ * roster already carries the numbers — this just totals them, applying the
+ * engine's rule per machine: unified memory (Apple Silicon) is ONE physical
+ * pool and is counted once, discrete VRAM and RAM add up.
+ *
+ * `complete` is false when any member reported nothing (an older build). The
+ * total is then a lower bound, and the caller must say "cannot tell" rather
+ * than declare a shortfall that may not exist — a wrong "not enough" would
+ * send someone shopping for hardware they already have.
+ */
+export function poolMemory(nodes: NodeMemory[]): { bytes: number; complete: boolean } {
+  let bytes = 0;
+  let complete = nodes.length > 0;
+  for (const n of nodes) {
+    const v = n.vramFree ?? 0;
+    const r = n.ramFree ?? 0;
+    if (v === 0 && r === 0) {
+      complete = false;
+      continue;
+    }
+    bytes += n.unifiedMemory ? Math.max(v, r) : v + r;
+  }
+  return { bytes, complete };
 }
 
 // `nNodes`: the known cluster size when paired; pass the nominal typical

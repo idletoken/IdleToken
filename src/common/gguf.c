@@ -312,6 +312,51 @@ int idletoken_gguf_meta_arr_i32(const idletoken_gguf_meta *m, const char *key,
  * Streams the metadata region in 1 MiB chunks: on a sparse layer shard the
  * region is present (it is what the fetcher needs to parse the index), while
  * reading the whole 80 GiB file is neither affordable nor possible there. */
+/* Whole-file digest — the value curated manifests pin. See the header for why
+ * it is separate from the metadata identity above and must stay off startup
+ * paths. */
+int idletoken_gguf_file_sha256(const char *path, uint8_t out[32],
+                               unsigned progress_mib,
+                               char *err, size_t errlen) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        if (err && errlen) snprintf(err, errlen, "open %s failed", path);
+        return -1;
+    }
+    enum { CHUNK = 1u << 20 };
+    unsigned char *buf = (unsigned char *)malloc(CHUNK);
+    if (!buf) { fclose(f); if (err && errlen) snprintf(err, errlen, "oom"); return -1; }
+
+    idletoken_sha256_ctx c;
+    idletoken_sha256_init(&c);
+    uint64_t done = 0, next_report = (uint64_t)progress_mib << 20;
+    for (;;) {
+        size_t got = fread(buf, 1, CHUNK, f);
+        if (got == 0) break;
+        idletoken_sha256_update(&c, buf, got);
+        done += got;
+        if (progress_mib > 0 && done >= next_report) {
+            fprintf(stderr, "coord: hashing GGUF… %llu MiB\n",
+                    (unsigned long long)(done >> 20));
+            fflush(stderr);
+            next_report = done + ((uint64_t)progress_mib << 20);
+        }
+    }
+    int read_err = ferror(f);
+    free(buf);
+    fclose(f);
+    if (read_err) {
+        if (err && errlen) snprintf(err, errlen, "read error on %s", path);
+        return -1;
+    }
+    if (done == 0) {
+        if (err && errlen) snprintf(err, errlen, "%s is empty", path);
+        return -1;
+    }
+    idletoken_sha256_final(&c, out);
+    return 0;
+}
+
 int idletoken_gguf_identity(const char *path, uint8_t out[32],
                          char *err, size_t errlen) {
     char merr[256] = "";

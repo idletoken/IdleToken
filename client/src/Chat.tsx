@@ -16,8 +16,6 @@ import { inTauri } from "./platform";
 import type { ClusterApi } from "./pairing";
 import { recordProblem } from "./problems";
 import { useClusterStats, servedModelOf } from "./clusterStats";
-import type { CustomModelSource } from "./weights";
-import ModelPicker from "./ModelPicker";
 
 interface ChatMsg {
   role: "user" | "assistant";
@@ -46,12 +44,70 @@ interface Conversation {
   updatedAt: number;
 }
 
+/** A generation in flight, one per conversation.
+ *
+ *  `phase` is the honest answer to "what is happening right now":
+ *    waiting   — the request is out and the cluster has not said a word. Most
+ *                often it is queued behind another turn; nothing is being
+ *                generated, so nothing may be animated as though it were.
+ *    prefill   — the cluster is reading the prompt (ticks arrive, `prefill` is set)
+ *    streaming — tokens are landing in the transcript
+ */
+interface LiveGen {
+  /** Passed to `api_chat_cancel`, and what tags this stream's `api-chat` events. */
+  reqId: string;
+  phase: "waiting" | "prefill" | "streaming";
+  prefill: { done: number; total: number; reused: number } | null;
+  startedAt: number;
+}
+
 const STORE_KEY = "idletoken.chat.v2";
 const LEGACY_KEY = "idletoken.chat.v1"; // single rolling transcript
 const MAX_STORED = 50; // messages kept per conversation
 const MAX_CONVOS = 40;
+/** How many conversations may generate at once.
+ *
+ *  Not a setting (and not derived from the cluster): the coordinator serves
+ *  requests serially in single-machine llama.cpp mode today, so past a small
+ *  number the extra turns are pure queue — a ceiling that let a user open ten
+ *  would be a ceiling that lies about what the machine can do. Three is enough
+ *  to work in one thread while two others think, and small enough that the
+ *  queue behind it stays comprehensible. Raise it when the engine grows real
+ *  sequence slots (see the engine-multislot-cachehit plan), not before.
+ */
+const CLIENT_MAX_INFLIGHT = 3;
+/** How long changes may sit unwritten before history hits localStorage. The
+ *  whole table is serialized on every write, so with three streams appending
+ *  deltas several times a second an unbatched write is a full re-serialize per
+ *  token. Flushed on unmount and on `beforeunload`, so the debounce can only
+ *  ever cost the last few hundred ms of an unclean kill. */
+const STORE_DEBOUNCE_MS = 400;
+/** …and the ceiling on that wait. A plain debounce is WRONG here: deltas land
+ *  every few tens of milliseconds, so each one re-arms the timer and a reply
+ *  that streams for two minutes writes nothing for two minutes — a crash
+ *  mid-generation would then lose the whole conversation, which is worse than
+ *  the write cost the debounce was meant to save. This makes it a throttle:
+ *  under continuous change, history still reaches disk this often. */
+const STORE_MAX_WAIT_MS = 2000;
 
 const newId = () => `c-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+/** Drop a trailing assistant turn that has neither text nor an error.
+ *
+ *  That message is the empty placeholder a generation writes before its first
+ *  token; the run that was going to fill it did not survive the reload (or the
+ *  process was killed). In-flight state is deliberately not persisted, so
+ *  without this the transcript ends on a bubble that is permanently about to
+ *  start speaking — the "half-generating" residue §5 of the plan forbids. */
+function settleTail(msgs: ChatMsg[]): ChatMsg[] {
+  const out = [...(msgs ?? [])];
+  while (out.length) {
+    const last = out[out.length - 1];
+    if (last.role !== "assistant" || last.text || last.error) break;
+    out.pop();
+  }
+  return out;
+}
 
 function loadConversations(): Conversation[] {
   try {
@@ -65,13 +121,16 @@ function loadConversations(): Conversation[] {
       // more correct — and it means the oldest conversations, the ones most
       // likely to look wrong, get fixed instead of being grandfathered in.
       if (Array.isArray(parsed)) {
-        return parsed.slice(0, MAX_CONVOS).map((c) => ({ ...c, title: c.msgs?.length ? titleOf(c.msgs) : c.title }));
+        return parsed.slice(0, MAX_CONVOS).map((c) => {
+          const msgs = settleTail(c.msgs);
+          return { ...c, msgs, title: msgs.length ? titleOf(msgs) : c.title };
+        });
       }
     }
     // Migrate the old single transcript rather than dropping it on the floor.
     const legacy = localStorage.getItem(LEGACY_KEY);
     if (legacy) {
-      const msgs = JSON.parse(legacy) as ChatMsg[];
+      const msgs = settleTail(JSON.parse(legacy) as ChatMsg[]);
       if (Array.isArray(msgs) && msgs.length > 0) {
         return [{ id: newId(), title: titleOf(msgs), msgs: msgs.slice(-MAX_STORED), updatedAt: Date.now() }];
       }
@@ -171,10 +230,67 @@ export function splitThink(text: string): { reasoning: string; answer: string; t
   return { reasoning: reasoning.trim(), answer: answer.trim(), thinking: false };
 }
 
+/** Per-message actions under a finished turn: copy, and regenerate on the
+ *  latest assistant reply. Copy takes the ANSWER only — the reasoning block is
+ *  scratchpad, and pasting it along with the answer is never what "copy this
+ *  reply" means. Regenerate doubles as retry: an errored turn renders the same
+ *  button, and re-running it is exactly what retrying is. */
+function MsgActions(props: { m: ChatMsg; canRegen: boolean; onRegen: () => void }) {
+  const { t } = useI18n();
+  const [copied, setCopied] = useState(false);
+  const text = props.m.role === "assistant" ? splitThink(props.m.text).answer || props.m.text : props.m.text;
+  return (
+    <div className="chat-msg__actions">
+      {text ? (
+        <button
+          className="msgbtn"
+          onClick={() => {
+            void navigator.clipboard?.writeText(text).then(
+              () => { setCopied(true); setTimeout(() => setCopied(false), 1400); },
+              () => {},   // clipboard denied: stay silent rather than claim success
+            );
+          }}
+        >
+          <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
+            {copied ? (
+              <path d="M20 6L9 17l-5-5" fill="none" stroke="currentColor" strokeWidth="2.2"
+                    strokeLinecap="round" strokeLinejoin="round" />
+            ) : (
+              <>
+                <rect x="9" y="9" width="11" height="11" rx="2" fill="none" stroke="currentColor" strokeWidth="1.8" />
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" fill="none"
+                      stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+              </>
+            )}
+          </svg>
+          {copied ? t("chat.copied") : t("chat.copy")}
+        </button>
+      ) : null}
+      {props.canRegen ? (
+        <button className="msgbtn" onClick={props.onRegen}>
+          <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
+            <path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6" fill="none" stroke="currentColor"
+                  strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+          {t("chat.regen")}
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
 function Bubble(props: {
   m: ChatMsg;
-  busy: boolean;
+  /** A reply is being generated into THIS conversation. */
+  live: boolean;
   last: boolean;
+  /** How far that generation has got, or null when nothing is in flight here. */
+  phase: LiveGen["phase"] | null;
+  /** Another conversation's generation has already been picked up by the
+   *  cluster, so this one is genuinely behind it. Kept separate from "we have
+   *  simply not heard back yet": both look identical from here, and only one of
+   *  them is evidence that something is ahead in the queue. */
+  behind: boolean;
   /** Prefill progress, while the cluster is still reading the prompt. */
   prefill: { done: number; total: number; reused: number } | null;
 }) {
@@ -185,7 +301,11 @@ function Bubble(props: {
   if (props.m.role === "user") {
     return <div className="chat-msg__bubble">{props.m.text}</div>;
   }
-  const waiting = props.busy && props.last && !props.m.text;
+  const waiting = props.live && props.last && !props.m.text;
+  // Nothing is being generated yet: the request is out and the cluster has not
+  // said a word, which on a coordinator that serves one request at a time
+  // usually means this turn is behind another one.
+  const queued = waiting && props.phase === "waiting";
   return (
     <div className="chat-msg__bubble">
       {reasoning ? (
@@ -206,6 +326,15 @@ function Bubble(props: {
       {/* On a LAN cluster prefill is minutes. Without this the bubble is blank
           the whole time and the app looks hung — which is how the read-timeout
           bug was experienced even before it errored out. */}
+      {/* Deliberately a plain line and no animated ellipsis: nothing is being
+          typed. Animating a queued turn would be the app claiming progress it
+          has no evidence for — the same rule that keeps a seeded leaderboard
+          from showing a confident 0. And it says WHICH kind of silence this is:
+          "queued behind another reply" is a claim, and it is only made when
+          another generation has actually been picked up. */}
+      {queued ? (
+        <span className="chat-msg__phase">{t(props.behind ? "chat.queuedBehind" : "chat.queued")}</span>
+      ) : null}
       {waiting && props.prefill ? (
         <span className="chat-msg__phase">
           {/* Say which of the two it is. "120/135" and "0/135" scroll past
@@ -221,7 +350,7 @@ function Bubble(props: {
             : t("chat.prefill", { done: props.prefill.done, total: props.prefill.total })}
         </span>
       ) : null}
-      {waiting || (thinking && !answer) ? <span className="chat-msg__dots">…</span> : null}
+      {(waiting && !queued) || (thinking && !answer) ? <span className="chat-msg__dots">…</span> : null}
       {props.m.error ? (
         <div className="chat-msg__err">
           <span className="chat-msg__err-text">{props.m.error}</span>
@@ -254,36 +383,47 @@ export default function Chat(props: {
    *  signed out or on a local-only identity — then a neutral glyph is used. */
   identity: UserIdentity | null;
   onGoCluster: () => void;
-  /** Machines in the running cluster (0 when nothing is running) — a switch has
-   *  to restart them, so the picker says so before it does. */
+  /** Machines in the running cluster (0 when nothing is running). */
   machines?: number;
-  /** Save the pick and rebuild whatever is running around it (App.switchModel).
-   *  Absent = the header shows the model but cannot change it. */
-  onSwitchModel?: (modelId: string, quant: string) => void;
-  /** Display label for modelId — getModel() cannot name an open GGUF
-   *  (LOCAL_GGUF_ID), so the caller supplies the name it knows. */
+  /** Display label for modelId, supplied by the caller. */
   modelLabel: string;
-  /** Open-intake pick (local file / HF), threaded into the picker. */
-  onPickCustomModel?: (c: CustomModelSource) => void;
-  customName?: string;
 }) {
   const { t, tErr } = useI18n();
   const [convos, setConvos] = useState<Conversation[]>(loadConversations);
   const [activeId, setActiveId] = useState<string | null>(() => loadConversations()[0]?.id ?? null);
   const [input, setInput] = useState("");
-  const [busy, setBusy] = useState(false);
-  // Which conversation the in-flight generation belongs to. Reading the
-  // sidebar while a reply streams is allowed, so "is something generating"
-  // (busy) and "is it generating HERE" are different questions — every
-  // in-progress affordance below asks the second one. Answering the first
-  // everywhere is what made the spinner appear on whichever conversation you
-  // happened to open.
-  const [liveConvo, setLiveConvo] = useState<string | null>(null);
-  // Id of the generation currently streaming, so it can be stopped. A reply can
-  // run for minutes; without this the only way out is quitting the app.
-  const [liveId, setLiveId] = useState<string | null>(null);
-  const [prefill, setPrefill] = useState<{ done: number; total: number; reused: number } | null>(null);
-  const [pickOpen, setPickOpen] = useState(false);
+  // Every conversation with a generation in flight, keyed by conversation id.
+  // Until 2026-08-18 this was a single global `busy` flag: one reply at a time,
+  // and on a LAN cluster a reply is minutes — so the sidebar full of
+  // conversations could be read but never used. Conversations are now
+  // independent, up to CLIENT_MAX_INFLIGHT of them; within one conversation a
+  // second send is still refused (the two turns would race the same transcript).
+  const [liveMap, setLiveMap] = useState<Map<string, LiveGen>>(() => new Map());
+  // The AUTHORITATIVE record of what is running; `liveMap` above only drives
+  // rendering. The guard in generate() used to read React state, i.e. whatever
+  // the last COMMITTED render captured. Press regenerate several times faster
+  // than React commits — easy on a long transcript, where re-rendering Markdown
+  // takes longer than the gap between clicks — and every press passes the guard
+  // and starts its own generation.
+  //
+  // That is not merely wasteful. The coordinator executes one request at a time
+  // (the intake queue in src/coord/coord_main.c hands the executor thread a
+  // single request), so the extra turns sit in its queue emitting NOTHING, and
+  // whichever generation finishes first runs the tail below and clears the
+  // state for all of them — leaving a silent UI, an empty bubble and a stop
+  // button that no longer knows what to stop. A ref updates synchronously, so
+  // the second press is refused in the same tick as the first.
+  //
+  // It maps conversation id -> request id rather than being a bare set of ids:
+  // stop() needs the request id SYNCHRONOUSLY, and reading that out of
+  // `liveMap` would reintroduce exactly the stale-state read this ref exists to
+  // avoid.
+  const liveRef = useRef<Map<string, string>>(new Map());
+  // Browser dev-sim only: request ids whose simulated stream has been stopped.
+  // The Tauri path cancels through the Rust registry, which the sim has no
+  // access to — and a stop button that works in one build but not the other is
+  // how the sim stops being somewhere this feature can be tested.
+  const simStopRef = useRef<Set<string>>(new Set());
   const scrollRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   // "Follow the stream." A ref, not state: every delta reads it, and it must be
@@ -314,16 +454,57 @@ export default function Chat(props: {
 
   const active = convos.find((c) => c.id === activeId) ?? null;
   const msgs = active?.msgs ?? [];
-  /** A reply is streaming into the conversation currently on screen. */
-  const liveHere = busy && activeId === liveConvo;
+  /** The generation running in the conversation on screen, if any. Every
+   *  in-progress affordance below asks THIS question rather than "is anything
+   *  generating" — answering the second one everywhere is what used to put the
+   *  spinner on whichever conversation you happened to open. */
+  const here = activeId ? liveMap.get(activeId) ?? null : null;
+  const liveHere = here !== null;
+  /** No more generations may be started until one of the running ones ends.
+   *  Deliberately NOT a local queue: a queue the user cannot see is a promise
+   *  the UI never shows itself keeping, and "why has nothing happened for two
+   *  minutes" has no answer on screen. */
+  const atLimit = liveMap.size >= CLIENT_MAX_INFLIGHT;
+  /** Some OTHER conversation's generation has already been picked up by the
+   *  cluster. That is the only evidence we have that a silent turn here is
+   *  queued rather than merely not answered yet, and the copy below says so
+   *  only when it holds. */
+  const othersStarted =
+    activeId !== null && [...liveMap].some(([id, g]) => id !== activeId && g.phase !== "waiting");
 
-  useEffect(() => {
+  // History is written on a debounce. The whole table is re-serialized per
+  // write, and with several streams appending deltas that is a full JSON
+  // encode per token — measurable on a long transcript, and pure waste since
+  // only the last state of the batch is ever read back.
+  const convosRef = useRef(convos);
+  convosRef.current = convos;
+  const lastWriteRef = useRef(0);
+  const flushStore = useRef(() => {
+    lastWriteRef.current = Date.now();
     try {
-      localStorage.setItem(STORE_KEY, JSON.stringify(convos.slice(0, MAX_CONVOS)));
+      localStorage.setItem(STORE_KEY, JSON.stringify(convosRef.current.slice(0, MAX_CONVOS)));
     } catch {
       /* storage full/blocked: history is a convenience, chatting still works */
     }
+  });
+  useEffect(() => {
+    // Debounce, but never past STORE_MAX_WAIT_MS since the last write — see the
+    // constant: a pure debounce never fires at all while a reply is streaming.
+    const waited = Date.now() - lastWriteRef.current;
+    const delay = Math.max(0, Math.min(STORE_DEBOUNCE_MS, STORE_MAX_WAIT_MS - waited));
+    const h = setTimeout(() => flushStore.current(), delay);
+    return () => clearTimeout(h);
   }, [convos]);
+  // The two ways the debounce could otherwise swallow the last few hundred
+  // milliseconds: closing the window, and navigating off the chat page.
+  useEffect(() => {
+    const onClose = () => flushStore.current();
+    window.addEventListener("beforeunload", onClose);
+    return () => {
+      window.removeEventListener("beforeunload", onClose);
+      flushStore.current();
+    };
+  }, []);
 
   // Opening a conversation always starts at its newest message, whatever the
   // previous one's scroll position was. Declared BEFORE the pin effect so the
@@ -358,7 +539,10 @@ export default function Chat(props: {
     // its OLDEST message — the one place nobody wants to be.
     const raf = requestAnimationFrame(pin);
     return () => cancelAnimationFrame(raf);
-  }, [msgs, busy]);
+    // `liveHere`, not "anything is generating": a stream landing in a
+    // conversation you are not reading changes nothing about this scroller, and
+    // re-pinning on it would fight the reader for no reason.
+  }, [msgs, liveHere]);
 
   /** Re-arm following and go there. */
   const jumpToLatest = () => {
@@ -418,10 +602,24 @@ export default function Chat(props: {
     });
   };
 
+  /** May a fresh generation start in `convoId` right now?
+   *
+   *  Two independent refusals, both read from the ref so the answer is the one
+   *  as of THIS tick: the conversation already has a reply in flight (a second
+   *  send would race the first over the same transcript), and the client-wide
+   *  ceiling. Both are also reflected in the composer, so reaching either of
+   *  them here should be rare — but "rare" is not "never", and a guard that
+   *  only the UI enforces is not a guard. */
+  const canGenerate = (convoId: string) =>
+    !liveRef.current.has(convoId) && liveRef.current.size < CLIENT_MAX_INFLIGHT;
+
   const send = async () => {
     const q = input.trim();
-    if (!q || busy || !online || !props.api) return;
-    const api = props.api;
+    if (!q || !online || !props.api) return;
+    // Checked BEFORE the conversation is created and before the box is cleared:
+    // a refused send that had already emptied the composer would look like the
+    // app swallowing the message.
+    if (liveRef.current.size >= CLIENT_MAX_INFLIGHT) return;
 
     // Sending from a fresh window creates the conversation.
     let id = activeId;
@@ -431,16 +629,44 @@ export default function Chat(props: {
       setActiveId(c.id);
       id = c.id;
     }
-    const convoId = id;
-
-    setBusy(true);
-    setLiveConvo(convoId);
+    if (!canGenerate(id)) return;
     setInput("");
-    // Sending is an explicit "I am at the live end again", so it re-arms
-    // following even if you had scrolled up to re-read something first.
+    const history = [...(convos.find((c) => c.id === id)?.msgs ?? []), { role: "user" as const, text: q }];
+    await generate(id, history);
+  };
+
+  /** Stream one assistant reply into `convoId`, whose transcript becomes
+   *  `history` + the reply. Shared by send (history = old msgs + the new user
+   *  turn) and regenerate (history = old msgs cut back to the last user turn) —
+   *  the engine is stateless per request, so both are just "replay this list". */
+  const generate = async (convoId: string, history: ChatMsg[]) => {
+    if (!canGenerate(convoId) || !online || !props.api) return;
+    const api = props.api;
+
+    // One id per generation, minted before anything else so it can be recorded
+    // synchronously: it is what routes this stream's `api-chat` events back to
+    // THIS conversation (the Rust bridge tags every event with it, and
+    // app.emit broadcasts to the whole webview — without the filter two
+    // conversations' deltas land in one bubble), and what api_chat_cancel
+    // takes. In the browser sim it is only a cancellation handle.
+    const reqId = `chat-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    liveRef.current.set(convoId, reqId);
+    // Starts in "waiting": the request is out and the cluster has said nothing.
+    setLiveMap((m) => new Map(m).set(convoId, { reqId, phase: "waiting", prefill: null, startedAt: Date.now() }));
+    /** Move this conversation's generation on. A no-op once it has ended —
+     *  a late event from a stream we already cleaned up must not resurrect it. */
+    const setPhase = (phase: LiveGen["phase"], prefill: LiveGen["prefill"]) =>
+      setLiveMap((m) => {
+        const cur = m.get(convoId);
+        if (!cur || cur.reqId !== reqId) return m;
+        return new Map(m).set(convoId, { ...cur, phase, prefill });
+      });
+    // Starting a generation is an explicit "I am at the live end again", so it
+    // re-arms following even if you had scrolled up to re-read something first.
+    // Safe to do unconditionally: generation is only ever started from the
+    // conversation on screen (send and regenerate both act on the active one).
     stickRef.current = true;
     setAtBottom(true);
-    const history = [...(convos.find((c) => c.id === convoId)?.msgs ?? []), { role: "user" as const, text: q }];
     setConvos((cs) =>
       cs.map((c) =>
         c.id === convoId
@@ -456,8 +682,6 @@ export default function Chat(props: {
 
     try {
       if (inTauri()) {
-        const reqId = `chat-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-        setLiveId(reqId);
         const { listen } = await import("@tauri-apps/api/event");
         const { invoke } = await import("@tauri-apps/api/core");
         // Failed turns are not conversation: sending an assistant message that
@@ -476,13 +700,13 @@ export default function Chat(props: {
             const p = ev.payload;
             if (p.id !== reqId) return;
             if (p.kind === "progress") {
-              setPrefill({ done: p.done ?? 0, total: p.total ?? 0, reused: p.reused ?? 0 });
               lastPrefill = { done: p.done ?? 0, total: p.total ?? 0, reused: p.reused ?? 0 };
+              setPhase("prefill", lastPrefill);
             }
             if (p.kind === "delta" && p.text) {
               if (nDeltas === 0) {
                 tFirst = performance.now();
-                setPrefill(null); // prefill is over the moment real text arrives
+                setPhase("streaming", null); // prefill is over the moment real text arrives
               }
               nDeltas++;
               setActiveMsgs((m) => {
@@ -530,9 +754,20 @@ export default function Chat(props: {
         });
       } else {
         // Browser dev build: simulated streaming echo, clearly labeled per-message.
+        // Each call has its own loop and its own timers, so several of these run
+        // side by side exactly as several real streams do — which is what makes
+        // the dev channel a place this feature can be hand-tested without a
+        // cluster. Nothing here is serialized: the sim has no queue to model.
+        const q = [...history].reverse().find((m) => m.role === "user")?.text ?? "";
         const reply = `“${q}” ✓`;
+        let first = true;
         for (const ch of reply.split("")) {
           await new Promise((ok) => setTimeout(ok, 30));
+          if (simStopRef.current.has(reqId)) break; // stop() pressed on this conversation
+          if (first) {
+            first = false;
+            setPhase("streaming", null);
+          }
           setActiveMsgs((m) => {
             const out = [...m];
             out[out.length - 1] = { ...out[out.length - 1], text: out[out.length - 1].text + ch };
@@ -574,18 +809,79 @@ export default function Chat(props: {
           partialReply: partial,
         },
       });
+    } finally {
+      // MUST be `finally`. This used to be straight-line code after the
+      // try/catch, so anything that threw on the way out — including inside the
+      // catch block itself — skipped it and left the guard stuck at "running".
+      // From then on EVERY later generation in this conversation is refused,
+      // silently: no text, and a stop button that has no id to stop. Permanent,
+      // and it survives switching conversations. One escape hatch being
+      // conditional on nothing having gone wrong is not an escape hatch.
+      //
+      // It clears ONLY this conversation's row. Clearing the lot — which the
+      // single-flag version effectively did — would strand every other stream:
+      // still running in Rust, no longer stoppable from here.
+      clearLive(convoId, reqId);
     }
-    setLiveId(null);
-    setLiveConvo(null);
-    setPrefill(null);
-    setBusy(false);
   };
 
-  /** Stop the running generation, keeping whatever has already streamed in. */
-  const stop = async () => {
-    if (!liveId) return;
-    const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("api_chat_cancel", { id: liveId }).catch(() => {});
+  /** Forget one conversation's generation. Safe to run twice: generate()'s own
+   *  finally does exactly this.
+   *
+   *  `reqId` guards against clearing a row that a LATER generation in the same
+   *  conversation has already replaced — a stop pressed just as the previous
+   *  run ended would otherwise wipe the new one's state. */
+  const clearLive = (convoId: string, reqId?: string) => {
+    if (reqId && liveRef.current.get(convoId) !== reqId) return;
+    liveRef.current.delete(convoId);
+    if (reqId) simStopRef.current.delete(reqId);
+    setLiveMap((m) => {
+      if (!m.has(convoId)) return m;
+      const next = new Map(m);
+      next.delete(convoId);
+      return next;
+    });
+  };
+
+  /** Stop one conversation's generation, keeping whatever has already streamed
+   *  in. Every other conversation's stream is untouched: cancellation is keyed
+   *  by request id all the way down to the Rust registry, which holds one
+   *  cancel flag per id and drops only that stream's socket. */
+  const stop = async (convoId: string) => {
+    const reqId = liveRef.current.get(convoId);
+    if (reqId) {
+      if (inTauri()) {
+        const { invoke } = await import("@tauri-apps/api/core");
+        // api_chat_cancel answers whether it FOUND a stream to cancel. The answer
+        // used to be discarded, so "there is nothing by that id" and "cancelled"
+        // were indistinguishable and a press that reached neither was silent.
+        const found = await invoke<boolean>("api_chat_cancel", { id: reqId }).catch(() => false);
+        if (found) return; // it will stop itself, and generate()'s finally cleans up
+      } else {
+        // Browser sim: its loop checks this set between characters and then
+        // falls into the same finally.
+        simStopRef.current.add(reqId);
+        return;
+      }
+    }
+    // Either nothing is registered under this id or there is no id at all: this
+    // view is showing a generation that is not running. Recovering the state is
+    // the only useful thing left — a stop button that provably does nothing is
+    // worse than no button, because the user keeps pressing it.
+    clearLive(convoId);
+  };
+
+  /** Re-run the last exchange: cut the trailing assistant turn (reply, error,
+   *  or both — a stopped reply then a retry can stack two) and replay what is
+   *  left. The old reply is not kept as an alternative; on a home cluster a
+   *  reply costs minutes, and someone regenerating has already judged it. */
+  const regen = async () => {
+    const cur = convos.find((c) => c.id === activeId);
+    if (!cur || !canGenerate(cur.id) || !online || !props.api) return;
+    let end = cur.msgs.length;
+    while (end > 0 && cur.msgs[end - 1].role === "assistant") end--;
+    if (end === 0) return; // nothing but assistant turns: no prompt to replay
+    await generate(cur.id, cur.msgs.slice(0, end));
   };
 
   // Offline is a SENDING problem, not a reading one. History lives in this
@@ -607,31 +903,43 @@ export default function Chat(props: {
         </button>
         <div className="chatbar__list">
           {convos.length === 0 ? <p className="chatbar__empty">{t("chat.noConvos")}</p> : null}
-          {convos.map((c) => (
+          {convos.map((c) => {
+            const gen = liveMap.get(c.id) ?? null;
+            // A queued turn gets a still dot, a running one a pulsing dot.
+            // Same rule as the bubble: motion means something is happening.
+            const label = gen?.phase === "waiting" ? t("chat.queued") : t("chat.generating");
+            return (
             <div key={c.id} className={`chatbar__item${c.id === activeId ? " is-on" : ""}`}>
               <button className="chatbar__pick" onClick={() => setActiveId(c.id)}>
                 <span className="chatbar__title">{c.title || t("chat.untitled")}</span>
-                {/* Where the reply is landing, for when you have navigated away.
-                    Outside the truncating span, or a long title would ellipsis
-                    it away exactly when it matters most. */}
-                {busy && c.id === liveConvo ? (
-                  <span className="chatbar__live" title={t("chat.generating")} aria-label={t("chat.generating")} />
+                {/* Where the replies are landing, for when you have navigated
+                    away. Outside the truncating span, or a long title would
+                    ellipsis it away exactly when it matters most. Now one per
+                    generating conversation, not one for the app. */}
+                {gen ? (
+                  <span
+                    className={`chatbar__live${gen.phase === "waiting" ? " chatbar__live--queued" : ""}`}
+                    title={label}
+                    aria-label={label}
+                  />
                 ) : null}
               </button>
               <button
                 className="chatbar__del"
                 onClick={() => deleteChat(c.id)}
                 // Deleting the thread being written to would drop the reply on
-                // the floor and leave Stop pointing at nothing. Every other
-                // conversation is fair game.
-                disabled={busy && c.id === liveConvo}
+                // the floor and leave Stop pointing at nothing. Only THIS
+                // conversation is locked; the others stay deletable however
+                // many of them are generating.
+                disabled={!!gen}
                 aria-label={t("chat.delete")}
                 title={t("chat.delete")}
               >
                 ✕
               </button>
             </div>
-          ))}
+            );
+          })}
         </div>
       </aside>
 
@@ -644,49 +952,23 @@ export default function Chat(props: {
             the coordinator reporting what it loaded, "selected" is this
             machine's setting when the cluster has not said. */}
         <div className="chat__head">
-          {/* The chip IS the picker's trigger — the model is the one setting
-              this page is about, so it is edited where it is shown rather than
-              two screens away. Switching restarts the cluster (no hot swap in
-              the engine), which the picker states before doing it. */}
-          <button
-            className={`modelchip modelchip--btn${served ? " modelchip--live" : ""}`}
-            disabled={!props.onSwitchModel}
-            onClick={() => setPickOpen((v) => !v)}
-            aria-haspopup="dialog"
-            aria-expanded={pickOpen}
+          {/* Display only (2026-08-15 split): chatting happens against
+              whatever is running, and switching models is a cluster operation
+              that lives on the Cluster page. The chip stopped being a picker —
+              a page for talking is not a place to tear the cluster down. */}
+          <div
+            className={`modelchip${served ? " modelchip--live" : ""}`}
             title={served ? t("chat.model.servingTitle") : t("chat.model.selectedTitle")}
           >
             <span className="modelchip__label">{t(served ? "model.serving" : "model.selected")}</span>
             <span className="modelchip__name">{shownModel.label}</span>
             {shownModel.quant ? <span className="modelchip__quant">{shownModel.quant}</span> : null}
-            {props.onSwitchModel ? (
-              <svg className="modelchip__chev" viewBox="0 0 24 24" width="12" height="12" aria-hidden="true">
-                <path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" strokeWidth="2.4"
-                      strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-            ) : null}
-          </button>
-          {pickOpen && props.onSwitchModel ? (
-            <ModelPicker
-              modelId={props.modelId}
-              quant={props.quant}
-              running={
-                (props.machines ?? 0) > 0
-                  ? { modelId: served?.id ?? "", quant: served?.quant ?? "", machines: props.machines! }
-                  : null
-              }
-              onPick={props.onSwitchModel}
-              onPickCustom={props.onPickCustomModel}
-              customName={props.customName}
-              onClose={() => setPickOpen(false)}
-            />
-          ) : null}
+          </div>
         </div>
         <div className="chat__scroll" ref={scrollRef} onScroll={onScroll}>
           <div className="chat__thread">
-            {msgs.length === 0 ? <p className="chat-hint">{t("chat.hint")}</p> : null}
             {msgs.map((m, i) => (
-              <div key={i} className={`chat-msg chat-msg--${m.role}`}>
+              <div key={i} className={`chat-msg chat-msg--${m.role}${i === msgs.length - 1 ? " chat-msg--tail" : ""}`}>
                 {m.role === "user"
                   ? <UserAvatar identity={props.identity} />
                   : <div className="chat-avatar chat-avatar--assistant" aria-hidden="true" />}
@@ -694,7 +976,14 @@ export default function Chat(props: {
                   <div className="chat-msg__who">
                     {m.role === "user" ? props.identity?.name ?? t("chat.you") : t("chat.assistant")}
                   </div>
-                  <Bubble m={m} busy={liveHere} last={i === msgs.length - 1} prefill={liveHere ? prefill : null} />
+                  <Bubble
+                    m={m}
+                    live={liveHere}
+                    last={i === msgs.length - 1}
+                    phase={here?.phase ?? null}
+                    behind={othersStarted}
+                    prefill={here?.prefill ?? null}
+                  />
                   {m.stats ? (
                     <div className="chat-msg__stats">
                       {t("tryit.stats", {
@@ -721,6 +1010,18 @@ export default function Chat(props: {
                         </span>
                       ) : null}
                     </div>
+                  ) : null}
+                  {/* Actions only once the turn is settled — while text is
+                      still streaming into it, copy would take half a reply.
+                      Regenerate lives on the last message only: re-running an
+                      EARLIER turn would have to throw away everything after
+                      it, which is a different (destructive) feature. */}
+                  {!(liveHere && i === msgs.length - 1) ? (
+                    <MsgActions
+                      m={m}
+                      canRegen={i === msgs.length - 1 && m.role === "assistant" && online && !liveHere && !atLimit}
+                      onRegen={() => void regen()}
+                    />
                   ) : null}
                 </div>
               </div>
@@ -751,7 +1052,6 @@ export default function Chat(props: {
                 {t("chat.goCluster")} →
               </button>
             </div>
-            <p className="composer__hint">{t("chat.offlineHistory")}</p>
           </div>
         ) : (
         <div className="chat__composer">
@@ -762,7 +1062,10 @@ export default function Chat(props: {
               value={input}
               rows={1}
               placeholder={t("chat.placeholder")}
-              disabled={busy}
+              // Live while OTHER conversations generate — that is the whole
+              // point of the change. Only two things close it: this thread is
+              // already answering, and the client-wide ceiling.
+              disabled={liveHere || atLimit}
               onChange={(e) => setInput(e.target.value)}
               // Enter sends, Shift+Enter breaks the line — the convention every
               // chat client shares. isComposing guards IME candidate selection,
@@ -777,11 +1080,14 @@ export default function Chat(props: {
             {/* Stop belongs to the conversation being generated. Showing it
                 while reading a different thread would offer to cancel
                 something not on screen. */}
-            {liveHere ? (
+            {liveHere && activeId ? (
               <button
                 className="composer__btn composer__btn--stop"
-                onClick={() => void stop()}
-                disabled={!liveId}
+                onClick={() => void stop(activeId)}
+                /* Deliberately never disabled. It used to be `!liveId`, i.e.
+                 * the button went dead in exactly the state where the user most
+                 * needs it — the view says "generating" but no id is on record.
+                 * stop() now treats that case as "recover this view". */
                 title={t("chat.stop")}
                 aria-label={t("chat.stop")}
               >
@@ -790,10 +1096,7 @@ export default function Chat(props: {
             ) : (
               <button
                 className="composer__btn"
-                // Still one generation at a time: the coordinator serves a
-                // single sequence slot by default, so a second send would only
-                // queue behind the first (or 429).
-                disabled={busy || !input.trim()}
+                disabled={atLimit || !input.trim()}
                 onClick={() => send()}
                 title={t("tryit.send")}
                 aria-label={t("tryit.send")}
@@ -805,15 +1108,11 @@ export default function Chat(props: {
               </button>
             )}
           </div>
-          {/* Why the composer is dead while you are reading another thread —
-              otherwise it just looks broken. */}
-          {busy && !liveHere ? (
-            <p className="composer__hint">
-              {t("chat.otherBusy")}{" "}
-              <button className="linkbtn" onClick={() => liveConvo && setActiveId(liveConvo)}>
-                {t("chat.goLive")}
-              </button>
-            </p>
+          {/* Why the composer is dead — otherwise it just looks broken. The
+              old "another conversation is generating, one at a time" hint is
+              gone with the restriction it explained. */}
+          {atLimit ? (
+            <p className="composer__hint">{t("chat.limit", { n: CLIENT_MAX_INFLIGHT })}</p>
           ) : (
             <p className="composer__hint">{t("chat.sendHint")}</p>
           )}

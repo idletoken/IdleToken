@@ -41,6 +41,7 @@ OBJS := $(BUILD)/tweetnacl.o \
         $(BUILD)/sodium_seal.o \
         $(BUILD)/net.o \
         $(BUILD)/http.o \
+        $(BUILD)/b64.o \
         $(BUILD)/platform_agent.o
 
 .PHONY: all clean
@@ -58,7 +59,7 @@ $(BUILD)/blake2b.o: vendor/blake2/blake2b.c vendor/blake2/blake2.h | $(BUILD)
 $(BUILD)/privacy.o: src/common/privacy.c include/idletoken_privacy.h vendor/tweetnacl/tweetnacl.h | $(BUILD)
 	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
 
-$(BUILD)/sodium_seal.o: src/tools/sodium_seal.c include/idletoken_sodium_seal.h include/idletoken_privacy.h vendor/blake2/blake2.h | $(BUILD)
+$(BUILD)/sodium_seal.o: src/common/sodium_seal.c include/idletoken_sodium_seal.h include/idletoken_privacy.h vendor/blake2/blake2.h | $(BUILD)
 	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
 
 $(BUILD)/net.o: src/common/net.c include/idletoken_net.h include/idletoken_proto.h | $(BUILD)
@@ -67,7 +68,10 @@ $(BUILD)/net.o: src/common/net.c include/idletoken_net.h include/idletoken_proto
 $(BUILD)/http.o: src/common/http.c include/idletoken_http.h | $(BUILD)
 	$(CC) $(CFLAGS) -D_GNU_SOURCE $(INCLUDES) -c -o $@ $<
 
-$(BUILD)/platform_agent.o: src/tools/platform_agent.c include/idletoken_sodium_seal.h include/idletoken_privacy.h include/idletoken_net.h include/idletoken_http.h | $(BUILD)
+$(BUILD)/b64.o: src/common/b64.c include/idletoken_b64.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
+
+$(BUILD)/platform_agent.o: src/tools/platform_agent.c include/idletoken_sodium_seal.h include/idletoken_privacy.h include/idletoken_net.h include/idletoken_http.h include/idletoken_b64.h | $(BUILD)
 	$(CC) $(CFLAGS) -D_GNU_SOURCE $(INCLUDES) -c -o $@ $<
 
 $(BIN): $(OBJS)

@@ -145,8 +145,12 @@ export function listApiKeys(): Promise<ApiKeyInfo[]> {
   return req<ApiKeyInfo[]>("/me/api-keys");
 }
 
-export function createApiKey(): Promise<CreatedApiKey> {
-  return req<CreatedApiKey>("/me/api-keys", { method: "POST" });
+export function createApiKey(opts?: { label?: string; dailyCapMilli?: number }): Promise<CreatedApiKey> {
+  // The plaintext key comes back exactly once, so whoever calls this owns
+  // keeping it. `label` matters more than it looks: without one, a revoke page
+  // shows a list of prefixes and no way to tell which is which.
+  const body = opts && (opts.label || opts.dailyCapMilli) ? JSON.stringify(opts) : undefined;
+  return req<CreatedApiKey>("/me/api-keys", { method: "POST", ...(body ? { body } : {}) });
 }
 
 export function revokeApiKey(id: string): Promise<{ ok: boolean }> {
@@ -162,6 +166,57 @@ export interface RendezvousToken {
 /** Fetch a 30-day scope=rendezvous token: the engine speaks over a plaintext link and should hold nothing but this restricted token. */
 export function createRendezvousToken(): Promise<RendezvousToken> {
   return req<RendezvousToken>("/auth/rendezvous-token", { method: "POST" });
+}
+
+// ---- model usage leaderboard (public, no session) --------------------------
+// The platform's scoreboard of how many tokens each curated model actually
+// served, over a rolling window. The picker uses it to ORDER the list; it is
+// never a gate on what you can run.
+export interface LeaderboardRow {
+  model: string;
+  requests: number;
+  inTokens: number;
+  outTokens: number;
+  cachedTokens: number;
+  totalTokens: number;
+}
+
+export interface LeaderboardPayload {
+  window: "day" | "week" | "month" | "all";
+  /** `seeded` = the platform has too little traffic to rank; the order is editorial. */
+  source: "measured" | "seeded";
+  generatedAt: string;
+  rows: LeaderboardRow[];
+}
+
+/** How long the picker waits before deciding the platform is not answering. */
+const LEADERBOARD_TIMEOUT_MS = 5_000;
+
+/**
+ * Public, unauthenticated: it needs a platform URL and nothing else — no
+ * session, no API key. Deliberately NOT routed through `req()`, whose gate
+ * demands a cloud session: a signed-out user opening the picker should still
+ * see the ordering, and a failure here must stay a non-event.
+ *
+ * Throws on any failure (unreachable, timeout, non-200). Callers fall back to
+ * the static manifest order — see ModelPicker.
+ */
+export async function fetchLeaderboard(
+  window: "day" | "week" | "month" | "all" = "week",
+): Promise<LeaderboardPayload> {
+  const base = loadSettings().platformUrl.trim().replace(/\/+$/, "");
+  if (!base) throw new Error("platform not configured");
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), LEADERBOARD_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${base}/leaderboard/models?window=${encodeURIComponent(window)}`, {
+      signal: ctrl.signal,
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return (await res.json()) as LeaderboardPayload;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // ---- agent control (Tauri only) --------------------------------------------
@@ -194,6 +249,8 @@ export async function agentStart(opts: {
   jwt: string;
   name: string;
   coordApiPort: number;
+  /** settings.apiToken — the coordinator 401s dispatched jobs without it. */
+  coordToken: string;
 }): Promise<void> {
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("platform_agent_start", {
@@ -201,6 +258,7 @@ export async function agentStart(opts: {
     jwt: opts.jwt,
     name: opts.name,
     coordApiPort: opts.coordApiPort,
+    coordToken: opts.coordToken,
   });
 }
 

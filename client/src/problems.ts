@@ -41,41 +41,17 @@ export interface Problem {
   detail?: Record<string, string | number | boolean>;
 }
 
-/**
- * Consent to SHARE the log with us — not consent to keep it.
- *
- * The distinction matters, and the first version had it wrong: switching off
- * deleted everything, so someone who turned it back on later found their
- * history gone. Recording is local and unconditional. It is also the user's own
- * record of what keeps failing, and confiscating that is not what "do not send
- * this to the developers" asks for.
- *
- * What "off" governs today is the diagnostics bundle, which is the only way any
- * of this reaches us. When an upload path exists it will gate that too — same
- * switch, same meaning.
- *
- * Deleting is a separate, explicit action (Clear the log).
- */
-const NO_SHARE_KEY = "idletoken.problems.noshare";
+// The share switch is gone (2026-08-15): the diagnostics export always
+// includes the log now. Exporting is itself the explicit act of sharing — it
+// produces a file the user sends by hand — so the opt-out ahead of it gated
+// nothing. Recording stays local and unconditional; nothing leaves the machine
+// on its own, and deleting is the explicit "Clear the log" action. ⚠ If an
+// AUTOMATIC upload path ever appears, that is a different act and needs its
+// own consent — do not treat this removal as blanket permission.
+// (The retired localStorage key "idletoken.problems.noshare" is left behind
+// where set; nothing reads it.)
 
-export function problemsShared(): boolean {
-  try {
-    return localStorage.getItem(NO_SHARE_KEY) !== "1";
-  } catch {
-    return true;
-  }
-}
-
-export function setProblemsShared(on: boolean): void {
-  try {
-    if (on) localStorage.removeItem(NO_SHARE_KEY);
-    else localStorage.setItem(NO_SHARE_KEY, "1");
-  } catch {
-    /* a blocked localStorage must not break the setting */
-  }
-}
-
-/** Always records — see problemsShared() for what the switch actually does. */
+/** Always records; the log never leaves the machine on its own. */
 export function recordProblem(p: Problem): void {
   try {
     const all = readProblems();

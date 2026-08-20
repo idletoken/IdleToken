@@ -1,15 +1,21 @@
 // "Connect a client here" — the block that tells the user their own base URL
-// and token (docs/api-surface.md §7).
+// (docs/api-surface.md §7).
 //
-// It exists because the client never said either one. You could start a
-// cluster, watch it go green, and still have to go find the README to point
-// Claude Code at the thing you had just started. The two scenarios in §1 differ
-// by exactly two facts — which address, which key — so both are shown side by
-// side, each with the one sentence that says when it is the right one.
-import { useEffect, useState } from "react";
+// It exists because the client never said it. You could start a cluster,
+// watch it go green, and still have to go find the README to point a client
+// at the thing you had just started.
+//
+// 2026-08-15: the API serves its own machine only (127.0.0.1, enforced by the
+// coordinator), so this block no longer shows a LAN address or warns about the
+// LAN at all. The address is derived from the SETTINGS, not from the running
+// cluster's report: it used to prefer the live base URL, which meant editing
+// the port field left the shown address on the old port until the next
+// restart — the card looked broken exactly while the user was configuring it.
+// A restart applies the port anyway, so the configured value is the one worth
+// copying.
+import { useState } from "react";
 import { useI18n, type Lang } from "./i18n";
 import type { AppSettings } from "./settings";
-import { getPairingProvider } from "./pairing";
 
 type Bi = { en: string; zh: string };
 const L = (b: Bi, lang: Lang) => b[lang];
@@ -48,48 +54,7 @@ function Row(props: { label: string; value: string; mono?: boolean; lang: Lang }
 export function EndpointsPanel(props: { settings: AppSettings }) {
   const { lang } = useI18n();
   const s = props.settings;
-  const [liveBase, setLiveBase] = useState<string | null>(null);
-
-  // Prefer the address the cluster is actually serving on: apiHost is often
-  // 0.0.0.0, which is a bind address and not something anyone can type into a
-  // client. Fall back to the configured values when no cluster is up, so the
-  // block is still useful before you press start.
-  useEffect(() => {
-    let alive = true;
-    try {
-      const off = getPairingProvider().subscribe((snap) => {
-        if (!alive) return;
-        setLiveBase(snap.api?.status === "online" && snap.api.baseUrl ? snap.api.baseUrl : null);
-      });
-      return () => {
-        alive = false;
-        off();
-      };
-    } catch {
-      // No provider (plain browser, no Tauri): fall back to the configured
-      // values below rather than rendering nothing.
-      return () => {
-        alive = false;
-      };
-    }
-  }, []);
-
-  const host =
-    s.apiHost && s.apiHost !== "0.0.0.0"
-      ? s.apiHost
-      : L({ en: "<this machine's LAN IP>", zh: "<本机局域网 IP>" }, lang);
-  const localBase = liveBase ?? `http://${host}:${s.apiPort}`;
-  const localKey = s.apiToken || "";
-  const cloudBase = (s.platformUrl || "https://api.idletoken.ai").replace(/\/+$/, "");
-
-  const localExport =
-    `export ANTHROPIC_BASE_URL=${localBase}\n` +
-    `export ANTHROPIC_API_KEY=${localKey || "unused"}\n` +
-    `claude`;
-  const cloudExport =
-    `export ANTHROPIC_BASE_URL=${cloudBase}\n` +
-    `export ANTHROPIC_API_KEY=<your API key>\n` +
-    `claude`;
+  const localBase = `http://127.0.0.1:${s.apiPort || 8000}`;
 
   return (
     <div className="setting-group endpoints">
@@ -97,72 +62,15 @@ export function EndpointsPanel(props: { settings: AppSettings }) {
 
       <div className="endpoint-card">
         <div className="endpoint-card__title">{L({ en: "This machine", zh: "本机" }, lang)}</div>
-        <p className="setting-hint">
-          {L(
-            {
-              en: "Use this while you have your own cluster running. Requests are served by your hardware and cost nothing.",
-              zh: "当你自己的集群正在运行时使用。请求由你自己的硬件完成，不消耗火花。",
-            },
-            lang,
-          )}
-        </p>
+        {/* One fact: the address. No token row (the loopback-only API gates
+            nothing a local caller could not already do), no client snippet —
+            configuring third-party tools is their docs' job. */}
         <Row label={L({ en: "Base URL", zh: "服务地址" }, lang)} value={localBase} lang={lang} />
-        {localKey ? (
-          <Row label={L({ en: "Token", zh: "访问令牌" }, lang)} value={localKey} lang={lang} />
-        ) : (
-          // An empty token is a real state (upgraded installs keep it), and it
-          // is exactly the state that becomes dangerous once this machine can
-          // spend Sparks — so say so here rather than only in the field's hint.
-          <p className="setting-hint setting-hint--warn">
-            {L(
-              {
-                en: "No token set — any device on your LAN can call this API. Set one under “Access token” below.",
-                zh: "未设置访问令牌，局域网内的设备均可调用此 API；可在下方「访问令牌」中设置。",
-              },
-              lang,
-            )}
-          </p>
-        )}
-        <pre className="endpoint-snippet">{localExport}</pre>
-        <CopyBtn text={localExport} lang={lang} />
-        {liveBase ? null : (
-          <p className="setting-hint">
-            {L(
-              {
-                en: "The cluster is not serving yet — these are configured values, not confirmed ones.",
-                zh: "集群尚未开始服务，以上为配置值，不代表当前可用。",
-              },
-              lang,
-            )}
-          </p>
-        )}
       </div>
 
-      <div className="endpoint-card">
-        <div className="endpoint-card__title">{L({ en: "IdleToken platform", zh: "IdleToken 平台" }, lang)}</div>
-        <p className="setting-hint">
-          {L(
-            {
-              en: "For devices without a cluster of their own. Requests run on shared capacity and are billed in Sparks; create the key under “Sharing & earnings”.",
-              zh: "用于没有自建集群的设备。请求由平台共享算力完成，按火花计费；密钥在「共享与收益」中创建。",
-            },
-            lang,
-          )}
-        </p>
-        <Row label={L({ en: "Base URL", zh: "服务地址" }, lang)} value={cloudBase} lang={lang} />
-        <pre className="endpoint-snippet">{cloudExport}</pre>
-        <CopyBtn text={cloudExport} lang={lang} />
-      </div>
-
-      <p className="setting-hint">
-        {L(
-          {
-            en: "Both expose the same OpenAI- and Anthropic-compatible API; only the address and key differ.",
-            zh: "两个入口提供相同的 OpenAI / Anthropic 兼容 API，仅地址与密钥不同。",
-          },
-          lang,
-        )}
-      </p>
+      {/* No "IdleToken platform" card here (2026-08-15): the platform side is
+          not live for users yet, and a settings page must not display things
+          that do nothing. It returns together with the platform features. */}
     </div>
   );
 }

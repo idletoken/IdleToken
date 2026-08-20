@@ -16,6 +16,7 @@ tauri-build = { version = "2", features = [] }
 # needs to decode the bundled icon.
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-shell = "2"
+tauri-plugin-single-instance = "2"
 # Native open-file dialog for the open-model picker (WS-D1): picking a local
 # GGUF needs a real filesystem path, which the webview's own file input does
 # not expose. Same "three OS conventions we should not re-implement" reasoning
@@ -37,6 +38,11 @@ tauri-plugin-autostart = "2"
 url = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Integrity gate for downloaded weights (weights.rs): curated manifests pin
+# each GGUF's SHA-256 and the client refuses to promote or serve a file that
+# does not match. A hash we implement ourselves is not evidence of anything,
+# so the crate is justified despite the bundle-size constraint.
+sha2 = "0.10"
 # Backoff sleeps in the engine supervisor; tauri's async runtime is tokio.
 tokio = { version = "1", features = ["time"] }
 # Weight downloads (weights.rs). Why the client downloads them rather than the

@@ -136,7 +136,7 @@ export default function PairingPanel(props: {
   // Gate = platform URL configured + a cloud session carrying the user id.
   const gate = platformGate();
   const accountReady = gate.ok && !!gate.session.userId;
-  const clusterName = loadSettings().clusterName.trim() || "home";
+  const clusterName = loadSettings().clusterName.trim() || "IdleToken-Home";
   const deriveSecret = async (): Promise<string | null> => {
     const g = platformGate();
     if (!g.ok || !g.session.userId) return null;

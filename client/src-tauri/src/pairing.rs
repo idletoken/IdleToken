@@ -119,6 +119,22 @@ pub struct Tuning {
     /// "auto"/empty, or an IPv4 this machine binds to and advertises.
     #[serde(default)]
     bind_nic: String,
+    // ---- overflow: borrow another machine when this one is full -------------
+    //
+    // Launch parameters. The coordinator reads them once, at start, and refuses
+    // to start at all if overflow is asked for without an api_token -- which is
+    // why these travel together with it rather than through a separate channel.
+    //
+    // Empty url = do not enable. There is deliberately no boolean: a flag and a
+    // credential that can disagree is a flag that will.
+    #[serde(default)]
+    overflow_url: String,
+    #[serde(default)]
+    overflow_key: String,
+    #[serde(default)]
+    overflow_wait_s: u32,
+    #[serde(default)]
+    overflow_daily_cap_milli: u64,
 }
 
 fn default_true() -> bool {
@@ -142,7 +158,7 @@ fn default_max_decode() -> u32 {
 impl Default for Tuning {
     fn default() -> Self {
         Tuning {
-            api_host: "0.0.0.0".into(),
+            api_host: "127.0.0.1".into(),
             api_port: API_PORT,
             api_token: String::new(),
             inter_stage_port: INTER_STAGE_PORT,
@@ -159,6 +175,10 @@ impl Default for Tuning {
             prefer_coordinator: false,
             same_subnet_only: false,
             bind_nic: String::new(),
+            overflow_url: String::new(),
+            overflow_key: String::new(),
+            overflow_wait_s: 0,
+            overflow_daily_cap_milli: 0,
         }
     }
 }
@@ -257,6 +277,21 @@ pub struct Peer {
     hb_secs: u32,
     #[serde(skip)]
     ip: String,
+    /// What this member brings to the pool: free VRAM and free RAM in bytes,
+    /// as ITS OWN probe measured them (2026-08-15). Every machine already
+    /// knows its own memory; sending it with the join is what lets the whole
+    /// cluster answer "is this enough for the model we picked" BEFORE anyone
+    /// presses Start — until now that question was only answered by the
+    /// coordinator refusing after the fact. 0 = an older client that does not
+    /// report it; the UI then says it cannot tell rather than guessing.
+    #[serde(rename = "vramFree")]
+    vram_free: u64,
+    #[serde(rename = "ramFree")]
+    ram_free: u64,
+    /// Unified memory (Apple Silicon): VRAM and RAM are one physical pool and
+    /// must be counted once, not summed (the engine's plan.c rule).
+    #[serde(rename = "unifiedMemory")]
+    unified_memory: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -276,6 +311,12 @@ struct Inner {
     self_id: String,
     self_host: String,
     self_gpu: String,
+    /// This machine's own free VRAM/RAM (bytes) and whether it is unified
+    /// memory, as reported by the UI's probe through `pairing_report_memory`.
+    /// Sent with every join/poll so the roster can total the pool.
+    self_vram_free: u64,
+    self_ram_free: u64,
+    self_unified: bool,
     peers: Vec<Peer>,
     coordinator_id: Option<String>,
     /// idle (roster forming) | starting (engines launching) | ready
@@ -319,6 +360,9 @@ impl Default for Pairing {
             self_id: String::new(),
             self_host: String::new(),
             self_gpu: String::new(),
+            self_vram_free: 0,
+            self_ram_free: 0,
+            self_unified: false,
             peers: Vec::new(),
             coordinator_id: None,
             phase: "idle".into(),
@@ -372,10 +416,14 @@ fn snapshot_json(inner: &Inner) -> Value {
         "peers": inner.peers,
         "coordinatorId": inner.coordinator_id,
         "phase": inner.phase,
-        "api": if inner.phase == "ready" {
+        // The inference API is loopback-only on the coordinator (2026-08-15,
+        // coord enforces it) — so only the coordinator's own UI gets a base
+        // URL. Joiner machines contribute compute; chatting happens on the
+        // machine that runs the coordinator.
+        "api": if inner.phase == "ready" && inner.mode == Mode::Creator {
             let api_port = inner.tuning.api_port;
-            inner.coord_ip.as_ref().map(|ip| json!({
-                "baseUrl": format!("http://{ip}:{api_port}"),
+            Some(json!({
+                "baseUrl": format!("http://127.0.0.1:{api_port}"),
                 "status": "online",
             }))
         } else { None },
@@ -420,6 +468,15 @@ fn roster_reply(inner: &Inner) -> Value {
             // Liveness travels with the roster so every member's UI shows the
             // same offline states the creator sees.
             "online": p.online,
+            // The layer plan travels too (2026-08-15): joiners can no longer
+            // read /idletoken/v1/cluster/status themselves — the API answers
+            // only the coordinator's machine — so the roster is the one place
+            // their UI learns which layers each node holds.
+            "layerLo": p.layer_lo, "layerHi": p.layer_hi,
+            // Each member's own measurement, echoed to everyone so any machine
+            // can total the pool (not just the creator that collected them).
+            "vramFree": p.vram_free, "ramFree": p.ram_free,
+            "unifiedMemory": p.unified_memory,
         })).collect::<Vec<_>>(),
     })
 }
@@ -489,14 +546,21 @@ fn apply_roster(inner: &mut Inner, v: &Value) -> RosterEffect {
                 id,
                 hostname: m["hostname"].as_str().unwrap_or("").to_string(),
                 gpu: m["gpu"].as_str().unwrap_or("").to_string(),
-                layer_lo: None,
-                layer_hi: None,
+                // From the creator's engine-status merge, via the roster
+                // (absent on an older creator → None, same as before).
+                layer_lo: m["layerLo"].as_u64().map(|x| x as u32),
+                layer_hi: m["layerHi"].as_u64().map(|x| x as u32),
                 // Adopted from the creator's sweep; absent (older creator)
                 // reads as online, which is what the field's absence meant.
                 online: m["online"].as_bool().unwrap_or(true),
                 last_seen: None,
                 hb_secs: 0,
                 ip: m["ip"].as_str().unwrap_or("").to_string(),
+                // Memory travels with the roster so every machine can total
+                // the pool, not just the creator (0 = an older peer).
+                vram_free: m["vramFree"].as_u64().unwrap_or(0),
+                ram_free: m["ramFree"].as_u64().unwrap_or(0),
+                unified_memory: m["unifiedMemory"].as_bool().unwrap_or(false),
             }
         })
         .collect();
@@ -596,6 +660,33 @@ fn usage_cap_args(tuning: &Tuning) -> Vec<String> {
     v
 }
 
+/// Overflow flags for the coordinator ("borrow another machine when this one is
+/// full"). Both the URL and the key or nothing: the coordinator treats their
+/// presence as the switch, so passing one without the other would ask it to
+/// enable a feature it cannot use and it would refuse to start.
+///
+/// Deliberately NOT guarded on api_token here. The coordinator's own refusal is
+/// the guard, and duplicating it would mean a client that silently drops the
+/// flags instead of surfacing why -- the user would see sharing "on" in the
+/// panel and a machine that never borrows.
+fn overflow_args(tuning: &Tuning) -> Vec<String> {
+    if tuning.overflow_url.is_empty() || tuning.overflow_key.is_empty() {
+        return Vec::new();
+    }
+    let mut v = vec![
+        "--overflow-url".into(), tuning.overflow_url.clone(),
+        "--overflow-key".into(), tuning.overflow_key.clone(),
+        "--overflow-wait-s".into(), tuning.overflow_wait_s.to_string(),
+    ];
+    // 0 means "use the coordinator's own default", which is a real ceiling --
+    // never "no ceiling". Omitting the flag says the same thing more plainly.
+    if tuning.overflow_daily_cap_milli > 0 {
+        v.push("--overflow-daily-cap".into());
+        v.push(tuning.overflow_daily_cap_milli.to_string());
+    }
+    v
+}
+
 /// Start this machine's engine(s) per its role in the frozen roster. The
 /// coordinator's llama-server uses local compute directly; only other machines
 /// run rpc-supervisors. There is deliberately no co-located RPC worker and no
@@ -633,12 +724,28 @@ fn materialize_engine(app: &AppHandle) {
         };
         let host = bind_host(&tuning);   // "Bind interface / IP", else 0.0.0.0
         let mut coord_args = vec![
+            // Hardened engine, always — not only once someone presses "share
+            // compute". The flags that keep a buyer's prompt unreadable on this
+            // machine (engine args locked, unix-socket link, binary digest
+            // checked) are all fixed when the engine process starts, and
+            // sharing is turned on long after the cluster is up. Deciding it
+            // here means starting to share costs no restart and needs no
+            // sentence explaining why the model has to reload.
+            //
+            // It takes nothing away from local use: IDLETOKEN_LLAMA_ARGS is a
+            // development variable that no client user sets, and anyone who
+            // wants it runs the coordinator from a shell, where --shared stays
+            // opt-in. See docs/shared-mode-plan-2026-08.md P0-1.
+            "--shared".into(),
             "--bind".into(), format!("{host}:{COORD_PORT}"),
             "--llama-server-bin".into(), engine_bin.to_string_lossy().into_owned(),
             "--llama-gguf".into(), model_path,
             "--llama-port".into(), LLAMA_PORT.to_string(),
             "--http".into(),
-            "--api-bind".into(), format!("{}:{}", tuning.api_host, tuning.api_port),
+            // Always loopback (2026-08-15): the coordinator rewrites anything
+            // else to 127.0.0.1 anyway; upgraded installs may still store
+            // "0.0.0.0" in settings, so it is normalized here too.
+            "--api-bind".into(), format!("127.0.0.1:{}", tuning.api_port),
             "--ctx-size".into(), tuning.ctx_size.to_string(),
             "--max-decode".into(), tuning.max_decode.to_string(),
         ];
@@ -652,6 +759,7 @@ fn materialize_engine(app: &AppHandle) {
             coord_args.push("--api-token".into());
             coord_args.push(tuning.api_token.clone());
         }
+        coord_args.extend(overflow_args(&tuning));
         if let Err(e) = crate::engine::start_engine(app, "coordinator".into(), coord_args, Vec::new()) {
             eprintln!("[pairing] coord start failed: {e}");
         }
@@ -738,17 +846,20 @@ fn content_length(headers: &[u8]) -> Option<usize> {
 }
 
 /// Poll the engine coordinator's status API and merge the real stage/layer
-/// plan into the roster (creator and joiners both run this once starting).
+/// plan into the roster. Creator only, over loopback: the API answers its own
+/// machine exclusively (coord enforces it), so a joiner cannot poll it — a
+/// joiner's phase/stage/layers all arrive through the roster protocol instead
+/// (roster_reply carries them from the creator's merge).
 fn merge_engine_status(app: &AppHandle) -> bool {
-    let (coord_ip, api_port) = {
+    let api_port = {
         let pairing = app.state::<Pairing>();
         let inner = pairing.0.lock().unwrap();
-        match (&inner.coord_ip, inner.phase.as_str()) {
-            (Some(ip), "starting") | (Some(ip), "ready") => (ip.clone(), inner.tuning.api_port),
+        match (inner.mode, inner.phase.as_str()) {
+            (Mode::Creator, "starting") | (Mode::Creator, "ready") => inner.tuning.api_port,
             _ => return false,
         }
     };
-    let Some(body) = http_get_body(&coord_ip, api_port, "/idletoken/v1/cluster/status") else {
+    let Some(body) = http_get_body("127.0.0.1", api_port, "/idletoken/v1/cluster/status") else {
         return false;
     };
     let Ok(v) = serde_json::from_str::<Value>(&body) else {
@@ -832,6 +943,9 @@ fn handle_roster_conn(app: &AppHandle, stream: TcpStream, generation: u64) {
                         last_seen: Some(std::time::Instant::now()),
                         hb_secs: hb,
                         ip: peer_ip.clone(),
+                        vram_free: req["vramFree"].as_u64().unwrap_or(0),
+                        ram_free: req["ramFree"].as_u64().unwrap_or(0),
+                        unified_memory: req["unifiedMemory"].as_bool().unwrap_or(false),
                     });
                 }
                 // The joiner asked to be the coordinator ("Prefer this machine
@@ -1141,8 +1255,18 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
                 // `prefer`: this machine's own "Prefer this machine as
                 // coordinator". Sent on every (re)join so it survives the
                 // creator restarting the roster.
+                // Memory goes with the join: the machine that owns the
+                // numbers is the one that measured them, and the roster is
+                // where the cluster totals them up (pre-flight "will this
+                // model fit on all of us together").
+                let (vram_free, ram_free, unified) = {
+                    let pairing = app.state::<Pairing>();
+                    let inner = pairing.0.lock().unwrap();
+                    (inner.self_vram_free, inner.self_ram_free, inner.self_unified)
+                };
                 json!({"op": "join", "code": code, "hostname": self_host, "gpu": self_gpu,
-                       "prefer": prefer, "hb": poll.as_secs()})
+                       "prefer": prefer, "hb": poll.as_secs(),
+                       "vramFree": vram_free, "ramFree": ram_free, "unifiedMemory": unified})
             };
             let reply: Option<Value> = (|| {
                 let addr: SocketAddr = format!("{creator_ip}:{ROSTER_PORT}").parse().ok()?;
@@ -1252,6 +1376,38 @@ fn spawn_ready_watcher(app: AppHandle, generation: u64) {
             if inner.phase == "ready" {
                 return;
             }
+            // The coordinator process is GONE and the cluster never came up
+            // (2026-08-15). Without this the formation had no failure exit:
+            // the roster kept answering "starting" to every joiner, so their
+            // machines sat at "loading" forever waiting for a coordinator that
+            // had already exited — and the creator's own card said "starting"
+            // just as long. Dropping back to idle is what ends it on BOTH
+            // sides: joiners read phase=idle as teardown and stop their
+            // workers (apply_roster's stop_engine), and the creator gets its
+            // Start button back. The refusal sentence itself is already on
+            // screen — the engine card carries `refusedReason`.
+            // Whichever role THIS machine started (the creator is usually the
+            // coordinator, but `preferCoordinator` can put that job on another
+            // machine, and then the creator runs a worker).
+            let my_role = if inner.coordinator_id.as_deref() == Some(inner.self_id.as_str()) {
+                "coordinator"
+            } else {
+                "worker"
+            };
+            let my_st = crate::engine::role_state_str(&app, my_role);
+            if my_st == "crashed" || my_st == "stopped" {
+                eprintln!(
+                    "[pairing] {my_role} engine is {my_st} while forming — cluster back to idle"
+                );
+                inner.phase = "idle".into();
+                inner.engine_started = false;
+                for p in inner.peers.iter_mut() {
+                    p.stage = "joined".into();
+                }
+                drop(inner);
+                emit_snapshot(&app);
+                return;
+            }
             // creator's own live progress into the roster (P4)
             let self_id = inner.self_id.clone();
             if let Some(p) = inner.peers.iter_mut().find(|p| p.id == self_id) {
@@ -1316,6 +1472,12 @@ pub fn pairing_create(
             last_seen: None,
             hb_secs: 0,
             ip: String::new(),
+            // Filled by pairing_report_memory once the probe has run — the
+            // creator's own numbers come from the same command the joiners
+            // send, so one path fills every entry.
+            vram_free: 0,
+            ram_free: 0,
+            unified_memory: false,
         }];
     }
     emit_snapshot(&app);
@@ -1443,6 +1605,42 @@ pub fn pairing_set_coordinator(
     Ok(())
 }
 
+/// This machine's free memory, from the UI's own probe snapshot.
+///
+/// Called whenever the probe refreshes, in every mode — the numbers must be in
+/// place BEFORE a join is sent, and the creator's own roster entry is filled
+/// from here too, so one path feeds every member. Cheap and idempotent: it
+/// only writes three integers and refreshes this machine's roster row.
+#[tauri::command]
+pub fn pairing_report_memory(
+    app: AppHandle,
+    state: State<'_, Pairing>,
+    vram_free: u64,
+    ram_free: u64,
+    unified_memory: bool,
+) -> Result<(), String> {
+    let changed = {
+        let mut inner = state.0.lock().unwrap();
+        inner.self_vram_free = vram_free;
+        inner.self_ram_free = ram_free;
+        inner.self_unified = unified_memory;
+        let self_id = inner.self_id.clone();
+        match inner.peers.iter_mut().find(|p| p.id == self_id) {
+            Some(p) if p.vram_free != vram_free || p.ram_free != ram_free => {
+                p.vram_free = vram_free;
+                p.ram_free = ram_free;
+                p.unified_memory = unified_memory;
+                true
+            }
+            _ => false,
+        }
+    };
+    if changed {
+        emit_snapshot(&app);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn pairing_leave(app: AppHandle, state: State<'_, Pairing>) -> Result<(), String> {
     {
@@ -1540,6 +1738,13 @@ pub fn headless_pair(app: &AppHandle, spec: &str) {
         }
         _ => eprintln!("[pairing] headless: unknown op '{op}'"),
     }
+}
+
+/// The machine's LAN address, for the front end ("connect a client" needs a
+/// dialable address to show, and the bind address 0.0.0.0 is not one).
+#[tauri::command]
+pub fn net_lan_ip() -> String {
+    local_lan_ip()
 }
 
 /// Best-effort LAN ip of this machine (the address peers should dial): open a
@@ -1643,6 +1848,35 @@ mod pairing_settings_tests {
         assert_eq!(usage_cap_args(&only_vram), vec!["--max-vram-mb", "4096"]);
     }
 
+    /// Overflow travels as a pair. One half without the other would ask the
+    /// coordinator to enable a feature it cannot use, and it answers that by
+    /// refusing to start -- so the client must not send half.
+    #[test]
+    fn overflow_flags_need_both_url_and_key() {
+        assert!(overflow_args(&Tuning::default()).is_empty());
+        assert!(overflow_args(&tuning(|t| t.overflow_url = "http://p".into())).is_empty());
+        assert!(overflow_args(&tuning(|t| t.overflow_key = "sk".into())).is_empty());
+        let t = tuning(|t| {
+            t.overflow_url = "http://p".into();
+            t.overflow_key = "sk".into();
+            t.overflow_wait_s = 5;
+            t.overflow_daily_cap_milli = 2500;
+        });
+        assert_eq!(
+            overflow_args(&t),
+            vec!["--overflow-url", "http://p", "--overflow-key", "sk",
+                 "--overflow-wait-s", "5", "--overflow-daily-cap", "2500"]
+        );
+        // A cap of 0 means "the coordinator's own default", which is a real
+        // ceiling. It must never be sent as an explicit 0, which would read as
+        // a cap of zero -- and it must never be read as "no ceiling".
+        let no_cap = tuning(|t| {
+            t.overflow_url = "http://p".into();
+            t.overflow_key = "sk".into();
+        });
+        assert!(!overflow_args(&no_cap).contains(&"--overflow-daily-cap".to_string()));
+    }
+
     /// The client sends camelCase; a rename on either side must fail loudly
     /// here rather than silently deserialize to a default (which is how a
     /// setting goes back to doing nothing).
@@ -1656,8 +1890,13 @@ mod pairing_settings_tests {
             "lanDiscovery": false, "manualPeers": "192.168.1.50",
             "heartbeatSec": 3, "preferCoordinator": true,
             "sameSubnetOnly": true, "bindNic": "192.168.1.9",
+            "overflowUrl": "http://platform", "overflowKey": "sk-x",
+            "overflowWaitS": 7, "overflowDailyCapMilli": 4200,
         }))
         .expect("client payload must deserialize");
+        assert_eq!(t.overflow_url, "http://platform");
+        assert_eq!(t.overflow_wait_s, 7);
+        assert_eq!(t.overflow_daily_cap_milli, 4200);
         assert_eq!(t.max_vram_mb, 8192);
         assert!(!t.lan_discovery);
         assert_eq!(manual_peer_list(&t), vec!["192.168.1.50"]);

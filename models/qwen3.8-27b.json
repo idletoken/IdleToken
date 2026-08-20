@@ -1,0 +1,403 @@
+{
+  "id": "qwen3.8-27b",
+  "label": "Qwen3.8 27B",
+  "family": "qwen3.8",
+  "backend": "llamacpp",
+  "arch": "qwen35",
+  "available": true,
+  "deployment": "single-node",
+  "license": "Apache-2.0",
+  "params_summary": "27B · 64 layers · hybrid linear attention (Gated DeltaNet 3:1 full) · +1 MTP block",
+  "n_layers": 64,
+  "n_embd": 5120,
+  "hc_streams": 1,
+  "n_vocab": 248320,
+  "context_max": 262144,
+  "attn": {
+    "kind": "hybrid",
+    "full_attention_interval": 4,
+    "full": {
+      "kind": "gqa",
+      "n_head": 24,
+      "n_head_kv": 4,
+      "head_dim": 256,
+      "qk_norm": true,
+      "rope_dim_partial": 64,
+      "out_gate": "sigmoid"
+    },
+    "linear": {
+      "kind": "gated_deltanet",
+      "k_heads": 16,
+      "k_dim": 128,
+      "v_heads": 48,
+      "v_dim": 128,
+      "conv_kernel": 4,
+      "z_gate": "silu"
+    }
+  },
+  "kv": {
+    "kind": "hybrid",
+    "bytes_per_token_per_layer": 8192,
+    "state_bytes_per_layer": 3268608,
+    "full_attention_interval": 4
+  },
+  "rope_theta": 10000000,
+  "split": {
+    "boundary_multiple": 0
+  },
+  "overhead_base_bytes": 2147483648,
+  "chat_template": "gguf",
+  "layer_weight_bytes": 6192222208,
+  "shared_weight_bytes": 0,
+  "default_gguf": "Qwen3.8-27B-UD-IQ1_S.gguf",
+  "sources": [
+    {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "quant": "IQ1_S"
+    },
+    {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "quant": "IQ1_M"
+    },
+    {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "quant": "IQ2_XXS"
+    },
+    {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "quant": "IQ2_S"
+    },
+    {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "quant": "Q2_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "quant": "IQ3_XXS"
+    },
+    {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "quant": "IQ3_S"
+    },
+    {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "quant": "Q3_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "quant": "IQ4_XS"
+    },
+    {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "quant": "Q4_K_S"
+    },
+    {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "quant": "Q4_0"
+    },
+    {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "quant": "Q4_K_M"
+    },
+    {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "quant": "Q4_1"
+    },
+    {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "quant": "Q4_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "quant": "Q5_K_S"
+    },
+    {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "quant": "Q5_K_M"
+    },
+    {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "quant": "Q5_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "quant": "Q6_K"
+    },
+    {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "quant": "Q6_K_M"
+    },
+    {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "quant": "Q6_K_L"
+    },
+    {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "quant": "Q6_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "quant": "Q8_K_L"
+    },
+    {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "quant": "Q8_0"
+    },
+    {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "quant": "Q8_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "quant": "BF16"
+    }
+  ],
+  "default_quant": "IQ1_S",
+  "variants": [
+    {
+      "quant": "IQ1_S",
+      "layer_weight_bytes": 6192222208,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "gguf": "Qwen3.8-27B-UD-IQ1_S.gguf",
+      "sha256": "3895b6eaa91e705c06ad1938d16c22e86f073c6a67df86260a1da79be3d1f887",
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+    },
+    {
+      "quant": "IQ1_M",
+      "layer_weight_bytes": 6729166848,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "gguf": "Qwen3.8-27B-UD-IQ1_M.gguf",
+      "sha256": "1b5165a7149ea51e683c8eaf23372188ad9fc9d1a795386f7a1b558acf847dc6",
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+    },
+    {
+      "quant": "IQ2_XXS",
+      "layer_weight_bytes": 7266070528,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "gguf": "Qwen3.8-27B-UD-IQ2_XXS.gguf",
+      "sha256": "e792d8fb3142fe6d9171876d6da0f71f05a71028718debc72dbec93ff645e67d",
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+    },
+    {
+      "quant": "IQ2_S",
+      "layer_weight_bytes": 8371970048,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "gguf": "Qwen3.8-27B-UD-IQ2_S.gguf",
+      "sha256": "7897d2c5a5cee46aef50895141b2c8a0803c1185f3d03c4fda4cd137a7ad77fe",
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+    },
+    {
+      "quant": "Q2_K_XL",
+      "layer_weight_bytes": 9828981664,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "gguf": "Qwen3.8-27B-UD-Q2_K_XL.gguf",
+      "sha256": "fd4730dd8aad070517978752b63d530aeb1740d2283cab9fa24f1e404032ddb0",
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+    },
+    {
+      "quant": "IQ3_XXS",
+      "layer_weight_bytes": 10934860704,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "gguf": "Qwen3.8-27B-UD-IQ3_XXS.gguf",
+      "sha256": "c0b7c3038681ed2e3040456c1dd45f9858b6c2290bed172c70388a94874f3eee",
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+    },
+    {
+      "quant": "IQ3_S",
+      "layer_weight_bytes": 12040883104,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "gguf": "Qwen3.8-27B-UD-IQ3_S.gguf",
+      "sha256": "d847e2c1e4aa276e4b7b8e9ad7628050e61e165d49ab995407bc36677a6f3864",
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+    },
+    {
+      "quant": "Q3_K_XL",
+      "layer_weight_bytes": 13146393504,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "gguf": "Qwen3.8-27B-UD-Q3_K_XL.gguf",
+      "sha256": "8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e",
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+    },
+    {
+      "quant": "IQ4_XS",
+      "layer_weight_bytes": 14252845984,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "gguf": "Qwen3.8-27B-UD-IQ4_XS.gguf",
+      "sha256": "40fac4050e940397dbf13087afd50f4734a11805bf9d65ef8ddd7483470e6199",
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+    },
+    {
+      "quant": "Q4_K_S",
+      "layer_weight_bytes": 15358213024,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "gguf": "Qwen3.8-27B-UD-Q4_K_S.gguf",
+      "sha256": "75bc9c8adba2842e72f0ab5201aaa07133c5010b566305c09187fcbdcd364017",
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+    },
+    {
+      "quant": "Q4_0",
+      "layer_weight_bytes": 16056478688,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "gguf": "Qwen3.8-27B-Q4_0.gguf",
+      "sha256": "ede16c7b36e578ca87a8c70e011e4b4633a32c831c0ce76d0f474582384e671d",
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+    },
+    {
+      "quant": "Q4_K_M",
+      "layer_weight_bytes": 16464440224,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "gguf": "Qwen3.8-27B-UD-Q4_K_M.gguf",
+      "sha256": "322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482",
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+    },
+    {
+      "quant": "Q4_1",
+      "layer_weight_bytes": 17540705248,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "gguf": "Qwen3.8-27B-Q4_1.gguf",
+      "sha256": "3e020514545c310dfc511dc8d3ddc23482b645189cb9287816d84bed6eddd4ac",
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+    },
+    {
+      "quant": "Q4_K_XL",
+      "layer_weight_bytes": 17559178144,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "gguf": "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+      "sha256": "3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e",
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+    },
+    {
+      "quant": "Q5_K_S",
+      "layer_weight_bytes": 18665753504,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "gguf": "Qwen3.8-27B-UD-Q5_K_S.gguf",
+      "sha256": "d8d62ffcf84d42658dd6ccf9782b4d0404700af78b26d750507510c7597b5bfe",
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+    },
+    {
+      "quant": "Q5_K_M",
+      "layer_weight_bytes": 19771509664,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "gguf": "Qwen3.8-27B-UD-Q5_K_M.gguf",
+      "sha256": "2de73110cb254cbf09b54b717578dadff12ef1194e7271527e68202f39ba4bfd",
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+    },
+    {
+      "quant": "Q5_K_XL",
+      "layer_weight_bytes": 20876938144,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "gguf": "Qwen3.8-27B-UD-Q5_K_XL.gguf",
+      "sha256": "8601193d3d5760c37fb8ce1b43afebc69df5fb24e1fbc5a547c32e2200305276",
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+    },
+    {
+      "quant": "Q6_K",
+      "layer_weight_bytes": 21983677344,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "gguf": "Qwen3.8-27B-UD-Q6_K.gguf",
+      "sha256": "c9c206812fbe4ac7b76a729e25928b63f2ae89d37f69da7a71c20aec763cd436",
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+    },
+    {
+      "quant": "Q6_K_M",
+      "layer_weight_bytes": 23088409504,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "gguf": "Qwen3.8-27B-UD-Q6_K_M.gguf",
+      "sha256": "493301830a596b8ad56dc1329f80bbcb578c8e910da395feafdc9cd8263430bb",
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+    },
+    {
+      "quant": "Q6_K_L",
+      "layer_weight_bytes": 24193919904,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "gguf": "Qwen3.8-27B-UD-Q6_K_L.gguf",
+      "sha256": "121355b4c7422771da25adc74090e3c90138f77ce5c92d348687d47824ec80f4",
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+    },
+    {
+      "quant": "Q6_K_XL",
+      "layer_weight_bytes": 25299061664,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "gguf": "Qwen3.8-27B-UD-Q6_K_XL.gguf",
+      "sha256": "701d8fa9ed214ab21bfc130cd2a7df19ca89bbef7713e2dfb19f3c63696aa917",
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+    },
+    {
+      "quant": "Q8_K_L",
+      "layer_weight_bytes": 28045695904,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "gguf": "Qwen3.8-27B-UD-Q8_K_L.gguf",
+      "sha256": "2a13bba36d2efa213f9275abc430c40e4d914b145bfde976f30f1bb5b7e23ac2",
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+    },
+    {
+      "quant": "Q8_0",
+      "layer_weight_bytes": 29047086048,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "gguf": "Qwen3.8-27B-Q8_0.gguf",
+      "sha256": "a680f44a06920e5d689774823782006aa3acc8db95750323373b24139b67e348",
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+    },
+    {
+      "quant": "Q8_K_XL",
+      "layer_weight_bytes": 31457991680,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "gguf": "Qwen3.8-27B-UD-Q8_K_XL.gguf",
+      "sha256": "af36ecb6b5db1407953345b746c14ac93f0657dda413910b4348683a2d990377",
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+    },
+    {
+      "quant": "BF16",
+      "layer_weight_bytes": 54657735616,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "gguf": "BF16/Qwen3.8-27B-BF16-00001-of-00002.gguf",
+      "sha256": "b9966e82b7a4d87028b5eae061d578ee826305ebf8baea5bfc6e09bad0ba191f",
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7",
+      "parts": [
+        {
+          "file": "BF16/Qwen3.8-27B-BF16-00002-of-00002.gguf",
+          "bytes": 4671576000,
+          "sha256": "92e3943c4f9bd6292a7bef82369f65fed9bfed088b9df0fb2fa2ce17c9edfa02"
+        }
+      ]
+    }
+  ],
+  "notes": [
+    "PROMOTED 2026-08-20 (T14 phase B). available=true and the file now sits in models/ alongside the rest, so scripts/model_manifest_check.py cross-checks it against src/common/model.c and client/src/models.ts. The onboarding prerequisites of hard constraint #2 are both on record: the real-machine ppl gate (test-assets/ppl/qwen3.8-27b.Q4_K_M.json -- PPL 1.9780 +/- 0.05305 on DGX at the b10502 pin, identical across 3 runs, G_PPL_OK) and the testbed smoke. Evidence: results/t14-engine-bump-phaseb-20260820.md.",
+    "Architecture: the GGUF declares general.architecture = 'qwen35' -- Qwen3.8-27B is a Qwen3.5-27B-shaped model, not a new architecture. Every geometry field below was read from THIS model's own GGUF header (scripts/measure_gguf.py --meta) and matches qwen3.5-27b.json exactly: 5120 embd, 24 q heads / 4 KV heads x 256, full_attention_interval 4, ssm inner 6144 / state 128 / group 16 / conv 4, ff 17408, vocab 248320, ctx 262144, rope base 1e7. The KV numbers are therefore carried over rather than re-derived: full layers 4 x 256 x 2 x 4 B = 8192 B/token/layer; linear layers 48x128x128x4 + 3x10240x4 = 3268608 B of state, context-independent.",
+    "MTP / n_layers: qwen35.block_count is 65 in most community quants, because block 64 is an MTP (NextN) draft head, not a decode layer. n_layers here is 64 -- the planner splits decode layers, and counting the MTP block as one would mis-size every node. MTP is NOT present in every precision of this repo: IQ1_S / IQ1_M / IQ2_XXS / IQ2_S ship block_count 64 with no MTP at all; everything from Q2_K_XL up carries it at ~335 MiB (Q4_0 253, Q4_1 275, Q8_0 430, Q8_K_XL 543 -- the MTP head is quantised on its own schedule). Per-precision measurements: results/t14-qwen38-manifest-draft-20260819.md.",
+    "layer_weight_bytes carries the WHOLE file size and shared_weight_bytes is 0 -- the same convention as every other manifest here (the planner only uses their sum, and shared_weight_bytes is charged to every node, which would over-count a cluster). The real split is measured and recorded in the results file rather than guessed; e.g. UD-Q4_K_M is 14,344,308,736 B across blk.0-63, 351,008,768 B of MTP, 1,758,126,080 B shared.",
+    "Source: unsloth/Qwen3.8-27B-GGUF, revision 990216c. Chosen over bartowski/Qwen3.8-27B-GGUF (also reputable, imatrix-calibrated) because it matches the qwen3.5-* manifests already in this tree, and because its low end reaches IQ1_S -- which is the part of the ladder that decides whether a 16 GiB discrete GPU can hold this model at all. bartowski remains the fallback if the phase-B ppl gate prefers imatrix quants.",
+    "Multimodal: upstream Qwen3.8-27B is image-text-to-text and both repos ship mmproj files. They are deliberately NOT listed -- v2 does not do multimodal (hard constraint #2). Text-only serving is unaffected; the chat template simply never emits vision tokens.",
+    "Thinking model: the template turns reasoning on by default and injects a 'Reasoning effort is set to xhigh' system line. The sidecar's `--reasoning off` default already covers the known failure mode (whole max_tokens burnt inside <think>), but this model's default effort is the highest of the three it accepts, which is worth a look during the phase-B smoke.",
+    "The GGUF carries the publisher's sampling recommendation: temp 1.0, top_k 20, top_p 0.95.",
+    "deployment=single-node, RESOLVED 2026-08-20 (phase B); the draft said cluster and flagged it for measurement, and the draft was wrong. 'Follows the other llamacpp-backed manifests' conflated backend with deployment: the llamacpp models are clustered because they are 200-850 GB, not because they are llamacpp. Backend and deployment are independent axes. Every manifest here under ~11 GB is single-node, and this model's default (IQ1_S) is 6.2 GB -- smaller than qwen3.5-35b-a3b at 10.7 GB. Marking it cluster would also fight hard scheduling rule #8, 'if it fits, do not go over the network'. The planner unit test caught the mistake directly: with deployment=cluster, 'extra machines do NOT unlock a single-node model' went red. Q4_K_M at 16.46 GB remains the interesting rung for a 16 GiB discrete card, and the T8 resolve path sizes it to 1 sequence slot there -- the same answer it gives qwen3.5-27B Q4_K_M at 16.74 GB (src/tools/plan_test.c, 'T3 replay: 27B Q4_K_M on the 16 GiB card').",
+    "Every byte count, sha256 and the revision come from the HF API and from HTTP Range reads of the file headers. No weights were downloaded to the control machine.",
+    "Gate coverage, stated plainly so nobody assumes more than was measured: the ppl band covers Q4_K_M, which is the precision the gate ran on. default_quant is IQ1_S -- the smallest rung, chosen the same way qwen3.5-27b defaults to IQ2_XXS, so the model reaches the most machines. That default is NOT ppl-gated, and IQ1_S is exactly the precision where quantisation damage would show first. Gating it needs its own download and its own band; until then the honest statement is that Q4_K_M is verified and the low rungs are inherited convention."
+  ]
+}

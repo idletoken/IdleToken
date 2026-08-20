@@ -31,7 +31,7 @@ MANIFEST="models/$MODEL.json"
 [ -f "$MANIFEST" ] || die "unknown model '$MODEL' (no $MANIFEST). Known: $(ls models/*.json | xargs -n1 basename | sed 's/.json//' | tr '\n' ' ')"
 
 # --- resolve repo / filename / expected size from the manifest --------------
-read -r REPO FILE EXPECT <<EOF
+read -r REPO FILE EXPECT SHA REV <<EOF
 $(python3 - "$MANIFEST" "$QUANT" <<'PY'
 import json, sys
 man = json.load(open(sys.argv[1]))
@@ -46,13 +46,17 @@ if variants:
 repo = (v or {}).get("repo") or (man.get("sources") or [{}])[0].get("repo", "")
 gguf = (v or {}).get("gguf") or man.get("default_gguf", "")
 size = int((v or man).get("layer_weight_bytes", 0)) + int((v or man).get("shared_weight_bytes", 0))
-print(repo, gguf, size)
+# "-" = no pinned hash (curation gap); the shell side skips verification then.
+sha = ((v.get("sha256") if v else None) or man.get("sha256") or "-")
+# Pinned repo commit; "main" when the manifest does not pin one.
+rev = ((v.get("revision") if v else None) or man.get("revision") or "main")
+print(repo, gguf, size, sha, rev)
 PY
 )
 EOF
 [ -n "${REPO:-}" ] && [ -n "${FILE:-}" ] || die "manifest $MANIFEST has no repo/filename for quant '${QUANT:-default}'"
 echo "model:    $MODEL ${QUANT:+($QUANT)}"
-echo "repo:     $REPO"
+echo "repo:     $REPO${REV:+@${REV}}"
 echo "file:     $FILE"
 
 mkdir -p "$DEST" 2>/dev/null || die "cannot create destination $DEST"
@@ -68,7 +72,11 @@ else
     ENDPOINTS="https://huggingface.co ${IDLETOKEN_MIRRORS:-https://hf-mirror.com}"
 fi
 
-url_for() { echo "$1/$REPO/resolve/main/$FILE"; }
+# Downloads resolve against the pinned commit, not the moving branch: a repo
+# force-push then either serves the bytes the manifest was hashed from, or
+# fails loudly — it cannot quietly swap them.
+REV="${REV:-main}"
+url_for() { echo "$1/$REPO/resolve/$REV/$FILE"; }
 
 PICKED=""
 CLEN=0
@@ -130,6 +138,27 @@ if [ "${CLEN:-0}" -gt 0 ] && [ "$got" != "$CLEN" ]; then
 fi
 magic=$(head -c 4 "$OUT" | tr -d '\0')
 [ "$magic" = "GGUF" ] || die "not a GGUF file (magic '$magic'). The endpoint may have served an error page — delete $OUT and retry."
+
+# Integrity gate: when the manifest pins a SHA-256, the file must match it —
+# a mirror or a hijacked repo serving different bytes must go red HERE, not as
+# an inexplicable failure (or a silently different model) at load time. The
+# same gate exists in the client (weights.rs); this script must not be the
+# unverified back door. A provably wrong file is deleted: keeping it around
+# only invites "just use it anyway".
+if [ "${SHA:-"-"}" != "-" ] && [ -n "${SHA:-}" ]; then
+    if command -v sha256sum >/dev/null 2>&1; then
+        got_sha=$(sha256sum "$OUT" | awk '{print $1}')
+    elif command -v shasum >/dev/null 2>&1; then
+        got_sha=$(shasum -a 256 "$OUT" | awk '{print $1}')
+    else
+        die "no sha256 tool found (need sha256sum or shasum) — cannot verify the download against the curated hash"
+    fi
+    echo "sha256:   $got_sha"
+    if [ "$got_sha" != "$SHA" ]; then
+        rm -f "$OUT"
+        die "hash mismatch: manifest pins $SHA. The file was deleted — the source may be compromised; retry, and report it if this repeats."
+    fi
+fi
 
 # Manifest sizes are recorded from real files, so a large deviation means the
 # manifest and the repo have drifted apart. Warn (the download is still valid)

@@ -39,6 +39,7 @@
 #include "idletoken_sodium_seal.h"
 #include "idletoken_net.h"
 #include "idletoken_http.h"
+#include "idletoken_b64.h"
 
 #include <errno.h>
 #include <signal.h>
@@ -386,72 +387,20 @@ static int platform_post_cache_state(const char *platform_addr, const char *jwt,
 
 /* ======================================================================
  * base64 — standard alphabet with '=' padding (libsodium ORIGINAL variant).
+ *
+ * The codec moved to src/common/b64.c on 2026-08-19: the coordinator's overflow
+ * path seals envelopes with the same encoding this file opens them with, and a
+ * second copy of a codec that must agree byte for byte is how "the agent
+ * accepts it, the coordinator 400s it" gets written. These two thin wrappers
+ * keep the ~20 call sites below untouched.
  * ====================================================================== */
 
-static const char b64_alphabet[] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-/* Encode `n` bytes; returns malloc'd NUL-terminated string (caller frees). */
 static char *b64_encode(const uint8_t *in, size_t n) {
-    size_t olen = 4 * ((n + 2) / 3);
-    char *out = malloc(olen + 1);
-    if (!out) return NULL;
-    size_t o = 0;
-    for (size_t i = 0; i < n; i += 3) {
-        uint32_t v = (uint32_t)in[i] << 16;
-        if (i + 1 < n) v |= (uint32_t)in[i + 1] << 8;
-        if (i + 2 < n) v |= (uint32_t)in[i + 2];
-        out[o++] = b64_alphabet[(v >> 18) & 63];
-        out[o++] = b64_alphabet[(v >> 12) & 63];
-        out[o++] = (i + 1 < n) ? b64_alphabet[(v >> 6) & 63] : '=';
-        out[o++] = (i + 2 < n) ? b64_alphabet[v & 63] : '=';
-    }
-    out[o] = '\0';
-    return out;
+    return idletoken_b64_encode(in, n);
 }
 
-/* Decode a padded base64 string. Returns malloc'd bytes and sets *out_len;
- * NULL on any invalid character / bad length (treated as malformed → 400). */
 static uint8_t *b64_decode(const char *s, size_t slen, size_t *out_len) {
-    if (slen == 0 || slen % 4 != 0) return NULL;
-    int8_t rev[256];
-    memset(rev, -1, sizeof(rev));
-    for (int i = 0; i < 64; i++) rev[(uint8_t)b64_alphabet[i]] = (int8_t)i;
-
-    size_t pad = 0;
-    if (s[slen - 1] == '=') pad++;
-    if (s[slen - 2] == '=') pad++;
-    size_t olen = slen / 4 * 3 - pad;
-    uint8_t *out = malloc(olen ? olen : 1);
-    if (!out) return NULL;
-
-    size_t o = 0;
-    for (size_t i = 0; i < slen; i += 4) {
-        int last = (i + 4 == slen);
-        uint32_t v = 0;
-        int npad = 0;
-        for (int k = 0; k < 4; k++) {
-            char c = s[i + k];
-            if (c == '=') {
-                /* '=' only allowed as the final group's tail: "xx==" / "xxx=" */
-                if (!last || k < 2 || (k == 2 && s[i + 3] != '=')) { free(out); return NULL; }
-                npad = 4 - k;
-                v <<= 6 * npad;
-                break;
-            }
-            int8_t d = rev[(uint8_t)c];
-            if (d < 0) { free(out); return NULL; }
-            v = (v << 6) | (uint32_t)d;
-        }
-        int nout = 3 - npad;
-        for (int k = 0; k < nout; k++) {
-            if (o >= olen) { free(out); return NULL; }
-            out[o++] = (uint8_t)(v >> (16 - 8 * k));
-        }
-    }
-    if (o != olen) { free(out); return NULL; }
-    if (out_len) *out_len = olen;
-    return out;
+    return idletoken_b64_decode(s, slen, out_len);
 }
 
 /* ======================================================================
@@ -545,6 +494,22 @@ static int json_array_token(const char *json, size_t len, const char *key,
 }
 
 /* Extract `"key": N` as an int; `dflt` if absent (coord_main.c pattern). */
+/* Does this (possibly non-terminated) JSON buffer contain `needle`?
+ *
+ * The stats body is read as bytes + length, so plain strstr() would run past
+ * the end on a response that is not NUL-terminated. Only used for exact-shape
+ * literals like "\"shared_mode\":true", which the coordinator emits without
+ * spaces — a pretty-printer on the other side would make this miss, and the
+ * platform would read a hardened node as unhardened. That direction of error
+ * is the safe one, and the two sides are the same repo.  */
+static int json_has_literal(const char *json, size_t len, const char *needle) {
+    size_t nl = strlen(needle);
+    if (!json || nl == 0 || len < nl) return 0;
+    for (size_t i = 0; i + nl <= len; i++)
+        if (memcmp(json + i, needle, nl) == 0) return 1;
+    return 0;
+}
+
 static int json_int_field(const char *json, size_t len, const char *key, int dflt) {
     long p = json_key_colon(json, len, key);
     if (p < 0) return dflt;
@@ -578,7 +543,14 @@ static uint8_t *http_request_json(const char *method,
                                   const uint8_t *body, size_t body_len,
                                   int *out_status, size_t *out_len,
                                   int timeout_secs) {
-    int fd = idletoken_connect_tcp(addr);
+    /* "unix:<path>" is the shared-mode transport to the coordinator. The agent
+     * opens the platform's envelope, so everything it sends onward is the
+     * buyer's plaintext; on loopback TCP that is readable with one tcpdump by
+     * the owner of this machine. Same dispatch shape as the sidecar's engine
+     * link, so there is one idiom to learn, not two. */
+    int is_unix = strncmp(addr, "unix:", 5) == 0;
+    int fd = is_unix ? idletoken_connect_unix(addr + 5)
+                     : idletoken_connect_tcp(addr);
     if (fd < 0) return NULL;
     if (timeout_secs > 0) {
         /* Winsock's SO_RCVTIMEO/SO_SNDTIMEO take a DWORD of milliseconds, not
@@ -608,7 +580,10 @@ static uint8_t *http_request_json(const char *method,
                       "Content-Length: %zu\r\n"
                       "%s%s"
                       "Connection: close\r\n\r\n",
-                      method, path, addr, body_len, auth,
+                      /* A socket path is not a host name; send a name the
+                       * server will accept (cpp-httplib and our own parser
+                       * both ignore which). */
+                      method, path, is_unix ? "localhost" : addr, body_len, auth,
                       extra_hdr ? extra_hdr : "");
     if (hn < 0 || (size_t)hn >= sizeof(head)) { close(fd); return NULL; }
     if (idletoken_sendall(fd, head, (size_t)hn) < 0 ||
@@ -767,11 +742,23 @@ static uint8_t *http_post_json(const char *addr, const char *path, const char *b
  * the same endpoint over loopback, so the marker is the only thing that
  * distinguishes them; if this header is ever dropped, that rule silently stops
  * holding. G_OVERFLOW_ORIGIN exists to catch exactly that. */
+/* The coordinator's --api-token, when it has one. Empty = the coordinator does
+ * not ask for one, which is the LAN default.
+ *
+ * Needed since overflow routing landed (2026-08-19). The coordinator refuses to
+ * enable overflow without an --api-token, and the client's sharing switch turns
+ * lending and borrowing on together -- so from that switch onwards every
+ * coordinator that shares also demands a token, and an agent that could not
+ * present one would have every dispatched job answered 401. The failure would
+ * read as "the platform stopped sending me work". */
+static char g_coord_token[256] = "";
+
 static uint8_t *http_post_json_platform(const char *addr, const char *path,
                                         const uint8_t *body, size_t body_len,
                                         int *out_status, size_t *out_len,
                                         int timeout_secs) {
-    return http_request_json("POST", addr, path, NULL,
+    return http_request_json("POST", addr, path,
+                             g_coord_token[0] ? g_coord_token : NULL,
                              IDLETOKEN_HDR_ORIGIN ": " IDLETOKEN_ORIGIN_PLATFORM "\r\n",
                              body, body_len, out_status, out_len, timeout_secs);
 }
@@ -780,6 +767,106 @@ static uint8_t *http_get_json(const char *addr, const char *path,
                               int *out_status, size_t *out_len, int timeout_secs) {
     return http_request_json("GET", addr, path, NULL, NULL, NULL, 0,
                              out_status, out_len, timeout_secs);
+}
+
+/* ----------------------------------------------------------------------
+ * Listing floor: a machine with less than this much context per slot is
+ * refused at the door (cleanup-t9 §A3).
+ *
+ * Why a floor and not a smaller platform tier. The platform buckets capacity
+ * declarations by context class, and the smallest class is 8192 (`CTX_CLASSES`
+ * in scheduler/tiers.ts); `numFromCtxMap` only ever borrows UPWARD. So a
+ * machine declaring, say, 4096 matches no class at all, every declared number
+ * is silently dropped, and the platform falls back to "one slot, no TTFT
+ * estimate" -- the machine looks serial and blind, and the buyer whose request
+ * lands there gets the worst experience on the market with nothing in the logs
+ * to explain it.
+ *
+ * The floor is the honest end of that. Claude Code's system prompt alone is
+ * ~13K tokens; a slot smaller than 8192 cannot hold a real conversation, so
+ * listing it produces a bad trade rather than a cheap one. Refusing at startup
+ * costs this machine's owner nothing they were going to earn, and it is a
+ * sentence they can act on ("give the coordinator a bigger -c") instead of a
+ * silent mismatch three layers away.
+ *
+ * This is the SHARING side only. The platform's borrow rule is unchanged:
+ * adding a 4096 class there would move the problem, not remove it -- somebody
+ * would still be selling a context too small to serve anyone. */
+#define AGENT_MIN_LIST_CTX 8192
+
+/**
+ * The coordinator's per-slot context, or -1 if it cannot be read.
+ *
+ * -1 means "we could not check", NOT "the machine is fine": the caller has to
+ * say which one it is out loud. `ctx_size` is the context of ONE slot
+ * (llama_sidecar.c) -- the number a single conversation actually gets, which
+ * is the number this floor is about. `-np N` divides `-c`, so a machine with a
+ * large `-c` and many slots can still be under the floor per slot.
+ */
+static int coord_ctx_size(const char *coord_addr) {
+    if (!coord_addr || !coord_addr[0]) return -1;
+    int status = 0; size_t rlen = 0;
+    uint8_t *resp = http_get_json(coord_addr, IDLETOKEN_PATH_STATS, &status, &rlen, 5);
+    if (!resp) return -1;
+    if (status < 200 || status >= 300) { free(resp); return -1; }
+    int ctx = json_int_field((const char *)resp, rlen, "ctx_size", 0);
+    free(resp);
+    return ctx > 0 ? ctx : -1;
+}
+
+/**
+ * Refuse to list a coordinator whose slots are too small. Returns 0 to go on,
+ * non-zero to exit with that code.
+ *
+ * Retries, because "the coordinator is still loading the model" and "the
+ * coordinator serves 4096-token slots" are different facts and the first one
+ * looks exactly like the second for the first few seconds after boot. The
+ * agent is normally started next to the coordinator, so a startup race is the
+ * common case, not the exception.
+ *
+ * If it still cannot be read after that, we warn loudly and continue. Refusing
+ * on "cannot check" would take a machine off the market for a reason we have
+ * not established, which is its own kind of dishonesty -- but silence is not an
+ * option either, so the operator gets told the check did not happen.
+ */
+static int assert_listable_ctx(const char *coord_addr) {
+    int ctx = -1;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        ctx = coord_ctx_size(coord_addr);
+        if (ctx > 0) break;
+        if (attempt == 0)
+            fprintf(stderr, "platform-agent: coordinator at %s is not answering "
+                            "/idletoken/v1/stats yet; waiting for it before listing\n",
+                    coord_addr);
+        sleep(2);
+    }
+    if (ctx < 0) {
+        fprintf(stderr, "platform-agent: WARNING: could not read the coordinator's "
+                        "ctx_size, so the %d-token listing floor was NOT checked. "
+                        "If this cluster serves less than %d tokens per slot it will "
+                        "be a poor provider (the platform's smallest context class "
+                        "is %d and it never borrows downward).\n",
+                AGENT_MIN_LIST_CTX, AGENT_MIN_LIST_CTX, AGENT_MIN_LIST_CTX);
+        return 0;
+    }
+    if (ctx < AGENT_MIN_LIST_CTX) {
+        fprintf(stderr,
+                "platform-agent: refuse: this coordinator serves %d tokens per slot, "
+                "and listing on the marketplace needs at least %d.\n"
+                "  Why: the platform's smallest context class is %d tokens and it "
+                "never borrows downward, so everything this machine declares about "
+                "its own speed would be dropped and it would be dispatched to as if "
+                "it were serial and untimed. Claude Code's system prompt alone is "
+                "~13K tokens, so buyers landing here would get the worst sessions on "
+                "the market.\n"
+                "  Fix: restart the coordinator with a larger context "
+                "(-c per-slot >= %d; remember -np divides -c), then start sharing "
+                "again. Using the cluster yourself is unaffected -- this only stops "
+                "it from being listed.\n",
+                ctx, AGENT_MIN_LIST_CTX, AGENT_MIN_LIST_CTX, AGENT_MIN_LIST_CTX);
+        return 4;
+    }
+    return 0;
 }
 
 /**
@@ -833,15 +920,37 @@ static int coord_stats_json(const char *coord_addr, char *out, size_t out_cap) {
      * queueing alone. That is more honest than substituting service time, which
      * would reject every real machine. */
     int ttft_ms = json_int_field(j, rlen, "avg_ttft_ms", 0);
+    /* Shared-mode posture (P1-6). Relayed as the coordinator states it —
+     * three facts, not one "trusted" flag. This is NOT proof: the node runs
+     * this code and could report whatever it likes. Its value is that a node
+     * which lies has to lie ON THE RECORD, which is what makes cheating
+     * accountable rather than merely discouraged.
+     *
+     * Absent fields (older coordinator, or shared mode off) simply do not
+     * appear in the heartbeat — the platform must not read "silent" as
+     * "hardened". */
+    char shared_field[128] = "";
+    {
+        int sm = json_has_literal(j, rlen, "\"shared_mode\":true");
+        if (sm) {
+            int ev = json_has_literal(j, rlen, "\"engine_verified\":true");
+            int lu = json_has_literal(j, rlen, "\"engine_link\":\"unix\"");
+            snprintf(shared_field, sizeof(shared_field),
+                     "\"shared_mode\":true,\"engine_verified\":%s,"
+                     "\"engine_link\":\"%s\",",
+                     ev ? "true" : "false", lu ? "unix" : "tcp");
+        }
+    }
     free(resp);
     if (ctx <= 0 || qdepth < 0) return -1;   /* older coordinator lacks these fields: report nothing rather than guess */
     char ttft_field[64] = "";
     if (ttft_ms > 0)
         snprintf(ttft_field, sizeof(ttft_field), "\"avg_ttft_ms\":{\"%d\":%d},", ctx, ttft_ms);
     int n = snprintf(out, out_cap,
-        "{\"seq_slots_by_ctx\":{\"%d\":%d},\"avg_service_ms\":{\"%d\":%d},%s"
+        "{\"seq_slots_by_ctx\":{\"%d\":%d},\"avg_service_ms\":{\"%d\":%d},%s%s"
         "\"queue_depth\":%d,\"max_ctx_tokens\":%d}",
-        ctx, slots > 0 ? slots : 1, ctx, svc_ms > 0 ? svc_ms : 0, ttft_field, qdepth, ctx);
+        ctx, slots > 0 ? slots : 1, ctx, svc_ms > 0 ? svc_ms : 0, ttft_field,
+        shared_field, qdepth, ctx);
     if (n < 0 || (size_t)n >= out_cap) { out[0] = '\0'; return -1; }
     return 0;
 }
@@ -891,12 +1000,13 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
 static int relay_post_result(const char *platform_addr, const char *jwt,
                              const char *provider_id, const char *job_id,
                              const char *sealed_b64 /* NULL on error */,
-                             const char *err_msg    /* used when sealed_b64 == NULL */) {
+                             const char *err_msg,   /* used when sealed_b64 == NULL */
+                             int err_status         /* HTTP-ish code for that error */) {
     char path[256];
     int pn = snprintf(path, sizeof(path), "/providers/%s/relay/result", provider_id);
     if (pn < 0 || (size_t)pn >= sizeof(path)) return -1;
 
-    size_t cap = (sealed_b64 ? strlen(sealed_b64) : strlen(err_msg)) + strlen(job_id) + 64;
+    size_t cap = (sealed_b64 ? strlen(sealed_b64) : strlen(err_msg)) + strlen(job_id) + 96;
     char *body = malloc(cap);
     if (!body) return -1;
     int bl;
@@ -906,7 +1016,16 @@ static int relay_post_result(const char *platform_addr, const char *jwt,
     } else {
         char msg_esc[256];
         json_escape_into(msg_esc, sizeof(msg_esc), err_msg);
-        bl = snprintf(body, cap, "{\"job_id\":\"%s\",\"error\":\"%s\"}", job_id, msg_esc);
+        /* `status` carries WHY it failed, not just that it did. Without it the
+         * relay transport is strictly worse than the direct one at the same
+         * job: direct returns an HTTP status the platform classifies (429 =
+         * busy, not a fault), while a relay failure arrived as a bare string
+         * and defaulted to CONNECT — a real fault, with a strike and a
+         * cooldown. Relay is the DEFAULT for home providers, so the transport
+         * most people run was the one that punished them for being busy.
+         * An older gateway simply ignores the extra field. */
+        bl = snprintf(body, cap, "{\"job_id\":\"%s\",\"error\":\"%s\",\"status\":%d}",
+                      job_id, msg_esc, err_status > 0 ? err_status : 502);
     }
     if (bl < 0 || (size_t)bl >= cap) { free(body); return -1; }
 
@@ -927,11 +1046,35 @@ static void relay_loop(const idletoken_keypair *node, const char *coord_addr,
                        const char *provider_id) {
     char path[256];
     snprintf(path, sizeof(path), "/providers/%s/relay/poll", provider_id);
-    char poll_body[64];
-    int pbl = snprintf(poll_body, sizeof(poll_body), "{\"wait_ms\":%d}", RELAY_WAIT_MS);
     int backoff = 1;
 
     for (;;) {
+        /* The poll IS the heartbeat on this transport, so the live load has to
+         * ride along with it — rebuilt every iteration because that is the
+         * point of it (queue depth and service time change between polls).
+         *
+         * It used to be a fixed `{"wait_ms":N}` with no capacity at all, and
+         * the consequence was invisible from here: relay providers reported
+         * their load NOWHERE, so the platform's scheduler fell back to "one
+         * slot, no TTFT budget" for every one of them (measured 2026-08-19,
+         * results/platform-seam-20260819.md V1). Relay is the DEFAULT for
+         * home machines — the transport most people run was the one the
+         * scheduler knew least about.
+         *
+         * A coordinator that cannot be probed yields an empty stats string and
+         * the poll goes out exactly as it did before: the wait, and nothing
+         * claimed. */
+        char poll_body[512];
+        char stats[400];
+        int pbl;
+        if (coord_stats_json(coord_addr, stats, sizeof(stats)) == 0)
+            pbl = snprintf(poll_body, sizeof(poll_body),
+                           "{\"wait_ms\":%d,\"capacity\":%s}", RELAY_WAIT_MS, stats);
+        else
+            pbl = snprintf(poll_body, sizeof(poll_body), "{\"wait_ms\":%d}", RELAY_WAIT_MS);
+        if (pbl < 0 || (size_t)pbl >= sizeof(poll_body))
+            pbl = snprintf(poll_body, sizeof(poll_body), "{\"wait_ms\":%d}", RELAY_WAIT_MS);
+
         int status = 0; size_t rlen = 0;
         /* Socket timeout comfortably above the server's hold time. */
         uint8_t *resp = http_post_json(platform_addr, path, jwt,
@@ -964,7 +1107,7 @@ static void relay_loop(const idletoken_keypair *node, const char *coord_addr,
                 job_id, rc == 0 ? "sealed ok" : err_msg);
 
         if (relay_post_result(platform_addr, jwt, provider_id, job_id,
-                              rc == 0 ? sealed_b64 : NULL, err_msg) != 0)
+                              rc == 0 ? sealed_b64 : NULL, err_msg, err_status) != 0)
             fprintf(stderr, "platform-agent: relay result post failed for job=%s "
                             "(job will expire platform-side)\n", job_id);
         free(sealed_b64);
@@ -1102,6 +1245,23 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
     if (!cresp || cstatus != 200) {
         if (cresp) wipe_free(cresp, cresp_len);
         free(reply_to);
+        /* "Busy" is not "broken", and the difference must survive this hop.
+         *
+         * The coordinator answers 429 when every sequence slot is in flight and
+         * its queue is full (coord_main.c coord_send_busy_429). The platform
+         * already knows what to do with that: reliability.ts classifies 429 as
+         * BUSY and pointedly does NOT count it against the provider's failure
+         * EWMA, because a popular machine must not be penalised for being
+         * popular. Collapsing it into 502 here threw that away — measured on a
+         * live chain (results/platform-seam-20260819.md, V6): one refusal took
+         * a healthy provider from failCount 0 to 1, strikes 0 to 1, and put it
+         * in cooldown, i.e. the machine was removed from routing for being in
+         * use. The consumer meanwhile saw "provider error" for something that
+         * was nobody's error.
+         *
+         * Every other non-200 stays 502: those really are "this machine cannot
+         * serve you", and pretending otherwise would suppress real faults. */
+        if (cstatus == 429) FAIL(429, "coordinator busy: no free sequence slot");
         FAIL(502, "upstream coord unreachable or errored");
     }
 
@@ -1133,14 +1293,39 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
         }
     }
     if (cached_tokens < 0) cached_tokens = 0;
-    size_t reply_cap = content_len + 96;
+
+    /* The engine's own token counts, forwarded verbatim (pricing decision D3,
+     * platform/pricing/anchor-proposal-v1.md). The platform used to bill input
+     * on its own count of the message BODIES, while the engine prefills the
+     * whole chat template around them: measured 7 against 15 on one request
+     * (results/platform-seam-20260819.md §3), i.e. the provider did the work
+     * for fifteen tokens and was paid for seven. Only the coordinator knows the
+     * post-template length, so it has to travel this hop.
+     *
+     * Absent is not zero. A coordinator that reports no usage block (an older
+     * build) must leave the object OUT entirely, so the platform can fall back
+     * to its own count instead of billing a confident 0 -- and the platform
+     * clamps whatever does arrive, because this number is produced by the party
+     * it charges for. */
+    char usage_frag[64];
+    usage_frag[0] = '\0';
+    if (json_key_colon((const char *)cresp, cresp_len, "prompt_tokens") >= 0) {
+        int in_tok  = json_int_field((const char *)cresp, cresp_len, "prompt_tokens", 0);
+        int out_tok = json_int_field((const char *)cresp, cresp_len, "completion_tokens", 0);
+        if (in_tok  < 0) in_tok  = 0;
+        if (out_tok < 0) out_tok = 0;
+        snprintf(usage_frag, sizeof usage_frag,
+                 ",\"usage\":{\"in\":%d,\"out\":%d}", in_tok, out_tok);
+    }
+
+    size_t reply_cap = content_len + 96 + sizeof usage_frag;
     char *reply = malloc(reply_cap);
     if (!reply) { wipe_free(cresp, cresp_len); free(reply_to); FAIL(500, "oom"); }
     idletoken_mlock(reply, reply_cap);
     int rl = snprintf(reply, reply_cap,
-                      "{\"text\":\"%.*s\",\"cache_hit\":%s,\"cached_tokens\":%d}",
+                      "{\"text\":\"%.*s\",\"cache_hit\":%s,\"cached_tokens\":%d%s}",
                       (int)content_len, content_tok,
-                      cache_hit ? "true" : "false", cached_tokens);
+                      cache_hit ? "true" : "false", cached_tokens, usage_frag);
     wipe_free(cresp, cresp_len);
     if (rl < 0 || (size_t)rl >= reply_cap) {
         idletoken_secure_zero(reply, reply_cap);
@@ -1349,6 +1534,11 @@ static void usage(FILE *o) {
 "\n"
 "  --port N            platform-facing listen port (default 9700; unused in --relay)\n"
 "  --coord URL         local coord OpenAI API (default http://127.0.0.1:8000)\n"
+"  --coord-token TOK   the coordinator's --api-token, when it requires one.\n"
+"                      A coordinator with overflow routing enabled always does\n"
+"                      (it refuses to start otherwise), so a sharing machine\n"
+"                      that also borrows needs this or every dispatched job\n"
+"                      comes back 401. Also via env IDLETOKEN_API_TOKEN.\n"
 "  --key-file PATH     persist/reuse the 32-byte provider secret key (0600).\n"
 "                      Omit for an ephemeral per-run key.\n"
 "  --platform URL      platform gateway; enables registration + heartbeat\n"
@@ -1378,6 +1568,7 @@ static void usage(FILE *o) {
 int main(int argc, char **argv) {
     int         port           = 9700;
     const char *coord_url      = "http://127.0.0.1:8000"; /* idletoken-coord --api-bind default */
+    const char *coord_unix     = NULL;   /* --coord-unix: socket path, shared mode */
     const char *key_file       = NULL;
     const char *platform_url   = NULL;
     const char *jwt            = NULL;
@@ -1391,11 +1582,25 @@ int main(int argc, char **argv) {
     const char *quant          = "";      /* precision (small models); "" = any */
     int         beat_secs      = 30;
     int         relay          = 0;
+    /* Env fallback first, so an explicit flag still wins. Same pattern as the
+     * coordinator's own --api-token: the Tauri supervisor passes secrets
+     * without putting them through shell argument quoting. */
+    {
+        const char *t = getenv("IDLETOKEN_API_TOKEN");
+        if (t && t[0]) snprintf(g_coord_token, sizeof g_coord_token, "%s", t);
+    }
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if      (!strcmp(a, "--port")           && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(a, "--coord")          && i + 1 < argc) coord_url = argv[++i];
+        /* Shared mode: hand the buyer's plaintext to the coordinator over a
+         * socket file instead of loopback TCP. Explicit on purpose — if this
+         * is given and the socket is not there, the agent fails loudly rather
+         * than falling back to a transport this machine's owner can sniff. */
+        else if (!strcmp(a, "--coord-unix")     && i + 1 < argc) coord_unix = argv[++i];
+        else if (!strcmp(a, "--coord-token")    && i + 1 < argc)
+            snprintf(g_coord_token, sizeof g_coord_token, "%s", argv[++i]);
         else if (!strcmp(a, "--key-file")       && i + 1 < argc) key_file = argv[++i];
         else if (!strcmp(a, "--platform")       && i + 1 < argc) platform_url = argv[++i];
         else if (!strcmp(a, "--jwt")            && i + 1 < argc) jwt = argv[++i];
@@ -1433,7 +1638,23 @@ int main(int argc, char **argv) {
     if (!pubkey_b64) return 1;
 
     char coord_addr[256];
-    if (url_to_addr(coord_url, coord_addr, sizeof(coord_addr)) != 0) {
+    /* Socket path wins when given: it is the shared-mode transport, and the
+     * caller asked for it explicitly. A missing socket must NOT quietly become
+     * a TCP connection — that is the leg this exists to close. */
+    if (coord_unix && coord_unix[0]) {
+        int probe = idletoken_connect_unix(coord_unix);
+        if (probe < 0) {
+            fprintf(stderr, "platform-agent: refuse: --coord-unix %s is not "
+                            "accepting connections (%s). Not falling back to "
+                            "loopback TCP: the coordinator would then receive "
+                            "buyers' prompts over a link this machine's owner "
+                            "can capture.\n", coord_unix, strerror(errno));
+            return 3;
+        }
+        idletoken_close_fd(probe);
+        snprintf(coord_addr, sizeof(coord_addr), "unix:%s", coord_unix);
+        fprintf(stderr, "platform-agent: coordinator link: unix socket %s\n", coord_unix);
+    } else if (url_to_addr(coord_url, coord_addr, sizeof(coord_addr)) != 0) {
         fprintf(stderr, "platform-agent: bad --coord URL: %s\n", coord_url);
         return 2;
     }
@@ -1464,6 +1685,14 @@ int main(int argc, char **argv) {
     /* Register with the platform (unless an existing provider id was given). */
     char *provider_id = NULL;
     if (platform_url) {
+        /* The listing floor, checked before anything is registered or beaten:
+         * a machine that cannot serve 8192 tokens per slot should never appear
+         * on the market at all, not appear and then disappoint. Gated on
+         * platform_url because without it this agent is not listing anything.
+         * Escape hatch on purpose absent -- see §A3 in the cleanup plan; the
+         * decision is that such a machine is not a provider. */
+        int floor_rc = assert_listable_ctx(coord_addr);
+        if (floor_rc != 0) { free(pubkey_b64); return floor_rc; }
         if (provider_id_in) {
             provider_id = strdup(provider_id_in);
         } else {

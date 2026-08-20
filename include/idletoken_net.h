@@ -51,12 +51,40 @@ int idletoken_recv_msg(int fd, idletoken_msg_header *out_h,
 int idletoken_listen_tcp(const char *bind_addr);   /* returns listener fd, -1 on error */
 int idletoken_accept_tcp(int listener);            /* returns conn fd, -1 on error */
 
+/* accept() bounded by a deadline. Returns the conn fd, -2 on timeout (a state
+ * the caller must be able to tell from an error), -1 on a real failure.
+ * Exists because a plain accept() waits forever: a cluster whose second
+ * machine never arrives — or quietly went away — left the coordinator blocked
+ * with nothing on screen but "starting" (2026-08-15). */
+int idletoken_accept_tcp_timeout(int listener, int timeout_ms);
+
 /* Numeric IPv4 of the remote end of a connected socket (getpeername +
  * inet_ntop), written to `out`. Lets the coordinator learn a worker's real LAN
  * address so it can rewrite a wildcard ("0.0.0.0") bind into a dialable
  * next/prev-stage address — workers then need zero addressing config. 0 / -1. */
 int idletoken_peer_ip(int fd, char *out, size_t cap);
 int idletoken_connect_tcp(const char *peer_addr);  /* returns conn fd, -1 on error */
+
+/* Connect to an AF_UNIX stream socket at `path`. Returns conn fd, -1 on error
+ * (errno ENAMETOOLONG when the path does not fit sun_path — 104 bytes on
+ * macOS, 108 on Linux, which a deep home directory can genuinely exceed).
+ *
+ * Exists for the coordinator↔engine link in shared mode: a Unix socket carries
+ * no packets a loopback capture can see, and the directory's 0700 keeps other
+ * local accounts out (docs/shared-mode-plan-2026-08.md P0-4). Windows has
+ * AF_UNIX in winsock since Windows 10 1803; the path is an ordinary filesystem
+ * path there too. */
+int idletoken_connect_unix(const char *path);
+
+/* Listen on a unix socket, owner-only (0600), replacing any stale file.
+ *
+ * Why this exists: a TCP listener on loopback is readable by anyone on the
+ * machine who can run tcpdump — which on a home node is the owner. A socket
+ * file carries the same bytes without ever entering the network stack, so
+ * there is no packet to capture, and the filesystem decides who may connect.
+ * Accept with idletoken_accept_tcp(); the call is address-family agnostic. */
+int idletoken_listen_unix(const char *path);
+
 void idletoken_close_fd(int fd);                    /* platform-correct socket close */
 
 /* ---- UDP datagram helpers (LAN discovery) ------------------------------

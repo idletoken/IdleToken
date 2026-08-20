@@ -1,22 +1,15 @@
 // "What has gone wrong on this machine" — the improvement loop, and the honest
-// bound on it.
+// bound on it: failures are written down here, they never leave the machine on
+// their own, and exporting a diagnostics bundle is how they reach us.
 //
-// This is what replaced the "Share anonymous telemetry" switch (2026-08-13).
-// That switch gated nothing: there is no telemetry client anywhere in this
-// product, so turning it off bought the careful user precisely nothing. What
-// the product actually needs in order to improve is the failures themselves,
-// and what a user can honestly be offered is this: they are written down here,
-// they never leave the machine on their own, and exporting them is how they
-// reach us.
-//
-// The switch is about SHARING, not recording. Off = the log is left out of the
-// diagnostics export (and of any future upload); the records stay, because they
-// are also how the user themselves answers "what keeps going wrong here", and
-// because someone who switches sharing back on should not find their history
-// deleted. Throwing them away is the button at the bottom, said out loud.
+// No sharing switch (2026-08-15; its predecessor, the telemetry switch, went
+// on 2026-08-13). Exporting the bundle is itself the explicit act of sharing —
+// it produces a file the user sends by hand — so a second opt-out ahead of it
+// gated nothing a user could feel, and a bundle without the failures is the
+// one kind that cannot diagnose anything.
 import { useCallback, useEffect, useState } from "react";
 import { useI18n } from "./i18n";
-import { clearProblems, problemsShared, readProblems, setProblemsShared, type Problem } from "./problems";
+import { clearProblems, readProblems, type Problem } from "./problems";
 
 /** Local time, short. These are read next to "did that just happen?", so the
  *  date only appears when it is not today. */
@@ -40,43 +33,16 @@ function detailOf(p: Problem): string {
 
 export default function ProblemLog() {
   const { t } = useI18n();
-  const [share, setShare] = useState(problemsShared);
   const [items, setItems] = useState<Problem[]>([]);
   const [expanded, setExpanded] = useState(false);
 
   const reload = useCallback(() => setItems(readProblems()), []);
   useEffect(() => reload(), [reload]);
 
-  // Off means "do not send these to the developers", and nothing more. The log
-  // stays: it is the user's own record of what keeps failing, and someone who
-  // turns sharing back on later should still have their history. Deleting is
-  // the separate button below, where a destructive action belongs.
-  const toggle = (next: boolean) => {
-    setProblemsShared(next);
-    setShare(next);
-  };
-
   const shown = expanded ? items : items.slice(0, 3);
 
   return (
     <div className="problems">
-      <div className="setting-row setting-row--inline">
-        <div className="setting-row__label">
-          <span className="setting-row__k">{t("prob.share")}</span>
-        </div>
-        <div className="setting-row__control">
-          <button
-            role="switch"
-            aria-checked={share}
-            aria-label={t("prob.share")}
-            className={`switch${share ? " is-on" : ""}`}
-            onClick={() => toggle(!share)}
-          >
-            <span className="switch__knob" />
-          </button>
-        </div>
-      </div>
-
       {items.length === 0 ? (
         <p className="setting-hint">{t("prob.none")}</p>
       ) : (

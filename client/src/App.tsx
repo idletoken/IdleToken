@@ -5,8 +5,8 @@ import { getEngineProvider, type EngineLogLine, type EngineRole, type EngineStat
 import { uiTestDirectives } from "./testHooks";
 import type { NodeSnapshot, ClusterState } from "./types";
 import { HW_NO_GPU, HW_CC_TOO_LOW, HW_DRIVER_TOO_OLD, HW_VRAM_TOO_SMALL, HW_GPU_UNSUPPORTED, HW_MACOS_SEALED } from "./types";
-import { getModel, getManifest, defaultQuant, estimateClusterCapacity, isSingleNode, isLocalGguf, localGgufSpec, LOCAL_GGUF_ID, pickBestFittingModel, type ModelSpec } from "./models";
-import { resolveLocalWeights, resolveCustomWeights, customGgufName, fetchWeights, onFetchProgress, defaultModelDir, cancelFetch, resolveDownload, weightsState, isWeightsCancelled, WeightsCancelled, type CustomModelSource, type DownloadTarget } from "./weights";
+import { getModel, getManifest, defaultQuant, estimateClusterCapacity, poolMemory, isSingleNode, pickBestFittingModel, type ModelSpec } from "./models";
+import { resolveLocalWeights, fetchWeights, onFetchProgress, defaultModelDir, cancelFetch, resolveDownload, weightsState, verifyWeights, isWeightsCancelled, type DownloadTarget } from "./weights";
 import { loadSettings, saveSettings, settingsWerePersisted, effectiveCaps, engineTuning, autoUiScale, TIERS, type AppSettings } from "./settings";
 import { buildDiagnosticsBundle } from "./diagnostics";
 import { getAuthProvider, type Session } from "./auth";
@@ -18,10 +18,10 @@ import ModelPicker from "./ModelPicker";
 import WeightsRow, { type WeightsInfo } from "./WeightsRow";
 import { inTauri, platformGate, getMe } from "./platform";
 import { identityFrom, type UserIdentity } from "./Avatar";
-import { accountPairSecret, getPairingProvider, type PairingSnapshot, type ClusterApi } from "./pairing";
+import { accountPairSecret, getPairingProvider, type PairingSnapshot, type ClusterApi, type PeerNode } from "./pairing";
 import { recordProblem } from "./problems";
 import { useClusterStats, servedModelOf, type ClusterStats } from "./clusterStats";
-import { fmtBytes, fmtGiB, pct } from "./format";
+import { fmtGiB, pct } from "./format";
 import UpdateDialog, { type UpdateResult } from "./UpdateDialog";
 import { getUpdateProvider } from "./provider/update";
 import { quitApp, setAutostart, syncTray, syncWindowPrefs, windowState } from "./system";
@@ -29,11 +29,9 @@ import { quitApp, setAutostart, syncTray, syncWindowPrefs, windowState } from ".
 type Theme = "dark" | "light";
 
 let uiTestRan = false;
-// Identifies THIS JS context in UI-test reports. Diagnostic for the one class
-// of double-execution the module guard above cannot stop: the webview loading
-// the page twice (fresh module state each time). Two reports with different
-// ids = two page loads, not a re-run within one.
-const uiTestCtx = Math.random().toString(36).slice(2, 8);
+// (uiTestCtx, the per-JS-context id for UI-test reports, left with the
+// serve-open-gguf oracle on 2026-08-15 — reintroduce it with the next
+// reporter that needs to tell two page loads apart.)
 
 // Ship a UI-test assertion result to the shell's stderr (see ui_test_report
 // in src-tauri/src/main.rs). No-op outside Tauri.
@@ -189,26 +187,72 @@ function NodeCapacityCard(props: {
   quant: string; // selected precision → sizes the weight bytes in the estimate
   tier: { id: number; ctx: number };
   nNodes: number; // known cluster size when paired; nominal estimate otherwise
-  // Once the cluster is READY the layer plan is decided — the capacity pitch
-  // has done its job, so it collapses to one line (lifecycle-aware layout).
-  compact?: boolean;
+  /** The paired machines, each carrying the memory IT measured (roster). More
+   *  than one = the verdict is about the pool, not just this machine. */
+  peers?: PeerNode[];
 }) {
   const { t } = useI18n();
   const s = props.snap;
-  // An open GGUF has no manifest, so there is nothing honest to estimate from:
-  // the engine measures this machine at start and refuses with a reason when
-  // the model does not fit (WS-B2). The card says exactly that instead of
-  // rendering figures derived from another model's manifest.
-  const open = isLocalGguf(props.model.id);
-  const cap = open ? null : estimateClusterCapacity(props.model, s, props.tier.ctx, props.nNodes, props.quant);
+  // Sized against what the machine actually has FREE (total − other
+  // processes), not the engine's reserved budget (2026-08-15, user's call):
+  // this card answers "does it fit on my hardware", and quoting a number the
+  // user cannot find in any system monitor made the answer unverifiable. The
+  // engine's own scheduler still applies its reserves when it decides how to
+  // place layers — that verdict is the one that must not overpromise.
+  const selfFreeVram = Math.max(0, s.vram_total - s.vram_used_other);
+  const selfFreeRam = Math.max(0, s.ram_total - s.ram_used_other);
+  const freeMem = {
+    vram_usable: selfFreeVram,
+    ram_usable: selfFreeRam,
+    unified_memory: s.unified_memory,
+  };
+  // Paired: total what every machine reported and answer for the CLUSTER
+  // (2026-08-15). Each machine measures its own memory and sends it with its
+  // join, so this question was always answerable before pressing Start — until
+  // now the only answer came from the coordinator refusing afterwards.
+  const peers = props.peers ?? [];
+  const pool = useMemo(() => poolMemory(peers), [peers]);
+  const clustered = peers.length > 1;
+  const cap = estimateClusterCapacity(props.model, freeMem, props.tier.ctx, props.nNodes, props.quant);
+  // The pooled verdict reuses the same needBytes (it already accounts for the
+  // node count) against the summed memory.
+  const haveBytes = clustered ? pool.bytes : cap.haveBytes;
+  const short = haveBytes < cap.needBytes;
+  // "Cannot tell" beats a wrong "not enough": a member that reported nothing
+  // makes the total a lower bound, and only a SHORTFALL can be wrong that way
+  // (a total that already covers the model cannot be talked down by adding
+  // more memory to it).
+  const unknown = clustered && !pool.complete && short;
   const GB = (b: number) => Math.round(b / 1024 ** 3);
-  const vUsable = fmtGiB(s.vram_usable);
+  // What the machine actually has free (total − other processes), NOT the
+  // engine's scheduling budget (2026-08-15): `vram_usable`/`ram_usable` also
+  // subtract runtime reserves (CUDA context, inference workspace), which made
+  // an idle 16 GB card read "13.2 GB" — a number that looks like a lie next to
+  // any GPU monitor. Reserves still count where they matter: the fits/doesn't
+  // verdict (estimateClusterCapacity above and the engine's scheduler) keeps
+  // using the reserved budget.
+  const vFree = fmtGiB(Math.max(0, s.vram_total - s.vram_used_other));
   const vTotal = fmtGiB(s.vram_total);
-  const ram = fmtGiB(s.ram_usable);
-  const disk = fmtBytes(s.disk_avail);
+  const ram = fmtGiB(Math.max(0, s.ram_total - s.ram_used_other));
+  const ramTotal = fmtGiB(s.ram_total);
   const total = props.model.totalLayers;
   const ticks = useMemo(() => Array.from({ length: total }), [total]);
-  const ctxLabel = props.tier.ctx >= 1048576 ? "1M" : `${props.tier.ctx / 1024}K`;
+  // CPU model, same billing as the GPU's (the engine probe only counts
+  // threads; the shell reads the brand string — see cpu_name in main.rs).
+  const [cpuName, setCpuName] = useState("");
+  useEffect(() => {
+    if (!inTauri()) return;
+    let live = true;
+    void import("@tauri-apps/api/core")
+      .then(({ invoke }) => invoke<string>("cpu_name"))
+      .then((n) => {
+        if (live) setCpuName(n);
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, []);
   // Hardware floor: the engine decided, the UI only renders the verdict. A
   // blocked machine must SAY SO up front — otherwise the card looks healthy and
   // the failure surfaces much later as a mock fallback or garbage tokens.
@@ -242,95 +286,85 @@ function NodeCapacityCard(props: {
         <div className="nstat nstat--bar">
           <span className="nstat__k">{t("node.vram")}</span>
           <span className="nstat__v">
-            {vUsable.value}
+            {vFree.value}
             <span className="unit">/ {vTotal.value} {vTotal.unit}</span>
           </span>
           <div className="track track--mini">
-            <span className="track__usable" style={{ width: `${pct(s.vram_usable, s.vram_total)}%` }} />
+            <span className="track__usable" style={{ width: `${pct(s.vram_total - s.vram_used_other, s.vram_total)}%` }} />
             <span className="track__used" style={{ width: `${pct(s.vram_used_other, s.vram_total)}%` }} />
           </div>
         </div>
-        <div className="nstat">
+        <div className="nstat nstat--gpu">
+          <span className="nstat__k">{t("node.cpu")}</span>
+          <span className="nstat__v">{cpuName || "—"}</span>
+          <span className="nstat__sub">{t("node.threads", { n: s.cpu_count })}</span>
+        </div>
+        {/* Same treatment as VRAM (2026-08-15), and directly under it: the two
+            memory bars stack so their scales read together. RAM is the other
+            half of what HYBRID mode can use. */}
+        <div className="nstat nstat--bar">
           <span className="nstat__k">{t("node.ram")}</span>
           <span className="nstat__v">
             {ram.value}
-            <span className="unit">{ram.unit}</span>
+            <span className="unit">/ {ramTotal.value} {ramTotal.unit}</span>
           </span>
-        </div>
-        <div className="nstat">
-          <span className="nstat__k">{t("node.disk")}</span>
-          <span className="nstat__v">
-            {disk.split(" ")[0]}
-            <span className="unit">{disk.split(" ")[1]}</span>
-          </span>
-        </div>
-        <div className="nstat">
-          <span className="nstat__k">{t("node.cpu")}</span>
-          <span className="nstat__v">{s.cpu_count}</span>
+          <div className="track track--mini">
+            <span className="track__usable" style={{ width: `${pct(s.ram_total - s.ram_used_other, s.ram_total)}%` }} />
+            <span className="track__used" style={{ width: `${pct(s.ram_used_other, s.ram_total)}%` }} />
+          </div>
         </div>
       </div>
 
-      {cap === null ? (
-        <p className="capacity__text">{t("capacity.custom")}</p>
-      ) : props.compact ? (
-        <p className="capacity__text capacity__text--compact">
-          {t("capacity.have", { have: GB(cap.haveBytes) })}
-        </p>
-      ) : (
+      {/* Two facts and a bar (2026-08-15; the explanatory sentences are gone —
+          have/need in GB says it, and the tick bar shows how many of the
+          model's layers fit). Red numbers = does not fit. The bar shows in
+          BOTH modes now: the ready-state "compact" variant used to drop it,
+          which read as the graphic disappearing the moment a cluster worked. */}
       <div className="capacity">
         <div className="capacity__head">
-          <span className="card__label">{t("capacity.title")}</span>
-          <span className="capacity__need">
-            {/* cap.nodes, not props.nNodes: a single-node model is sized for
-                one machine however many are paired, and quoting the roster
-                size here would describe a cluster the engine will not form. */}
-            {props.model.singleNode
-              ? t("capacity.need.single", { need: GB(cap.needBytes), model: props.model.label, tier: ctxLabel })
-              : t("capacity.need", { need: GB(cap.needBytes), model: props.model.label, tier: ctxLabel, n: cap.nodes })}
+          <span className={`capacity__need${short ? " capacity__gap" : ""}`}>
+            {t("capacity.ratio", { have: GB(haveBytes), need: GB(cap.needBytes) })}
           </span>
         </div>
-        <div className="spine" role="img" aria-label={t("spine.caption", { n: cap.hostableLayers, total })}>
+        <div className="spine" role="img" aria-label={t(short ? "spine.no" : "spine.fits")}>
           {ticks.map((_, i) => (
             <span key={i} className={`tick${i < cap.hostableLayers ? " tick--on" : ""}`} />
           ))}
         </div>
-        <div className="spine-scale">
-          <span>{t("spine.layer0")}</span>
-          <span>{total - 1}</span>
-        </div>
-        <p className="capacity__text">
-          {t("capacity.have", { have: GB(cap.haveBytes) })}{" "}
-          {cap.gapBytes > 0 ? (
-            <span className="capacity__gap">
-              {t(props.model.singleNode ? "capacity.gap.single" : "capacity.gap", { gap: GB(cap.gapBytes) })}
-            </span>
-          ) : (
-            <span className="capacity__ok">{t("capacity.enough")}</span>
-          )}
+        {/* Two outcomes, one line — three once machines are pooled, because
+            "the machines that reported add up to less than the model" is a
+            different claim from "this machine cannot hold it". The bar is the
+            only thing on this card a glance can read, and unlabelled it is
+            decoration; the earlier paragraphs said more than the moment needs. */}
+        <p className={`capacity__verdict${short ? " capacity__verdict--no" : ""}`}>
+          {unknown
+            ? t("spine.unknown")
+            : clustered
+              ? t(short ? "spine.clusterNo" : "spine.clusterFits", { n: peers.length })
+              : t(short ? "spine.no" : "spine.fits")}
         </p>
       </div>
-      )}
     </section>
   );
 }
 
-// ---- engine lifecycle card (P1) --------------------------------------------
+// ---- engine diagnostics card (P1) ------------------------------------------
 // The native engine is a separate process the client supervises (philosophy
-// 17). This card shows its live state and lets the user start/stop it; crash →
-// backoff restarts are the supervisor's job and surface here via events.
+// 17). This card is READ-ONLY: live state, crash/refusal reasons and the last
+// log lines, for troubleshooting. Starting and stopping belong to the cluster
+// flows (they attach a model path and tuning); crash → backoff restarts are
+// the supervisor's job and surface here via events.
 const LOG_TAIL = 6;
 
 function EngineCard() {
   const { t, tErr } = useI18n();
   const [st, setSt] = useState<EngineStatus | null>(null);
   const [lines, setLines] = useState<EngineLogLine[]>([]);
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
     const eng = getEngineProvider();
     let live = true;
-    eng.status().then((s) => live && setSt(s)).catch((e) => live && setErr(String(e?.message ?? e)));
+    eng.status().then((s) => live && setSt(s)).catch(() => {});
     eng.logs(LOG_TAIL).then((ls) => live && setLines(ls)).catch(() => {});
     const unStatus = eng.onStatus((s) => setSt(s));
     const unLog = eng.onLog((l) => setLines((prev) => [...prev.slice(-(LOG_TAIL - 1)), l]));
@@ -340,20 +374,6 @@ function EngineCard() {
       unLog();
     };
   }, []);
-
-  const active = st !== null && st.state !== "stopped" && st.state !== "crashed";
-  const toggle = async () => {
-    if (busy || !st) return;
-    setBusy(true);
-    setErr(null);
-    try {
-      if (active) await getEngineProvider().stop();
-      else await getEngineProvider().start("worker");
-    } catch (e) {
-      setErr(String((e as Error)?.message ?? e));
-    }
-    setBusy(false);
-  };
 
   const state = st?.state ?? "stopped";
   // Collapsed by default: the engine is auto-managed by pairing orchestration —
@@ -370,11 +390,13 @@ function EngineCard() {
         </span>
       </summary>
       <div className="engine-details__body">
+        {/* Read-only on purpose (2026-08-15): the engine is started and
+            stopped by the cluster flows with a model path and tuning attached.
+            The manual "start engine" button was a relic of the pre-llamacpp
+            architecture — a bare worker with no model does nothing, and the
+            button just looked broken. */}
         <div className="engine-card__head">
           <span className="engine-hint">{t("engine.advancedNote")}</span>
-          <button className="btn-secondary engine-card__btn" disabled={busy || st === null} onClick={toggle}>
-            {active ? t("engine.stop") : t("engine.start")}
-        </button>
         </div>
         {st?.state === "running" && st.pid ? (
           <div className="engine-meta">
@@ -398,7 +420,6 @@ function EngineCard() {
             {t("engine.crashedHint", { code: st.lastExitCode ?? "?" })}
           </div>
         ) : null}
-        {err ? <div className="engine-meta engine-meta--bad">{err}</div> : null}
         {lines.length > 0 ? (
           <pre className="engine-log" aria-label={t("engine.logs")}>
             {lines.map((l) => l.line).join("\n")}
@@ -483,9 +504,6 @@ function ClusterCard(props: {
   // questions, and two nearly-equal numbers side by side just read as a bug.
   // The card owns the quantities; this row owns the choice.
   fitsStandalone?: boolean;
-  /** The selection is a user-supplied GGUF (open intake): the local option is
-   *  the llama.cpp engine and the cluster options do not apply (WS-C). */
-  openModel?: boolean;
   onServeStandalone?: () => void;
   // "Run it here" downloads the weights first when they are missing — 4.7 GB
   // for an 8B, 80 GB for DSv4. Without this the button looked broken: it really
@@ -494,21 +512,15 @@ function ClusterCard(props: {
   // that button.
   weights?: WeightsInfo;
   onCreate: () => void;
-  onJoin: () => void;
   onManage: () => void;
-  onOpenSharing: () => void;
   // The LOCAL setting, used only to detect disagreement with what the cluster
   // reports it is serving. Never used as the displayed value.
   settingModelId: string;
-  /** Display label for the setting — getModel() cannot name an open GGUF. */
   settingModelLabel: string;
   settingQuant: string;
   onOpenModelSetting: () => void;
   // Save a pick and rebuild whatever is running around it (App.switchModel).
   onSwitchModel: (modelId: string, quant: string) => void;
-  /** Open-intake pick (local file / HF) — threaded into the picker. */
-  onPickCustom: (c: CustomModelSource) => void;
-  customName: string;
 }) {
   const { t, tErr } = useI18n();
   const [copiedApi, setCopiedApi] = useState(false);
@@ -536,9 +548,8 @@ function ClusterCard(props: {
   // path. Offering it for a single-node model would walk the user through
   // pairing, downloading and starting, only for the coordinator to refuse the
   // second worker — so the option stays visible (it explains itself) but its
-  // buttons do not. An open GGUF is single-machine too, for now (WS-C wires
-  // open models across machines).
-  const clusterable = !props.openModel && !isSingleNode(props.settingModelId);
+  // buttons do not.
+  const clusterable = !isSingleNode(props.settingModelId);
 
   if (!active) {
     return (
@@ -559,7 +570,6 @@ function ClusterCard(props: {
           <span className="cluster-model__label">{t("model.selected")}</span>
           <span className="cluster-model__name">{props.settingModelLabel}</span>
           {props.settingQuant ? <span className="cluster-model__quant">{props.settingQuant}</span> : null}
-          {props.openModel ? <span className="cluster-model__quant">{t("model.open.badge")}</span> : null}
           {/* Nothing is running yet, so this pick is free: it writes the
               setting and the two options below re-read it. */}
           <button className="linkbtn cluster-model__change" onClick={() => setPickOpen((v) => !v)}>
@@ -570,9 +580,8 @@ function ClusterCard(props: {
               modelId={props.settingModelId}
               quant={props.settingQuant}
               running={null}
+              apiBaseUrl={snap?.api?.status === "online" ? snap.api.baseUrl : null}
               onPick={props.onSwitchModel}
-              onPickCustom={props.onPickCustom}
-              customName={props.customName}
               onClose={() => setPickOpen(false)}
             />
           ) : null}
@@ -586,59 +595,46 @@ function ClusterCard(props: {
         <div className="deploy-opt">
           <div className="deploy-opt__text">
             <h3 className="deploy-opt__title">{t("deploy.local")}</h3>
-            {/* Both branches promise something about the OTHER option ("add
-                machines later", "or pool machines below"), and neither is true
-                for a single-node model — so each has a solo wording. */}
-            <p className="deploy-opt__body">
-              {props.openModel
-                ? t("deploy.local.open")
-                : fits
-                  ? t(clusterable ? "deploy.local.fits" : "deploy.local.fitsSolo")
-                  : t(clusterable ? "deploy.local.tooBig" : "deploy.local.tooBigSolo")}
-            </p>
           </div>
           <button
             className={fits ? "btn-primary" : "btn-secondary"}
-            // Also disabled while its own download runs — pressing it again
-            // would start the sequence a second time with nothing to show for it.
-            disabled={!fits || !!props.weights?.dl}
+            // Serving needs the weights already here: downloading belongs to
+            // Settings (2026-08-15 split), so the button waits rather than
+            // fetching gigabytes as a side effect.
+            disabled={!fits || !!props.weights?.dl || !!props.weights?.needs}
             onClick={props.onServeStandalone}
           >
             {props.weights?.dl ? t("weights.downloading") : t("cluster.serveLocal")}
           </button>
-          {/* Progress for the download this button starts, plus anything the
-              button does not already imply (a resumable partial, why the last
-              attempt stopped). `idle=hide` drops the plain "no weights yet",
-              which the button next to it already says. */}
-          {props.weights ? <WeightsRow w={props.weights} idle="hide" /> : null}
+          {/* A download already running (started from Settings) shows its
+              progress here; weights simply not present point at the place
+              that downloads them. */}
+          {props.weights?.dl ? (
+            <WeightsRow w={props.weights} idle="hide" />
+          ) : props.weights?.needs ? (
+            <span className="wrow">
+              <span className="wrow__msg">{t("weights.needed")}</span>
+              <button className="linkbtn" onClick={props.onOpenModelSetting}>
+                {t("weights.goSettings")}
+              </button>
+            </span>
+          ) : null}
         </div>
 
         <div className="deploy-opt">
           <div className="deploy-opt__text">
             <h3 className="deploy-opt__title">{t("deploy.cluster")}</h3>
-            <p className="deploy-opt__body">
-              {clusterable
-                ? t("deploy.cluster.body")
-                : props.openModel
-                  ? t("deploy.cluster.openGguf")
-                  : t("deploy.cluster.singleNode", { model: props.settingModelLabel })}
-            </p>
-            {!clusterable && (
-              <button className="linkbtn" onClick={props.onOpenModelSetting}>
-                {t("deploy.cluster.pickOther")}
-              </button>
-            )}
           </div>
           <div className="deploy-opt__actions">
+            {/* One button: "Create a cluster" opens the pairing dialog, which
+                already offers joining with a code — a second button for the
+                same dialog's other tab was noise (removed 2026-08-15). */}
             <button
               className={fits || !clusterable ? "btn-secondary" : "btn-primary"}
               disabled={!clusterable}
               onClick={props.onCreate}
             >
               {t("cluster.create")}
-            </button>
-            <button className="btn-secondary" disabled={!clusterable} onClick={props.onJoin}>
-              {t("cluster.joinCode")}
             </button>
           </div>
         </div>
@@ -715,9 +711,8 @@ function ClusterCard(props: {
               modelId={props.settingModelId}
               quant={props.settingQuant}
               running={{ modelId: served.id, quant: served.quant, machines: snap.peers.length }}
+              apiBaseUrl={snap.api?.status === "online" ? snap.api.baseUrl : null}
               onPick={props.onSwitchModel}
-              onPickCustom={props.onPickCustom}
-              customName={props.customName}
               onClose={() => setPickOpen(false)}
             />
           ) : null}
@@ -821,18 +816,13 @@ function ClusterCard(props: {
               {copiedApi ? t("pairing.copied") : t("pairing.copy")}
             </button>
           </div>
-          <p className="cluster-api__hint">{t("cluster.apiHint")}</p>
           <ActivityRow stats={stats} />
         </div>
       ) : null}
 
-      {snap.phase === "ready" ? (
-        <div className="cluster-share">
-          <button className="linkbtn" onClick={props.onOpenSharing}>
-            {t("cluster.share")} →
-          </button>
-        </div>
-      ) : null}
+      {/* No "share this cluster" entry (2026-08-15): it deep-linked into the
+          platform settings, which are hidden until the platform side is live
+          for users. It returns with them. */}
     </section>
   );
 }
@@ -846,15 +836,18 @@ function ClusterCard(props: {
 //   - live engine health from /idletoken/v1/stats (engine_state mirrors
 //     /health; chat 503s until "ready" — no fake green);
 //   - a refusal, verbatim (exit 3 + worded stderr, latched by the supervisor).
+// NOTE (2026-08-15): with the open intake removed nothing sets `localEngine`
+// yet, so this card is dormant. It stays because it is the llamacpp
+// single-machine surface (WS-B1: verdict/manifest latching, engine health) —
+// the curated single-machine path rewires onto it when it moves off the
+// legacy pairing flow.
 function LocalEngineCard(props: {
-  label: string; // the file the user picked
+  label: string; // the file being served
   api: ClusterApi | null;
   engStatus: EngineStatus | null;
   settingModelId: string;
   settingQuant: string;
-  customName: string;
   onSwitchModel: (modelId: string, quant: string) => void;
-  onPickCustom: (c: CustomModelSource) => void;
   onStop: () => void;
   /** Polled app-level (App owns one poll shared with the topbar pill — the
    *  coordinator serves requests serially, so pollers are not free). */
@@ -930,7 +923,6 @@ function LocalEngineCard(props: {
         {/* The engine's own id once it has read the GGUF header; the picked
             file name until then. */}
         <span className="cluster-model__name">{stats?.model_label || stats?.model || props.label}</span>
-        <span className="cluster-model__quant">{t("model.open.badge")}</span>
         <button className="linkbtn cluster-model__change" onClick={() => setPickOpen((v) => !v)}>
           {t("model.change")}
         </button>
@@ -939,17 +931,17 @@ function LocalEngineCard(props: {
             modelId={props.settingModelId}
             quant={props.settingQuant}
             running={{ modelId: props.settingModelId, quant: "", machines: 1 }}
+            apiBaseUrl={props.api?.status === "online" ? props.api.baseUrl : null}
             onPick={props.onSwitchModel}
-            onPickCustom={props.onPickCustom}
-            customName={props.customName}
             onClose={() => setPickOpen(false)}
           />
         ) : null}
       </div>
 
       {/* Download progress for an HF-sourced GGUF lives next to the card that
-          started it, like every other weight download. */}
-      {props.weights ? <WeightsRow w={props.weights} idle="hide" /> : null}
+          started it. Only live progress renders here — the resting "not
+          downloaded" states belong to the download manager in Settings. */}
+      {props.weights?.dl ? <WeightsRow w={props.weights} idle="hide" /> : null}
 
       {refused ? (
         <div className="hw-blocked" role="alert">
@@ -992,7 +984,6 @@ function LocalEngineCard(props: {
               {copiedApi ? t("pairing.copied") : t("pairing.copy")}
             </button>
           </div>
-          <p className="cluster-api__hint">{t("cluster.apiHint")}</p>
           <ActivityRow stats={stats} />
         </div>
       ) : null}
@@ -1023,14 +1014,11 @@ function Dashboard(props: {
   localApi: ClusterApi | null;
   localStats: ClusterStats | null;
   engStatus: EngineStatus | null;
-  customName: string;
   onStopLocal: () => void;
-  onPickCustom: (c: CustomModelSource) => void;
   onServeStandalone: () => void;
   onCreateCluster: () => void;
   onJoinCluster: () => void;
   onManageCluster: () => void;
-  onOpenSharing: () => void;
   /** Jump to the full model section in Settings (the cluster card's picker
    *  covers the common case; Settings still owns weights paths and the rest). */
   onOpenModelSetting: () => void;
@@ -1040,15 +1028,11 @@ function Dashboard(props: {
   const { t, tErr } = useI18n();
   const s = props.snap;
   const nNodes = props.pair && props.pair.peers.length > 0 ? props.pair.peers.length : 3;
-  const open = isLocalGguf(props.model.id);
   // Single-node-first: does the selected model+precision fit THIS machine alone
   // (N=1)? If so the empty-state leads with "serve locally" instead of pairing.
   // The shortfall goes down with it — the local row reports how far off it is
-  // rather than just going quiet. An open GGUF has no client-side estimate:
-  // the button stays live and the ENGINE rules on fit at start (worded
-  // refusal on the local-engine card), per hard invariant "no client guess
-  // overrides the scheduler".
-  const standalone = open ? null : estimateClusterCapacity(props.model, s, props.tier.ctx, 1, props.quant);
+  // rather than just going quiet.
+  const standalone = estimateClusterCapacity(props.model, s, props.tier.ctx, 1, props.quant);
   // The generic refusal surface (D2): whatever sentence the engine sent
   // through the JOIN_REFUSED / exit-3 channel, verbatim, where the user is
   // looking. WS-C's "upgrade machine X" (version mismatch) arrives through
@@ -1074,30 +1058,23 @@ function Dashboard(props: {
               engStatus={props.engStatus}
               settingModelId={props.model.id}
               settingQuant={props.quant}
-              customName={props.customName}
               onSwitchModel={props.onSwitchModel}
-              onPickCustom={props.onPickCustom}
               onStop={props.onStopLocal}
               weights={props.weights}
             />
           ) : (
           <ClusterCard
             pair={props.pair}
-            fitsStandalone={standalone === null ? true : standalone.gapBytes === 0}
-            openModel={open}
+            fitsStandalone={standalone.gapBytes === 0}
             onServeStandalone={props.onServeStandalone}
             weights={props.weights}
             onCreate={props.onCreateCluster}
-            onJoin={props.onJoinCluster}
             onManage={props.onManageCluster}
-            onOpenSharing={props.onOpenSharing}
             settingModelId={props.model.id}
             settingModelLabel={props.model.label}
             settingQuant={props.quant}
             onOpenModelSetting={props.onOpenModelSetting}
             onSwitchModel={props.onSwitchModel}
-            onPickCustom={props.onPickCustom}
-            customName={props.customName}
           />
           )}
         </div>
@@ -1113,7 +1090,7 @@ function Dashboard(props: {
             quant={props.quant}
             tier={props.tier}
             nNodes={nNodes}
-            compact={props.pair?.phase === "ready"}
+            peers={props.pair?.peers}
           />
           <EngineCard />
         </div>
@@ -1173,26 +1150,14 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [nonce, setNonce] = useState(0);
 
-  // ---- open model intake + local llama.cpp engine (v2 WS-D1) ---------------
-  // The selection may be a user-supplied GGUF (LOCAL_GGUF_ID sentinel): then
-  // there is no manifest, the display spec is synthesized from the file name,
-  // and serving goes through the coordinator's llamacpp single-machine mode
-  // instead of the pairing path.
-  const customSel: CustomModelSource | null = isLocalGguf(settings.modelId)
-    ? {
-        source: settings.customSource,
-        path: settings.customGgufPath,
-        repo: settings.customHfRepo,
-        file: settings.customHfFile,
-      }
-    : null;
-  const customName = customSel ? customGgufName(customSel) : "";
-  const model = customSel ? localGgufSpec(customName) : getModel(settings.modelId);
+  const model = getModel(settings.modelId);
 
   // The local llama.cpp engine this client started (llamacpp_serve). Not
   // persisted: the sidecar dies with the client, so a fresh launch starts
-  // clean. `label` is what the user picked; the AUTO id the coordinator read
-  // from the GGUF header arrives later via /idletoken/v1/stats.
+  // clean. Dormant since the open intake was removed (2026-08-15) — nothing
+  // sets it until the curated single-machine path moves onto llamacpp mode
+  // (see LocalEngineCard's note); the plumbing stays because that move is the
+  // architecture's direction (coordinator drives llama-server, no RPC solo).
   const [localEngine, setLocalEngine] = useState<{ gguf: string; label: string } | null>(null);
 
   // Aggregate engine-supervisor status, held app-level: the local-engine card,
@@ -1222,42 +1187,40 @@ export default function App() {
   // Bytes of an unfinished copy on disk. The download resumes from it, so this
   // is the difference between "4.7 GB to fetch" and "600 MB to go".
   const [partialBytes, setPartialBytes] = useState(0);
-  const [dl, setDl] = useState<{
-    have: number; total: number; note?: string;
-  } | null>(null);
+  // The gguf file the current selection resolves to — the key that ties the
+  // selection to its entry in the download maps below.
+  const [selFile, setSelFile] = useState("");
   /**
-   * Why the last attempt stopped — a footnote, never a state.
-   *
-   * A download that did not finish leaves the machine in exactly the state it
-   * was in before: no weights. That is what the row now says, with the button
-   * that fixes it, because "Download failed" as a state of its own is a dead
-   * end the user has to clear before the normal affordance comes back — and it
-   * is not even true after a resume, which starts from what is already there.
-   * The reason still ships, quietly, so a download that keeps dying is not a
-   * button that silently does nothing.
+   * Downloads, keyed by gguf file name (2026-08-15 redesign). Settings is a
+   * download manager: every model row downloads, cancels and reports
+   * independently, and none of it is tied to which model is *selected*. The
+   * previous design had ONE app-wide download slot bound to the selection,
+   * which is how "download A, then switch and download B" killed both.
+   * The file name is the natural key: unique per model+precision, and the same
+   * identity the engine's one-writer-per-file guard uses (weights.rs).
    */
-  const [lastError, setLastError] = useState<string | null>(null);
+  const [dls, setDls] = useState<Record<string, { have: number; total: number; note?: string }>>({});
+  /**
+   * Why the last attempt for a file stopped — a footnote on its row, never a
+   * state. A download that did not finish leaves the machine exactly where it
+   * was (without the weights), and the next attempt resumes from the .part.
+   */
+  const [dlErrors, setDlErrors] = useState<Record<string, string>>({});
+  /** Bumped when any download reaches a final state (or weights are deleted),
+   *  so every row re-probes what is actually on disk. */
+  const [weightsVersion, setWeightsVersion] = useState(0);
 
   const refreshWeights = useCallback(async () => {
     try {
-      const r = isLocalGguf(settings.modelId)
-        ? await resolveCustomWeights({
-            modelDir: settings.modelDir,
-            custom: {
-              source: settings.customSource,
-              path: settings.customGgufPath,
-              repo: settings.customHfRepo,
-              file: settings.customHfFile,
-            },
-          })
-        : await resolveLocalWeights({
-            modelDir: settings.modelDir,
-            manifest: getManifest(settings.modelId),
-            quant: settings.quant,
-          });
+      const r = await resolveLocalWeights({
+        modelDir: settings.modelDir,
+        manifest: getManifest(settings.modelId),
+        quant: settings.quant,
+      });
       setWeightsPath(r.path);
       setNeedsWeights(r.needsDownload);
       setPartialBytes(r.haveBytes);
+      setSelFile(resolveDownload(getManifest(settings.modelId), settings.quant)?.file ?? "");
     } catch {
       // A failed probe must not block the UI: treat it as "needs downloading", and
       // the user gets the real error when they press download.
@@ -1265,15 +1228,7 @@ export default function App() {
       setNeedsWeights(true);
       setPartialBytes(0);
     }
-  }, [
-    settings.modelDir,
-    settings.modelId,
-    settings.quant,
-    settings.customSource,
-    settings.customGgufPath,
-    settings.customHfRepo,
-    settings.customHfFile,
-  ]);
+  }, [settings.modelDir, settings.modelId, settings.quant]);
 
   useEffect(() => { void refreshWeights(); }, [refreshWeights]);
 
@@ -1285,44 +1240,73 @@ export default function App() {
   // says afterwards.
   const cancelled = useRef<Set<string>>(new Set());
 
-  /** The in-flight `primary` fetch, if any. There is one download slot, and
-   *  the engine refuses a second writer on the same id (two writers on one
-   *  .part once blessed a corrupt file as complete — see weights_fetch), so
-   *  everything that starts or abandons a download coordinates through this. */
-  const fetchInFlight = useRef<Promise<void> | null>(null);
+  /** Files with a fetch currently in flight — the double-click guard readable
+   *  from callbacks (state would be stale there). */
+  const activeFetches = useRef<Set<string>>(new Set());
 
-  /** What a download "belongs to": one selection, one key. `dl` is a single
-   *  app-wide value and the row renders wherever the selection is — so without
-   *  an owner, whatever download happens to be running paints the row of
-   *  whatever model happens to be selected (this is exactly how "I picked B
-   *  and it showed A's progress" looked). */
-  const ownerKeyOf = useCallback(
-    (modelId: string, quant: string, custom?: CustomModelSource) =>
-      isLocalGguf(modelId) && custom
-        ? `custom:${custom.source}:${custom.source === "file" ? custom.path : `${custom.repo}/${custom.file}`}`
-        : `${modelId}:${quant}`,
-    []
-  );
-  /** Owner of the current/last `primary` download. */
-  const dlOwner = useRef<string | null>(null);
-  /** Owner key of the selection on screen, readable from event callbacks. */
-  const curSelKey = ownerKeyOf(settings.modelId, settings.quant, {
-    source: settings.customSource,
-    path: settings.customGgufPath,
-    repo: settings.customHfRepo,
-    file: settings.customHfFile,
-  });
-  const curSelRef = useRef(curSelKey);
-  useEffect(() => {
-    curSelRef.current = curSelKey;
-  });
-
-  const cancelDownload = useCallback(() => {
-    cancelled.current.add("primary");
-    setDl(null);
-    void cancelFetch("primary");
+  /** Everything on disk may have changed: re-probe the selected model and tell
+   *  every Settings row to re-probe too. */
+  const bumpWeights = useCallback(() => {
+    setWeightsVersion((v) => v + 1);
     void refreshWeights();
   }, [refreshWeights]);
+
+  /**
+   * Start one file's download and see it through. Returns true when the file
+   * is complete, false when it stopped (cancel or error — the row's footnote
+   * says which). Failures are reported on the row and in the problem log here,
+   * so callers do not each invent their own reporting.
+   */
+  const startDownload = useCallback(
+    async (file: string, target: DownloadTarget): Promise<boolean> => {
+      if (!file || activeFetches.current.has(file)) return false;
+      activeFetches.current.add(file);
+      const dir = settings.modelDir || (await defaultModelDir());
+      setDlErrors((m) => {
+        if (!(file in m)) return m;
+        const n = { ...m };
+        delete n[file];
+        return n;
+      });
+      setDls((m) => ({ ...m, [file]: { have: 0, total: target.expectBytes } }));
+      try {
+        await fetchWeights({ id: file, target, destDir: dir });
+        return true;
+      } catch (e) {
+        if (!isWeightsCancelled(e)) {
+          const msg = String(e);
+          setDlErrors((m) => ({ ...m, [file]: msg }));
+          recordProblem({
+            at: new Date().toISOString(),
+            kind: "download",
+            message: msg,
+            detail: { file },
+          });
+        }
+        return false;
+      } finally {
+        activeFetches.current.delete(file);
+        setDls((m) => {
+          const n = { ...m };
+          delete n[file];
+          return n;
+        });
+        bumpWeights();
+      }
+    },
+    [settings.modelDir, bumpWeights]
+  );
+
+  /** Cancel one file's download. Its `.part` is kept; the next attempt resumes. */
+  const cancelDownloadFor = useCallback((file: string) => {
+    cancelled.current.add(file);
+    setDls((m) => {
+      const n = { ...m };
+      delete n[file];
+      return n;
+    });
+    void cancelFetch(file);
+  }, []);
 
   /**
    * Show a failed download — or say nothing, when the "failure" is the user's
@@ -1338,158 +1322,73 @@ export default function App() {
    * was.
    */
   const reportWeightsError = useCallback((e: unknown, kind: "download" | "cluster" = "download") => {
-    setDl(null);
-    // A cancel leaves no footnote at all: the user knows why it stopped, they
-    // stopped it.
-    if (isWeightsCancelled(e)) {
-      setLastError(null);
-    } else {
-      const msg = String(e);
-      setLastError(msg);
-      // The footnote is cleared by the next attempt or a model switch; the
-      // problem log is what remains for "this keeps failing, here is what it
-      // says" (Settings -> Data & about).
-      recordProblem({
-        at: new Date().toISOString(),
-        kind,
-        message: msg,
-        detail: { model: settings.modelId, quant: settings.quant },
-      });
-    }
-    void refreshWeights();
-  }, [refreshWeights, settings.modelId, settings.quant]);
+    // A cancel is the user's own decision — nothing to report. Everything else
+    // goes to the problem log (Settings → Data & about); download failures
+    // additionally carry their own per-row footnote via dlErrors.
+    if (isWeightsCancelled(e)) return;
+    recordProblem({
+      at: new Date().toISOString(),
+      kind,
+      message: String(e),
+      detail: { model: settings.modelId, quant: settings.quant },
+    });
+  }, [settings.modelId, settings.quant]);
 
-  // What the download row is showing right now, readable from the UI-test
-  // directives — those run in a mount-time effect and would otherwise see the
-  // first render's value forever.
-  const errRef = useRef(lastError);
+  // What the selected model's download row is showing right now, readable from
+  // the UI-test directives — those run in a mount-time effect and would
+  // otherwise see the first render's value forever.
+  const errRef = useRef<string | null>(null);
   useEffect(() => {
-    errRef.current = lastError;
+    errRef.current = dlErrors[selFile] ?? null;
   });
 
-  // A download report belongs to the model that was being downloaded. Switching
-  // model (or precision) makes it answer a question nobody asked — clear it, and
-  // let refreshWeights say what THIS model's state is.
-  //
-  // The download itself is abandoned too, not just its report. Clearing alone
-  // was not enough: the old model's fetch kept running, and its next progress
-  // event resurrected the cleared row — so a freshly selected model whose
-  // weights were already complete on disk still said "downloading" until the
-  // abandoned download ended. The cancel keeps the `.part`, so switching back
-  // resumes from where it stopped.
-  useEffect(() => {
-    if (fetchInFlight.current) {
-      cancelled.current.add("primary");
-      void cancelFetch("primary");
-    }
-    setDl(null);
-    setLastError(null);
-  }, [
-    settings.modelId,
-    settings.quant,
-    settings.customSource,
-    settings.customGgufPath,
-    settings.customHfRepo,
-    settings.customHfFile,
-  ]);
-
-  // Progress event subscription. Subscribed once for the whole application;
-  // only the `primary` slot reaches the row (see below).
+  // Progress event subscription — one for the whole application; each event
+  // lands on its own file's entry. Downloads run independently of the model
+  // selection, so nothing here cares which model is on screen.
   useEffect(() => {
     let un: (() => void) | null = null;
     let dead = false;
     onFetchProgress((p) => {
-      const id = p.id || "primary";
-      // Only the `primary` slot drives the row. Other ids run real downloads
-      // too (the UI-test oracles), and their progress must not paint the row
-      // of whatever model happens to be selected.
-      if (id !== "primary") return;
+      const id = p.id;
+      // The UI-test oracles run real downloads under this id; their progress
+      // must not appear in the download manager.
+      if (!id || id === "uitest") return;
       if (cancelled.current.has(id)) {
         // The download is winding down. Only its final word clears the mark —
         // anything before that (a last progress tick) is stale by definition.
         if (p.kind === "done" || p.kind === "error" || p.kind === "cancelled") {
           cancelled.current.delete(id);
-          void refreshWeights();
+          bumpWeights();
         }
         return;
       }
-      // Ownership: the download knows which selection started it, and its
-      // progress may only paint the row when that selection is still the one
-      // on screen. Cancel-on-switch already stops the abandoned download; this
-      // is the second lock, for any event that arrives inside that window (or
-      // any path that forgot to cancel).
-      const owned = dlOwner.current === curSelRef.current;
       if (p.kind === "progress" || p.kind === "probe") {
-        if (!owned) return;
         // The event still says which endpoint is serving the bytes, but that
         // stays out of the row on purpose: where the download comes from is an
         // implementation detail the user is not asked to think about.
-        setDl((prev) => ({
-          have: p.have ?? prev?.have ?? 0,
-          total: p.total ?? prev?.total ?? 0,
-          note: p.note ?? prev?.note,
+        setDls((m) => ({
+          ...m,
+          [id]: {
+            have: p.have ?? m[id]?.have ?? 0,
+            total: p.total ?? m[id]?.total ?? 0,
+            note: p.note ?? m[id]?.note,
+          },
         }));
-      } else if (p.kind === "done") {
-        setDl(null);
-        void refreshWeights();
-      } else if (p.kind === "cancelled") {
-        // Cancelled without going through our button (older shell, or a second
-        // window): still not an error — back to "not downloaded", resume ready.
-        setDl(null);
-        void refreshWeights();
-      } else if (p.kind === "error") {
-        setDl(null);
-        // The footnote goes on the row the failure belongs to; a model the
-        // user already left keeps its story out of the new row. The problem
-        // log still gets it through the command-rejection path.
-        if (owned) setLastError(p.message ?? "download failed");
-        void refreshWeights();
+      } else if (p.kind === "done" || p.kind === "cancelled" || p.kind === "error") {
+        setDls((m) => {
+          if (!(id in m)) return m;
+          const n = { ...m };
+          delete n[id];
+          return n;
+        });
+        if (p.kind === "error") {
+          setDlErrors((m) => ({ ...m, [id]: p.message ?? "download failed" }));
+        }
+        bumpWeights();
       }
     }).then((f) => (dead ? f() : (un = f)));
     return () => { dead = true; un?.(); };
-  }, [refreshWeights]);
-
-  /**
-   * Start (or take over) the one `primary` download. An older fetch still in
-   * flight — the user abandoned it by switching models, or pressed Download
-   * again — is cancelled and awaited out first, so the new one does not bounce
-   * off the engine's one-writer-per-id guard with "a download is already
-   * running". Its `.part` survives the cancel; a later return to that model
-   * resumes from it.
-   */
-  const runPrimaryFetch = useCallback(async (target: DownloadTarget, destDir: string, owner: string) => {
-    dlOwner.current = owner;
-    setLastError(null); // this attempt speaks for itself
-    // Optimistic row, but only on the row it belongs to — the caller may be a
-    // switch flow whose selection has already moved on again.
-    if (curSelRef.current === owner) setDl({ have: 0, total: target.expectBytes });
-    const prev = fetchInFlight.current;
-    if (prev) {
-      cancelled.current.add("primary");
-      void cancelFetch("primary");
-      await prev.catch(() => {});
-      // The wound-down fetch's final event normally clears the mark; delete it
-      // again in case that event was already processed before the mark landed,
-      // or the new download's own progress would be swallowed with it.
-      cancelled.current.delete("primary");
-    }
-    const p = fetchWeights({ id: "primary", target, destDir });
-    fetchInFlight.current = p;
-    try {
-      await p;
-    } catch (e) {
-      // A failure of a download the user has already walked away from (the
-      // selection changed while it ran, which also requested its cancel) is
-      // not the on-screen model's story — classify it with the cancels so no
-      // caller paints it as that model's failure.
-      if (!isWeightsCancelled(e) && dlOwner.current === owner && owner !== curSelRef.current) {
-        throw new WeightsCancelled(String(e));
-      }
-      throw e;
-    } finally {
-      if (fetchInFlight.current === p) fetchInFlight.current = null;
-    }
-  }, []);
+  }, [bumpWeights]);
 
   /** Ensure usable weights are present locally, downloading them when needed, and
    *  return the final path (an empty string means the cluster feeds the shards). */
@@ -1504,13 +1403,16 @@ export default function App() {
   );
 
   /**
-   * Resolve (downloading if necessary) the weights for the selected model.
+   * The weights the cluster flows are allowed to use — resolve, never fetch.
+   *
+   * Downloading belongs to Settings (the download manager) since the
+   * 2026-08-15 split: the cluster starts and switches models, and when the
+   * weights are not here yet it says so and points at Settings, instead of
+   * kicking off a multi-gigabyte download as a side effect of a start button.
    *
    * `over` overrides the model/precision for THIS call. switchModel needs it:
    * it saves the new selection and immediately acts on it, and `settings` in
-   * this closure is still the old value until React re-renders — without the
-   * override the switch would faithfully download and start the model the user
-   * just moved away from.
+   * this closure is still the old value until React re-renders.
    */
   const ensureWeights = useCallback(async (over?: { modelId: string; quant: string }): Promise<string> => {
     const modelId = over?.modelId ?? settings.modelId;
@@ -1520,86 +1422,26 @@ export default function App() {
       manifest: getManifest(modelId),
       quant,
     });
-    if (!r.needsDownload || !r.target) return r.path;
-    const dir = settings.modelDir || (await defaultModelDir());
-    await runPrimaryFetch(r.target, dir, ownerKeyOf(modelId, quant));
-    const after = await resolveLocalWeights({
-      modelDir: dir,
-      manifest: getManifest(modelId),
-      quant,
-    });
-    return after.path;
-  }, [settings.modelDir, settings.modelId, settings.quant, runPrimaryFetch, ownerKeyOf]);
-
-  /** Resolve (downloading if necessary) a user-supplied GGUF, returning the
-   *  local path the engine will load. HF picks reuse the exact weights
-   *  machinery curated models use (weights_fetch is manifest-agnostic);
-   *  local-file picks are only re-verified — a moved file is a one-sentence
-   *  answer here instead of a load failure later. */
-  const ensureCustomWeights = useCallback(
-    async (c: CustomModelSource): Promise<string> => {
-      const r = await resolveCustomWeights({ modelDir: settings.modelDir, custom: c });
-      if (r.path) return r.path;
-      if (!r.needsDownload || !r.target) {
-        throw new Error(`GGUF file not found: ${c.source === "file" ? c.path : `${c.repo}/${c.file}`}`);
-      }
-      const dir = settings.modelDir || (await defaultModelDir());
-      await runPrimaryFetch(r.target, dir, ownerKeyOf(LOCAL_GGUF_ID, "", c));
-      const after = await resolveCustomWeights({ modelDir: dir, custom: c });
-      if (!after.path) throw new Error("download finished but the file did not verify — try again");
-      return after.path;
-    },
-    [settings.modelDir, runPrimaryFetch, ownerKeyOf]
-  );
-
-  /**
-   * Serve a user-supplied GGUF on this machine: coordinator in llamacpp
-   * single-machine mode (WS-D1). The scheduler verdict — fits / refuses with a
-   * worded reason, exit 3 — comes back through the engine supervisor's
-   * log/refusal channels and renders on the local-engine card.
-   *
-   * ctxSize 0 on purpose: the coordinator sizes the context from measured
-   * memory (32K ask, 16K floor, worded refusal below it). Passing the legacy
-   * tier here would turn "it fits at 16K" into a refusal at 128K nobody asked
-   * for.
-   *
-   * The "this machine's usage" caps ride along as --max-vram-mb/--max-ram-mb
-   * (0 = uncapped): the coordinator probes the machine itself, then caps what
-   * the probe reports before planning — same contract as the worker flag.
-   */
-  const serveOpenModel = useCallback(
-    async (over?: CustomModelSource): Promise<void> => {
-      const sel = over ?? customSel;
-      if (!sel) return;
-      const label = customGgufName(sel);
+    if (r.needsDownload || !r.path) {
+      // "[CODE] detail" — localized by tErr (ERROR_KEYS in i18n.ts).
+      throw new Error(`[WEIGHTS_NOT_DOWNLOADED] ${modelId}${quant ? ` ${quant}` : ""}`);
+    }
+    // Complete on disk but never hash-checked (script download, or a client
+    // from before the integrity gate): verify NOW, before any engine sees the
+    // file. On mismatch the engine deletes it and rejects — re-probe so the
+    // UI flips back to "needs downloading" instead of offering a file that no
+    // longer exists.
+    if (r.needsVerify && r.target) {
       try {
-        if (!inTauri()) {
-          // Browser dev build: no engine to start; show the card in fixture mode.
-          setLocalEngine({ gguf: sel.path || sel.file, label });
-          setView("cluster");
-          return;
-        }
-        const path = await ensureCustomWeights(sel);
-        const { invoke } = await import("@tauri-apps/api/core");
-        await invoke("llamacpp_serve", {
-          ggufPath: path,
-          apiHost: settings.apiHost || "0.0.0.0",
-          apiPort: settings.apiPort || 8000,
-          apiToken: settings.apiToken,
-          ctxSize: 0,
-          maxDecode: settings.maxTokens,
-          maxVramMb: caps.maxVramMb,
-          maxRamMb: caps.maxRamMb,
-        });
-        setLocalEngine({ gguf: path, label });
-        setView("cluster");
+        const dir = settings.modelDir || (await defaultModelDir());
+        await verifyWeights({ id: r.target.file, destDir: dir, file: r.target.file, sha256: r.target.sha256 });
       } catch (e) {
-        if (!isWeightsCancelled(e)) console.error("serve-open-model:", e);
-        reportWeightsError(e, "cluster");
+        bumpWeights();
+        throw e;
       }
-    },
-    [customSel, ensureCustomWeights, settings.apiHost, settings.apiPort, settings.apiToken, settings.maxTokens, caps, reportWeightsError]
-  );
+    }
+    return r.path;
+  }, [settings.modelDir, settings.modelId, settings.quant, bumpWeights]);
 
   const stopLocalEngine = useCallback(async () => {
     try {
@@ -1611,12 +1453,11 @@ export default function App() {
   }, []);
 
   /**
-   * Rebuilds are serialized, and stale ones are skipped. "Selecting a model IS
-   * the switch" (2026-08-15) made quick successive picks easy — the Settings
-   * radios are a list of one-click switches — and two rebuilds running
+   * Rebuilds are serialized, and stale ones are skipped: two rebuilds running
    * concurrently race each other through leave/create/start on the pairing
-   * provider. Each pick bumps the sequence; a queued rebuild that is no longer
-   * the newest does not run. The last pick wins, in one line of teardown.
+   * provider. Each pick from the Cluster page's picker bumps the sequence; a
+   * queued rebuild that is no longer the newest does not run — the last pick
+   * wins, with one line of teardown.
    */
   const switchSeq = useRef(0);
   const switchChain = useRef<Promise<void>>(Promise.resolve());
@@ -1632,77 +1473,25 @@ export default function App() {
     return chained;
   }, []);
 
-  /**
-   * Switch to a user-supplied GGUF from wherever the picker is open. Same
-   * restart semantics as switchModel: save the choice; when something is
-   * running, tear it down and serve the new file through the local engine
-   * (llamacpp_serve stops any engine sidecars itself — a model switch is a
-   * rebuild, never a hot swap).
-   */
-  const switchToCustom = useCallback(
-    async (c: CustomModelSource) => {
-      updateSettings({
-        ...settings,
-        modelId: LOCAL_GGUF_ID,
-        quant: "",
-        customSource: c.source,
-        customGgufPath: c.path,
-        customHfRepo: c.repo,
-        customHfFile: c.file,
-      });
-      const clusterRunning = pairSnap && pairSnap.peers.length > 0;
-      if (!clusterRunning && !localEngine) return; // nothing running: the pick is the whole operation
-      setView("cluster");
-      return queueRebuild(async () => {
-        try {
-          if (clusterRunning) await getPairingProvider().leave();
-          await serveOpenModel(c);
-        } catch (e) {
-          if (!isWeightsCancelled(e)) console.error("switch-to-custom:", e);
-          reportWeightsError(e, "cluster");
-        }
-      });
-    },
-    [settings, pairSnap, localEngine, serveOpenModel, reportWeightsError, queueRebuild]
-  );
-
   // One object, two renderers: the model row in Settings → Quick, and the
   // "run on this machine" row on Cluster. Both start the same download, so
   // both must show the same progress — building it once is what keeps them
   // from drifting into two half-truths.
+  // The SELECTED model's weight situation, for the cluster surfaces. Since the
+  // 2026-08-15 split those surfaces only DISPLAY it (progress if a download is
+  // running, "not here yet" otherwise) — the download button lives in Settings,
+  // so onDownload sends the user there rather than starting anything.
   const weightsInfo = useMemo<WeightsInfo>(
     () => ({
       needs: needsWeights,
       path: weightsPath,
-      dl,
+      dl: dls[selFile] ?? null,
       partialBytes,
-      lastError,
-      onDownload: () =>
-        void (customSel && customSel.source === "hf"
-          ? ensureCustomWeights(customSel).then(() => refreshWeights())
-          : ensureWeights()
-        ).catch((e) => reportWeightsError(e)),
-      onCancel: cancelDownload,
+      lastError: dlErrors[selFile] ?? null,
+      onDownload: () => openSettings("quick"),
+      onCancel: () => cancelDownloadFor(selFile),
     }),
-    // customSel is derived from settings each render; its fields (not its
-    // identity) are what matter here, and they are covered by refreshWeights'
-    // own deps — spelling the primitives out again keeps the memo honest.
-    [
-      needsWeights,
-      weightsPath,
-      dl,
-      partialBytes,
-      lastError,
-      ensureWeights,
-      ensureCustomWeights,
-      refreshWeights,
-      cancelDownload,
-      reportWeightsError,
-      settings.modelId,
-      settings.customSource,
-      settings.customHfRepo,
-      settings.customHfFile,
-    ]
+    [needsWeights, weightsPath, dls, dlErrors, selFile, partialBytes, cancelDownloadFor, openSettings]
   );
 
   /**
@@ -1808,7 +1597,7 @@ export default function App() {
         // account, so every machine re-derives the same one and finds us again.
         if (account) {
           const g = platformGate();
-          const secret = g.ok && g.session.userId ? await accountPairSecret(g.session.userId, g.url, settings.clusterName.trim() || "home") : null;
+          const secret = g.ok && g.session.userId ? await accountPairSecret(g.session.userId, g.url, settings.clusterName.trim() || "IdleToken-Home") : null;
           if (secret) await getPairingProvider().createAccount(self, secret);
         } else {
           await getPairingProvider().create(self, code ?? undefined);
@@ -1828,10 +1617,6 @@ export default function App() {
   const serveStandaloneRef = useRef(serveStandalone);
   useEffect(() => {
     serveStandaloneRef.current = serveStandalone;
-  });
-  const serveOpenRef = useRef(serveOpenModel);
-  useEffect(() => {
-    serveOpenRef.current = serveOpenModel;
   });
 
   useEffect(() => {
@@ -1911,7 +1696,7 @@ export default function App() {
             const secret = await accountPairSecret(
               gate.session.userId,
               gate.url,
-              loadSettings().clusterName || "home"
+              loadSettings().clusterName || "IdleToken-Home"
             );
             const { invoke } = await import("@tauri-apps/api/core");
             try {
@@ -1943,7 +1728,7 @@ export default function App() {
             signedIn: sess !== null,
             sessionProvider: sess?.provider ?? null,
             gate: gate.ok ? "ok" : gate.reason,
-            agentName: s.clusterName || "home",
+            agentName: s.clusterName || "IdleToken-Home",
             coordApiPort: s.apiPort || 8000,
             tauri: inTauri(),
           });
@@ -2077,7 +1862,7 @@ export default function App() {
               if (!target) { reportTest("weightsFetch", { error: "manifest has no repo/gguf" }); return; }
               const dir = wf[2] || (await defaultModelDir());
               await fetchWeights({ id: "uitest", target, destDir: dir });
-              const st = await weightsState(dir, target.file, target.expectBytes);
+              const st = await weightsState(dir, target.file, target.expectBytes, target.sha256);
               reportTest("weightsFetch", {
                 model: wf[1], file: target.file, dir,
                 complete: st.complete, haveBytes: st.have_bytes,
@@ -2111,10 +1896,10 @@ export default function App() {
               // here (`.catch(() => {})`) is what let the bug hide: the command
               // rejects on a cancel too, and in the app that rejection landed
               // in a catch that painted "Download failed — cancelled …".
-              void fetchWeights({ id: "primary", target, destDir: dir }).catch(reportWeightsError);
+              void fetchWeights({ id: target.file, target, destDir: dir }).catch(reportWeightsError);
               await new Promise((r) => setTimeout(r, Number(wc[2])));
               const tCancel = Date.now();
-              cancelDownload();
+              cancelDownloadFor(target.file);
               const uiClearedMs = Date.now() - tCancel; // the click-to-UI latency
               await new Promise((r) => setTimeout(r, 15000)); // let the engine wind down
               reportTest("weightsCancel", {
@@ -2149,19 +1934,19 @@ export default function App() {
               const target = resolveDownload(man, defaultQuant(wd[1]));
               if (!target) { reportTest("weightsDouble", { error: "manifest has no repo/gguf" }); return; }
               const dir = await defaultModelDir();
-              const first = fetchWeights({ id: "primary", target, destDir: dir }).catch((e) => `ERR:${e}`);
+              const first = fetchWeights({ id: target.file, target, destDir: dir }).catch((e) => `ERR:${e}`);
               await new Promise((r) => setTimeout(r, 3000)); // let it get past register()
               let secondRefused = false;
               let secondMsg = "";
               try {
-                await fetchWeights({ id: "primary", target, destDir: dir });
+                await fetchWeights({ id: target.file, target, destDir: dir });
               } catch (e) {
                 secondRefused = true;
                 secondMsg = String(e);
               }
-              cancelDownload();
+              cancelDownloadFor(target.file);
               await new Promise((r) => setTimeout(r, 8000));
-              const st = await weightsState(dir, target.file, target.expectBytes);
+              const st = await weightsState(dir, target.file, target.expectBytes, target.sha256);
               reportTest("weightsDouble", {
                 secondRefused, secondMsg,
                 haveBytes: st.have_bytes, expectBytes: target.expectBytes,
@@ -2212,49 +1997,9 @@ export default function App() {
             }
           })();
         }
-        // Open-model oracle (v2 WS-D1): serve an arbitrary local GGUF through
-        // the REAL handler (coordinator llamacpp mode), then report what the
-        // coordinator said — auto-manifest id + engine state on success, the
-        // worded refusal on refusal. Both outcomes are reportable on purpose:
-        // the refusal path is a feature, not a failure of the test.
-        //   serve-open-gguf:<absolute-path.gguf>
-        const sg = d.match(/^serve-open-gguf:(\S+)$/);
-        if (sg) {
-          (async () => {
-            const t0 = Date.now();
-            try {
-              await serveOpenRef.current({ source: "file", path: sg[1], repo: "", file: "" });
-              const { invoke } = await import("@tauri-apps/api/core");
-              const base = `http://127.0.0.1:${loadSettings().apiPort || 8000}`;
-              let stats: Record<string, unknown> | null = null;
-              let refused: string | null = null;
-              for (let i = 0; i < 60; i++) {
-                await new Promise((r) => setTimeout(r, 2000));
-                const st = await getEngineProvider().status();
-                if (st.refusedReason) {
-                  refused = st.refusedReason;
-                  break;
-                }
-                try {
-                  stats = await invoke<Record<string, unknown>>("api_stats", { baseUrl: base });
-                } catch {
-                  /* API not up yet */
-                }
-                if (stats && (stats.engine_state === "ready" || stats.engine_state === "failed")) break;
-              }
-              reportTest("serveOpenGguf", {
-                ctx: uiTestCtx,
-                seconds: Math.round((Date.now() - t0) / 1000),
-                refused,
-                engine: (stats?.engine as string) ?? null,
-                engineState: (stats?.engine_state as string) ?? null,
-                model: (stats?.model as string) ?? null,
-              });
-            } catch (e) {
-              reportTest("serveOpenGguf", { error: String(e) });
-            }
-          })();
-        }
+        // The open-model oracle ("serve-open-gguf:<path>") retired 2026-08-15
+        // with the open intake: the curated registry is the whole selectable
+        // set, so there is no arbitrary-GGUF path left to prove.
         // Stop-generation oracle (2026-08-11). Two claims worth proving on real
         // hardware: deltas stop arriving when the user presses Stop, and the
         // partial text survives. Timing again — unprovable by reading code.
@@ -2444,6 +2189,26 @@ export default function App() {
         if (!live) return;
         setSnap(s);
         setTotals({ vram_total: s.vram_total, ram_total: s.ram_total });
+        // Hand this machine's free memory to the pairing layer, which sends it
+        // with every join (2026-08-15). Each machine measures its own, so the
+        // roster can total the pool and answer "does the model fit on all of
+        // us" BEFORE anyone presses Start — that used to be answerable only by
+        // the coordinator refusing after the fact. Reported in every mode: the
+        // numbers have to be in place before a join is sent.
+        if (inTauri()) {
+          void import("@tauri-apps/api/core")
+            .then(({ invoke }) =>
+              invoke("pairing_report_memory", {
+                vramFree: Math.max(0, s.vram_total - s.vram_used_other),
+                ramFree: Math.max(0, s.ram_total - s.ram_used_other),
+                unifiedMemory: s.unified_memory,
+              })
+            )
+            .catch(() => {
+              /* pre-pairing or an older backend: the pool total just stays
+                 incomplete, which the card reports as "cannot tell" */
+            });
+        }
         // First-start selection (B3): the default model used to be hardcoded to
         // DSv4-Flash (80.76 GiB), so the first thing a new user with an 8 GB card
         // saw was "does not fit on one machine, please build a cluster" -- with one
@@ -2692,9 +2457,6 @@ export default function App() {
                 identity={identity}
                 onGoCluster={() => setView("cluster")}
                 machines={pairSnap?.peers.length ?? (localEngine ? 1 : 0)}
-                onSwitchModel={(id, q) => void switchModel(id, q)}
-                onPickCustomModel={(c) => void switchToCustom(c)}
-                customName={customName}
               />
             ) : view === "settings" ? (
               <SettingsPanel
@@ -2710,9 +2472,12 @@ export default function App() {
                 session={session}
                 onSignIn={() => setShowAuth(true)}
                 initialCategory={settingsCategory}
-                weights={weightsInfo}
-                onSwitchModel={(id, q) => void switchModel(id, q)}
-                onWeightsChanged={() => void refreshWeights()}
+                downloads={dls}
+                downloadErrors={dlErrors}
+                weightsVersion={weightsVersion}
+                onStartDownload={(file, target) => void startDownload(file, target)}
+                onCancelDownload={cancelDownloadFor}
+                onWeightsChanged={bumpWeights}
                 onCheckUpdate={() => checkUpdate("always")}
                 onClose={() => setView("cluster")}
               />
@@ -2727,14 +2492,11 @@ export default function App() {
                 localApi={localApi}
                 localStats={localStats}
                 engStatus={engStatus}
-                customName={customName}
                 onStopLocal={() => void stopLocalEngine()}
-                onPickCustom={(c) => void switchToCustom(c)}
-                // Wrapped, not passed through: serveStandalone now takes an
+                // Wrapped, not passed through: serveStandalone takes an
                 // optional {modelId,quant} override, and a bare handler would
-                // hand it the click event as that argument. An open GGUF's
-                // "run it here" is the local llama.cpp engine, not pairing.
-                onServeStandalone={() => void (customSel ? serveOpenModel() : serveStandalone())}
+                // hand it the click event as that argument.
+                onServeStandalone={() => void serveStandalone()}
                 onCreateCluster={() => {
                   setPairingView("choose");
                   setShowPairing(true);
@@ -2747,7 +2509,6 @@ export default function App() {
                   setPairingView("choose");
                   setShowPairing(true);
                 }}
-                onOpenSharing={() => openSettings("platform")}
                 onOpenModelSetting={() => openSettings("quick")}
                 onSwitchModel={(id, q) => void switchModel(id, q)}
                 weights={weightsInfo}

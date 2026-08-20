@@ -540,6 +540,24 @@ pub fn current_state_str(app: &AppHandle) -> &'static str {
     aggregate_status(&inner).state.as_str()
 }
 
+/// One role's own lifecycle state ("stopped" when that role has no slot).
+///
+/// Not the aggregate: `aggregate_status` reports the highest-ranked state
+/// across every slot, and Crashed outranks Running — so a stale crashed
+/// "worker" from an earlier run would describe a perfectly healthy
+/// coordinator as crashed. Anything that acts on a role's liveness (the
+/// pairing layer tearing a forming cluster down, 2026-08-15) has to ask about
+/// that role.
+pub fn role_state_str(app: &AppHandle, role: &str) -> &'static str {
+    let engine = app.state::<Engine>();
+    let inner = engine.0.lock().unwrap();
+    inner
+        .slots
+        .get(role)
+        .map(|s| s.state.as_str())
+        .unwrap_or("stopped")
+}
+
 /// Start (or restart) one role's sidecar. Public (not just a command) so the
 /// pairing layer can materialize the cluster through the exact same path the UI
 /// uses. Idempotent per role: starting a role that is already active is an
@@ -606,8 +624,8 @@ fn stop_matching(app: &AppHandle, want: impl Fn(&str) -> bool) {
     for c in children {
         // SIGTERM first, hard kill as the backstop (unix). CommandChild::kill
         // is SIGKILL, and a SIGKILLed coordinator in llamacpp mode cannot take
-        // its llama-server child down — on macOS (no PR_SET_PDEATHSIG) that
-        // orphaned a llama-server holding the model in RAM after every clean
+        // its idletoken-server child down — on macOS (no PR_SET_PDEATHSIG) that
+        // orphaned a idletoken-server holding the model in RAM after every clean
         // client quit (seen live 2026-08-14; the gap is documented in
         // results/llamacpp-b1-sidecar-20260814.md deviations #4). The
         // coordinator handles SIGTERM by shutting the sidecar down cleanly.
@@ -696,6 +714,27 @@ pub fn engine_logs(state: State<'_, Engine>, max_lines: Option<usize>) -> Vec<Lo
 /// SECURITY: `jwt` arrives over the local Tauri IPC only and ends up in the
 /// child's argv. Do NOT log it — push_log never prints slot args, and nothing
 /// here persists it; the frontend passes the live session token on each start.
+/// The socket the platform agent hands the buyer's plaintext to the
+/// coordinator over, in shared mode.
+///
+/// Why the client owns this path: the coordinator and the agent are two
+/// separate processes that must agree on it, and the client is the only thing
+/// that starts both. Deriving it independently on each side would be a second
+/// copy of a convention — the kind that drifts silently.
+///
+/// Why a socket at all: on loopback TCP that leg carries the prompt in the
+/// clear, and one `tcpdump -i lo` reads it. Measured on a real node
+/// 2026-08-16 (results/shared-mode-realmachine-20260816.md).
+fn coord_api_socket() -> Option<String> {
+    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok()?;
+    if home.is_empty() {
+        return None;
+    }
+    let dir = std::path::PathBuf::from(home).join(".idletoken");
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir.join("coord-api.sock").to_string_lossy().into_owned())
+}
+
 #[tauri::command]
 pub fn platform_agent_start(
     app: AppHandle,
@@ -703,6 +742,7 @@ pub fn platform_agent_start(
     jwt: String,
     name: String,
     coord_api_port: u16,
+    coord_token: String,
 ) -> Result<(), String> {
     let platform_url = platform_url.trim().to_string();
     if platform_url.is_empty() {
@@ -711,8 +751,11 @@ pub fn platform_agent_start(
     if jwt.trim().is_empty() {
         return Err("[PLATFORM_NO_SESSION] not signed in to the platform (no session token)".into());
     }
-    let name = if name.trim().is_empty() { "home".to_string() } else { name.trim().to_string() };
-    let args: Vec<String> = vec![
+    // Must match the front end's default cluster name (settings.ts /
+    // pairing.ts): account-mode pairing derives its secret from this value,
+    // so a drifted fallback would split one account's machines in two.
+    let name = if name.trim().is_empty() { "IdleToken-Home".to_string() } else { name.trim().to_string() };
+    let mut args: Vec<String> = vec![
         "--relay".into(),
         "--platform".into(),
         platform_url,
@@ -723,6 +766,23 @@ pub fn platform_agent_start(
         "--coord".into(),
         format!("http://127.0.0.1:{coord_api_port}"),
     ];
+    // The coordinator's own API token. It has always been allowed to require
+    // one; since overflow routing it MUST when borrowing is on, and the sharing
+    // switch turns lending and borrowing on together. Without this the
+    // coordinator answers 401 to every dispatched job and the machine looks to
+    // its owner like one the platform stopped sending work to.
+    if !coord_token.trim().is_empty() {
+        args.push("--coord-token".into());
+        args.push(coord_token.trim().to_string());
+    }
+    // Hand the plaintext over the socket instead of loopback TCP. The agent
+    // treats this as exclusive: if the socket is not there it exits loudly
+    // rather than falling back to a transport this machine's owner can sniff.
+    if let Some(sock) = coord_api_socket() {
+        args.push("--coord-unix".into());
+        args.push(sock);
+    }
+    let args = args;
     start_engine(&app, ROLE_PLATFORM_AGENT.into(), args, Vec::new())
 }
 
@@ -740,7 +800,7 @@ pub fn platform_agent_status(state: State<'_, Engine>) -> EngineStatus {
     slot_status(&state.0.lock().unwrap(), ROLE_PLATFORM_AGENT)
 }
 
-/// Resolve the llama-server engine binary the coordinator will spawn.
+/// Resolve the idletoken-server engine binary the coordinator will spawn.
 ///
 /// It is staged NEXT TO the client executable — scripts/stage_sidecars.sh puts
 /// it in target/debug/ for dev runs, and the bundler ships it beside the app
@@ -765,16 +825,29 @@ pub(crate) fn llama_server_bin() -> Result<std::path::PathBuf, String> {
     let dir = exe
         .parent()
         .ok_or_else(|| "cannot locate this app's directory".to_string())?;
-    let name = if cfg!(windows) { "llama-server.exe" } else { "llama-server" };
-    let p = dir.join(name);
-    if p.is_file() {
-        return Ok(p);
+    // The bundled name is ours (2026-08-15): upstream's "llama-server" in Task
+    // Manager read as some third-party thing having installed itself. The
+    // binary IS llama.cpp's server (attribution stays in About and NOTICE, as
+    // MIT asks); only the file name is branded. The old name is still accepted
+    // second so a checkout staged before the rename keeps working — the pair
+    // was accidentally two copies of the NEW name, which quietly turned the
+    // fallback off.
+    let names: &[&str] = if cfg!(windows) {
+        &["idletoken-server.exe", "llama-server.exe"]
+    } else {
+        &["idletoken-server", "llama-server"]
+    };
+    for name in names {
+        let p = dir.join(name);
+        if p.is_file() {
+            return Ok(p);
+        }
     }
     // "[CODE] detail": the UI localizes the sentence (with the fix-it steps)
     // and keeps the path as the variable detail; logs read fine as-is.
     Err(format!(
         "[ENGINE_BIN_MISSING] looked for {}",
-        p.display()
+        dir.join(names[0]).display()
     ))
 }
 
@@ -786,16 +859,18 @@ pub(crate) fn llama_engine_dir() -> Result<std::path::PathBuf, String> {
         if !p.trim().is_empty() {
             let dir = std::path::PathBuf::from(p.trim());
             let rpc = dir.join(if cfg!(windows) {
-                "ggml-rpc-server.exe"
+                "idletoken-rpc-server.exe"
             } else {
-                "ggml-rpc-server"
+                "idletoken-rpc-server"
             });
-            let server = dir.join(if cfg!(windows) { "llama-server.exe" } else { "llama-server" });
-            if rpc.is_file() && server.is_file() {
+            let server_ok = ["idletoken-server", "llama-server"].iter().any(|n| {
+                dir.join(if cfg!(windows) { format!("{n}.exe") } else { n.to_string() }).is_file()
+            });
+            if rpc.is_file() && server_ok {
                 return Ok(dir);
             }
             return Err(format!(
-                "IDLETOKEN_ENGINE_DIR must contain llama-server and ggml-rpc-server (checked {})",
+                "IDLETOKEN_ENGINE_DIR must contain idletoken-server and idletoken-rpc-server (checked {})",
                 dir.display()
             ));
         }
@@ -806,13 +881,13 @@ pub(crate) fn llama_engine_dir() -> Result<std::path::PathBuf, String> {
         .ok_or_else(|| "cannot locate the llama.cpp engine directory".to_string())?
         .to_path_buf();
     let rpc = dir.join(if cfg!(windows) {
-        "ggml-rpc-server.exe"
+        "idletoken-rpc-server.exe"
     } else {
-        "ggml-rpc-server"
+        "idletoken-rpc-server"
     });
     if !rpc.is_file() {
         return Err(format!(
-            "the ggml-rpc-server engine binary is missing (looked for {})",
+            "the idletoken-rpc-server engine binary is missing (looked for {})",
             rpc.display()
         ));
     }
@@ -822,6 +897,11 @@ pub(crate) fn llama_engine_dir() -> Result<std::path::PathBuf, String> {
 /// Serve one GGUF on this machine through the coordinator's llamacpp
 /// single-machine mode (v2 rebuild WS-D1; coordinator contract in
 /// results/llamacpp-b1-sidecar-20260814.md / -b2b4-):
+///
+/// NOTE (2026-08-15): the open model intake that used to call this from the
+/// UI was removed (curated registry only). The command stays: it is the
+/// coordinator's llamacpp-mode contract, and the curated single-machine path
+/// is expected to move onto it.
 ///
 ///   idletoken-coord --llama-server-bin P --llama-gguf P --http
 ///                   --api-bind H:P [--api-token T] [--ctx-size N] [--max-decode N]
@@ -853,8 +933,19 @@ pub fn llamacpp_serve(
         return Err(format!("GGUF file not found: {gguf}"));
     }
     let engine_bin = llama_server_bin()?;
-    let host = if api_host.trim().is_empty() { "0.0.0.0" } else { api_host.trim() };
+    // Loopback regardless of what the settings still say: the coordinator
+    // rewrites a non-loopback API bind to 127.0.0.1 anyway (2026-08-15), and
+    // passing one through would only add a warning line to explain away.
+    let host = {
+        let h = api_host.trim();
+        if h.is_empty() || (!h.starts_with("127.") && h != "localhost") { "127.0.0.1" } else { h }
+    };
     let mut args: Vec<String> = vec![
+        // Same reasoning as the cluster path in pairing.rs: the engine is
+        // started hardened whether or not this machine is currently serving
+        // anyone else, because every one of those settings is fixed at spawn
+        // and sharing is switched on later.
+        "--shared".into(),
         "--llama-server-bin".into(),
         engine_bin.to_string_lossy().into_owned(),
         "--llama-gguf".into(),
@@ -863,6 +954,15 @@ pub fn llamacpp_serve(
         "--api-bind".into(),
         format!("{host}:{api_port}"),
     ];
+    // Shared mode's second door. The TCP listener above stays — this machine's
+    // own user talks to it — but platform work arrives on the socket, so the
+    // buyer's plaintext never crosses the IP stack. No socket (no HOME) simply
+    // means the extra door is not offered; the agent then refuses to start
+    // rather than quietly using TCP.
+    if let Some(sock) = coord_api_socket() {
+        args.push("--api-unix".into());
+        args.push(sock);
+    }
     if !api_token.is_empty() {
         args.push("--api-token".into());
         args.push(api_token);

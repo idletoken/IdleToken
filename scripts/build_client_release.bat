@@ -69,19 +69,33 @@ if exist "%ROOT%\idletoken-platform-agent.exe" (
     copy /y "%ROOT%\idletoken-coord.exe" "%ROOT%\client\src-tauri\binaries\idletoken-platform-agent-%TRIPLE%.exe" >nul
 )
 
-REM llama.cpp sidecars are the v2 compute engine: llama-server serves local
-REM models and drives clusters; ggml-rpc-server is supervised on worker nodes.
+REM llama.cpp sidecars are the v2 compute engine: idletoken-server serves local
+REM models and drives clusters; idletoken-rpc-server is supervised on worker nodes.
 REM Both must come from the same pinned checkout/build or an installed client
 REM can offer cluster mode while carrying only half of the engine.
+REM The BUILD produces upstream's names (llama-server.exe, ggml-rpc-server.exe —
+REM see scripts\build_llamacpp_win.bat, which cmake-builds those two targets);
+REM only the STAGED copy carries our name, exactly as stage_sidecars.sh and
+REM build_client_win.sh do it. This loop used to look for idletoken-server.exe
+REM *in the llama.cpp build directory*, where nothing ever writes that name, so
+REM it failed every time with "run scripts\build_llamacpp_win.bat first" —
+REM advice that cannot fix it, because that script had already run.
 set "LLAMA_BIN=%ROOT%\vendor\llama.cpp\build\bin\Release"
 if not exist "%LLAMA_BIN%\llama-server.exe" set "LLAMA_BIN=%ROOT%\vendor\llama.cpp\build\bin"
-for %%E in (llama-server ggml-rpc-server) do (
-    if not exist "%LLAMA_BIN%\%%E.exe" (
-        echo CLIENT_RELEASE_FAIL: no pinned %%E.exe ^(run scripts\build_llamacpp_win.bat first^)
-        exit /b 1
-    )
-    copy /y "%LLAMA_BIN%\%%E.exe" "%ROOT%\client\src-tauri\binaries\%%E-%TRIPLE%.exe" >nul
+call :stage_engine llama-server    idletoken-server     || exit /b 1
+call :stage_engine ggml-rpc-server idletoken-rpc-server || exit /b 1
+goto :engines_staged
+
+:stage_engine
+if not exist "%LLAMA_BIN%\%1.exe" (
+    echo CLIENT_RELEASE_FAIL: no pinned %1.exe under "%LLAMA_BIN%" ^(run scripts\build_llamacpp_win.bat first^)
+    exit /b 1
 )
+copy /y "%LLAMA_BIN%\%1.exe" "%ROOT%\client\src-tauri\binaries\%2-%TRIPLE%.exe" >nul || (
+    echo CLIENT_RELEASE_FAIL: could not stage %1.exe as %2 & exit /b 1)
+exit /b 0
+
+:engines_staged
 
 REM --- licences ----------------------------------------------------------
 REM The sidecars staged above contain vendored third-party code (ds4 = MIT,

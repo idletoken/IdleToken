@@ -82,6 +82,23 @@ def main(argv):
             problems.append("%s: manifest deployment=%r (want 'single-node' or 'cluster')" % (mid, md))
         elif md != rd:
             problems.append("%s: deployment manifest=%r registry=%r" % (mid, md, rd))
+        # Integrity gate (threat-model.md, plan A2): a model offered to users
+        # (available=true) must pin a SHA-256 for every downloadable file —
+        # variants each carry their own; variant-less models pin default_gguf
+        # at the top level. Without the hash the client/scripts download
+        # unverified, which reopens exactly the hole the gate closed. Models
+        # still under curation stay available=false until the hash is recorded
+        # (locally renamed files: record it by hand from the merged file).
+        if bool(man.get("available")):
+            vs = man.get("variants") or []
+            if vs:
+                for v in vs:
+                    if not v.get("sha256"):
+                        problems.append("%s[%s]: available but variant has no sha256"
+                                        " (run scripts/manifest_sha256.py)" % (mid, v.get("quant")))
+            elif not man.get("sha256"):
+                problems.append("%s: available but no top-level sha256 for default_gguf"
+                                " (run scripts/manifest_sha256.py, or record it by hand)" % mid)
         mv = {v["quant"]: v for v in man.get("variants", [])}
         rv = {v["quant"]: v for v in r.get("variants", [])}
         if set(mv) != set(rv):

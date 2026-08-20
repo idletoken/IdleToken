@@ -71,6 +71,20 @@ const SEED = [
     ],
   },
   {
+    // The interrupted generation: stored while a reply was in flight, so the
+    // transcript ends on the empty assistant placeholder the stream never got
+    // to fill. Nothing about "generating" is persisted, so on load this must
+    // come back as a conversation waiting for an answer — NOT as a bubble that
+    // is permanently about to start speaking. Chat.settleTail is what does it.
+    id: "c-lab-5",
+    title: "Interrupted mid-reply",
+    updatedAt: Date.now() - 500_000,
+    msgs: [
+      { role: "user", text: "What happens to this reply if the app is killed right now?" },
+      { role: "assistant", text: "" },
+    ],
+  },
+  {
     id: "c-lab-3",
     title: "Quantisation trade-offs for Q2",
     updatedAt: Date.now() - 86400_000,

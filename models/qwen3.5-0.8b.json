@@ -47,51 +47,298 @@
   },
   "overhead_base_bytes": 858993459,
   "chat_template": "gguf",
-  "layer_weight_bytes": 312962304,
-  "shared_weight_bytes": 208592896,
-  "default_gguf": "Qwen3.5-0.8B-Q4_K_M.gguf",
+  "layer_weight_bytes": 338227456,
+  "shared_weight_bytes": 0,
+  "default_gguf": "Qwen3.5-0.8B-UD-IQ2_XXS.gguf",
   "sources": [
     {
       "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "quant": "IQ2_XXS"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "quant": "IQ2_M"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "quant": "IQ3_XXS"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "quant": "Q2_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "quant": "Q3_K_S"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "quant": "Q3_K_M"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "quant": "Q3_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "quant": "IQ4_XS"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "quant": "IQ4_NL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "quant": "Q4_0"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "quant": "Q4_K_S"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
       "quant": "Q4_K_M"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "quant": "Q4_1"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "quant": "Q4_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "quant": "Q5_K_S"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "quant": "Q5_K_M"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "quant": "Q5_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "quant": "Q6_K"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "quant": "Q6_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "quant": "Q8_0"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "quant": "Q8_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "quant": "BF16"
     }
   ],
-  "default_quant": "Q4_K_M",
+  "default_quant": "IQ2_XXS",
   "variants": [
     {
-      "quant": "Q4_K_M",
-      "layer_weight_bytes": 312962304,
-      "shared_weight_bytes": 208592896,
+      "quant": "IQ2_XXS",
+      "layer_weight_bytes": 338227456,
+      "shared_weight_bytes": 0,
       "repo": "unsloth/Qwen3.5-0.8B-GGUF",
-      "gguf": "Qwen3.5-0.8B-Q4_K_M.gguf"
+      "gguf": "Qwen3.5-0.8B-UD-IQ2_XXS.gguf",
+      "sha256": "a369165c8ec45a92d55cbad98b5377e2c32ca8dfc824c899d9d05b33b6b53e54",
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+    },
+    {
+      "quant": "IQ2_M",
+      "layer_weight_bytes": 371933440,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "gguf": "Qwen3.5-0.8B-UD-IQ2_M.gguf",
+      "sha256": "e31519c0ffb8e5bec09f34d7783731c39f9eaee13c0ec5a0f14b191761bb5134",
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+    },
+    {
+      "quant": "IQ3_XXS",
+      "layer_weight_bytes": 398237952,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "gguf": "Qwen3.5-0.8B-UD-IQ3_XXS.gguf",
+      "sha256": "3dc1f2217751ca270d41f6fc3084160c386465fe09bf4596576dccd7a4565b8a",
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+    },
+    {
+      "quant": "Q2_K_XL",
+      "layer_weight_bytes": 417718528,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "gguf": "Qwen3.5-0.8B-UD-Q2_K_XL.gguf",
+      "sha256": "8d992fef3b0bd269eb4ef2ed492b2b02f9027a055d6a764b700f4092593c9909",
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+    },
+    {
+      "quant": "Q3_K_S",
+      "layer_weight_bytes": 440750336,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "gguf": "Qwen3.5-0.8B-Q3_K_S.gguf",
+      "sha256": "4649ee78ff7cbad4e9fe4c0bab3b73a7c70096b51e36ef299469b08989a93c39",
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+    },
+    {
+      "quant": "Q3_K_M",
+      "layer_weight_bytes": 470167808,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "gguf": "Qwen3.5-0.8B-Q3_K_M.gguf",
+      "sha256": "c49ad509cd0a3f8584c4eff50d84202336bf9475b8a724c89f4061687c1fb510",
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+    },
+    {
+      "quant": "Q3_K_XL",
+      "layer_weight_bytes": 492216576,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "gguf": "Qwen3.5-0.8B-UD-Q3_K_XL.gguf",
+      "sha256": "30a1353e67c9795e375dac8a19d25429ace0ec2b6ca55436406ee02d2603a218",
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+    },
+    {
+      "quant": "IQ4_XS",
+      "layer_weight_bytes": 492605696,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "gguf": "Qwen3.5-0.8B-IQ4_XS.gguf",
+      "sha256": "619917ae92f61eb6515a7070e944a0a7c2b198a2cf6536386f475485188a36ff",
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+    },
+    {
+      "quant": "IQ4_NL",
+      "layer_weight_bytes": 506859776,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "gguf": "Qwen3.5-0.8B-IQ4_NL.gguf",
+      "sha256": "de9f7f28a4155c1678cbdae54c61ae63aa6326f7fffd2cdacfb765cfeab21670",
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+    },
+    {
+      "quant": "Q4_0",
+      "layer_weight_bytes": 507154688,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "gguf": "Qwen3.5-0.8B-Q4_0.gguf",
+      "sha256": "444406ddd926550c724ec18d5120a9d40ded44908a063b0e66e9a7e5464c652c",
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+    },
+    {
+      "quant": "Q4_K_S",
+      "layer_weight_bytes": 508104960,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "gguf": "Qwen3.5-0.8B-Q4_K_S.gguf",
+      "sha256": "5f7ccfa6e9df0d9ebbaff9ee095b18202bec1e0ac313ca688d2c57c9c80a6bc9",
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+    },
+    {
+      "quant": "Q4_K_M",
+      "layer_weight_bytes": 532517120,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "gguf": "Qwen3.5-0.8B-Q4_K_M.gguf",
+      "sha256": "bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517",
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+    },
+    {
+      "quant": "Q4_1",
+      "layer_weight_bytes": 535171328,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "gguf": "Qwen3.5-0.8B-Q4_1.gguf",
+      "sha256": "e5926ccfef0c54aebf5d8bda01b2fb6c12ceff4f02a490bc108c5fabf60b334e",
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+    },
+    {
+      "quant": "Q4_K_XL",
+      "layer_weight_bytes": 558772480,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "gguf": "Qwen3.5-0.8B-UD-Q4_K_XL.gguf",
+      "sha256": "3177ebd67afe4438374da19e690bc1b98756f7e0fea9240e1be404336156a7b5",
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+    },
+    {
+      "quant": "Q5_K_S",
+      "layer_weight_bytes": 568889600,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "gguf": "Qwen3.5-0.8B-Q5_K_S.gguf",
+      "sha256": "a201a5899049a7f7845f910ad803574787b4474c3daffc0d33e8688f9114880f",
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
     },
     {
       "quant": "Q5_K_M",
-      "layer_weight_bytes": 370502912,
-      "shared_weight_bytes": 208592896,
+      "layer_weight_bytes": 590057728,
+      "shared_weight_bytes": 0,
       "repo": "unsloth/Qwen3.5-0.8B-GGUF",
-      "gguf": "Qwen3.5-0.8B-Q5_K_M.gguf"
+      "gguf": "Qwen3.5-0.8B-Q5_K_M.gguf",
+      "sha256": "c3ef5827b322c4be08a3a26ce424460d8b37daf593356c2cc1f4e40a7ab0581b",
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+    },
+    {
+      "quant": "Q5_K_XL",
+      "layer_weight_bytes": 606585088,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "gguf": "Qwen3.5-0.8B-UD-Q5_K_XL.gguf",
+      "sha256": "299824f81e5a1d84bf49db6b603b1c002a4e910c6e9f242a504ddc51e758ee0e",
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
     },
     {
       "quant": "Q6_K",
-      "layer_weight_bytes": 419474688,
-      "shared_weight_bytes": 208592896,
+      "layer_weight_bytes": 639029504,
+      "shared_weight_bytes": 0,
       "repo": "unsloth/Qwen3.5-0.8B-GGUF",
-      "gguf": "Qwen3.5-0.8B-Q6_K.gguf"
+      "gguf": "Qwen3.5-0.8B-Q6_K.gguf",
+      "sha256": "8408c5c222111cec253682b49eece2a02ed641ded68490001ec4ee160e71098e",
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+    },
+    {
+      "quant": "Q6_K_XL",
+      "layer_weight_bytes": 771092736,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "gguf": "Qwen3.5-0.8B-UD-Q6_K_XL.gguf",
+      "sha256": "8f0cb1e8e058e45c7d9676fcd4da2f08eb62ff537da747a6ffc7157c1f6a5684",
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
     },
     {
       "quant": "Q8_0",
-      "layer_weight_bytes": 530705664,
-      "shared_weight_bytes": 270176256,
+      "layer_weight_bytes": 811843840,
+      "shared_weight_bytes": 0,
       "repo": "unsloth/Qwen3.5-0.8B-GGUF",
-      "gguf": "Qwen3.5-0.8B-Q8_0.gguf"
+      "gguf": "Qwen3.5-0.8B-Q8_0.gguf",
+      "sha256": "0ad885ffd4bb022fc4f0d33a3308fa108ef8613159d3b3a67e23abca056b7a6c",
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+    },
+    {
+      "quant": "Q8_K_XL",
+      "layer_weight_bytes": 1186443520,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+      "gguf": "Qwen3.5-0.8B-UD-Q8_K_XL.gguf",
+      "sha256": "167183aecc0735359970e977c21a88c7d69112be06aa5d2df27c0d2a23662805",
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
     },
     {
       "quant": "BF16",
-      "layer_weight_bytes": 997219584,
-      "shared_weight_bytes": 508563456,
+      "layer_weight_bytes": 1516744736,
+      "shared_weight_bytes": 0,
       "repo": "unsloth/Qwen3.5-0.8B-GGUF",
-      "gguf": "Qwen3.5-0.8B-BF16.gguf"
+      "gguf": "Qwen3.5-0.8B-BF16.gguf",
+      "sha256": "cedf89af31c9041b601fa58303285bc46d99c51baee1b13f5e919626ca526ee5",
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
     }
   ],
   "notes": [

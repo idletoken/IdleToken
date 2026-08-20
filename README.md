@@ -45,7 +45,7 @@ The OpenAI-compatible endpoint works at the same base URL. Requests run on clust
 
 IdleToken is a desktop app; normal use needs no command line. Installers for Windows, Linux and macOS are on the [Releases](https://github.com/idletoken/IdleToken/releases) page.
 
-1. **Pick a model** — from the built-in list, a local GGUF file, or a Hugging Face link. The app checks it against this machine's available VRAM and RAM.
+1. **Pick a model** — from the built-in list. The app checks it against this machine's available VRAM and RAM.
 2. **Start serving** — missing weights download automatically. The API listens on `:8000`; the app shows the address and the generated API key.
 
 Connect Claude Code:
@@ -71,7 +71,7 @@ To earn Sparks, turn on sharing while your cluster is idle — it is off by defa
 
 ## Models
 
-IdleToken runs text-generation models in GGUF format — from the built-in list, a local file, or a Hugging Face link; model metadata is read from the GGUF header. Multimodal input is not supported.
+IdleToken serves a curated list of text-generation models in GGUF format. Every listed model is verified on our real hardware before it ships — that is what keeps shared endpoints trustworthy, so the list is deliberately not an "open any file" box. Missing a model you need? [Open an issue](https://github.com/idletoken/IdleToken/issues) and we will evaluate it for the next list update. Multimodal input is not supported.
 
 The built-in models:
 

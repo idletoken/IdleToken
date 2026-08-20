@@ -2,7 +2,7 @@
 // Split into a Simple set (what a home user needs) and an Advanced set (precise
 // control). Persisted to localStorage and restored on launch. Theme + language
 // live separately (pure UI state) but are surfaced in the Simple tab.
-import { DEFAULT_MODEL_ID, LOCAL_GGUF_ID, defaultQuant, isAvailable, quantOptions } from "./models";
+import { DEFAULT_MODEL_ID, defaultQuant, isAvailable, quantOptions } from "./models";
 
 const MiB = 1024 ** 2;
 
@@ -37,15 +37,10 @@ export interface AppSettings {
   // ---- simple ----
   modelId: string;
   quant: string; // selected precision ("" = model's default variant / single-precision models)
-  // ---- open model intake (v2 WS-D1; modelId === LOCAL_GGUF_ID) -------------
-  // Where the user-supplied GGUF comes from. Unlike the removed v3 "GGUF file
-  // path" box, these are never handed to the engine unchecked: the file path
-  // comes from a native dialog (a real, existing file), and the HF pair goes
-  // through the same verified download machinery as curated weights.
-  customSource: "file" | "hf";
-  customGgufPath: string; // absolute path picked in the native dialog ("" = none)
-  customHfRepo: string; // e.g. "unsloth/Qwen3.5-4B-GGUF" ("" = none)
-  customHfFile: string; // exact .gguf file name inside the repo
+  // No open-intake fields any more (customSource/customGgufPath/customHfRepo/
+  // customHfFile, removed 2026-08-15 with the open model intake): the curated
+  // registry is the whole selectable set, and a stored "local-gguf" selection
+  // migrates back to the default model below.
   tier: Tier["id"];
   resourcePreset: ResourcePreset;
   // ---- advanced: resources (precise; used when resourcePreset === "custom") ----
@@ -65,6 +60,30 @@ export interface AppSettings {
   apiOpenAI: boolean;
   apiAnthropic: boolean;
   apiToken: string; // empty = no auth (LAN default)
+  // ---- sharing: lend when idle, borrow when busy (one switch) ----
+  //
+  // One setting, because it is one deal: this machine takes other people's work
+  // when it is free and hands its own overflow to someone else when it is full.
+  // Splitting it into two switches would offer "only earn" and "only spend" as
+  // if they were separate products; they are the two halves of the same
+  // exchange, and the pricing only works if most machines do both.
+  sharingEnabled: boolean;
+  /** Ceiling on what borrowing may cost in one UTC day, in milli-credits.
+   *  Adjustable, never zero-able: an automatic spender with no ceiling empties
+   *  a balance overnight and the owner finds out afterwards. Shown next to the
+   *  switch rather than in an advanced pane -- it is the only guard rail
+   *  against a switch that can both earn and spend. */
+  overflowDailyCapMilli: number;
+  /** Only borrow once this machine's estimated wait reaches this many seconds.
+   *  0 = borrow as soon as it is full. Advanced: the useful default is 0 and
+   *  the setting only matters to someone who would rather queue than pay. */
+  overflowWaitS: number;
+  /** The platform API key borrowing is billed to. Minted on first use and kept
+   *  so the switch does not create a new key every time it is flipped -- an
+   *  account slowly filling with abandoned keys is worse than one key the user
+   *  can see and revoke. Stored beside apiToken, which is already a secret in
+   *  the same store. */
+  overflowKey: string;
   // ---- advanced: default sampling (interface-reserved; sampler is argmax today) ----
   temperature: number;
   topP: number;
@@ -132,6 +151,19 @@ export interface AppSettings {
   apiRequestLog: boolean;
 
   // ---- power / thermal / scheduling (home shared machines) ----
+  //
+  // NONE of the fields in this block is wired to anything (checked 2026-08-19:
+  // no reader outside this file, and SettingsPanel renders an explicit key list
+  // that does not include them). They are kept, not rendered: persisted
+  // settings from older builds already carry them, and dropping the fields
+  // would mean a schema migration to buy nothing.
+  //
+  // pauseOnGpuBusy specifically: the honest implementation is worker-side --
+  // detect foreground GPU use and stop accepting work -- and only Windows has a
+  // reliable foreground-GPU signal (DXGI / performance counters). That is its
+  // own piece of work, scheduled with the sharing side, not a checkbox. Do not
+  // surface any of these in the UI until the behaviour behind them exists: a
+  // toggle that does nothing is worse than an absent one.
   pauseOnGpuBusy: boolean; // pause contributing while a foreground app uses the GPU (gaming)
   scheduleEnabled: boolean;
   scheduleFrom: string; // "23:00"
@@ -191,23 +223,44 @@ export interface AppSettings {
 const BUILT_IN_PLATFORM_URL: string =
   (typeof import.meta !== "undefined" && (import.meta as any).env?.VITE_PLATFORM_URL) || "";
 
+/** Mirror of the coordinator's IDLETOKEN_OVF_DEFAULT_DAILY_CAP_MILLI
+ * (include/idletoken_overflow.h). It lives here as a named constant because
+ * the number used to be spelled out in three places — the defaults below, the
+ * launch-argument fallback, and the panel's initial field value — and there is
+ * no reason for those to be able to drift apart. */
+export const OVERFLOW_DEFAULT_DAILY_CAP_MILLI = 50000;
+
 export const DEFAULT_SETTINGS: AppSettings = {
   modelId: DEFAULT_MODEL_ID,
   quant: defaultQuant(DEFAULT_MODEL_ID),
-  customSource: "file",
-  customGgufPath: "",
-  customHfRepo: "",
-  customHfFile: "",
   tier: 2,
-  resourcePreset: "balanced",
+  // Full power by default (2026-08-15, was "balanced"): the product's whole
+  // promise is using this machine's idle capacity, and a fresh install that
+  // silently keeps 25% back both underuses the hardware and misreports what
+  // the machine could serve. Whoever needs headroom turns it down knowingly.
+  resourcePreset: "max",
   maxVramMb: 0,
   maxRamMb: 0,
   computeMode: "auto",
-  apiHost: "0.0.0.0",
+  apiHost: "127.0.0.1",
   apiPort: 8000,
   apiOpenAI: true,
   apiAnthropic: true,
   apiToken: "",
+  // Off by default. Sharing sends this machine other people's prompts and
+  // spends this account's credits; both are decisions to be made, not defaults
+  // to be discovered.
+  sharingEnabled: false,
+  // 50 credits/day. Matches the coordinator's own default
+  // (IDLETOKEN_OVF_DEFAULT_DAILY_CAP_MILLI) so the number shown here is the
+  // number in force. Raised from 5 on 2026-08-19 against the measured rate card
+  // (anchor-proposal-v1, D2): 5 credits bought one 27B-class conversation, so
+  // the feature looked broken to anyone who switched it on. 50 is still a
+  // guardrail — a default that surprises someone by refusing is recoverable in
+  // a way that one which surprises them by spending is not.
+  overflowDailyCapMilli: OVERFLOW_DEFAULT_DAILY_CAP_MILLI,
+  overflowWaitS: 0,
+  overflowKey: "",
   temperature: 0.7,
   topP: 0.95,
   topK: 40,
@@ -249,7 +302,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   mdns: true,
   discoveryPort: 14099,
   manualPeers: "",
-  clusterName: "home",
+  clusterName: "IdleToken-Home",
   // 1s, not the 5 it used to say: these six were hollow until 2026-08-13, so
   // the stored numbers described nothing. Now that the poll really uses it, the
   // default has to be the interval the client has always polled at — otherwise
@@ -436,18 +489,17 @@ export function loadSettings(): AppSettings {
         if (cut > 0) merged.modelDir = legacy.ggufPath.slice(0, cut);
       }
     }
+    // No migration for the cluster-name default rename ("home" →
+    // "IdleToken-Home", 2026-08-15): a stored "home" MAY be a deliberate
+    // choice, and rewriting a name the user could have typed is worse than
+    // letting old and new defaults coexist. Machines that should pair must
+    // simply agree on the name — which the field says out loud.
     // The picker only lists models the engine can run, so a stored id outside
-    // that set (hand-edited storage, a model withdrawn between releases) would
+    // that set (hand-edited storage, a model withdrawn between releases, or
+    // the "local-gguf" sentinel of the open intake removed 2026-08-15) would
     // leave the list with nothing selected and no way to select anything.
-    // Fall back rather than render a dead panel. The open-intake sentinel is
-    // valid exactly when its source details survived — a bare sentinel with no
-    // file/repo would render a selection that cannot start anything.
-    const customOk =
-      merged.modelId === LOCAL_GGUF_ID &&
-      (merged.customSource === "hf"
-        ? !!(merged.customHfRepo && merged.customHfFile)
-        : !!merged.customGgufPath);
-    if (!isAvailable(merged.modelId) && !customOk) {
+    // Fall back rather than render a dead panel.
+    if (!isAvailable(merged.modelId)) {
       merged.modelId = DEFAULT_MODEL_ID;
       merged.quant = defaultQuant(DEFAULT_MODEL_ID);
     }
@@ -481,11 +533,12 @@ export function saveSettings(s: AppSettings): void {
 // AppSettings → engine CLI args). Serializable mirror of the Rust `Tuning`
 // struct in src-tauri/src/pairing.rs — every field has a real engine/pairing
 // destination:
-//   apiHost + apiPort → coord `--api-bind host:port` (apiPort is also
-//                       broadcast via the roster so joiners poll the right
-//                       status port and show the right baseUrl)
+//   apiHost + apiPort → coord `--api-bind host:port`. The host is always
+//                       127.0.0.1 since 2026-08-15 — the API serves its own
+//                       machine only (coord enforces it).
 //   apiToken          → coord `--api-token` (401 without it on the inference
-//                       endpoints; empty = open on the LAN)
+//                       endpoints; empty = open, which only loopback callers
+//                       can reach anyway)
 //   interStagePort    → worker `--bind 0.0.0.0:port` (the coordinator's
 //                       co-located worker binds port+1 to avoid collision)
 //   discoveryPort     → the pairing layer's UDP beacon port (both sides must
@@ -533,6 +586,21 @@ export interface EngineTuning {
   /** "auto" or an IPv4: which interface cluster traffic binds to and which
    *  address this machine advertises to the others. */
   bindNic: string;
+  // ---- overflow (borrow when full) -> coord --overflow-* ------------------
+  //
+  // Launch parameters, not live controls: the coordinator reads them once, at
+  // start. Turning sharing on therefore restarts the engine, which is the same
+  // thing switching models does and is described to the user in the same words
+  // -- there is no hot swap and pretending otherwise would leave the switch
+  // showing a state the engine is not in.
+  /** Platform base URL, or "" for off. Empty here means no --overflow-* flags
+   *  reach the coordinator at all. */
+  overflowUrl: string;
+  /** The account key the borrowed time is billed to. Sealed inside the
+   *  envelope by the coordinator, never sent as a header. */
+  overflowKey: string;
+  overflowWaitS: number;
+  overflowDailyCapMilli: number;
 }
 
 export function tierCtx(tier: Tier["id"]): number {
@@ -565,7 +633,10 @@ export function engineTuning(
     preferCoordinator: s.preferCoordinator,
     sameSubnetOnly: s.sameSubnetOnly,
     bindNic: s.bindNic,
-    apiHost: s.apiHost || "0.0.0.0",
+    // Always loopback (2026-08-15): the API serves its own machine only, and
+    // both the Rust spawn path and the coordinator itself normalize anything
+    // else — the stored value (old installs may hold "0.0.0.0") is ignored.
+    apiHost: "127.0.0.1",
     apiPort: s.apiPort || 8000,
     apiToken: s.apiToken,
     interStagePort: s.interStagePort || 14101,
@@ -577,6 +648,16 @@ export function engineTuning(
     // sends, so the number the user typed is the number that governs — for
     // third-party API clients too, not just our own chat.
     maxDecode: s.maxTokens,
+    // Overflow reaches the coordinator only when the sharing switch is on AND
+    // a key has been minted for it. Anything less and the URL is left empty,
+    // which is how the coordinator is told "do not enable this" -- there is no
+    // separate off flag to fall out of step with the credentials.
+    overflowUrl: s.sharingEnabled && s.overflowKey ? s.platformUrl.trim().replace(/\/+$/, "") : "",
+    overflowKey: s.sharingEnabled ? s.overflowKey : "",
+    overflowWaitS: Math.max(0, s.overflowWaitS || 0),
+    // Never 0: 0 means "the coordinator's own default", not "no ceiling", and
+    // the coordinator has no way to express "no ceiling" at all.
+    overflowDailyCapMilli: Math.max(1, s.overflowDailyCapMilli || OVERFLOW_DEFAULT_DAILY_CAP_MILLI),
   };
 }
 

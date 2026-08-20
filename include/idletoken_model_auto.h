@@ -36,6 +36,12 @@ typedef struct {
      * 0 = the header carries no attention shape at all (caller must treat the
      * KV cost as unknown, not as free). */
     uint64_t kv_bytes_per_token;
+    /* MoE shape from <arch>.expert_count / <arch>.expert_used_count; 0/0 on a
+     * dense model. The scheduler needs them to size the WORKING SET — the
+     * bytes a token actually touches, which on an MoE is a fraction of the
+     * file and is what decides speed (idletoken_llama_working_set). */
+    uint32_t n_expert;
+    uint32_t n_expert_used;
 } idletoken_auto_model;
 
 /* Parse `path`'s GGUF header into `out`. Returns 0 on success, -1 with a

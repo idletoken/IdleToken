@@ -26,52 +26,139 @@
 #define IDLETOKEN_METAL_WORKSPACE_BYTES (512ull * 1024ull * 1024ull)          /* 0.5 GB */
 #define IDLETOKEN_RAM_SAFETY_BYTES      (4ull * 1024ull * 1024ull * 1024ull)  /* 4.0 GB */
 
-/* Blunt proportional ceiling on `ram_usable`, applied on top of the
- * "total − used_other − safety" subtraction and independent of it.
+/* Headroom the machine keeps for itself, as an ABSOLUTE amount — applied on
+ * top of the "total − used_other − safety" subtraction, and only ever as a
+ * backstop.
  *
- * Why a second, cruder rule: the subtraction *looks* precise and is not. It
- * charges only what other processes hold at probe time, so anything our own
- * load costs beyond the raw weight bytes is unaccounted — and on Windows that
- * turned out to be large. Measured on win-a (63.7 GiB, 28 layers): available
- * memory sat at 128–730 MiB for the whole run, not as a loading dip but as the
- * steady state, while the formula believed 53.7 GiB were usable and ~10 GiB
- * would be left over. A machine that plans to the last byte hangs the moment
- * anything else asks for memory; the user hit exactly that twice, screen on and
- * keyboard dead.
+ * HISTORY, because the shape of this rule changed for a reason (2026-08-16).
+ * It used to be a proportional ceiling (70% of RAM), introduced after two
+ * hangs on win-a: available memory sat at 128–730 MiB for a whole run while
+ * the subtraction believed ~10 GiB would be left over. That was measured
+ * against **ds4**, which ALLOCATED the weights — unreclaimable memory, so
+ * planning to the last byte really did starve the machine.
  *
- * Parallax (GradientHQ) caps parameter memory at a flat 50% of device memory
- * and never subtracts anything — cruder than us and it does not hang. The
- * lesson taken is not the number but the shape: keep a floor of headroom that
- * no amount of estimation error can eat into.
+ * llama.cpp mmaps the weights instead: they are page cache, and the kernel
+ * evicts them under pressure. Measured 2026-08-16 on DGX (119.6 GiB RAM,
+ * GLM-5.2 IQ2_XXS = 222 GiB — nearly 2x physical): the model loaded, served,
+ * and generated at 0.91 tok/s, RSS plateaued at physical RAM, and
+ * **MemAvailable never fell below 113 GiB** across 245 samples. The failure
+ * the proportional ceiling defends against does not occur on this engine.
+ * (docs/resource-budget-rethink-2026-08.md §5.)
  *
- * 70% of a 64 GiB box leaves ~19 GiB, which still admits the 28-layer split
- * this cluster actually runs. It is a ceiling, not a target: the subtraction
- * still wins whenever it is lower. Override with IDLETOKEN_RAM_MAX_PCT for
- * measurement; values outside 10..95 are ignored. */
-#define IDLETOKEN_RAM_MAX_PCT           70
+ * Two problems with the old shape, both real:
+ *   - it BOUND on 2 of 3 testbed machines, i.e. one hardcoded percentage —
+ *     not the careful subtraction under it — decided the whole product's
+ *     memory budget;
+ *   - the risk it guards (the OS being starved) needs a roughly FIXED reserve,
+ *     while a proportion wastes 36 GiB on a 119 GiB box and leaves a 16 GiB
+ *     laptop only 4.8.
+ *
+ * So: leave a mostly-fixed amount and let the subtraction (which measures what
+ * is actually in use) govern normally.
+ *
+ * `total/8` clamped to [4, 12] GiB rather than a flat number, because both
+ * extremes are wrong at one end: a flat 8 GiB takes HALF of a 16 GiB laptop,
+ * while a flat 4 GiB is thin on a 119 GiB box hosting a 200 GiB working set.
+ * The clamp keeps it within a range a human can sanity-check:
+ *     16 GiB → 4    64 GiB → 8    119 GiB → 12
+ * Override with IDLETOKEN_OS_HEADROOM_GIB for measurement; values outside
+ * 1..64 are ignored, so a typo cannot disable the backstop. */
+#define IDLETOKEN_OS_HEADROOM_MIN_BYTES (4ull * 1024ull * 1024ull * 1024ull)
+#define IDLETOKEN_OS_HEADROOM_MAX_BYTES (12ull * 1024ull * 1024ull * 1024ull)
 
 /* Hardware floor. A node below any of these cannot serve layers, and finding
  * that out at model-load time (or worse: as garbage tokens) is exactly the
  * experience this floor exists to prevent.
  *
- * cc 7.5 = Turing = RTX 20 series. Everything older lacks the tensor-core /
- * fp16 paths the ds4 and ds4x kernels are written against.
+ * cc 7.5 = Turing. Say plainly what this is and is not: it is a SUPPORT
+ * boundary, not a claim that older cards cannot run the engine. The pinned
+ * llama.cpp does support Volta -- ggml-cuda/common.cuh defines
+ * GGML_CUDA_CC_VOLTA (700) and gates a dedicated VOLTA_MMA_AVAILABLE
+ * tensor-core path on it -- and a real Tesla V100 (cc 7.0, driver 580.173.02)
+ * passed every probe and floor check on 2026-08-17 once the floor was lowered.
+ * We choose not to carry it.
  *
- * The driver floor tracks the CUDA toolkit each shipped package is BUILT with,
- * because that is what the runtime demands:
- *   - Windows package: ds4cuda.dll built with CUDA 12.8 -> 527.41 (CUDA 12.x
- *     minimum; minor-version compatibility covers 12.0..12.9, which is why a
- *     555.85 laptop runs a 12.8 build).
- *   - Linux package: built with CUDA 13.0 -> 580.65.
- * Rebuild against a different toolkit => update these. */
+ * Why 7.5 and not lower, now that the old reason is gone (it used to read
+ * "the tensor-core / fp16 paths the ds4 and ds4x kernels are written against",
+ * and those kernels were shelved on 2026-08-16 -- Makefile: DS4X_*_OBJ :=
+ * # shelved -- so the floor was guarding a dead code path):
+ *
+ *   - NVIDIA is removing the ground under pre-7.5. CUDA 12.9 already warns
+ *     "support for offline compilation for architectures prior to sm_75 will
+ *     be removed in a future release", and CUDA 13.0 has removed sm_70
+ *     outright (measured with `nvcc --list-gpu-arch` on both: 12.9 emits 70,
+ *     13.0 starts at 75). Supporting Volta means pinning the whole Linux
+ *     build to a 12.x toolkit for as long as we promise it.
+ *   - Every supported architecture is a testbed obligation, not just a
+ *     -gencode flag. Nothing in the acceptance ladder covers Volta.
+ *
+ * So the floor is 7.5 because that is where our toolchain and our testing can
+ * both hold, and anyone with older hardware can build for it themselves.
+ *
+ * The driver floor tracks the CUDA toolkit this build is compiled against,
+ * because that is what the runtime demands. It used to be two hand-written
+ * constants -- Windows 527.41 (CUDA 12.x) and Linux 580.65 (CUDA 13.0) -- with
+ * a comment saying "rebuild against a different toolkit => update these".
+ * Nobody does. On 2026-08-16 a Linux build made with CUDA 12.4 still refused
+ * an RTX 4090 on driver 550.142, quoting the 580.65 floor of a toolkit it was
+ * not built with: a perfectly capable machine turned away with a sentence that
+ * was simply false for those bytes. The same coupling had already misfired on
+ * Windows (docs/cross-machine-pp-analysis.md: a CUDA 13.3 build refused a
+ * 555.85 laptop until it was rebuilt against 12.8).
+ *
+ * So derive it. CUDART_VERSION is defined by the CUDA headers this
+ * translation unit is compiled with, and minor-version compatibility means
+ * the floor is a function of the MAJOR version only: any 12.x runs on the
+ * 12.0 minimum driver. Values are NVIDIA's published per-toolkit minimums.
+ *
+ * ⚠ Residual gap, deliberately left visible rather than papered over: what
+ * actually loads CUDA at inference time is llama.cpp's backend, built by
+ * scripts/build_llamacpp.sh with whatever toolkit that machine has -- not
+ * necessarily the one coord/worker were compiled against. When they differ,
+ * this floor describes the wrong binary. It is right whenever both are built
+ * on the same machine (every path we ship today), and it can no longer be
+ * wrong merely because someone forgot to edit a constant. */
 #define IDLETOKEN_MIN_CC_MAJOR   7
 #define IDLETOKEN_MIN_CC_MINOR   5
-#ifdef _WIN32
-  #define IDLETOKEN_MIN_DRIVER_MAJOR 527
-  #define IDLETOKEN_MIN_DRIVER_MINOR 41
+
+/* CUDART_VERSION comes from the CUDA headers; include them when this machine
+ * has them. Guarded by __has_include because the macOS build has no CUDA at
+ * all, and the header is not on the include path of every target. */
+#if defined(__has_include)
+#  if __has_include(<cuda_runtime_api.h>)
+#    include <cuda_runtime_api.h>
+#  endif
+#endif
+
+#if defined(CUDART_VERSION) && CUDART_VERSION < 12000
+  /* Fail loudly rather than hand back a 12.x floor that is simply wrong for an
+   * older toolkit (it would refuse machines that work). No silent fallback. */
+  #error "IdleToken needs CUDA 12 or newer; this build sees an older CUDART_VERSION"
+#endif
+
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
+  /* CUDA 13.x. Linux figure verified on the DGX Spark (driver 580.126.09). */
+  #ifdef _WIN32
+    #define IDLETOKEN_MIN_DRIVER_MAJOR 580
+    #define IDLETOKEN_MIN_DRIVER_MINOR 88
+  #else
+    #define IDLETOKEN_MIN_DRIVER_MAJOR 580
+    #define IDLETOKEN_MIN_DRIVER_MINOR 65
+  #endif
 #else
-  #define IDLETOKEN_MIN_DRIVER_MAJOR 580
-  #define IDLETOKEN_MIN_DRIVER_MINOR 65
+  /* CUDA 12.x, and the fallback when no CUDA header is visible (macOS, or a
+   * target built without the CUDA include path). Falling back to the LOWER
+   * floor is the deliberate direction: the higher floor's only justification
+   * is a CUDA 13 build, and a translation unit that cannot see the CUDA
+   * headers is not one. The Windows figure is the one verified in practice --
+   * a 555.85 laptop runs the 12.8 build. */
+  #ifdef _WIN32
+    #define IDLETOKEN_MIN_DRIVER_MAJOR 527
+    #define IDLETOKEN_MIN_DRIVER_MINOR 41
+  #else
+    #define IDLETOKEN_MIN_DRIVER_MAJOR 525
+    #define IDLETOKEN_MIN_DRIVER_MINOR 60
+  #endif
 #endif
 /* Hard constraint (docs/architecture.md §2): every node needs a GPU with at least this much VRAM
  * (CUDA context + workspace + at least one layer). Unified-memory hosts are

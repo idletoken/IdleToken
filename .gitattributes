@@ -1,0 +1,23 @@
+# cmd.exe reads a batch file by SEEKING to a byte offset, not by buffering
+# lines. With LF-only endings its offsets drift, so it resumes mid-line and
+# executes the tail of a comment as a command. The symptom is not "syntax
+# error": it is a pile of
+#
+#   'ild' is not recognized as an internal or external command
+#   'coord_main' is not recognized as an internal or external command
+#
+# — fragments of REM lines — followed by the script's own failure message,
+# which is what you actually read and believe (2026-08-19: this cost an hour
+# chasing a missing MinGW that was present the whole time; the probe for it
+# worked perfectly when tested on its own line).
+#
+# So: batch files are CRLF in the working tree on every platform, checked in
+# with CRLF, and never normalised. `* text=auto` is deliberately NOT set here
+# — it would rewrite these on checkout and reintroduce exactly this.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# PowerShell is not affected by the seek behaviour (it buffers), but it lives
+# on the same machines and mixed endings in one directory invite the next
+# person to "fix" one of them.
+*.ps1 text eol=crlf

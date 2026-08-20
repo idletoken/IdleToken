@@ -13,8 +13,8 @@
   "n_embd": 4096,
   "hc_streams": 4,
   "n_vocab": 129280,
-  "layer_weight_bytes": 85092941824,
-  "shared_weight_bytes": 1621835840,
+  "layer_weight_bytes": 82539237024,
+  "shared_weight_bytes": 0,
   "context_max": 1048576,
   "split": {
     "boundary_multiple": 0
@@ -24,29 +24,386 @@
     "bytes_per_token_per_layer": 0
   },
   "overhead_base_bytes": 0,
-  "default_gguf": "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf",
+  "default_gguf": "UD-IQ1_S/DeepSeek-V4-Flash-UD-IQ1_S-00001-of-00003.gguf",
   "chat_template": "ds4",
   "sources": [
     {
-      "repo": "antirez/deepseek-v4-gguf",
-      "quant": "IQ2_XXS+Q2_K"
-    }
-  ],
-  "default_quant": "IQ2_XXS+Q2_K",
-  "variants": [
-    {
-      "quant": "IQ2_XXS+Q2_K",
-      "layer_weight_bytes": 85092941824,
-      "shared_weight_bytes": 1621835840,
-      "repo": "antirez/deepseek-v4-gguf",
-      "gguf": "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
+      "repo": "unsloth/DeepSeek-V4-Flash-GGUF",
+      "quant": "IQ1_S"
     },
     {
-      "quant": "IQ2_XXS+Q4_K-L37-42",
-      "layer_weight_bytes": 95964577792,
-      "shared_weight_bytes": 1621835840,
-      "repo": "antirez/deepseek-v4-gguf",
-      "gguf": "DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf"
+      "repo": "unsloth/DeepSeek-V4-Flash-GGUF",
+      "quant": "IQ1_M"
+    },
+    {
+      "repo": "unsloth/DeepSeek-V4-Flash-GGUF",
+      "quant": "IQ2_XXS"
+    },
+    {
+      "repo": "unsloth/DeepSeek-V4-Flash-GGUF",
+      "quant": "IQ2_M"
+    },
+    {
+      "repo": "unsloth/DeepSeek-V4-Flash-GGUF",
+      "quant": "Q2_K_XL"
+    },
+    {
+      "repo": "unsloth/DeepSeek-V4-Flash-GGUF",
+      "quant": "IQ3_XXS"
+    },
+    {
+      "repo": "unsloth/DeepSeek-V4-Flash-GGUF",
+      "quant": "IQ3_S"
+    },
+    {
+      "repo": "unsloth/DeepSeek-V4-Flash-GGUF",
+      "quant": "Q3_K_M"
+    },
+    {
+      "repo": "unsloth/DeepSeek-V4-Flash-GGUF",
+      "quant": "Q3_K_XL"
+    },
+    {
+      "repo": "unsloth/DeepSeek-V4-Flash-GGUF",
+      "quant": "IQ4_NL"
+    },
+    {
+      "repo": "unsloth/DeepSeek-V4-Flash-GGUF",
+      "quant": "IQ4_XS"
+    },
+    {
+      "repo": "unsloth/DeepSeek-V4-Flash-GGUF",
+      "quant": "Q4_K_XL"
+    },
+    {
+      "repo": "unsloth/DeepSeek-V4-Flash-GGUF",
+      "quant": "Q8_K_XL"
+    }
+  ],
+  "default_quant": "IQ1_S",
+  "variants": [
+    {
+      "quant": "IQ1_S",
+      "layer_weight_bytes": 82539237024,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/DeepSeek-V4-Flash-GGUF",
+      "gguf": "UD-IQ1_S/DeepSeek-V4-Flash-UD-IQ1_S-00001-of-00003.gguf",
+      "sha256": "b191572a6376fecf1bb653b0fd04fa0d38c4eadbaa995f1ad8ac604dea64649a",
+      "revision": "e3aa0d6a5fa4f820d9e132ac1fd1d01e1b2b49e0",
+      "parts": [
+        {
+          "file": "UD-IQ1_S/DeepSeek-V4-Flash-UD-IQ1_S-00002-of-00003.gguf",
+          "bytes": 49975054912,
+          "sha256": "6907d2c7b3389624c0ad8face70ce8b5e14d662f9aaa51e5f7ef8ae389735750"
+        },
+        {
+          "file": "UD-IQ1_S/DeepSeek-V4-Flash-UD-IQ1_S-00003-of-00003.gguf",
+          "bytes": 32558925248,
+          "sha256": "53dba406a9158bf2628f7b04190096fc236ff63d0a1bf189902c0b87587a3cce"
+        }
+      ]
+    },
+    {
+      "quant": "IQ1_M",
+      "layer_weight_bytes": 86901313152,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/DeepSeek-V4-Flash-GGUF",
+      "gguf": "UD-IQ1_M/DeepSeek-V4-Flash-UD-IQ1_M-00001-of-00003.gguf",
+      "sha256": "279f2abec23194a3d293a78e74daccba4e2b96b04eacfc44c4a2439a7b06bfac",
+      "revision": "e3aa0d6a5fa4f820d9e132ac1fd1d01e1b2b49e0",
+      "parts": [
+        {
+          "file": "UD-IQ1_M/DeepSeek-V4-Flash-UD-IQ1_M-00002-of-00003.gguf",
+          "bytes": 49971881120,
+          "sha256": "65e130e081cf098d607e85b08a9bf1eceb2aa92dfaa9e880949c70e5f3b4638e"
+        },
+        {
+          "file": "UD-IQ1_M/DeepSeek-V4-Flash-UD-IQ1_M-00003-of-00003.gguf",
+          "bytes": 36924175168,
+          "sha256": "cda8950af479a83ee8c14c895cc447e144b3fe0ed9d4dde80440cec807ba413f"
+        }
+      ]
+    },
+    {
+      "quant": "IQ2_XXS",
+      "layer_weight_bytes": 90860736128,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/DeepSeek-V4-Flash-GGUF",
+      "gguf": "UD-IQ2_XXS/DeepSeek-V4-Flash-UD-IQ2_XXS-00001-of-00003.gguf",
+      "sha256": "cb4e49c79b28c8e11f3261ab1321a8d48e0520b6ea25d0bba9137db556bf5517",
+      "revision": "e3aa0d6a5fa4f820d9e132ac1fd1d01e1b2b49e0",
+      "parts": [
+        {
+          "file": "UD-IQ2_XXS/DeepSeek-V4-Flash-UD-IQ2_XXS-00002-of-00003.gguf",
+          "bytes": 49890588800,
+          "sha256": "c1d91faa0ad52d5e5302fa4ef286da056f9feea4e29475f3f7466c56053778c4"
+        },
+        {
+          "file": "UD-IQ2_XXS/DeepSeek-V4-Flash-UD-IQ2_XXS-00003-of-00003.gguf",
+          "bytes": 40964890464,
+          "sha256": "f80ae237748d94ffda1eb0ba793de0d80a7108453fed7cb5eee97e40d27a3398"
+        }
+      ]
+    },
+    {
+      "quant": "IQ2_M",
+      "layer_weight_bytes": 90926927488,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/DeepSeek-V4-Flash-GGUF",
+      "gguf": "UD-IQ2_M/DeepSeek-V4-Flash-UD-IQ2_M-00001-of-00003.gguf",
+      "sha256": "9a24d09040d040330e5e490cc888df65c43184e556fee8301ffbcd3db9bde8e3",
+      "revision": "e3aa0d6a5fa4f820d9e132ac1fd1d01e1b2b49e0",
+      "parts": [
+        {
+          "file": "UD-IQ2_M/DeepSeek-V4-Flash-UD-IQ2_M-00002-of-00003.gguf",
+          "bytes": 49956780160,
+          "sha256": "f2e8382860b99afac19bbfbbac7d817aecb855738b45bcdf06f315a1b160ebcd"
+        },
+        {
+          "file": "UD-IQ2_M/DeepSeek-V4-Flash-UD-IQ2_M-00003-of-00003.gguf",
+          "bytes": 40964890464,
+          "sha256": "f80ae237748d94ffda1eb0ba793de0d80a7108453fed7cb5eee97e40d27a3398"
+        }
+      ]
+    },
+    {
+      "quant": "Q2_K_XL",
+      "layer_weight_bytes": 96832507552,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/DeepSeek-V4-Flash-GGUF",
+      "gguf": "UD-Q2_K_XL/DeepSeek-V4-Flash-UD-Q2_K_XL-00001-of-00003.gguf",
+      "sha256": "5475dce5d7189b4304d490bf559d438c967bbc924ce5384ba8e9ecc0385cb003",
+      "revision": "e3aa0d6a5fa4f820d9e132ac1fd1d01e1b2b49e0",
+      "parts": [
+        {
+          "file": "UD-Q2_K_XL/DeepSeek-V4-Flash-UD-Q2_K_XL-00002-of-00003.gguf",
+          "bytes": 49437013568,
+          "sha256": "3faf8797868960141239b69bdd8105b0459fbc0f1927652889ae936a967fc4ca"
+        },
+        {
+          "file": "UD-Q2_K_XL/DeepSeek-V4-Flash-UD-Q2_K_XL-00003-of-00003.gguf",
+          "bytes": 47390237120,
+          "sha256": "4083f1f78e2730006acf78a458ac6b190faf1f515c30cce479a6f8d5066dda80"
+        }
+      ]
+    },
+    {
+      "quant": "IQ3_XXS",
+      "layer_weight_bytes": 102999887616,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/DeepSeek-V4-Flash-GGUF",
+      "gguf": "UD-IQ3_XXS/DeepSeek-V4-Flash-UD-IQ3_XXS-00001-of-00004.gguf",
+      "sha256": "efd54820d4124b88383e081504e480e8057ed1c20009f2002cd28884af658cd0",
+      "revision": "e3aa0d6a5fa4f820d9e132ac1fd1d01e1b2b49e0",
+      "parts": [
+        {
+          "file": "UD-IQ3_XXS/DeepSeek-V4-Flash-UD-IQ3_XXS-00002-of-00004.gguf",
+          "bytes": 49485728288,
+          "sha256": "76c77826a6efe13a2cbe79e95973a3c7fc55f1de8b2fd235d7fa2d935b76f8fa"
+        },
+        {
+          "file": "UD-IQ3_XXS/DeepSeek-V4-Flash-UD-IQ3_XXS-00003-of-00004.gguf",
+          "bytes": 49437886752,
+          "sha256": "bf5d5bfa9cf38334b98085249cfa11d29d3875607d34a6e82dadfa739f3f0e62"
+        },
+        {
+          "file": "UD-IQ3_XXS/DeepSeek-V4-Flash-UD-IQ3_XXS-00004-of-00004.gguf",
+          "bytes": 4071015712,
+          "sha256": "9eea1aa152d81a689e01a0d3cd25d33b43fa92fe4dc473aa65ba8eaa88234e55"
+        }
+      ]
+    },
+    {
+      "quant": "IQ3_S",
+      "layer_weight_bytes": 117310852864,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/DeepSeek-V4-Flash-GGUF",
+      "gguf": "UD-IQ3_S/DeepSeek-V4-Flash-UD-IQ3_S-00001-of-00004.gguf",
+      "sha256": "798bc5e3787d14b7d89489b69e3cba9068779839880cbedbf19118d8d9c762c0",
+      "revision": "e3aa0d6a5fa4f820d9e132ac1fd1d01e1b2b49e0",
+      "parts": [
+        {
+          "file": "UD-IQ3_S/DeepSeek-V4-Flash-UD-IQ3_S-00002-of-00004.gguf",
+          "bytes": 48999127776,
+          "sha256": "eb1ca0fc140c1d2b0efe60998029e6b37fd8f4f2b176b63b9ca4413878b6e464"
+        },
+        {
+          "file": "UD-IQ3_S/DeepSeek-V4-Flash-UD-IQ3_S-00003-of-00004.gguf",
+          "bytes": 49122679744,
+          "sha256": "7725f1737fe27e89ddd5d8908405e94ff530c83529a6f18eea71a220e8d78440"
+        },
+        {
+          "file": "UD-IQ3_S/DeepSeek-V4-Flash-UD-IQ3_S-00004-of-00004.gguf",
+          "bytes": 19183788480,
+          "sha256": "0ae5969594ea677b49467a062ebf6395de4bfd8b76d96cb8eb65a72f25b61c98"
+        }
+      ]
+    },
+    {
+      "quant": "Q3_K_M",
+      "layer_weight_bytes": 129319997216,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/DeepSeek-V4-Flash-GGUF",
+      "gguf": "UD-Q3_K_M/DeepSeek-V4-Flash-UD-Q3_K_M-00001-of-00004.gguf",
+      "sha256": "951458825be77e285141adb8a71bcb72abf26ab33a39bbdead9eb7d73ef7b396",
+      "revision": "e3aa0d6a5fa4f820d9e132ac1fd1d01e1b2b49e0",
+      "parts": [
+        {
+          "file": "UD-Q3_K_M/DeepSeek-V4-Flash-UD-Q3_K_M-00002-of-00004.gguf",
+          "bytes": 49222528448,
+          "sha256": "18b14302f74d59760ac8e8e113e83848586979ccfe8d0e3b73554bb1e82b6034"
+        },
+        {
+          "file": "UD-Q3_K_M/DeepSeek-V4-Flash-UD-Q3_K_M-00003-of-00004.gguf",
+          "bytes": 49189072672,
+          "sha256": "9c2c9878beb485d3553fe272edcc13f5959c31ec371f5df947fa0514b83cd4dc"
+        },
+        {
+          "file": "UD-Q3_K_M/DeepSeek-V4-Flash-UD-Q3_K_M-00004-of-00004.gguf",
+          "bytes": 30903139232,
+          "sha256": "2deb9faaa22707d4af983955f517f961d7e939e169a11ec129066186918a13ea"
+        }
+      ]
+    },
+    {
+      "quant": "Q3_K_XL",
+      "layer_weight_bytes": 129448242976,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/DeepSeek-V4-Flash-GGUF",
+      "gguf": "UD-Q3_K_XL/DeepSeek-V4-Flash-UD-Q3_K_XL-00001-of-00004.gguf",
+      "sha256": "951458825be77e285141adb8a71bcb72abf26ab33a39bbdead9eb7d73ef7b396",
+      "revision": "e3aa0d6a5fa4f820d9e132ac1fd1d01e1b2b49e0",
+      "parts": [
+        {
+          "file": "UD-Q3_K_XL/DeepSeek-V4-Flash-UD-Q3_K_XL-00002-of-00004.gguf",
+          "bytes": 49350774208,
+          "sha256": "63c873e288a2ab222bf902cfda53105cdf37fd714f0aa939070f8106fdda3242"
+        },
+        {
+          "file": "UD-Q3_K_XL/DeepSeek-V4-Flash-UD-Q3_K_XL-00003-of-00004.gguf",
+          "bytes": 49189072672,
+          "sha256": "9c2c9878beb485d3553fe272edcc13f5959c31ec371f5df947fa0514b83cd4dc"
+        },
+        {
+          "file": "UD-Q3_K_XL/DeepSeek-V4-Flash-UD-Q3_K_XL-00004-of-00004.gguf",
+          "bytes": 30903139232,
+          "sha256": "2deb9faaa22707d4af983955f517f961d7e939e169a11ec129066186918a13ea"
+        }
+      ]
+    },
+    {
+      "quant": "IQ4_NL",
+      "layer_weight_bytes": 137903959808,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/DeepSeek-V4-Flash-GGUF",
+      "gguf": "UD-IQ4_NL/DeepSeek-V4-Flash-UD-IQ4_NL-00001-of-00004.gguf",
+      "sha256": "c7fd97292fd41729235058a710891ac8cb566330e6833ab90204bdfd1fcbc92f",
+      "revision": "e3aa0d6a5fa4f820d9e132ac1fd1d01e1b2b49e0",
+      "parts": [
+        {
+          "file": "UD-IQ4_NL/DeepSeek-V4-Flash-UD-IQ4_NL-00002-of-00004.gguf",
+          "bytes": 49431060672,
+          "sha256": "56d47c47e5fe8146fcda887d8d22429d0550d5c98f5714953079103831026a70"
+        },
+        {
+          "file": "UD-IQ4_NL/DeepSeek-V4-Flash-UD-IQ4_NL-00003-of-00004.gguf",
+          "bytes": 49160711776,
+          "sha256": "2399d4c493508822c9dfa681dd01f500ed32f05e24275166c6fc801b81263303"
+        },
+        {
+          "file": "UD-IQ4_NL/DeepSeek-V4-Flash-UD-IQ4_NL-00004-of-00004.gguf",
+          "bytes": 39306930496,
+          "sha256": "3051c7dd3b5614fb8f8bf86f16eac88b31cff15339a9a98ab558b23cc092766b"
+        }
+      ]
+    },
+    {
+      "quant": "IQ4_XS",
+      "layer_weight_bytes": 137903959808,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/DeepSeek-V4-Flash-GGUF",
+      "gguf": "UD-IQ4_XS/DeepSeek-V4-Flash-UD-IQ4_XS-00001-of-00004.gguf",
+      "sha256": "9a1a0122a788a9c7cd4d7f866341a101a959df759e1e3cc22d11b7c0f6db735f",
+      "revision": "e3aa0d6a5fa4f820d9e132ac1fd1d01e1b2b49e0",
+      "parts": [
+        {
+          "file": "UD-IQ4_XS/DeepSeek-V4-Flash-UD-IQ4_XS-00002-of-00004.gguf",
+          "bytes": 49431060672,
+          "sha256": "56d47c47e5fe8146fcda887d8d22429d0550d5c98f5714953079103831026a70"
+        },
+        {
+          "file": "UD-IQ4_XS/DeepSeek-V4-Flash-UD-IQ4_XS-00003-of-00004.gguf",
+          "bytes": 49160711776,
+          "sha256": "2399d4c493508822c9dfa681dd01f500ed32f05e24275166c6fc801b81263303"
+        },
+        {
+          "file": "UD-IQ4_XS/DeepSeek-V4-Flash-UD-IQ4_XS-00004-of-00004.gguf",
+          "bytes": 39306930496,
+          "sha256": "3051c7dd3b5614fb8f8bf86f16eac88b31cff15339a9a98ab558b23cc092766b"
+        }
+      ]
+    },
+    {
+      "quant": "Q4_K_XL",
+      "layer_weight_bytes": 155095240320,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/DeepSeek-V4-Flash-GGUF",
+      "gguf": "UD-Q4_K_XL/DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf",
+      "sha256": "0cecd47692e23e39de16598a4b40c4e1e53a3f2f56a965cc419fc136e9801494",
+      "revision": "e3aa0d6a5fa4f820d9e132ac1fd1d01e1b2b49e0",
+      "parts": [
+        {
+          "file": "UD-Q4_K_XL/DeepSeek-V4-Flash-UD-Q4_K_XL-00002-of-00005.gguf",
+          "bytes": 48935523072,
+          "sha256": "1f7a6e3b8f2f4eb37ffb261c1e0d1e9784a9bb53f34a576cc475d55b67c275b8"
+        },
+        {
+          "file": "UD-Q4_K_XL/DeepSeek-V4-Flash-UD-Q4_K_XL-00003-of-00005.gguf",
+          "bytes": 48980787136,
+          "sha256": "bb8080adaaa52b4bc8b51e9316c85e9e28933f0e70ae817473711fa8dbe9690d"
+        },
+        {
+          "file": "UD-Q4_K_XL/DeepSeek-V4-Flash-UD-Q4_K_XL-00004-of-00005.gguf",
+          "bytes": 49999168416,
+          "sha256": "4b7be9d4d07c573525a15f2899a1193e3b2699dc59345d6d73ef2118c546c8f3"
+        },
+        {
+          "file": "UD-Q4_K_XL/DeepSeek-V4-Flash-UD-Q4_K_XL-00005-of-00005.gguf",
+          "bytes": 7174505088,
+          "sha256": "60fb82d6e1651544f8b1d44eb7eaf8bd20b5e70a855f5c04044f82750a5bfb20"
+        }
+      ]
+    },
+    {
+      "quant": "Q8_K_XL",
+      "layer_weight_bytes": 161869614720,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/DeepSeek-V4-Flash-GGUF",
+      "gguf": "UD-Q8_K_XL/DeepSeek-V4-Flash-UD-Q8_K_XL-00001-of-00005.gguf",
+      "sha256": "0cecd47692e23e39de16598a4b40c4e1e53a3f2f56a965cc419fc136e9801494",
+      "revision": "e3aa0d6a5fa4f820d9e132ac1fd1d01e1b2b49e0",
+      "parts": [
+        {
+          "file": "UD-Q8_K_XL/DeepSeek-V4-Flash-UD-Q8_K_XL-00002-of-00005.gguf",
+          "bytes": 49215492960,
+          "sha256": "cba9ebcaa33c238c98ddd2881bae4b0766fa46e0329413bec7b36e691d43c335"
+        },
+        {
+          "file": "UD-Q8_K_XL/DeepSeek-V4-Flash-UD-Q8_K_XL-00003-of-00005.gguf",
+          "bytes": 49700372160,
+          "sha256": "789aaf82287d21e77cb939fbf00da0452340d17768cff8494a6e575c14cb23bb"
+        },
+        {
+          "file": "UD-Q8_K_XL/DeepSeek-V4-Flash-UD-Q8_K_XL-00004-of-00005.gguf",
+          "bytes": 49466495968,
+          "sha256": "93bf0d35912e0d337265d28b43914321146a1498133202c430adf61070a2a391"
+        },
+        {
+          "file": "UD-Q8_K_XL/DeepSeek-V4-Flash-UD-Q8_K_XL-00005-of-00005.gguf",
+          "bytes": 13481997024,
+          "sha256": "60e6f48401428db11e9bba1f39886e2cdac40216270fcffa53bc9665b73bffae"
+        }
+      ]
     }
   ],
   "speculative": {

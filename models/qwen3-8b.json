@@ -30,44 +30,77 @@
   },
   "overhead_base_bytes": 1610612736,
   "chat_template": "gguf",
-  "layer_weight_bytes": 4161245184,
-  "shared_weight_bytes": 860581888,
+  "layer_weight_bytes": 5027783488,
+  "shared_weight_bytes": 0,
   "default_gguf": "Qwen3-8B-Q4_K_M.gguf",
   "sources": [
     {
       "repo": "Qwen/Qwen3-8B-GGUF",
       "quant": "Q4_K_M"
+    },
+    {
+      "repo": "Qwen/Qwen3-8B-GGUF",
+      "quant": "Q5_0"
+    },
+    {
+      "repo": "Qwen/Qwen3-8B-GGUF",
+      "quant": "Q5_K_M"
+    },
+    {
+      "repo": "Qwen/Qwen3-8B-GGUF",
+      "quant": "Q6_K"
+    },
+    {
+      "repo": "Qwen/Qwen3-8B-GGUF",
+      "quant": "Q8_0"
     }
   ],
   "default_quant": "Q4_K_M",
   "variants": [
     {
       "quant": "Q4_K_M",
-      "layer_weight_bytes": 4161245184,
-      "shared_weight_bytes": 860581888,
+      "layer_weight_bytes": 5027783488,
+      "shared_weight_bytes": 0,
       "repo": "Qwen/Qwen3-8B-GGUF",
-      "gguf": "Qwen3-8B-Q4_K_M.gguf"
+      "gguf": "Qwen3-8B-Q4_K_M.gguf",
+      "sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785",
+      "revision": "7c41481f57cb95916b40956ab2f0b139b296d974"
+    },
+    {
+      "quant": "Q5_0",
+      "layer_weight_bytes": 5720761152,
+      "shared_weight_bytes": 0,
+      "repo": "Qwen/Qwen3-8B-GGUF",
+      "gguf": "Qwen3-8B-Q5_0.gguf",
+      "sha256": "c034cdfb0ad5b3edc5cf4ac07bff3b1b214aa541e633b37191c19c3a7b119727",
+      "revision": "7c41481f57cb95916b40956ab2f0b139b296d974"
     },
     {
       "quant": "Q5_K_M",
-      "layer_weight_bytes": 4906782720,
-      "shared_weight_bytes": 938373120,
+      "layer_weight_bytes": 5851112224,
+      "shared_weight_bytes": 0,
       "repo": "Qwen/Qwen3-8B-GGUF",
-      "gguf": "Qwen3-8B-Q5_K_M.gguf"
+      "gguf": "Qwen3-8B-Q5_K_M.gguf",
+      "sha256": "068bae163faa96ad48032daf4e071a6a28fe67d8dcc95367609c2ff165e52738",
+      "revision": "7c41481f57cb95916b40956ab2f0b139b296d974"
     },
     {
       "quant": "Q6_K",
-      "layer_weight_bytes": 5698916352,
-      "shared_weight_bytes": 1021026304,
+      "layer_weight_bytes": 6725899040,
+      "shared_weight_bytes": 0,
       "repo": "Qwen/Qwen3-8B-GGUF",
-      "gguf": "Qwen3-8B-Q6_K.gguf"
+      "gguf": "Qwen3-8B-Q6_K.gguf",
+      "sha256": "cb042ccd76795a8830d6be6bd4165245847cc68e41797b13bd61aed4c2cfbce6",
+      "revision": "7c41481f57cb95916b40956ab2f0b139b296d974"
     },
     {
       "quant": "Q8_0",
-      "layer_weight_bytes": 7381094400,
-      "shared_weight_bytes": 1322467328,
+      "layer_weight_bytes": 8709518112,
+      "shared_weight_bytes": 0,
       "repo": "Qwen/Qwen3-8B-GGUF",
-      "gguf": "Qwen3-8B-Q8_0.gguf"
+      "gguf": "Qwen3-8B-Q8_0.gguf",
+      "sha256": "408b955510e196121c1c375201744783b5c9a43c7956d73fc78df54c66e883d6",
+      "revision": "7c41481f57cb95916b40956ab2f0b139b296d974"
     }
   ],
   "note": "Runs on a single machine; verified on real hardware 2026-07-27 (Qwen3-8B Q4_K_M, CPU and CUDA agree token for token)"

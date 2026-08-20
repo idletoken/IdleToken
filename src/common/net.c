@@ -10,6 +10,16 @@
 #ifdef _WIN32
   #include <winsock2.h>
   #include <ws2tcpip.h>
+  /* afunix.h names types declared in winsock2.h, so it has to come after it.
+   * Present since the Windows 10 SDK; a toolchain without it still builds —
+   * idletoken_connect_unix then fails with a sentence at run time rather than
+   * breaking the build for everyone. */
+  #if defined(__has_include)
+    #if __has_include(<afunix.h>)
+      #include <afunix.h>
+      #define IDLETOKEN_HAVE_AFUNIX 1
+    #endif
+  #endif
   #ifndef MSG_NOSIGNAL
   #define MSG_NOSIGNAL 0        /* Windows has no SIGPIPE */
   #endif
@@ -26,8 +36,11 @@
   #include <netinet/in.h>
   #include <netinet/tcp.h>
   #include <sys/socket.h>
+  #include <sys/stat.h>     /* chmod — the socket file IS the access control */
   #include <sys/time.h>
+  #include <sys/un.h>
   #include <unistd.h>
+  #define IDLETOKEN_HAVE_AFUNIX 1
   #define closesock(fd) close(fd)
   static void ensure_wsa(void) {}
 #endif
@@ -275,6 +288,33 @@ int idletoken_accept_tcp(int listener) {
     return fd;
 }
 
+int idletoken_accept_tcp_timeout(int listener, int timeout_ms) {
+    if (listener < 0) { errno = EINVAL; return -1; }
+#ifndef _WIN32
+    if (listener >= FD_SETSIZE) return idletoken_accept_tcp(listener);
+#endif
+    for (;;) {
+        fd_set rd;
+        struct timeval tv;
+        tv.tv_sec  = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+        FD_ZERO(&rd);
+#ifdef _WIN32
+        FD_SET((SOCKET)listener, &rd);
+#else
+        FD_SET(listener, &rd);
+#endif
+        int n = select(listener + 1, &rd, NULL, NULL, &tv);
+        /* A signal is not a timeout: retrying would restart the full window,
+         * but reporting -1 would read as a broken listener. Treat it as the
+         * timeout expiring so the caller re-decides with its own clock. */
+        if (n < 0 && errno == EINTR) return -2;
+        if (n < 0) return -1;
+        if (n == 0) return -2;
+        return idletoken_accept_tcp(listener);
+    }
+}
+
 int idletoken_peer_ip(int fd, char *out, size_t cap) {
     if (!out || cap == 0) { errno = EINVAL; return -1; }
     struct sockaddr_in pa;
@@ -313,6 +353,95 @@ int idletoken_connect_tcp(const char *peer_addr) {
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
     return fd;
+}
+
+int idletoken_connect_unix(const char *path) {
+#ifndef IDLETOKEN_HAVE_AFUNIX
+    (void)path;
+    fprintf(stderr, "idletoken-net: this build has no AF_UNIX support "
+                    "(no afunix.h at compile time)\n");
+    errno = EAFNOSUPPORT;
+    return -1;
+#else
+    ensure_wsa();
+    if (!path || !path[0]) { errno = EINVAL; return -1; }
+
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sun_family = AF_UNIX;
+    size_t n = strlen(path);
+    /* sun_path is NOT a C string with room to spare: the terminator must fit
+     * too, and the buffer is 104 bytes on macOS. A silently truncated path
+     * would connect to the WRONG socket, so this is an error, not a clamp. */
+    if (n + 1 > sizeof(sa.sun_path)) {
+        fprintf(stderr, "idletoken-net: socket path is %zu bytes, the platform "
+                        "allows %zu: %s\n", n, sizeof(sa.sun_path) - 1, path);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(sa.sun_path, path, n);
+
+    int fd = (int)socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    if (connect(fd, (struct sockaddr *)&sa, (socklen_t)sizeof(sa)) != 0) {
+        int e = errno; closesock(fd); errno = e; return -1;
+    }
+    return fd;
+#endif
+}
+
+int idletoken_listen_unix(const char *path) {
+#ifndef IDLETOKEN_HAVE_AFUNIX
+    (void)path;
+    fprintf(stderr, "idletoken-net: this build has no AF_UNIX support "
+                    "(no afunix.h at compile time)\n");
+    errno = EAFNOSUPPORT;
+    return -1;
+#else
+    ensure_wsa();
+    if (!path || !path[0]) { errno = EINVAL; return -1; }
+
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sun_family = AF_UNIX;
+    size_t n = strlen(path);
+    /* Same reasoning as connect_unix: a truncated path would bind the WRONG
+     * socket, so refuse rather than clamp. */
+    if (n + 1 > sizeof(sa.sun_path)) {
+        fprintf(stderr, "idletoken-net: socket path is %zu bytes, the platform "
+                        "allows %zu: %s\n", n, sizeof(sa.sun_path) - 1, path);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(sa.sun_path, path, n);
+
+    /* A leftover socket file from a crashed run makes bind() fail with
+     * EADDRINUSE forever. Removing it is safe because a LIVE listener would
+     * have been caught by the connect() probe callers do first; and if we are
+     * wrong, the worst case is one refused connection, versus a node that can
+     * never serve again. */
+    unlink(path);
+
+    int fd = (int)socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    if (bind(fd, (struct sockaddr *)&sa, (socklen_t)sizeof(sa)) != 0) {
+        int e = errno; closesock(fd); errno = e; return -1;
+    }
+    /* Owner-only. This is the access control for the socket — the filesystem
+     * is what replaces "anyone who can sniff loopback" as the boundary, so a
+     * permissive mode here would give away the entire point of using a socket
+     * file instead of a TCP port. chmod AFTER bind: the file does not exist
+     * before it, and a umask-dependent mode is not something to leave to luck. */
+#ifndef _WIN32
+    if (chmod(path, 0600) != 0) {
+        int e = errno; closesock(fd); unlink(path); errno = e; return -1;
+    }
+#endif
+    if (listen(fd, 16) != 0) {
+        int e = errno; closesock(fd); unlink(path); errno = e; return -1;
+    }
+    return fd;
+#endif
 }
 
 void idletoken_close_fd(int fd) {

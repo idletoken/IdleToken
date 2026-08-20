@@ -1,8 +1,10 @@
 /* Capability advisor — see include/idletoken_advise.h. */
 
 #include "idletoken_advise.h"
+#include "idletoken_modelsize.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Context tiers, descending so the first fit is the largest. */
@@ -77,9 +79,16 @@ int idletoken_advise(const idletoken_node_mem *nodes, int n_nodes,
             row->quant    = quant;
             row->unavailable = !m->available;
 
-            uint64_t layer_bytes = 0, shared_bytes = 0;
-            idletoken_model_weight_bytes(m, quant, &layer_bytes, &shared_bytes);
-            row->weight_bytes = layer_bytes + shared_bytes;
+            /* Same resolver the coordinator budgets with (T8). There is no GGUF
+             * on this machine to point at — the advisor answers "what COULD run
+             * here" — so this is always the (model, quant) source, and the point
+             * of routing it through one function is that it stays that way when
+             * a future caller does have a path. An advisor that sizes models
+             * its own way is an advisor that promises what the planner refuses. */
+            idletoken_llm_model_size msize;
+            if (idletoken_model_size_resolve(m, quant, NULL, &msize, NULL, 0) != 0)
+                continue;
+            row->weight_bytes = msize.total_bytes;
 
             if (!m->available) {
                 /* Honest: the manifest says this build cannot run it, so no
@@ -202,12 +211,25 @@ int idletoken_advise_json(const idletoken_advice_row *rows, int n, int n_nodes,
     return (int)off;
 }
 
+size_t idletoken_advise_json_cap(int n) {
+    if (n < 0) n = 0;
+    return 256 + (size_t)n * 512;
+}
+
 void idletoken_advise_print_json(const idletoken_advice_row *rows, int n, int n_nodes) {
-    /* Big enough for every registered model × precision at the sizes above. */
-    static char buf[16384];
-    if (idletoken_advise_json(rows, n, n_nodes, buf, sizeof buf) < 0) {
+    /* Sized from the row count rather than from a constant somebody has to
+     * remember to raise — see idletoken_advise_json_cap for why. */
+    const size_t cap = idletoken_advise_json_cap(n);
+    char *buf = (char *)malloc(cap);
+    if (!buf) {
+        fprintf(stderr, "idletoken-advise: out of memory for the capability JSON\n");
+        return;
+    }
+    if (idletoken_advise_json(rows, n, n_nodes, buf, cap) < 0) {
         fprintf(stderr, "idletoken-advise: capability JSON did not fit\n");
+        free(buf);
         return;
     }
     puts(buf);
+    free(buf);
 }

@@ -8,10 +8,21 @@ REM   vendor\llama.cpp\build\bin\Release\llama-server.exe      inference + OpenA
 REM   vendor\llama.cpp\build\bin\Release\ggml-rpc-server.exe   worker-side RPC backend
 REM   vendor\llama.cpp\build\bin\Release\llama-perplexity.exe  numeric gate
 REM
-REM Runtime DLL note for packaging: cudart is linked statically (GGML_STATIC),
-REM but the CUDA Toolkit for Windows has no static cuBLAS, so the exes still
-REM import cublas64_12.dll + cublasLt64_12.dll (Toolkit DLLs, NOT shipped with
-REM the driver). Verify with dumpbin /dependents after any flag change.
+REM Runtime DLL note for packaging: cudart is linked statically (GGML_STATIC).
+REM cublas64_12.dll still appears as a string inside the exe, but it is NOT
+REM needed at load time -- measured 2026-08-20 at pin b10502 on win_PC2, a box
+REM with the NVIDIA driver and NO CUDA Toolkit (all of cublas64_12.dll,
+REM cublasLt64_12.dll, cudart64_12.dll absent from System32): llama-server.exe
+REM started, loaded Qwen3.5-0.8B-Q4_K_M with -ngl 99, appeared in nvidia-smi as a
+REM CUDA compute process holding 776 MiB, and prefilled 1310 tokens at 5288
+REM tok/s. A Windows COMPUTE node therefore needs only the driver; the Toolkit is
+REM a BUILD-node requirement.
+REM
+REM Scope of that measurement, stated so nobody widens it by accident: one small
+REM Q4_K quant, whose matmuls take the MMQ path. A model or quant that falls back
+REM to dequant+GEMM could still reach for cuBLAS. Re-measure on the largest model
+REM a node is expected to serve before promising this to users, and keep
+REM `dumpbin /dependents` in the loop after any flag change.
 REM
 REM No silent fallback (v2 hard invariant): if CUDA or MSVC is missing this
 REM script exits red. It never downgrades to a CPU build to "keep things green".
@@ -57,16 +68,29 @@ if not defined IDLETOKEN_CUDA_ARCHS set "IDLETOKEN_CUDA_ARCHS=75-real;120"
 REM --- pin ---------------------------------------------------------------------
 set "REPO_URL="
 set "PIN_SHA="
-for /f "usebackq tokens=1,2" %%A in ("%PATCH_DIR%\UPSTREAM") do (
+set "PIN_TAG="
+for /f "usebackq tokens=1,2,3" %%A in ("%PATCH_DIR%\UPSTREAM") do (
     if not defined PIN_SHA (
         set "REPO_URL=%%A"
         set "PIN_SHA=%%B"
+        set "PIN_TAG=%%C"
     )
 )
 if not defined PIN_SHA (
     echo FATAL: cannot parse %PATCH_DIR%\UPSTREAM
     exit /b 1
 )
+REM Field 3 is the upstream release tag; it pins the engine's own version
+REM string so it does not depend on how this machine cloned. See the long note
+REM in build_llamacpp.sh -- a shallow fetch reports "build 1" and a full clone
+REM of the same commit reports "build 10502", and G-ENGINE-VER compares that
+REM string for equality across the cluster.
+if not defined PIN_TAG (
+    echo FATAL: %PATCH_DIR%\UPSTREAM has no release tag in field 3
+    echo        Expected: ^<url^> ^<full-sha^> b^<build-number^>
+    exit /b 1
+)
+set "PIN_BUILD=%PIN_TAG:~1%"
 set "PIN7=%PIN_SHA:~0,7%"
 
 REM --- git discovery -----------------------------------------------------------
@@ -204,12 +228,15 @@ echo == configuring ^(MSVC + CUDA %IDLETOKEN_CUDA_VER%, archs %IDLETOKEN_CUDA_AR
 "%CMAKE%" -S "%SRC_DIR%" -B "%BUILD_DIR%" -G "Visual Studio 17 2022" -A x64 -T cuda=%IDLETOKEN_CUDA_VER% ^
     -DGGML_CUDA=ON ^
     "-DCMAKE_CUDA_ARCHITECTURES=%IDLETOKEN_CUDA_ARCHS%" ^
+    -DLLAMA_BUILD_NUMBER=%PIN_BUILD% ^
+    -DLLAMA_BUILD_COMMIT=%PIN7% ^
     -DGGML_RPC=ON ^
     -DGGML_RPC_TLS=ON ^
     "-DIDLETOKEN_MBEDTLS_SRC=%IDLETOKEN_MBEDTLS_SRC%" ^
     -DGGML_STATIC=ON ^
     -DBUILD_SHARED_LIBS=OFF ^
     -DLLAMA_CURL=OFF ^
+    -DLLAMA_BUILD_UI=OFF ^
     -DLLAMA_BUILD_TESTS=OFF ^
     -DLLAMA_BUILD_EXAMPLES=OFF ^
     -DLLAMA_BUILD_TOOLS=ON ^

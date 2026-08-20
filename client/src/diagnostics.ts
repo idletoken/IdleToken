@@ -5,7 +5,7 @@
 // whether an access token goes out, the last place that should have two
 // implementations.
 import type { AppSettings } from "./settings";
-import { problemsShared, readProblems } from "./problems";
+import { readProblems } from "./problems";
 
 // The settings fields that go into the bundle (an **allowlist**). Anything that
 // could carry a credential is excluded: apiToken, the platform session, any
@@ -34,16 +34,14 @@ export function buildDiagnosticsBundle(
   // the next send wiped, so "what did it say?" had no answer. No prompts or
   // replies go in: see problems.ts for what is deliberately excluded.
   //
-  // The switch in Settings decides whether they travel. `problems_shared` is
-  // reported either way and the list is OMITTED rather than emptied when it is
-  // off: an empty array would read as "nothing has ever failed on this machine",
-  // which is the one wrong conclusion a withheld log must not produce.
-  const shared = problemsShared();
+  // Always included (2026-08-15, the opt-out switch is gone): exporting the
+  // bundle is itself the explicit act of sharing — it downloads a file the
+  // user then sends by hand — and a diagnostics bundle without the failures
+  // is the one kind that cannot diagnose anything.
   return {
     ...report,
     settings: picked,
-    problems_shared: shared,
-    ...(shared ? { recent_problems: readProblems() } : {}),
+    recent_problems: readProblems(),
   };
 }
 

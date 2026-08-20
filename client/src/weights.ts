@@ -14,7 +14,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { ModelManifest } from "./models";
+import type { ModelManifest, SplitPart } from "./models";
 import { inTauri } from "./platform";
 
 export interface DownloadTarget {
@@ -23,6 +23,15 @@ export interface DownloadTarget {
   /** Byte count declared by the manifest (layers + shared). 0 = not stated, in
    *  which case the server's value wins. */
   expectBytes: number;
+  /** SHA-256 pinned by the manifest. "" = not pinned (curation gap): the
+   *  integrity gate then has nothing to check — it never invents a hash. */
+  sha256: string;
+  /** HF repo commit to download from. "" = not pinned; the engine then falls
+   *  back to the moving branch. */
+  revision: string;
+  /** Split GGUF: the parts after `file`. Empty = single-file. The engine is
+   *  handed `file`; every part must nonetheless land complete and verified. */
+  parts: SplitPart[];
 }
 
 /**
@@ -47,13 +56,25 @@ export function resolveDownload(man: ModelManifest, quant?: string): DownloadTar
   if (!repo || !file) return null;
   const layer = v?.layer_weight_bytes ?? man.layer_weight_bytes ?? 0;
   const shared = v?.shared_weight_bytes ?? man.shared_weight_bytes ?? 0;
-  return { repo, file, expectBytes: layer + shared };
+  // The hash follows the same precedence as the file it certifies: a selected
+  // variant's hash never falls back to the top-level one (that would verify
+  // file A against file B's hash and reject a perfectly good download).
+  const sha256 = (v ? v.sha256 : man.sha256) ?? "";
+  const revision = (v ? v.revision : man.revision) ?? "";
+  const parts = (v ? v.parts : man.parts) ?? [];
+  // The declared size must cover the WHOLE model, parts included — otherwise a
+  // 434 GB download would report "done" at part one's 36 GB.
+  const partBytes = parts.reduce((n: number, p: SplitPart) => n + (p.bytes ?? 0), 0);
+  return { repo, file, expectBytes: layer + shared + partBytes, sha256, revision, parts };
 }
 
 export interface WeightsState {
   path: string;
   complete: boolean;
   have_bytes: number;
+  /** Passed the SHA-256 gate (or nothing was pinned). `complete && !verified`
+   *  means: run verifyWeights before serving this file. */
+  verified: boolean;
 }
 
 export async function defaultModelDir(): Promise<string> {
@@ -64,8 +85,30 @@ export async function weightsState(
   destDir: string,
   file: string,
   expectBytes: number,
+  expectSha256: string,
 ): Promise<WeightsState> {
-  return invoke<WeightsState>("weights_state", { destDir, file, expectBytes });
+  return invoke<WeightsState>("weights_state", { destDir, file, expectBytes, expectSha256 });
+}
+
+/**
+ * Verify an already-downloaded file against the manifest hash (the serve-path
+ * gate for files that came from model_fetch.sh or predate the gate). Slow on
+ * big files — progress arrives on the same weights-fetch channel under `id`.
+ * A mismatch DELETES the file and rejects: red, no automatic retry (decision
+ * 2026-08-15); recovery is a fresh download.
+ */
+export async function verifyWeights(args: {
+  id: string;
+  destDir: string;
+  file: string;
+  sha256: string;
+}): Promise<void> {
+  await invoke("weights_verify", {
+    id: args.id,
+    destDir: args.destDir,
+    file: args.file,
+    expectSha256: args.sha256,
+  });
 }
 
 export interface FetchProgress {
@@ -138,6 +181,9 @@ export async function fetchWeights(args: {
       file: args.target.file,
       destDir: args.destDir,
       expectBytes: args.target.expectBytes,
+      expectSha256: args.target.sha256,
+      revision: args.target.revision,
+      parts: args.target.parts,
       endpoints: args.endpoints ?? [],
     });
   } catch (e) {
@@ -171,63 +217,6 @@ export async function cancelFetch(id: string): Promise<boolean> {
   return invoke<boolean>("weights_cancel", { id });
 }
 
-// ---- open model intake (v2 WS-D1) ------------------------------------------
-// A user-supplied GGUF instead of a curated manifest. Two sources, one result
-// shape (the same as resolveLocalWeights, so the serve flow does not fork):
-//   file -> the picked path IS the weights; verified to still exist.
-//   hf   -> repo + exact file name, through the SAME download machinery as
-//           curated weights (weights_fetch takes repo/file/expectBytes and is
-//           manifest-agnostic; expectBytes 0 = the server's Content-Length is
-//           authoritative).
-
-export interface CustomModelSource {
-  source: "file" | "hf";
-  path: string; // file source: absolute GGUF path
-  repo: string; // hf source
-  file: string; // hf source: exact .gguf name
-}
-
-/** The file name a custom selection would load — for display and for scanning
- *  the model folder. */
-export function customGgufName(c: CustomModelSource): string {
-  if (c.source === "hf") return c.file;
-  const cut = Math.max(c.path.lastIndexOf("/"), c.path.lastIndexOf("\\"));
-  return cut >= 0 ? c.path.slice(cut + 1) : c.path;
-}
-
-export async function resolveCustomWeights(args: {
-  modelDir: string;
-  custom: CustomModelSource;
-}): Promise<{ path: string; needsDownload: boolean; target: DownloadTarget | null; haveBytes: number }> {
-  if (!inTauri()) return { path: "(dev-sim)", needsDownload: false, target: null, haveBytes: 0 };
-  const c = args.custom;
-  if (c.source === "file") {
-    // The dialog guaranteed existence when it was picked; re-verify now because
-    // files get moved/deleted, and handing a stale path to the engine turns a
-    // one-sentence answer here into a load-time failure there.
-    const cut = Math.max(c.path.lastIndexOf("/"), c.path.lastIndexOf("\\"));
-    const dir = cut > 0 ? c.path.slice(0, cut) : "";
-    const file = cut >= 0 ? c.path.slice(cut + 1) : c.path;
-    if (!dir || !file) return { path: "", needsDownload: false, target: null, haveBytes: 0 };
-    const st = await weightsState(dir, file, 0);
-    return {
-      path: st.complete ? c.path : "",
-      needsDownload: false, // a fixed local path is not something we can fetch
-      target: null,
-      haveBytes: 0,
-    };
-  }
-  const target: DownloadTarget = { repo: c.repo, file: c.file, expectBytes: 0 };
-  const dir = args.modelDir || (await defaultModelDir());
-  const st = await weightsState(dir, c.file, 0);
-  return {
-    path: st.complete ? st.path : "",
-    needsDownload: !st.complete,
-    target,
-    haveBytes: st.complete ? 0 : st.have_bytes,
-  };
-}
-
 /**
  * "Where is this machine's copy of the weights" -- called by the startup flow.
  *
@@ -259,21 +248,27 @@ export async function resolveLocalWeights(args: {
    *  attempt resumes from here, so the UI can say so instead of implying the
    *  whole file has to come down again. 0 = nothing to resume. */
   haveBytes: number;
+  /** Complete on disk but never checked against the manifest hash (script
+   *  download, or a client from before the gate). The serve path must run
+   *  verifyWeights first — using the file anyway would make the hash in the
+   *  manifest decorative. */
+  needsVerify: boolean;
 }> {
   // Browser dev build: no engine, no filesystem, so every call below throws on
   // the missing Tauri bridge — which blocked "run on this machine alone", a
   // headline mode, from being reachable in the dev sim at all. Report the
   // weights as present. inTauri() is false ONLY under `vite dev`/`preview`;
   // the packaged app always takes the real path below.
-  if (!inTauri()) return { path: "(dev-sim)", needsDownload: false, target: null, haveBytes: 0 };
+  if (!inTauri()) return { path: "(dev-sim)", needsDownload: false, target: null, haveBytes: 0, needsVerify: false };
   const target = resolveDownload(args.manifest, args.quant);
-  if (!target) return { path: "", needsDownload: false, target: null, haveBytes: 0 };
+  if (!target) return { path: "", needsDownload: false, target: null, haveBytes: 0, needsVerify: false };
   const dir = args.modelDir || (await defaultModelDir());
-  const st = await weightsState(dir, target.file, target.expectBytes);
+  const st = await weightsState(dir, target.file, target.expectBytes, target.sha256);
   return {
     path: st.complete ? st.path : "",
     needsDownload: !st.complete,
     target,
     haveBytes: st.complete ? 0 : st.have_bytes,
+    needsVerify: st.complete && !st.verified,
   };
 }

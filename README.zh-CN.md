@@ -45,7 +45,7 @@ OpenAI 兼容接口使用同一地址。请求运行在他人分享的集群上�
 
 IdleToken 是一个桌面客户端，日常使用不需要命令行。Windows、Linux 和 macOS 安装包见 [Releases](https://github.com/idletoken/IdleToken/releases) 页面。
 
-1. **选一个模型**——从内置列表中选择，或打开本地 GGUF 文件、粘贴 Hugging Face 链接。客户端会根据本机可用显存和内存判断能否运行。
+1. **选一个模型**——从内置列表中选择。客户端会根据本机可用显存和内存判断能否运行。
 2. **启动服务**——缺少的权重自动下载。API 默认监听 `:8000`，客户端会显示地址和生成的 API key。
 
 Claude Code 接入：
@@ -71,7 +71,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 ## 模型
 
-IdleToken 可运行 GGUF 格式的文本生成模型——内置列表、本地文件或 Hugging Face 链接均可，模型信息直接读取自 GGUF 文件头。暂不支持多模态输入。
+IdleToken 提供一份精选的 GGUF 格式文本生成模型列表。列表中的每个模型都先在我们的真机上验证过才会上架——这是共享 endpoint 质量可信的前提，所以客户端有意不提供"打开任意文件"的入口。需要列表之外的模型？欢迎[提一个 issue](https://github.com/idletoken/IdleToken/issues)，我们会评估并纳入下次列表更新。暂不支持多模态输入。
 
 内置模型：
 

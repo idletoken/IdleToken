@@ -41,6 +41,8 @@ HF_FILE = "https://huggingface.co/{repo}/resolve/main/{name}"
 
 # GGUF metadata value types, and how many bytes the fixed-width ones take.
 FIXED = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+FMT = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i",
+       6: "<f", 7: "<?", 10: "<Q", 11: "<q", 12: "<d"}
 T_STRING, T_ARRAY = 8, 9
 
 
@@ -83,6 +85,31 @@ class Reader:
         else:
             raise ValueError(f"unknown GGUF value type {t}")
 
+    def read_value(self, t, cap=8):
+        """Same walk as skip_value, but keeps the value (arrays truncated to `cap`).
+
+        Only --meta uses this. The byte cursor must advance identically either
+        way, so the two functions handle exactly the same type set: a value we
+        can print but not skip (or vice versa) would desynchronise the reader
+        and turn every later key into garbage.
+        """
+        if t in FMT:
+            return struct.unpack(FMT[t], self.take(FIXED[t]))[0]
+        if t == T_STRING:
+            return self.string()
+        if t == T_ARRAY:
+            et, n = self.u32(), self.u64()
+            if et in FIXED and n > cap:
+                self.take(FIXED[et] * n)
+                return f"<{n} values of type {et}>"
+            head = []
+            for i in range(n):
+                v = self.read_value(et, cap)
+                if i < cap:
+                    head.append(v)
+            return head if n <= cap else head + [f"... ({n} total)"]
+        raise ValueError(f"unknown GGUF value type {t}")
+
 
 def http_get(url, byte_range=None):
     req = urllib.request.Request(url, headers={"User-Agent": "idletoken-measure/1"})
@@ -93,14 +120,19 @@ def http_get(url, byte_range=None):
         return r.read()
 
 
-def parse_header(buf):
-    """-> (tensors[(name, offset)], data_start). Raises Short if buf is too small."""
+def parse_header(buf, keep_kv=False):
+    """-> (tensors[(name, dims, offset)], data_start, kv). Raises Short if buf is too small.
+
+    `kv` is empty unless keep_kv: the measuring path never needed the metadata,
+    and reading a 250k-entry tokenizer vocabulary to throw it away is pure cost.
+    """
     r = Reader(buf)
     if r.take(4) != b"GGUF":
         raise ValueError("not a GGUF file (bad magic)")
     r.u32()  # version
     n_tensors, n_kv = r.u64(), r.u64()
     alignment = 32
+    kv = {}
     for _ in range(n_kv):
         key = r.string()
         t = r.u32()
@@ -109,35 +141,42 @@ def parse_header(buf):
             if t != 4:
                 raise ValueError("general.alignment is not UINT32")
             alignment = r.u32()
+            kv[key] = alignment
+        elif keep_kv:
+            kv[key] = r.read_value(t)
         else:
             r.skip_value(t)
     tensors = []
     for _ in range(n_tensors):
         name = r.string()
         n_dims = r.u32()
-        r.take(8 * n_dims)  # dims
+        dims = struct.unpack(f"<{n_dims}Q", r.take(8 * n_dims))
         r.u32()  # ggml type
-        tensors.append((name, r.u64()))
+        tensors.append((name, dims, r.u64()))
     data_start = (r.i + alignment - 1) // alignment * alignment
-    return tensors, data_start
+    return tensors, data_start, kv
 
 
-def measure(repo, name, file_size):
-    """-> (layer_bytes, shared_bytes, data_start)."""
+def fetch_header(repo, name, keep_kv=False):
+    """-> (tensors, data_start, kv), growing the Range request until it fits."""
     want = 16 << 20
     while True:
         buf = http_get(HF_FILE.format(repo=repo, name=name), (0, want - 1))
         try:
-            tensors, data_start = parse_header(buf)
-            break
+            return parse_header(buf, keep_kv=keep_kv)
         except Short:
             if want >= (256 << 20):
                 raise SystemExit(f"{name}: header exceeds 256 MiB — refusing to keep fetching")
             want *= 2
-    tensors.sort(key=lambda t: t[1])
+
+
+def measure(repo, name, file_size):
+    """-> (layer_bytes, shared_bytes, data_start)."""
+    tensors, data_start, _ = fetch_header(repo, name)
+    tensors.sort(key=lambda t: t[2])
     layer = shared = 0
-    for i, (tname, off) in enumerate(tensors):
-        end = tensors[i + 1][1] if i + 1 < len(tensors) else file_size - data_start
+    for i, (tname, _dims, off) in enumerate(tensors):
+        end = tensors[i + 1][2] if i + 1 < len(tensors) else file_size - data_start
         size = end - off
         if size < 0:
             raise SystemExit(f"{name}: tensor {tname} has negative size — bad file_size?")
@@ -154,13 +193,48 @@ def measure(repo, name, file_size):
     return layer, shared, data_start
 
 
+def dump_meta(repo, name):
+    """Print a GGUF's metadata and its tensor shapes, one Range request.
+
+    Onboarding a model needs facts the byte totals do not carry: which
+    architecture the file declares (an arch the pinned engine does not know is a
+    hard refusal, not a slow path), how many blocks it has, KV head geometry,
+    and whether extra blocks (a NextN/MTP draft head, a vision tower) are baked
+    into the same file or shipped separately.
+    """
+    tensors, data_start, kv = fetch_header(repo, name, keep_kv=True)
+    print(f"# {repo}/{name}")
+    print(f"# {len(kv)} metadata keys, {len(tensors)} tensors, data starts at {data_start:,}")
+    for k in sorted(kv):
+        print(f"{k} = {kv[k]!r}")
+    prefixes = {}
+    for tname, dims, _off in tensors:
+        parts = tname.split(".")
+        # blk.<N>.<rest> -> one bucket per <rest>, so 62 identical layers print once.
+        key = f"blk.*.{'.'.join(parts[2:])}" if parts[0] == "blk" else tname
+        prefixes.setdefault(key, []).append((tname, dims))
+    print(f"# --- tensors ({len(prefixes)} distinct shapes) ---")
+    for key in sorted(prefixes):
+        group = prefixes[key]
+        tname, dims = group[0]
+        count = f" x{len(group)}" if len(group) > 1 else ""
+        print(f"{key:<44} dims={list(dims)}{count}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("repo", help="HF repo, e.g. unsloth/Qwen3.5-4B-GGUF")
     ap.add_argument("quants", nargs="*", help="quant names to measure, e.g. Q5_K_M Q6_K")
     ap.add_argument("--all-files", action="store_true", help="measure every .gguf in the repo")
     ap.add_argument("--json", action="store_true", help="emit manifest-shaped variant objects")
+    ap.add_argument("--meta", metavar="FILE",
+                    help="dump one file's GGUF metadata and tensor shapes instead of "
+                         "measuring (the arch / layer counts a new manifest needs)")
     args = ap.parse_args()
+
+    if args.meta:
+        dump_meta(args.repo, args.meta)
+        return
 
     api = json.loads(http_get(HF_API.format(repo=args.repo)))
     sizes = {

@@ -58,7 +58,17 @@ function ctxLabel(ctx: number): string {
 export async function loadCapability(apiBaseUrl?: string | null): Promise<CapabilityReport> {
   const { invoke } = await import("@tauri-apps/api/core");
   if (apiBaseUrl) {
-    return (await invoke("api_capability", { baseUrl: apiBaseUrl })) as CapabilityReport;
+    // The cluster endpoint can be unreachable even when the pairing snapshot
+    // says "online": the cluster just stopped, or — since 2026-08-15 — the
+    // API serves only the coordinator's own machine, so every OTHER machine
+    // gets connection-refused here by design. A dead endpoint must not take
+    // the table down when the local advisor can still answer for THIS machine
+    // (the table then honestly says "based on 1 machine").
+    try {
+      return (await invoke("api_capability", { baseUrl: apiBaseUrl })) as CapabilityReport;
+    } catch {
+      return (await invoke("advise_capability")) as CapabilityReport;
+    }
   }
   return (await invoke("advise_capability")) as CapabilityReport;
 }
@@ -92,7 +102,10 @@ export default function Capability(props: { apiBaseUrl?: string | null }) {
   const verdict = (r: CapabilityRow) => {
     if (r.mode === "gpu_only") return <span className="cap-yes">{t("cap.yesGpu")}</span>;
     if (r.mode === "hybrid") return <span className="cap-hybrid">{t("cap.yesHybrid")}</span>;
-    if (r.mode === "unavailable") return <span className="cap-na">{t("cap.notInBuild")}</span>;
+    // "unavailable" ("backend not implemented") is a relic of the self-built
+    // kernel era: with llama.cpp as the engine (2026-08-14 pivot) every model
+    // in the curated list is implemented, and the only honest reasons left are
+    // memory ones. An old engine still reporting it renders as a plain "No".
     return <span className="cap-no">{t("cap.no")}</span>;
   };
 
@@ -128,11 +141,9 @@ export default function Capability(props: { apiBaseUrl?: string | null }) {
                         .replace("{gb}", String(Math.ceil(r.shortfall_bytes / 1024 ** 3)))
                     : r.mode === "hybrid"
                       ? t("cap.hybridNote")
-                      : r.mode === "unavailable"
-                        ? t("cap.notInBuildNote")
-                        : r.single_node
-                          ? t("cap.singleNodeNote")
-                          : ""}
+                      : r.single_node
+                        ? t("cap.singleNodeNote")
+                        : ""}
                 </td>
               </tr>
             );

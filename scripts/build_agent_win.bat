@@ -32,7 +32,13 @@ gcc -c vendor/blake2/blake2b.c %CF% -o a_blake2b.o >> agent_build.log 2>&1
 if errorlevel 1 goto :fail
 gcc -c src/common/privacy.c %CF% -o a_privacy.o >> agent_build.log 2>&1
 if errorlevel 1 goto :fail
-gcc -c src/tools/sodium_seal.c %CF% -o a_sodium_seal.o >> agent_build.log 2>&1
+REM src/common/sodium_seal.c, NOT src/tools/ -- it moved on 2026-08-19 (504e968)
+REM when the coordinator started sealing overflow requests. This script kept
+REM naming the old path and kept building, because sync-to-win.sh merges a
+REM tarball and never deletes: the pre-move copy is still lying on the build
+REM node, byte-identical today, so the drift was invisible. The next edit to
+REM sodium_seal.c would simply not have reached the Windows agent.
+gcc -c src/common/sodium_seal.c %CF% -o a_sodium_seal.o >> agent_build.log 2>&1
 if errorlevel 1 goto :fail
 gcc -c src/platform/win/win_compat.c -O2 -std=gnu11 -Isrc/platform/win -o a_win_compat.o >> agent_build.log 2>&1
 if errorlevel 1 goto :fail
@@ -42,13 +48,19 @@ gcc -c src/common/net.c %CF% -o a_net.o >> agent_build.log 2>&1
 if errorlevel 1 goto :fail
 gcc -c src/common/http.c %CF% -o a_http.o >> agent_build.log 2>&1
 if errorlevel 1 goto :fail
+REM b64.c is on Makefile.platform's object list; this copy of the list did not
+REM have it, so the Windows agent stopped linking (undefined idletoken_b64_*)
+REM as soon as platform_agent.c started base64-ing. Two lists of the same
+REM objects is the drift; keep them in step until one of them goes away.
+gcc -c src/common/b64.c %CF% -o a_b64.o >> agent_build.log 2>&1
+if errorlevel 1 goto :fail
 
 echo === agent ===>> agent_build.log
 gcc -c src/tools/platform_agent.c %CF% -o a_platform_agent.o >> agent_build.log 2>&1
 if errorlevel 1 goto :fail
 
 echo === link ===>> agent_build.log
-gcc -static-libgcc -o idletoken-platform-agent.exe a_platform_agent.o a_sodium_seal.o a_privacy.o a_tweetnacl.o a_blake2b.o a_net.o a_http.o a_win_compat.o -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic -lws2_32 -lbcrypt >> agent_build.log 2>&1
+gcc -static-libgcc -o idletoken-platform-agent.exe a_platform_agent.o a_sodium_seal.o a_privacy.o a_tweetnacl.o a_blake2b.o a_net.o a_http.o a_b64.o a_win_compat.o -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic -lws2_32 -lbcrypt >> agent_build.log 2>&1
 if errorlevel 1 goto :fail
 
 echo AGENT_WIN_OK

@@ -273,12 +273,12 @@ static void usage(FILE *out) {
 "  -h, --help          show this help\n"
 "\n"
 "llama.cpp rpc-supervisor mode (v2 WS-C1; pairs, then supervises a local\n"
-"ggml-rpc-server the coordinator's llama-server computes through):\n"
+"idletoken-rpc-server the coordinator's idletoken-server computes through):\n"
 "  --rpc-supervisor    join as an rpc worker instead of the legacy INFER loop.\n"
 "                      Requires pairing (--pair-code / account mode): the\n"
 "                      cluster TLS PSK arrives through the pairing channel.\n"
-"  --engine-dir DIR    llama.cpp build bin dir holding ggml-rpc-server and\n"
-"                      llama-server (env IDLETOKEN_ENGINE_DIR)\n"
+"  --engine-dir DIR    llama.cpp build bin dir holding idletoken-rpc-server and\n"
+"                      idletoken-server (env IDLETOKEN_ENGINE_DIR)\n"
 "  --rpc-host H        LAN ip to bind the rpc-server to (default: this\n"
 "                      machine's primary LAN ipv4; NEVER 0.0.0.0; overlay\n"
 "                      addresses (100.64/10) are refused — tensor traffic\n"
@@ -536,7 +536,7 @@ static int seq_resolve(uint8_t seq_id,
  *
  * The worker's new job on the llama.cpp line: pair with the coordinator,
  * prove its engine version, receive the cluster's ggml-RPC TLS PSK through
- * the pairing channel, then spawn and supervise a local `ggml-rpc-server`
+ * the pairing channel, then spawn and supervise a local `idletoken-rpc-server`
  * bound to this machine's REAL LAN interface. The legacy INFER_* loop is not
  * used in this mode. POSIX uses fork/exec; Windows uses CreateProcess and a
  * kill-on-close Job so a dead supervisor cannot leave an open compute port.
@@ -559,7 +559,7 @@ static void worker_rpc_psk_path(char *out, size_t cap) {
 
 /* The rpc-server child's pid, mirrored for signal-time cleanup: a SIGTERM'd
  * worker must not orphan its child. Linux children carry pdeathsig, but macOS
- * has no equivalent — killing the worker there left ggml-rpc-server holding
+ * has no equivalent — killing the worker there left idletoken-rpc-server holding
  * the port (measured during the WS-C rehearsal). */
 #ifdef _WIN32
 static HANDLE g_rpc_child_handle;
@@ -598,7 +598,7 @@ static int rpc_coord_readable(int fd, int timeout_ms) {
 #endif
 }
 
-/* Spawn ggml-rpc-server. GGML_RPC_PSK comes from the persisted credential
+/* Spawn idletoken-rpc-server. GGML_RPC_PSK comes from the persisted credential
  * file, re-read here on purpose (see worker_rpc_psk_path). Returns 0 and sets
  * *pid_out, or -1. */
 static int rpc_spawn(const char *rpc_bin, const char *host, int port,
@@ -750,17 +750,29 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
                         "build bin directory\n");
         return 2;
     }
+    /* Our names first, upstream's as a fallback (2026-08-15 rename): a checkout
+     * staged before the rename keeps working, and a user who built llama.cpp by
+     * hand can still point --engine-dir at its build/bin. */
     char rpc_bin[1024], llsrv_bin[1024];
 #ifdef _WIN32
-    snprintf(rpc_bin, sizeof(rpc_bin), "%s/ggml-rpc-server.exe", engine_dir);
-    snprintf(llsrv_bin, sizeof(llsrv_bin), "%s/llama-server.exe", engine_dir);
+    const char *rpc_names[]   = { "idletoken-rpc-server.exe", "ggml-rpc-server.exe" };
+    const char *llsrv_names[] = { "idletoken-server.exe",     "llama-server.exe" };
 #else
-    snprintf(rpc_bin, sizeof(rpc_bin), "%s/ggml-rpc-server", engine_dir);
-    snprintf(llsrv_bin, sizeof(llsrv_bin), "%s/llama-server", engine_dir);
+    const char *rpc_names[]   = { "idletoken-rpc-server", "ggml-rpc-server" };
+    const char *llsrv_names[] = { "idletoken-server",     "llama-server" };
 #endif
+    {
+        struct stat probe;
+        snprintf(rpc_bin, sizeof(rpc_bin), "%s/%s", engine_dir, rpc_names[0]);
+        if (stat(rpc_bin, &probe) != 0)
+            snprintf(rpc_bin, sizeof(rpc_bin), "%s/%s", engine_dir, rpc_names[1]);
+        snprintf(llsrv_bin, sizeof(llsrv_bin), "%s/%s", engine_dir, llsrv_names[0]);
+        if (stat(llsrv_bin, &probe) != 0)
+            snprintf(llsrv_bin, sizeof(llsrv_bin), "%s/%s", engine_dir, llsrv_names[1]);
+    }
     struct stat st;
     if (stat(rpc_bin, &st) != 0 || !S_ISREG(st.st_mode)) {
-        fprintf(stderr, "idletoken-worker: no ggml-rpc-server in %s — build the "
+        fprintf(stderr, "idletoken-worker: no idletoken-rpc-server in %s — build the "
                         "engine first (scripts/build_llamacpp.sh)\n", engine_dir);
         return 2;
     }
@@ -823,7 +835,7 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
      * machine that can fix it is this one. */
     {
         char rule[64];
-        snprintf(rule, sizeof rule, "IdleToken ggml-rpc-server TCP %d", rpc_port);
+        snprintf(rule, sizeof rule, "IdleToken idletoken-rpc-server TCP %d", rpc_port);
         idletoken_win_ensure_firewall_rule(rule, "TCP", rpc_port);
         snprintf(rule, sizeof rule, "IdleToken discovery UDP %d", disc_port);
         idletoken_win_ensure_firewall_rule(rule, "UDP", disc_port);
@@ -1127,8 +1139,8 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
                         "(psk=%s) and persisted to %s\n", fp, psk_path);
     }
 
-    /* --- spawn + supervise ggml-rpc-server --------------------------------
-     * Same state machine as the coordinator's llama-server sidecar
+    /* --- spawn + supervise idletoken-rpc-server --------------------------------
+     * Same state machine as the coordinator's idletoken-server sidecar
      * (src/coord/llama_sidecar.c): backoff 2/4/8/16/30s, 5 consecutive quick
      * crashes latch FAILED. Readiness = the endpoint accepts TCP (rpc-server
      * has no /health; it serves the ggml-RPC protocol directly). */
@@ -1147,7 +1159,7 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
         close(fd);
         return 1;
     }
-    fprintf(stderr, "idletoken-worker: spawned ggml-rpc-server (pid %lld) on %s "
+    fprintf(stderr, "idletoken-worker: spawned idletoken-rpc-server (pid %lld) on %s "
                     "(-d %s), log: %s\n", pid, endpoint, rpc_device, log_path);
 
     int ever_ready = 0, starting = 1, quick_restarts = 0;
@@ -1219,7 +1231,7 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
 #endif
                 if (ready_uptime >= 60000) quick_restarts = 0;
                 if (quick_restarts >= 5) {
-                    fprintf(stderr, "idletoken-worker: ggml-rpc-server kept "
+                    fprintf(stderr, "idletoken-worker: idletoken-rpc-server kept "
                                     "crashing (%d quick restarts, last: %s) — "
                                     "giving up; check %s\n",
                             quick_restarts, how, log_path);
@@ -1231,7 +1243,7 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
                 if (delay_s > 30) delay_s = 30;
                 restart_due_ms = now + delay_s * 1000;
                 starting = 0;   /* not probing while down */
-                fprintf(stderr, "idletoken-worker: ggml-rpc-server exited (%s); "
+                fprintf(stderr, "idletoken-worker: idletoken-rpc-server exited (%s); "
                                 "restarting in %llds (attempt %d/5)\n",
                         how, delay_s, quick_restarts);
             }
@@ -1242,7 +1254,7 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
             if (rpc_spawn(rpc_bin, rpc_host, rpc_port, rpc_device, log_path,
                           &pid) == 0) {
                 starting = 1;
-                fprintf(stderr, "idletoken-worker: respawned ggml-rpc-server "
+                fprintf(stderr, "idletoken-worker: respawned idletoken-rpc-server "
                                 "(pid %lld)\n", pid);
             } else {
                 fprintf(stderr, "idletoken-worker: respawn failed — giving up\n");
@@ -1254,7 +1266,7 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
         if (starting && pid > 0 && rpc_endpoint_up(endpoint)) {
             starting = 0;
             became_ready_ms = now;
-            fprintf(stderr, "idletoken-worker: ggml-rpc-server ready on %s\n",
+            fprintf(stderr, "idletoken-worker: idletoken-rpc-server ready on %s\n",
                     endpoint);
             if (!ever_ready) {
                 ever_ready = 1;
@@ -1487,8 +1499,8 @@ int main(int argc, char **argv) {
     }
 
     /* llama.cpp rpc-supervisor mode (v2 WS-C1): pair, receive the TLS PSK,
-     * supervise a ggml-rpc-server. No legacy INFER loop, no model load here —
-     * the coordinator's llama-server pushes tensors over authenticated RPC. */
+     * supervise a idletoken-rpc-server. No legacy INFER loop, no model load here —
+     * the coordinator's idletoken-server pushes tensors over authenticated RPC. */
     if (rpc_supervisor) {
         if (rpc_port < 1 || rpc_port > 65535) {
             fprintf(stderr, "idletoken-worker: --rpc-port must be 1..65535\n");

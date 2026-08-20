@@ -3,7 +3,9 @@
    platform/packages/web/src/styles.css). Sourced from the brand logo:
    distributed idle nodes converging into a token that gets lit up.
    Primary = electric blue #2563EB (the system, actions, capacity).
-   Spark    = amber #F59E0B (the "it's alive" accent: online / live / ready).
+   Spark    = amber #F59E0B (brand mark, in-progress states, warnings).
+   Live     = green #16A34A (online / ready / serving — health is green;
+   amber for "all is well" read as a warning, 2026-08-15).
    Display = Space Grotesk (headings & wordmark) / body = IBM Plex Sans /
    data = IBM Plex Mono (every number — GB, layers, tokens, credits, ports —
    is monospaced: the product's unit is the number).
@@ -23,13 +25,24 @@
   --void: #0b1120; /* network night — local dark surfaces (engine logs) */
   --paper: #f6f8fc;
 
+  /* Health/liveness — green (2026-08-15, was the brand amber). "Serving" in
+     amber read as a warning: yellow means "attention" everywhere else in
+     computing, and the one state that means "all is well" was the one drawn in
+     it. Amber stays for what it is good at — in-progress (loading, probing)
+     and genuine warnings — and for the brand mark. Three tiers, same hue:
+     --live for dots/fills, --live-ink for text on light tints (green-700,
+     AA on the 12% tint), --live-2 for text on dark surfaces. */
+  --live: #16a34a;
+  --live-ink: #15803d;
+  --live-2: #4ade80;
+
   /* legacy semantic aliases, kept so every existing class stays in-brand.
      --amber* is now the PRIMARY accent (electric blue): buttons, toggles,
-     sliders, active nav, this-node, capacity. --teal is the LIVE SPARK
-     (amber): online / ready / coordinator / running. */
+     sliders, active nav, this-node, capacity. --teal is LIVENESS (green):
+     online / ready / coordinator / running / serving. */
   --amber: var(--electric);
   --amber-soft: var(--electric-2);
-  --teal: var(--spark);
+  --teal: var(--live);
   --bad: #dc2626;
 
   --radius: 14px;
@@ -70,6 +83,7 @@
 
 /* ---- dark (same palette, network-night variant on --void / --ink) -------- */
 [data-theme="dark"] {
+  --live: #22c55e; /* one step brighter: green-600 dots sink into the navy */
   --bg: #0b1120;
   --bg-grad: radial-gradient(1200px 700px at 78% -8%, #131c31 0%, #0b1120 58%);
   --surface: #131c31;
@@ -225,7 +239,7 @@ textarea {
 
 .pill--ready .pill__dot {
   background: var(--teal);
-  box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.2);
+  box-shadow: 0 0 0 4px rgba(22, 163, 74, 0.18);
 }
 
 /* icon buttons */
@@ -881,6 +895,79 @@ textarea {
   transition: border-color 0.15s, background 0.15s;
 }
 
+/* Download-manager card (2026-08-15): a clickable header that unfolds the
+   card, then one precision dropdown + one weights row for the precision being
+   viewed. Unfolding is browsing — what runs is chosen on the Cluster page. */
+.model-opt--rows {
+  display: block;
+  cursor: default;
+}
+.model-opt__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+}
+.model-opt__deploy--busy {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+/* The sizes inside a brand card (2026-08-15). Chips rather than rows: a
+   brand has a handful of sizes and they read as a ladder, so they wrap onto
+   one or two lines instead of costing a full row each. */
+.model-sizes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+.model-size {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 5px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.model-size:hover { border-color: var(--accent); }
+.model-size.is-on {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.model-size__name { font-size: 13px; font-weight: 600; }
+.model-size__params {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-faint);
+}
+
+.model-variant {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 7px 0 7px 12px;
+  margin-top: 8px;
+  border-top: 1px dashed var(--line);
+}
+.model-variant__q {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  min-width: 64px;
+}
+.model-variant__size {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+.model-variant .wrow {
+  margin-left: auto;
+}
+
 .model-opt.is-on {
   border-color: var(--amber);
   background: color-mix(in srgb, var(--amber) 8%, transparent);
@@ -1085,6 +1172,29 @@ textarea {
 
 .setting-row__control {
   flex: none;
+}
+
+/* Path field + its Browse button. The field grows so a real Windows path
+   ("D:\AI\models") is readable without scrolling it sideways. */
+.setting-row__control--dir {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+  justify-content: flex-end;
+}
+
+.setting-row__control--dir .field__input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.btn-secondary--sm {
+  flex: none;
+  padding: 6px 11px;
+  font-size: 12.5px;
+  white-space: nowrap;
 }
 
 .reserved-tag {
@@ -1598,7 +1708,7 @@ textarea {
   height: 7px;
   border-radius: 50%;
   background: var(--teal);
-  box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.2);
+  box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.18);
 }
 
 .linkbtn {
@@ -1743,7 +1853,7 @@ textarea {
 
 .peer--coord .peer__dot {
   background: var(--teal);
-  box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.2);
+  box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.18);
 }
 
 .peer__id {
@@ -1869,7 +1979,7 @@ textarea {
   height: 8px;
   border-radius: 50%;
   background: var(--teal);
-  box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.2);
+  box-shadow: 0 0 0 4px rgba(22, 163, 74, 0.18);
 }
 
 .api-card__row {
@@ -2322,12 +2432,12 @@ textarea {
 }
 
 .stage-tag--ready {
-  color: #b45309;
-  background: rgba(245, 158, 11, 0.12);
+  color: var(--live-ink);
+  background: rgba(22, 163, 74, 0.12);
 }
 
 [data-theme="dark"] .stage-tag--ready {
-  color: var(--spark-2);
+  color: var(--live-2);
 }
 
 .stage-tag--busy {
@@ -2377,7 +2487,7 @@ textarea {
   background: var(--ink-faint);
 }
 
-.cpeer__dot--ready { background: var(--spark); box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.18); }
+.cpeer__dot--ready { background: var(--live); box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.18); }
 .cpeer__dot--loading, .cpeer__dot--probing, .cpeer__dot--assigned { background: var(--electric); }
 .cpeer__dot--error { background: var(--bad); }
 
@@ -2629,11 +2739,14 @@ textarea {
 }
 
 /* this-machine strip: one dense row of probe facts */
+/* Two rows, two columns (2026-08-15): GPU over CPU threads on the left, the
+   VRAM bar over the RAM bar on the right — the two memory bars stack so their
+   scales read together. */
 .node-strip {
-  display: flex;
-  align-items: flex-start;
-  gap: clamp(14px, 3vw, 30px);
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);
+  align-items: start;
+  gap: 12px clamp(14px, 3vw, 30px);
   padding-bottom: 16px;
   border-bottom: 1px solid var(--line);
 }
@@ -2712,6 +2825,22 @@ textarea {
   color: var(--ink-dim);
 }
 
+/* The one line under the layer bar: fits, or it doesn't. Green/amber rather
+   than green/red — "too big for this machine" is a fact about the pairing of
+   model and hardware, not a failure, and the cluster path right below it is
+   the answer. */
+.capacity__verdict {
+  margin: 9px 0 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--live-ink);
+}
+
+.capacity__verdict--no { color: #b45309; }
+
+[data-theme="dark"] .capacity__verdict { color: var(--live-2); }
+[data-theme="dark"] .capacity__verdict--no { color: var(--spark-2); }
+
 .capacity__gap {
   color: var(--electric-ink);
   font-weight: 600;
@@ -2722,12 +2851,12 @@ textarea {
 }
 
 .capacity__ok {
-  color: #b45309;
+  color: var(--live-ink);
   font-weight: 600;
 }
 
 [data-theme="dark"] .capacity__ok {
-  color: var(--spark-2);
+  color: var(--live-2);
 }
 
 /* ---- 2026-07 UX pass, round 3 --------------------------------------------- */
@@ -2860,6 +2989,54 @@ textarea {
 .modelpick__params,
 .modelpick__deploy {
   font-size: 11.5px;
+  color: var(--ink-dim);
+}
+
+/* Second line of a row: size · fit verdict · usage. One flex line spanning both
+   columns, so adding a chip never pushes the name around. */
+.modelpick__meta {
+  grid-column: 1 / -1;
+  grid-row: 2;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+}
+
+/* The advisor's verdict, same three states as the capability table. */
+.modelpick__fit {
+  font-size: 10.5px;
+  line-height: 1.6;
+  padding: 0 6px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+}
+/* Same two colours the capability table uses, with the same fallbacks —
+   --ok/--warn are not declared as theme tokens, only used with a default. */
+.modelpick__fit.is-fast {
+  color: var(--ok, #30a46c);
+  border-color: color-mix(in srgb, var(--ok, #30a46c) 35%, transparent);
+}
+.modelpick__fit.is-slow {
+  color: var(--warn, #f5a524);
+  border-color: color-mix(in srgb, var(--warn, #f5a524) 35%, transparent);
+}
+.modelpick__fit.is-no {
+  color: var(--ink-dim);
+  border-color: var(--line);
+}
+
+.modelpick__usage {
+  font-size: 10.5px;
+  color: var(--ink-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Present only when the order really came from usage data (see ModelPicker). */
+.modelpick__ranked {
+  margin: 0 0 6px;
+  padding: 0 10px;
+  font-size: 11px;
   color: var(--ink-dim);
 }
 
@@ -3335,15 +3512,15 @@ textarea {
   height: 6px;
   margin-right: 6px;
   border-radius: 50%;
-  background: var(--spark);
+  background: var(--live);
 }
 
 /* Running something other than the local setting. Not an error — the cluster is
    serving fine, it is just serving something else — so only the label changes
-   colour (the same amber .stage-tag--ready uses, which is legible on both
-   themes) and the tooltip carries the explanation. Recolouring the model NAME
-   was the first attempt: amber body text on the light theme is unreadable, and
-   it made the one thing this row exists to state the hardest thing to read. */
+   colour (amber — the warning tier, now that liveness is green) and the
+   tooltip carries the explanation. Recolouring the model NAME was the first
+   attempt: amber body text on the light theme is unreadable, and it made the
+   one thing this row exists to state the hardest thing to read. */
 .modelchip--warn .modelchip__label {
   color: #b45309;
 }
@@ -3455,6 +3632,16 @@ textarea {
   animation: chatbar-live 1.4s ease-in-out infinite;
 }
 
+/* Queued, not generating: the turn is out and the cluster has not started on
+   it. Still and hollow, because the pulse means "tokens are arriving" and
+   nothing is arriving yet — the same honesty rule as the bubble, which shows a
+   sentence instead of a typing ellipsis in this state. */
+.chatbar__live--queued {
+  animation: none;
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px var(--ink-faint);
+}
+
 /* Both reduce-motion paths (the media query and [data-reduce-motion]) already
    collapse every animation globally, and this one resolves to opacity 1 when
    they do — the dot stays visible, only the pulse goes. */
@@ -3550,13 +3737,6 @@ textarea {
      more below". Every mainstream client does this. */
   -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 22px), transparent 100%);
           mask-image: linear-gradient(to bottom, #000 calc(100% - 22px), transparent 100%);
-}
-
-.chat-hint {
-  color: var(--ink-faint);
-  font-size: 13px;
-  text-align: center;
-  margin: 24px 0;
 }
 
 /* Avatar gutter + content, both roles left-aligned. The old layout was bubble
@@ -3672,6 +3852,47 @@ textarea {
   font-size: 11px;
   color: var(--ink-faint);
   margin-top: 7px;
+}
+
+/* Per-message actions (copy / regenerate). Revealed on hover so a long thread
+   does not read as a wall of buttons, but ALWAYS shown on the last turn — that
+   is where regenerate lives, and an affordance that only appears if you happen
+   to mouse over it is one most people never find. focus-within keeps them
+   reachable by keyboard, where there is no hover to reveal them. */
+.chat-msg__actions {
+  display: flex;
+  gap: 2px;
+  margin-top: 5px;
+  margin-left: -6px;   /* the first button's padding, so its label aligns with the text above */
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.chat-msg:hover .chat-msg__actions,
+.chat-msg__actions:focus-within,
+.chat-msg--tail .chat-msg__actions { opacity: 1; }
+.chat-msg--user .chat-msg__actions {
+  justify-content: flex-end;
+  margin-left: 0;
+  margin-right: -6px;
+}
+
+.msgbtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: none;
+  background: transparent;
+  color: var(--ink-faint);
+  font-family: inherit;
+  font-size: 11.5px;
+  padding: 3px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: color 0.12s ease, background 0.12s ease;
+}
+.msgbtn:hover {
+  color: var(--ink-dim);
+  background: var(--surface-2);
 }
 
 /* Composer: one rounded field that grows with the text, with the send button
@@ -4103,19 +4324,6 @@ textarea {
   font-size: 12px;
   overflow-wrap: anywhere;
   flex: 1 1 auto;
-}
-
-.endpoint-snippet {
-  font-family: var(--font-mono);
-  font-size: 11.5px;
-  line-height: 1.6;
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 10px 12px;
-  margin: 12px 0 8px;
-  overflow-x: auto;
-  white-space: pre;
 }
 
 .setting-hint--warn {

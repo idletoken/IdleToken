@@ -24,8 +24,30 @@ PATCH_DIR="$ROOT/scripts/llamacpp-patches"
 SRC_DIR="${IDLETOKEN_LLAMACPP_SRC:-$ROOT/vendor/llama.cpp}"
 BUILD_DIR="$SRC_DIR/build"
 
-read -r REPO_URL PIN_SHA < "$PATCH_DIR/UPSTREAM"
+read -r REPO_URL PIN_SHA PIN_TAG _rest < "$PATCH_DIR/UPSTREAM"
 [ -n "$PIN_SHA" ] || { echo "FATAL: cannot parse $PATCH_DIR/UPSTREAM" >&2; exit 1; }
+# The third field is the upstream release tag, and it is required: it is what
+# makes the engine's own version string a function of the pin instead of a
+# function of how this machine happened to clone.
+#
+# llama.cpp derives "build N" from `git rev-list --count HEAD` and the commit
+# from `git rev-parse --short HEAD`. Both depend on the checkout: the shallow
+# fetch this script performs yields `build 1` and a 7-char hash, while a full
+# clone of the same commit yields `build 10502` and a 9-char hash. Measured
+# 2026-08-19 with DGX and the control Mac at the identical pin:
+#     DGX : version: 0.1.2-dev (build 1, commit 0adcc3b)
+#     Mac : version: 0.1.2-dev (build 10502, commit 0adcc3bb5)
+# G-ENGINE-VER compares that string for equality across the cluster, so two
+# nodes running byte-identical engines refuse to form a cluster and the refusal
+# names a machine that has nothing to upgrade. Forcing both values makes the
+# string depend only on UPSTREAM. 7 chars because that is the width both build
+# scripts already assert the pin against.
+case "$PIN_TAG" in
+    b[0-9]*) ;;
+    *) echo "FATAL: $PATCH_DIR/UPSTREAM has no release tag in field 3 (got '${PIN_TAG:-}')" >&2
+       echo "       Expected: <url> <full-sha> b<build-number>" >&2; exit 1 ;;
+esac
+PIN_BUILD="${PIN_TAG#b}"
 
 # --- fetch ------------------------------------------------------------------
 if [ ! -d "$SRC_DIR/.git" ]; then
@@ -35,7 +57,22 @@ if [ ! -d "$SRC_DIR/.git" ]; then
 fi
 if ! git -C "$SRC_DIR" cat-file -e "$PIN_SHA" 2>/dev/null; then
     echo "== fetching $PIN_SHA from $REPO_URL"
-    git -C "$SRC_DIR" fetch --depth 1 origin "$PIN_SHA"
+    # A mirror, tried only after the real upstream fails. Machines behind a
+    # restrictive network cannot reach github.com at all (a rented GPU box in
+    # China times out on the TLS handshake), and the pin is a content hash --
+    # a mirror either serves those exact bytes or `checkout` below fails, so
+    # this cannot quietly substitute a different tree. Same escape hatch the
+    # Windows script has had as IDLETOKEN_LLAMACPP_GIT_URL.
+    if ! git -C "$SRC_DIR" fetch --depth 1 origin "$PIN_SHA"; then
+        [ -n "${IDLETOKEN_LLAMACPP_GIT_URL:-}" ] || {
+            echo "FATAL: cannot fetch $PIN_SHA from $REPO_URL." >&2
+            echo "       Set IDLETOKEN_LLAMACPP_GIT_URL to a reachable mirror," >&2
+            echo "       or copy a checkout that already has the pin into $SRC_DIR." >&2
+            exit 1
+        }
+        echo "== upstream unreachable; retrying from $IDLETOKEN_LLAMACPP_GIT_URL"
+        git -C "$SRC_DIR" fetch --depth 1 "$IDLETOKEN_LLAMACPP_GIT_URL" "$PIN_SHA"
+    fi
 fi
 # Reset tracked files to the pinned commit; patches are reapplied below.
 # (Local edits in vendor/llama.cpp/ are lost here — capture them as a patch
@@ -61,14 +98,39 @@ fi
 # --- configure --------------------------------------------------------------
 COMMON_FLAGS=(
     -DCMAKE_BUILD_TYPE=Release
+    # Deterministic engine version string — see the PIN_TAG note above.
+    -DLLAMA_BUILD_NUMBER="$PIN_BUILD"
+    -DLLAMA_BUILD_COMMIT="${PIN_SHA:0:7}"
     -DGGML_RPC=ON
     -DGGML_RPC_TLS=ON         # PSK-TLS inside the RPC transport (patch 0001)
     -DBUILD_SHARED_LIBS=OFF
     -DLLAMA_CURL=OFF          # downloads are the coordinator's job
+    # The embedded web UI is fetched from a Hugging Face bucket AT BUILD TIME,
+    # and when the pinned tag's asset is unreachable upstream silently falls
+    # back to `.../resolve/latest/dist.tar.gz` — unpinned bytes inside a pinned
+    # engine. On DGX (2026-08-19) the pinned fetch timed out and the fallback
+    # then hung the build outright. We never serve that UI anyway: llama-server
+    # is loopback-only behind the coordinator, and the product UI is the Tauri
+    # client. Off makes the build hermetic after the git fetch.
+    -DLLAMA_BUILD_UI=OFF
     -DLLAMA_BUILD_TESTS=OFF
     -DLLAMA_BUILD_EXAMPLES=OFF
     -DLLAMA_BUILD_TOOLS=ON
 )
+# The TLS transport patch pulls mbedTLS v3.6.7 through CMake FetchContent,
+# i.e. a second trip to github.com -- so a machine that needed the mirror
+# above fails again here, several minutes later, with a completely different
+# error message. Point this at a local mbedTLS source tree to skip the
+# download. The Windows script already accepted this variable; this side
+# silently ignored it, which meant "seed the tree" advice only worked on one
+# of the two platforms.
+#
+# Written as `if`, not `[ -n ... ] && COMMON_FLAGS+=(...)`: under `set -e` the
+# latter exits the whole script when the variable is unset, i.e. on every
+# ordinary build (the trap already documented in scripts/testbed-lib.sh).
+if [ -n "${IDLETOKEN_MBEDTLS_SRC:-}" ]; then
+    COMMON_FLAGS+=(-DIDLETOKEN_MBEDTLS_SRC="$IDLETOKEN_MBEDTLS_SRC")
+fi
 case "$(uname -s)" in
     Darwin)
         PLATFORM_FLAGS=(-DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON)

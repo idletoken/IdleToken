@@ -16,13 +16,12 @@
 #include <stdio.h>
 #include <string.h>
 
-/* The registry has no public iterator (callers look models up by id), so the
- * ids live here. Keep in sync with src/common/model.c — the checker reports a
- * manifest with no registry entry, which is what a forgotten id looks like. */
-static const char *IDS[] = {
-    "deepseek-v4-flash", "qwen3.5-0.8b", "qwen3.5-4b", "qwen3.5-9b", "qwen3.5-27b", "qwen3.5-35b-a3b", "qwen3-8b",
-    "glm-5.2", "kimi-k2.5", "kimi-k3",
-};
+/* The registry enumerates ITSELF (idletoken_model_count/at). This file used to
+ * carry a hand-written id list "kept in sync with model.c" — and on 2026-08-15
+ * a newly registered model (deepseek-v4-pro) was dumped as absent, so the
+ * manifest checker reported a missing registry entry that was in fact present.
+ * A checker fed by a second hand-maintained copy checks the copy, not the
+ * thing. */
 
 static void jstr(const char *k, const char *v, int last) {
     printf("    \"%s\": \"%s\"%s\n", k, v ? v : "", last ? "" : ",");
@@ -34,8 +33,8 @@ static void jnum(const char *k, unsigned long long v, int last) {
 int main(void) {
     printf("{\n");
     int first = 1;
-    for (size_t i = 0; i < sizeof(IDS) / sizeof(IDS[0]); i++) {
-        const idletoken_model_spec *m = idletoken_model_get(IDS[i]);
+    for (int i = 0; i < idletoken_model_count(); i++) {
+        const idletoken_model_spec *m = idletoken_model_at(i);
         if (!m) continue;
         if (!first) printf("  },\n");
         printf("%s  \"%s\": {\n", first ? "" : "", m->id);

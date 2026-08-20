@@ -15,30 +15,18 @@
 //
 // The alternative — let the dropdown change a setting that does nothing until
 // the next restart — is worse than a link to Settings: it looks like it worked.
+//
+// The list is the CURATED registry, and it is the whole list: the open intake
+// (pick any GGUF file / HF repo) was removed on 2026-08-15 — serving arbitrary
+// models is not this product's job, and shared endpoints must run models whose
+// quality we can vouch for. Model requests go through GitHub issues.
 import { useEffect, useState } from "react";
 import { useI18n } from "./i18n";
-import { AVAILABLE_MODELS, isLocalGguf, defaultQuant, hasQuantChoice, quantOptions, isSingleNode } from "./models";
-import type { CustomModelSource } from "./weights";
+import { AVAILABLE_MODELS, defaultQuant, hasQuantChoice, quantOptions, isSingleNode } from "./models";
 import { fmtBytes } from "./format";
 import { useDialog } from "./useDialog";
-import { inTauri } from "./platform";
-
-/** Parse the HF inputs into a repo + exact .gguf file name. The first box
- *  accepts either "owner/name" or a full huggingface.co file link (blob/ or
- *  resolve/ URL) — pasting the browser address bar is the common case, and
- *  asking someone to dissect it by hand is error entry by design. */
-export function parseHfInput(repoOrUrl: string, fileName: string): { repo: string; file: string } | null {
-  let repo = repoOrUrl.trim();
-  let file = fileName.trim();
-  const m = repo.match(/huggingface\.co\/([^/\s]+\/[^/\s]+)\/(?:blob|resolve)\/[^/\s]+\/([^?\s]+\.gguf)/i);
-  if (m) {
-    repo = m[1];
-    if (!file) file = decodeURIComponent(m[2]);
-  }
-  if (!/^[\w][\w.-]*\/[\w][\w.-]*$/.test(repo)) return null;
-  if (!/\.gguf$/i.test(file) || file.includes("/")) return null;
-  return { repo, file };
-}
+import { loadCapability, type CapabilityMode, type CapabilityRow } from "./Capability";
+import { fetchLeaderboard } from "./platform";
 
 /** What the cluster is running right now, which is what a switch would have to
  *  restart. `null` = nothing is running, so a pick costs nothing.
@@ -53,32 +41,89 @@ export interface RunningModel {
   machines: number;
 }
 
+/** The advisor's three states, worded exactly as the capability table words
+ *  them — one verdict must not read differently on two screens. "unavailable"
+ *  (an old engine's "backend not implemented") collapses into "won't run",
+ *  same as it does there. */
+function fitKey(mode: CapabilityMode): "cap.yesGpu" | "cap.yesHybrid" | "cap.no" {
+  if (mode === "gpu_only") return "cap.yesGpu";
+  if (mode === "hybrid") return "cap.yesHybrid";
+  return "cap.no";
+}
+function fitClass(mode: CapabilityMode): string {
+  if (mode === "gpu_only") return "is-fast";
+  if (mode === "hybrid") return "is-slow";
+  return "is-no";
+}
+
+/** 1_234_567 → "1.2M". Order of magnitude is the point; exact counts are not. */
+function shortCount(n: number): string {
+  if (n >= 1e9) return `${(n / 1e9).toFixed(n >= 1e10 ? 0 : 1)}B`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(n >= 1e7 ? 0 : 1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(n >= 1e4 ? 0 : 1)}K`;
+  return String(n);
+}
+
 export default function ModelPicker(props: {
   /** The local setting: what the next start would use. */
   modelId: string;
   quant: string;
   running: RunningModel | null;
+  /** The paired cluster's API, when there is one: the fit verdicts then cover
+   *  the whole pool instead of this machine alone. */
+  apiBaseUrl?: string | null;
   /** Apply the pick. The caller saves it and performs any restart. */
   onPick: (modelId: string, quant: string) => void;
-  /** Apply an OPEN pick — a user-supplied GGUF (local file / HF repo+file).
-   *  The caller saves it under LOCAL_GGUF_ID and restarts through the local
-   *  llama.cpp engine. Absent = this surface cannot switch to open models. */
-  onPickCustom?: (c: CustomModelSource) => void;
-  /** Display name of the current open selection (file name), when the setting
-   *  points at one. */
-  customName?: string;
   onClose: () => void;
 }) {
   const { t } = useI18n();
   const ref = useDialog(props.onClose);
+
+  // Ordering by real usage on the platform (7-day window). Enhancement only:
+  // no platform configured, offline, slow, or too little traffic to rank
+  // (`source: 'seeded'`) all end the same way — the static manifest order, no
+  // label, no numbers. That degradation is deliberate and it is VISIBLE: the
+  // "ordered by usage" line is absent, so nobody reads the list as a ranking
+  // it is not. Faking either the order or the numbers is the thing not allowed.
+  const [usage, setUsage] = useState<Map<string, number> | null>(null);
+  useEffect(() => {
+    let alive = true;
+    fetchLeaderboard("week")
+      .then((p) => {
+        if (!alive || p.source !== "measured") return;
+        setUsage(new Map(p.rows.map((r) => [r.model, r.totalTokens])));
+      })
+      .catch(() => {
+        /* enhancement only — the manifest order is a fine answer */
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  // The three-state fit verdict per model. NOT recomputed here: it comes from
+  // the engine's advisor through the same loader the capability table uses
+  // (Capability.tsx). A second derivation in TypeScript is exactly what that
+  // file's header forbids.
+  const [fit, setFit] = useState<Map<string, CapabilityRow[]>>(new Map());
+  useEffect(() => {
+    let alive = true;
+    loadCapability(props.apiBaseUrl)
+      .then((rep) => {
+        if (!alive) return;
+        const by = new Map<string, CapabilityRow[]>();
+        for (const r of rep.models) by.set(r.id, [...(by.get(r.id) ?? []), r]);
+        setFit(by);
+      })
+      .catch(() => {
+        /* no advisor (plain browser, engine down) → no pills, no error box */
+      });
+    return () => {
+      alive = false;
+    };
+  }, [props.apiBaseUrl]);
   // A pick that is waiting for confirmation because it would restart something.
-  const [pending, setPending] = useState<
-    { kind: "curated"; modelId: string; quant: string } | { kind: "open"; c: CustomModelSource; label: string } | null
-  >(null);
-  const [hfOpen, setHfOpen] = useState(false);
-  const [hfRepo, setHfRepo] = useState("");
-  const [hfFile, setHfFile] = useState("");
-  const [hfErr, setHfErr] = useState(false);
+  const [pending, setPending] = useState<{ modelId: string; quant: string } | null>(null);
 
   // Popover, not a modal: clicking anywhere else dismisses it. useDialog gives
   // Escape and the focus trap; there is no scrim to click, so outside-click is
@@ -121,57 +166,37 @@ export default function ModelPicker(props: {
       props.onClose();
       return;
     }
-    setPending({ kind: "curated", modelId, quant });
-  };
-
-  /** An open pick goes through the same restart gate as a curated one: with
-   *  something running it is a rebuild, and the picker says so first. */
-  const chooseCustom = (c: CustomModelSource, label: string) => {
-    if (!props.onPickCustom) return;
-    if (run && run.modelId) {
-      setPending({ kind: "open", c, label });
-      return;
-    }
-    props.onPickCustom(c);
-    props.onClose();
-  };
-
-  const pickLocalFile = async () => {
-    if (!inTauri()) return; // button carries the explanation
-    try {
-      const { open } = await import("@tauri-apps/plugin-dialog");
-      const picked = await open({
-        multiple: false,
-        directory: false,
-        filters: [{ name: "GGUF", extensions: ["gguf"] }],
-      });
-      const path = typeof picked === "string" ? picked : null;
-      if (!path) return; // cancelled
-      const cut = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
-      chooseCustom({ source: "file", path, repo: "", file: "" }, cut >= 0 ? path.slice(cut + 1) : path);
-    } catch (e) {
-      console.error("gguf file dialog:", e);
-    }
-  };
-
-  const useHf = () => {
-    const parsed = parseHfInput(hfRepo, hfFile);
-    if (!parsed) {
-      setHfErr(true);
-      return;
-    }
-    setHfErr(false);
-    chooseCustom({ source: "hf", path: "", repo: parsed.repo, file: parsed.file }, parsed.file);
+    setPending({ modelId, quant });
   };
 
   const confirm = () => {
     if (!pending) return;
-    if (pending.kind === "curated") props.onPick(pending.modelId, pending.quant);
-    else props.onPickCustom?.(pending.c);
+    props.onPick(pending.modelId, pending.quant);
     props.onClose();
   };
 
   const curQuant = cur.quant || defaultQuant(cur.modelId);
+
+  // Usage order when we have it, manifest order otherwise. Models the platform
+  // has never served keep their manifest position AFTER the ranked ones — a
+  // model nobody has run yet is not the same as a model that ranked last.
+  const ordered = usage
+    ? [...AVAILABLE_MODELS].sort((a, b) => (usage.get(b.id) ?? -1) - (usage.get(a.id) ?? -1))
+    : AVAILABLE_MODELS;
+
+  /** The advisor's verdict for this model at this precision (exact row first,
+   *  otherwise any row for the model — an older engine may report one quant). */
+  const fitOf = (modelId: string, quant: string): CapabilityMode | null => {
+    const rows = fit.get(modelId);
+    if (!rows || rows.length === 0) return null;
+    return (rows.find((r) => r.quant === quant) ?? rows[0]).mode;
+  };
+
+  // The DRAFT pick (2026-08-15). Clicking a row used to apply immediately —
+  // with a cluster running, the restart confirmation popped before the user
+  // could even reach the precision dropdown. Now the row and the dropdown
+  // only edit this draft; the Apply button is the one thing that acts.
+  const [sel, setSel] = useState({ modelId: cur.modelId, quant: curQuant });
 
   return (
     <div className="modelpick" ref={ref} role="dialog" aria-label={t("model.pick.title")}>
@@ -179,10 +204,7 @@ export default function ModelPicker(props: {
         <div className="modelpick__confirm">
           <p className="modelpick__confirm-title">
             {t("model.switch.title", {
-              model:
-                pending.kind === "curated"
-                  ? AVAILABLE_MODELS.find((m) => m.id === pending.modelId)?.label ?? pending.modelId
-                  : pending.label,
+              model: AVAILABLE_MODELS.find((m) => m.id === pending.modelId)?.label ?? pending.modelId,
             })}
           </p>
           {/* One machine and several machines are different promises. The
@@ -202,85 +224,54 @@ export default function ModelPicker(props: {
         </div>
       ) : (
         <>
+          {/* The label IS the signal that the order below came from usage data.
+              Absent = the static manifest order (see the fetch above). */}
+          {usage ? <p className="modelpick__ranked">{t("model.rank.byUsage")}</p> : null}
           <div className="modelpick__list">
-            {AVAILABLE_MODELS.map((m) => (
-              <button
-                key={m.id}
-                className={`modelpick__item${m.id === cur.modelId ? " is-on" : ""}`}
-                onClick={() => choose(m.id, defaultQuant(m.id))}
-              >
-                <span className="modelpick__name">{m.label}</span>
-                <span className="modelpick__params">{m.params}</span>
-                {/* Whether a model can be pooled changes what the Cluster screen
-                    will let you do next, and it is not guessable from the size. */}
-                <span className="modelpick__deploy">
-                  {t(isSingleNode(m.id) ? "settings.model.singleNode" : "settings.model.cluster")}
-                </span>
-              </button>
-            ))}
-          </div>
-          {/* Open intake (v2 WS-D1): any GGUF llama.cpp can run, below the
-              curated recommendations. The engine reads the manifest from the
-              file and rules on fit at start — the picker only says where the
-              file lives. */}
-          {props.onPickCustom ? (
-            <div className="modelpick__open">
-              <div className="modelpick__open-head">
-                <span>{t("model.open.section")}</span>
-                {isLocalGguf(cur.modelId) && props.customName ? (
-                  <span className="modelpick__open-cur is-on" title={props.customName}>
-                    {props.customName}
-                  </span>
-                ) : null}
-              </div>
-              <div className="modelpick__open-actions">
+            {ordered.map((m) => {
+              const tokens = usage?.get(m.id);
+              const mode = fitOf(m.id, m.id === sel.modelId ? sel.quant : defaultQuant(m.id));
+              return (
                 <button
-                  className="btn-secondary"
-                  disabled={!inTauri()}
-                  title={inTauri() ? undefined : t("model.open.pickBrowser")}
-                  onClick={() => void pickLocalFile()}
+                  key={m.id}
+                  className={`modelpick__item${m.id === sel.modelId ? " is-on" : ""}`}
+                  onClick={() => setSel({ modelId: m.id, quant: defaultQuant(m.id) })}
                 >
-                  {t("model.open.pickFile")}
+                  <span className="modelpick__name">{m.label}</span>
+                  {/* Whether a model can be pooled changes what the Cluster screen
+                      will let you do next, and it is not guessable from the size. */}
+                  <span className="modelpick__deploy">
+                    {t(isSingleNode(m.id) ? "settings.model.singleNode" : "settings.model.cluster")}
+                  </span>
+                  <span className="modelpick__meta">
+                    <span className="modelpick__params">{m.params}</span>
+                    {/* Can these machines actually run it — the advisor's verdict,
+                        same wording as the capability table. */}
+                    {mode ? <span className={`modelpick__fit ${fitClass(mode)}`}>{t(fitKey(mode))}</span> : null}
+                    {/* Usage only when there IS usage: a "0 tokens" chip reads as
+                        "nobody runs this", which is not what missing data means. */}
+                    {tokens ? (
+                      <span className="modelpick__usage">{t("model.rank.tokens", { n: shortCount(tokens) })}</span>
+                    ) : null}
+                  </span>
                 </button>
-                <button className="linkbtn" onClick={() => setHfOpen((v) => !v)} aria-expanded={hfOpen}>
-                  {t("model.open.hfToggle")}
-                </button>
-              </div>
-              {hfOpen ? (
-                <div className="modelpick__hf">
-                  <input
-                    className="field__input"
-                    value={hfRepo}
-                    placeholder={t("model.open.hfRepo")}
-                    onChange={(e) => setHfRepo(e.target.value)}
-                  />
-                  <input
-                    className="field__input"
-                    value={hfFile}
-                    placeholder={t("model.open.hfFile")}
-                    onChange={(e) => setHfFile(e.target.value)}
-                  />
-                  <button className="btn-secondary" onClick={useHf}>
-                    {t("model.open.hfUse")}
-                  </button>
-                  {hfErr ? <p className="modelpick__hf-err">{t("model.open.hfBad")}</p> : null}
-                </div>
-              ) : null}
-              <p className="modelpick__open-hint">{t("model.open.hint")}</p>
-            </div>
-          ) : null}
+              );
+            })}
+          </div>
+          {/* A model you want that is not listed: the answer is a GitHub issue,
+              not a file box — see model.request.hint. */}
+          <p className="modelpick__open-hint">{t("model.request.hint")}</p>
           {/* Precision belongs to the selected model, so it stays a separate row
-              rather than multiplying the list by five. (An open GGUF has no
-              menu — its precision is whatever the file is.) */}
-          {!isLocalGguf(cur.modelId) && hasQuantChoice(cur.modelId) ? (
+              rather than multiplying the list by five. */}
+          {hasQuantChoice(sel.modelId) ? (
             <div className="modelpick__quant">
               <span className="modelpick__quant-label">{t("settings.precision")}</span>
               <select
                 className="select"
-                value={curQuant}
-                onChange={(e) => choose(cur.modelId, e.target.value)}
+                value={sel.quant || defaultQuant(sel.modelId)}
+                onChange={(e) => setSel((p) => ({ ...p, quant: e.target.value }))}
               >
-                {quantOptions(cur.modelId).map((v) => (
+                {quantOptions(sel.modelId).map((v) => (
                   <option key={v.quant} value={v.quant}>
                     {v.quant} · {fmtBytes(v.layer_weight_bytes + v.shared_weight_bytes)}
                   </option>
@@ -288,6 +279,14 @@ export default function ModelPicker(props: {
               </select>
             </div>
           ) : null}
+          <div className="modelpick__actions">
+            <button className="btn-secondary" onClick={props.onClose}>
+              {t("model.switch.cancel")}
+            </button>
+            <button className="btn-primary" onClick={() => choose(sel.modelId, sel.quant)}>
+              {t("model.pick.apply")}
+            </button>
+          </div>
         </>
       )}
     </div>

@@ -44,21 +44,27 @@
   #include <nvml.h>
 #endif
 
-/* Proportional ceiling: see IDLETOKEN_RAM_MAX_PCT in idletoken_resource.h.
+/* OS headroom backstop: see IDLETOKEN_OS_HEADROOM_BYTES in
+ * idletoken_resource.h for why this is an absolute amount and no longer a
+ * percentage (2026-08-16, measured).
  * WARNING: this must sit **before** `#if defined(_WIN32)` -- both the Windows
  * and the Linux probe call it. The first version put it inside the Windows
  * branch, which compiled fine on Windows and only blew up at link time on
- * Linux (undefined reference to ram_apply_proportional_ceiling).
+ * Linux (undefined reference).
  * Combined with the subtraction by taking the smaller of the two, so the
- * subtraction wins whenever it is the more conservative bound. */
-static void ram_apply_proportional_ceiling(idletoken_resource_report *r) {
-    unsigned pct = IDLETOKEN_RAM_MAX_PCT;
-    const char *e = getenv("IDLETOKEN_RAM_MAX_PCT");
+ * subtraction wins whenever it is the more conservative bound — which, unlike
+ * under the old proportional rule, is now the normal case. */
+static void ram_apply_os_headroom(idletoken_resource_report *r) {
+    uint64_t headroom = r->ram_total / 8;
+    if (headroom < IDLETOKEN_OS_HEADROOM_MIN_BYTES) headroom = IDLETOKEN_OS_HEADROOM_MIN_BYTES;
+    if (headroom > IDLETOKEN_OS_HEADROOM_MAX_BYTES) headroom = IDLETOKEN_OS_HEADROOM_MAX_BYTES;
+    const char *e = getenv("IDLETOKEN_OS_HEADROOM_GIB");
     if (e && e[0]) {
         unsigned long v = strtoul(e, NULL, 10);
-        if (v >= 10 && v <= 95) pct = (unsigned)v;   /* out-of-range values are ignored: a typo must not disable the ceiling */
+        /* out-of-range values are ignored: a typo must not disable the backstop */
+        if (v >= 1 && v <= 64) headroom = (uint64_t)v * 1024ull * 1024ull * 1024ull;
     }
-    uint64_t ceiling = r->ram_total / 100ull * pct;
+    uint64_t ceiling = r->ram_total > headroom ? r->ram_total - headroom : 0;
     if (r->ram_usable > ceiling) r->ram_usable = ceiling;
 }
 
@@ -415,7 +421,7 @@ static int probe_host(idletoken_resource_report *r) {
     } else {
         r->ram_usable = 0;
     }
-    ram_apply_proportional_ceiling(r);
+    ram_apply_os_headroom(r);
     return 0;
 #elif defined(__APPLE__)
     struct utsname un;
@@ -481,7 +487,7 @@ static int probe_host(idletoken_resource_report *r) {
     } else {
         r->ram_usable = 0;
     }
-    ram_apply_proportional_ceiling(r);
+    ram_apply_os_headroom(r);
     return 0;
 #else
     struct utsname un;
@@ -531,7 +537,7 @@ static int probe_host(idletoken_resource_report *r) {
     } else {
         r->ram_usable = 0;
     }
-    ram_apply_proportional_ceiling(r);
+    ram_apply_os_headroom(r);
     return 0;
 #endif /* _WIN32 */
 }

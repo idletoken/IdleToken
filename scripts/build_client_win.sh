@@ -102,12 +102,41 @@ echo "== [3/4] stage the engine binaries as sidecars =="
 # Real engines, not stubs: this is a compute node. Their dates are printed
 # because a stale sidecar is invisible otherwise — a coordinator talking to an
 # older worker just loops on `Protocol error` (see scripts/stage_sidecars.sh).
-$SSH "$NODE" "if not exist \"$WIN\\client\\src-tauri\\binaries\" mkdir \"$WIN\\client\\src-tauri\\binaries\"" >/dev/null 2>&1
-for b in worker coord platform-agent; do
-    $SSH "$NODE" "copy /Y \"$WIN\\idletoken-$b.exe\" \"$WIN\\client\\src-tauri\\binaries\\idletoken-$b-$TRIPLE.exe\"" >/dev/null 2>&1 \
-        || fail "missing $WIN\\idletoken-$b.exe on $NODE — build the engine there first"
+BIN="$WIN\\client\\src-tauri\\binaries"
+$SSH "$NODE" "if not exist \"$BIN\" mkdir \"$BIN\"" >/dev/null 2>&1
+
+# Where the pinned llama.cpp lands on Windows: the MSVC generator adds a
+# per-config subdirectory, Ninja does not. Accept either instead of hardcoding
+# one and failing on the next machine.
+LLAMA_DIR=
+for d in 'build\bin\Release' 'build\bin'; do
+    if $SSH "$NODE" "if exist \"$WIN\\vendor\\llama.cpp\\$d\\llama-server.exe\" (exit 0) else (exit 1)" >/dev/null 2>&1; then
+        LLAMA_DIR="$WIN\\vendor\\llama.cpp\\$d"; break
+    fi
 done
-$SSH "$NODE" "dir \"$WIN\\client\\src-tauri\\binaries\\*.exe\"" 2>/dev/null | tr -d '\r' | grep -E '\.exe' | sed 's/^/   /'
+[ -n "$LLAMA_DIR" ] || fail "no llama-server.exe under $WIN\\vendor\\llama.cpp\\build\\bin[\\Release] on $NODE — build the pinned engine there first (scripts\\build_llamacpp_win.bat)"
+
+# ALL FIVE externalBin entries are staged, every build. Staging only three of
+# them (worker/coord/agent) is what this step used to do, and the other two —
+# the actual inference engines — were then whatever an earlier build had left
+# in the directory. That is the "gate certifies the wrong artifact" shape
+# stage_sidecars.sh exists to prevent, except here it reaches a shipped .exe.
+stage_win() {   # stage_win <src-exe> <sidecar-name>
+    $SSH "$NODE" "copy /Y \"$1\" \"$BIN\\$2-$TRIPLE.exe\"" >/dev/null 2>&1 \
+        || fail "could not stage $2 from $1 on $NODE — build it there first"
+}
+stage_win "$WIN\\idletoken-worker.exe"         idletoken-worker
+stage_win "$WIN\\idletoken-coord.exe"          idletoken-coord
+stage_win "$WIN\\idletoken-platform-agent.exe" idletoken-platform-agent
+# Staged under OUR names, matching engine.rs's runtime lookup and
+# stage_sidecars.sh. The binaries are upstream's, unchanged; only the file name
+# is ours (MIT attribution stays in About + NOTICE).
+stage_win "$LLAMA_DIR\\llama-server.exe"       idletoken-server
+stage_win "$LLAMA_DIR\\ggml-rpc-server.exe"    idletoken-rpc-server
+# Pre-rename leftovers: not in externalBin, so they never ship, but they sit
+# next to the real ones and read as current.
+$SSH "$NODE" "del /q \"$BIN\\ggml-rpc-server-$TRIPLE.exe\" \"$BIN\\llama-server-$TRIPLE.exe\" 2>NUL" >/dev/null 2>&1
+$SSH "$NODE" "dir \"$BIN\\*.exe\"" 2>/dev/null | tr -d '\r' | grep -E '\.exe' | sed 's/^/   /'
 
 if [ "$MODE" = debug ]; then
     echo "== [4/4] cargo build (debug shell for the product gates) =="

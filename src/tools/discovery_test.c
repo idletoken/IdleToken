@@ -22,6 +22,11 @@
 #include <sys/socket.h>
 
 static int g_fail = 0;
+/* Mirrors THROTTLE_FREE_TRIES in discovery.c. Deliberately a separate literal:
+ * the free allowance is a promise to users ("a few typos cost nothing"), so a
+ * change to it should break this test and be re-decided, not silently follow. */
+#define THROTTLE_FREE_TRIES_T 5
+
 #define CHECK(cond, msg) do { \
     if (cond) { printf("  [ok] %s\n", msg); } \
     else { printf("  [FAIL] %s\n", msg); g_fail = 1; } \
@@ -121,6 +126,45 @@ static void test_auth(void) {
     CHECK(rc2 != 0, "wrong code -> auth rejected");
 }
 
+/* ---- online-guessing throttle (D2) ---------------------------------------
+ *
+ * The security property is "wrong codes get slower"; the usability property is
+ * "a person who mistypes a few times is not locked out". Both are asserted,
+ * and in that order — a throttle that never fires would pass a test that only
+ * checked the happy path. */
+static void test_throttle(void) {
+    printf("pairing throttle:\n");
+    idletoken_pair_throttle_reset();
+
+    /* The curve itself: free allowance, then doubling to a ceiling. */
+    CHECK(idletoken_pair_backoff_ms(1) == 0, "first failure is free (typo)");
+    CHECK(idletoken_pair_backoff_ms(5) == 0, "five failures still free");
+    CHECK(idletoken_pair_backoff_ms(6) == 1000, "sixth failure costs 1 s");
+    CHECK(idletoken_pair_backoff_ms(7) == 2000, "then it doubles");
+    CHECK(idletoken_pair_backoff_ms(40) == 30000, "and is capped (no permanent lockout)");
+
+    uint8_t sk[32], ck[32];
+    /* Baseline: with a clean record the right code works. Without this the
+     * "blocked" assertion below could pass for the wrong reason. */
+    CHECK(run_auth("ABC234", "ABC234", sk, ck) == 0, "clean record: correct code works");
+
+    idletoken_pair_throttle_reset();
+    /* Spend the free allowance and one more, exactly as a guesser would. The
+     * allowance counts FAILURES, so the Nth wrong code is still answered
+     * normally; the penalty starts once it has failed N+1 times. */
+    for (int i = 0; i < THROTTLE_FREE_TRIES_T + 1; i++) run_auth("ABC234", "WRONG9", sk, ck);
+    /* Past the allowance the source is refused even WITH the right code —
+     * this is the property that makes walking 2^30 impractical. */
+    CHECK(run_auth("ABC234", "ABC234", sk, ck) != 0,
+          "past the free allowance even a correct code is refused (guessing is throttled)");
+
+    /* And the lockout is not permanent state damage: clearing the record (what
+     * the backoff window does once it expires) restores normal service. */
+    idletoken_pair_throttle_reset();
+    CHECK(run_auth("ABC234", "ABC234", sk, ck) == 0,
+          "once the window passes, the correct code works again");
+}
+
 /* ---- broadcast provider e2e (real UDP on a test port) -------------------- */
 static void test_broadcast(void) {
     printf("broadcast provider e2e:\n");
@@ -167,6 +211,7 @@ int main(void) {
     test_code();
     test_pairid();
     test_auth();
+    test_throttle();
     test_mock();
     test_broadcast();
     printf("\n%s\n", g_fail ? "DISCOVERY_TEST_FAIL" : "DISCOVERY_TEST_OK");

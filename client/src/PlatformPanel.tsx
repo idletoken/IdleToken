@@ -6,7 +6,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { fmtCredits as fmtCreditsBase } from "@idletoken/shared-ui";
 import { useI18n } from "./i18n";
-import type { AppSettings } from "./settings";
+import { loadSettings, saveSettings, OVERFLOW_DEFAULT_DAILY_CAP_MILLI, type AppSettings } from "./settings";
 import type { Session } from "./auth";
 import { getPairingProvider } from "./pairing";
 import {
@@ -144,6 +144,11 @@ function Console(props: { settings: AppSettings; jwt: string; url: string }) {
         </button>
       </div>
       {me.err ? <div className="engine-meta engine-meta--bad">{t("platform.err", { msg: me.err })}</div> : null}
+      {/* TODO(after next client release): zero-balance empty state. Signing up no
+          longer grants Sparks (2026-08-19, docs/t11-no-signup-grant-2026-08.md), so a
+          fresh account shows a bare "0" here with no hint of where Sparks come from.
+          The portal already says it (share compute / redeem a code); this panel should
+          say the same thing once we ship a client build. */}
       {me.data ? (
         <div className="plat-balance">
           <span className="plat-balance__v">
@@ -241,7 +246,31 @@ function RendezvousTokenCard() {
   );
 }
 
-// ---- share compute (platform agent lifecycle) ------------------------------
+// ---- sharing: lend when idle, borrow when full -----------------------------
+//
+// ONE switch (T5, 2026-08-19). It is one arrangement, not two features: this
+// machine takes other people's work while it is free, and hands its own
+// overflow to someone else when it is full. Two switches would offer "earn
+// only" and "spend only" as if they were products.
+//
+// Turning it on does three things, and either all three happen or none do:
+//
+//   1. the local API token exists (settings.ts mints one on first launch). The
+//      coordinator REFUSES TO START with overflow and no token, because an open
+//      local API plus automatic spending means anyone on the network can drain
+//      the balance;
+//   2. the lending half: the platform agent runs and the provider is listed;
+//   3. the borrowing half: an account key exists for it, and the --overflow-*
+//      launch parameters reach the coordinator.
+//
+// A half-applied state is the thing to avoid. "Listed but not earning" and
+// "spending but not listed" are both states a user cannot diagnose from this
+// screen, so a failure anywhere rolls the others back and the status line says
+// what went wrong.
+//
+// The borrowing half only takes effect when the engine next starts -- these are
+// launch parameters, and the engine has no hot swap. Said in the same words as
+// a model switch, because it is the same event.
 function ShareCard(props: {
   settings: AppSettings;
   jwt: string;
@@ -256,24 +285,13 @@ function ShareCard(props: {
   const [lines, setLines] = useState<AgentLogLine[]>([]);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
   const [clusterReady, setClusterReady] = useState(false);
-  const [listBusy, setListBusy] = useState<string | null>(null);
-
-  // List or unlist on the marketplace: the last inch of the sharing loop.
-  // Registration defaults to listed=false, so without this switch a provider
-  // never receives anyone's traffic and never earns credits.
-  const toggleListing = async (p: ProviderInfo) => {
-    setListBusy(p.id);
-    setErr(null);
-    try {
-      await setProviderListing(p.id, !p.listed);
-      props.onChanged();
-    } catch (e) {
-      setErr(String((e as Error)?.message ?? e));
-    } finally {
-      setListBusy(null);
-    }
-  };
+  const [on, setOn] = useState(props.settings.sharingEnabled);
+  const [capCredits, setCapCredits] = useState(
+    String((props.settings.overflowDailyCapMilli || OVERFLOW_DEFAULT_DAILY_CAP_MILLI) / 1000));
+  const [waitS, setWaitS] = useState(String(props.settings.overflowWaitS || 0));
+  const [advanced, setAdvanced] = useState(false);
 
   useEffect(() => {
     if (!tauri) return;
@@ -290,57 +308,211 @@ function ShareCard(props: {
   }, [tauri]);
 
   // Honest readiness hint: the local cluster state comes from the same pairing
-  // subscription the topbar pill uses. Not ready ≠ blocked — the agent waits.
+  // subscription the topbar pill uses. Not ready is not blocked — the agent waits.
   useEffect(() => {
     return getPairingProvider().subscribe((s) => setClusterReady(s.phase === "ready"));
   }, []);
 
-  const active = st !== null && st.state !== "stopped" && st.state !== "crashed";
+  const agentAlive = st !== null && st.state !== "stopped" && st.state !== "crashed";
+
+  const capMilli = (): number => {
+    const n = Number(capCredits);
+    // Never 0 and never NaN. 0 would read as "no borrowing at all" here and as
+    // "use the default" at the coordinator — two different meanings for one
+    // number is how a limit stops limiting.
+    return Number.isFinite(n) && n > 0 ? Math.round(n * 1000) : 5000;
+  };
+
+  /** Mint the borrowing key once and keep it. A new key on every flip would
+   *  leave the account filling with abandoned keys nobody can tell apart. */
+  const ensureOverflowKey = async (): Promise<string> => {
+    const stored = loadSettings().overflowKey;
+    if (stored) return stored;
+    const created = await createApiKey({
+      label: "overflow (borrow when busy)",
+      dailyCapMilli: capMilli(),
+    });
+    saveSettings({ ...loadSettings(), overflowKey: created.apiKey });
+    return created.apiKey;
+  };
+
+  const turnOn = async () => {
+    const before = loadSettings();
+    let agentStarted = false;
+    const listedIds: string[] = [];
+    try {
+      if (!before.apiToken) {
+        // Should be unreachable: settings.ts mints one on first launch. If it
+        // ever is reached, saying so beats letting the coordinator refuse to
+        // start with a message this screen never shows.
+        throw new Error("this machine has no local API token (Settings → API)");
+      }
+      const key = await ensureOverflowKey();
+      await agentStart({
+        platformUrl: props.url,
+        jwt: props.jwt,
+        name: before.clusterName || "IdleToken-Home",
+        coordApiPort: before.apiPort || 8000,
+        coordToken: before.apiToken,
+      });
+      agentStarted = true;
+      for (const p of props.providers.data ?? []) {
+        if (!p.listed && p.status !== "SUSPENDED") {
+          await setProviderListing(p.id, true);
+          listedIds.push(p.id);
+        }
+      }
+      saveSettings({
+        ...loadSettings(),
+        sharingEnabled: true,
+        overflowKey: key,
+        overflowDailyCapMilli: capMilli(),
+        overflowWaitS: Math.max(0, Number(waitS) || 0),
+      });
+      setOn(true);
+      setNote(t("platform.share.restart"));
+      props.onChanged();
+    } catch (e) {
+      // Roll back whatever did happen. Being listed while the agent is not
+      // running means the platform dispatches work nothing will answer, and the
+      // provider is scored for it.
+      for (const id of listedIds) {
+        try { await setProviderListing(id, false); } catch { /* reported below */ }
+      }
+      if (agentStarted) {
+        try { await agentStop(); } catch { /* reported below */ }
+      }
+      saveSettings({ ...loadSettings(), sharingEnabled: false });
+      setOn(false);
+      setErr(t("platform.share.failed", { msg: tErr(String((e as Error)?.message ?? e)) }));
+    }
+  };
+
+  const turnOff = async () => {
+    // Order matters the other way round: stop taking work before announcing
+    // availability is gone, so nothing is dispatched into the gap.
+    const problems: string[] = [];
+    try { await agentStop(); } catch (e) { problems.push(String((e as Error)?.message ?? e)); }
+    for (const p of props.providers.data ?? []) {
+      if (p.listed) {
+        try { await setProviderListing(p.id, false); }
+        catch (e) { problems.push(String((e as Error)?.message ?? e)); }
+      }
+    }
+    // The borrowing half stops at the next engine start; until then the
+    // coordinator's own daily ceiling is what bounds it. Said plainly rather
+    // than implied by a switch that looks immediate.
+    saveSettings({ ...loadSettings(), sharingEnabled: false });
+    setOn(false);
+    setNote(t("platform.share.restart"));
+    if (problems.length) setErr(t("platform.share.offFailed", { msg: problems.join("; ") }));
+    props.onChanged();
+  };
+
   const toggle = async () => {
     if (busy || !tauri) return;
     setBusy(true);
     setErr(null);
-    try {
-      if (active) {
-        await agentStop();
-      } else {
-        await agentStart({
-          platformUrl: props.url,
-          jwt: props.jwt,
-          name: props.settings.clusterName || "home",
-          coordApiPort: props.settings.apiPort || 8000,
-        });
-      }
-    } catch (e) {
-      // tErr: the supervisor's own precondition errors ("[PLATFORM_URL_EMPTY]"
-      // and friends) render localized; anything else passes through verbatim.
-      setErr(tErr(String((e as Error)?.message ?? e)));
-    }
+    setNote(null);
+    if (on) await turnOff();
+    else await turnOn();
     setBusy(false);
   };
 
-  const state = st?.state ?? "stopped";
+  // Three states, not two: on, off, and mid-flight. A switch that reads "on"
+  // while the agent is still starting is a switch that lies for a few seconds.
+  const capsule = busy
+    ? { cls: "starting", label: t("platform.share.working") }
+    : on
+      ? { cls: agentAlive ? "running" : "starting", label: t("platform.share.on") }
+      : { cls: "stopped", label: t("platform.share.off") };
+
+  const commitCap = () => {
+    const milli = capMilli();
+    setCapCredits(String(milli / 1000));
+    saveSettings({ ...loadSettings(), overflowDailyCapMilli: milli });
+  };
+  const commitWait = () => {
+    const n = Math.max(0, Number(waitS) || 0);
+    setWaitS(String(n));
+    saveSettings({ ...loadSettings(), overflowWaitS: n });
+  };
+
   return (
     <>
       <div className="setting-group__label plat-label">{t("platform.share")}</div>
       <div className="plat-share">
         <div className="engine-card__head">
-          <span className={`engine-state engine-state--${state}`}>
+          <span className={`engine-state engine-state--${capsule.cls}`}>
             <span className="engine-state__dot" />
-            {t(`engine.state.${state}` as const)}
+            {capsule.label}
           </span>
           <button className="btn-secondary engine-card__btn" disabled={busy || !tauri} onClick={toggle}>
-            {active ? t("platform.share.stop") : t("platform.share.start")}
+            {on ? t("platform.share.stop") : t("platform.share.start")}
           </button>
         </div>
         <p className="setting-row__hint">{t("platform.share.explain")}</p>
+
+        {/* The daily limit lives HERE, next to the switch, not in the advanced
+            pane: it is the only thing standing between "sharing is on" and an
+            account that spends by itself. */}
+        <div className="setting-row">
+          <span className="setting-row__label">
+            <label htmlFor="ovf-cap">{t("platform.share.cap")}</label>
+            <span className="setting-row__hint">{t("platform.share.capUnit")}</span>
+          </span>
+          <span className="setting-row__control">
+            <input
+              id="ovf-cap"
+              className="field__input field__input--num"
+              type="number"
+              min={0.001}
+              step={1}
+              value={capCredits}
+              disabled={busy}
+              onChange={(e) => setCapCredits(e.target.value)}
+              onBlur={commitCap}
+            />
+          </span>
+        </div>
+        <p className="setting-row__hint">{t("platform.share.capHint")}</p>
+
+        <button className="linkbtn" onClick={() => setAdvanced((v) => !v)}>
+          {t("platform.share.advanced")}
+        </button>
+        {advanced ? (
+          <>
+            <div className="setting-row">
+              <span className="setting-row__label">
+                <label htmlFor="ovf-wait">{t("platform.share.wait")}</label>
+                <span className="setting-row__hint">{t("platform.share.waitUnit")}</span>
+              </span>
+              <span className="setting-row__control">
+                <input
+                  id="ovf-wait"
+                  className="field__input field__input--num"
+                  type="number"
+                  min={0}
+                  step={1}
+                  value={waitS}
+                  disabled={busy}
+                  onChange={(e) => setWaitS(e.target.value)}
+                  onBlur={commitWait}
+                />
+              </span>
+            </div>
+            <p className="setting-row__hint">{t("platform.share.waitHint")}</p>
+          </>
+        ) : null}
+
         {!tauri ? <p className="engine-meta">{t("platform.share.browser")}</p> : null}
-        {tauri && !active && !clusterReady ? (
+        {tauri && !on && !clusterReady ? (
           <p className="engine-meta">{t("platform.share.notReady", { port: props.settings.apiPort || 8000 })}</p>
         ) : null}
         {st?.state === "crashed" ? (
           <p className="engine-meta engine-meta--bad">{t("engine.crashedHint", { code: st.lastExitCode ?? "?" })}</p>
         ) : null}
+        {note ? <p className="engine-meta">{note}</p> : null}
         {err ? <p className="engine-meta engine-meta--bad">{err}</p> : null}
         {lines.length > 0 ? (
           <pre className="engine-log" aria-label={t("platform.agent.log")}>
@@ -349,7 +521,9 @@ function ShareCard(props: {
         ) : null}
       </div>
 
-      {/* my providers, as the platform sees them */}
+      {/* my providers, as the platform sees them. Read-only now: the switch
+          above owns listing, and a second control for the same state is how the
+          two get out of step. */}
       <div className="setting-group__label plat-label">{t("platform.providers")}</div>
       {props.providers.err ? (
         <div className="engine-meta engine-meta--bad">{t("platform.err", { msg: props.providers.err })}</div>
@@ -373,21 +547,8 @@ function ShareCard(props: {
                       ? t("platform.provider.suspended")
                       : t("platform.provider.offline")}
                 </span>
-                <button
-                  className={`sw${p.listed ? " is-on" : ""}`}
-                  disabled={listBusy === p.id || p.status === "SUSPENDED"}
-                  onClick={() => toggleListing(p)}
-                  role="switch"
-                  aria-checked={p.listed}
-                  title={p.listed ? t("platform.listing.on") : t("platform.listing.off")}
-                >
-                  <span className="sw__k" />
-                </button>
               </div>
             ))}
-            <p className="auth-note plat-listing-hint">
-              {t("platform.listing.hint")}
-            </p>
           </div>
         )
       ) : null}

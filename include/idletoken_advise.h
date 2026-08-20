@@ -24,7 +24,12 @@
 /* Context tiers (8K / 32K / 128K / 512K / 1M). The
  * advisor reports the largest tier a given (model, quant) fits in; a model
  * whose own context_max is smaller is capped to it. */
-#define IDLETOKEN_ADVISE_MAX_ROWS 128
+/* One row per (model, precision). Raised from 128 on 2026-08-15, when the
+ * catalogue stopped listing "the three or four quants we measured" and started
+ * listing every precision the upstream repos publish (~140 rows today). A cap
+ * below the real count does not fail loudly — it truncates the table, so the
+ * precision a user is looking for silently is not there. */
+#define IDLETOKEN_ADVISE_MAX_ROWS 512
 
 typedef struct {
     const char *model_id;
@@ -64,5 +69,21 @@ void idletoken_advise_print_json(const idletoken_advice_row *rows, int n, int n_
  * if the buffer is too small. */
 int idletoken_advise_json(const idletoken_advice_row *rows, int n, int n_nodes,
                        char *buf, size_t cap);
+
+/* Bytes to allocate for the JSON of `n` rows.
+ *
+ * A fixed buffer is the wrong shape here and has now been wrong twice: the
+ * catalogue grew from "the three or four quants we measured" to every
+ * precision the upstream repos publish, and a table sized for the old
+ * catalogue does not truncate politely — the writer returns -1 and the caller
+ * has NO capability table at all. `idletoken-advise --json` hit that in
+ * 2026-08-15 and got a bigger constant; the coordinator's
+ * GET /idletoken/v1/capability was still on the original 16 KiB and answered
+ * 500 with the full curated list (12 models, ~140 rows).
+ *
+ * 512 B/row against the ~150 B a row actually writes is deliberate slack: the
+ * cost of over-allocating is a few hundred KiB for the length of one request,
+ * and the cost of under-allocating is the whole feature. */
+size_t idletoken_advise_json_cap(int n);
 
 #endif /* IDLETOKEN_ADVISE_H */

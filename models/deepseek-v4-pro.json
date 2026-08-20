@@ -1,0 +1,282 @@
+{
+  "id": "deepseek-v4-pro",
+  "label": "DeepSeek V4 Pro",
+  "family": "deepseek",
+  "backend": "llamacpp",
+  "arch": "deepseek4",
+  "available": true,
+  "deployment": "cluster",
+  "license": "MIT",
+  "params_summary": "671B · 37B active",
+  "release": "0731",
+  "n_layers": 61,
+  "n_embd": 7168,
+  "hc_streams": 1,
+  "n_vocab": 129280,
+  "layer_weight_bytes": 849683927055,
+  "shared_weight_bytes": 0,
+  "context_max": 1048576,
+  "split": {
+    "boundary_multiple": 0
+  },
+  "kv": {
+    "kind": "dsv4",
+    "bytes_per_token_per_layer": 0
+  },
+  "overhead_base_bytes": 3221225472,
+  "default_gguf": "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00001-of-00020.gguf",
+  "chat_template": "ds4",
+  "sources": [
+    {
+      "repo": "unsloth/DeepSeek-V4-Pro-0813-GGUF",
+      "quant": "Q4_K_XL"
+    },
+    {
+      "repo": "unsloth/DeepSeek-V4-Pro-0813-GGUF",
+      "quant": "Q8_K_XL"
+    }
+  ],
+  "default_quant": "Q4_K_XL",
+  "speculative": {
+    "kind": "dspark",
+    "available": false,
+    "gguf": "DeepSeek-V4-Flash-DSpark-support.gguf",
+    "repo": "antirez/deepseek-v4-gguf",
+    "weight_bytes": 5989114272,
+    "block_size": 5,
+    "stage_count": 3,
+    "markov_rank": 256,
+    "noise_token_id": 128799,
+    "target_layer_ids": [
+      40,
+      41,
+      42
+    ],
+    "placement": "last_stage",
+    "status": "parked-2026-08-03"
+  },
+  "notes": [
+    "Since 2026-08-03 the **release build DeepSeek-V4-Flash-0731** is the source of truth (deepseek-ai/DeepSeek-V4-Flash-0731, MIT). The official model card marks the preview, deepseek-ai/DeepSeek-V4-Flash, as superseded; this project no longer references it.",
+    "The release and preview GGUFs have **identical tensor layout**: 1328 tensors, arch string deepseek4, block_count 43, and equal byte sizes tensor for tensor. Only the weight values differ, so the ds4 inference path needs no change.",
+    "compress_ratios has 46 entries in the official config.json (44 in the preview), but antirez's converted GGUF metadata still carries 44; ds4 validates only the first n_layers (43) entries and requires length >= 43, so both pass.",
+    "The model card states 304B (284B for the preview). The extra ~20B is the DSpark speculative decoding module, **packaged separately** as DeepSeek-V4-Flash-DSpark-support.gguf (5.6 GiB) and absent from the main weight file -- which is why the main GGUF is byte for byte the same size as the preview.",
+    "layer_weight_bytes / shared_weight_bytes are **measured**: summed tensor by tensor from the GGUF tensor directory (blk.N.* counted as layer weights, everything else as shared), reading only the header over HTTP Range. Self-check: layer + shared + data_start == file size, exactly, for both variants.",
+    "The previously registered 81 GiB / 1 GiB were estimates and were off by a visible margin (measured: 79.249 GiB / 1.510 GiB). Within shared, token_embd (1.06 GB) lands on the first stage and output (0.56 GB) on the last, so a wrong estimate skews the pipeline-parallel plan directly.",
+    "speculative.weight_bytes lands on the **last stage only** -- the draft module consumes the hidden states of layers 40/41/42 -- unlike shared_weight_bytes, which every stage loads. available=false means the weights are confirmed fetchable but the engine forward pass is not implemented yet (see docs/dspark-design.md).",
+    "DSpark is shelved (decided 2026-08-03): the code and analysis stay in the tree but are not enabled, speculative.available=false, there are zero production call sites, and the G_DSPARK gate defaults to SKIP (set HOMEAI_DSPARK_GATE=1 to run it). Read the shelving note at the top of docs/dspark-design.md before restarting the work."
+  ],
+  "variants": [
+    {
+      "quant": "Q4_K_XL",
+      "layer_weight_bytes": 849683927055,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/DeepSeek-V4-Pro-0813-GGUF",
+      "gguf": "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00001-of-00020.gguf",
+      "sha256": "0c6e411bf23282b5f149b3f0d7e0ae37f26bd23c6a3fbe52841437a4016736be",
+      "revision": "6d053616d152293da72569f56b861466f10ace7d",
+      "parts": [
+        {
+          "file": "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00002-of-00020.gguf",
+          "bytes": 48499332992,
+          "sha256": "aeb64ef378a3632ef938a32995b744e4935bcb2a73a6f4d4ac5a1dd8ed6fb467"
+        },
+        {
+          "file": "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00003-of-00020.gguf",
+          "bytes": 46206696672,
+          "sha256": "440d5d735679f120baac875242c1a353cc37b87ecc41502052609c2bc90e725d"
+        },
+        {
+          "file": "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00004-of-00020.gguf",
+          "bytes": 46551168480,
+          "sha256": "140fb3dc53d6bd908799044c8e83a71fa72b092c0232648837ab99bfbd60b6a8"
+        },
+        {
+          "file": "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00005-of-00020.gguf",
+          "bytes": 46211371104,
+          "sha256": "82a295f7d1e5198cf004ac2ed2251a3f1eab76a99f1c17cebae3b5a2020d373e"
+        },
+        {
+          "file": "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00006-of-00020.gguf",
+          "bytes": 46206696768,
+          "sha256": "f4ae46e760ad3b73ed2f99c8cf1f7e1f45d9013609ac7e8e5d8d040a6dec7f98"
+        },
+        {
+          "file": "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00007-of-00020.gguf",
+          "bytes": 46551168576,
+          "sha256": "9bd015cbe215ae720f6e4a1708924da10fbc55bff5c9039b044f815abcf9aa77"
+        },
+        {
+          "file": "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00008-of-00020.gguf",
+          "bytes": 46211371104,
+          "sha256": "f4534f1618f970b21e0585155c6fe3b432be3a54c604edb4bafff8198a161475"
+        },
+        {
+          "file": "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00009-of-00020.gguf",
+          "bytes": 46206696768,
+          "sha256": "88a0868c24cff08ddb236fd10bba28916604a214d40a9d5c3038bfc61cf3fe21"
+        },
+        {
+          "file": "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00010-of-00020.gguf",
+          "bytes": 46551168576,
+          "sha256": "ea34c36b38d90fe53d323e76f720ca8de8bd5c9e67ca4490499653b65ffe37fc"
+        },
+        {
+          "file": "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00011-of-00020.gguf",
+          "bytes": 46211371104,
+          "sha256": "31eea9aebe4dd925cabad9a323813f164bc4728f653fadb7529c3ae350efda0b"
+        },
+        {
+          "file": "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00012-of-00020.gguf",
+          "bytes": 46206696768,
+          "sha256": "d2cd296b4722733671669b0647d0b034353392fe62cfde819e3fc694cbf683d7"
+        },
+        {
+          "file": "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00013-of-00020.gguf",
+          "bytes": 46551168576,
+          "sha256": "dd0f7c98b34f1a873ad61c22e0c78f8b85da56b2e2fe6a92016cfc5587bbf317"
+        },
+        {
+          "file": "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00014-of-00020.gguf",
+          "bytes": 46211371104,
+          "sha256": "9a530b4ceb6231b5fe9a52f9cfd89caece00244089f94125c1081e41be134253"
+        },
+        {
+          "file": "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00015-of-00020.gguf",
+          "bytes": 46206696768,
+          "sha256": "4983ff25d96c5bc89b111ac6560bef3cdbc6823c19ae3b48a2beef0e0fb90e39"
+        },
+        {
+          "file": "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00016-of-00020.gguf",
+          "bytes": 46551168576,
+          "sha256": "b466c173037d16dd6e8bdd66cdcd5f0fefa22fa19d73b09a8271340ff8da0274"
+        },
+        {
+          "file": "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00017-of-00020.gguf",
+          "bytes": 46211371104,
+          "sha256": "a3d408224bae3102de30d66c06efcf4f2ad1d9e6cf7c0f96e8f923e46b581d49"
+        },
+        {
+          "file": "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00018-of-00020.gguf",
+          "bytes": 46206696768,
+          "sha256": "e8d837147dfc345a56de32f70575d5db708350894dac344a94adc85e4839f291"
+        },
+        {
+          "file": "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00019-of-00020.gguf",
+          "bytes": 46551168576,
+          "sha256": "bd14f611c85332e42ab737167aefa0034f757b4e5c163fe4134395a585633661"
+        },
+        {
+          "file": "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00020-of-00020.gguf",
+          "bytes": 13575289024,
+          "sha256": "5978999836fd1fe7ad7da6232a70981bd7f98274ed71d3b06652ba42c7b46031"
+        }
+      ]
+    },
+    {
+      "quant": "Q8_K_XL",
+      "layer_weight_bytes": 873445601295,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/DeepSeek-V4-Pro-0813-GGUF",
+      "gguf": "UD-Q8_K_XL/DeepSeek-V4-Pro-0813-UD-Q8_K_XL-00001-of-00020.gguf",
+      "sha256": "0c6e411bf23282b5f149b3f0d7e0ae37f26bd23c6a3fbe52841437a4016736be",
+      "revision": "6d053616d152293da72569f56b861466f10ace7d",
+      "parts": [
+        {
+          "file": "UD-Q8_K_XL/DeepSeek-V4-Pro-0813-UD-Q8_K_XL-00002-of-00020.gguf",
+          "bytes": 47081826048,
+          "sha256": "0340e8996404fea1085ae6594b6e3059b4339a366928b592ef359ab07c0b1997"
+        },
+        {
+          "file": "UD-Q8_K_XL/DeepSeek-V4-Pro-0813-UD-Q8_K_XL-00003-of-00020.gguf",
+          "bytes": 47301123168,
+          "sha256": "d5b9b42b4c024a86381c1de0d0940cb8ebf0676b857d419dfee9512af31af638"
+        },
+        {
+          "file": "UD-Q8_K_XL/DeepSeek-V4-Pro-0813-UD-Q8_K_XL-00004-of-00020.gguf",
+          "bytes": 47325651072,
+          "sha256": "ada82c0eb161174a85c50279cdcf706f1da85ef6a89a7b18a1ff9db9dd99a555"
+        },
+        {
+          "file": "UD-Q8_K_XL/DeepSeek-V4-Pro-0813-UD-Q8_K_XL-00005-of-00020.gguf",
+          "bytes": 47954826816,
+          "sha256": "468fc891b72094fd29c7b9fcd0108d6ae4eb992b57628e73b5f619ed7d409129"
+        },
+        {
+          "file": "UD-Q8_K_XL/DeepSeek-V4-Pro-0813-UD-Q8_K_XL-00006-of-00020.gguf",
+          "bytes": 47301123264,
+          "sha256": "09304d3a2a5ac990f20c6f392926954ee097e73d5983ac549bb3d47f587a2f57"
+        },
+        {
+          "file": "UD-Q8_K_XL/DeepSeek-V4-Pro-0813-UD-Q8_K_XL-00007-of-00020.gguf",
+          "bytes": 47325651168,
+          "sha256": "fcda5952163f3e4a9875278ea179a6adb9339393539c5a8df4a7711f6d5023c8"
+        },
+        {
+          "file": "UD-Q8_K_XL/DeepSeek-V4-Pro-0813-UD-Q8_K_XL-00008-of-00020.gguf",
+          "bytes": 47954826816,
+          "sha256": "b83774a2b39538ff9151d3453959c6a8ef87de3a2f2bcc0b1c65607492109a09"
+        },
+        {
+          "file": "UD-Q8_K_XL/DeepSeek-V4-Pro-0813-UD-Q8_K_XL-00009-of-00020.gguf",
+          "bytes": 47301123264,
+          "sha256": "7c117ae8eb07fd84743f9bf7741d0d8fd9a3b8012ac4a0c808b706e1034b4a87"
+        },
+        {
+          "file": "UD-Q8_K_XL/DeepSeek-V4-Pro-0813-UD-Q8_K_XL-00010-of-00020.gguf",
+          "bytes": 47325651168,
+          "sha256": "8e563420aa3bc13d9747ed8271d779834284fe14427656ed7324f79f8401aac0"
+        },
+        {
+          "file": "UD-Q8_K_XL/DeepSeek-V4-Pro-0813-UD-Q8_K_XL-00011-of-00020.gguf",
+          "bytes": 47954826816,
+          "sha256": "c64c9c2762c930ff1dc81183ba8120c88f4ee1a8717cc14b4a123feba03b67cc"
+        },
+        {
+          "file": "UD-Q8_K_XL/DeepSeek-V4-Pro-0813-UD-Q8_K_XL-00012-of-00020.gguf",
+          "bytes": 47301123264,
+          "sha256": "f8774b0d4c3d873a326ae78eff52be2c5995ef95ea22d4c5a25fc46c0be74f9e"
+        },
+        {
+          "file": "UD-Q8_K_XL/DeepSeek-V4-Pro-0813-UD-Q8_K_XL-00013-of-00020.gguf",
+          "bytes": 47325651168,
+          "sha256": "ce419c237ec9b5e05584bfe2e34be51ab4e9e8fe934718d64beec3bf147d31ca"
+        },
+        {
+          "file": "UD-Q8_K_XL/DeepSeek-V4-Pro-0813-UD-Q8_K_XL-00014-of-00020.gguf",
+          "bytes": 47954826816,
+          "sha256": "3126d42e4c42d53b7f746293934547280b7f7301e15509070a5de9820d41b8ac"
+        },
+        {
+          "file": "UD-Q8_K_XL/DeepSeek-V4-Pro-0813-UD-Q8_K_XL-00015-of-00020.gguf",
+          "bytes": 47301123264,
+          "sha256": "a5317d1fc6f71f78e437dd1207dabc9fac5c637ef6deadc7c3ba190a8f8f0489"
+        },
+        {
+          "file": "UD-Q8_K_XL/DeepSeek-V4-Pro-0813-UD-Q8_K_XL-00016-of-00020.gguf",
+          "bytes": 47325651168,
+          "sha256": "69222448646f9e2db0e8c2bf9024fa778b36f946e9c004a0882adeb983e53bea"
+        },
+        {
+          "file": "UD-Q8_K_XL/DeepSeek-V4-Pro-0813-UD-Q8_K_XL-00017-of-00020.gguf",
+          "bytes": 47954826816,
+          "sha256": "f7e6281fec2a3748dc2c2521d491694f72402385398a58ceef5b336d78fb07ec"
+        },
+        {
+          "file": "UD-Q8_K_XL/DeepSeek-V4-Pro-0813-UD-Q8_K_XL-00018-of-00020.gguf",
+          "bytes": 47301123264,
+          "sha256": "40a9e70899072dc0e1763229eeaf8015bec9ed62f579df3b494e1dc842f30f1e"
+        },
+        {
+          "file": "UD-Q8_K_XL/DeepSeek-V4-Pro-0813-UD-Q8_K_XL-00019-of-00020.gguf",
+          "bytes": 47325651168,
+          "sha256": "4db8ee212ba02b7ce9ede251a1855b8666f8290acd8335beb1e1be2737c3dedc"
+        },
+        {
+          "file": "UD-Q8_K_XL/DeepSeek-V4-Pro-0813-UD-Q8_K_XL-00020-of-00020.gguf",
+          "bytes": 18823737120,
+          "sha256": "27fbe4c1ab2928bb63a8871273255891277653f4fbba37f16383f3a6712ebedc"
+        }
+      ]
+    }
+  ]
+}

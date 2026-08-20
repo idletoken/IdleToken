@@ -69,7 +69,7 @@ read -r -a WORKER_NODES <<< "${IDLETOKEN_WORKER_NODES:-}"
 # purely local and hardware-free -- exited 2 without a testbed.env. CI could not
 # run it, a stranger cloning the repo could not run it, and that README sentence
 # was false. Requiring something presupposes actually using it.
-LOCAL_ONLY_GATES=" G_MODEL G_SCHED G_VERSION G_MAC_SMOKE G_PRIV7 G_PPL "
+LOCAL_ONLY_GATES=" G_MODEL G_SCHED G_VERSION G_MAC_SMOKE G_PRIV7 G_PPL G_INTEGRITY "
 needs_nodes=1
 if [ -n "$ONLY_GATE" ] && [[ "$LOCAL_ONLY_GATES" == *" $ONLY_GATE "* ]]; then needs_nodes=0; fi
 if [ "$needs_nodes" = 1 ] && { [ -z "$COORD_NODE" ] || [ ${#WORKER_NODES[@]} -eq 0 ]; }; then
@@ -346,23 +346,35 @@ g1_build() {
         $SSH "$bn" "powershell -NoProfile -Command \"Get-Process idletoken-worker,idletoken-coord,idletoken-platform-agent -ErrorAction SilentlyContinue | Stop-Process -Force\"" >/dev/null 2>&1
         sleep 2
         before=$($SSH "$bn" "powershell -NoProfile -Command \"cd $bhome; if(Test-Path idletoken-worker.exe){(Get-Item idletoken-worker.exe).LastWriteTime.Ticks}else{0}\"" 2>/dev/null | tr -d '\r ')
-        # The MinGW worker imports ds4x CUDA through ds4xcuda.dll. Rebuilding
-        # only the .exe regenerates the import library from ds4xcuda.def but
-        # leaves the DLL itself stale; a newly exported entry point then links
-        # yet fails when Windows loads it. Build the DLL from the same synced
-        # tree first, and require the CUDA script's real exit status.
-        if ! $SSH "$bn" "cd /d ${bhome//\//\\} && call src\\platform\\win\\build_ds4xcuda.bat > ds4xcuda_build.log 2>&1" >/dev/null 2>&1; then
-            fail "$name" "$bn ds4xcuda.dll rebuild failed (see $bhome/ds4xcuda_build.log)"; return
-        fi
-        if ! $SSH "$bn" "cd /d ${bhome//\//\\} && call build_ds4x_win.bat" >/dev/null 2>&1; then
-            fail "$name" "$bn worker rebuild command failed (see $bhome/ds4x_build.log)"; return
+        # build_worker_win.bat, NOT build_ds4x_win.bat. The ds4 line was shelved
+        # on 2026-08-16 and its build scripts were taken down, but this gate went
+        # on calling one -- a spot that shelving missed. It mattered: the ds4x
+        # script compiles src/ds4x + vendor/ds4 and links -lds4cuda -lds4xcuda,
+        # so the gate was building a worker the product no longer ships, and
+        # requiring a CUDA Toolkit on the build node that a real user does not
+        # need. It also carries the hand-maintained object list whose twin was
+        # fixed in build_worker_win.bat (be895a9): it never compiles modelsize.c
+        # at all, so it has failed on `undefined reference to
+        # idletoken_model_size_resolve` ever since advise.c started calling it.
+        # Repairing that script would have kept a retired path alive; the path
+        # the product ships is the one worth gating.
+        #
+        # This script also prints a REAL success marker. The ds4x one echoed
+        # LINK_DONE unconditionally -- the false green the checks below exist to
+        # work around. They stay as belt and braces, but WORKER_BUILD_OK is the
+        # primary judgement now, and the script runs `--help` before claiming it.
+        local blog
+        blog=$($SSH "$bn" "cd /d ${bhome//\//\\} && call build_worker_win.bat" 2>&1 | tr -d '\r')
+        if ! printf '%s\n' "$blog" | grep -q "WORKER_BUILD_OK"; then
+            fail "$name" "$bn worker rebuild failed: $(printf '%s\n' "$blog" | grep -E 'WORKER_BUILD_FAIL' | head -1) (see $bhome/worker_build.log)"; return
         fi
         after=$($SSH "$bn" "powershell -NoProfile -Command \"cd $bhome; if(Test-Path idletoken-worker.exe){(Get-Item idletoken-worker.exe).LastWriteTime.Ticks}else{0}\"" 2>/dev/null | tr -d '\r ')
-        # `LINK_DONE` in the log is NOT a success marker — the script echoes it
-        # unconditionally, so a failed link still writes it. A log that reads
-        # like success is exactly how the broken build hid. Judge by the two
-        # things that cannot lie: a newer exe, and no compiler errors.
-        errs=$($SSH "$bn" "powershell -NoProfile -Command \"cd $bhome; (Select-String -Path ds4x_build.log -Pattern 'undefined reference','error:' -ErrorAction SilentlyContinue | Measure-Object).Count\"" 2>/dev/null | tr -d '\r ')
+        # Belt and braces behind WORKER_BUILD_OK: a newer exe, and no compiler
+        # errors in the log. These were the ONLY judgement while the gate drove
+        # the ds4x script, which echoed LINK_DONE whether or not the link
+        # succeeded -- a log that reads like success is exactly how a broken
+        # build hid for days. Keeping them costs one ssh round trip.
+        errs=$($SSH "$bn" "powershell -NoProfile -Command \"cd $bhome; (Select-String -Path worker_build.log -Pattern 'undefined reference','error:' -ErrorAction SilentlyContinue | Measure-Object).Count\"" 2>/dev/null | tr -d '\r ')
         # A failed query is not the same as no artifact. `${after:-0}` turns one
         # ssh hiccup into a 0 and reports "rebuild produced no newer exe", pointing
         # at a build log that is perfectly clean. A round was wasted this way on
@@ -373,24 +385,31 @@ g1_build() {
             fail "$name" "could not read the timestamp of idletoken-worker.exe on $bn (an ssh query failure, not a build failure) -- retry"; return
         fi
         if [ "$after" -le "$before" ]; then
-            fail "$name" "$bn rebuild produced no newer idletoken-worker.exe (see $bhome/ds4x_build.log)"; return
+            fail "$name" "$bn rebuild produced no newer idletoken-worker.exe (see $bhome/worker_build.log)"; return
         fi
         if [ "${errs:-1}" != "0" ]; then
-            fail "$name" "$bn rebuild log has $errs error/undefined-reference line(s) (see $bhome/ds4x_build.log)"; return
+            fail "$name" "$bn rebuild log has $errs error/undefined-reference line(s) (see $bhome/worker_build.log)"; return
         fi
         vlog "$bn rebuilt the worker from the synced tree (no link errors)"
     else
         vlog "rebuild subcheck skipped: build node $bn not in this run's node set"
     fi
 
-    # Every Windows worker: native exe + CUDA dll + runnable. This used to check
-    # win-a only (hardcoded), so a second Windows worker's binaries were never
-    # build-checked at all — and the product's whole point is any N machines.
+    # Every Windows worker: native exe + runnable. This used to check win-a only
+    # (hardcoded), so a second Windows worker's binaries were never build-checked
+    # at all — and the product's whole point is any N machines.
+    #
+    # ds4cuda.dll is NOT required any more (2026-08-16 shelving). The worker's
+    # link line is `-lwinpthread -lws2_32 -lbcrypt` and nothing else; ds4x is not
+    # compiled in, ds4_stub.c stands in for it. The DLL still happens to sit on
+    # both boxes from old builds, so this check was passing on a leftover file
+    # rather than on a real dependency — and would have gone red on a clean
+    # machine, which is what a new user's node is.
     local n home w help
     for n in "${WORKER_NODES[@]}"; do
         home=$(win_home "$n")
-        w=$($SSH "$n" "powershell -NoProfile -Command \"cd $home; ''+(Test-Path idletoken-worker.exe)+(Test-Path ds4cuda.dll)\"" 2>/dev/null | tr -d '\r ')
-        if [ "$w" != "TrueTrue" ]; then fail "$name" "$n missing idletoken-worker.exe/ds4cuda.dll (got '$w')"; return; fi
+        w=$($SSH "$n" "powershell -NoProfile -Command \"cd $home; ''+(Test-Path idletoken-worker.exe)\"" 2>/dev/null | tr -d '\r ')
+        if [ "$w" != "True" ]; then fail "$name" "$n missing idletoken-worker.exe (got '$w')"; return; fi
         help=$($SSH "$n" "powershell -NoProfile -Command \"cd $home; \$env:PATH='$WIN_CUDA_BIN;'+\$env:PATH; (& .\\idletoken-worker.exe --help 2>&1 | Select-Object -First 1)\"" 2>/dev/null | tr -d '\r')
         case "$help" in *idletoken-worker*) vlog "$n --help ok" ;; *) fail "$name" "$n idletoken-worker.exe --help did not run (got '$help')"; return ;; esac
     done
@@ -897,8 +916,8 @@ g_release() {
 
     # --- what is actually INSIDE the installer ----------------------------
     # A fresh timestamp says the build ran, not what it packed. Two ways that
-    # goes wrong, both seen on 2026-08-14: the v2 engine (llama-server +
-    # ggml-rpc-server) is what makes an installed client able to infer at all,
+    # goes wrong, both seen on 2026-08-14: the v2 engine (idletoken-server +
+    # idletoken-rpc-server) is what makes an installed client able to infer at all,
     # and tauri.windows.conf.json REPLACES `bundle.resources` from
     # tauri.conf.json rather than adding to it — so the Windows installer
     # shipped with no LICENSE/NOTICE while every other platform had them.
@@ -909,11 +928,11 @@ g_release() {
         fail "$name" "could not list the installer on $bn (is 7-Zip installed at C:\\Program Files\\7-Zip\\7z.exe? the gate refuses to certify a package it cannot open)"; return
     fi
     missing=""
-    # The engine halves first: llama-server serves, ggml-rpc-server is what a
+    # The engine halves first: idletoken-server serves, idletoken-rpc-server is what a
     # worker node runs. Shipping one without the other gives an installed
     # client a cluster mode it cannot actually join.
     for f in idletoken-client.exe idletoken-coord.exe idletoken-worker.exe \
-             llama-server.exe ggml-rpc-server.exe \
+             idletoken-server.exe idletoken-rpc-server.exe \
              LICENSE.txt NOTICE.txt ds4-MIT.txt rax-BSD-3-Clause.txt llamacpp-MIT.txt; do
         printf '%s\n' "$listing" | grep -qF "$f" || missing="$missing $f"
     done
@@ -982,14 +1001,43 @@ g4_single_infer() {
 # =====================================================================
 g5_cluster_ready() {
     local name="$1"
-    local out; out=$($SSH "$COORD_NODE" "cd $DGX_HOME && test -x scripts/run_cluster.sh && ./scripts/run_cluster.sh --check-ready 2>&1 | tail -1 || echo NO_HELPER" 2>/dev/null | tr -d '\r')
-    # Tear down what this gate started. A readiness check has no reason to keep
-    # 80 GB of weights resident, and leaving them there is how G6 failed with an
-    # empty error: it went on to start a SECOND cluster, and two copies of DSv4
-    # do not fit in 119 GB — something got OOM-killed and the gate reported
-    # `could not start cluster ()` with nothing to go on.
-    $SSH "$COORD_NODE" "cd $DGX_HOME && ./scripts/run_cluster.sh --stop" >/dev/null 2>&1
-    [ "$out" = "CLUSTER_READY" ] && pass "$name" || fail "$name" "cluster did not reach ready (got '$out')"
+    # PORTED 2026-08-20 (T15). The old oracle was scripts/run_cluster.sh
+    # --check-ready: coord + N workers over the INFER_* wire, judged on 43
+    # contiguous ds4 layer ranges. Both the wire and the engine are retired, so
+    # NO build of the current tree could pass this — and 15 gates skip behind
+    # it, which is how the multi-machine half of the ladder lost every gate it
+    # had (the oracle-single-machine-bias review's main finding).
+    #
+    # The replacement runs on the CONTROL machine and drives real nodes over
+    # ssh, rather than running on the coordinator: the llama.cpp cluster is
+    # coord + rpc-supervisor workers on separate boxes, so the thing under test
+    # no longer fits inside one host.
+    #
+    # SMALL model on purpose. This gate asks "does a real cluster FORM" —
+    # pairing, PSK, engine ready, a tensor split across ≥2 nodes. Whether the
+    # answer is any good is G6's question, and G6 pays the 80 GiB for it. A
+    # readiness check has no business holding that memory: leaving it resident
+    # is how G6 once failed with an empty error, because a SECOND cluster then
+    # would not fit in 119 GB and something got OOM-killed silently.
+    if [ ${#WORKER_NODES[@]} -eq 0 ]; then
+        skip "$name" "no worker node in service this run — 'a cluster forms' has no single-machine form"
+        return
+    fi
+    local w="${IDLETOKEN_G5_WORKER:-${WORKER_NODES[0]}}"
+    local model="${IDLETOKEN_G5_MODEL:-${IDLETOKEN_SMOKE_MODEL_ID:-qwen3.5-0.8b}}"
+    local gg="${IDLETOKEN_G5_GGUF:-}"
+    # Reuse the smoke model's path on the coord node when one is configured.
+    [ -n "$gg" ] || gg=$(coord_small_gguf 2>/dev/null) || gg=""
+    local out
+    out=$(bash "$REPO_ROOT/scripts/run_cluster_llamacpp.sh" --check-ready \
+            --tag g5 --api-port "${IDLETOKEN_G5_PORT:-18531}" \
+            --coord "$COORD_NODE" --worker "$w" --model "$model" \
+            ${gg:+--gguf "$gg"} --ready-wait "${IDLETOKEN_G5_READY_S:-420}" 2>&1 | tail -1)
+    bash "$REPO_ROOT/scripts/run_cluster_llamacpp.sh" --stop --tag g5 >/dev/null 2>&1
+    case "$out" in
+        CLUSTER_READY) vlog "coord $COORD_NODE + worker $w formed a real llama.cpp cluster ($model)"; pass "$name" ;;
+        *) fail "$name" "cluster did not reach ready: ${out#CLUSTER_FAIL: }" ;;
+    esac
 }
 
 # =====================================================================
@@ -997,30 +1045,66 @@ g5_cluster_ready() {
 # =====================================================================
 g6_e2e() {
     local name="$1" started=0
-    # Self-sufficient: if no API is live, bring the cluster up on the coord
-    # node via run_cluster.sh --serve (and tear it down after the checks).
-    if ! curl -s -m 3 "http://$API_HOST:$API_PORT/health" 2>/dev/null | grep -q '"status":"ok"'; then
-        vlog "no live API; starting cluster via run_cluster.sh --serve"
-        # Free the memory first. run_cluster.sh's own leftover-cleanup only
-        # knows processes it has pid files for; anything another gate left
-        # behind still holds its 80 GB, and the start then dies on memory with
-        # no message at all.
-        $SSH "$COORD_NODE" "cd $DGX_HOME && ./scripts/run_cluster.sh --stop; pkill -x idletoken-coord; pkill -x idletoken-worker; true" >/dev/null 2>&1
+    # PORTED 2026-08-20 (T15) from scripts/run_cluster.sh, whose INFER_* wire and
+    # ds4 engine are retired -- no current build could reach this gate at all.
+    # The assertions are unchanged (200 + on-topic reply + non-zero usage, both
+    # protocol faces); only the vehicle moved to the llama.cpp cluster path.
+    #
+    # MODEL: DeepSeek-V4-Flash, the one model on this testbed that genuinely
+    # needs more than one machine. The small curated models are the vehicle for
+    # P3-P6 (orchestration and API exposure, where load time is dead weight);
+    # G6 is the end-to-end product claim, so it drives the big one. Weights are
+    # already staged on DGX and win_PC2 from T14.
+    #
+    # TIMEOUTS: the ready window is 900 s, not the old 240 s. Basis:
+    # matrix_cell_cluster_llamacpp.sh measured 306 s to ready for this model at
+    # a 68/32 split and notes it grows as the coordinator's share does; T14's
+    # regression ran at 88.8/11.2, a much larger local share, so its load was
+    # longer still. 900 s is ~3x the measured datum. Requests get 300 s.
+    # These are TIMEOUTS, not sleeps: a generous value costs nothing when the
+    # model loads quickly and only ever bites on a real failure. The opposite
+    # mistake is on record here -- P1's budget was called flaky and grown twice
+    # before anyone measured that the cause was a dead desktop session.
+    # LOOPBACK, not $API_HOST. The requests below execute ON the coordinator
+    # (hard constraint #5 forces --api-bind to 127.0.0.1), and $API_HOST
+    # resolves to this testbed's ssh hostname for that node -- a Tailscale
+    # address. Aiming there produced an empty body and the gate reported
+    # "not json", which reads as a broken engine rather than a wrong address.
+    local api_base="http://127.0.0.1:$API_PORT"
+    local g6_model="${IDLETOKEN_G6_MODEL:-deepseek-v4-flash}"
+    if ! curl -s -m 3 "$api_base/health" 2>/dev/null | grep -q '"status":"ok"'; then
+        if [ ${#WORKER_NODES[@]} -eq 0 ]; then
+            skip "$name" "no worker node in service this run — G6 is the CLUSTER end-to-end claim and has no single-machine form"
+            return
+        fi
+        vlog "no live API; starting a real cluster via run_cluster_llamacpp.sh"
+        # Free the memory first: anything an earlier gate left behind still
+        # holds its 80 GB, and the load then dies with nothing to go on.
+        $SSH "$COORD_NODE" "pkill -x idletoken-coord; pkill -x llama-server; true" >/dev/null 2>&1
+        local g6_worker="${IDLETOKEN_G6_WORKER:-${WORKER_NODES[0]}}"
         local up
-        up=$($SSH "$COORD_NODE" "cd $DGX_HOME && bash scripts/run_cluster.sh --serve 2>&1 | tail -1" 2>/dev/null | tr -d '\r')
+        up=$(IDLETOKEN_CLUSTER_READY_S=900 bash "$REPO_ROOT/scripts/run_cluster_llamacpp.sh" --serve \
+                --tag g6 --api-port "$API_PORT" \
+                --coord "$COORD_NODE" --worker "$g6_worker" \
+                --model "$g6_model" ${GGUF_DGX:+--gguf "$GGUF_DGX"} \
+                --ready-wait 900 2>&1 | tail -1)
         case "$up" in
-            API_READY*) started=1; vlog "$up" ;;
-            # Empty means the remote command produced nothing — usually the box
-            # ran out of memory mid-load. Say so instead of printing "()".
-            "") fail "$name" "run_cluster.sh --serve produced NO output (OOM during load? check free memory on $COORD_NODE)"; return ;;
-            *) fail "$name" "could not start cluster ($up)"; return ;;
+            CLUSTER_LLAMACPP_READY*) started=1; vlog "cluster up: $(printf '%s' "$up" | tail -c 200)" ;;
+            "") fail "$name" "run_cluster_llamacpp.sh produced NO output (OOM during load? check free memory on $COORD_NODE)"; return ;;
+            *) fail "$name" "could not start the cluster (${up#CLUSTER_FAIL: })"; return ;;
         esac
+        # The API is on the coordinator's loopback (hard constraint #5), so the
+        # requests below run THERE, not here.
     fi
+    _g6_stop() { [ "$started" = 1 ] && bash "$REPO_ROOT/scripts/run_cluster_llamacpp.sh" --stop --tag g6 >/dev/null 2>&1; }
+    # Requests execute on the coordinator: --api-bind is forced to 127.0.0.1.
+    _g6_curl() {  # _g6_curl <path> <json>
+        $SSH "$COORD_NODE" "cat > /tmp/g6req.json" <<< "$2"
+        $SSH "$COORD_NODE" "curl -s -m 300 $api_base$1 -H content-type:application/json -d @/tmp/g6req.json" 2>/dev/null
+    }
 
     # Anthropic shape — 200 + non-empty coherent text + non-zero usage.
-    local a; a=$(curl -s -m 120 "http://$API_HOST:$API_PORT/v1/messages" \
-        -H 'content-type: application/json' \
-        -d '{"model":"deepseek-v4-flash","max_tokens":24,"messages":[{"role":"user","content":"Reply with the single word: pong"}]}' 2>/dev/null)
+    local a; a=$(_g6_curl /v1/messages "{\"model\":\"$g6_model\",\"max_tokens\":24,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word: pong\"}]}")
     local av; av=$(printf '%s' "$a" | python3 -c '
 import json,sys
 try: d=json.load(sys.stdin)
@@ -1036,12 +1120,10 @@ if not (u.get("input_tokens",0)>0 and u.get("output_tokens",0)>0): sys.exit("zer
 # missing shard flag all produced ready clusters answering BOS noise).
 if "pong" not in t.lower(): sys.exit("off-topic reply: " + t.strip()[:80])
 print("OK "+t.strip()[:60])' 2>&1)
-    case "$av" in OK*) vlog "anthropic: $av" ;; *) [ "$started" = 1 ] && $SSH "$COORD_NODE" "cd $DGX_HOME && bash scripts/run_cluster.sh --stop" >/dev/null 2>&1; fail "$name" "Anthropic /v1/messages: $av"; return ;; esac
+    case "$av" in OK*) vlog "anthropic: $av" ;; *) _g6_stop; fail "$name" "Anthropic /v1/messages: $av"; return ;; esac
 
     # OpenAI shape.
-    local o; o=$(curl -s -m 120 "http://$API_HOST:$API_PORT/v1/chat/completions" \
-        -H 'content-type: application/json' \
-        -d '{"model":"deepseek-v4-flash","max_tokens":24,"messages":[{"role":"user","content":"Reply with the single word: pong"}]}' 2>/dev/null)
+    local o; o=$(_g6_curl /v1/chat/completions "{\"model\":\"$g6_model\",\"max_tokens\":24,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word: pong\"}]}")
     local ov; ov=$(printf '%s' "$o" | python3 -c '
 import json,sys
 try: d=json.load(sys.stdin)
@@ -1053,8 +1135,64 @@ if not t.strip(): sys.exit("empty content")
 if not (u.get("prompt_tokens",0)>0 and u.get("completion_tokens",0)>0): sys.exit("zero usage")
 if "pong" not in t.lower(): sys.exit("off-topic reply: " + t.strip()[:80])
 print("OK "+t.strip()[:60])' 2>&1)
-    [ "$started" = 1 ] && $SSH "$COORD_NODE" "cd $DGX_HOME && bash scripts/run_cluster.sh --stop" >/dev/null 2>&1
-    case "$ov" in OK*) vlog "openai: $ov"; pass "$name" ;; *) fail "$name" "OpenAI /v1/chat/completions: $ov" ;; esac
+    case "$ov" in OK*) vlog "openai: $ov" ;; *) _g6_stop; fail "$name" "OpenAI /v1/chat/completions: $ov"; return ;; esac
+
+    # SSE: the stream must actually stream AND terminate. A client that never
+    # sees [DONE] hangs forever, which is the exact shape of the Clash-proxy
+    # trap in CLAUDE.md -- so "it returned tokens" is not enough on its own.
+    local ss; ss=$($SSH "$COORD_NODE" "cat > /tmp/g6sse.json" <<< "{\"model\":\"$g6_model\",\"max_tokens\":24,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word: pong\"}]}" \
+        && $SSH "$COORD_NODE" "curl -s -N -m 300 $api_base/v1/chat/completions -H content-type:application/json -d @/tmp/g6sse.json" 2>/dev/null \
+        | python3 -c '
+import sys
+chunks = done = 0; text = ""
+for line in sys.stdin:
+    line = line.strip()
+    if not line.startswith("data:"): continue
+    body = line[5:].strip()
+    if body == "[DONE]": done = 1; continue
+    chunks += 1
+    try:
+        import json; d = json.loads(body)
+        text += ((d.get("choices") or [{}])[0].get("delta") or {}).get("content","") or ""
+    except Exception: pass
+if not chunks: sys.exit("no data: chunks at all — the response did not stream")
+if not done:   sys.exit("stream never sent [DONE] (%d chunks) — a client would hang" % chunks)
+if "pong" not in text.lower(): sys.exit("streamed text off-topic: " + text.strip()[:60])
+print("OK %d chunks, [DONE] seen" % chunks)' 2>&1)
+    case "$ss" in OK*) vlog "sse: $ss" ;; *) _g6_stop; fail "$name" "SSE stream: $ss"; return ;; esac
+
+    # cache_hit / cached_tokens honesty (CLAUDE.md decision 11). The contract is
+    # NOT "the number is high" -- prefix caching is the engine's business. It is
+    # that the field is REPORTED FROM THE ENGINE and never guessed: coord reads
+    # usage.prompt_tokens_details.cached_tokens, falls back to timings.cache_n,
+    # and on a missing field warns and reports an honest 0. So: send the same
+    # long prefix twice and require the second reply to carry the field at all,
+    # with a value that is a number and not larger than the prompt.
+    local pfx; pfx=$(python3 -c 'print("The quick brown fox jumps over the lazy dog. " * 40)')
+    local body2="{\"model\":\"$g6_model\",\"max_tokens\":8,\"temperature\":0,\"messages\":[{\"role\":\"user\",\"content\":\"$pfx Reply with the single word: pong\"}]}"
+    _g6_curl /v1/chat/completions "$body2" >/dev/null 2>&1
+    local c2; c2=$(_g6_curl /v1/chat/completions "$body2")
+    # MEASURED 2026-08-20: the coordinator emits `cache_hit` and `cached_tokens`
+    # at the TOP LEVEL of both faces -- not under usage.prompt_tokens_details,
+    # which is where it READS them from the engine. The platform agent probes
+    # for the byte-literal shape `"cache_hit":true`, so top-level is the
+    # contract; asserting the engine-side spelling would have failed a correct
+    # coordinator.
+    local cv; cv=$(printf '%s' "$c2" | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit("not json")
+if "cached_tokens" not in d or "cache_hit" not in d:
+    sys.exit("reply carries no top-level cache_hit/cached_tokens — the fields the "
+             "coordinator promises to report from the engine are absent "
+             "(present keys: %s)" % ",".join(sorted(d))[:120])
+ct = d["cached_tokens"]; pt = (d.get("usage") or {}).get("prompt_tokens", 0)
+if not isinstance(ct, int): sys.exit("cached_tokens is %r, not an integer" % (ct,))
+if ct < 0 or ct > pt: sys.exit("cached_tokens=%s is outside [0, prompt_tokens=%s]" % (ct, pt))
+if d["cache_hit"] and ct == 0: sys.exit("cache_hit=true with cached_tokens=0 — the two disagree")
+print("OK cache_hit=%s cached_tokens=%s of prompt_tokens=%s" % (d["cache_hit"], ct, pt))' 2>&1)
+    _g6_stop
+    case "$cv" in OK*) vlog "cache: $cv"; pass "$name" ;; *) fail "$name" "cached_tokens contract: $cv" ;; esac
 }
 
 # =====================================================================
@@ -1082,12 +1220,48 @@ g_priv() {
 
     local e2e
     e2e=$($SSH "$COORD_NODE" "cd $DGX_HOME && bash scripts/privacy_proxy_e2e.sh 2>&1 | tail -1" 2>/dev/null | tr -d '\r')
-    if [ "$e2e" = "PRIVACY_PROXY_E2E_OK" ]; then
-        vlog "real-socket proxy e2e passed on $COORD_NODE"
-        pass "$name"
-    else
-        fail "$name" "sealed-proxy e2e did not pass (got '$e2e')"
+    if [ "$e2e" != "PRIVACY_PROXY_E2E_OK" ]; then
+        fail "$name" "sealed-proxy e2e did not pass (got '$e2e')"; return
     fi
+    vlog "real-socket proxy e2e passed on $COORD_NODE"
+
+    # (3) CLUSTER half (T15, 2026-08-20). The two oracles above are hardware-free
+    #     and cover md items 4/5/6 (bad key refused, sealed round-trip, pluggable
+    #     layers). Items 1-3 -- no plaintext on the wire, no prompt plaintext in
+    #     the cluster's logs, and the placement that keeps layer 0 home -- can
+    #     only be shown on a REAL multi-machine cluster, and under llama.cpp they
+    #     changed shape entirely: an rpc-server holds tensors, not tokens, and
+    #     the wire is ggml-RPC-over-TLS rather than our retired INFER_*.
+    #     Until this, those three were claimed in prose and asserted nowhere.
+    #     The reader controls run even with no testbed, so a laptop still checks
+    #     that the argv reader can go red.
+    local rc
+    rc=$(bash "$REPO_ROOT/scripts/gpriv_cluster_gate.sh" --selftest 2>&1 | tail -1)
+    case "$rc" in
+        G_PRIV_CLUSTER_OK*) vlog "${rc#G_PRIV_CLUSTER_OK }" ;;
+        *) fail "$name" "the layer-0 argv reader failed its own controls (${rc#G_PRIV_CLUSTER_FAIL: }) — a reader that cannot go red proves nothing about a green cluster"; return ;;
+    esac
+    if [ ${#WORKER_NODES[@]} -eq 0 ]; then
+        vlog "cluster half skipped: no worker node in service this run (reader controls only)"
+        pass "$name"; return
+    fi
+    local cl
+    # Pass the GGUF explicitly. Without it the cluster script resolves the path
+    # from models/<id>.json, whose default_quant for the smoke model is IQ2_XXS
+    # -- a file that is not on this testbed -- and the gate then failed with
+    # "an overlay --rpc-host did NOT refuse", blaming the privacy control for a
+    # missing weights file.
+    local priv_gguf; priv_gguf=$(coord_small_gguf 2>/dev/null) || priv_gguf=""
+    cl=$(IDLETOKEN_GPRIV_COORD="$COORD_NODE" \
+         IDLETOKEN_GPRIV_WORKER="${IDLETOKEN_GPRIV_WORKER:-${WORKER_NODES[0]}}" \
+         IDLETOKEN_GPRIV_MODEL="${IDLETOKEN_GPRIV_MODEL:-${IDLETOKEN_SMOKE_MODEL_ID:-qwen3.5-0.8b}}" \
+         IDLETOKEN_GPRIV_GGUF="$priv_gguf" \
+         bash "$REPO_ROOT/scripts/gpriv_cluster_gate.sh" 2>&1 | tail -1)
+    case "$cl" in
+        G_PRIV_CLUSTER_OK*) vlog "${cl#G_PRIV_CLUSTER_OK }"; pass "$name" ;;
+        G_PRIV_CLUSTER_SKIP*) vlog "cluster half skipped: ${cl#G_PRIV_CLUSTER_SKIP: }"; pass "$name" ;;
+        *) fail "$name" "cluster privacy half: ${cl#G_PRIV_CLUSTER_FAIL: }" ;;
+    esac
 }
 
 # =====================================================================
@@ -1128,15 +1302,35 @@ g_pair() {
     # joiner resolves to itself). The product's claim is "same code on several
     # machines" — with the loopback check alone, a fleet-wide join failure went
     # unnoticed until the topology matrix hit it days later.
+    #
+    # PORTED 2026-08-20 (T15). The old oracle was scripts/pair_xmachine_check.sh,
+    # which drives the worker with --model-path + --shard-repo: the ds4
+    # layer-sharding path, retired with the engine. Same claim, current vehicle
+    # -- a worker on ANOTHER MACHINE finds the coordinator from the code alone
+    # and gets as far as serving its tensor share.
+    #
+    # NOT re-checked here: mixed engine versions refused at HELLO, the refusal
+    # naming the machine to upgrade, and JOIN_REFUSED/exit 2. G_VERSION owns all
+    # of that and proves it WITH a positive control on a real loopback llama.cpp
+    # cluster; duplicating it here would be a second copy to keep honest.
+    local xw="${IDLETOKEN_PAIR_WORKER:-${WORKER_NODES[0]}}"
+    local xg; xg=$(coord_small_gguf 2>/dev/null) || xg=""
+    if [ -z "$xg" ]; then
+        # A provisioning gap is not a pairing failure. Say which -- do not fake
+        # either verdict.
+        vlog "cross-machine half skipped: no smoke GGUF on $COORD_NODE"
+        pass "$name"; return
+    fi
     local xm
-    xm=$($SSH "$COORD_NODE" "cd $DGX_HOME && WORKER_NODE=${WORKER_NODES[0]} timeout 200 bash scripts/pair_xmachine_check.sh 2>&1 | tail -3" 2>/dev/null | tr -d '\r')
+    xm=$(bash "$REPO_ROOT/scripts/run_cluster_llamacpp.sh" --check-ready \
+            --tag pair --api-port "${IDLETOKEN_PAIR_PORT:-18534}" \
+            --coord "$COORD_NODE" --worker "$xw" \
+            --model "${IDLETOKEN_SMOKE_MODEL_ID:-qwen3.5-0.8b}" --gguf "$xg" \
+            --ready-wait "${IDLETOKEN_PAIR_READY_S:-420}" 2>&1 | tail -1)
+    bash "$REPO_ROOT/scripts/run_cluster_llamacpp.sh" --stop --tag pair >/dev/null 2>&1
     case "$xm" in
-        *XMACHINE_PAIR_OK*) vlog "${WORKER_NODES[0]} joined the coord over the LAN by code"; pass "$name" ;;
-        *XMACHINE_PAIR_SKIP*)
-            # Missing small-model weights on the coordinator is a provisioning
-            # gap, not a pairing failure — say which, do not fake either.
-            vlog "cross-machine half skipped: $(echo "$xm" | head -1)"; pass "$name" ;;
-        *) fail "$name" "cross-machine code pairing failed (got '$(echo "$xm" | tail -1)')" ;;
+        CLUSTER_READY) vlog "$xw found the coordinator over the LAN by code alone and served its share"; pass "$name" ;;
+        *) fail "$name" "cross-machine code pairing failed: ${xm#CLUSTER_FAIL: }" ;;
     esac
 }
 
@@ -1166,7 +1360,8 @@ g_model() {
     # 1. registry + planner
     local pt
     pt=$(cd "$repo" && cc -Wall -Wextra -std=c99 -Iinclude src/common/plan.c \
-            src/common/model.c src/common/advise.c src/tools/plan_test.c -o build/plan_test 2>&1 \
+            src/common/model.c src/common/modelsize.c src/common/advise.c \
+            src/tools/plan_test.c -o build/plan_test 2>&1 \
             && ./build/plan_test 2>&1 | tail -1)
     echo "$pt" | grep -q "PLAN_TEST_OK" || { fail "$name" "planner/registry tests failed ($pt)"; return; }
     vlog "registry + planner unit tests passed"
@@ -1194,6 +1389,12 @@ g_model() {
     # (registry+planner), 3 (no-hardcode scan) and 4 (protocol carries model
     # identity) are engine-agnostic orchestration properties and keep running.
     if [ "${IDLETOKEN_DS4X_GATE:-0}" = "1" ]; then
+    # The frozen ds4x line is not published: the public mirror strips
+    # scripts/ds4x_ref.py and src/ds4x/. Asking for the gate there must fail
+    # loudly, not stumble over a missing file three commands in.
+    if [ ! -f "$repo/scripts/ds4x_ref.py" ]; then
+        fail "$name" "IDLETOKEN_DS4X_GATE=1, but scripts/ds4x_ref.py is not in this distribution (the ds4x line is frozen and unpublished)"; return
+    fi
     local cf ff
     cf=$(cd "$repo" && python3 scripts/make_test_gguf.py build/fixtures >/dev/null 2>&1 \
             && cc -Wall -Wextra -std=c99 -Iinclude src/common/gguf.c src/common/model.c \
@@ -1318,7 +1519,10 @@ CLIENT_DIR="$DGX_HOME/client/src-tauri"
 CLIENT_BIN='./target/debug/idletoken-client'
 # WEBKIT var: NVIDIA white-screen fix; no_proxy: Clash on the coord node must
 # not intercept localhost RPC.
-CLIENT_ENV_BASE='WEBKIT_DISABLE_DMABUF_RENDERER=1 no_proxy=localhost,127.0.0.1'
+# IDLETOKEN_ALLOW_SMALL_CLUSTER: P3/P6 drive a curated model that FITS one
+# machine, and the scheduler would correctly release the second node. The
+# client spawns the coordinator, so the hatch has to travel in ITS environment.
+CLIENT_ENV_BASE='WEBKIT_DISABLE_DMABUF_RENDERER=1 no_proxy=localhost,127.0.0.1 IDLETOKEN_ALLOW_SMALL_CLUSTER=1'
 # The display is resolved by client_display() when the run starts, see below.
 CLIENT_ENV="$CLIENT_ENV_BASE DISPLAY=${IDLETOKEN_DISPLAY:-:1}"
 
@@ -1577,14 +1781,32 @@ p3_pairing() {
     # fell back to mock, so the cluster reported `ready` and this gate passed on a
     # MOCK cluster. Its layer-coverage assertion is satisfied by mock just as well
     # as by real weights, so nothing here could ever have noticed.
-    local gguf_abs; gguf_abs=$($SSH "$COORD_NODE" "echo $GGUF_DGX" 2>/dev/null | tr -d '\r')
-    case "$gguf_abs" in
-        ""|*'$'*) fail "$name" "could not expand the GGUF path on $COORD_NODE (got '$gguf_abs')"; return ;;
-    esac
+    local gguf_abs
+    gguf_abs=$(coord_p36_gguf) || { fail "$name" "no curated large GGUF on $COORD_NODE (searched IDLETOKEN_GGUF_DIRS_${COORD_NODE} for $(basename "${IDLETOKEN_P36_GGUF:-Qwen3.8-27B-UD-Q4_K_M.gguf}"))"; return; }
     $SSH "$COORD_NODE" "rm -f /tmp/idletoken-p3a.log /tmp/idletoken-p3b.log" >/dev/null 2>&1
     $SSHF "$COORD_NODE" "cd $CLIENT_DIR && exec env $CLIENT_ENV IDLETOKEN_UI_TEST='pairing-create:ACCEPT:model=$gguf_abs,pairing-auto-start,quit:600000' $CLIENT_BIN < /dev/null > /tmp/idletoken-p3a.log 2>&1" >/dev/null 2>&1
-    sleep 4
-    $SSHF "$COORD_NODE" "cd $CLIENT_DIR && exec env $CLIENT_ENV IDLETOKEN_UI_TEST='pairing-join:ACCEPT:as=accept-node-b:model=$gguf_abs,quit:600000' $CLIENT_BIN < /dev/null > /tmp/idletoken-p3b.log 2>&1" >/dev/null 2>&1
+    # Launch the joiner only once the creator's directive loop has actually run
+    # (the directives echo prints right before pairing_create fires, and the
+    # beacon follows within a second). The joiner listens for the beacon for
+    # only 8s after ITS webview loads, and webview startup skew on Xvfb
+    # (10-30s) dwarfs any fixed sleep — a missed window reads as "no cluster
+    # found" and then 600 s of nothing (seen 2026-08-20).
+    local w
+    for w in $(seq 1 60); do
+        $SSH "$COORD_NODE" "grep -aq 'UI_TEST_REPORT directives' /tmp/idletoken-p3a.log 2>/dev/null" && break
+        sleep 2
+    done
+    sleep 3
+    # dbus-run-session + private XDG_RUNTIME_DIR: the client's single-instance
+    # lock (added 2026-08-16) is a D-Bus name on the session bus, and both
+    # instances on one DISPLAY share the X11-autolaunched bus — instance B
+    # exits before printing a single line (0-byte log, seen 2026-08-20). A
+    # private bus scopes the lock per instance. The runtime dir must move with
+    # it: the private bus's xdg-document-portal otherwise tries to mount
+    # /run/user/<uid>/doc, which the real session's portal already holds, and
+    # WebKit never comes up (fuse init failed, also 2026-08-20). Product
+    # behavior on a real desktop is untouched — this is test-harness plumbing.
+    $SSHF "$COORD_NODE" "cd $CLIENT_DIR && rm -rf /tmp/idletoken-p3b-xdg && mkdir -m 700 /tmp/idletoken-p3b-xdg && exec dbus-run-session -- env $CLIENT_ENV XDG_RUNTIME_DIR=/tmp/idletoken-p3b-xdg IDLETOKEN_UI_TEST='pairing-join:ACCEPT:as=accept-node-b:model=$gguf_abs,quit:600000' $CLIENT_BIN < /dev/null > /tmp/idletoken-p3b.log 2>&1" >/dev/null 2>&1
 
     # A REAL 80 GiB load takes minutes, not the 90s that sufficed for mock.
     local st="" i
@@ -1649,8 +1871,17 @@ pairing_pair_report() {
     ensure_frontend
     $SSH "$COORD_NODE" "rm -f /tmp/idletoken-$tag-a.log /tmp/idletoken-$tag-b.log" >/dev/null 2>&1
     $SSHF "$COORD_NODE" "cd $CLIENT_DIR && exec env $CLIENT_ENV IDLETOKEN_UI_TEST='pairing-create:$code$cx,pairing-auto-start,report-pairing-phases,quit:$life' $CLIENT_BIN < /dev/null > /tmp/idletoken-$tag-a.log 2>&1" >/dev/null 2>&1
-    sleep 4
-    $SSHF "$COORD_NODE" "cd $CLIENT_DIR && exec env $CLIENT_ENV IDLETOKEN_UI_TEST='pairing-join:$code:as=$tag-node-b$jx,quit:$life' $CLIENT_BIN < /dev/null > /tmp/idletoken-$tag-b.log 2>&1" >/dev/null 2>&1
+    # Wait for the creator's directive loop before launching the joiner — same
+    # beacon-window race as p3_pairing above.
+    local w
+    for w in $(seq 1 60); do
+        $SSH "$COORD_NODE" "grep -aq 'UI_TEST_REPORT directives' /tmp/idletoken-$tag-a.log 2>/dev/null" && break
+        sleep 2
+    done
+    sleep 3
+    # dbus-run-session + private XDG_RUNTIME_DIR: same single-instance-lock and
+    # document-portal scoping as p3_pairing above.
+    $SSHF "$COORD_NODE" "cd $CLIENT_DIR && rm -rf /tmp/idletoken-$tag-b-xdg && mkdir -m 700 /tmp/idletoken-$tag-b-xdg && exec dbus-run-session -- env $CLIENT_ENV XDG_RUNTIME_DIR=/tmp/idletoken-$tag-b-xdg IDLETOKEN_UI_TEST='pairing-join:$code:as=$tag-node-b$jx,quit:$life' $CLIENT_BIN < /dev/null > /tmp/idletoken-$tag-b.log 2>&1" >/dev/null 2>&1
     local rep="" i
     for i in $(seq 1 "$tries"); do
         rep=$($SSH "$COORD_NODE" "grep 'UI_TEST_REPORT pairing-phases' /tmp/idletoken-$tag-a.log 2>/dev/null | head -1 | sed 's/.*UI_TEST_REPORT pairing-phases //'; true" 2>/dev/null | tr -d '\r')
@@ -1673,6 +1904,25 @@ pairing_pair_report() {
 # configured gguf dirs). P4/P5 must NOT use $GGUF_DGX: that is the 80 GiB DSv4,
 # whose load time blows their 120 s ready windows — P3 survives it only because
 # its window is 600 s.
+# The curated LARGE llama.cpp model for P3/P6 (T15, 2026-08-20). Decision: P3
+# and P6 test UI-driven orchestration and API exposure, where an 80 GiB load is
+# dead weight; G6 is the end-to-end product claim and drives DeepSeek-V4-Flash
+# instead. Qwen3.8-27B is the curated SKU T14 calibrated, and it fits one
+# machine -- so these two gates run under IDLETOKEN_ALLOW_SMALL_CLUSTER=1, the
+# same documented test vehicle every cross-machine gate uses.
+coord_p36_gguf() {
+    local fname dirs d
+    fname=$(basename "${IDLETOKEN_P36_GGUF:-Qwen3.8-27B-UD-Q4_K_M.gguf}")
+    eval "dirs=\${IDLETOKEN_GGUF_DIRS_${COORD_NODE}:-}"
+    for d in $dirs; do
+        if $SSH "$COORD_NODE" "test -r '$d/$fname'" >/dev/null 2>&1; then
+            echo "$d/$fname"; return 0
+        fi
+    done
+    return 1
+}
+P36_MODEL_ID="${IDLETOKEN_P36_MODEL_ID:-qwen3.8-27b}"
+
 coord_small_gguf() {
     local fname dirs d
     fname=$(basename "${IDLETOKEN_SMOKE_GGUF:-Qwen3.5-0.8B-Q4_K_M.gguf}")
@@ -1824,17 +2074,13 @@ except Exception as e:
 p6_api_exposure() {
     local name="$1"
     local tok="p6-external-client-token"
-    local has; has=$($SSH "$COORD_NODE" "test -f $GGUF_DGX && echo yes || echo no" 2>/dev/null | tr -d '\r')
-    [ "$has" = "yes" ] || { fail "$name" "GGUF not found on $COORD_NODE ($GGUF_DGX) — P6 needs the real model"; return; }
     # The path travels into the client as a UI directive and from there straight
     # into sidecar argv — no shell anywhere on that route, so a `$HOME` in it
     # would reach the engine literally (the weights sidecar reports
     # "cannot stat $HOME/..." and the cluster silently falls back to mock).
     # Expand it once, on the node.
-    local gguf_abs; gguf_abs=$($SSH "$COORD_NODE" "echo $GGUF_DGX" 2>/dev/null | tr -d '\r')
-    case "$gguf_abs" in
-        ""|*'$'*) fail "$name" "could not expand the GGUF path on $COORD_NODE (got '$gguf_abs')"; return ;;
-    esac
+    local gguf_abs
+    gguf_abs=$(coord_p36_gguf) || { fail "$name" "no curated large GGUF on $COORD_NODE (searched IDLETOKEN_GGUF_DIRS_${COORD_NODE} for $(basename "${IDLETOKEN_P36_GGUF:-Qwen3.8-27B-UD-Q4_K_M.gguf}"))"; return; }
 
     # Model load across coord + 2 workers is slow; allow up to ~10 min.
     # ORDER MATTERS: the UI-test pairing regex (client/src/App.tsx) ends with
@@ -1855,7 +2101,7 @@ p6_api_exposure() {
     # External client hits the UI-advertised address (curl runs on the coord
     # node so the advertised LAN ip resolves) and must get a real reply — with
     # the token the UI hands the user, since the API is closed by default.
-    local req='{"model":"deepseek-v4-flash","max_tokens":24,"messages":[{"role":"user","content":"Reply with the single word: pong"}]}'
+    local req="{\"model\":\"$P36_MODEL_ID\",\"max_tokens\":24,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word: pong\"}]}"
     local reply
     reply=$($SSH "$COORD_NODE" "curl -s -m 180 $base/v1/messages -H 'content-type: application/json' -H 'Authorization: Bearer $tok' -d '$req'" 2>/dev/null)
     # Same address, no credentials: must be refused. Asserted BEFORE cleanup,
@@ -2181,7 +2427,7 @@ g_version() {
         _ver_cleanup keep; return
     fi
     # /health is the coordinator's; readiness is its engine_state field (the
-    # raw llama-server 503-while-loading trap does not apply to this surface,
+    # raw idletoken-server 503-while-loading trap does not apply to this surface,
     # but "ready" must still be asserted, not assumed).
     local h="" ok=""
     i=0
@@ -2674,30 +2920,41 @@ g_no_prompt_log() {
     if [ ! -r "$IDLETOKEN_SMOKE_GGUF" ]; then
         fail "$name" "IDLETOKEN_SMOKE_GGUF is set but unreadable: $IDLETOKEN_SMOKE_GGUF"; return
     fi
-    local vocab
-    vocab=$(cd "$repo" && python3 -c "import json,sys;print(json.load(open('models/${IDLETOKEN_SMOKE_MODEL_ID}.json'))['n_vocab'])" 2>/dev/null)
-    [ -n "$vocab" ] || { fail "$name" "no models/${IDLETOKEN_SMOKE_MODEL_ID}.json"; return; }
+    # llamacpp single-machine path (ported 2026-08-20): the line under test is
+    # llama_chat_route's tokenize log — the product path. The previous
+    # incarnation drove the retired ds4 wire (mock worker + built-in ds4x
+    # tokenizer, shelved 2026-08-16), whose chat endpoints now refuse, so the
+    # sentinel red-lined on "no request was logged at all".
+    local engine_dir="${IDLETOKEN_ENGINE_DIR:-$repo/vendor/llama.cpp/build/bin}"
+    if [ ! -x "$engine_dir/llama-server" ]; then
+        skip "$name" "no pinned llama.cpp build in $engine_dir (scripts/build_llamacpp.sh)"
+        return
+    fi
+    local llama_port=$((wire_port + 4300))
 
     # A phrase that could not plausibly appear in the engine's own output.
     local secret="zzq-canary-prompt-9f3a1c"
-    local tmp cpid wpid
+    local tmp cpid wpid=""
     _pl_up() {   # _pl_up <logfile> [extra env]
         tmp=$(mktemp -d)
         # `exec env ...`, not `env ... exec ...`: the latter hands the literal
         # word "exec" to env as the program to run, which fails before the
         # coordinator is ever started -- and the symptom is an unhelpful
         # "cluster did not come up".
-        (cd "$repo" && exec env $2 ./idletoken-coord --model-id "$IDLETOKEN_SMOKE_MODEL_ID" \
-            --model-path "$IDLETOKEN_SMOKE_GGUF" --bind "127.0.0.1:$wire_port" \
-            --num-workers 1 --n-predict 0 --http --api-bind "127.0.0.1:$api_port" >"$1" 2>&1) &
+        (cd "$repo" && exec env $2 IDLETOKEN_LLAMA_LOG="$tmp/llama.log" \
+            ./idletoken-coord --model-id "$IDLETOKEN_SMOKE_MODEL_ID" \
+            --llama-server-bin "$engine_dir/llama-server" \
+            --llama-gguf "$IDLETOKEN_SMOKE_GGUF" --llama-port "$llama_port" \
+            --ctx-size 4096 \
+            --http --api-bind "127.0.0.1:$api_port" >"$1" 2>&1) &
         cpid=$!
-        sleep 2
-        (cd "$repo" && IDLETOKEN_MOCK_OS_FAMILY=1 IDLETOKEN_ALLOW_MOCK=1 exec python3 scripts/mock_worker.py \
-            "127.0.0.1:$wire_port" "$vocab" >"$tmp/mock.log" 2>&1) &
-        wpid=$!
-        local i=0
-        while [ $i -lt 150 ] && ! grep -q "cluster ready" "$1"; do sleep 0.2; i=$((i + 1)); done
-        grep -q "cluster ready" "$1"
+        local h="" i=0
+        while [ $i -lt 120 ]; do
+            h=$(curl -s -m 3 "http://127.0.0.1:$api_port/health" 2>/dev/null)
+            case "$h" in *'"engine_state":"ready"'*) return 0 ;; esac
+            sleep 1; i=$((i + 1))
+        done
+        return 1
     }
     # Kill by PID *and* by the port in the command line. `( ... ) &` does not
     # always leave $! pointing at the process that ends up holding the socket,
@@ -2705,8 +2962,8 @@ g_no_prompt_log() {
     # in use" -- which reads exactly like the gate's own failure message. The
     # pattern is scoped to this gate's ports so it cannot disturb other gates.
     _pl_kill_stray() {
-        pkill -f "idletoken-coord --bind 127.0.0.1:$wire_port" 2>/dev/null
-        pkill -f "mock_worker.py 127.0.0.1:$wire_port" 2>/dev/null
+        pkill -f "idletoken-coord.*--api-bind 127.0.0.1:$api_port" 2>/dev/null
+        pkill -f "llama-serve[r].*--port $llama_port" 2>/dev/null
         sleep 0.3
     }
     _pl_down() {
@@ -2885,6 +3142,9 @@ g_api_models() {
     _gm_cleanup() {
         [ -n "$wpid" ] && { kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null; }
         [ -n "$cpid" ] && { kill "$cpid" 2>/dev/null; wait "$cpid" 2>/dev/null; }
+        # claim 2's engine sidecar; the port guard keeps claim 1 (no engine)
+        # from pkilling every llama-server on the machine.
+        [ -n "${llama_port:-}" ] && pkill -f "llama-serve[r].*--port $llama_port" 2>/dev/null
         rm -rf "$tmp"
     }
 
@@ -2935,27 +3195,40 @@ g_api_models() {
         fail "$name" "IDLETOKEN_SMOKE_GGUF is set but unreadable: $IDLETOKEN_SMOKE_GGUF"
         return
     fi
-
-    local vocab p2 a2
-    vocab=$(cd "$repo" && python3 -c "import json,sys;print(json.load(open('models/${IDLETOKEN_SMOKE_MODEL_ID}.json'))['n_vocab'])" 2>/dev/null)
-    if [ -z "$vocab" ]; then
-        fail "$name" "no models/${IDLETOKEN_SMOKE_MODEL_ID}.json (IDLETOKEN_SMOKE_MODEL_ID must name a registry model)"
+    # Claim 2 runs the llamacpp single-machine path: count_tokens and the chat
+    # relay both call llama_prompt_token_count() (engine template + tokenizer),
+    # so this is the pairing the assertion exists to keep welded. The previous
+    # incarnation drove the retired ds4 wire (mock worker + built-in ds4x
+    # tokenizer) — shelved 2026-08-16, so its chat endpoints refuse and both
+    # numbers came back empty. Same disease as pre-T15 G5, same cure: port the
+    # oracle to the line the product actually runs.
+    local engine_dir="${IDLETOKEN_ENGINE_DIR:-$repo/vendor/llama.cpp/build/bin}"
+    if [ ! -x "$engine_dir/llama-server" ]; then
+        skip "$name/count_tokens" "no pinned llama.cpp build in $engine_dir (scripts/build_llamacpp.sh)"
+        pass "$name"
         return
     fi
+    local a2 llama_port
+    a2=$((api_port + 2)); llama_port=$((wire_port + 4300))
     tmp=$(mktemp -d); cpid=""; wpid=""
-    p2=$((wire_port + 2)); a2=$((api_port + 2))
-    (cd "$repo" && exec ./idletoken-coord --model-id "$IDLETOKEN_SMOKE_MODEL_ID" \
-        --model-path "$IDLETOKEN_SMOKE_GGUF" --num-workers 1 --n-predict 0 --http \
-        --bind "127.0.0.1:$p2" --api-bind "127.0.0.1:$a2" >"$tmp/coord.log" 2>&1) &
+    (cd "$repo" && exec env IDLETOKEN_LLAMA_LOG="$tmp/llama.log" \
+        ./idletoken-coord --model-id "$IDLETOKEN_SMOKE_MODEL_ID" \
+        --llama-server-bin "$engine_dir/llama-server" \
+        --llama-gguf "$IDLETOKEN_SMOKE_GGUF" --llama-port "$llama_port" \
+        --ctx-size 4096 \
+        --http --api-bind "127.0.0.1:$a2" >"$tmp/coord.log" 2>&1) &
     cpid=$!
-    sleep 2
-    (cd "$repo" && IDLETOKEN_MOCK_OS_FAMILY=1 IDLETOKEN_ALLOW_MOCK=1 exec python3 scripts/mock_worker.py \
-        "127.0.0.1:$p2" "$vocab" >"$tmp/mock.log" 2>&1) &
-    wpid=$!
+    local h=""
     i=0
-    while [ $i -lt 150 ] && ! grep -q "cluster ready" "$tmp/coord.log"; do sleep 0.2; i=$((i + 1)); done
-    if ! grep -q "cluster ready" "$tmp/coord.log"; then
-        fail "$name" "the $IDLETOKEN_SMOKE_MODEL_ID cluster never came up (see $tmp/coord.log)"
+    while [ $i -lt 120 ]; do
+        h=$(curl -s -m 3 "http://127.0.0.1:$a2/health" 2>/dev/null)
+        case "$h" in *'"engine_state":"ready"'*) break ;; esac
+        h=""
+        sleep 1; i=$((i + 1))
+    done
+    if [ -z "$h" ]; then
+        fail "$name" "the $IDLETOKEN_SMOKE_MODEL_ID engine never reached ready (see $tmp/coord.log and $tmp/llama.log)"
+        pkill -f "llama-serve[r].*--port $llama_port" 2>/dev/null
         _gm_cleanup; return
     fi
 
@@ -3164,14 +3437,23 @@ g_dspark() {
     # OPTIONAL accelerator, and a cluster without it is fully conformant.
     # This gate sits after G_FINAL for the same reason G_PLAT does — a red
     # optional accelerator must not set the FRONTIER and skip the ladder.
-    # PARKED (2026-08-03, user's call): the DSpark work stays in the tree but is
-    # not in use. Its sub-checks load the 80 GiB model three times, which is a
-    # lot of ladder time for a feature nothing calls — so they only run when
-    # asked for. Set IDLETOKEN_DSPARK_GATE=1 to exercise the parked work (do that
-    # before touching it again, so bit-rot surfaces as a gate failure rather
-    # than a surprise months later).
+    # PARKED (2026-08-03, user's call): the DSpark work stayed in the tree but
+    # was not in use; its sub-checks load the 80 GiB model three times, which is
+    # a lot of ladder time for a feature nothing calls.
+    #
+    # RETIRED (2026-08-20, T15): parking implied "coming back". It is not. The
+    # subject is speculative decoding for DSv4 ON THE ds4 BACKEND, and all three
+    # legs of that are gone: ds4 was shelved from the test and public surface on
+    # 2026-08-16 (CLAUDE.md hard constraint #1), speculative decoding is on v2's
+    # out-of-scope list, and the sub-checks below compile against
+    # build/worker/vendor/ds4_cuda.o with nvcc — which no current build
+    # produces. Sub-gates 2-4 of docs/acceptance-criteria.md §G-DSPARK
+    # (DRAFT/VERIFY/PERF) were never implemented and now never will be; the md
+    # entry keeps the history.
+    # The code stays runnable behind the env, same contract as G4 / G_HOMO /
+    # G_MACSEAL: an archaeologist gets a gate, not a surprise.
     if [ "${IDLETOKEN_DSPARK_GATE:-0}" != "1" ]; then
-        skip "$name" "DSpark is parked and unused; set IDLETOKEN_DSPARK_GATE=1 to check it"
+        skip "$name" "retired 2026-08-20 (ds4 shelved 2026-08-16; speculative decoding is out of v2 scope) — set IDLETOKEN_DSPARK_GATE=1 to run the parked ds4 check"
         return
     fi
     local gguf="$(dirname "$GGUF_DGX")/DeepSeek-V4-Flash-DSpark-support.gguf"
@@ -3464,6 +3746,113 @@ g_priv7() {
 #      scripts/ppl_gate.sh; the reference band lives in
 #      test-assets/ppl/<model>.<quant>.json.
 # =====================================================================
+# G-INTEGRITY (threat-model.md): the curated-model hash gate and canary
+# honesty. Local — no cluster node, no GPU, no weights — and every check in the
+# script carries its own positive control (see the script's header).
+g_integrity() {
+    local name="$1" out
+    out=$(bash scripts/integrity_gate.sh 2>&1 | grep -E "^G_INTEGRITY_(OK|FAIL|SKIP)" | tail -1)
+    case "$out" in
+        G_INTEGRITY_OK*)
+            vlog "${out#G_INTEGRITY_OK: }"
+            pass "$name" ;;
+        G_INTEGRITY_SKIP*) skip "$name" "${out#G_INTEGRITY_SKIP: }" ;;
+        "") fail "$name" "scripts/integrity_gate.sh reached no conclusion" ;;
+        *) fail "$name" "${out#G_INTEGRITY_FAIL:}" ;;
+    esac
+}
+
+# G-SHARED (shared-mode-plan-2026-08.md): when this machine executes somebody
+# else's request, that person's prompt is not readable here by ordinary means.
+# Local — one small model, no cluster — and, like G-INTEGRITY, every claim in
+# the script is paired with a positive control (usually the same code run in
+# LOCAL mode, which must come out the other way).
+g_shared() {
+    local name="$1" out
+    out=$(bash scripts/shared_mode_gate.sh 2>&1 | grep -E "^G_SHARED_(OK|FAIL|SKIP)" | tail -1)
+    case "$out" in
+        G_SHARED_OK*)
+            vlog "${out#G_SHARED_OK: }"
+            pass "$name" ;;
+        G_SHARED_SKIP*) skip "$name" "${out#G_SHARED_SKIP: }" ;;
+        "") fail "$name" "scripts/shared_mode_gate.sh reached no conclusion" ;;
+        *) fail "$name" "${out#G_SHARED_FAIL:}" ;;
+    esac
+}
+
+# G-WEDGE (results/coord-wedge-20260817.md): a dead engine must not take the
+# coordinator down with it, and with several slots one dark relay must not take
+# the other slots with it. Local — the fixture is a stub engine, no GPU and no
+# cluster node — and the script arms its own positive control (it refuses to
+# conclude anything unless the stub actually went dark).
+g_wedge() {
+    local name="$1" out
+    out=$(bash scripts/coord_wedge_gate.sh 2>&1 | grep -E "^WEDGE_GATE_(OK|FAIL|SKIP)" | tail -1)
+    case "$out" in
+        WEDGE_GATE_OK*) pass "$name" ;;
+        WEDGE_GATE_SKIP*) skip "$name" "${out#WEDGE_GATE_SKIP: }" ;;
+        "") fail "$name" "scripts/coord_wedge_gate.sh reached no conclusion" ;;
+        *) fail "$name" "${out#WEDGE_GATE_FAIL:}" ;;
+    esac
+}
+
+# G-FIT-FAIL (plans/multislot-vram-budget-fix.md): an engine that reports it
+# cannot fit the model into free device memory must stop the start (refuse,
+# exit 3) instead of being served into WDDM paging that can freeze the whole
+# machine. Local — the fixture is the same stub engine the wedge gate uses; the
+# script carries its own control run (no warning -> must serve normally), so a
+# refuse-everything implementation cannot pass it.
+g_fit_fail() {
+    local name="$1" out
+    out=$(bash scripts/fit_fail_gate.sh 2>&1 | grep -E "^FIT_GATE_(OK|FAIL|SKIP)" | tail -1)
+    case "$out" in
+        FIT_GATE_OK*) pass "$name" ;;
+        FIT_GATE_SKIP*) skip "$name" "${out#FIT_GATE_SKIP: }" ;;
+        "") fail "$name" "scripts/fit_fail_gate.sh reached no conclusion" ;;
+        *) fail "$name" "${out#FIT_GATE_FAIL:}" ;;
+    esac
+}
+
+# G-BUDGET-SRC (docs/t8-quant-budget-fix-2026-08.md): the memory budget must be
+# computed from the GGUF the engine will really open, not from the manifest's
+# default quantization, and the coordinator must log which it used. Local — the
+# fixtures are sparse files of the right size plus the same stub engine — and
+# the script carries its own control (the same command against a differently
+# sized file must move the budget), so a coordinator that ignores the path
+# cannot pass it. G-FIT-FAIL is the backup for when this estimate is wrong
+# anyway; this is the estimate itself.
+g_budget_source() {
+    local name="$1" out
+    out=$(bash scripts/budget_source_gate.sh 2>&1 | grep -E "^BUDGET_GATE_(OK|FAIL|SKIP)" | tail -1)
+    case "$out" in
+        BUDGET_GATE_OK*) pass "$name" ;;
+        BUDGET_GATE_SKIP*) skip "$name" "${out#BUDGET_GATE_SKIP: }" ;;
+        "") fail "$name" "scripts/budget_source_gate.sh reached no conclusion" ;;
+        *) fail "$name" "${out#BUDGET_GATE_FAIL:}" ;;
+    esac
+}
+
+# G_OVERFLOW (docs/overflow-b2b-plan-2026-08.md §2 O5): overflow routing's six
+# claims, the first of which is the rule that may not break — a job the platform
+# dispatched is finished here or refused here, never forwarded on. That one is
+# asserted through the REAL agent binary, because the whole rule rests on the
+# agent setting X-IdleToken-Origin and a dropped header would break it in
+# silence. The script carries a control for every claim (it refuses to conclude
+# anything unless the machine really filled up, the connection log really
+# records connections, and the plaintext search really finds a planted marker).
+g_overflow() {
+    local name="$1" out
+    out=$(bash scripts/overflow_gate.sh 2>&1 | grep -E "^OVERFLOW_GATE_(OK|FAIL|SKIP)" | tail -1)
+    case "$out" in
+        OVERFLOW_GATE_OK*)
+            vlog "${out#OVERFLOW_GATE_OK: }"
+            pass "$name" ;;
+        OVERFLOW_GATE_SKIP*) skip "$name" "${out#OVERFLOW_GATE_SKIP: }" ;;
+        "") fail "$name" "scripts/overflow_gate.sh reached no conclusion" ;;
+        *) fail "$name" "${out#OVERFLOW_GATE_FAIL: }" ;;
+    esac
+}
+
 g_ppl() {
     local name="$1" out
     out=$(bash scripts/ppl_gate.sh 2>&1 | grep -E "^G_PPL_(OK|FAIL|SKIP)" | tail -1)
@@ -3569,6 +3958,29 @@ gate_always G_NO_PROMPT_LOG g_no_prompt_log
 # distribution-level numeric band (WS-F3) — both local, both product-level.
 gate_always G_PRIV7    g_priv7
 gate_always G_PPL      g_ppl
+# Model integrity + canary honesty (threat-model.md). gate_always: "the file we
+# load is the curated model" and "a provider cannot recognise the probe" are
+# product-level invariants, and an offline laptop must not be able to hide them.
+gate_always G_INTEGRITY g_integrity
+# Shared-mode plaintext (shared-mode-plan-2026-08.md). gate_always for the same
+# reason as G_INTEGRITY: "the provider cannot read what a buyer sent" is a
+# product-level promise that appears on the purchase page, and a machine that
+# cannot run the ladder must not be able to skip past it quietly.
+gate_always G_SHARED    g_shared
+# Coordinator liveness under a dead engine (results/coord-wedge-20260817.md).
+# gate_always for the same reason as the two above: "one stuck request does not
+# take the machine with it" is what separates a home server from a toy, and it
+# needs no cluster node to check — so no machine gets to skip past it quietly.
+gate_always G_WEDGE     g_wedge
+# Engine-reported "cannot fit" must refuse the start (multislot-vram-budget-fix).
+# gate_always for the same reason as G_WEDGE: the consequence it guards against
+# is a frozen machine, and it needs no cluster node to check.
+gate_always G_FIT_FAIL  g_fit_fail
+# The budget that G_FIT_FAIL backs up: it must be computed from the file the
+# engine will open. gate_always for the same reason — a wrong budget is how a
+# machine gets asked for KV it does not have, and no cluster node is needed to
+# check it.
+gate_always G_BUDGET_SRC g_budget_source
 gate G_FINAL           g_final
 # Both of these run AFTER G_FINAL and are independent of it: G_PLAT is the
 # platform business layer (spec decision 11), G_DSPARK is an optional
@@ -3578,6 +3990,13 @@ gate G_PLAT            g_plat
 # G_SCHED needs only the gateway dependencies on the control machine and touches
 # no cluster node -> gate_local (see above).
 gate_local G_SCHED     g_sched
+# G_OVERFLOW is the platform track's (plan §2 O5) and touches no cluster node —
+# its fixtures are a stub engine and a stub platform on this machine — so
+# gate_local, alongside G_SCHED. Registered after G_PLAT for the same reason
+# that one is: the platform business layer is independent of the cluster's
+# G_FINAL (spec decision 11) and must not point the product track's "what to do
+# next" at itself.
+gate_local G_OVERFLOW  g_overflow
 echo "------------------------------------------------------"
 if [ -n "$ONLY_GATE" ]; then
     # Single-gate mode: report just that gate; no ladder-wide claims.

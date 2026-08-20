@@ -2,9 +2,9 @@
   "id": "glm-5.2",
   "label": "GLM-5.2",
   "family": "glm",
-  "backend": "ds4x",
+  "backend": "llamacpp",
   "arch": "GLM_DSA",
-  "available": false,
+  "available": true,
   "deployment": "cluster",
   "license": "MIT",
   "params_summary": "744B · 40B active · Q2 ≈ 238 GB",
@@ -12,16 +12,1492 @@
   "n_embd": 6144,
   "hc_streams": 1,
   "n_vocab": 154880,
-  "layer_weight_bytes": 253403070464,
-  "shared_weight_bytes": 2147483648,
+  "layer_weight_bytes": 216715360960,
+  "shared_weight_bytes": 0,
   "context_max": 1048576,
-  "split": { "boundary_multiple": 4 },
-  "kv": { "kind": "mla", "bytes_per_token_per_layer": 1152 },
+  "split": {
+    "boundary_multiple": 4
+  },
+  "kv": {
+    "kind": "mla",
+    "bytes_per_token_per_layer": 1152
+  },
   "overhead_base_bytes": 3221225472,
-  "default_gguf": "glm-5.2-q2.gguf",
+  "default_gguf": "UD-IQ1_S/GLM-5.2-UD-IQ1_S-00001-of-00006.gguf",
   "chat_template": "gguf",
   "sources": [
-    { "repo": "unsloth/GLM-5.2-GGUF", "quant": "UD-IQ2_XXS" }
+    {
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "quant": "IQ1_S"
+    },
+    {
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "quant": "IQ1_M"
+    },
+    {
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "quant": "IQ2_XXS"
+    },
+    {
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "quant": "IQ2_M"
+    },
+    {
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "quant": "Q2_K_XL"
+    },
+    {
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "quant": "IQ3_XXS"
+    },
+    {
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "quant": "IQ3_S"
+    },
+    {
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "quant": "Q3_K_M"
+    },
+    {
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "quant": "Q3_K_XL"
+    },
+    {
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "quant": "IQ4_XS"
+    },
+    {
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "quant": "IQ4_NL"
+    },
+    {
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "quant": "Q4_K_S"
+    },
+    {
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "quant": "Q4_K_M"
+    },
+    {
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "quant": "Q4_K_XL"
+    },
+    {
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "quant": "Q5_K_S"
+    },
+    {
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "quant": "Q5_K_M"
+    },
+    {
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "quant": "Q5_K_XL"
+    },
+    {
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "quant": "Q6_K"
+    },
+    {
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "quant": "Q6_K_XL"
+    },
+    {
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "quant": "Q8_0"
+    },
+    {
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "quant": "Q8_K_XL"
+    },
+    {
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "quant": "BF16"
+    }
   ],
-  "note": "ds4x backend pending (Phase B) — needs a large-RAM HYBRID cluster"
+  "default_quant": "IQ1_S",
+  "variants": [
+    {
+      "quant": "IQ1_S",
+      "layer_weight_bytes": 216715360960,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "gguf": "UD-IQ1_S/GLM-5.2-UD-IQ1_S-00001-of-00006.gguf",
+      "sha256": "46b6148389219ae45167cb8124fbb18ef7d432daf619b4faf9e06ea80d3f4777",
+      "revision": "abc55e72527792c6e77069c99b4cb7de16fa9f23",
+      "parts": [
+        {
+          "file": "UD-IQ1_S/GLM-5.2-UD-IQ1_S-00002-of-00006.gguf",
+          "bytes": 49208128256,
+          "sha256": "f2180207285e04fcaa5b8c53ba6e77ad5cc58666b6e7c6b04a5eded3fe8bef09"
+        },
+        {
+          "file": "UD-IQ1_S/GLM-5.2-UD-IQ1_S-00003-of-00006.gguf",
+          "bytes": 49684417024,
+          "sha256": "b1c0c5a302cc8d5d9ea0bcd4467c01db72c26839f820f7e882079582ea0a8d2b"
+        },
+        {
+          "file": "UD-IQ1_S/GLM-5.2-UD-IQ1_S-00004-of-00006.gguf",
+          "bytes": 49396052864,
+          "sha256": "a6a42da6975e29f89866dcde2956e9e50e6ea26635fb5063b74f3973f4f863b6"
+        },
+        {
+          "file": "UD-IQ1_S/GLM-5.2-UD-IQ1_S-00005-of-00006.gguf",
+          "bytes": 49246275936,
+          "sha256": "a4a9851a50db533f21ef824e5d8038f04e6782e7d602d18e5fdd6643f68ccccb"
+        },
+        {
+          "file": "UD-IQ1_S/GLM-5.2-UD-IQ1_S-00006-of-00006.gguf",
+          "bytes": 19171063136,
+          "sha256": "3b767f55df64e0432d52fcf1a14eb47a1ef3bbc91339e2ae220f38602237d7d7"
+        }
+      ]
+    },
+    {
+      "quant": "IQ1_M",
+      "layer_weight_bytes": 228492966624,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "gguf": "UD-IQ1_M/GLM-5.2-UD-IQ1_M-00001-of-00006.gguf",
+      "sha256": "e16a262199ae650398bd154d7dc108a7bd03da07bfafc51dc410dc0b68d9a258",
+      "revision": "abc55e72527792c6e77069c99b4cb7de16fa9f23",
+      "parts": [
+        {
+          "file": "UD-IQ1_M/GLM-5.2-UD-IQ1_M-00002-of-00006.gguf",
+          "bytes": 49257241920,
+          "sha256": "eeefb5c6abc9ade697b2542506c0d31bc358824aacd6c05e5bcbeb4a97976a3a"
+        },
+        {
+          "file": "UD-IQ1_M/GLM-5.2-UD-IQ1_M-00003-of-00006.gguf",
+          "bytes": 48943068032,
+          "sha256": "340b461ba6eb07c1ce83e9e39bc67f826dbd70c6d419206043f2549c0063aff5"
+        },
+        {
+          "file": "UD-IQ1_M/GLM-5.2-UD-IQ1_M-00004-of-00006.gguf",
+          "bytes": 48891518400,
+          "sha256": "bace0a24bd9531250e25ac1ad75f7b4edb3c3495f110bf2c7f31fe39eaf1f83c"
+        },
+        {
+          "file": "UD-IQ1_M/GLM-5.2-UD-IQ1_M-00005-of-00006.gguf",
+          "bytes": 49934857248,
+          "sha256": "2efd0f613e94ea0a019ba847da5cc7f0d0b87f78a2a503c1a71766fcfb445451"
+        },
+        {
+          "file": "UD-IQ1_M/GLM-5.2-UD-IQ1_M-00006-of-00006.gguf",
+          "bytes": 31456857280,
+          "sha256": "fdd4e74dfa3aea46cad3af2bd2b3deb53dc577a1aaee8df855d9e4307e8ebca3"
+        }
+      ]
+    },
+    {
+      "quant": "IQ2_XXS",
+      "layer_weight_bytes": 238458632928,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "gguf": "UD-IQ2_XXS/GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf",
+      "sha256": "7bf96eeabbe887e58b6c44364962731ddc9dc5bf46fec8d097c1dff64bea4a18",
+      "revision": "abc55e72527792c6e77069c99b4cb7de16fa9f23",
+      "parts": [
+        {
+          "file": "UD-IQ2_XXS/GLM-5.2-UD-IQ2_XXS-00002-of-00006.gguf",
+          "bytes": 49105028960,
+          "sha256": "d94adaa58ddd5abbcf2514192958084416b1aa36bd4d21409028a164341bac36"
+        },
+        {
+          "file": "UD-IQ2_XXS/GLM-5.2-UD-IQ2_XXS-00003-of-00006.gguf",
+          "bytes": 49143176640,
+          "sha256": "1cd0b1a3d9d939ce5a184c548f1b1c42edafaf1856cb0d7e586a2884a366256b"
+        },
+        {
+          "file": "UD-IQ2_XXS/GLM-5.2-UD-IQ2_XXS-00004-of-00006.gguf",
+          "bytes": 49143176640,
+          "sha256": "10f3965db697a46ba66494475045af183c1bcaf639984160930c91a377816d3e"
+        },
+        {
+          "file": "UD-IQ2_XXS/GLM-5.2-UD-IQ2_XXS-00005-of-00006.gguf",
+          "bytes": 49143176640,
+          "sha256": "40d7d4524ff07e0f9af494fb13130dc7090184800cc5af0a1563188b076af50d"
+        },
+        {
+          "file": "UD-IQ2_XXS/GLM-5.2-UD-IQ2_XXS-00006-of-00006.gguf",
+          "bytes": 41914650304,
+          "sha256": "eeceb9084350e64be8eebcd1f19ab14bbbb6b40132c86d77ffc65e72f425044d"
+        }
+      ]
+    },
+    {
+      "quant": "IQ2_M",
+      "layer_weight_bytes": 238577580768,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "gguf": "UD-IQ2_M/GLM-5.2-UD-IQ2_M-00001-of-00006.gguf",
+      "sha256": "7b8e91dd6dde4999da6c05bc75ae39e4982c6d8fa14969af9445c4d44d992623",
+      "revision": "abc55e72527792c6e77069c99b4cb7de16fa9f23",
+      "parts": [
+        {
+          "file": "UD-IQ2_M/GLM-5.2-UD-IQ2_M-00002-of-00006.gguf",
+          "bytes": 49223976800,
+          "sha256": "251603ba5daf220ac3cf998ab4919943803b07a8e289afc9a4f98967cc8f62e1"
+        },
+        {
+          "file": "UD-IQ2_M/GLM-5.2-UD-IQ2_M-00003-of-00006.gguf",
+          "bytes": 49143176640,
+          "sha256": "1cd0b1a3d9d939ce5a184c548f1b1c42edafaf1856cb0d7e586a2884a366256b"
+        },
+        {
+          "file": "UD-IQ2_M/GLM-5.2-UD-IQ2_M-00004-of-00006.gguf",
+          "bytes": 49143176640,
+          "sha256": "10f3965db697a46ba66494475045af183c1bcaf639984160930c91a377816d3e"
+        },
+        {
+          "file": "UD-IQ2_M/GLM-5.2-UD-IQ2_M-00005-of-00006.gguf",
+          "bytes": 49143176640,
+          "sha256": "40d7d4524ff07e0f9af494fb13130dc7090184800cc5af0a1563188b076af50d"
+        },
+        {
+          "file": "UD-IQ2_M/GLM-5.2-UD-IQ2_M-00006-of-00006.gguf",
+          "bytes": 41914650304,
+          "sha256": "eeceb9084350e64be8eebcd1f19ab14bbbb6b40132c86d77ffc65e72f425044d"
+        }
+      ]
+    },
+    {
+      "quant": "Q2_K_XL",
+      "layer_weight_bytes": 253878401856,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "gguf": "UD-Q2_K_XL/GLM-5.2-UD-Q2_K_XL-00001-of-00007.gguf",
+      "sha256": "3ca70bbb94d59269302e36b94b810ac529a0e24c0ceaddaa69a981e12ff1e1ea",
+      "revision": "abc55e72527792c6e77069c99b4cb7de16fa9f23",
+      "parts": [
+        {
+          "file": "UD-Q2_K_XL/GLM-5.2-UD-Q2_K_XL-00002-of-00007.gguf",
+          "bytes": 49172427136,
+          "sha256": "2441eb4291df6aa52719b71ff02a883655c37870c21c8d06c5a344c923a1a476"
+        },
+        {
+          "file": "UD-Q2_K_XL/GLM-5.2-UD-Q2_K_XL-00003-of-00007.gguf",
+          "bytes": 49091626976,
+          "sha256": "928afc623f84561604d00b371ebc61dcef9e79b462ef0087857fb146620adf78"
+        },
+        {
+          "file": "UD-Q2_K_XL/GLM-5.2-UD-Q2_K_XL-00004-of-00007.gguf",
+          "bytes": 49091626976,
+          "sha256": "e5410d786b49274cb115d9cf91f93ee81688a5e38252f56c554ad34e8a80df82"
+        },
+        {
+          "file": "UD-Q2_K_XL/GLM-5.2-UD-Q2_K_XL-00005-of-00007.gguf",
+          "bytes": 49091626976,
+          "sha256": "d5ed72e53bc15ddd5fe7956edbb4110769c5c1455914bf1c781d0b03bd0b1cb2"
+        },
+        {
+          "file": "UD-Q2_K_XL/GLM-5.2-UD-Q2_K_XL-00006-of-00007.gguf",
+          "bytes": 49994703552,
+          "sha256": "8a82df1e6bd8497cfa48790ad6fa94e9723d9497d6759309d7920e061db12505"
+        },
+        {
+          "file": "UD-Q2_K_XL/GLM-5.2-UD-Q2_K_XL-00007-of-00007.gguf",
+          "bytes": 7426966496,
+          "sha256": "69443efd86161328242297a705430f68daeba21cbee4f67b30c91a1226527dfa"
+        }
+      ]
+    },
+    {
+      "quant": "IQ3_XXS",
+      "layer_weight_bytes": 281688431424,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "gguf": "UD-IQ3_XXS/GLM-5.2-UD-IQ3_XXS-00001-of-00007.gguf",
+      "sha256": "8386870d4e7b7144ff20cfeb7164156e95688cffdcd9c3161ee3a9cafbf96fc4",
+      "revision": "abc55e72527792c6e77069c99b4cb7de16fa9f23",
+      "parts": [
+        {
+          "file": "UD-IQ3_XXS/GLM-5.2-UD-IQ3_XXS-00002-of-00007.gguf",
+          "bytes": 49975052160,
+          "sha256": "4bd0ae5f34828ecbc0554c70697b5cc48d29e950f9092f3dd30fa5412f02d5e5"
+        },
+        {
+          "file": "UD-IQ3_XXS/GLM-5.2-UD-IQ3_XXS-00003-of-00007.gguf",
+          "bytes": 49960276224,
+          "sha256": "754e1aa13867ae840f578a8963a781edc13d575fed0ba5859995fc1729f9e9b0"
+        },
+        {
+          "file": "UD-IQ3_XXS/GLM-5.2-UD-IQ3_XXS-00004-of-00007.gguf",
+          "bytes": 49614270848,
+          "sha256": "7d6d1cbde8e1e36ff9f8ec898a692c0fade3eaba9693ee5c46db56615c25a8ea"
+        },
+        {
+          "file": "UD-IQ3_XXS/GLM-5.2-UD-IQ3_XXS-00005-of-00007.gguf",
+          "bytes": 49808113120,
+          "sha256": "971bbf2fea615fdfbdccf2b1ee787e58f7c4638bb4b3b1db53804fbb40a459ca"
+        },
+        {
+          "file": "UD-IQ3_XXS/GLM-5.2-UD-IQ3_XXS-00006-of-00007.gguf",
+          "bytes": 49960276224,
+          "sha256": "b0fa58b645951cd5404f38665fe4474954539f5a64c5100dac48e477ae5f4ef7"
+        },
+        {
+          "file": "UD-IQ3_XXS/GLM-5.2-UD-IQ3_XXS-00007-of-00007.gguf",
+          "bytes": 32361019104,
+          "sha256": "3ac0becc6b7ec77f51b93707da652a42404355d2b25c9075786ce6791142b963"
+        }
+      ]
+    },
+    {
+      "quant": "IQ3_S",
+      "layer_weight_bytes": 308641029024,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "gguf": "UD-IQ3_S/GLM-5.2-UD-IQ3_S-00001-of-00008.gguf",
+      "sha256": "4c86aea0b01192afeaf5797d81e048b00f07f896015c28d471a92421e2613f5d",
+      "revision": "abc55e72527792c6e77069c99b4cb7de16fa9f23",
+      "parts": [
+        {
+          "file": "UD-IQ3_S/GLM-5.2-UD-IQ3_S-00002-of-00008.gguf",
+          "bytes": 49385164960,
+          "sha256": "946d6493d77fd7e06b21df81e1b4e4b8b73f953131b5416ddbf85fe9bad0e616"
+        },
+        {
+          "file": "UD-IQ3_S/GLM-5.2-UD-IQ3_S-00003-of-00008.gguf",
+          "bytes": 49896659872,
+          "sha256": "7e3269871a5cf7a34a7b54c057ab9407ce3fc5f5fdcef5a7e375bbef0b273b1c"
+        },
+        {
+          "file": "UD-IQ3_S/GLM-5.2-UD-IQ3_S-00004-of-00008.gguf",
+          "bytes": 49369220864,
+          "sha256": "72cb21732c1ed2cf219c0a9e3b76644ed330cc28f3b7d175614ce0cf0ce6cf99"
+        },
+        {
+          "file": "UD-IQ3_S/GLM-5.2-UD-IQ3_S-00005-of-00008.gguf",
+          "bytes": 49896659872,
+          "sha256": "b87a7fdcbd6c6bf021db4f67d02cbc17aee90cda15113ef3ce1f781fdfb5314a"
+        },
+        {
+          "file": "UD-IQ3_S/GLM-5.2-UD-IQ3_S-00006-of-00008.gguf",
+          "bytes": 49369220864,
+          "sha256": "d53f51e5bdc958f758c5400027f6e39e0550f6ebbfd128f256402d1f5bbcb718"
+        },
+        {
+          "file": "UD-IQ3_S/GLM-5.2-UD-IQ3_S-00007-of-00008.gguf",
+          "bytes": 49509893728,
+          "sha256": "767260c72fce5ec16da42444ef625a099d9a1179c31fe97f13c3bc5826145d6b"
+        },
+        {
+          "file": "UD-IQ3_S/GLM-5.2-UD-IQ3_S-00008-of-00008.gguf",
+          "bytes": 11204785120,
+          "sha256": "d2b8d53333b4b1fb351c1516757b4edde6c10874ecb7ed85958f7d4591751c0d"
+        }
+      ]
+    },
+    {
+      "quant": "Q3_K_M",
+      "layer_weight_bytes": 342735510656,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "gguf": "UD-Q3_K_M/GLM-5.2-UD-Q3_K_M-00001-of-00009.gguf",
+      "sha256": "f3d949f4dd553f0c3df4e0f4c7e159d026543e003917fe2bbcb1fac7cd193ab7",
+      "revision": "abc55e72527792c6e77069c99b4cb7de16fa9f23",
+      "parts": [
+        {
+          "file": "UD-Q3_K_M/GLM-5.2-UD-Q3_K_M-00002-of-00009.gguf",
+          "bytes": 48574511680,
+          "sha256": "fdc7d0c92edf2bcda10cda11ed25ee30f7f3e4aaef9748d31178a31a49386d0e"
+        },
+        {
+          "file": "UD-Q3_K_M/GLM-5.2-UD-Q3_K_M-00003-of-00009.gguf",
+          "bytes": 48508432544,
+          "sha256": "46347dde31750f00588b1f3d5da380dc989939e57cdc0fb72e6ec2d3c44486a0"
+        },
+        {
+          "file": "UD-Q3_K_M/GLM-5.2-UD-Q3_K_M-00004-of-00009.gguf",
+          "bytes": 48508432544,
+          "sha256": "ffcbe5b44fd3aa6ba15681cef63111589d0e91efc06c8f2499d5da87e0b043cb"
+        },
+        {
+          "file": "UD-Q3_K_M/GLM-5.2-UD-Q3_K_M-00005-of-00009.gguf",
+          "bytes": 48508432544,
+          "sha256": "e2829ffd920bd4ca7b6e3106a55d2d1ac38075514151558f5b10145be12a2fae"
+        },
+        {
+          "file": "UD-Q3_K_M/GLM-5.2-UD-Q3_K_M-00006-of-00009.gguf",
+          "bytes": 48508432544,
+          "sha256": "5659c3d8cfc815f38fa6b730f48a472179e97d647cc93604c20d1c84c9ce788e"
+        },
+        {
+          "file": "UD-Q3_K_M/GLM-5.2-UD-Q3_K_M-00007-of-00009.gguf",
+          "bytes": 48508432544,
+          "sha256": "717a342c5ca5a6e22dfb3f5be51e5cca1ddda370fdc850dea5a036c03cec9a80"
+        },
+        {
+          "file": "UD-Q3_K_M/GLM-5.2-UD-Q3_K_M-00008-of-00009.gguf",
+          "bytes": 48717290336,
+          "sha256": "b2447fd18b43149eb0ea273dfcc25319397b8365f8742682f821c6fc885a0ff8"
+        },
+        {
+          "file": "UD-Q3_K_M/GLM-5.2-UD-Q3_K_M-00009-of-00009.gguf",
+          "bytes": 2892122176,
+          "sha256": "40f5872a12eb0619045de8b6e99dab8ccaf486636448fbe5daf9b43d29d531b7"
+        }
+      ]
+    },
+    {
+      "quant": "Q3_K_XL",
+      "layer_weight_bytes": 342965972096,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "gguf": "UD-Q3_K_XL/GLM-5.2-UD-Q3_K_XL-00001-of-00009.gguf",
+      "sha256": "f3d949f4dd553f0c3df4e0f4c7e159d026543e003917fe2bbcb1fac7cd193ab7",
+      "revision": "abc55e72527792c6e77069c99b4cb7de16fa9f23",
+      "parts": [
+        {
+          "file": "UD-Q3_K_XL/GLM-5.2-UD-Q3_K_XL-00002-of-00009.gguf",
+          "bytes": 48804973120,
+          "sha256": "26ba75cb250d6204312ba875986d4006ea8b295043de128c632f98a6029188a8"
+        },
+        {
+          "file": "UD-Q3_K_XL/GLM-5.2-UD-Q3_K_XL-00003-of-00009.gguf",
+          "bytes": 48508432544,
+          "sha256": "46347dde31750f00588b1f3d5da380dc989939e57cdc0fb72e6ec2d3c44486a0"
+        },
+        {
+          "file": "UD-Q3_K_XL/GLM-5.2-UD-Q3_K_XL-00004-of-00009.gguf",
+          "bytes": 48508432544,
+          "sha256": "ffcbe5b44fd3aa6ba15681cef63111589d0e91efc06c8f2499d5da87e0b043cb"
+        },
+        {
+          "file": "UD-Q3_K_XL/GLM-5.2-UD-Q3_K_XL-00005-of-00009.gguf",
+          "bytes": 48508432544,
+          "sha256": "e2829ffd920bd4ca7b6e3106a55d2d1ac38075514151558f5b10145be12a2fae"
+        },
+        {
+          "file": "UD-Q3_K_XL/GLM-5.2-UD-Q3_K_XL-00006-of-00009.gguf",
+          "bytes": 48508432544,
+          "sha256": "5659c3d8cfc815f38fa6b730f48a472179e97d647cc93604c20d1c84c9ce788e"
+        },
+        {
+          "file": "UD-Q3_K_XL/GLM-5.2-UD-Q3_K_XL-00007-of-00009.gguf",
+          "bytes": 48508432544,
+          "sha256": "717a342c5ca5a6e22dfb3f5be51e5cca1ddda370fdc850dea5a036c03cec9a80"
+        },
+        {
+          "file": "UD-Q3_K_XL/GLM-5.2-UD-Q3_K_XL-00008-of-00009.gguf",
+          "bytes": 48717290336,
+          "sha256": "b2447fd18b43149eb0ea273dfcc25319397b8365f8742682f821c6fc885a0ff8"
+        },
+        {
+          "file": "UD-Q3_K_XL/GLM-5.2-UD-Q3_K_XL-00009-of-00009.gguf",
+          "bytes": 2892122176,
+          "sha256": "40f5872a12eb0619045de8b6e99dab8ccaf486636448fbe5daf9b43d29d531b7"
+        }
+      ]
+    },
+    {
+      "quant": "IQ4_XS",
+      "layer_weight_bytes": 365313223776,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "gguf": "UD-IQ4_XS/GLM-5.2-UD-IQ4_XS-00001-of-00009.gguf",
+      "sha256": "beb9dba83db38c77b342c3a4dabd40cc4380937b5c3b24aaf3d88387b37111aa",
+      "revision": "abc55e72527792c6e77069c99b4cb7de16fa9f23",
+      "parts": [
+        {
+          "file": "UD-IQ4_XS/GLM-5.2-UD-IQ4_XS-00002-of-00009.gguf",
+          "bytes": 49939486208,
+          "sha256": "490e3376e9be0758ed0723e692239a670d14195f210a2b2da7139f5fd56428dc"
+        },
+        {
+          "file": "UD-IQ4_XS/GLM-5.2-UD-IQ4_XS-00003-of-00009.gguf",
+          "bytes": 48701869824,
+          "sha256": "db8f997992aa06fc6ec7b7de530a461cf205f08318d1302e2e88bbc3e07dfee2"
+        },
+        {
+          "file": "UD-IQ4_XS/GLM-5.2-UD-IQ4_XS-00004-of-00009.gguf",
+          "bytes": 48843119456,
+          "sha256": "0765301f0095a7774af0a463511dd619f78f4a9d8377bdeb36891d4bc7f6079c"
+        },
+        {
+          "file": "UD-IQ4_XS/GLM-5.2-UD-IQ4_XS-00005-of-00009.gguf",
+          "bytes": 49940777632,
+          "sha256": "b01907268e0a6a825132043323aec98c2c39fcc19c57077eade52a8a47b18a8f"
+        },
+        {
+          "file": "UD-IQ4_XS/GLM-5.2-UD-IQ4_XS-00006-of-00009.gguf",
+          "bytes": 49008017600,
+          "sha256": "037e1f4b05087b63d0a8ca816e1d8ace5acc6e2cc36e49f5ebb0ba1384c6c692"
+        },
+        {
+          "file": "UD-IQ4_XS/GLM-5.2-UD-IQ4_XS-00007-of-00009.gguf",
+          "bytes": 49940777632,
+          "sha256": "5e60ffa886e7c2b007dada827f1b8799cc31d6c80150a528762c936b4f4bdad2"
+        },
+        {
+          "file": "UD-IQ4_XS/GLM-5.2-UD-IQ4_XS-00008-of-00009.gguf",
+          "bytes": 49939153088,
+          "sha256": "53375e45d73aa9f2467963d9ddcd1b624e6aa839380784ba98257a47a9c0a7a1"
+        },
+        {
+          "file": "UD-IQ4_XS/GLM-5.2-UD-IQ4_XS-00009-of-00009.gguf",
+          "bytes": 18990598592,
+          "sha256": "fafc47741e806c40c37fac189c528fb82b5a17ea22d5e0d41d0437495d4db337"
+        }
+      ]
+    },
+    {
+      "quant": "IQ4_NL",
+      "layer_weight_bytes": 372661644384,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "gguf": "UD-IQ4_NL/GLM-5.2-UD-IQ4_NL-00001-of-00009.gguf",
+      "sha256": "29827938025266f52e98808b45386585b542846a6f3ea93943894d6ca20e6e2b",
+      "revision": "abc55e72527792c6e77069c99b4cb7de16fa9f23",
+      "parts": [
+        {
+          "file": "UD-IQ4_NL/GLM-5.2-UD-IQ4_NL-00002-of-00009.gguf",
+          "bytes": 49642976512,
+          "sha256": "f2fabdc7fe29a7027fbdb1a37fc82ae7634844a8ba9a0c9275f51addcc176160"
+        },
+        {
+          "file": "UD-IQ4_NL/GLM-5.2-UD-IQ4_NL-00003-of-00009.gguf",
+          "bytes": 49528912832,
+          "sha256": "529a4864703b68856be48a1a4c71951607439f45aa7336aa0c15c54c426d5425"
+        },
+        {
+          "file": "UD-IQ4_NL/GLM-5.2-UD-IQ4_NL-00004-of-00009.gguf",
+          "bytes": 49708502784,
+          "sha256": "f04bc65c1ff73d765834aa81f34033a821b1e7fe7fc57b8c4752f8ab13af8d52"
+        },
+        {
+          "file": "UD-IQ4_NL/GLM-5.2-UD-IQ4_NL-00005-of-00009.gguf",
+          "bytes": 49950415712,
+          "sha256": "9c062d387028e5e4dd2f6280b9c4287fbac99e4977352ce569929bbb9510dea9"
+        },
+        {
+          "file": "UD-IQ4_NL/GLM-5.2-UD-IQ4_NL-00006-of-00009.gguf",
+          "bytes": 49528912832,
+          "sha256": "d5919e14d445e5cc91dfb43db1f0a0150f04bfbf0b350a774f27003e984fd093"
+        },
+        {
+          "file": "UD-IQ4_NL/GLM-5.2-UD-IQ4_NL-00007-of-00009.gguf",
+          "bytes": 49708502784,
+          "sha256": "089cd1d4fdc3c479407797ae8ffaca492fb7b5b19a221e1f4f637973c75104a0"
+        },
+        {
+          "file": "UD-IQ4_NL/GLM-5.2-UD-IQ4_NL-00008-of-00009.gguf",
+          "bytes": 49950415712,
+          "sha256": "ba14888154800c47684ec5e42c556305cb5d1482bf405a447d572e1817bf9f2c"
+        },
+        {
+          "file": "UD-IQ4_NL/GLM-5.2-UD-IQ4_NL-00009-of-00009.gguf",
+          "bytes": 24633581472,
+          "sha256": "3e3450fbb900806502caea7a5ec3b34cdf2166b43a2fc87f55ad3ba4aa0dd92b"
+        }
+      ]
+    },
+    {
+      "quant": "Q4_K_S",
+      "layer_weight_bytes": 436431842432,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "gguf": "UD-Q4_K_S/GLM-5.2-UD-Q4_K_S-00001-of-00010.gguf",
+      "sha256": "b551adfdd1ccc2d0952f1b6ea56ab365a89fcc0a94bc1bb7a66c0502e57e5202",
+      "revision": "abc55e72527792c6e77069c99b4cb7de16fa9f23",
+      "parts": [
+        {
+          "file": "UD-Q4_K_S/GLM-5.2-UD-Q4_K_S-00002-of-00010.gguf",
+          "bytes": 48591969952,
+          "sha256": "c4fcb8cd907d97c44ac6f3506c5d3a269ee5b66bf6b8dfb22b59397841078394"
+        },
+        {
+          "file": "UD-Q4_K_S/GLM-5.2-UD-Q4_K_S-00003-of-00010.gguf",
+          "bytes": 49002123424,
+          "sha256": "7183960c1164bf1f95fac6310c167ab9637a818d100b60275597339493cc25cd"
+        },
+        {
+          "file": "UD-Q4_K_S/GLM-5.2-UD-Q4_K_S-00004-of-00010.gguf",
+          "bytes": 49181713376,
+          "sha256": "936fc2c65560447086faebc02c7739c51b759e74c37300a8b6db4c38bb8c9721"
+        },
+        {
+          "file": "UD-Q4_K_S/GLM-5.2-UD-Q4_K_S-00005-of-00010.gguf",
+          "bytes": 49188029536,
+          "sha256": "9f36098e98b143439dc3325796ee51fe508c517207c9ae580c74559aee7a608b"
+        },
+        {
+          "file": "UD-Q4_K_S/GLM-5.2-UD-Q4_K_S-00006-of-00010.gguf",
+          "bytes": 49002123424,
+          "sha256": "c517e8ccd374e1cbd3035812eba6b3a35f6dba0118f869809535cbfe7456aef0"
+        },
+        {
+          "file": "UD-Q4_K_S/GLM-5.2-UD-Q4_K_S-00007-of-00010.gguf",
+          "bytes": 49181713376,
+          "sha256": "a4223a0e47895ccf54ae977abc1c731b1ac6965bf382820ed97079ccc13781fa"
+        },
+        {
+          "file": "UD-Q4_K_S/GLM-5.2-UD-Q4_K_S-00008-of-00010.gguf",
+          "bytes": 49188029536,
+          "sha256": "61a6732bc76f42513f3511d7f7d879f39978ccb7c6a2f103db4464e23f735544"
+        },
+        {
+          "file": "UD-Q4_K_S/GLM-5.2-UD-Q4_K_S-00009-of-00010.gguf",
+          "bytes": 49002123424,
+          "sha256": "7ad1adda26d8e263e06ad485d98a09317e8d2617d4c445779aa9fed2c2f5b2da"
+        },
+        {
+          "file": "UD-Q4_K_S/GLM-5.2-UD-Q4_K_S-00010-of-00010.gguf",
+          "bytes": 44084592640,
+          "sha256": "5474eccce888428c6ededb7d7f74e523db072675b70331a7ca742924a277873a"
+        }
+      ]
+    },
+    {
+      "quant": "Q4_K_M",
+      "layer_weight_bytes": 465825525088,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "gguf": "UD-Q4_K_M/GLM-5.2-UD-Q4_K_M-00001-of-00011.gguf",
+      "sha256": "3256ac8c290273f0965ff39e93a8bcd07dc99bcd23e923bd4b7306ef39061038",
+      "revision": "abc55e72527792c6e77069c99b4cb7de16fa9f23",
+      "parts": [
+        {
+          "file": "UD-Q4_K_M/GLM-5.2-UD-Q4_K_M-00002-of-00011.gguf",
+          "bytes": 49801980512,
+          "sha256": "1020105e78d862988a6cabb3a78eafa75f29666ab8a5fd10de1b9b8c8a6bc5e8"
+        },
+        {
+          "file": "UD-Q4_K_M/GLM-5.2-UD-Q4_K_M-00003-of-00011.gguf",
+          "bytes": 48566415136,
+          "sha256": "0b36f406e120759290894ea4960d5086f9b362a8c8f9c7fcaad24b4471172efb"
+        },
+        {
+          "file": "UD-Q4_K_M/GLM-5.2-UD-Q4_K_M-00004-of-00011.gguf",
+          "bytes": 48566415136,
+          "sha256": "04b19199f52ba29e7f9966b15df3fbc2d1e5c56cd6343c405076be7174d49d32"
+        },
+        {
+          "file": "UD-Q4_K_M/GLM-5.2-UD-Q4_K_M-00005-of-00011.gguf",
+          "bytes": 48566415136,
+          "sha256": "5cb76d724ee16e80c1cb6aba29aacd76161e7a6f147079be3447501c06d95f2c"
+        },
+        {
+          "file": "UD-Q4_K_M/GLM-5.2-UD-Q4_K_M-00006-of-00011.gguf",
+          "bytes": 48566415136,
+          "sha256": "ec2c65255c834b686f066e350bc5b8d8a7020cd1133f0ee9e819d2fb5d3afad0"
+        },
+        {
+          "file": "UD-Q4_K_M/GLM-5.2-UD-Q4_K_M-00007-of-00011.gguf",
+          "bytes": 48566415136,
+          "sha256": "53c8328852ca0b6791a9a9243bcc56157305adca8526a646054389845e7445a9"
+        },
+        {
+          "file": "UD-Q4_K_M/GLM-5.2-UD-Q4_K_M-00008-of-00011.gguf",
+          "bytes": 48566415136,
+          "sha256": "9a23bfb21c5f6fcc94b0329c108ec1ef3fdbd815c57eeb0bf105d26861d7271e"
+        },
+        {
+          "file": "UD-Q4_K_M/GLM-5.2-UD-Q4_K_M-00009-of-00011.gguf",
+          "bytes": 48566415136,
+          "sha256": "71088054fb1a09a4f38e2ee8a726526790660a4f77ead817f75cb7a484bdb0b8"
+        },
+        {
+          "file": "UD-Q4_K_M/GLM-5.2-UD-Q4_K_M-00010-of-00011.gguf",
+          "bytes": 48566415136,
+          "sha256": "848db99658faf24971df23638281305a15bdc187cbcaed968952ed9e9c835b50"
+        },
+        {
+          "file": "UD-Q4_K_M/GLM-5.2-UD-Q4_K_M-00011-of-00011.gguf",
+          "bytes": 27482799744,
+          "sha256": "629e23bce250fb500d9a190de7249c2882af524aacc112ce507a871ed5bebf90"
+        }
+      ]
+    },
+    {
+      "quant": "Q4_K_XL",
+      "layer_weight_bytes": 467289111904,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "gguf": "UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00001-of-00011.gguf",
+      "sha256": "3256ac8c290273f0965ff39e93a8bcd07dc99bcd23e923bd4b7306ef39061038",
+      "revision": "abc55e72527792c6e77069c99b4cb7de16fa9f23",
+      "parts": [
+        {
+          "file": "UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00002-of-00011.gguf",
+          "bytes": 49433942336,
+          "sha256": "aaedfb89d314d6967a80005b93a9c460a494babc6c3e4f0138e21891e21572e1"
+        },
+        {
+          "file": "UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00003-of-00011.gguf",
+          "bytes": 48566415136,
+          "sha256": "a2b45b63075b2e1bc8a73c9ce531ccea54c03001286a80f77454871aa93fdca8"
+        },
+        {
+          "file": "UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00004-of-00011.gguf",
+          "bytes": 48566415136,
+          "sha256": "b5404d8d17b63e127aa34c1f98cef64d3722050d8ef1a0792dba816477f4c606"
+        },
+        {
+          "file": "UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00005-of-00011.gguf",
+          "bytes": 48566415136,
+          "sha256": "9ab79e1947115be35da815c1be2812a1451d3ec11f9f5d60dd3ba152e1ed5be2"
+        },
+        {
+          "file": "UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00006-of-00011.gguf",
+          "bytes": 48566415136,
+          "sha256": "43a2631ee392492f8857bae6c88660e0f1cac0fd6bc40d832538ac5421b3167b"
+        },
+        {
+          "file": "UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00007-of-00011.gguf",
+          "bytes": 48566415136,
+          "sha256": "1efd96717a956a160a1717999c7dedbe601b5787ea6220d8185d232e95eff893"
+        },
+        {
+          "file": "UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00008-of-00011.gguf",
+          "bytes": 48566415136,
+          "sha256": "3460334e8148d12402c8f5adf684b132918504bbea4d3aecd74801121e8c8a99"
+        },
+        {
+          "file": "UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00009-of-00011.gguf",
+          "bytes": 48566415136,
+          "sha256": "7f6be8ce1c9dcb973ede026b7341657f8add8617f386f77cc165ff697cf9620d"
+        },
+        {
+          "file": "UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00010-of-00011.gguf",
+          "bytes": 48566415136,
+          "sha256": "6a26bf391e6f1de947e63016d11ada565f7476a06cb90b444f6db334baa949f9"
+        },
+        {
+          "file": "UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00011-of-00011.gguf",
+          "bytes": 29314424736,
+          "sha256": "27032b927daa606872d887c56631c5278a788b39d219784b262e1df3d4cb851e"
+        }
+      ]
+    },
+    {
+      "quant": "Q5_K_S",
+      "layer_weight_bytes": 527259270528,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "gguf": "UD-Q5_K_S/GLM-5.2-UD-Q5_K_S-00001-of-00012.gguf",
+      "sha256": "a6521809fd0c6209bb904e0085573fc9b5839e086490d74daa03eca6f5c95ac9",
+      "revision": "abc55e72527792c6e77069c99b4cb7de16fa9f23",
+      "parts": [
+        {
+          "file": "UD-Q5_K_S/GLM-5.2-UD-Q5_K_S-00002-of-00012.gguf",
+          "bytes": 49196131456,
+          "sha256": "950265e1ca6471e794fe5864f2264de8d546c319066063aa985d34f08734b3dc"
+        },
+        {
+          "file": "UD-Q5_K_S/GLM-5.2-UD-Q5_K_S-00003-of-00012.gguf",
+          "bytes": 48132757824,
+          "sha256": "ac92545a76fa25776a5fbe612e80161fc674cd31dc16a3ac704e7388925993e3"
+        },
+        {
+          "file": "UD-Q5_K_S/GLM-5.2-UD-Q5_K_S-00004-of-00012.gguf",
+          "bytes": 48132757824,
+          "sha256": "6e5052c5e5a8a5876be8bc2049ccfd8f5ff0827b8f8c045ec6a1df4ebfd30038"
+        },
+        {
+          "file": "UD-Q5_K_S/GLM-5.2-UD-Q5_K_S-00005-of-00012.gguf",
+          "bytes": 48132757824,
+          "sha256": "5a904aea1a82e548a4cb8678b28908288bbc88d9df003984b9936aba357a7c26"
+        },
+        {
+          "file": "UD-Q5_K_S/GLM-5.2-UD-Q5_K_S-00006-of-00012.gguf",
+          "bytes": 48132757824,
+          "sha256": "0dde45e80abb64b58de257ba3fe938c298deafe082b9e114a413ba3211aa6516"
+        },
+        {
+          "file": "UD-Q5_K_S/GLM-5.2-UD-Q5_K_S-00007-of-00012.gguf",
+          "bytes": 48132757824,
+          "sha256": "69b1b0d62cddd26e1e992d1630e5d6dacb03ead2209ee41190ffb962e9309545"
+        },
+        {
+          "file": "UD-Q5_K_S/GLM-5.2-UD-Q5_K_S-00008-of-00012.gguf",
+          "bytes": 48132757824,
+          "sha256": "4697d25e262e520bc35877afc03cecb0a1f14ab57eb9c7e36059b69d3202b131"
+        },
+        {
+          "file": "UD-Q5_K_S/GLM-5.2-UD-Q5_K_S-00009-of-00012.gguf",
+          "bytes": 48132757824,
+          "sha256": "1ec9a8a20a5676f6a50285a42dfafc0b614597845f56b6ad842edbc66adfc69c"
+        },
+        {
+          "file": "UD-Q5_K_S/GLM-5.2-UD-Q5_K_S-00010-of-00012.gguf",
+          "bytes": 48132757824,
+          "sha256": "aa3b9a15aa1ddbaa286bdae70dfb28f7fada4706390c7f349e3e7bb43815fbb3"
+        },
+        {
+          "file": "UD-Q5_K_S/GLM-5.2-UD-Q5_K_S-00011-of-00012.gguf",
+          "bytes": 48132757824,
+          "sha256": "bd611e54ea80eaeb56e2683ace29d3e3fa25ca1ce87269d4e3a59ccfcef081ab"
+        },
+        {
+          "file": "UD-Q5_K_S/GLM-5.2-UD-Q5_K_S-00012-of-00012.gguf",
+          "bytes": 44858894912,
+          "sha256": "147f75e3d8b7674a46c6ed09cb8c36ed4f51954760e8eb076568dd04fb2e417e"
+        }
+      ]
+    },
+    {
+      "quant": "Q5_K_M",
+      "layer_weight_bytes": 560830479904,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "gguf": "UD-Q5_K_M/GLM-5.2-UD-Q5_K_M-00001-of-00013.gguf",
+      "sha256": "03ab6cf225abf04e26f3ab05b3ece62f9aaabbf36a97410e02ac744ac08c9710",
+      "revision": "abc55e72527792c6e77069c99b4cb7de16fa9f23",
+      "parts": [
+        {
+          "file": "UD-Q5_K_M/GLM-5.2-UD-Q5_K_M-00002-of-00013.gguf",
+          "bytes": 49956586368,
+          "sha256": "4e60762d1d97bb69d643df7ccf5a933122e10d23bb0f32e8bbaec1211d30b578"
+        },
+        {
+          "file": "UD-Q5_K_M/GLM-5.2-UD-Q5_K_M-00003-of-00013.gguf",
+          "bytes": 48471709856,
+          "sha256": "b717fc40bf556709745a75f3b973ce904c824755187eabc827068a284cedd7e9"
+        },
+        {
+          "file": "UD-Q5_K_M/GLM-5.2-UD-Q5_K_M-00004-of-00013.gguf",
+          "bytes": 48713622784,
+          "sha256": "567ae7e8faf44d531bb49dc7cbde35f3a9ea927b887bf95dbe239be4ccceac60"
+        },
+        {
+          "file": "UD-Q5_K_M/GLM-5.2-UD-Q5_K_M-00005-of-00013.gguf",
+          "bytes": 48893212736,
+          "sha256": "907658d5c621f6338509c6d18876e6fae0bf68af20143d7946f92d5c2183f46b"
+        },
+        {
+          "file": "UD-Q5_K_M/GLM-5.2-UD-Q5_K_M-00006-of-00013.gguf",
+          "bytes": 48471709888,
+          "sha256": "c18c0b27fd25aebbfb89196267e1217b79424674641c83f1d31da2d2f65d9018"
+        },
+        {
+          "file": "UD-Q5_K_M/GLM-5.2-UD-Q5_K_M-00007-of-00013.gguf",
+          "bytes": 48713622784,
+          "sha256": "f0a8ee76825512670a597eff3029928b17f7a4adaceca3853744825b9f72c3ec"
+        },
+        {
+          "file": "UD-Q5_K_M/GLM-5.2-UD-Q5_K_M-00008-of-00013.gguf",
+          "bytes": 48893212736,
+          "sha256": "67760d84f5bfd5be21b31acab9bd2dbb464c3d9eb9c963cba05b2822ec339549"
+        },
+        {
+          "file": "UD-Q5_K_M/GLM-5.2-UD-Q5_K_M-00009-of-00013.gguf",
+          "bytes": 48471709888,
+          "sha256": "c29792180662a57203ab148bbae893c5a25b84317f1f093a6408ab6ecf076fb5"
+        },
+        {
+          "file": "UD-Q5_K_M/GLM-5.2-UD-Q5_K_M-00010-of-00013.gguf",
+          "bytes": 48713622784,
+          "sha256": "64e16f44124fc7636512751438e87758e0a76c4fed1a786855174bbd7af13098"
+        },
+        {
+          "file": "UD-Q5_K_M/GLM-5.2-UD-Q5_K_M-00011-of-00013.gguf",
+          "bytes": 48893212736,
+          "sha256": "feb53662b5dda61bb70b8604e104232be76f9a8a07a9477cc0ed2f0d9bba0a4e"
+        },
+        {
+          "file": "UD-Q5_K_M/GLM-5.2-UD-Q5_K_M-00012-of-00013.gguf",
+          "bytes": 49251850432,
+          "sha256": "50232874f460efc2a0c699b2ed929aef4acb95ef76540e6bdfdea284f8201bb5"
+        },
+        {
+          "file": "UD-Q5_K_M/GLM-5.2-UD-Q5_K_M-00013-of-00013.gguf",
+          "bytes": 23376983168,
+          "sha256": "4ea4cb3b3a012d0f4c8374d970af56baf92f13684179cdd7eb23ef49e79aa510"
+        }
+      ]
+    },
+    {
+      "quant": "Q5_K_XL",
+      "layer_weight_bytes": 562466258496,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "gguf": "UD-Q5_K_XL/GLM-5.2-UD-Q5_K_XL-00001-of-00013.gguf",
+      "sha256": "03ab6cf225abf04e26f3ab05b3ece62f9aaabbf36a97410e02ac744ac08c9710",
+      "revision": "abc55e72527792c6e77069c99b4cb7de16fa9f23",
+      "parts": [
+        {
+          "file": "UD-Q5_K_XL/GLM-5.2-UD-Q5_K_XL-00002-of-00013.gguf",
+          "bytes": 48936583936,
+          "sha256": "0f87f26242d6a9b9e3fb133ff1661a42dbd9794ad8a90225d170d7f2a36736a5"
+        },
+        {
+          "file": "UD-Q5_K_XL/GLM-5.2-UD-Q5_K_XL-00003-of-00013.gguf",
+          "bytes": 48713622784,
+          "sha256": "445822f9379d8901bc42cdf62e513be6802554f64c50be53244654be8056c534"
+        },
+        {
+          "file": "UD-Q5_K_XL/GLM-5.2-UD-Q5_K_XL-00004-of-00013.gguf",
+          "bytes": 48893212736,
+          "sha256": "1d94f4466c591e3e2e597c7a7c9e45e18779692e2c3d393746f7d835896b2131"
+        },
+        {
+          "file": "UD-Q5_K_XL/GLM-5.2-UD-Q5_K_XL-00005-of-00013.gguf",
+          "bytes": 48471709888,
+          "sha256": "30b1dcabf804829fb88d877428b7b635bcf753b762cdecd2b28e66bb1318df2a"
+        },
+        {
+          "file": "UD-Q5_K_XL/GLM-5.2-UD-Q5_K_XL-00006-of-00013.gguf",
+          "bytes": 48713622784,
+          "sha256": "66de6d18714d573b86f7d45447df0062c7b194662a729139fc8c6822f2956812"
+        },
+        {
+          "file": "UD-Q5_K_XL/GLM-5.2-UD-Q5_K_XL-00007-of-00013.gguf",
+          "bytes": 48893212736,
+          "sha256": "a69a098c795763c0397e516f88e2977009bb5d872b8271a9a0ef15b025c60177"
+        },
+        {
+          "file": "UD-Q5_K_XL/GLM-5.2-UD-Q5_K_XL-00008-of-00013.gguf",
+          "bytes": 48471709888,
+          "sha256": "5908a283745e6920d07edc28f42b5581d8e4a97d4a3a417c7055908e071fd09e"
+        },
+        {
+          "file": "UD-Q5_K_XL/GLM-5.2-UD-Q5_K_XL-00009-of-00013.gguf",
+          "bytes": 48713622784,
+          "sha256": "b985f15b5a9aee2a978d186e9df38c347c5ff7aa8dedd3529a903eaa51326f6f"
+        },
+        {
+          "file": "UD-Q5_K_XL/GLM-5.2-UD-Q5_K_XL-00010-of-00013.gguf",
+          "bytes": 48893212736,
+          "sha256": "cc424ac5531f1ae5a3d2b7f1f3a762c7e23c4d7465ec90b446eef05196f91df8"
+        },
+        {
+          "file": "UD-Q5_K_XL/GLM-5.2-UD-Q5_K_XL-00011-of-00013.gguf",
+          "bytes": 48471709888,
+          "sha256": "b5e33a5641c2ee81e60f9abd0726b71938a524003de4ed8735ffdba8892da46d"
+        },
+        {
+          "file": "UD-Q5_K_XL/GLM-5.2-UD-Q5_K_XL-00012-of-00013.gguf",
+          "bytes": 49493763328,
+          "sha256": "dc371568a12357eb8a8bb83fe56b349597c2f44a771b5cdc9994c27f03021d93"
+        },
+        {
+          "file": "UD-Q5_K_XL/GLM-5.2-UD-Q5_K_XL-00013-of-00013.gguf",
+          "bytes": 25790851264,
+          "sha256": "c2a3fce030fd25c6584cd3a4fe09a3a8ae9843d25f5b007df0277b709b6e660b"
+        }
+      ]
+    },
+    {
+      "quant": "Q6_K",
+      "layer_weight_bytes": 625858969376,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "gguf": "UD-Q6_K/GLM-5.2-UD-Q6_K-00001-of-00014.gguf",
+      "sha256": "e3edbe857c52e760ccec32d02f188f3df3eb2560183a6223353c8e086863646f",
+      "revision": "abc55e72527792c6e77069c99b4cb7de16fa9f23",
+      "parts": [
+        {
+          "file": "UD-Q6_K/GLM-5.2-UD-Q6_K-00002-of-00014.gguf",
+          "bytes": 49592946368,
+          "sha256": "dba9d61b3b0d09e47bc8b0fe15c507f3095b56b6320246965ddaf006d7eb0989"
+        },
+        {
+          "file": "UD-Q6_K/GLM-5.2-UD-Q6_K-00003-of-00014.gguf",
+          "bytes": 48957391712,
+          "sha256": "b835b87528c6df69f803ea77c6ccda67cad6e8756b81bf27883bb3dc9ba58fcb"
+        },
+        {
+          "file": "UD-Q6_K/GLM-5.2-UD-Q6_K-00004-of-00014.gguf",
+          "bytes": 48957391744,
+          "sha256": "806496582661ca8ba92572bae6655904bb4742c4d80bf0e973b3ea0ee39f7007"
+        },
+        {
+          "file": "UD-Q6_K/GLM-5.2-UD-Q6_K-00005-of-00014.gguf",
+          "bytes": 48957391744,
+          "sha256": "97746625ac4b80bdd01f98432cdf1067d81ce9632370cac37a9b911410ef0389"
+        },
+        {
+          "file": "UD-Q6_K/GLM-5.2-UD-Q6_K-00006-of-00014.gguf",
+          "bytes": 48957391744,
+          "sha256": "e575fc0bf14a1dc98b5b1a9ced785cab782ff3b6de4586278b3cc83a96917f9e"
+        },
+        {
+          "file": "UD-Q6_K/GLM-5.2-UD-Q6_K-00007-of-00014.gguf",
+          "bytes": 48957391744,
+          "sha256": "bbd7eae65f0574b794c00227d8fedac437fb899be165f7f1b0c2caf98ade03c5"
+        },
+        {
+          "file": "UD-Q6_K/GLM-5.2-UD-Q6_K-00008-of-00014.gguf",
+          "bytes": 48957391744,
+          "sha256": "599d3a2cbc25296a3ffc79fde171a96165e408d144b4f40b26c2e929c4cd7327"
+        },
+        {
+          "file": "UD-Q6_K/GLM-5.2-UD-Q6_K-00009-of-00014.gguf",
+          "bytes": 48957391744,
+          "sha256": "dea9fcdada25f41d219c57dd9f8a1600e49e80950b00c481d7c637b75ca8312e"
+        },
+        {
+          "file": "UD-Q6_K/GLM-5.2-UD-Q6_K-00010-of-00014.gguf",
+          "bytes": 48957391744,
+          "sha256": "a6e7fe8834550a548550ee3e52618c8de10c4ac4a03237e8714936656e4e1a40"
+        },
+        {
+          "file": "UD-Q6_K/GLM-5.2-UD-Q6_K-00011-of-00014.gguf",
+          "bytes": 48957391744,
+          "sha256": "5cdf818e48d8792c80d99da11e9c6023fa82bee06adf434f31692c2ea4ffe208"
+        },
+        {
+          "file": "UD-Q6_K/GLM-5.2-UD-Q6_K-00012-of-00014.gguf",
+          "bytes": 48957391744,
+          "sha256": "5857516f873b0e962808f64acefea3b7d4e8348c6263b40e5c19ac029d3a6d86"
+        },
+        {
+          "file": "UD-Q6_K/GLM-5.2-UD-Q6_K-00013-of-00014.gguf",
+          "bytes": 48957391744,
+          "sha256": "b7be711e134839162c84787c142f504ab0d4466b915fb87b218018c7bc3bd28f"
+        },
+        {
+          "file": "UD-Q6_K/GLM-5.2-UD-Q6_K-00014-of-00014.gguf",
+          "bytes": 37725290112,
+          "sha256": "9a0369335fb822fbf459838a572ef4f5b69e7785ad2989cd057e80a8fa6b0ade"
+        }
+      ]
+    },
+    {
+      "quant": "Q6_K_XL",
+      "layer_weight_bytes": 684369510240,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "gguf": "UD-Q6_K_XL/GLM-5.2-UD-Q6_K_XL-00001-of-00016.gguf",
+      "sha256": "13fdefdeab31cc7947427ef5f55e1c012726760f9799ce39c050e970d8940609",
+      "revision": "abc55e72527792c6e77069c99b4cb7de16fa9f23",
+      "parts": [
+        {
+          "file": "UD-Q6_K_XL/GLM-5.2-UD-Q6_K_XL-00002-of-00016.gguf",
+          "bytes": 48175770944,
+          "sha256": "b3bdc76ee28d05bf4dc43d6ae78deb285ec75666bd25b72b389bde6e7c276d09"
+        },
+        {
+          "file": "UD-Q6_K_XL/GLM-5.2-UD-Q6_K_XL-00003-of-00016.gguf",
+          "bytes": 49694731776,
+          "sha256": "a3dcda7cbb152fc4075d7a1355e44f05e77c7a84c69344302c2ab4d18f5e20b6"
+        },
+        {
+          "file": "UD-Q6_K_XL/GLM-5.2-UD-Q6_K_XL-00004-of-00016.gguf",
+          "bytes": 47360626336,
+          "sha256": "6f02cc79f19bdcfe2cd114d07148bdd7e270566124273db58bdd06ae1a5a83aa"
+        },
+        {
+          "file": "UD-Q6_K_XL/GLM-5.2-UD-Q6_K_XL-00005-of-00016.gguf",
+          "bytes": 47540216288,
+          "sha256": "1b287a86d7ae2d97268c9658d36c264f5fa6b15b6ce47f63bac5f4f72e495cc3"
+        },
+        {
+          "file": "UD-Q6_K_XL/GLM-5.2-UD-Q6_K_XL-00006-of-00016.gguf",
+          "bytes": 48134450720,
+          "sha256": "ba26127d42d97a1d88b081bfdcd5564488dc4b94efea98779eb697941d86113d"
+        },
+        {
+          "file": "UD-Q6_K_XL/GLM-5.2-UD-Q6_K_XL-00007-of-00016.gguf",
+          "bytes": 47360626336,
+          "sha256": "0f3715ed5e8309503058f2386ded0079728aeecd294e0af0857400ec8830bba7"
+        },
+        {
+          "file": "UD-Q6_K_XL/GLM-5.2-UD-Q6_K_XL-00008-of-00016.gguf",
+          "bytes": 47540216288,
+          "sha256": "32b7b747d569c3d77a0744bea8c7eb74c3e2741650923f92c706473108fa87ca"
+        },
+        {
+          "file": "UD-Q6_K_XL/GLM-5.2-UD-Q6_K_XL-00009-of-00016.gguf",
+          "bytes": 48134450720,
+          "sha256": "18824bdac72caa054ab8383502610309c60d51f6456b54d5f92f19baee29edcf"
+        },
+        {
+          "file": "UD-Q6_K_XL/GLM-5.2-UD-Q6_K_XL-00010-of-00016.gguf",
+          "bytes": 47360626336,
+          "sha256": "00fee94eb635c15635bd999159118985bd051c3469a4c2e59997ba4c1a5de314"
+        },
+        {
+          "file": "UD-Q6_K_XL/GLM-5.2-UD-Q6_K_XL-00011-of-00016.gguf",
+          "bytes": 47540216288,
+          "sha256": "88ab2cc0e271a33276e45409e21e6507ee60584d6f5f61b3aaf597ab6cbcb755"
+        },
+        {
+          "file": "UD-Q6_K_XL/GLM-5.2-UD-Q6_K_XL-00012-of-00016.gguf",
+          "bytes": 48134450720,
+          "sha256": "83048bf5ee64e741c0d4c124bd4ed0c5999d849eea7a9358b71c2f643807cfb1"
+        },
+        {
+          "file": "UD-Q6_K_XL/GLM-5.2-UD-Q6_K_XL-00013-of-00016.gguf",
+          "bytes": 47360626336,
+          "sha256": "8bb105f9205c593e9f9adc8207239c047aea9f33af75d00bb0cc8be44de99869"
+        },
+        {
+          "file": "UD-Q6_K_XL/GLM-5.2-UD-Q6_K_XL-00014-of-00016.gguf",
+          "bytes": 47540216288,
+          "sha256": "4ed449ba99dd9c4508183da4b38b7220978c491db489ba572cbe99d28b491a35"
+        },
+        {
+          "file": "UD-Q6_K_XL/GLM-5.2-UD-Q6_K_XL-00015-of-00016.gguf",
+          "bytes": 48134450720,
+          "sha256": "d1cb4264c94a89a53677c37e12ce60d93d6c8b6786b6f051a65146063b2d6dc3"
+        },
+        {
+          "file": "UD-Q6_K_XL/GLM-5.2-UD-Q6_K_XL-00016-of-00016.gguf",
+          "bytes": 14348410400,
+          "sha256": "426312b0774bc22770b94ebb9adaeff1e45c33f4c7a688c8c98adc327d1d33f0"
+        }
+      ]
+    },
+    {
+      "quant": "Q8_0",
+      "layer_weight_bytes": 801357672256,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "gguf": "Q8_0/GLM-5.2-Q8_0-00001-of-00017.gguf",
+      "sha256": "d04fe0b6dda2b1acc8a2e47b20a249c6c8e5db99f3a64af1df84a1297167811f",
+      "revision": "abc55e72527792c6e77069c99b4cb7de16fa9f23",
+      "parts": [
+        {
+          "file": "Q8_0/GLM-5.2-Q8_0-00002-of-00017.gguf",
+          "bytes": 49105526048,
+          "sha256": "e872a77c3a56d93536531c46f86dbc4bc04e82903cc2b9fd841a5ff19888e514"
+        },
+        {
+          "file": "Q8_0/GLM-5.2-Q8_0-00003-of-00017.gguf",
+          "bytes": 49299773536,
+          "sha256": "be4812dac3a6fd7b55e0d0285ece06269a523599f435c16141e176eedee22ae8"
+        },
+        {
+          "file": "Q8_0/GLM-5.2-Q8_0-00004-of-00017.gguf",
+          "bytes": 49065113632,
+          "sha256": "9ac8eb3c5a802a6e2dec70015fbd1fe3a283b5ec9f57987d39be11d2adec8b33"
+        },
+        {
+          "file": "Q8_0/GLM-5.2-Q8_0-00005-of-00017.gguf",
+          "bytes": 49065113600,
+          "sha256": "c314a85181beeaaae11f8f01883e7bae86997a60ed2ed10b9e146fc5ce15e9bb"
+        },
+        {
+          "file": "Q8_0/GLM-5.2-Q8_0-00006-of-00017.gguf",
+          "bytes": 48843319392,
+          "sha256": "6f0ad6bc0a825ed2b8b818ab4c082afee5207242c3be08f4d5ff8fbba98b4770"
+        },
+        {
+          "file": "Q8_0/GLM-5.2-Q8_0-00007-of-00017.gguf",
+          "bytes": 49065113600,
+          "sha256": "cafd62c56e76dcf01ca3eb12177feefcc845eb3ebe62ceec3e56468552a7c08c"
+        },
+        {
+          "file": "Q8_0/GLM-5.2-Q8_0-00008-of-00017.gguf",
+          "bytes": 49065113632,
+          "sha256": "6b3a9a428aae5cc1355e3c63857e2e6a0e62ad847e0a9e4de1fce7c9f8590966"
+        },
+        {
+          "file": "Q8_0/GLM-5.2-Q8_0-00009-of-00017.gguf",
+          "bytes": 48843319392,
+          "sha256": "bddf947ee4a3c6162e19d6ceb4d155a03d8e7f30a3a00f712181279155015790"
+        },
+        {
+          "file": "Q8_0/GLM-5.2-Q8_0-00010-of-00017.gguf",
+          "bytes": 49065113600,
+          "sha256": "126c5d66871a1132e122a2edb86ec5d89cccd1beb97efe98043fee657db6515d"
+        },
+        {
+          "file": "Q8_0/GLM-5.2-Q8_0-00011-of-00017.gguf",
+          "bytes": 49065113632,
+          "sha256": "c779af5b3d7d5d151c00fee376105816ce6f4d04df7bc7eb2f167b72879dee5f"
+        },
+        {
+          "file": "Q8_0/GLM-5.2-Q8_0-00012-of-00017.gguf",
+          "bytes": 48883731776,
+          "sha256": "7a9f4634cc88e62f27bd8722016f30c61f7f5b646a323accb9105a42e072ac56"
+        },
+        {
+          "file": "Q8_0/GLM-5.2-Q8_0-00013-of-00017.gguf",
+          "bytes": 49065113632,
+          "sha256": "f6c7baef1019b559ca90965d3e4da418662b31f9c6d0c535f4a47d1fad29fc8e"
+        },
+        {
+          "file": "Q8_0/GLM-5.2-Q8_0-00014-of-00017.gguf",
+          "bytes": 49065113600,
+          "sha256": "6cb7990749efba16c56faaad4cba9502eebcc47064674e30a0588bdf382117dc"
+        },
+        {
+          "file": "Q8_0/GLM-5.2-Q8_0-00015-of-00017.gguf",
+          "bytes": 48843319392,
+          "sha256": "2fbd2056fd1df4c0729835c7e73a9b7837946388c90d1160082ef7b65ddd6823"
+        },
+        {
+          "file": "Q8_0/GLM-5.2-Q8_0-00016-of-00017.gguf",
+          "bytes": 49155939904,
+          "sha256": "d5469b815db12244c40232d7232f1260091530d5eb4c62d1780098f527ac93ab"
+        },
+        {
+          "file": "Q8_0/GLM-5.2-Q8_0-00017-of-00017.gguf",
+          "bytes": 17556349216,
+          "sha256": "6f5bbd05c12602b0b47bff76f86456c4ee42ac910ad18e0fa0be1a2ed5ce4cd3"
+        }
+      ]
+    },
+    {
+      "quant": "Q8_K_XL",
+      "layer_weight_bytes": 819700080736,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "gguf": "UD-Q8_K_XL/GLM-5.2-UD-Q8_K_XL-00001-of-00018.gguf",
+      "sha256": "bfc1786420a49d9d293e825054aa7bd3db2d524632490007a7e7aa800b0196bf",
+      "revision": "abc55e72527792c6e77069c99b4cb7de16fa9f23",
+      "parts": [
+        {
+          "file": "UD-Q8_K_XL/GLM-5.2-UD-Q8_K_XL-00002-of-00018.gguf",
+          "bytes": 48913111040,
+          "sha256": "81e611e56e21d65358b10a7b455cc106587572561352929db04b31c9fa13c192"
+        },
+        {
+          "file": "UD-Q8_K_XL/GLM-5.2-UD-Q8_K_XL-00003-of-00018.gguf",
+          "bytes": 47813818112,
+          "sha256": "44bd8abc44911daf20296141a43dfb897a31a18359fa96739b0c2245c955f42f"
+        },
+        {
+          "file": "UD-Q8_K_XL/GLM-5.2-UD-Q8_K_XL-00004-of-00018.gguf",
+          "bytes": 48878106976,
+          "sha256": "d22c7267fa7324b06f68fad643ba5561901bf40057a783010d401f8b538701d5"
+        },
+        {
+          "file": "UD-Q8_K_XL/GLM-5.2-UD-Q8_K_XL-00005-of-00018.gguf",
+          "bytes": 49057696928,
+          "sha256": "e1748b254bfdf9d6a8d443a2cb9891c73dfddcf827098fa8e807c88f9b65b3f3"
+        },
+        {
+          "file": "UD-Q8_K_XL/GLM-5.2-UD-Q8_K_XL-00006-of-00018.gguf",
+          "bytes": 49064013056,
+          "sha256": "b5f863b099cdbb37beb60ea24b1c15e73826410caba6c22068da7b7bb133de21"
+        },
+        {
+          "file": "UD-Q8_K_XL/GLM-5.2-UD-Q8_K_XL-00007-of-00018.gguf",
+          "bytes": 48878106976,
+          "sha256": "c9b96730d5aaed6470478573abdcbae17e5ae021b67486d0d407a971f1077523"
+        },
+        {
+          "file": "UD-Q8_K_XL/GLM-5.2-UD-Q8_K_XL-00008-of-00018.gguf",
+          "bytes": 49057696928,
+          "sha256": "72b77f9c3b3803a7dddfcdb42edb9825db8d01727dad84968ea3685c82bcfe9a"
+        },
+        {
+          "file": "UD-Q8_K_XL/GLM-5.2-UD-Q8_K_XL-00009-of-00018.gguf",
+          "bytes": 49064013056,
+          "sha256": "cdd52037ae1fe4cc19450ae5b50042aeba9b6a254564a4df4db9cfaa63bea9cc"
+        },
+        {
+          "file": "UD-Q8_K_XL/GLM-5.2-UD-Q8_K_XL-00010-of-00018.gguf",
+          "bytes": 48878106976,
+          "sha256": "521cc0a275eaca1fa0458e78476597f9a9ba6ebb0d3cabe842a17eb87e163883"
+        },
+        {
+          "file": "UD-Q8_K_XL/GLM-5.2-UD-Q8_K_XL-00011-of-00018.gguf",
+          "bytes": 49057696928,
+          "sha256": "4510e3634c7b605b3bbbfa2a64768f06ddf8b9b6e764c20a57ecb669c2a6595f"
+        },
+        {
+          "file": "UD-Q8_K_XL/GLM-5.2-UD-Q8_K_XL-00012-of-00018.gguf",
+          "bytes": 49064013056,
+          "sha256": "ef7e143877ef12d9e0c0150c0785c52da1231fa8264290b65f28aab52bb70e6d"
+        },
+        {
+          "file": "UD-Q8_K_XL/GLM-5.2-UD-Q8_K_XL-00013-of-00018.gguf",
+          "bytes": 48878106976,
+          "sha256": "8a262982a8a1fce11849dfe0ba5eae4ade35b4a168ad24ecbafe74db248381ee"
+        },
+        {
+          "file": "UD-Q8_K_XL/GLM-5.2-UD-Q8_K_XL-00014-of-00018.gguf",
+          "bytes": 49057696928,
+          "sha256": "e4029d13861c07c3e8589adf438de25ef3fadad3298822753935bac726175bac"
+        },
+        {
+          "file": "UD-Q8_K_XL/GLM-5.2-UD-Q8_K_XL-00015-of-00018.gguf",
+          "bytes": 49064013056,
+          "sha256": "8db726fbce4fd222ea2c004ecf732eefd37f9ecbc102f7d5def556d8bc94661e"
+        },
+        {
+          "file": "UD-Q8_K_XL/GLM-5.2-UD-Q8_K_XL-00016-of-00018.gguf",
+          "bytes": 48878106976,
+          "sha256": "118aed919ad719ec0cb51cbfa41144b56fc70ea4b2844cf239849e5a952b0cd7"
+        },
+        {
+          "file": "UD-Q8_K_XL/GLM-5.2-UD-Q8_K_XL-00017-of-00018.gguf",
+          "bytes": 48641674240,
+          "sha256": "f78e3bfd679b82de36fce1c1c1f2f8eec3f9a535a70689cdca622cd6d8c0cfad"
+        },
+        {
+          "file": "UD-Q8_K_XL/GLM-5.2-UD-Q8_K_XL-00018-of-00018.gguf",
+          "bytes": 37444678784,
+          "sha256": "e2ea6236af6a13d74788781f436dfc3894d62a436953b4220a9ae9e6e8bf9cc6"
+        }
+      ]
+    },
+    {
+      "quant": "BF16",
+      "layer_weight_bytes": 1507988023008,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "gguf": "BF16/GLM-5.2-BF16-00001-of-00033.gguf",
+      "sha256": "3c5ddaa0fd80caef31d10c1b96ee982e3fb2abd150a3413797a1b37c9de33f11",
+      "revision": "abc55e72527792c6e77069c99b4cb7de16fa9f23",
+      "parts": [
+        {
+          "file": "BF16/GLM-5.2-BF16-00002-of-00033.gguf",
+          "bytes": 45920936416,
+          "sha256": "4fee983cbc0224f06b032694a968e9c1c2b9c00c5977e2a243efdc3d43bf1962"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00003-of-00033.gguf",
+          "bytes": 45996308224,
+          "sha256": "be743351e47c9a084fd065b83fef8969a082ceb0bad5ec12a0e2d5ad01cfda81"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00004-of-00033.gguf",
+          "bytes": 46408197792,
+          "sha256": "40272b7b58ba56c5a49329d0d1dafc0b2eafc77564591db7e699a53fdac87088"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00005-of-00033.gguf",
+          "bytes": 46779392512,
+          "sha256": "0f3449cfe80b651cb3e6277714d1fbd6fc059db53c1841e7ae3a2f0e783e21e3"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00006-of-00033.gguf",
+          "bytes": 45996308224,
+          "sha256": "22d0dbe4dea0dafe413b0d0f9335595a0d9b83cef96b2997dd38ef4c4ba8af6f"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00007-of-00033.gguf",
+          "bytes": 46332826016,
+          "sha256": "1aaf935b5b6a7d336cf203a39fec1a9e8c2fd10a43dfb5d445e4d36b171d35d1"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00008-of-00033.gguf",
+          "bytes": 45996308224,
+          "sha256": "d64c844afd7f638d0d0c83a416e33674f04b286fce0e09bea07aa7b0762e34d0"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00009-of-00033.gguf",
+          "bytes": 45920936416,
+          "sha256": "2a7fd44066c3966b59d2ba8e998b90b3b2f2e8d945f7950ed0f541a55997d4d4"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00010-of-00033.gguf",
+          "bytes": 46408197792,
+          "sha256": "02ffddd2bafb8d801e47ea85513d328b18ed3cbd63acb95d870a85f970c1d1b5"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00011-of-00033.gguf",
+          "bytes": 45920936416,
+          "sha256": "a2773f2fd076592c238f1a4a4af0dc3fbbbb9cb7068749bdc5666d434442e1ac"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00012-of-00033.gguf",
+          "bytes": 45996308224,
+          "sha256": "6de08d8c2f62b343cc7d577951c4d1a98a56e18538fe554252ed504700522985"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00013-of-00033.gguf",
+          "bytes": 46408197792,
+          "sha256": "021621fa0d7d36517f58a18f619ac0a16a45c4f8d362420c804dba82ac6f4359"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00014-of-00033.gguf",
+          "bytes": 45920936416,
+          "sha256": "7f94ca0e339707a248f77aef4ce4cae49536a9fd126ee6e2a926b5aa7369921f"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00015-of-00033.gguf",
+          "bytes": 45920936416,
+          "sha256": "e9a61e362c0814a421c52d701cb7ad5e2759a56e3637d048fa330e54c00e29c0"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00016-of-00033.gguf",
+          "bytes": 46408197792,
+          "sha256": "445af48926edbbe07c50c60aeb6fee7bc61304adfd5465ee51b31ea620b4d43d"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00017-of-00033.gguf",
+          "bytes": 45996308224,
+          "sha256": "ceabd9b63d7ad269853e5157fb184a323e90f312923d3f0fedf7b83659e1de25"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00018-of-00033.gguf",
+          "bytes": 45920936416,
+          "sha256": "e0d1381d089ebf063cb29a71c4280c283e5e5611116311d0ac7b4043d3a61ea7"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00019-of-00033.gguf",
+          "bytes": 46408197760,
+          "sha256": "7f90f958d3da370b6565de794de29d9f51864b1c18ff8f1446339fd6aa04fd70"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00020-of-00033.gguf",
+          "bytes": 45920936416,
+          "sha256": "abf6cb86ad8348c5fc68f9e5b2881756083162833b85635ad8a80bd4c68050c4"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00021-of-00033.gguf",
+          "bytes": 45996308224,
+          "sha256": "3aea56006856790a92268c8151be7d7bd548bd48bdb66d3513a56ead266e096b"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00022-of-00033.gguf",
+          "bytes": 46332826016,
+          "sha256": "ae15732104d3364f71262ceb81965201b682e4192a60182ed09ea18e879f7c96"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00023-of-00033.gguf",
+          "bytes": 45996308192,
+          "sha256": "051b714be1700f458751d64c041b7642232392820ff405802c3d098ed1c1ac8a"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00024-of-00033.gguf",
+          "bytes": 45996308160,
+          "sha256": "447eca36139945c45c7d2f408f8acb99f3f95993febb39252ede639d4457f148"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00025-of-00033.gguf",
+          "bytes": 46408197792,
+          "sha256": "f4b663351f131ee7bae9787ac18de822fa5e975f3a51d42a7bb11bc985bd7ddf"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00026-of-00033.gguf",
+          "bytes": 45920936416,
+          "sha256": "5830fa329f46d3a44ad5d9c0b038a0104b3cb1e47b158f59407747ed7ff7d713"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00027-of-00033.gguf",
+          "bytes": 45996308224,
+          "sha256": "1365a227d9a2f361a6dbdd49d3b2628465d8d6b247b94f3261ce447214a4640e"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00028-of-00033.gguf",
+          "bytes": 46332825984,
+          "sha256": "c1734989ad370ec0d3114302f57720125aed75b7f68c210b6583fc0b9deef740"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00029-of-00033.gguf",
+          "bytes": 45996308224,
+          "sha256": "5467d86c3c3257b4c094e4ae1c4bb428922f88a688ceac6c03e811aaf3dd59c8"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00030-of-00033.gguf",
+          "bytes": 45920936416,
+          "sha256": "91960f9dfce7e81a1d9e42566a816e2c72b6d895f587603ce7f0a8b5d2eb2c2f"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00031-of-00033.gguf",
+          "bytes": 46408197792,
+          "sha256": "0ac1b708f51bcfc995e08f73e4be87170b048c418cbb89807486e9ceef8982ea"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00032-of-00033.gguf",
+          "bytes": 46091143200,
+          "sha256": "3b8b9492eb2b90ebc00de0ab005fa35b07f180f240279d11ef36a34f21619ce0"
+        },
+        {
+          "file": "BF16/GLM-5.2-BF16-00033-of-00033.gguf",
+          "bytes": 33036034336,
+          "sha256": "7ef960fc2b20a6a0e262c0fa68f598dd9f412a36deddc1e133083107b5ffb206"
+        }
+      ]
+    }
+  ]
 }

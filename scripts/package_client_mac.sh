@@ -5,7 +5,7 @@
 # Tauri, sign the updater artifact with the NON-REGENERABLE minisign key, and
 # then verify what actually shipped (sidecars + engine pin inside the mounted
 # dmg, signature against the pubkey compiled into the client). Verification is
-# part of the contract, not a courtesy: a dmg that carries a stale llama-server
+# part of the contract, not a courtesy: a dmg that carries a stale idletoken-server
 # or an unverifiable signature looks identical to a good one from the outside.
 #
 # Usage:  scripts/package_client_mac.sh
@@ -51,7 +51,7 @@ awk '/^\/\* Rax/,/^ \*\/$/' "$ROOT/vendor/ds4/rax.c" > "$LIC/rax-BSD-3-Clause.tx
     || fail "could not extract the rax licence"
 grep -q "Redistribution and use in source and binary forms" "$LIC/rax-BSD-3-Clause.txt" \
     || fail "extracted rax licence does not contain the BSD terms"
-# llama.cpp is MIT and is shipped as the llama-server sidecar.
+# llama.cpp is MIT and is shipped as the idletoken-server sidecar.
 cp -f "$ROOT/vendor/llama.cpp/LICENSE" "$LIC/llamacpp-MIT.txt" \
     || fail "could not stage the llama.cpp licence"
 
@@ -93,19 +93,22 @@ hdiutil attach -readonly -nobrowse -mountpoint "$MNT" "$DMG" >/dev/null \
     || fail "could not mount $DMG"
 trap 'hdiutil detach "$MNT" >/dev/null 2>&1; rmdir "$MNT" 2>/dev/null' EXIT
 MACOS_DIR="$MNT/IdleToken.app/Contents/MacOS"
-# ggml-rpc-server is the other half of the engine: llama-server serves, the rpc
+# idletoken-rpc-server is the other half of the engine: idletoken-server serves, the rpc
 # server is what this machine runs when it joins someone else's cluster. Ship
 # one without the other and the app offers a cluster mode it cannot join.
-for b in idletoken-client idletoken-coord idletoken-worker idletoken-platform-agent llama-server ggml-rpc-server; do
+for b in idletoken-client idletoken-coord idletoken-worker idletoken-platform-agent idletoken-server idletoken-rpc-server; do
     [ -x "$MACOS_DIR/$b" ] || fail "dmg is missing $b in Contents/MacOS (bundler shipped an incomplete app)"
 done
-PIN_SHA=$(awk '{print $2}' "$ROOT/scripts/llamacpp-patches/UPSTREAM")
+PIN_SHA=$(awk 'NR==1{print $2}' "$ROOT/scripts/llamacpp-patches/UPSTREAM")
 [ -n "$PIN_SHA" ] || fail "cannot read the engine pin from scripts/llamacpp-patches/UPSTREAM"
-VERSION_LINE=$("$MACOS_DIR/llama-server" --version 2>&1 | grep -m1 'version:') \
-    || fail "bundled llama-server does not run"
+# The bundled engine carries the PRODUCT name (idletoken-server), not the
+# upstream one — probing llama-server here failed on a file that does not
+# exist and read as "does not run" (rename leftover, caught 2026-08-20).
+VERSION_LINE=$("$MACOS_DIR/idletoken-server" --version 2>&1 | grep -m1 'version:') \
+    || fail "bundled idletoken-server does not run"
 case "$VERSION_LINE" in
-    *"${PIN_SHA:0:7}"*) echo "  bundled llama-server: $VERSION_LINE (matches pin ${PIN_SHA:0:7})" ;;
-    *) fail "bundled llama-server is '$VERSION_LINE', not the pinned ${PIN_SHA:0:7} — a stale engine got staged" ;;
+    *"${PIN_SHA:0:7}"*) echo "  bundled idletoken-server: $VERSION_LINE (matches pin ${PIN_SHA:0:7})" ;;
+    *) fail "bundled idletoken-server is '$VERSION_LINE', not the pinned ${PIN_SHA:0:7} — a stale engine got staged" ;;
 esac
 for r in LICENSE.txt NOTICE.txt ds4-MIT.txt rax-BSD-3-Clause.txt llamacpp-MIT.txt; do
     [ -f "$MNT/IdleToken.app/Contents/Resources/licenses/$r" ] \

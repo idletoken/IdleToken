@@ -326,6 +326,15 @@ def calibrate(client, model, target_pp, nonce_fn, verbose=True, filler=FILLER):
 # but us for the duration
 # ---------------------------------------------------------------------------
 
+# Cold-cache allowance, in prompt tokens. The chat template's leading tokens are
+# shared by every request no matter what the nonce does, so the floor is "a few
+# tokens per request"; the share cap keeps that from scaling into something that
+# could hide a real hit on a long prompt. Both are deliberately tiny: a genuine
+# prefix hit reuses most of the prompt, not 0.4% of it.
+COLD_CACHE_TEMPLATE_TOKENS = 8
+COLD_CACHE_MAX_SHARE = 0.005
+
+
 def snapshot(client):
     return client.get_json("/idletoken/v1/stats")
 
@@ -343,17 +352,40 @@ def check_env(before, after, expected_requests, cold_cache, strict):
          measuring cache hit rate rather than compute.
     """
     problems = []
+    notes = []
     d_req = after.get("requests", 0) - before.get("requests", 0)
     if d_req != expected_requests:
         problems.append(
             f"the cluster served {d_req} requests during this run while we sent only {expected_requests}"
             f" -- something else is using this cluster, so this round's numbers are not trustworthy")
     d_hit = after.get("cache_hits", 0) - before.get("cache_hits", 0)
+    d_cached = after.get("cached_tokens", 0) - before.get("cached_tokens", 0)
+    d_in = after.get("input_tokens", 0) - before.get("input_tokens", 0)
     if cold_cache:
-        if d_hit != 0:
+        # Count TOKENS, not hits. A hit count cannot tell two tokens from two
+        # thousand, and there is a floor no nonce can get under: the chat
+        # template's leading tokens are identical in every request by
+        # construction, so once the engine has KV room it reports a "hit" of a
+        # few tokens on every single one. Measured 2026-08-19 on the pinned
+        # engine: 2 of 513 prompt tokens, i.e. 0.4% of the prefill skipped --
+        # while a hit that really replaces the work reuses most of the prompt.
+        # Counting hits made those two tokens indistinguishable from measuring
+        # the cache, and voided every calibration run on both machines.
+        allowance = max(COLD_CACHE_TEMPLATE_TOKENS * max(expected_requests, 1),
+                        int(d_in * COLD_CACHE_MAX_SHARE))
+        share = (100.0 * d_cached / d_in) if d_in else 0.0
+        if d_cached > allowance:
             problems.append(
-                f"{d_hit} KV prefix hits occurred in cold-cache mode"
+                f"{d_hit} KV prefix hits reused {d_cached} of {d_in} prompt tokens ({share:.1f}%)"
+                f" in cold-cache mode, over the {allowance}-token chat-template allowance"
                 f" -- this measures the cache rather than compute (is the nonce not working?)")
+        elif d_hit:
+            # Never silent: a tolerated reuse is still a reuse, and the person
+            # reading the number is entitled to know it was there and how big.
+            notes.append(
+                f"{d_hit} KV prefix hits reused {d_cached}/{d_in} prompt tokens ({share:.2f}%),"
+                f" within the {allowance}-token chat-template allowance"
+                f" -- the prefill measurement stands")
     else:
         # --warm-cache is the mirror image: zero hits means this case is **not
         # exercising the cache path at all**, and the numbers it reports would be
@@ -369,6 +401,8 @@ def check_env(before, after, expected_requests, cold_cache, strict):
                 "--warm-cache produced zero KV prefix hits -- the cache path was never exercised. "
                 "KV reuse is a **multi-turn continuation** cache (the new prompt must strictly extend "
                 "the previous turn's history), not a same-prompt replay cache")
+    for note in notes:
+        print("    (env gate: " + note + ")", file=sys.stderr)
     if problems:
         # The gate is evaluated after the case has run, so the numbers are already
         # on screen. It must say explicitly that they are void -- otherwise the
@@ -421,7 +455,7 @@ CONTINUE_TURN = "Please continue."
 
 
 def run_batch(base_url, api_token, model, prompt_maker, tg, concurrency,
-              barrier_wait=True, warm_cache=False):
+              barrier_wait=True, warm_cache=False, ignore_eos=False):
     """Send `concurrency` requests concurrently and return a sample for each.
 
     The crux of concurrency is here: **establish every connection first, then
@@ -465,6 +499,11 @@ def run_batch(base_url, api_token, model, prompt_maker, tg, concurrency,
                 clients[i].close()
                 clients[i].connect()
             payload = {"model": model, "messages": msgs, "max_tokens": tg}
+            if ignore_eos:
+                # The coordinator passes the client's JSON through to the engine
+                # (llama_openai_upstream_body: "so sampling parameters survive"),
+                # so this reaches llama-server unmodified.
+                payload["ignore_eos"] = True
             results[i] = derive(stream_request(clients[i], payload, barrier))
         except BaseException as e:          # noqa: BLE001 -- the barrier raises BrokenBarrierError
             errors[i] = e
@@ -516,9 +555,12 @@ def summarize(samples, tg):
             warns.append(f"generation throughput spread {spread*100:.0f}% > {SPREAD_WARN*100:.0f}%"
                          f" ({min(gen):.2f}-{max(gen):.2f} tok/s) -- the environment is not clean; do not draw conclusions from this")
 
-    # Differing output lengths mean two runs did not measure the same thing. The
-    # engine has no ignore_eos yet, so all we can do here is **detect it and say
-    # so**, not enforce it. (Adding ignore_eos is a small engine-side change.)
+    # Differing output lengths mean two runs did not measure the same thing.
+    # --ignore-eos prevents it at the source; this stays as the detector for runs
+    # that do not use it. (The comment here used to say the engine had no
+    # ignore_eos. It does, and the coordinator passes it through untouched --
+    # measured 2026-08-19 on the pinned engine: the same prompt returned 11
+    # tokens/finish_reason=stop without the field and exactly 200/length with it.)
     if len(set(out)) > 1:
         warns.append(f"output lengths differ across runs {sorted(set(out))} -- throughputs at different lengths are not directly comparable")
     short = [s for s in samples if s["finish_reason"] == "stop"]
@@ -571,6 +613,17 @@ def main():
                          "cold cache by default")
     ap.add_argument("--prompt-file",
                     help="repeat this UTF-8 corpus instead of the default English filler; used by versioned pricing workloads")
+    # Decode throughput is tokens per second, and a run that stopped at 113 of
+    # 256 tokens because the model had said its piece measures a different thing
+    # than one that ran to the limit -- the lengths are not comparable and the
+    # gate says so. Asking the engine to keep going makes every run the same
+    # length by construction. This is what a cost-per-1K-output-tokens number
+    # needs: the price of producing the tokens, not the model's inclination to
+    # stop. Off by default: it is a measurement instrument, not how anyone
+    # serves real traffic.
+    ap.add_argument("--ignore-eos", action="store_true",
+                    help="ask the engine to keep generating past EOS, so every run "
+                         "produces exactly --tg tokens")
     ap.add_argument("--no-strict", dest="strict", action="store_false",
                     help="warn instead of exiting when the environment gate fails")
     ap.add_argument("--json", dest="json_out", help="write the full result (environment snapshots included) to a file")
@@ -635,7 +688,8 @@ def main():
 
         def batch(conc):
             return run_batch(args.base_url, args.api_token, args.model, prompt_maker,
-                             tg, conc, warm_cache=args.warm_cache)
+                             tg, conc, warm_cache=args.warm_cache,
+                             ignore_eos=args.ignore_eos)
 
         run_sent = 0
         for _ in range(args.warmup):

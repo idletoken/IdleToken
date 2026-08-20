@@ -7,6 +7,7 @@
  */
 #include "idletoken_model_auto.h"
 #include "idletoken_gguf.h"
+#include "idletoken_modelsize.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,25 +25,11 @@ static const char *path_basename(const char *path) {
     return b;
 }
 
-/* "-00001-of-00004.gguf" style multi-file naming (llama.cpp split convention).
- * Detected from the NAME so the error can also fire on part 2..N, whose header
- * parses fine but whose tensors are elsewhere. */
-static int looks_like_split_name(const char *base) {
-    const char *dot = strrchr(base, '.');
-    if (!dot || strcmp(dot, ".gguf") != 0) return 0;
-    /* expect ...-NNNNN-of-NNNNN.gguf */
-    const char *p = dot;                     /* points at ".gguf" */
-    int digits = 0;
-    const char *q = p;
-    while (q > base && q[-1] >= '0' && q[-1] <= '9') { q--; digits++; }
-    if (digits != 5) return 0;
-    if (q - base < 4 || strncmp(q - 4, "-of-", 4) != 0) return 0;
-    q -= 4;
-    digits = 0;
-    while (q > base && q[-1] >= '0' && q[-1] <= '9') { q--; digits++; }
-    if (digits != 5) return 0;
-    return q > base && q[-1] == '-';
-}
+/* The "-NNNNN-of-NNNNN.gguf" convention and the on-disk size (parts summed)
+ * both live in modelsize.c now — the scheduler's budget needs the same two
+ * answers, and two copies of "how big is this model" is precisely the drift
+ * that made T8 necessary. */
+#define split_name_parts idletoken_gguf_split_parts
 
 /* Lowercase + keep [a-z0-9._], everything else collapses to a single '-'.
  * Result never empty (falls back to "model") and never starts/ends with '-'. */
@@ -176,12 +163,14 @@ int idletoken_model_from_gguf(const char *path, idletoken_auto_model *out,
     const char *base = path_basename(path);
     snprintf(out->gguf_name, sizeof(out->gguf_name), "%s", base);
 
-    struct stat st;
-    if (stat(path, &st) != 0 || st.st_size <= 0) {
-        if (err && errlen) snprintf(err, errlen, "cannot stat %s", path);
+    /* Whole-set size: a split GGUF is summed over its parts here, so the split
+     * handling below only has to police "is this part 1" and the metadata. */
+    char serr[512] = "";
+    out->file_bytes = idletoken_gguf_bytes_on_disk(path, serr, sizeof(serr));
+    if (out->file_bytes == 0) {
+        if (err && errlen) snprintf(err, errlen, "%s", serr);
         return -1;
     }
-    out->file_bytes = (uint64_t)st.st_size;
 
     char merr[256] = "";
     idletoken_gguf_meta *m = idletoken_gguf_meta_open(path, merr, sizeof(merr));
@@ -190,15 +179,26 @@ int idletoken_model_from_gguf(const char *path, idletoken_auto_model *out,
         return -1;
     }
 
-    /* Split (multi-file) GGUFs: refuse with instructions, both by filename
-     * convention and by the split.count metadata (either alone can be absent —
-     * renamed part files keep the KV, merged-then-renamed files keep neither). */
+    /* Split (multi-file) GGUFs. Supported since 2026-08-16: EVERY model past
+     * ~50 GB ships split on HF, i.e. exactly the models whose size the
+     * scheduler most needs to measure, and llama.cpp loads them natively by
+     * finding the siblings by name.
+     *
+     * The part-1 check and the whole-set sum are idletoken_gguf_bytes_on_disk's
+     * job (it already ran, above). What is left here is the case only the
+     * header can see: metadata that says "split" on a file whose NAME does not,
+     * which is what a renamed part looks like — nothing can find its siblings,
+     * so the size above is one part's worth and saying so beats guessing. */
     uint32_t split_count = 0;
     (void)idletoken_gguf_meta_u32(m, "split.count", &split_count);
-    if (split_count > 1 || looks_like_split_name(base))
-        FAILF("%s is one part of a multi-file (split) GGUF; loading split models "
-              "is not supported yet. Merge it first (llama-gguf-split --merge) "
-              "and point at the single merged .gguf file.", base);
+    unsigned part_idx = 0, part_total = 0;
+    const int split_by_name = split_name_parts(base, &part_idx, &part_total);
+    (void)part_idx; (void)part_total;
+    if (split_count > 1 && !split_by_name)
+        FAILF("%s says it is part of a %u-part split GGUF but its name does not "
+              "follow the -00001-of-%05u.gguf convention, so its siblings cannot "
+              "be found; restore the original filenames.",
+              base, split_count, split_count);
 
     if (idletoken_gguf_meta_str(m, "general.architecture",
                                 out->arch, sizeof(out->arch)) != 0)
@@ -238,6 +238,15 @@ int idletoken_model_from_gguf(const char *path, idletoken_auto_model *out,
     }
 
     out->kv_bytes_per_token = kv_bytes_per_token(m, out->arch, n_layers, n_embd);
+
+    /* MoE shape. Absent on a dense model, and absence must stay 0/0 — the
+     * working-set estimate reads that as "every byte is hot", which is the
+     * conservative reading. */
+    {
+        uint32_t ec = 0, eu = 0;
+        if (arch_u32(m, out->arch, "expert_count", &ec) == 0)      out->n_expert = ec;
+        if (arch_u32(m, out->arch, "expert_used_count", &eu) == 0) out->n_expert_used = eu;
+    }
 
     uint64_t layer_b = 0, shared_b = 0;
     const uint64_t data_off = idletoken_gguf_data_offset(m);

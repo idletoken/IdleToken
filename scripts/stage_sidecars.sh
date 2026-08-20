@@ -31,12 +31,35 @@ TRIPLE=$(rustc -vV | awk '/^host:/{print $2}')
 
 mkdir -p client/src-tauri/binaries
 
+# SHA-256 of a file, bare hex. macOS ships shasum, Linux sha256sum, and a
+# Windows git-bash may have either — try all three rather than assume.
+sha256_of() {
+    if command -v shasum >/dev/null 2>&1;    then shasum -a 256 "$1" | awk '{print $1}'
+    elif command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+    elif command -v openssl >/dev/null 2>&1;   then openssl dgst -sha256 "$1" | awk '{print $NF}'
+    else return 1
+    fi
+}
+
 stage() {  # stage <src> <sidecar-name>
     [ -x "$1" ] || fail "missing engine binary $1 (build it first: make all / make -f Makefile.platform)"
-    cp -f "$1" "client/src-tauri/binaries/$2-$TRIPLE" || fail "could not stage $2"
+    dst="client/src-tauri/binaries/$2-$TRIPLE"
+    cp -f "$1" "$dst" || fail "could not stage $2"
+    # Record what these bytes are, beside them. In shared mode the coordinator
+    # compares the engine against this before it will take other people's work
+    # (docs/shared-mode-plan-2026-08.md P0-3) — a provider who swaps in a
+    # self-built engine that logs prompts stops being dispatched to. Written
+    # for EVERY sidecar, not just the engine: the file costs nothing, and a
+    # rule with exceptions is a rule someone forgets to extend.
+    #
+    # `shasum -a 256` format on purpose, so a provider can reproduce the
+    # number with one command instead of trusting our word for it.
+    h=$(sha256_of "$dst") || fail "no sha256 tool (shasum/sha256sum/openssl) — the shared-mode integrity check has nothing to compare against"
+    printf '%s  %s\n' "$h" "$2-$TRIPLE" > "$dst.sha256"
     # Print the mtime: the whole class of bug this script exists for is
     # invisible unless you look at dates.
-    printf '  staged %-22s <- %s  (%s)\n' "$2" "$1" "$(date -r "$1" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?')"
+    printf '  staged %-22s <- %s  (%s)  %s\n' "$2" "$1" \
+        "$(date -r "$1" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?')" "${h%"${h#??????????}"}…"
 }
 
 stage "$ROOT/idletoken-worker" idletoken-worker
@@ -51,10 +74,15 @@ stage "$ROOT/idletoken-coord"  idletoken-coord
 # exists to prevent.
 LLAMA_SERVER="$ROOT/vendor/llama.cpp/build/bin/llama-server"
 [ -x "$LLAMA_SERVER" ] || fail "missing engine binary $LLAMA_SERVER — build the pinned llama.cpp first: scripts/build_llamacpp.sh (Windows: scripts\\build_llamacpp_win.bat)"
-stage "$LLAMA_SERVER" llama-server
+# Staged under OUR name (2026-08-15): upstream builds "llama-server", but what
+# a user sees in Task Manager, in a firewall prompt or in a crash dialog must
+# say IdleToken — "llama-server.exe wants network access" reads as though some
+# other product installed itself. The binary is unchanged; only the file name
+# is ours, which the MIT licence allows (attribution stays in About + NOTICE).
+stage "$LLAMA_SERVER" idletoken-server
 GGML_RPC_SERVER="$ROOT/vendor/llama.cpp/build/bin/ggml-rpc-server"
 [ -x "$GGML_RPC_SERVER" ] || fail "missing cluster engine binary $GGML_RPC_SERVER — build the pinned llama.cpp with GGML_RPC=ON"
-stage "$GGML_RPC_SERVER" ggml-rpc-server
+stage "$GGML_RPC_SERVER" idletoken-rpc-server
 # The agent lives under build/ when made via Makefile.platform; accept either.
 if [ -x "$ROOT/build/idletoken-platform-agent" ]; then
     stage "$ROOT/build/idletoken-platform-agent" idletoken-platform-agent
@@ -76,20 +104,26 @@ fi
 # Staging binaries/ alone did NOT fix it — the first fix aimed at the wrong
 # directory, which is exactly why both are done here now.
 DBG="client/src-tauri/target/debug"
+stage_dbg() {   # stage_dbg <src> <name-next-to-the-debug-exe>
+    cp -f "$1" "$DBG/$2" || fail "could not stage $2 into $DBG"
+    h=$(sha256_of "$DBG/$2") || fail "no sha256 tool for $2"
+    printf '%s  %s\n' "$h" "$2" > "$DBG/$2.sha256"
+    printf '  staged %-22s -> %s\n' "$2" "$DBG/"
+}
 if [ -d "$DBG" ]; then
     for b in idletoken-worker idletoken-coord; do
-        cp -f "$ROOT/$b" "$DBG/$b" || fail "could not stage $b into $DBG"
-        printf '  staged %-22s -> %s\n' "$b" "$DBG/"
+        stage_dbg "$ROOT/$b" "$b"
     done
-    # The debug client resolves llama-server next to itself too (engine.rs
-    # llamacpp_serve). Same hard-failure rule as above.
-    cp -f "$LLAMA_SERVER" "$DBG/llama-server" || fail "could not stage llama-server into $DBG"
-    printf '  staged %-22s -> %s\n' llama-server "$DBG/"
-    cp -f "$GGML_RPC_SERVER" "$DBG/ggml-rpc-server" || fail "could not stage ggml-rpc-server into $DBG"
-    printf '  staged %-22s -> %s\n' ggml-rpc-server "$DBG/"
+    # The debug client resolves the engine next to itself too (engine.rs
+    # llama_server_bin / llama_engine_dir), under OUR names — the same ones the
+    # bundler ships. They used to land here as llama-server / ggml-rpc-server,
+    # which the 2026-08-15 rename left behind: the lookup went new-name-only and
+    # a debug client could no longer find an engine that was sitting right
+    # there. Same hard-failure rule as above.
+    stage_dbg "$LLAMA_SERVER" idletoken-server
+    stage_dbg "$GGML_RPC_SERVER" idletoken-rpc-server
     if [ -x "$ROOT/build/idletoken-platform-agent" ]; then
-        cp -f "$ROOT/build/idletoken-platform-agent" "$DBG/idletoken-platform-agent" || true
-        printf '  staged %-22s -> %s\n' idletoken-platform-agent "$DBG/"
+        stage_dbg "$ROOT/build/idletoken-platform-agent" idletoken-platform-agent
     fi
 else
     echo "  note: no $DBG yet (debug client never built here) — skipping"

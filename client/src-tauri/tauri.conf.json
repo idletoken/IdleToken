@@ -44,8 +44,8 @@
       "binaries/idletoken-worker",
       "binaries/idletoken-coord",
       "binaries/idletoken-platform-agent",
-      "binaries/llama-server",
-      "binaries/ggml-rpc-server"
+      "binaries/idletoken-server",
+      "binaries/idletoken-rpc-server"
     ],
     "resources": [
       "licenses/*"

@@ -34,8 +34,8 @@ echo "target triple: $TRIPLE"
 # --- stage engine sidecars ------------------------------------------------
 # scripts/stage_sidecars.sh is the single source of truth for what a client
 # ships (coord, worker, platform-agent, and — since the v2 llama.cpp pivot —
-# the pinned llama-server + ggml-rpc-server). This script used to carry its own copy of the
-# staging and it drifted: it kept shipping bundles without llama-server after
+# the pinned idletoken-server + idletoken-rpc-server). This script used to carry its own copy of the
+# staging and it drifted: it kept shipping bundles without idletoken-server after
 # stage_sidecars.sh already required it.
 out=$(scripts/stage_sidecars.sh) || { echo "$out"; fail "sidecar staging failed"; }
 echo "$out" | sed 's/^/  /'
@@ -60,7 +60,7 @@ awk '/^\/\* Rax/,/^ \*\/$/' "$ROOT/vendor/ds4/rax.c" > "$LIC/rax-BSD-3-Clause.tx
     || fail "could not extract the rax licence"
 grep -q "Redistribution and use in source and binary forms" "$LIC/rax-BSD-3-Clause.txt" \
     || fail "extracted rax licence does not contain the BSD terms (rax.c header changed shape)"
-# llama.cpp is MIT and is shipped as the llama-server sidecar (v2 pivot).
+# llama.cpp is MIT and is shipped as the idletoken-server sidecar (v2 pivot).
 cp -f "$ROOT/vendor/llama.cpp/LICENSE" "$LIC/llamacpp-MIT.txt" \
     || fail "could not stage the llama.cpp licence"
 echo "  staged licences -> $LIC"
@@ -145,21 +145,21 @@ for f in $SIGS; do
 done
 
 # --- verify: the engine inside the newest .deb is the pinned llama.cpp ------
-# The whole point of the bundle is the engine it carries; a stale llama-server
+# The whole point of the bundle is the engine it carries; a stale idletoken-server
 # in the package is invisible to every gate that drives the repo binaries.
 NEWEST_DEB=$(ls -t "$BDIR"/deb/*.deb 2>/dev/null | head -1)
 if [ -n "$NEWEST_DEB" ]; then
-    PIN_SHA=$(awk '{print $2}' "$ROOT/scripts/llamacpp-patches/UPSTREAM")
+    PIN_SHA=$(awk 'NR==1{print $2}' "$ROOT/scripts/llamacpp-patches/UPSTREAM")
     [ -n "$PIN_SHA" ] || fail "cannot read the engine pin from scripts/llamacpp-patches/UPSTREAM"
     XTMP=$(mktemp -d /tmp/idletoken-deb-verify.XXXXXX)
     dpkg-deb -x "$NEWEST_DEB" "$XTMP" || { rm -rf "$XTMP"; fail "could not extract $NEWEST_DEB"; }
-    DEB_LS=$(find "$XTMP" -type f -name 'llama-server' | head -1)
-    [ -n "$DEB_LS" ] || { rm -rf "$XTMP"; fail "the .deb does not contain llama-server (bundler shipped an incomplete app)"; }
+    DEB_LS=$(find "$XTMP" -type f -name 'idletoken-server' | head -1)
+    [ -n "$DEB_LS" ] || { rm -rf "$XTMP"; fail "the .deb does not contain idletoken-server (bundler shipped an incomplete app)"; }
     VERSION_LINE=$("$DEB_LS" --version 2>&1 | grep -m1 'version:') \
-        || { rm -rf "$XTMP"; fail "llama-server inside the .deb does not run"; }
+        || { rm -rf "$XTMP"; fail "idletoken-server inside the .deb does not run"; }
     case "$VERSION_LINE" in
         *"${PIN_SHA:0:7}"*) echo "deb engine check: $VERSION_LINE (matches pin ${PIN_SHA:0:7})" ;;
-        *) rm -rf "$XTMP"; fail "llama-server inside the .deb is '$VERSION_LINE', not the pinned ${PIN_SHA:0:7} — a stale engine got staged" ;;
+        *) rm -rf "$XTMP"; fail "idletoken-server inside the .deb is '$VERSION_LINE', not the pinned ${PIN_SHA:0:7} — a stale engine got staged" ;;
     esac
     for b in idletoken-coord idletoken-worker idletoken-platform-agent; do
         [ -n "$(find "$XTMP" -type f -name "$b" | head -1)" ] \

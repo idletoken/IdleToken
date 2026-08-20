@@ -39,6 +39,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter};
 
 /// Default endpoint order: the origin first, then the mirror. **Probe, do not
@@ -90,6 +91,10 @@ pub struct WeightsState {
     complete: bool,
     /// Bytes already on disk (from the complete file or the .part, whichever exists).
     have_bytes: u64,
+    /// The file has passed the SHA-256 gate against the hash the caller expects
+    /// (or no hash is expected — an unpinned manifest has nothing to verify).
+    /// `complete && !verified` means: run `weights_verify` before serving.
+    verified: bool,
 }
 
 /// Where to download when the user has not set a directory in settings.
@@ -138,7 +143,12 @@ pub fn weights_default_dir() -> String {
 // instance one copied in half-finished from elsewhere.
 /// Downloads nothing; only answers "how far along is this file on this machine".
 #[tauri::command]
-pub fn weights_state(dest_dir: String, file: String, expect_bytes: u64) -> WeightsState {
+pub fn weights_state(
+    dest_dir: String,
+    file: String,
+    expect_bytes: u64,
+    expect_sha256: String,
+) -> WeightsState {
     let final_path = PathBuf::from(&dest_dir).join(&file);
     let part_path = part_of(&final_path);
     let final_len = fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
@@ -149,10 +159,19 @@ pub fn weights_state(dest_dir: String, file: String, expect_bytes: u64) -> Weigh
     // expect_bytes==0 means the manifest does not state it, and then "it exists,
     // so it is complete" is the best judgment we can offer.
     let complete = part_len == 0 && final_len > 0 && (expect_bytes == 0 || final_len >= expect_bytes);
+    // Cheap check only — this command must stay instant, so it consults the
+    // marker written by a past verification, never the file contents. A
+    // complete-but-unverified file is the caller's cue to run weights_verify.
+    let verified = complete
+        && (expect_sha256.is_empty()
+            || fs::read_to_string(marker_of(&final_path))
+                .map(|m| m.trim().eq_ignore_ascii_case(&expect_sha256))
+                .unwrap_or(false));
     WeightsState {
         path: final_path.to_string_lossy().into_owned(),
         complete,
         have_bytes: if final_len > 0 { final_len } else { part_len },
+        verified,
     }
 }
 
@@ -174,6 +193,120 @@ fn part_of(final_path: &Path) -> PathBuf {
     let mut s = final_path.as_os_str().to_os_string();
     s.push(".part");
     PathBuf::from(s)
+}
+
+/// Sidecar recording the SHA-256 this exact file was verified against, so the
+/// serve path does not have to re-hash tens of gigabytes on every startup.
+/// The marker is written only after a full hash matched the manifest; deleting
+/// it costs nothing but a one-time re-verification.
+fn marker_of(final_path: &Path) -> PathBuf {
+    let mut s = final_path.as_os_str().to_os_string();
+    s.push(".sha256");
+    PathBuf::from(s)
+}
+
+/// Stream a file through SHA-256 with progress events and cancellation.
+/// Hashing an 80 GiB model takes minutes; doing it silently looks like a hang.
+fn file_sha256(
+    path: &Path,
+    id: &str,
+    cancel: &AtomicBool,
+    emit: &dyn Fn(serde_json::Value),
+) -> Result<String, String> {
+    let total = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let mut f = fs::File::open(path)
+        .map_err(|e| format!("cannot open {} for verification: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20]; // 1 MiB, same unit as the download loop
+    let mut done = 0u64;
+    let mut last_emit = Instant::now();
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("verification cancelled".into());
+        }
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| format!("read failed while verifying {}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        done += n as u64;
+        if last_emit.elapsed() >= Duration::from_millis(400) {
+            emit(serde_json::json!({
+                "id": id, "kind": "progress",
+                // "[CODE] detail" — localized by the UI (ERROR_KEYS in i18n.ts).
+                "note": "[WEIGHTS_VERIFYING] checking the file hash against the manifest",
+                "have": done, "total": total
+            }));
+            last_emit = Instant::now();
+        }
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// The single gate between "bytes on disk" and "a file this client will serve":
+/// when the manifest pins a hash, nothing is promoted to the final name without
+/// matching it. A mismatch deletes the bytes — a file that is provably not the
+/// curated model has no legitimate next use, and keeping it around is how a
+/// corrupt download gets served "just to check something" (decision 2026-08-15:
+/// fail red, no automatic retry; recovery is a fresh download).
+fn promote_verified(
+    part_path: &Path,
+    final_path: &Path,
+    expect_sha256: &str,
+    id: &str,
+    cancel: &AtomicBool,
+    emit: &dyn Fn(serde_json::Value),
+) -> Result<(), String> {
+    if !expect_sha256.is_empty() {
+        let got = file_sha256(part_path, id, cancel, emit)?;
+        if !got.eq_ignore_ascii_case(expect_sha256) {
+            let _ = fs::remove_file(part_path);
+            return Err(format!(
+                "[WEIGHTS_SHA256_MISMATCH] the downloaded file does not match the curated model (got {got}, manifest says {expect_sha256}). The file was deleted; download it again."
+            ));
+        }
+    }
+    fs::rename(part_path, final_path)
+        .map_err(|e| format!("rename failed for {}: {e}", final_path.display()))?;
+    if !expect_sha256.is_empty() {
+        // Best effort: a missing marker only costs a one-time re-verification.
+        let _ = fs::write(marker_of(final_path), format!("{expect_sha256}\n"));
+    }
+    Ok(())
+}
+
+/// Verify an already-promoted file (downloaded by an older client or by
+/// `model_fetch.sh`, which never passes through the promotion gate). Fast path
+/// is the marker; the full hash runs once and leaves one behind.
+fn ensure_final_verified(
+    final_path: &Path,
+    expect_sha256: &str,
+    id: &str,
+    cancel: &AtomicBool,
+    emit: &dyn Fn(serde_json::Value),
+) -> Result<(), String> {
+    if expect_sha256.is_empty() {
+        return Ok(());
+    }
+    let marker = marker_of(final_path);
+    if let Ok(m) = fs::read_to_string(&marker) {
+        if m.trim().eq_ignore_ascii_case(expect_sha256) {
+            return Ok(());
+        }
+        // Marker from another manifest revision: stale, re-verify in full.
+    }
+    let got = file_sha256(final_path, id, cancel, emit)?;
+    if !got.eq_ignore_ascii_case(expect_sha256) {
+        let _ = fs::remove_file(final_path);
+        let _ = fs::remove_file(&marker);
+        return Err(format!(
+            "[WEIGHTS_SHA256_MISMATCH] the file on disk does not match the curated model (got {got}, manifest says {expect_sha256}). The file was deleted; download it again."
+        ));
+    }
+    let _ = fs::write(&marker, format!("{expect_sha256}\n"));
+    Ok(())
 }
 
 /// One weight file sitting in the model folder.
@@ -237,6 +370,9 @@ pub fn weights_delete(dest_dir: String, file: String) -> Result<u64, String> {
     }
     let final_path = PathBuf::from(&dest_dir).join(&file);
     let part_path = part_of(&final_path);
+    // The verification marker goes with its file; an orphaned marker would
+    // bless a future download it never saw.
+    let _ = fs::remove_file(marker_of(&final_path));
     let mut freed = 0u64;
     let mut errs: Vec<String> = Vec::new();
     for p in [final_path, part_path] {
@@ -261,6 +397,14 @@ pub fn weights_delete(dest_dir: String, file: String) -> Result<u64, String> {
 /// An empty `endpoints` uses the default order; a non-empty one uses **only what
 /// was given** (mirroring the script's `HF_ENDPOINT`: when the user names an
 /// endpoint, do not go trying others behind their back).
+/// `parts` carries a split GGUF's extra files (2026-08-15), in order, each with
+/// its own pinned hash; empty means a single-file model — the one-part case of
+/// the same loop. The parts are fetched one after another rather than in
+/// parallel: the bottleneck is the link, not the server, and N concurrent
+/// streams would turn one resumable transfer into N racing ones, with N times
+/// the ways to leave half-written files behind. llama.cpp opens part 1 and
+/// finds the rest by name in the same directory, so all that matters is that
+/// every part lands complete and verified.
 #[tauri::command]
 pub async fn weights_fetch(
     app: AppHandle,
@@ -269,7 +413,10 @@ pub async fn weights_fetch(
     file: String,
     dest_dir: String,
     expect_bytes: u64,
+    expect_sha256: String,
+    revision: String,
     endpoints: Vec<String>,
+    parts: Vec<SplitPart>,
 ) -> Result<(), String> {
     // One download per id, enforced here. `register` used to just drop the old
     // entry and keep going, so a second call left the first task running —
@@ -297,12 +444,69 @@ pub async fn weights_fetch(
     let id2 = id.clone();
     let cancel_probe = cancel.clone();
     let r = tauri::async_runtime::spawn_blocking(move || {
-        let emit = |v: serde_json::Value| {
+        let raw_emit = move |v: serde_json::Value| {
             let _ = app.emit("weights-fetch", v);
         };
-        let out = fetch_inner(
-            &id2, &repo, &file, &dest_dir, expect_bytes, &endpoints, &cancel, &emit,
-        );
+        // One transfer per part, but ONE progress story for the whole model:
+        // the row must show "412 GB of 434 GB", not part 7 restarting at zero
+        // eleven times. Each part's `have`/`total` is offset by the bytes the
+        // finished parts already contributed; everything else passes through.
+        let all: Vec<(String, u64, String)> = std::iter::once((
+            file.clone(),
+            expect_bytes,
+            expect_sha256.clone(),
+        ))
+        .chain(parts.iter().map(|p| (p.file.clone(), p.bytes, p.sha256.clone())))
+        .collect();
+        // The denominator is the sum of what the manifest declares. A part with
+        // an unknown size contributes its server-reported length once it starts,
+        // so the total can only get more accurate, never wrong-and-stuck.
+        let declared_total: u64 = all.iter().map(|(_, b, _)| *b).sum();
+        let done_before = std::sync::Arc::new(Mutex::new(0u64));
+        let mut out: Result<String, String> = Err("no parts to download".into());
+        for (idx, (pfile, pbytes, psha)) in all.iter().enumerate() {
+            let base = *done_before.lock().unwrap();
+            let emit = |mut v: serde_json::Value| {
+                if let Some(o) = v.as_object_mut() {
+                    if let Some(h) = o.get("have").and_then(|x| x.as_u64()) {
+                        o.insert("have".into(), (base + h).into());
+                    }
+                    if declared_total > 0 {
+                        o.insert("total".into(), declared_total.into());
+                    }
+                    if all.len() > 1 {
+                        o.insert("part".into(), (idx as u64 + 1).into());
+                        o.insert("parts".into(), (all.len() as u64).into());
+                    }
+                }
+                raw_emit(v);
+            };
+            out = fetch_inner(
+                &id2, &repo, pfile, &dest_dir, *pbytes, psha, &revision, &endpoints,
+                &cancel, &emit,
+            );
+            match &out {
+                // Only the FIRST part's path is reported as the result: that is
+                // the file the engine is handed, and llama.cpp finds the rest by
+                // name in the same directory.
+                Ok(_) => {
+                    let landed = fs::metadata(PathBuf::from(&dest_dir).join(pfile))
+                        .map(|m| m.len())
+                        .unwrap_or(*pbytes);
+                    *done_before.lock().unwrap() = base + landed;
+                }
+                // A failed part stops the whole model: the parts already on disk
+                // are kept, so pressing Download again resumes at this one.
+                Err(_) => break,
+            }
+        }
+        let out = out.map(|_| {
+            PathBuf::from(&dest_dir)
+                .join(&file)
+                .to_string_lossy()
+                .into_owned()
+        });
+        let emit = raw_emit;
         match &out {
             Ok(path) => emit(serde_json::json!({
                 "id": id2, "kind": "done", "path": path
@@ -328,6 +532,19 @@ pub async fn weights_fetch(
         Ok(inner) => inner,
         Err(e) => Err(format!("download task exited abnormally: {e}")),
     }
+}
+
+/// One extra file of a split GGUF (`*-00002-of-00006.gguf` and friends).
+#[derive(Clone, serde::Deserialize)]
+pub struct SplitPart {
+    pub file: String,
+    /// Tensor bytes this part is expected to carry; 0 = unknown, the server's
+    /// length then decides (same rule as `expect_bytes`).
+    #[serde(default)]
+    pub bytes: u64,
+    /// SHA-256 for this part. "" = unpinned; the gate then has nothing to check.
+    #[serde(default)]
+    pub sha256: String,
 }
 
 /// The result of probing one endpoint.
@@ -361,8 +578,14 @@ enum ProbeFail {
 /// CDN, and some CDNs answer HEAD with 405. Asking for the first byte works on
 /// both, and the total length can be read from `Content-Range`. (This matches
 /// model_fetch.sh, whose comments give the same reason.)
-fn probe_one(c: &reqwest::blocking::Client, ep: &str, repo: &str, file: &str) -> Result<u64, ProbeFail> {
-    let url = format!("{}/{}/resolve/main/{}", ep.trim_end_matches('/'), repo, file);
+fn probe_one(
+    c: &reqwest::blocking::Client,
+    ep: &str,
+    repo: &str,
+    file: &str,
+    revision: &str,
+) -> Result<u64, ProbeFail> {
+    let url = format!("{}/{}/resolve/{}/{}", ep.trim_end_matches('/'), repo, revision, file);
     let resp = match c.get(&url).header("Range", "bytes=0-0").send() {
         Ok(r) => r,
         Err(_) => return Err(ProbeFail::Soft(format!("{ep}: unreachable (blocked or offline)"))),
@@ -416,6 +639,7 @@ fn probe(
     endpoints: &[String],
     repo: &str,
     file: &str,
+    revision: &str,
     emit: &dyn Fn(serde_json::Value),
     id: &str,
     cancel: &AtomicBool,
@@ -425,11 +649,12 @@ fn probe(
     for (i, ep) in endpoints.iter().enumerate() {
         let tx = tx.clone();
         let c = c.clone();
-        let (ep, repo, file) = (ep.clone(), repo.to_string(), file.to_string());
+        let (ep, repo, file, revision) =
+            (ep.clone(), repo.to_string(), file.to_string(), revision.to_string());
         std::thread::spawn(move || {
             // The receiver may be gone already (probe returned early); the
             // straggler's verdict is then simply dropped.
-            let _ = tx.send((i, probe_one(&c, &ep, &repo, &file)));
+            let _ = tx.send((i, probe_one(&c, &ep, &repo, &file, &revision)));
         });
     }
     drop(tx);
@@ -522,19 +747,28 @@ fn fetch_inner(
     file: &str,
     dest_dir: &str,
     expect_bytes: u64,
+    expect_sha256: &str,
+    revision: &str,
     endpoints: &[String],
     cancel: &AtomicBool,
     emit: &dyn Fn(serde_json::Value),
 ) -> Result<String, String> {
+    // Empty = the manifest pins no revision (curation gap): fall back to the
+    // moving branch rather than refusing to download. The hash gate is the
+    // authority on content either way; the revision only removes the window
+    // where a force-push serves different bytes under the same name.
+    let revision = if revision.is_empty() { "main" } else { revision };
     let dir = PathBuf::from(dest_dir);
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create the download directory {dest_dir}: {e}"))?;
     let final_path = dir.join(file);
     let part_path = part_of(&final_path);
 
-    // A complete copy already present is used as is -- downloaded by the script,
-    // or finished on a previous run.
+    // A complete copy already present is used -- downloaded by the script, or
+    // finished on a previous run -- but only once it passes the hash gate
+    // (script downloads never went through the promotion gate below).
     if let Ok(m) = fs::metadata(&final_path) {
         if m.len() > 0 && (expect_bytes == 0 || m.len() >= expect_bytes) {
+            ensure_final_verified(&final_path, expect_sha256, id, cancel, emit)?;
             return Ok(final_path.to_string_lossy().into_owned());
         }
     }
@@ -546,7 +780,7 @@ fn fetch_inner(
     };
 
     let c = client()?;
-    let p = probe(&c, &eps, repo, file, emit, id, cancel)?;
+    let p = probe(&c, &eps, repo, file, revision, emit, id, cancel)?;
     let total = if p.total > 0 { p.total } else { expect_bytes };
 
     let mut have = fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
@@ -572,8 +806,8 @@ fn fetch_inner(
     }
     if total > 0 && have == total {
         // Exactly the right length: finished last time but never renamed.
-        fs::rename(&part_path, &final_path)
-            .map_err(|e| format!("rename failed for {}: {e}", final_path.display()))?;
+        // Length is necessary, not sufficient — the hash gate still applies.
+        promote_verified(&part_path, &final_path, expect_sha256, id, cancel, emit)?;
         return Ok(final_path.to_string_lossy().into_owned());
     }
 
@@ -583,9 +817,10 @@ fn fetch_inner(
     }));
 
     let url = format!(
-        "{}/{}/resolve/main/{}",
+        "{}/{}/resolve/{}/{}",
         p.endpoint.trim_end_matches('/'),
         repo,
+        revision,
         file
     );
     let mut req = c.get(&url);
@@ -672,9 +907,61 @@ fn fetch_inner(
             "file is short: got {got} bytes, the server says it should be {total}. Trying again resumes from where it stopped."
         ));
     }
-    fs::rename(&part_path, &final_path)
-        .map_err(|e| format!("rename failed for {}: {e}", final_path.display()))?;
+    promote_verified(&part_path, &final_path, expect_sha256, id, cancel, emit)?;
     Ok(final_path.to_string_lossy().into_owned())
+}
+
+/// Verify an already-downloaded file against the manifest hash without
+/// downloading anything. This is the serve-path gate for files that predate
+/// the promotion gate or came from `model_fetch.sh`. Progress arrives on the
+/// same `weights-fetch` channel (kind "progress", note `[WEIGHTS_VERIFYING]`).
+/// A mismatch deletes the file and rejects — same contract as the download
+/// path: red, no automatic retry, recovery is a fresh download.
+#[tauri::command]
+pub async fn weights_verify(
+    app: AppHandle,
+    id: String,
+    dest_dir: String,
+    file: String,
+    expect_sha256: String,
+) -> Result<(), String> {
+    let final_path = PathBuf::from(&dest_dir).join(&file);
+    // Same collision rules as a download: one task per id, one task per file
+    // (a verify racing a download of the same file would hash a moving target).
+    if is_active(&id) {
+        return Err("a task with this id is already running".into());
+    }
+    let part = part_of(&final_path);
+    if is_active_part(&part) {
+        return Err("this file is being downloaded — wait for the download to finish".into());
+    }
+    let cancel = register(&id, part);
+    let id2 = id.clone();
+    let r = tauri::async_runtime::spawn_blocking(move || {
+        let emit = |v: serde_json::Value| {
+            let _ = app.emit("weights-fetch", v);
+        };
+        let out = ensure_final_verified(&final_path, &expect_sha256, &id2, &cancel, &emit);
+        match &out {
+            Ok(()) => emit(serde_json::json!({
+                "id": id2, "kind": "done",
+                "path": final_path.to_string_lossy().into_owned()
+            })),
+            Err(e) if cancel.load(Ordering::SeqCst) => emit(serde_json::json!({
+                "id": id2, "kind": "cancelled", "message": e
+            })),
+            Err(e) => emit(serde_json::json!({
+                "id": id2, "kind": "error", "message": e
+            })),
+        }
+        out
+    })
+    .await;
+    unregister(&id);
+    match r {
+        Ok(inner) => inner,
+        Err(e) => Err(format!("verification task exited abnormally: {e}")),
+    }
 }
 
 /// Tests for the disk-facing half of "delete a model".
@@ -775,5 +1062,148 @@ mod delete_tests {
     #[test]
     fn list_of_a_missing_folder_is_empty_not_a_crash() {
         assert!(weights_list("/nonexistent/idletoken/models".into()).is_empty());
+    }
+}
+
+/// Tests for the SHA-256 integrity gate.
+///
+/// The expected hashes are **external truth** (the published SHA-256 test
+/// vector for "abc" and a value computed with `shasum -a 256` outside this
+/// codebase), not values produced by the code under test — an oracle that
+/// shares the implementation would pass no matter what the implementation
+/// does. Every gate also has its positive control: the corrupted-content
+/// cases MUST go red, or the passing cases prove nothing.
+#[cfg(test)]
+mod integrity_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering as O};
+
+    static N: AtomicU32 = AtomicU32::new(0);
+
+    fn tmpdir() -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "idletoken-itest-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, O::SeqCst)
+        ));
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// FIPS 180-2 test vector: SHA-256("abc").
+    const ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    fn no_emit(_: serde_json::Value) {}
+
+    #[test]
+    fn promotion_accepts_a_matching_file_and_leaves_a_marker() {
+        let d = tmpdir();
+        let part = d.join("m.gguf.part");
+        let fin = d.join("m.gguf");
+        fs::write(&part, b"abc").unwrap();
+        let cancel = AtomicBool::new(false);
+        promote_verified(&part, &fin, ABC, "t", &cancel, &no_emit).unwrap();
+        assert!(fin.exists() && !part.exists());
+        assert_eq!(fs::read_to_string(marker_of(&fin)).unwrap().trim(), ABC);
+    }
+
+    #[test]
+    fn promotion_rejects_and_deletes_a_corrupted_file() {
+        // Positive control for the whole gate: same length, one byte off.
+        let d = tmpdir();
+        let part = d.join("m.gguf.part");
+        let fin = d.join("m.gguf");
+        fs::write(&part, b"abd").unwrap();
+        let cancel = AtomicBool::new(false);
+        let e = promote_verified(&part, &fin, ABC, "t", &cancel, &no_emit).unwrap_err();
+        assert!(e.contains("WEIGHTS_SHA256_MISMATCH"), "got: {e}");
+        assert!(!part.exists(), "a provably wrong file must not be kept");
+        assert!(!fin.exists(), "and must never reach the final name");
+    }
+
+    #[test]
+    fn promotion_without_a_pinned_hash_just_renames() {
+        // Unpinned manifest (transition state): no verification, no marker —
+        // a marker would claim a check that never happened.
+        let d = tmpdir();
+        let part = d.join("m.gguf.part");
+        let fin = d.join("m.gguf");
+        fs::write(&part, b"anything").unwrap();
+        let cancel = AtomicBool::new(false);
+        promote_verified(&part, &fin, "", "t", &cancel, &no_emit).unwrap();
+        assert!(fin.exists());
+        assert!(!marker_of(&fin).exists());
+    }
+
+    #[test]
+    fn legacy_file_verifies_once_then_hits_the_marker() {
+        let d = tmpdir();
+        let fin = d.join("m.gguf");
+        fs::write(&fin, b"abc").unwrap();
+        let cancel = AtomicBool::new(false);
+        // No marker (script download): full hash, then a marker appears.
+        ensure_final_verified(&fin, ABC, "t", &cancel, &no_emit).unwrap();
+        assert!(marker_of(&fin).exists());
+        // Second call is the fast path; corrupt the CONTENT but keep the
+        // marker to prove the marker is what answers now.
+        fs::write(&fin, b"abd").unwrap();
+        ensure_final_verified(&fin, ABC, "t", &cancel, &no_emit).unwrap();
+    }
+
+    #[test]
+    fn legacy_corrupted_file_is_deleted_and_reported() {
+        let d = tmpdir();
+        let fin = d.join("m.gguf");
+        fs::write(&fin, b"abd").unwrap();
+        let cancel = AtomicBool::new(false);
+        let e = ensure_final_verified(&fin, ABC, "t", &cancel, &no_emit).unwrap_err();
+        assert!(e.contains("WEIGHTS_SHA256_MISMATCH"), "got: {e}");
+        assert!(!fin.exists());
+    }
+
+    #[test]
+    fn stale_marker_forces_a_real_rehash() {
+        // The manifest hash changed (curation update): the old marker must not
+        // bless the file against the NEW expectation.
+        let d = tmpdir();
+        let fin = d.join("m.gguf");
+        fs::write(&fin, b"abc").unwrap();
+        fs::write(marker_of(&fin), "0000000000000000000000000000000000000000000000000000000000000000\n").unwrap();
+        let cancel = AtomicBool::new(false);
+        ensure_final_verified(&fin, ABC, "t", &cancel, &no_emit).unwrap();
+        assert_eq!(
+            fs::read_to_string(marker_of(&fin)).unwrap().trim(),
+            ABC,
+            "the marker must be rewritten to the hash that was actually verified"
+        );
+    }
+
+    #[test]
+    fn state_reports_verified_only_with_a_matching_marker() {
+        let d = tmpdir();
+        let dir = d.to_string_lossy().into_owned();
+        fs::write(d.join("m.gguf"), b"abc").unwrap();
+        // Complete but never verified.
+        let s = weights_state(dir.clone(), "m.gguf".into(), 0, ABC.into());
+        assert!(s.complete && !s.verified);
+        // No hash pinned: nothing to verify, not blocked.
+        let s = weights_state(dir.clone(), "m.gguf".into(), 0, String::new());
+        assert!(s.complete && s.verified);
+        // Marker present and matching.
+        fs::write(marker_of(&d.join("m.gguf")), format!("{ABC}\n")).unwrap();
+        let s = weights_state(dir.clone(), "m.gguf".into(), 0, ABC.into());
+        assert!(s.complete && s.verified);
+        // Marker for a different hash (uppercase compare also covered).
+        let s = weights_state(dir, "m.gguf".into(), 0, "AB".repeat(32));
+        assert!(s.complete && !s.verified);
+    }
+
+    #[test]
+    fn delete_removes_the_marker_with_the_file() {
+        let d = tmpdir();
+        fs::write(d.join("m.gguf"), b"abc").unwrap();
+        fs::write(d.join("m.gguf.sha256"), ABC).unwrap();
+        weights_delete(d.to_string_lossy().into(), "m.gguf".into()).unwrap();
+        assert!(!d.join("m.gguf.sha256").exists(), "an orphaned marker would bless a future download it never saw");
     }
 }

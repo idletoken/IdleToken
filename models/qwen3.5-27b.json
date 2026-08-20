@@ -47,44 +47,305 @@
   },
   "overhead_base_bytes": 2147483648,
   "chat_template": "gguf",
-  "layer_weight_bytes": 14971693056,
-  "shared_weight_bytes": 1758126080,
-  "default_gguf": "Qwen3.5-27B-Q4_K_M.gguf",
+  "layer_weight_bytes": 8573593504,
+  "shared_weight_bytes": 0,
+  "default_gguf": "Qwen3.5-27B-UD-IQ2_XXS.gguf",
   "sources": [
     {
       "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "quant": "IQ2_XXS"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "quant": "IQ2_M"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "quant": "Q2_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "quant": "IQ3_XXS"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "quant": "Q3_K_S"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "quant": "Q3_K_M"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "quant": "Q3_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "quant": "IQ4_XS"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "quant": "IQ4_NL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "quant": "Q4_0"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "quant": "Q4_K_S"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
       "quant": "Q4_K_M"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "quant": "Q4_1"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "quant": "Q4_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "quant": "Q5_K_S"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "quant": "Q5_K_M"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "quant": "Q5_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "quant": "Q6_K"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "quant": "Q6_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "quant": "Q8_0"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "quant": "Q8_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "quant": "BF16"
     }
   ],
-  "default_quant": "Q4_K_M",
+  "default_quant": "IQ2_XXS",
   "variants": [
     {
-      "quant": "Q4_K_M",
-      "layer_weight_bytes": 14971693056,
-      "shared_weight_bytes": 1758126080,
+      "quant": "IQ2_XXS",
+      "layer_weight_bytes": 8573593504,
+      "shared_weight_bytes": 0,
       "repo": "unsloth/Qwen3.5-27B-GGUF",
-      "gguf": "Qwen3.5-27B-Q4_K_M.gguf"
+      "gguf": "Qwen3.5-27B-UD-IQ2_XXS.gguf",
+      "sha256": "097435ea0befcd2edca4934b5ff387388d0396dea6b5c4c17a02ed8c696ae958",
+      "revision": "3221f178a6b842d04f1fb42f1c413534adcc0a6a"
+    },
+    {
+      "quant": "IQ2_M",
+      "layer_weight_bytes": 10188072864,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "gguf": "Qwen3.5-27B-UD-IQ2_M.gguf",
+      "sha256": "3c05eb29a4eacbe0caf80990c14f5857d0581af0b162934a42357960a99fb4ba",
+      "revision": "3221f178a6b842d04f1fb42f1c413534adcc0a6a"
+    },
+    {
+      "quant": "Q2_K_XL",
+      "layer_weight_bytes": 11213752224,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "gguf": "Qwen3.5-27B-UD-Q2_K_XL.gguf",
+      "sha256": "413992235c68b6da9dbb142f6da1c0eb011b58dc86b2a4809dde0008f216cd68",
+      "revision": "3221f178a6b842d04f1fb42f1c413534adcc0a6a"
+    },
+    {
+      "quant": "IQ3_XXS",
+      "layer_weight_bytes": 11506493344,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "gguf": "Qwen3.5-27B-UD-IQ3_XXS.gguf",
+      "sha256": "b694e54fe124e299e1342a9f0b81f1a51e3c8bbccf11c0bd94394b28cc8ae2f9",
+      "revision": "3221f178a6b842d04f1fb42f1c413534adcc0a6a"
+    },
+    {
+      "quant": "Q3_K_S",
+      "layer_weight_bytes": 12289423264,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "gguf": "Qwen3.5-27B-Q3_K_S.gguf",
+      "sha256": "4da64157d83ede86cce1b7c354ba6532181cae158a791324cdf3855ec0df691f",
+      "revision": "3221f178a6b842d04f1fb42f1c413534adcc0a6a"
+    },
+    {
+      "quant": "Q3_K_M",
+      "layer_weight_bytes": 13505116064,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "gguf": "Qwen3.5-27B-Q3_K_M.gguf",
+      "sha256": "f08ce37ebe8a7130db0c198262336773976b1e374f2444f898c41117710f0bb3",
+      "revision": "3221f178a6b842d04f1fb42f1c413534adcc0a6a"
+    },
+    {
+      "quant": "Q3_K_XL",
+      "layer_weight_bytes": 14438533024,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "gguf": "Qwen3.5-27B-UD-Q3_K_XL.gguf",
+      "sha256": "f97830c686a5e87f9949fa58c2b735afc929553addd84d9b50c068e201510c9e",
+      "revision": "3221f178a6b842d04f1fb42f1c413534adcc0a6a"
+    },
+    {
+      "quant": "IQ4_XS",
+      "layer_weight_bytes": 14977484704,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "gguf": "Qwen3.5-27B-IQ4_XS.gguf",
+      "sha256": "fb829c84491b30cda875b7366e29ce3e4cede19b40daf5b824003936bfc4dbbb",
+      "revision": "3221f178a6b842d04f1fb42f1c413534adcc0a6a"
+    },
+    {
+      "quant": "IQ4_NL",
+      "layer_weight_bytes": 15687894944,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "gguf": "Qwen3.5-27B-IQ4_NL.gguf",
+      "sha256": "2329e260f3b6d1aef7f7813bc47c16e2efc01cd7c032577549c4971235d6a96c",
+      "revision": "3221f178a6b842d04f1fb42f1c413534adcc0a6a"
+    },
+    {
+      "quant": "Q4_0",
+      "layer_weight_bytes": 15721973664,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "gguf": "Qwen3.5-27B-Q4_0.gguf",
+      "sha256": "4830d88d6abe246a070f549fc906b3f79b0116173da4225ae6b0ffc2387a622d",
+      "revision": "3221f178a6b842d04f1fb42f1c413534adcc0a6a"
+    },
+    {
+      "quant": "Q4_K_S",
+      "layer_weight_bytes": 15769159584,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "gguf": "Qwen3.5-27B-Q4_K_S.gguf",
+      "sha256": "223f8c0a94be9e94c36e3c4abf742067a0eea452f31b6b264824c030957508ee",
+      "revision": "3221f178a6b842d04f1fb42f1c413534adcc0a6a"
+    },
+    {
+      "quant": "Q4_K_M",
+      "layer_weight_bytes": 16740812704,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "gguf": "Qwen3.5-27B-Q4_K_M.gguf",
+      "sha256": "84b5f7f112156d63836a01a69dc3f11a6ba63b10a23b8ca7a7efaf52d5a2d806",
+      "revision": "3221f178a6b842d04f1fb42f1c413534adcc0a6a"
+    },
+    {
+      "quant": "Q4_1",
+      "layer_weight_bytes": 17182934944,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "gguf": "Qwen3.5-27B-Q4_1.gguf",
+      "sha256": "327aa26b00adf147d7ae51fa4bff24643444dd421c4620bf2d238f05afb728b1",
+      "revision": "3221f178a6b842d04f1fb42f1c413534adcc0a6a"
+    },
+    {
+      "quant": "Q4_K_XL",
+      "layer_weight_bytes": 17621125024,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "gguf": "Qwen3.5-27B-UD-Q4_K_XL.gguf",
+      "sha256": "13cb6228344898afa50d963c02ae0d991ae25094eea8837db8d0e452e91c5888",
+      "revision": "3221f178a6b842d04f1fb42f1c413534adcc0a6a"
+    },
+    {
+      "quant": "Q5_K_S",
+      "layer_weight_bytes": 18889000864,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "gguf": "Qwen3.5-27B-Q5_K_S.gguf",
+      "sha256": "f4d4f26d54c36608a559f21df730ad55ff90943fb41ef9406c2733972644a9e8",
+      "revision": "3221f178a6b842d04f1fb42f1c413534adcc0a6a"
     },
     {
       "quant": "Q5_K_M",
-      "layer_weight_bytes": 17680951296,
-      "shared_weight_bytes": 1917050880,
+      "layer_weight_bytes": 19608995744,
+      "shared_weight_bytes": 0,
       "repo": "unsloth/Qwen3.5-27B-GGUF",
-      "gguf": "Qwen3.5-27B-Q5_K_M.gguf"
+      "gguf": "Qwen3.5-27B-Q5_K_M.gguf",
+      "sha256": "e41a488a3f013dbfb323563d7250105b1e708daf084942f9011344ad1525996f",
+      "revision": "3221f178a6b842d04f1fb42f1c413534adcc0a6a"
+    },
+    {
+      "quant": "Q5_K_XL",
+      "layer_weight_bytes": 20171253664,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "gguf": "Qwen3.5-27B-UD-Q5_K_XL.gguf",
+      "sha256": "423ebe4779f784a2921da340a0fab0c372fbafb4b9eb502ae3768218de01597a",
+      "revision": "3221f178a6b842d04f1fb42f1c413534adcc0a6a"
     },
     {
       "quant": "Q6_K",
-      "layer_weight_bytes": 20357031936,
-      "shared_weight_bytes": 2085908480,
+      "layer_weight_bytes": 22453933984,
+      "shared_weight_bytes": 0,
       "repo": "unsloth/Qwen3.5-27B-GGUF",
-      "gguf": "Qwen3.5-27B-Q6_K.gguf"
+      "gguf": "Qwen3.5-27B-Q6_K.gguf",
+      "sha256": "69e0f8527e0d937097cbcd486b51e2effaed963f49ef7962c9ef3eab45164ff8",
+      "revision": "3221f178a6b842d04f1fb42f1c413534adcc0a6a"
+    },
+    {
+      "quant": "Q6_K_XL",
+      "layer_weight_bytes": 25675642784,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "gguf": "Qwen3.5-27B-UD-Q6_K_XL.gguf",
+      "sha256": "816bfc5160e699c123c7900ccaf3189e2e442407389281c852f1e4b685a8395d",
+      "revision": "3221f178a6b842d04f1fb42f1c413534adcc0a6a"
     },
     {
       "quant": "Q8_0",
-      "layer_weight_bytes": 25883027456,
-      "shared_weight_bytes": 2701742080,
+      "layer_weight_bytes": 28595763104,
+      "shared_weight_bytes": 0,
       "repo": "unsloth/Qwen3.5-27B-GGUF",
-      "gguf": "Qwen3.5-27B-Q8_0.gguf"
+      "gguf": "Qwen3.5-27B-Q8_0.gguf",
+      "sha256": "6b0a101b0a86697fe11eabcc1a7db72699a9f3d4b18b6a1ac75ea3fb2c26c450",
+      "revision": "3221f178a6b842d04f1fb42f1c413534adcc0a6a"
+    },
+    {
+      "quant": "Q8_K_XL",
+      "layer_weight_bytes": 35528652704,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "gguf": "Qwen3.5-27B-UD-Q8_K_XL.gguf",
+      "sha256": "40bfd1604775f784b7e2d51eb8997435f9e9541d0481f50619c7823f73a2ebef",
+      "revision": "3221f178a6b842d04f1fb42f1c413534adcc0a6a"
+    },
+    {
+      "quant": "BF16",
+      "layer_weight_bytes": 53808281472,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-27B-GGUF",
+      "gguf": "BF16/Qwen3.5-27B-BF16-00001-of-00002.gguf",
+      "sha256": "c834354ad4ddc2054ac400842ea20d8801bd6718f6cda95baeed6796b5e17e4f",
+      "revision": "3221f178a6b842d04f1fb42f1c413534adcc0a6a",
+      "parts": [
+        {
+          "file": "BF16/Qwen3.5-27B-BF16-00002-of-00002.gguf",
+          "bytes": 3853644192,
+          "sha256": "cd31f613eff781cde1bfe2b897a1eb37104bf0072a7bc5d1b4e9d363bd75a9bc"
+        }
+      ]
     }
   ],
   "notes": [

@@ -60,6 +60,52 @@ fn autostart_get(app: tauri::AppHandle) -> bool {
     app.autolaunch().is_enabled().unwrap_or(false)
 }
 
+/// The CPU's marketing name, for the dashboard's CPU tile (the engine probe
+/// reports only the thread count). Client-side on purpose: reading a brand
+/// string needs no engine change, and each platform has a one-step way to it.
+/// Empty string = unknown; the UI shows a dash.
+#[tauri::command]
+fn cpu_name() -> String {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // CPUID brand string, leaves 0x80000002..=0x80000004 (supported by
+        // every x86_64 CPU new enough to run this app).
+        let mut bytes = Vec::with_capacity(48);
+        unsafe {
+            for leaf in 0x8000_0002u32..=0x8000_0004 {
+                let r = std::arch::x86_64::__cpuid(leaf);
+                for v in [r.eax, r.ebx, r.ecx, r.edx] {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+        let s = String::from_utf8_lossy(&bytes).to_string();
+        // Trademark suffixes and padded spacing are noise on a dashboard tile.
+        let s = s
+            .trim_matches(char::from(0))
+            .replace("(R)", "")
+            .replace("(TM)", "")
+            .replace("(tm)", "");
+        let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        if let Ok(o) = std::process::Command::new("sysctl")
+            .args(["-n", "machdep.cpu.brand_string"])
+            .output()
+        {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !s.is_empty() {
+                return s;
+            }
+        }
+    }
+    String::new()
+}
+
 /// Run the native engine's hardware probe as a sidecar and return the parsed
 /// JSON report. This is the local RPC boundary between the GUI (web frontend)
 /// and the decoupled inference engine (design philosophy 17): the client never
@@ -344,9 +390,19 @@ fn api_chat_cancel(id: String) -> bool {
 /// sequence, close-delimited plain HTTP — see engine sse_begin/sse_delta) to
 /// the webview as `api-chat` events tagged with the caller's `id`:
 ///   { id, kind: "delta", text }  per text_delta
+///   { id, kind: "progress", done, total, reused }  per prefill tick
 ///   { id, kind: "done" }         on message_stop / socket close
 ///   { id, kind: "error", message } on any failure
 /// Rust-side for the same reason as `api_chat` (no CORS on the engine).
+///
+/// **Every event carries `id`, and that is load-bearing** (2026-08-17): the chat
+/// UI runs several conversations at once, `app.emit` broadcasts to the whole
+/// webview, and the only thing keeping one conversation's deltas out of
+/// another's bubble is the frontend filtering on this field. An event kind
+/// added here without an `id` would not fail — it would silently interleave two
+/// replies. Concurrency otherwise needs nothing from this function: each invoke
+/// owns its own socket, its own timeout accounting and its own cancel flag, and
+/// Tauri runs each on its own blocking task.
 #[tauri::command]
 async fn api_chat_stream(
     app: tauri::AppHandle,
@@ -362,6 +418,13 @@ async fn api_chat_stream(
     max_tokens: Option<u32>,
 ) -> Result<(), String> {
     use tauri::Emitter;
+    // Registered HERE, before the blocking task is spawned. It used to be the
+    // first line inside the closure, which leaves a window between the frontend
+    // learning the id (it generates the id itself, then invokes) and the flag
+    // existing. A stop pressed in that window found no entry, api_chat_cancel
+    // returned false — and the caller discards the return value, so the press
+    // was silently lost and the generation ran to completion.
+    let cancel = chat_register(&id);
     tauri::async_runtime::spawn_blocking(move || {
         let emit = |kind: &str, text: Option<&str>, message: Option<&str>| {
             let _ = app.emit(
@@ -372,7 +435,6 @@ async fn api_chat_stream(
         let model = model
             .filter(|m| !m.is_empty())
             .unwrap_or_else(|| "deepseek-v4-flash".into());
-        let cancel = chat_register(&id);
         let out = stream_chat_inner(
             &base_url, &messages, &token, &model, max_tokens, &cancel,
             &mut |t| emit("delta", Some(t), None),
@@ -406,6 +468,15 @@ async fn api_chat_stream(
 /// (`chat.err.timeoutMid` / `chat.err.timeoutNone` in client/src/i18n.ts) —
 /// change both together.
 const READ_TIMEOUT_S: u64 = 300;
+
+/// How long a single `read` may block. The cancel flag is only observable
+/// BETWEEN reads, so this — not READ_TIMEOUT_S — is what bounds how long a
+/// "stop" press goes unheard. It used to be the same 300 s: while a turn waits
+/// its place in the coordinator's queue the socket is completely silent, so the
+/// reader sat parked in one blocking read and the stop button did nothing for
+/// up to five minutes. Silence is accumulated across slices instead, so the
+/// liveness ceiling above is unchanged.
+const READ_SLICE_S: u64 = 1;
 
 /// Blocking SSE consumer: connect → POST with stream:true → parse
 /// `event:/data:` frames until the engine closes the connection.
@@ -456,7 +527,7 @@ fn stream_chat_inner(
     // that tick existed, a prompt whose prefill ran past the ceiling died here
     // with a bare "os error 10060".)
     stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(READ_TIMEOUT_S)))
+        .set_read_timeout(Some(std::time::Duration::from_secs(READ_SLICE_S)))
         .ok();
     stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
 
@@ -465,7 +536,13 @@ fn stream_chat_inner(
     let mut is_sse = false;
     let mut got_bytes = false;
     let mut status: u16 = 0;
+    // Seconds the coordinator asked us to wait, from the 429 it sends when every
+    // sequence slot is in flight. Kept so the refusal can say when to try again
+    // instead of just "busy".
+    let mut retry_after_s: u64 = 0;
     let mut chunk = [0u8; 4096];
+    // Consecutive silence, summed over the short read slices. Reset by any byte.
+    let mut silent_s: u64 = 0;
     loop {
         // Checked before every read AND after every frame below: deltas arrive
         // every few milliseconds while generating, so a stop lands almost at
@@ -481,6 +558,14 @@ fn stream_chat_inner(
             // cluster really did stall — say that, in words, instead of
             // surfacing "os error 10060", which is what the user actually saw.
             Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {
+                // One quiet slice is normal (a queued turn is silent until the
+                // coordinator reaches it). Only the ACCUMULATED silence counts
+                // against the liveness ceiling; going back round the loop is
+                // what gives the cancel check above its chance to run.
+                silent_s = silent_s.saturating_add(READ_SLICE_S);
+                if silent_s < READ_TIMEOUT_S {
+                    continue;
+                }
                 // "[CODE] detail" (client-error convention, ERROR_KEYS in
                 // i18n.ts): the UI shows a localized sentence for the code;
                 // the English detail survives in logs and the problem record.
@@ -495,6 +580,7 @@ fn stream_chat_inner(
         if n == 0 {
             break;
         }
+        silent_s = 0;
         got_bytes = true;
         buf.extend_from_slice(&chunk[..n]);
         if !headers_done {
@@ -511,6 +597,11 @@ fn stream_chat_inner(
                     .next()
                     .and_then(|l| l.split_whitespace().nth(1))
                     .and_then(|c| c.parse::<u16>().ok())
+                    .unwrap_or(0);
+                retry_after_s = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("retry-after:"))
+                    .and_then(|v| v.trim().parse::<u64>().ok())
                     .unwrap_or(0);
                 buf.drain(..pos + 4);
                 headers_done = true;
@@ -588,6 +679,27 @@ fn stream_chat_inner(
         // The engine answered non-streaming (error body or no SSE support):
         // surface its JSON honestly — text as one delta, errors as errors.
         let payload = String::from_utf8_lossy(&buf);
+        // 429 is not a fault, it is a fact about the cluster: every sequence
+        // slot is in flight (coord_main.c sends it both for a full intake queue
+        // and for no free slot). It gets its own code so the UI can say "the
+        // turn was not run, send it again" rather than showing the engine's
+        // English sentence as if it were an error the user caused.
+        //
+        // NOTHING here or above it retries. Several conversations can now be
+        // generating at once, and a client that retries a busy coordinator by
+        // itself turns one queue into a stampede — the user decides when to
+        // send again.
+        if status == 429 {
+            let why = serde_json::from_str::<Value>(payload.trim())
+                .ok()
+                .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+                .unwrap_or_else(|| "no free sequence slot".to_string());
+            return Err(if retry_after_s > 0 {
+                format!("[CHAT_BUSY] {why}; the coordinator suggested retrying in {retry_after_s}s")
+            } else {
+                format!("[CHAT_BUSY] {why}")
+            });
+        }
         let v: Value = serde_json::from_str(payload.trim()).map_err(|_| {
             format!("cluster replied HTTP {status} with: {}", payload.trim())
         })?;
@@ -723,6 +835,19 @@ async fn http_get_json(url: &str) -> Result<Value, String> {
 
 fn main() {
     tauri::Builder::default()
+        // Registered FIRST, before anything else can spin up state. A second
+        // launch focuses the existing window and exits — two live instances
+        // fight over the discovery port and each other's engines, and the
+        // window the user happens to look at sits on "loading" forever while
+        // the OTHER instance's cluster is already serving (seen for real on
+        // 2026-08-15: coord ready on 127.0.0.1:8000, UI stuck).
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_shell::init())
         // Native file dialog for the open-model picker (WS-D1: "any GGUF").
         // A dialog is the only honest way to take a local path: the old free-
@@ -805,6 +930,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             probe_resources,
+            cpu_name,
             advise_capability,
             api_chat,
             api_chat_stream,
@@ -828,8 +954,11 @@ fn main() {
             pairing::pairing_start,
             pairing::pairing_set_coordinator,
             pairing::pairing_leave,
+            pairing::pairing_report_memory,
             pairing::pairing_status,
+            pairing::net_lan_ip,
             weights::weights_fetch,
+            weights::weights_verify,
             weights::weights_default_dir,
             weights::weights_state,
             weights::weights_cancel,
@@ -982,16 +1111,156 @@ cluster.\"},\"prompt_tokens\":32984,\"context_size\":32768}";
     }
 
     #[test]
-    fn non_sse_error_body_is_surfaced_verbatim() {
+    fn busy_429_gets_its_own_code_and_carries_retry_after() {
+        // The coordinator's refusal when no sequence slot is free. It used to
+        // come out verbatim, indistinguishable from a genuine failure; with
+        // several conversations generating at once it is an ordinary, expected
+        // answer, so it is coded (CHAT_BUSY -> chat.err.busy) and the suggested
+        // wait is kept rather than thrown away.
         let body = "{\"error\":{\"message\":\"all sequence slots busy\"}}";
         let script: &'static [u8] = Box::leak(
             format!(
-                "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n\
+                 Retry-After: 7\r\nContent-Length: {}\r\n\r\n{body}",
                 body.len()
             )
             .into_boxed_str(),
         )
         .as_bytes();
-        assert_eq!(run(script).0.unwrap_err(), "all sequence slots busy");
+        let err = run(script).0.unwrap_err();
+        assert!(err.starts_with("[CHAT_BUSY] all sequence slots busy"), "{err}");
+        assert!(err.contains("retrying in 7s"), "{err}");
+    }
+
+    #[test]
+    fn non_sse_error_body_that_is_not_429_is_surfaced_verbatim() {
+        let body = "{\"error\":{\"message\":\"model not loaded\"}}";
+        let script: &'static [u8] = Box::leak(
+            format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .into_boxed_str(),
+        )
+        .as_bytes();
+        assert_eq!(run(script).0.unwrap_err(), "model not loaded");
+    }
+
+    /// Two streams at once must not mix. This is the property the whole
+    /// multi-conversation feature rests on, and §4.2 of the plan asks for it to
+    /// be MEASURED rather than reasoned about: each consumer holds its own
+    /// socket, buffer and silence counter, so the only way to find out whether
+    /// that is really true is to run two and check the transcripts.
+    #[test]
+    fn two_concurrent_streams_do_not_interleave() {
+        fn frames(word: &str, n: usize) -> String {
+            let mut s = String::from(HEAD);
+            for i in 0..n {
+                s.push_str(&format!(
+                    "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"{word}{i}\"}}}}\n\n"
+                ));
+            }
+            s.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+            s
+        }
+        // Leaked so both scripts have 'static lifetime, as `serve` wants.
+        let a: &'static [u8] = Box::leak(frames("A", 40).into_boxed_str()).as_bytes();
+        let b: &'static [u8] = Box::leak(frames("B", 40).into_boxed_str()).as_bytes();
+        let (ua, ub) = (serve(a), serve(b));
+        let run_one = |url: String| {
+            std::thread::spawn(move || {
+                let cancel = AtomicBool::new(false);
+                let mut text = String::new();
+                let msgs = serde_json::json!([{ "role": "user", "content": "hi" }]);
+                let out = super::stream_chat_inner(
+                    &url, &msgs, "", "m", None, &cancel,
+                    &mut |t| text.push_str(t),
+                    &mut |_, _, _| {},
+                );
+                (out, text)
+            })
+        };
+        let (ha, hb) = (run_one(ua), run_one(ub));
+        let (oa, ta) = ha.join().unwrap();
+        let (ob, tb) = hb.join().unwrap();
+        assert!(oa.is_ok() && ob.is_ok(), "{oa:?} {ob:?}");
+        assert_eq!(ta, (0..40).map(|i| format!("A{i}")).collect::<String>());
+        assert_eq!(tb, (0..40).map(|i| format!("B{i}")).collect::<String>());
+    }
+
+    /// Cancelling one conversation must not touch another's. The registry is
+    /// keyed by request id, but "keyed by id" is exactly the kind of claim that
+    /// is true until someone replaces the Vec with a single global flag.
+    #[test]
+    fn cancelling_one_request_leaves_the_others_running() {
+        let a = super::chat_register("req-a");
+        let b = super::chat_register("req-b");
+        assert!(super::api_chat_cancel("req-a".into()), "a live id must be found");
+        assert!(a.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!b.load(std::sync::atomic::Ordering::SeqCst), "cancelling A stopped B");
+        super::chat_unregister("req-a");
+        // Unregistering A must not have taken B's entry with it, and a stop for
+        // an id that has already finished must answer honestly (false) so the
+        // UI can fall back to recovering its own state.
+        assert!(!super::api_chat_cancel("req-a".into()), "a finished id must report not-found");
+        assert!(super::api_chat_cancel("req-b".into()), "B's registration was collateral damage");
+        super::chat_unregister("req-b");
+    }
+
+    /// Accept one connection, then hold it open in complete silence until the
+    /// test releases it. This is the state a turn is in while it waits its
+    /// place in the coordinator's intake queue (coord_main.c executes one
+    /// request at a time): the socket is alive and not one byte arrives.
+    fn serve_silent() -> (String, std::sync::Arc<AtomicBool>) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let d2 = done.clone();
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            while !d2.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), done)
+    }
+
+    /// A stop pressed while the socket is silent must be acted on promptly.
+    ///
+    /// REGRESSION (2026-08-16). The cancel flag is only observable BETWEEN
+    /// reads, and the read timeout used to be the full READ_TIMEOUT_S. A turn
+    /// queued behind another one sends nothing, so the consumer sat parked in a
+    /// single 300 s read and the stop button did nothing for up to five minutes
+    /// — the user-visible bug was "it hangs, no text, and stop does not work".
+    ///
+    /// This test is sensitive to exactly that: set READ_SLICE_S back to
+    /// READ_TIMEOUT_S and it stops finishing (verified by doing it).
+    #[test]
+    fn cancel_is_honoured_while_the_socket_is_silent() {
+        let (url, done) = serve_silent();
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let c2 = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            c2.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let msgs = serde_json::json!([{ "role": "user", "content": "hi" }]);
+        let t0 = std::time::Instant::now();
+        let out = super::stream_chat_inner(
+            &url, &msgs, "", "m", None, &cancel,
+            &mut |_| {},
+            &mut |_, _, _| {},
+        );
+        let dt = t0.elapsed();
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        // A cancelled stream is a normal end, not a failure: whatever already
+        // streamed in is kept and the turn is not marked as errored.
+        assert!(out.is_ok(), "a cancelled stream must not be an error: {out:?}");
+        assert!(
+            dt < std::time::Duration::from_secs(5),
+            "cancel took {dt:?}; it must land within about one read slice"
+        );
     }
 }

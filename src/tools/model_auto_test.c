@@ -77,19 +77,50 @@ int main(int argc, char **argv) {
     ok(am.kv_bytes_per_token == 61ull * 1 * (192 + 128) * 2,
        "kv bytes/token uses explicit key_length + value_length");
 
-    /* ---- split naming is refused with instructions ----------------------- */
-    snprintf(path, sizeof(path), "%s/fake-00001-of-00003.gguf", dir);
+    /* ---- split (multi-file) GGUFs -----------------------------------------
+     * Supported since 2026-08-16 (they used to be refused with "merge it
+     * first"). Every model past ~50 GB ships split, so refusing them meant the
+     * only path that measures the REAL file was unusable for exactly the
+     * models whose size matters most. Three behaviours to hold down: a missing
+     * part is named, a non-first part is redirected, and a complete set is
+     * sized by the SUM — not by part 1, which is a few MiB of header. */
     {
-        char src[1024];
+        char src[1024], p2[1024], p3[1024];
         snprintf(src, sizeof(src), "%s/glm_dsa.gguf", dir);
+        snprintf(path, sizeof(path), "%s/fake-00001-of-00003.gguf", dir);
+        snprintf(p2, sizeof(p2), "%s/fake-00002-of-00003.gguf", dir);
+        snprintf(p3, sizeof(p3), "%s/fake-00003-of-00003.gguf", dir);
         ok(copy_file(src, path) == 0, "split-name fixture staged");
+
+        /* (a) part 1 alone: the siblings are missing, and saying which one is
+         * missing is the difference between "your download stopped" and a
+         * loader crash three minutes later. */
+        err[0] = '\0';
+        ok(idletoken_model_from_gguf(path, &am, err, sizeof(err)) == -1,
+           "split part 1 without its siblings is refused");
+        ok(strstr(err, "missing") != NULL && strstr(err, "incomplete") != NULL,
+           "the refusal names the missing part, not a generic failure");
+
+        /* (b) pointing at a middle part: redirect to part 1, which is the only
+         * one carrying the header. */
+        ok(copy_file(src, p3) == 0, "third part staged");
+        err[0] = '\0';
+        ok(idletoken_model_from_gguf(p3, &am, err, sizeof(err)) == -1 &&
+               strstr(err, "part 1") != NULL,
+           "a non-first part is refused by pointing at part 1");
+
+        /* (c) complete set: accepted, and sized as the SUM of the parts. */
+        ok(copy_file(src, p2) == 0, "second part staged");
+        err[0] = '\0';
+        const int rc = idletoken_model_from_gguf(path, &am, err, sizeof(err));
+        ok(rc == 0, "a complete split set is accepted");
+        if (rc == 0) {
+            struct stat s1;
+            ok(stat(path, &s1) == 0 && am.file_bytes == (uint64_t)s1.st_size * 3,
+               "split model size is the sum of every part");
+        }
+        remove(path); remove(p2); remove(p3);
     }
-    err[0] = '\0';
-    ok(idletoken_model_from_gguf(path, &am, err, sizeof(err)) == -1,
-       "split-named GGUF is refused");
-    ok(strstr(err, "split") != NULL && strstr(err, "merge") != NULL,
-       "split refusal says what it is and what to do");
-    remove(path);
 
     /* ---- garbage / missing files fail with a reason ---------------------- */
     snprintf(path, sizeof(path), "%s/not-a.gguf", dir);

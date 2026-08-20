@@ -1,8 +1,9 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useI18n, type Lang } from "./i18n";
 import { EndpointsPanel } from "./EndpointsPanel";
-import { AVAILABLE_MODELS, hasQuantChoice, isLocalGguf, quantOptions, defaultQuant } from "./models";
-import { customGgufName } from "./weights";
+import { MODEL_BRANDS, shortModelLabel, hasQuantChoice, quantOptions, defaultQuant, getManifest } from "./models";
+import { resolveDownload, weightsState, defaultModelDir, type DownloadTarget } from "./weights";
+import { inTauri } from "./platform";
 import Capability from "./Capability";
 import { fmtBytes } from "./format";
 import {
@@ -16,8 +17,7 @@ import {
 } from "./settings";
 import type { NodeSnapshot } from "./types";
 import type { Session } from "./auth";
-import PlatformPanel from "./PlatformPanel";
-import WeightsRow, { type WeightsInfo } from "./WeightsRow";
+import WeightsRow from "./WeightsRow";
 import StoredModels from "./StoredModels";
 import ProblemLog from "./ProblemLog";
 import { getEngineProvider } from "./provider/engine";
@@ -62,7 +62,7 @@ interface Category {
   id: string;
   label: Bi;
   note?: Bi;
-  bespoke?: "quick" | "platform" | "endpoints";
+  bespoke?: "quick" | "platform" | "endpoints" | "resources";
   sections?: Section[];
 }
 
@@ -107,13 +107,85 @@ function CapSlider(props: { label: string; noCap: string; totalBytes: number; va
   );
 }
 
-// ---- schema (everything except the bespoke Quick page) --------------------
-// Six categories, down from fifteen (2026-07 UX audit): the handful of
-// settings that actually work today must not drown in reserved placeholders.
-// Everything not yet wired engine/OS-side lives under "Advanced (coming
-// soon)" with disabled controls — honest, but out of the way.
+/**
+ * One model's weight state + download control — the unit of the download
+ * manager (2026-08-15 split: Settings downloads, Cluster starts/switches,
+ * Chat displays). The cell probes its own file on disk (re-probing when
+ * `version` bumps) and renders the shared WeightsRow with THIS row's progress
+ * and error, so every model downloads independently of every other row and of
+ * whichever model is selected.
+ */
+function ModelWeightsCell(props: {
+  file: string;
+  target: DownloadTarget;
+  modelDir: string;
+  version: number;
+  dl: { have: number; total: number; note?: string } | null;
+  lastError: string | null;
+  onStart: () => void;
+  onCancel: () => void;
+}) {
+  const [st, setSt] = useState<{ needs: boolean; partial: number } | null>(null);
+  useEffect(() => {
+    let live = true;
+    (async () => {
+      // Browser dev build: no filesystem bridge; report "ready" so the page
+      // stays usable (same policy as resolveLocalWeights).
+      if (!inTauri()) {
+        if (live) setSt({ needs: false, partial: 0 });
+        return;
+      }
+      try {
+        const dir = props.modelDir || (await defaultModelDir());
+        const w = await weightsState(dir, props.file, props.target.expectBytes, props.target.sha256);
+        if (live) setSt({ needs: !w.complete, partial: w.complete ? 0 : w.have_bytes });
+      } catch {
+        if (live) setSt({ needs: true, partial: 0 });
+      }
+    })();
+    return () => {
+      live = false;
+    };
+    // A settled download (or a deletion) bumps `version`, re-running the probe.
+  }, [props.file, props.modelDir, props.version, props.target.expectBytes]);
+  if (!st && !props.dl) return null;
+  return (
+    <WeightsRow
+      w={{
+        needs: st?.needs ?? true,
+        path: "",
+        dl: props.dl,
+        partialBytes: st?.partial ?? 0,
+        lastError: props.lastError,
+        onDownload: props.onStart,
+        onCancel: props.onCancel,
+      }}
+      idle="show"
+    />
+  );
+}
+
+// ---- schema (everything except the bespoke Models page) --------------------
+// Reorganized 2026-08-15 along scenario lines (the same split as the pages:
+// Settings downloads, Cluster runs, Chat talks):
+//   Models        everything about model files on THIS machine — the download
+//                 manager, precision, the capability table, the folder.
+//   Cluster & API pairing, the API service, inference/cache knobs, and how to
+//                 connect a client.
+// "Sharing & earnings", "Platform account" and "Advanced (coming soon)" are
+// GONE, not moved: none of them does anything a user can feel yet, and a
+// settings page must not show controls that do nothing (principle 15). They
+// return together with the features they configure.
 const CATEGORIES: Category[] = [
-  { id: "quick", label: { en: "Quick", zh: "常用" }, bespoke: "quick" },
+  // The model page: download manager, capability table, storage, plus the
+  // model-adjacent runtime knobs (context tier, resource caps). Language and
+  // theme moved to Appearance (2026-08-15) — they were the one group here
+  // that had nothing to do with models.
+  { id: "quick", label: { en: "Models", zh: "模型" }, bespoke: "quick" },
+  // Its own page (2026-08-15, was a group at the bottom of Models): how much
+  // of this machine a cluster may use is a machine-level decision, not a
+  // model-level one — it applies to whatever model runs.
+  { id: "resources", label: { en: "Resource usage", zh: "资源占用" }, bespoke: "resources" },
   {
     id: "appearance",
     label: { en: "Appearance", zh: "外观" },
@@ -137,22 +209,40 @@ const CATEGORIES: Category[] = [
     ] }],
   },
   {
+    // Split from the old "Cluster & API" (2026-08-15): serving an API on this
+    // machine and forming a cluster with other machines are different jobs
+    // with different audiences, and one page mixing beacon ports with access
+    // tokens read as noise. API = how a client on this machine connects;
+    // Networking = how machines find each other and pair.
     id: "connect",
-    // The "how do I point Claude Code at this" block sits above the raw
-    // host/port/token fields. Until now the client never told anyone its own
-    // base URL: you had to go read the README to use the thing you had just
-    // started (docs/api-surface.md §7).
     bespoke: "endpoints",
-    label: { en: "Cluster & API", zh: "集群与 API" },
-    note: { en: "Engine-side settings take effect when the cluster restarts.", zh: "引擎相关设置在集群重新启动后生效。" },
+    label: { en: "API", zh: "API" },
     sections: [
-      // All nine are live as of 2026-08-13. The six pairing ones used to be
-      // rendered as working controls that nothing read — the toggle labelled
-      // "mDNS discovery" was the worst of them, since the discovery it did not
-      // control is not mDNS either (it is a UDP broadcast beacon). They are
-      // consumed by src-tauri/src/pairing.rs; each hint says WHICH of the two
-      // discovery layers or which side of the handshake it governs, because
-      // that is what nobody could tell from the label.
+      { fields: [
+        // No access-token field (2026-08-15): the API answers this machine
+        // only (loopback, coord-enforced), so a token gates nothing a local
+        // caller could not already do. The AppSettings key stays for engine
+        // compatibility; the UI no longer offers it.
+        { key: "apiPort", type: "number", label: { en: "Port", zh: "端口" },
+          hint: { en: "Changes apply when the cluster restarts.", zh: "修改后重启集群生效。" } },
+      ] },
+    ],
+  },
+  {
+    id: "network",
+    label: { en: "Networking", zh: "联机组网" },
+    sections: [
+      // All consumed by src-tauri/src/pairing.rs. "LAN auto-discovery" is a
+      // UDP broadcast beacon (it was never mDNS).
+      //
+      // "Only same subnet" and "Bind interface / IP" were removed from the UI
+      // on 2026-08-15 (too complex for the audience — the user's call). The
+      // AppSettings keys still exist and still reach the engine: subnet-only
+      // stays at its default (off), bindNic at auto. ⚠ bindNic was the manual
+      // escape for machines where a VPN adapter (Tailscale/Clash TUN) wins the
+      // route — if that class of "machine online but unreachable" reports
+      // returns, the fix is auto-detecting overlay adapters, not re-adding the
+      // field. Settings import still applies both keys for hand-edited files.
       { label: { en: "Pairing & discovery", zh: "组网与发现" }, fields: [
         { key: "clusterName", type: "text", label: { en: "Cluster name", zh: "集群名" } },
         { key: "mdns", type: "toggle", label: { en: "LAN auto-discovery", zh: "局域网自动发现" } },
@@ -160,82 +250,21 @@ const CATEGORIES: Category[] = [
         { key: "manualPeers", type: "text", label: { en: "Manual peer IPs", zh: "手动节点 IP" }, placeholder: "192.168.1.50, 192.168.1.51" },
         { key: "heartbeatSec", type: "number", label: { en: "Heartbeat (s)", zh: "心跳（秒）" } },
         { key: "preferCoordinator", type: "toggle", label: { en: "Prefer this machine as coordinator", zh: "优先本机作协调者" } },
-        { key: "sameSubnetOnly", type: "toggle", label: { en: "Only same subnet", zh: "仅限同子网" } },
-        { key: "bindNic", type: "text", label: { en: "Bind interface / IP", zh: "绑定网卡 / IP" }, placeholder: "auto" },
         { key: "interStagePort", type: "number", label: { en: "Inter-stage port", zh: "节点间端口" } },
-      ] },
-      { label: { en: "API service", zh: "API 服务" }, fields: [
-        { key: "apiHost", type: "text", label: { en: "Listen address", zh: "监听地址" } },
-        { key: "apiPort", type: "number", label: { en: "Port", zh: "端口" } },
-        { key: "apiToken", type: "password", label: { en: "Access token", zh: "访问令牌" } },
-      ] },
-      { label: { en: "Model & storage", zh: "模型与存储" }, fields: [
-        // "Weights source" (auto | local file) was removed on 2026-08-13.
-        //
-        // The choice was not one: "auto" already covers every case — a complete
-        // local copy is used as-is, a joiner streams only its own layers from
-        // the coordinator, and a coordinator/standalone downloads. The label
-        // ("Pull from cluster") described just the middle one, so on a single
-        // machine it read as something for other people.
-        //
-        // "Local file" was worse than redundant: the path was handed to the
-        // engine unchecked, so a typo — or the empty box you get the moment you
-        // switch to it — showed "Weights ready on this machine" and failed at
-        // load time instead. Pointing "Model download folder" at an existing
-        // directory does the same job and is verified (weights_state).
-        // reserved: nothing reads these yet. Joiners already fetch only their own
-        // layers from the coordinator's shard repo (pairing.rs), so the download
-        // folder / auto-download / checksum toggles have no consumer — and idle
-        // unload is not implemented in the engine at all. Leaving them editable
-        // would be exactly the "hollow setting" principle 15 forbids: the user changes one and
-        // nothing happens, with no way to tell.
-        { key: "modelDir", type: "text", label: { en: "Model download folder", zh: "模型下载目录" }, placeholder: "~/.idletoken/models" },
-        // What that folder actually holds, and a way to get the space back. A
-        // model is tens of gigabytes; trying two of them fills a laptop, and
-        // until now the only way to clean up was to find the folder yourself.
-        { type: "note", label: { en: "Downloaded weights on this machine", zh: "本机已下载的权重" } },
-        { type: "stored-models" },
-        { key: "autoDownload", type: "toggle", label: { en: "Auto-download on join", zh: "加入时自动下载" }, reserved: true },
-        { key: "verifySha", type: "toggle", label: { en: "Verify checksum (sha256)", zh: "校验 sha256" }, reserved: true },
-        { key: "idleUnload", type: "toggle", label: { en: "Unload model when idle", zh: "空闲时卸载模型" }, reserved: true },
-        { key: "idleUnloadMin", type: "number", label: { en: "Idle timeout (min)", zh: "空闲超时（分钟）" }, reserved: true, showIf: (s) => s.idleUnload },
-      ] },
-      { label: { en: "Inference & cache", zh: "推理与缓存" }, fields: [
-        // Real since 2026-08-11, in both directions: the chat sends it per
-        // request, and it is also passed to the coordinator as --max-decode, so
-        // it bounds third-party API clients too. (It used to be the worst shape
-        // of a fake setting: the Rust chat path hardcoded 200/512 and the engine
-        // hardcoded 4096, while the default here happened to be 512 — so it
-        // looked wired right up until you changed it.)
-        { key: "maxTokens", type: "number", label: { en: "Max tokens per reply", zh: "单次最大生成 tokens" } },
-        { key: "kvDir", type: "text", label: { en: "KV cache directory", zh: "KV 缓存目录" }, placeholder: "/tmp/idletoken-kv" },
-        { type: "action", action: "clearKv", label: { en: "Clear KV cache", zh: "清除 KV 缓存" } },
-      ] },
-      { label: { en: "Platform account", zh: "平台账号" }, fields: [
-        { type: "note", label: { en: "Only your account identity goes to the platform; pairing and inference happen on your LAN.", zh: "只有账号身份经过平台；组网与推理在局域网内完成。" } },
-        { key: "platformUrl", type: "text", label: { en: "Platform server URL", zh: "平台服务器地址" }, placeholder: "https://api.idletoken.ai" },
       ] },
     ],
   },
-  // Was a top-level place ("Marketplace") until 2026-08-10. Browsing the
-  // market is a browser job; what needs THIS machine — listing this cluster,
-  // balance, ledger, API keys, rendezvous token — is a settings category.
-  { id: "platform", label: { en: "Sharing & earnings", zh: "共享与收益" }, bespoke: "platform" },
   {
     id: "privacy",
     label: { en: "Privacy", zh: "隐私保护" },
-    // Marketplace wording removed on 2026-08-13: this page is read on the
-    // machine you own, by someone asking "what happens to what I type". Where
-    // the platform can see plaintext is a property of selling/buying on the
-    // market — it belongs on that screen, not here, where it only made the
-    // encryption story harder to follow.
-    note: {
-      en: "Your prompt is encrypted end to end to the cluster serving it; the nodes running it do not see the original text. On your own machines, it never leaves them.",
-      zh: "提示词经端到端加密送达提供服务的集群，执行节点接触不到原文。若集群全部由你自己的机器组成，内容不会离开这些机器。",
-    },
+    // Cut to the one verifiable line on 2026-08-15 (the end-to-end intro note
+    // and "prompts are not written to logs" went with it): prose assurances on
+    // a privacy page read as marketing, and every claim beyond the mechanism
+    // itself is another thing the page can be wrong about. The design doc
+    // (docs/privacy-design.md) is where the full story lives.
     sections: [
       { fields: [
-        { type: "note", label: { en: "Encryption: X25519 + AES-256-GCM envelope to the coordinator. Prompts are not written to logs.", zh: "加密方式：X25519 + AES-256-GCM 信封加密。提示词不写入日志。" } },
+        { type: "note", label: { en: "Encryption: X25519 + AES-256-GCM envelope encryption.", zh: "加密方式：X25519 + AES-256-GCM 信封加密。" } },
         // "Share anonymous telemetry" was removed on 2026-08-13. There is no
         // telemetry client anywhere in the tree — not in the client, the engine
         // or the platform agent — so the switch never had a consumer. A privacy
@@ -282,13 +311,10 @@ const CATEGORIES: Category[] = [
       // bundle could say `logLevel: "debug"` about an engine that had never
       // been asked to run that way, and send whoever read it looking for logs
       // that were never produced.
-      { label: { en: "Problems & diagnostics", zh: "问题与诊断" }, fields: [
-        // The improvement loop, and the honest bound on it: recorded here,
-        // nothing is sent. What reaches us is what the user exports below.
-        { type: "problems" },
-        { type: "action", action: "diagnostics",
-          label: { en: "Export diagnostics bundle", zh: "导出诊断包" } },
-      ] },
+      // "Problems & diagnostics" hidden entirely (2026-08-15, user call): the
+      // problem log keeps recording locally (problems.ts) and the diagnostics
+      // bundle machinery stays in the codebase — only the surface is gone.
+      // Bring the section back here when a support flow needs it.
       // "Data folder" removed with them: the client's data lives in this
       // machine's app-data directory (Tauri decides it) and in localStorage,
       // and no code ever read the box. Typing a path did not move anything.
@@ -300,98 +326,21 @@ const CATEGORIES: Category[] = [
       { label: { en: "About", zh: "关于" }, fields: [
         { type: "note", label: { en: `IdleToken client ${APP_VERSION}`, zh: `IdleToken 客户端 ${APP_VERSION}` } },
         // Said wrong until 2026-08-13 ("MIT-licensed"). IdleToken is
-        // **Apache-2.0** — LICENSE, NOTICE and the README have always said so;
-        // the MIT belongs to vendored ds4, and the two got merged into one
-        // sentence. A licence claim is the one line in an About box that
-        // someone may act on, so it now names both, separately, and points at
-        // the NOTICE that Apache-2.0 §4(d) requires to travel with the build.
-        // Updated with the 2026-08-14 engine pivot: llama.cpp is the inference
-        // engine now; ds4 remains only as the frozen DSv4-Flash legacy backend
-        // (opt-in via IDLETOKEN_FORCE_BACKEND=ds4). NOTICE carries the full
-        // third-party list, as Apache-2.0 §4(d) requires.
-        { type: "note", label: {
-          en: "Apache-2.0. Inference is powered by llama.cpp (MIT). Includes ds4 (MIT) as a legacy optional backend; other third-party components are listed in NOTICE.",
-          zh: "Apache-2.0 许可。推理引擎为 llama.cpp（MIT）；内含 ds4（MIT）作为遗留可选组件；其余第三方组件见 NOTICE。" } },
-      ] },
-    ],
-  },
-  {
-    id: "advanced",
-    label: { en: "Advanced · coming soon", zh: "高级 · 即将推出" },
-    note: {
-      en: "Planned capabilities, shown so you know what's coming. Controls are disabled until the engine/OS integration lands — changing them would do nothing today.",
-      zh: "这些能力已在规划中，提前展示让你知道方向；在引擎/系统集成落地前控件不可用——现在改了也不会生效。",
-    },
-    sections: [
-      { label: { en: "Compute", zh: "计算" }, fields: [
-        { key: "computeMode", type: "select", label: { en: "Compute mode", zh: "计算模式" }, reserved: true, options: [
-          { value: "auto", label: { en: "Auto", zh: "自动" } }, { value: "gpu_only", label: { en: "GPU only", zh: "纯 GPU" } }, { value: "hybrid", label: { en: "Hybrid", zh: "混合" } } ] },
-      ] },
-      { label: { en: "Sampling defaults", zh: "默认采样" }, fields: [
-        { key: "temperature", type: "slider", label: { en: "Temperature", zh: "温度" }, min: 0, max: 2, step: 0.05, reserved: true },
-        { key: "topP", type: "slider", label: { en: "Top-p", zh: "Top-p" }, min: 0, max: 1, step: 0.01, reserved: true },
-        { key: "topK", type: "number", label: { en: "Top-k", zh: "Top-k" }, reserved: true },
-      ] },
-      { label: { en: "KV cache", zh: "KV 缓存" }, fields: [
-        { key: "kvMaxMb", type: "number", label: { en: "Max size (MiB)", zh: "尺寸上限（MiB）" }, reserved: true },
-        { key: "kvTtlDays", type: "number", label: { en: "Idle TTL (days)", zh: "空闲保留（天）" }, reserved: true },
-        { key: "kvEviction", type: "select", label: { en: "Eviction policy", zh: "驱逐策略" }, reserved: true, options: [
-          { value: "lru", label: { en: "LRU (least recently used)", zh: "LRU（最久未用先出）" } },
-          { value: "fifo", label: { en: "FIFO (oldest first)", zh: "FIFO（最早写入先出）" } } ] },
-        { key: "kvOffload", type: "toggle", label: { en: "Offload live KV to disk when VRAM is tight", zh: "显存吃紧时把在用 KV 卸载到磁盘" }, reserved: true },
-      ] },
-      { label: { en: "API hardening", zh: "API 加固" }, fields: [
-        { key: "apiOpenAI", type: "toggle", label: { en: "OpenAI API", zh: "OpenAI API" }, reserved: true },
-        { key: "apiAnthropic", type: "toggle", label: { en: "Anthropic API", zh: "Anthropic API" }, reserved: true },
-        { key: "apiStreaming", type: "toggle", label: { en: "Streaming (SSE)", zh: "流式 (SSE)" }, reserved: true },
-        { key: "apiLocalOnly", type: "toggle", label: { en: "Localhost only", zh: "仅本地" }, reserved: true },
-        { key: "apiCors", type: "text", label: { en: "CORS origins", zh: "CORS 来源" }, reserved: true },
-        { key: "apiRateLimit", type: "number", label: { en: "Rate limit (req/min, 0=off)", zh: "限流（次/分，0=关）" }, reserved: true },
-        { key: "apiTimeoutSec", type: "number", label: { en: "Request timeout (s)", zh: "请求超时（秒）" }, reserved: true },
-        { key: "apiRequestLog", type: "toggle", label: { en: "Log requests", zh: "记录请求" }, reserved: true },
-      ] },
-      { label: { en: "Power & thermal", zh: "电源与散热" }, fields: [
-        { key: "pauseOnGpuBusy", type: "toggle", label: { en: "Pause when I'm using the GPU (gaming)", zh: "我在用 GPU（游戏）时暂停" }, reserved: true },
-        { key: "pauseOnBattery", type: "toggle", label: { en: "Pause on battery", zh: "用电池时暂停" }, reserved: true },
-        { key: "scheduleEnabled", type: "toggle", label: { en: "Only run on a schedule", zh: "仅按时段运行" }, reserved: true },
-        { key: "scheduleFrom", type: "time", label: { en: "From", zh: "从" }, reserved: true, showIf: (s) => s.scheduleEnabled },
-        { key: "scheduleTo", type: "time", label: { en: "To", zh: "到" }, reserved: true, showIf: (s) => s.scheduleEnabled },
-        { key: "powerLimitPct", type: "slider", label: { en: "GPU power limit", zh: "GPU 功耗上限" }, min: 30, max: 100, step: 5, unit: "%", reserved: true },
-        { key: "tempLimitC", type: "number", label: { en: "Throttle above °C (0=off)", zh: "超过 °C 降频（0=关）" }, reserved: true },
-      ] },
-      { label: { en: "Notifications", zh: "通知" }, fields: [
-        { key: "notifyEnabled", type: "toggle", label: { en: "Enable notifications", zh: "启用通知" }, reserved: true },
-        { key: "notifyNodeChange", type: "toggle", label: { en: "Machine joins / leaves", zh: "机器加入 / 退出" }, reserved: true, showIf: (s) => s.notifyEnabled },
-        { key: "notifyReady", type: "toggle", label: { en: "Cluster ready", zh: "集群就绪" }, reserved: true, showIf: (s) => s.notifyEnabled },
-        { key: "notifyErrors", type: "toggle", label: { en: "Errors", zh: "错误" }, reserved: true, showIf: (s) => s.notifyEnabled },
-        { key: "notifyDownload", type: "toggle", label: { en: "Download finished", zh: "下载完成" }, reserved: true, showIf: (s) => s.notifyEnabled },
-        { key: "notifySound", type: "toggle", label: { en: "Play a sound", zh: "播放声音" }, reserved: true, showIf: (s) => s.notifyEnabled },
-      ] },
-      // Window / startup / updates moved OUT of this category on 2026-08-13,
-      // into the visible "Startup & updates" one below: they are wired to the
-      // shell now (src-tauri/src/window.rs, tray.rs, update.rs). Only the one
-      // that still has no implementation stayed behind.
-      { label: { en: "Startup", zh: "启动" }, fields: [
-        { key: "autoRejoin", type: "toggle", label: { en: "Auto-rejoin last cluster", zh: "自动重连上次集群" }, reserved: true },
-      ] },
-      { label: { en: "Privacy hardening", zh: "隐私增强" }, fields: [
-        { key: "privacyEncryptAtRest", type: "toggle", label: { en: "Encrypt data at rest (KV, snapshots)", zh: "落盘加密（KV、快照）" }, reserved: true },
-        { key: "privacyLockMemory", type: "toggle", label: { en: "Lock plaintext in memory (mlock)", zh: "锁定明文内存 (mlock)" }, reserved: true },
-        { key: "privacyPadding", type: "toggle", label: { en: "Pad request length", zh: "填充请求长度" }, reserved: true },
-        { key: "privacyDpNoise", type: "toggle", label: { en: "Differential-privacy noise", zh: "差分隐私噪声" }, reserved: true },
-        { key: "privacyDummyTokens", type: "toggle", label: { en: "Insert dummy tokens", zh: "插入 dummy token" }, reserved: true },
+        // **Apache-2.0** — LICENSE, NOTICE and the README have always said so.
+        // The third-party inventory (llama.cpp, ds4, both MIT) was cut from
+        // this line on 2026-08-15: the NOTICE file that ships with the build is
+        // the attribution Apache-2.0 §4(d) actually requires, and an About box
+        // that re-lists it is a second copy to keep true.
+        { type: "note", label: { en: "Apache-2.0.", zh: "Apache-2.0 许可。" } },
       ] },
     ],
   },
 ];
 
-// Hidden for now (2026-08-11): "Advanced · coming soon" was a roadmap shelf —
-// 19 disabled controls for things the engine/OS side hasn't landed. Until they
-// are wired it is noise, so the category is kept in the schema (defaults and
-// AppSettings keys are unchanged, nothing migrates) but taken out of the nav
-// and out of search. Delete the id from this set to bring it back.
-const HIDDEN_CATEGORIES: ReadonlySet<string> = new Set(["advanced"]);
-const VISIBLE_CATEGORIES = CATEGORIES.filter((c) => !HIDDEN_CATEGORIES.has(c.id));
+// The "Advanced · coming soon" roadmap shelf is deleted outright (2026-08-15;
+// it had been hidden from the nav since 2026-08-11). AppSettings keys and
+// defaults for its reserved fields are unchanged, so nothing migrates.
+const VISIBLE_CATEGORIES = CATEGORIES;
 
 // ---- panel -----------------------------------------------------------------
 export default function SettingsPanel(props: {
@@ -410,18 +359,21 @@ export default function SettingsPanel(props: {
   // on whatever was open last. Applied on mount only — after that the nav owns
   // the selection, so navigating away inside settings isn't fought.
   initialCategory?: string | null;
-  // Weight presence + download control for the SELECTED model. Owned by App
-  // (it holds the progress-event subscription); rendered on the model row.
-  weights?: WeightsInfo;
-  /** Selecting a model IS the switch (2026-08-15): one semantic everywhere.
-   *  This routes the pick through the same flow as the model picker — save the
-   *  choice; if something is running, stop it and rebuild with the new model.
-   *  When absent (embedded reuse), the pick falls back to a plain setting
-   *  write. */
-  onSwitchModel?: (modelId: string, quant: string) => void;
-  /** Re-probe the selected model's weights — the stored-models list calls it
-   *  after a deletion, so the row above cannot keep claiming "ready" for a file
-   *  that is no longer there. */
+  // ---- the download manager (2026-08-15 split) ----
+  // Settings owns downloading and ONLY downloading: every model row shows its
+  // own weight state with its own download/cancel, independent of which model
+  // is selected. Selection and switching live on the Cluster page; chatting
+  // shows the model read-only. App owns the progress-event subscription, so
+  // the live pieces arrive as props keyed by gguf file name.
+  downloads?: Record<string, { have: number; total: number; note?: string }>;
+  downloadErrors?: Record<string, string>;
+  /** Bumped by App whenever a download settles or weights are deleted — every
+   *  row re-probes the disk. */
+  weightsVersion?: number;
+  onStartDownload?: (file: string, target: DownloadTarget) => void;
+  onCancelDownload?: (file: string) => void;
+  /** Something changed the model folder (the stored-models list calls it after
+   *  a deletion) — App re-probes and bumps weightsVersion. */
   onWeightsChanged?: () => void;
   /** Run an update check the user asked for. App owns it because every outcome
    *  — found / already current / could not check — is shown in the same
@@ -450,8 +402,46 @@ export default function SettingsPanel(props: {
   const [upd, setUpd] = useState<"idle" | "busy">("idle");
   const fileRef = useRef<HTMLInputElement>(null);
   const s = props.settings;
+  // Which model card is unfolded in the download manager. Clicking a card is
+  // browsing — "show me this model's precisions" — and nothing more; what RUNS
+  // is chosen on the Cluster page. Defaults to the model in use.
+  const [openModelId, setOpenModelId] = useState<string>(s.modelId);
+  // Per-model precision being VIEWED (and downloaded) — pure page state, never
+  // written to settings.
+  const [viewQuant, setViewQuant] = useState<Record<string, string>>({});
   const set = <K extends keyof AppSettings>(k: K, v: AppSettings[K]) => props.onChange({ ...s, [k]: v });
   const setCap = (k: "maxVramMb" | "maxRamMb", v: number) => props.onChange({ ...s, [k]: v, resourcePreset: "custom" });
+
+  // Model-folder editing. The draft is committed on blur/Enter rather than per
+  // keystroke — see the field for why. It re-syncs when the stored value
+  // changes underneath us (the picker below, or an imported settings file).
+  const [dirDraft, setDirDraft] = useState(s.modelDir);
+  useEffect(() => setDirDraft(s.modelDir), [s.modelDir]);
+  // What an empty setting resolves to, shown as the placeholder so the field
+  // says where the weights actually go instead of looking unconfigured.
+  const [defaultDir, setDefaultDir] = useState("");
+  useEffect(() => {
+    if (!inTauri()) return;
+    let live = true;
+    defaultModelDir().then((d) => live && setDefaultDir(d)).catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  /** Native folder picker. Typing a path is still allowed (pasting one is
+   *  normal), but on Windows — where this matters most, because the weights go
+   *  on D: — hand-typed paths are the failure. */
+  const pickModelDir = async () => {
+    if (!inTauri()) return;
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const picked = await open({ directory: true, multiple: false, defaultPath: s.modelDir || defaultDir || undefined });
+      if (typeof picked === "string" && picked) set("modelDir", picked);
+    } catch {
+      /* cancelled or unavailable: the text field remains the way in */
+    }
+  };
   // The caps actually in force — the same function App feeds to the probe and
   // to the engine, so the panel can never quote a limit the engine is not
   // given. Under a preset these are a fraction of this machine's totals; under
@@ -616,95 +606,133 @@ export default function SettingsPanel(props: {
     <>
       <div className="setting-group">
         <div className="setting-group__label">{t("settings.model")}</div>
+        {/* The download manager (2026-08-15 split). Clicking a card unfolds it
+            — that is browsing, not choosing what runs (the Cluster page owns
+            that; the tag on a card only reports it). The unfolded card shows
+            ONE precision dropdown and ONE weights row for the precision being
+            viewed — every precision was listed flat here once, and a page of
+            near-identical rows drowned the two facts that matter. Downloads
+            keep running when the card folds or the dropdown moves; the header
+            badge keeps them discoverable. */}
         <div className="model-list">
-          {AVAILABLE_MODELS.map((m) => (
-            <label key={m.id} className={`model-opt${s.modelId === m.id ? " is-on" : ""}`}>
-              <input
-                type="radio"
-                name="model"
-                checked={s.modelId === m.id}
-                // Switching model resets precision to that model's default so
-                // we never carry a quant the new model doesn't offer. The pick
-                // goes through the switch flow: if a cluster or local engine is
-                // running, it is stopped and rebuilt with this model — there is
-                // no "setting disagrees with what is running" state to explain.
-                onChange={() =>
-                  props.onSwitchModel
-                    ? props.onSwitchModel(m.id, defaultQuant(m.id))
-                    : props.onChange({ ...s, modelId: m.id, quant: defaultQuant(m.id) })
-                }
-              />
-              <span className="model-opt__name">{m.label}</span>
-              <span className="model-opt__params">{m.params}</span>
-              {/* Whether a model can be pooled across machines changes what the
-                  Cluster screen will let you do, and that is not guessable from
-                  its size — say it on the row where the choice is made. */}
-              <span className="model-opt__deploy">
-                {t(m.singleNode ? "settings.model.singleNode" : "settings.model.cluster")}
-              </span>
-              {/* Weight status sits on the SELECTED row only. It used to be a
-                  floating bar pinned to every screen, which is wrong twice:
-                  "no weights yet" is the resting state of a fresh install (so
-                  the bar never left), and the thing it is about — which model —
-                  is chosen right here. One probe, on the model it describes. */}
-              {s.modelId === m.id && props.weights ? <WeightsRow w={props.weights} idle="show" /> : null}
-            </label>
-          ))}
-          {/* Open-intake selection (v2 WS-D1): when the setting points at a
-              user-supplied GGUF, the curated radios above are all unchecked —
-              this row says what IS selected instead of leaving the list
-              looking broken. Changing/choosing an open model happens in the
-              model picker (chat header / cluster card), which owns the file
-              dialog and the HF input. */}
-          {isLocalGguf(s.modelId) ? (
-            <label className="model-opt is-on">
-              <input type="radio" name="model" checked readOnly />
-              <span className="model-opt__name">
-                {customGgufName({
-                  source: s.customSource,
-                  path: s.customGgufPath,
-                  repo: s.customHfRepo,
-                  file: s.customHfFile,
-                })}
-              </span>
-              <span className="model-opt__params">{t("model.open.badge")}</span>
-              <span className="model-opt__deploy">{t("settings.model.singleNode")}</span>
-              {props.weights ? <WeightsRow w={props.weights} idle="show" /> : null}
-            </label>
-          ) : null}
+          {/* One card per BRAND (2026-08-15): a flat list of ~10 models, each
+              with up to 26 precisions, ran off the screen. The choice is a
+              funnel — whose model, then how big, then how precise — so the UI
+              is one too: pick a brand card, pick a size inside it, pick the
+              precision next to the size. */}
+          {MODEL_BRANDS.map((brand) => {
+            const inBrand = brand.models.some((m) => m.id === openModelId);
+            const sel = inBrand
+              ? brand.models.find((m) => m.id === openModelId)!
+              : brand.models[0];
+            const open = inBrand;
+            const variants = hasQuantChoice(sel.id) ? quantOptions(sel.id) : [];
+            const q =
+              viewQuant[sel.id] ??
+              (s.modelId === sel.id ? s.quant || defaultQuant(sel.id) : defaultQuant(sel.id));
+            const target = resolveDownload(getManifest(sel.id), q);
+            // "Something in this brand is downloading" — computed over every
+            // size AND precision, so a collapsed card still says so.
+            const busy = brand.models.some((m) =>
+              (hasQuantChoice(m.id) ? quantOptions(m.id) : []).some(
+                (v) => props.downloads?.[resolveDownload(getManifest(m.id), v.quant)?.file ?? ""]
+              ) || props.downloads?.[resolveDownload(getManifest(m.id))?.file ?? ""]
+            );
+            const current = brand.models.find((m) => m.id === s.modelId);
+            return (
+              <div key={brand.id} className={`model-opt model-opt--rows${open ? " is-on" : ""}`}>
+                <div
+                  className="model-opt__head"
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => setOpenModelId(open ? "" : brand.models[0].id)}
+                  onKeyDown={(e) =>
+                    (e.key === "Enter" || e.key === " ") && setOpenModelId(open ? "" : brand.models[0].id)
+                  }
+                >
+                  <span className="model-opt__name">{brand.label}</span>
+                  <span className="model-opt__params">
+                    {brand.models.length}
+                    {L({ en: " sizes", zh: " 个规格" }, lang)}
+                  </span>
+                  {current ? (
+                    <span className="model-opt__deploy">{t("settings.model.current")}</span>
+                  ) : null}
+                  {busy && !open ? (
+                    <span className="model-opt__deploy model-opt__deploy--busy">
+                      {L({ en: "Downloading", zh: "下载中" }, lang)}
+                    </span>
+                  ) : null}
+                </div>
+                {open ? (
+                  <>
+                    {/* The sizes in this brand. One click switches which size
+                        the precision row below is about; nothing is applied to
+                        the cluster from here (that is the Cluster page's job). */}
+                    <div className="model-sizes">
+                      {brand.models.map((m) => (
+                        <button
+                          key={m.id}
+                          className={`model-size${m.id === sel.id ? " is-on" : ""}`}
+                          onClick={() => setOpenModelId(m.id)}
+                        >
+                          {/* Brand stripped (the card title already says it)
+                              and the params suppressed when the name already
+                              carries them — "Qwen3.5 4B" beside "4B" said the
+                              same thing twice. */}
+                          <span className="model-size__name">{shortModelLabel(m.label, brand.label)}</span>
+                          {shortModelLabel(m.label, brand.label)
+                            .replace(/\s+/g, "")
+                            .toUpperCase()
+                            .includes(m.params.split("·")[0].replace(/\s+/g, "").toUpperCase()) ? null : (
+                            <span className="model-size__params">{m.params}</span>
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                    <div className="model-variant">
+                      {variants.length > 0 ? (
+                        <>
+                          <span className="model-variant__q">{t("settings.precision")}</span>
+                          <select
+                            className="select"
+                            value={q}
+                            onChange={(e) => setViewQuant((v) => ({ ...v, [sel.id]: e.target.value }))}
+                          >
+                            {variants.map((v) => (
+                              <option key={v.quant} value={v.quant}>
+                                {v.quant} · {fmtBytes(v.layer_weight_bytes + v.shared_weight_bytes)}
+                              </option>
+                            ))}
+                          </select>
+                        </>
+                      ) : target ? (
+                        <span className="model-variant__size">{fmtBytes(target.expectBytes)}</span>
+                      ) : null}
+                      {target ? (
+                        <ModelWeightsCell
+                          file={target.file}
+                          target={target}
+                          modelDir={s.modelDir}
+                          version={props.weightsVersion ?? 0}
+                          dl={props.downloads?.[target.file] ?? null}
+                          lastError={props.downloadErrors?.[target.file] ?? null}
+                          onStart={() => props.onStartDownload?.(target.file, target)}
+                          onCancel={() => props.onCancelDownload?.(target.file)}
+                        />
+                      ) : null}
+                    </div>
+                  </>
+                ) : null}
+              </div>
+            );
+          })}
         </div>
-        {!isLocalGguf(s.modelId) && hasQuantChoice(s.modelId) ? (
-          <div className="setting-row setting-row--inline" style={{ marginTop: 10 }}>
-            <div className="setting-row__label">
-              <span className="setting-row__k">{t("settings.precision")}</span>
-            </div>
-            <div className="setting-row__control">
-              <select
-                className="select"
-                value={s.quant || defaultQuant(s.modelId)}
-                // A precision change is a model switch too — different weights,
-                // same restart semantics as picking another model.
-                onChange={(e) =>
-                  props.onSwitchModel
-                    ? props.onSwitchModel(s.modelId, e.target.value)
-                    : set("quant", e.target.value)
-                }
-              >
-                {quantOptions(s.modelId).map((v) => (
-                  <option key={v.quant} value={v.quant}>
-                    {v.quant} · {fmtBytes(v.layer_weight_bytes + v.shared_weight_bytes)}
-                  </option>
-                ))}
-              </select>
-            </div>
-          </div>
-        ) : null}
-        {/* "What can I run?" moved here from the cluster card (2026-08-11).
-            On the cluster card it was a table of models you could not choose —
-            it listed what the hardware supports next to no way to act on it.
-            Here it sits directly under the picker it is advice ABOUT. */}
-        <Capability apiBaseUrl={props.apiBaseUrl ?? null} />
       </div>
+      {/* Page order (2026-08-15, user-specified): models → context/performance
+          → storage → inference & cache → the capability table LAST. The table
+          is a summary verdict over everything set above it — context tier
+          changes its "max context" column — so it reads best at the bottom. */}
       <div className="setting-group">
         <div className="setting-group__label">{t("settings.tier")}</div>
         <div className="tier-list">
@@ -719,36 +747,93 @@ export default function SettingsPanel(props: {
           })}
         </div>
       </div>
+      {/* Storage: the folder the download manager writes into, and what it
+          holds. Moved here from "Cluster & API" (2026-08-15 reorg) — it
+          belongs next to the downloads it serves, not under cluster plumbing.
+
+          Models run to tens of GB, so the folder is routinely NOT on the
+          system disk and users keep weights on several. Two consequences,
+          both handled here (2026-08-15): a native folder picker, because
+          typing a Windows path by hand is where this goes wrong; and every
+          weights probe on this page is scoped to THIS folder, so pointing it
+          at another disk re-scans and finds what is already there. The wording
+          across the page says "the model folder", never "this machine". */}
       <div className="setting-group">
-        <div className="setting-group__label">{t("settings.resource")}</div>
-        <Segmented<ResourcePreset>
-          value={s.resourcePreset}
-          options={[
-            { value: "conservative", label: t("preset.conservative") },
-            { value: "balanced", label: t("preset.balanced") },
-            { value: "max", label: t("preset.max") },
-            ...(s.resourcePreset === "custom" ? [{ value: "custom" as ResourcePreset, label: t("preset.custom") }] : []),
-          ]}
-          onChange={(v) => set("resourcePreset", v)}
-        />
-        {/* The sliders show the limit that is IN EFFECT, not the stored custom
-            number. They are not a second, separate cap — they are the precise
-            form of the control above, and under a preset the value comes from
-            that preset (a share of this machine's total). Showing `s.maxVramMb`
-            here meant the default install said "Balanced" and "No limit" in the
-            same box, one line apart, while 75% was what the engine got.
-            Dragging either one takes over as a custom limit (setCap). */}
-        <CapSlider label={t("settings.maxVram")} noCap={t("settings.noCap")} totalBytes={props.snap.vram_total} valueMb={liveCaps.maxVramMb} onChange={(mb) => setCap("maxVramMb", mb)} />
-        <CapSlider label={t("settings.maxRam")} noCap={t("settings.noCap")} totalBytes={props.snap.ram_total} valueMb={liveCaps.maxRamMb} onChange={(mb) => setCap("maxRamMb", mb)} />
+        <div className="setting-group__label">{L({ en: "Storage", zh: "存储" }, lang)}</div>
+        <div className="setting-row setting-row--inline">
+          <div className="setting-row__label">
+            <span className="setting-row__k">{L({ en: "Model folder", zh: "模型目录" }, lang)}</span>
+          </div>
+          <div className="setting-row__control setting-row__control--dir">
+            <input
+              className="field__input field__input--inline"
+              type="text"
+              value={dirDraft}
+              placeholder={defaultDir || "~/.idletoken/models"}
+              // Committed on blur / Enter, not per keystroke: every commit
+              // re-probes every model row and re-scans the folder, and a
+              // half-typed path ("D:\mod") is a folder that holds nothing —
+              // so typing used to flash "not in the model folder" down the
+              // whole list before you reached the end of the path.
+              onChange={(e) => setDirDraft(e.target.value)}
+              onBlur={() => dirDraft !== s.modelDir && set("modelDir", dirDraft)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                if (e.key === "Escape") setDirDraft(s.modelDir);
+              }}
+            />
+            <button className="btn-secondary btn-secondary--sm" onClick={() => void pickModelDir()}>
+              {L({ en: "Browse…", zh: "选择目录…" }, lang)}
+            </button>
+          </div>
+        </div>
+        <div className="setting-row">
+          <span className="setting-row__k">{L({ en: "Weights in this folder", zh: "该目录下的权重" }, lang)}</span>
+        </div>
+        <StoredModels modelDir={s.modelDir} onChanged={props.onWeightsChanged} />
       </div>
+      {/* Moved from "Cluster & API" (2026-08-15 reorg): reply length and the
+          KV cache are properties of running models, not of cluster plumbing.
+          Rendered through the same field renderer the schema pages use. */}
       <div className="setting-group">
-        <div className="setting-group__label">{t("settings.appearance")}</div>
-        <div className="setting-row setting-row--inline"><span className="setting-row__k">{t("settings.language")}</span>
-          <Segmented<Lang> options={[{ value: "en", label: "EN" }, { value: "zh", label: "中文" }]} value={props.lang} onChange={props.onLang} /></div>
-        <div className="setting-row setting-row--inline"><span className="setting-row__k">{t("settings.theme")}</span>
-          <Segmented<Theme> options={[{ value: "dark", label: t("settings.themeDark") }, { value: "light", label: t("settings.themeLight") }]} value={props.theme} onChange={props.onTheme} /></div>
+        <div className="setting-group__label">{L({ en: "Inference & cache", zh: "推理与缓存" }, lang)}</div>
+        {renderField({ key: "maxTokens", type: "number", label: { en: "Max tokens per reply", zh: "单次最大生成 tokens" } }, 0)}
+        {renderField({ key: "kvDir", type: "text", label: { en: "KV cache directory", zh: "KV 缓存目录" }, placeholder: "/tmp/idletoken-kv" }, 1)}
+        {renderField({ type: "action", action: "clearKv", label: { en: "Clear KV cache", zh: "清除 KV 缓存" } }, 2)}
+      </div>
+      {/* "What can I run?" — the summary verdict, last on purpose (see the
+          order note above). Moved out of the model group 2026-08-15. */}
+      <div className="setting-group">
+        <Capability apiBaseUrl={props.apiBaseUrl ?? null} />
       </div>
     </>
+  );
+
+  // "Resource usage" — its own page since 2026-08-15 (was the bottom of the
+  // Models page): how much of this machine a cluster may use applies to
+  // whatever model runs, so it is machine configuration, not model choice.
+  const renderResources = () => (
+    <div className="setting-group">
+      <Segmented<ResourcePreset>
+        value={s.resourcePreset}
+        options={[
+          { value: "conservative", label: t("preset.conservative") },
+          { value: "balanced", label: t("preset.balanced") },
+          { value: "max", label: t("preset.max") },
+          ...(s.resourcePreset === "custom" ? [{ value: "custom" as ResourcePreset, label: t("preset.custom") }] : []),
+        ]}
+        onChange={(v) => set("resourcePreset", v)}
+      />
+      {/* The sliders show the limit that is IN EFFECT, not the stored custom
+          number. They are not a second, separate cap — they are the precise
+          form of the control above, and under a preset the value comes from
+          that preset (a share of this machine's total). Showing `s.maxVramMb`
+          here meant the default install said "Balanced" and "No limit" in the
+          same box, one line apart, while 75% was what the engine got.
+          Dragging either one takes over as a custom limit (setCap). */}
+      <CapSlider label={t("settings.maxVram")} noCap={t("settings.noCap")} totalBytes={props.snap.vram_total} valueMb={liveCaps.maxVramMb} onChange={(mb) => setCap("maxVramMb", mb)} />
+      <CapSlider label={t("settings.maxRam")} noCap={t("settings.noCap")} totalBytes={props.snap.ram_total} valueMb={liveCaps.maxRamMb} onChange={(mb) => setCap("maxRamMb", mb)} />
+    </div>
   );
 
   const inner = (
@@ -783,16 +868,34 @@ export default function SettingsPanel(props: {
               <h3 className="settings-content__title">{L(cat.label, lang)}</h3>
               {cat.note ? <div className="cat-note">{L(cat.note, lang)}</div> : null}
               {cat.bespoke === "quick" ? renderQuick() : null}
+              {cat.bespoke === "resources" ? renderResources() : null}
               {cat.bespoke === "endpoints" ? <EndpointsPanel settings={s} /> : null}
-              {cat.bespoke === "platform" ? (
-                <PlatformPanel
-                  settings={s}
-                  session={props.session ?? null}
-                  // "no platform URL" sends you to the field that fixes it,
-                  // which lives one category over — not to a dead end.
-                  onOpenSettings={() => setActive("connect")}
-                  onSignIn={props.onSignIn ?? (() => {})}
-                />
+              {/* Language and theme live with the rest of Appearance (moved
+                  from the model page 2026-08-15). They are not AppSettings
+                  fields — the app shell owns them — so they render here rather
+                  than through the schema. */}
+              {cat.id === "appearance" ? (
+                <div className="setting-group">
+                  <div className="setting-row setting-row--inline">
+                    <span className="setting-row__k">{t("settings.language")}</span>
+                    <Segmented<Lang>
+                      options={[{ value: "en", label: "EN" }, { value: "zh", label: "中文" }]}
+                      value={props.lang}
+                      onChange={props.onLang}
+                    />
+                  </div>
+                  <div className="setting-row setting-row--inline">
+                    <span className="setting-row__k">{t("settings.theme")}</span>
+                    <Segmented<Theme>
+                      options={[
+                        { value: "dark", label: t("settings.themeDark") },
+                        { value: "light", label: t("settings.themeLight") },
+                      ]}
+                      value={props.theme}
+                      onChange={props.onTheme}
+                    />
+                  </div>
+                </div>
               ) : null}
               {cat.sections?.map((sec, si) => (
                 <div className="setting-group" key={si}>
@@ -800,11 +903,7 @@ export default function SettingsPanel(props: {
                   {sec.fields.map((f, i) => renderField(f, i))}
                 </div>
               ))}
-              {/* Sharing & earnings holds no settings — a "reset to defaults"
-                  under a credit ledger reads like it would reset the ledger. */}
-              {cat.bespoke === "platform" ? null : (
-                <button className="linkbtn" onClick={() => props.onChange({ ...DEFAULT_SETTINGS })}>{t("settings.reset")}</button>
-              )}
+              <button className="linkbtn" onClick={() => props.onChange({ ...DEFAULT_SETTINGS })}>{t("settings.reset")}</button>
             </>
           )}
         </div>

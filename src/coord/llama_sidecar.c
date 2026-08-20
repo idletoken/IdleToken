@@ -1,4 +1,4 @@
-/* llama_sidecar.c — spawn + supervise a local llama-server (WS-B1).
+/* llama_sidecar.c — spawn + supervise a local idletoken-server (WS-B1).
  *
  * See include/idletoken_llama_sidecar.h for the contract. Design notes:
  *
@@ -12,7 +12,7 @@
  *    "Quick" means the child never reached STABLE_UPTIME_MS of READY uptime.
  *
  *  - The child's stdout/stderr go to a log file of their own, opened in the
- *    child after fork. llama-server's default log level prints request
+ *    child after fork. idletoken-server's default log level prints request
  *    metadata but no prompt text; we deliberately pass NO extra verbosity
  *    flags (no -v, never --log-prompts-dir) so that stays true. The
  *    coordinator's own stderr never carries engine output at all.
@@ -27,6 +27,7 @@
 #include <string.h>
 #include <time.h>
 #include <pthread.h>
+#include <sys/stat.h>   /* engine-log size at spawn (see llama_scan_log) */
 
 #ifdef _WIN32
   #include <winsock2.h>
@@ -46,6 +47,15 @@
 #define LLAMA_MAX_QUICK_RESTARTS 5     /* = engine.rs MAX_QUICK_RESTARTS */
 #define LLAMA_STABLE_UPTIME_MS 60000   /* = engine.rs STABLE_UPTIME_MS */
 #define LLAMA_HEALTH_TIMEOUT_MS 2000
+/* Bounded waiting on the engine while relaying inference (see
+ * idletoken_llama_http_watch). The slice only bounds how often we get to look
+ * around; it is NOT a deadline for the engine. */
+#define LLAMA_READ_SLICE_MS     5000
+/* Silence shorter than this is ordinary prefill on a large model — do not go
+ * knocking. Past it, ask the engine whether it is still there, no more often
+ * than LLAMA_PROBE_EVERY_MS. */
+#define LLAMA_SILENCE_GRACE_MS 15000
+#define LLAMA_PROBE_EVERY_MS   10000
 #define LLAMA_ARGV_MAX 64
 
 struct idletoken_llama {
@@ -55,8 +65,12 @@ struct idletoken_llama {
     char log_path[512];
     char cluster_args[1024];  /* WS-C cluster flags (--rpc/--device/--tensor-split) */
     char extra_args[1024];    /* IDLETOKEN_LLAMA_ARGS copy, split at spawn */
+    int  shared;              /* serving OTHER people's requests — see below */
+    char sock_path[256];      /* AF_UNIX path, or "" for TCP loopback */
+    char endpoint[300];       /* "127.0.0.1:<port>" | "unix:<sock_path>" */
     int  port;
-    uint32_t ctx_size;
+    uint32_t ctx_size;        /* context of ONE slot */
+    int  n_parallel;          /* -np: independent sequences the engine serves */
 
     /* state (under mu) */
     pthread_mutex_t mu;
@@ -70,7 +84,12 @@ struct idletoken_llama {
     long long spawned_ms;     /* when the current child was exec'd */
     long long became_ready_ms;/* when it last turned READY (0 = never) */
     long long restart_due_ms; /* RESTARTING: when the backoff expires */
-    char fail[256];           /* FAILED: the reason, for the API surface */
+    char fail[700];           /* FAILED: the reason, for the API surface */
+    /* Engine-log watch (see idletoken_llama_fatal_reason). The log is APPENDED
+     * to across runs, so the offset is stamped at each spawn: scanning from 0
+     * would re-read a previous run's warning and refuse a start that is fine. */
+    long long log_off;
+    char fatal[700];          /* startup condition the coordinator must refuse over */
 #ifdef _WIN32
     HANDLE child_handle;      /* kept until exit is observed / shutdown */
     HANDLE job;               /* kill-on-close: no orphan on hard coord exit */
@@ -147,16 +166,22 @@ static const char *hdr_find(const char *hay, size_t hay_len, const char *needle)
     return NULL;
 }
 
-int idletoken_llama_http_open(int port, const char *method, const char *path,
+int idletoken_llama_http_open(const char *endpoint, const char *method,
+                              const char *path,
                               const char *body, size_t body_len,
                               int timeout_ms, idletoken_llama_conn *c) {
     memset(c, 0, sizeof(*c));
     c->fd = -1;
     c->content_left = -1;
 
-    char addr[32];
-    snprintf(addr, sizeof(addr), "127.0.0.1:%d", port);
-    int fd = idletoken_connect_tcp(addr);
+    if (!endpoint || !endpoint[0]) return -1;
+    /* "unix:<path>" is the shared-mode transport. The Host header still has to
+     * be a name (cpp-httplib does not care which), so a socket endpoint sends
+     * "localhost" rather than a filesystem path. */
+    int is_unix = strncmp(endpoint, "unix:", 5) == 0;
+    const char *host_hdr = is_unix ? "localhost" : endpoint;
+    int fd = is_unix ? idletoken_connect_unix(endpoint + 5)
+                     : idletoken_connect_tcp(endpoint);
     if (fd < 0) return -1;
     conn_set_timeout(fd, timeout_ms);
 
@@ -167,7 +192,7 @@ int idletoken_llama_http_open(int port, const char *method, const char *path,
                       "Content-Type: application/json\r\n"
                       "Content-Length: %zu\r\n"
                       "Connection: close\r\n\r\n",
-                      method, path, addr, body_len);
+                      method, path, host_hdr, body_len);
     if (hn < 0 || (size_t)hn >= sizeof(head)) { idletoken_close_fd(fd); return -1; }
     if (idletoken_sendall(fd, head, (size_t)hn) < 0 ||
         (body_len && idletoken_sendall(fd, body, body_len) < 0)) {
@@ -209,11 +234,65 @@ int idletoken_llama_http_open(int port, const char *method, const char *path,
     return 0;
 }
 
+/* Did that recv fail only because the slice expired, or for a real reason? */
+static int conn_recv_timed_out(void) {
+#ifdef _WIN32
+    int e = WSAGetLastError();
+    return e == WSAETIMEDOUT || e == WSAEWOULDBLOCK;
+#else
+    return errno == EAGAIN || errno == EWOULDBLOCK;
+#endif
+}
+
+static int llama_health_ok(const char *endpoint);   /* defined below */
+
+/* recv() with the bounded-wait policy applied (see idletoken_llama_http_watch).
+ *
+ * EVERY read goes through here. Routing only one of the two readers through it
+ * is worse than routing neither: idletoken_llama_http_watch sets SO_RCVTIMEO on
+ * the socket, so a reader that does not know about slices sees an ordinary
+ * timeout and calls the stream dead — which would kill any prefill silent for
+ * longer than one slice, i.e. every large model. Measured: with only
+ * conn_raw_read converted, a frozen engine was reported as `decode_failed`
+ * after 5s and the liveness check never ran at all. */
+static ssize_t conn_recv_watched(idletoken_llama_conn *c, void *dst, size_t cap) {
+    for (;;) {
+        ssize_t r = conn_recv(c->fd, dst, cap);
+        if (r >= 0) {                      /* any byte means the engine is there */
+            c->silent_ms = 0;
+            c->probed_at_ms = 0;
+            return r;
+        }
+        /* Not watching, or a genuine socket error: unchanged behaviour. */
+        if (c->slice_ms <= 0 || !conn_recv_timed_out()) return r;
+        c->silent_ms += c->slice_ms;
+        if (!c->watch || c->silent_ms < LLAMA_SILENCE_GRACE_MS ||
+            c->silent_ms - c->probed_at_ms < LLAMA_PROBE_EVERY_MS)
+            continue;                      /* still plausibly just a long prefill */
+        c->probed_at_ms = c->silent_ms;
+        if (llama_health_ok(c->watch)) continue;   /* alive and working: keep waiting */
+        /* It is not answering any more, and waiting longer cannot help. The
+         * check is PER CONNECTION, which is what keeps this to one lost
+         * request: the other pool threads go on serving their own slots.
+         * (Until the pool landed on 2026-08-18 this thread was the
+         * coordinator's only executor, so parking here stopped everything —
+         * that is the failure the check was written for, and the reason it
+         * still matters is that a dead relay must not become a dead machine.) */
+        fprintf(stderr,
+                "coord: llama-sidecar: the engine stopped answering (%llds of silence, "
+                "and GET /health no longer succeeds) — failing this request rather than "
+                "waiting forever; other in-flight requests are unaffected\n",
+                (long long)(c->silent_ms / 1000));
+        c->eof = 1;
+        return -1;
+    }
+}
+
 /* One raw payload byte (post-header stream): buffered leftover first, then the
  * socket. Returns 0..255, or -1 on EOF/error. */
 static int conn_byte(idletoken_llama_conn *c) {
     if (c->boff >= c->blen) {
-        ssize_t r = conn_recv(c->fd, c->buf, sizeof(c->buf));
+        ssize_t r = conn_recv_watched(c, c->buf, sizeof(c->buf));
         if (r <= 0) return -1;
         c->boff = 0;
         c->blen = (size_t)r;
@@ -230,7 +309,16 @@ static ssize_t conn_raw_read(idletoken_llama_conn *c, void *dst, size_t cap) {
         c->boff += have;
         return (ssize_t)have;
     }
-    return conn_recv(c->fd, dst, cap);
+    return conn_recv_watched(c, dst, cap);
+}
+
+void idletoken_llama_http_watch(idletoken_llama_conn *c, const char *endpoint) {
+    if (!c || c->fd < 0) return;
+    c->slice_ms     = LLAMA_READ_SLICE_MS;
+    c->watch        = endpoint;
+    c->silent_ms    = 0;
+    c->probed_at_ms = 0;
+    conn_set_timeout(c->fd, LLAMA_READ_SLICE_MS);
 }
 
 ssize_t idletoken_llama_http_read(idletoken_llama_conn *c, void *dst, size_t cap) {
@@ -325,13 +413,13 @@ void idletoken_llama_http_close(idletoken_llama_conn *c) {
 /* --- readiness probe ------------------------------------------------------ */
 
 /* READY means GET /health answered 200 with EXACTLY {"status":"ok"}.
- * llama-server binds its port while the model is still loading and answers
+ * idletoken-server binds its port while the model is still loading and answers
  * 503 {"error":{"message":"Loading model",...}} there — a status-only or
  * connect-only check reports ready long before the model exists (this exact
  * mistake invalidated three measurement runs; see the header comment). */
-static int llama_health_ok(int port) {
+static int llama_health_ok(const char *endpoint) {
     idletoken_llama_conn c;
-    if (idletoken_llama_http_open(port, "GET", "/health", NULL, 0,
+    if (idletoken_llama_http_open(endpoint, "GET", "/health", NULL, 0,
                                   LLAMA_HEALTH_TIMEOUT_MS, &c) != 0)
         return 0;
     size_t blen = 0;
@@ -351,6 +439,57 @@ static int llama_health_ok(int port) {
 
 /* --- spawn ---------------------------------------------------------------- */
 
+/* Locking argv is only half of it. llama.cpp applies environment variables
+ * BEFORE the command line (common/arg.cpp common_params_parse_ex: "handle
+ * environment variables" runs first), and 138 of its flags carry one. Argv
+ * wins for anything we pass — but for anything we DON'T, the environment is in
+ * sole control, and the child inherits ours, which the machine's owner sets.
+ * LLAMA_ARG_LOG_PROMPTS_DIR does not exist, but LLAMA_ARG_RPC + LLAMA_ARG_DEVICE
+ * would move layer 0 onto another machine (breaking the invariant that keeps
+ * the prompt recoverable only where the embedding table is), and the next
+ * upstream release may add one that matters more.
+ *
+ * So shared mode does to the environment what it already does to argv: an
+ * allow-list whose allowed set is (almost) empty. Everything in the engine's
+ * own namespaces goes, and exactly one variable comes back — GGML_RPC_PSK,
+ * which the coordinator sets itself and the cluster TLS link cannot work
+ * without. Note this also drops GGML_RPC_ALLOW_PLAINTEXT, which is right:
+ * "testing only" is not a thing to honour while holding someone else's prompt.
+ *
+ * Deliberately NOT applied in local mode — LLAMA_ARG_* is how you experiment
+ * with your own engine. */
+static int llama_env_is_engine_namespace(const char *name) {
+    return strncmp(name, "LLAMA_", 6) == 0 ||
+           strncmp(name, "GGML_", 5) == 0 ||
+           strncmp(name, "HF_", 3) == 0;
+}
+
+#ifndef _WIN32
+extern char **environ;
+
+/* Called in the CHILD between fork and exec. The names are collected first:
+ * unsetenv rewrites `environ` underneath a walk of it. */
+static void llama_scrub_env(void) {
+    char keep_psk[160] = "";
+    const char *psk = getenv("GGML_RPC_PSK");
+    if (psk) snprintf(keep_psk, sizeof(keep_psk), "%s", psk);
+
+    char names[128][64];
+    int n = 0;
+    for (char **e = environ; *e && n < 128; e++) {
+        const char *eq = strchr(*e, '=');
+        size_t len = eq ? (size_t)(eq - *e) : strlen(*e);
+        if (len >= sizeof(names[0])) continue;
+        char nm[64];
+        memcpy(nm, *e, len);
+        nm[len] = '\0';
+        if (llama_env_is_engine_namespace(nm)) snprintf(names[n++], 64, "%s", nm);
+    }
+    for (int i = 0; i < n; i++) unsetenv(names[i]);
+    if (keep_psk[0]) setenv("GGML_RPC_PSK", keep_psk, 1);
+}
+#endif
+
 /* Spawn the child. Called with the mutex held (fork+exec does not block).
  * Returns 0 and fills lc->pid / lc->spawned_ms, or -1 with lc->fail set. */
 static int llama_spawn(idletoken_llama *lc) {
@@ -362,25 +501,62 @@ static int llama_spawn(idletoken_llama *lc) {
              * coordinator log mistakes this cluster for a TLS one. */
             fprintf(stderr,
                     "coord: ==========================================================\n"
-                    "coord: == GGML_RPC_ALLOW_PLAINTEXT=1 is set: llama-server may  ==\n"
+                    "coord: == GGML_RPC_ALLOW_PLAINTEXT=1 is set: idletoken-server may  ==\n"
                     "coord: == move tensor traffic WITHOUT TLS. Testing only —      ==\n"
                     "coord: == never run a real cluster this way.                   ==\n"
                     "coord: ==========================================================\n");
         }
     }
+    /* A socket file left behind by a killed run makes the engine's bind fail
+     * with "address already in use" — AF_UNIX binds a path, and SO_REUSEADDR
+     * has nothing to say about that. Clearing it here covers respawns too. */
+    if (lc->sock_path[0]) {
 #ifdef _WIN32
-    char portstr[16], ctxstr[16], cmd[4096];
+        DeleteFileA(lc->sock_path);
+#else
+        unlink(lc->sock_path);
+#endif
+    }
+
+    /* Start reading the engine log where THIS child will start writing it. The
+     * file is shared by every run of this port (append mode), so the previous
+     * run's lines must not be attributed to the child we are about to spawn. */
+    {
+        struct stat lst;
+        lc->log_off = (lc->log_path[0] && stat(lc->log_path, &lst) == 0)
+                          ? (long long)lst.st_size : 0;
+    }
+
+    /* `-c` is the engine's TOTAL KV budget and `-np` divides it (see the header:
+     * n_ctx_seq = n_ctx / n_seq_max). Multiply here, in ONE place, so neither
+     * platform branch can be the one that forgets and quietly hands every
+     * conversation a quarter of its window. */
+    const int  npar    = lc->n_parallel > 0 ? lc->n_parallel : 1;
+    const uint64_t ctx_total = (uint64_t)lc->ctx_size * (uint64_t)npar;
+
+#ifdef _WIN32
+    char portstr[16], ctxstr[24], nparstr[16], cmd[4096], listen_args[320];
     snprintf(portstr, sizeof(portstr), "%d", lc->port);
-    snprintf(ctxstr, sizeof(ctxstr), "%u", lc->ctx_size);
+    snprintf(ctxstr, sizeof(ctxstr), "%llu", (unsigned long long)ctx_total);
+    snprintf(nparstr, sizeof(nparstr), "%d", npar);
+    /* The engine picks AF_UNIX off the host name alone: a `--host` ending in
+     * .sock switches address families (llama.cpp server-http.cpp), and --port
+     * is then meaningless, so it is left out rather than logged misleadingly. */
+    if (lc->sock_path[0])
+        snprintf(listen_args, sizeof(listen_args), "--host \"%s\"", lc->sock_path);
+    else
+        snprintf(listen_args, sizeof(listen_args), "--host 127.0.0.1 --port %s", portstr);
     int n = snprintf(cmd, sizeof(cmd),
-                     "\"%s\" -m \"%s\" --host 127.0.0.1 --port %s "
-                     "-ngl 99 --reasoning off%s%s%s%s",
-                     lc->bin, lc->gguf, portstr,
+                     "\"%s\" -m \"%s\" %s%s "
+                     "-ngl 99 --reasoning off%s%s -np %s%s%s",
+                     lc->bin, lc->gguf, listen_args,
+                     lc->shared ? " --no-slots" : "",
                      lc->ctx_size > 0 ? " -c " : "",
                      lc->ctx_size > 0 ? ctxstr : "",
+                     nparstr,
                      lc->cluster_args[0] ? " " : "", lc->cluster_args);
     if (n < 0 || (size_t)n >= sizeof(cmd)) {
-        snprintf(lc->fail, sizeof(lc->fail), "llama-server command line is too long");
+        snprintf(lc->fail, sizeof(lc->fail), "idletoken-server command line is too long");
         return -1;
     }
     if (lc->extra_args[0]) {
@@ -393,6 +569,43 @@ static int llama_spawn(idletoken_llama *lc) {
         snprintf(cmd + used, sizeof(cmd) - used, "%s", lc->extra_args);
     }
 
+    /* The environment the child gets. NULL = inherit ours; in shared mode we
+     * hand over a filtered block instead (see llama_env_is_engine_namespace).
+     * The block is "NAME=VAL\0NAME=VAL\0\0" and must stay alive across
+     * CreateProcess, hence the malloc rather than a scratch local. */
+    char *child_env = NULL;
+    if (lc->shared) {
+        LPCH all = GetEnvironmentStringsA();
+        if (!all) {
+            snprintf(lc->fail, sizeof(lc->fail),
+                     "cannot read this process's environment to filter it "
+                     "(winerr %lu)", (unsigned long)GetLastError());
+            return -1;
+        }
+        size_t total = 0;
+        for (LPCH p = all; *p; p += strlen(p) + 1) total += strlen(p) + 1;
+        child_env = (char *)malloc(total + 2);
+        if (!child_env) {
+            FreeEnvironmentStringsA(all);
+            snprintf(lc->fail, sizeof(lc->fail), "out of memory");
+            return -1;
+        }
+        size_t off = 0;
+        for (LPCH p = all; *p; p += strlen(p) + 1) {
+            /* An entry may begin with '=' (the per-drive cwd variables Windows
+             * keeps, e.g. "=C:=C:\path"); those are not ours to judge. */
+            if (p[0] != '=' && llama_env_is_engine_namespace(p) &&
+                strncmp(p, "GGML_RPC_PSK=", 13) != 0)
+                continue;
+            size_t n2 = strlen(p) + 1;
+            memcpy(child_env + off, p, n2);
+            off += n2;
+        }
+        child_env[off++] = '\0';
+        child_env[off] = '\0';
+        FreeEnvironmentStringsA(all);
+    }
+
     SECURITY_ATTRIBUTES sa;
     memset(&sa, 0, sizeof(sa));
     sa.nLength = sizeof(sa);
@@ -403,6 +616,7 @@ static int llama_spawn(idletoken_llama *lc) {
     if (log == INVALID_HANDLE_VALUE) {
         snprintf(lc->fail, sizeof(lc->fail), "cannot open engine log %s (winerr %lu)",
                  lc->log_path, (unsigned long)GetLastError());
+        free(child_env);
         return -1;
     }
     SetFilePointer(log, 0, NULL, FILE_END);
@@ -416,9 +630,10 @@ static int llama_spawn(idletoken_llama *lc) {
     si.hStdOutput = log;
     si.hStdError = log;
     BOOL ok = CreateProcessA(lc->bin, cmd, NULL, NULL, TRUE,
-                             CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+                             CREATE_NO_WINDOW, child_env, NULL, &si, &pi);
     DWORD werr = ok ? 0 : GetLastError();
     CloseHandle(log);
+    free(child_env);
     if (!ok) {
         snprintf(lc->fail, sizeof(lc->fail), "CreateProcess %s failed (winerr %lu)",
                  lc->bin, (unsigned long)werr);
@@ -435,18 +650,36 @@ static int llama_spawn(idletoken_llama *lc) {
     lc->spawned_ms = llama_now_ms();
     return 0;
 #else
-    char portstr[16], ctxstr[16];
+    char portstr[16], ctxstr[24], nparstr[16];
     snprintf(portstr, sizeof(portstr), "%d", lc->port);
-    snprintf(ctxstr, sizeof(ctxstr), "%u", lc->ctx_size);
+    snprintf(ctxstr, sizeof(ctxstr), "%llu", (unsigned long long)ctx_total);
+    snprintf(nparstr, sizeof(nparstr), "%d", npar);
 
     char *argv[LLAMA_ARGV_MAX];
     int argc = 0;
     argv[argc++] = lc->bin;
     argv[argc++] = "-m";        argv[argc++] = lc->gguf;
-    /* Loopback ALWAYS: the coordinator's api_token gate must remain the only
-     * gate, so llama-server must never be reachable from the LAN. */
-    argv[argc++] = "--host";    argv[argc++] = "127.0.0.1";
-    argv[argc++] = "--port";    argv[argc++] = portstr;
+    /* Never reachable from the LAN: the coordinator's api_token gate must
+     * remain the only gate. Shared mode goes one further and leaves the IP
+     * stack entirely — the engine picks AF_UNIX off a `--host` ending in .sock
+     * (llama.cpp server-http.cpp), which is why --port is omitted there: with
+     * a socket it is meaningless, and printing one would misdescribe the link. */
+    if (lc->sock_path[0]) {
+        argv[argc++] = "--host";    argv[argc++] = lc->sock_path;
+    } else {
+        argv[argc++] = "--host";    argv[argc++] = "127.0.0.1";
+        argv[argc++] = "--port";    argv[argc++] = portstr;
+    }
+    /* GET /slots hands back every live slot's prompt AND its generated text
+     * verbatim (llama.cpp server-context.cpp: res["prompt"] / res["generated"]),
+     * and upstream has it ON by default (common.h endpoint_slots = true). That
+     * is a prompt reader we were shipping without noticing — one curl, no
+     * tools. Nothing in the coordinator calls /slots, so turning it off in
+     * shared mode costs nothing. Local use keeps it: it is a genuinely useful
+     * window into your own machine.
+     * (Prompts on DISK were already impossible: --slot-save-path is never
+     * passed, and without it the engine refuses the save/restore action.) */
+    if (lc->shared) argv[argc++] = "--no-slots";
     argv[argc++] = "-ngl";      argv[argc++] = "99";
     /* Reasoning off by default: thinking models (Qwen3.5 etc.) otherwise burn
      * the whole token budget inside <think> and the visible answer comes back
@@ -456,12 +689,15 @@ static int llama_spawn(idletoken_llama *lc) {
      * last, so a user-supplied --reasoning wins). */
     argv[argc++] = "--reasoning"; argv[argc++] = "off";
     if (lc->ctx_size > 0) { argv[argc++] = "-c"; argv[argc++] = ctxstr; }
+    /* Continuous batching is already the upstream default, so `-np` alone is
+     * enough to get overlapping prefill/decode across slots. */
+    argv[argc++] = "-np";       argv[argc++] = nparstr;
     /* No extra log flags on purpose: the default level logs request metadata
      * but no prompt text. Never add -v or --log-prompts-dir here. */
 
     /* Cluster args first (their internal order is load-bearing: --rpc must
      * precede --device so RPC device names resolve), then the user's
-     * IDLETOKEN_LLAMA_ARGS LAST so on duplicate flags llama-server takes the
+     * IDLETOKEN_LLAMA_ARGS LAST so on duplicate flags idletoken-server takes the
      * user's value. Split into scratch copies: the config strings must
      * survive for the next respawn. */
     static char cluster_scratch[sizeof(lc->cluster_args)];
@@ -492,6 +728,7 @@ static int llama_spawn(idletoken_llama *lc) {
          * there the coordinator's own signal path does the cleanup) */
         prctl(PR_SET_PDEATHSIG, SIGKILL);
 #endif
+        if (lc->shared) llama_scrub_env();
         /* child: engine output goes to its own log file, not our stderr */
         int lg = open(lc->log_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
         if (lg >= 0) {
@@ -510,7 +747,148 @@ static int llama_spawn(idletoken_llama *lc) {
 #endif
 }
 
+/* --- placement-flag guard --------------------------------------------------
+ *
+ * Contract and the reasoning: the header. Pure function of the string so
+ * coord --selftest can drive both directions. */
+const char *idletoken_llama_placement_flag(const char *args) {
+    /* The closed set of flags that decide where tensors live. `-dev`/`-ts` are
+     * upstream's short aliases for `--device`/`--tensor-split`; refusing the
+     * long form alone would be a doorway, not a guard. */
+    static const char *placement[] = { "--device", "-dev", "--rpc",
+                                       "--tensor-split", "-ts" };
+    if (!args || !args[0]) return NULL;
+
+    /* Walk token by token rather than substring-searching the whole string:
+     * "--devices-note" contains "--device" and must stay allowed, and a
+     * placement flag appearing inside somebody's VALUE ("--chat-template-file
+     * /opt/--device") is not a flag either. */
+    const char *p = args;
+    while (*p) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        const char *start = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+
+        /* The token, cut at '=' so `--device=RPC0` compares as `--device`. */
+        size_t len = (size_t)(p - start);
+        const char *eq = memchr(start, '=', len);
+        if (eq) len = (size_t)(eq - start);
+
+        char tok[64];
+        if (len < sizeof(tok)) {
+            memcpy(tok, start, len);
+            tok[len] = '\0';
+            /* Upstream normalises '_' to '-' for every '--' argument
+             * (common/arg.cpp), so `--tensor_split` IS `--tensor-split` to the
+             * engine. Do the same before comparing, or the guard has a bypass
+             * one keystroke wide — measured 2026-08-20. Only for '--' tokens,
+             * matching upstream exactly: a short flag keeps its spelling. */
+            if (tok[0] == '-' && tok[1] == '-')
+                for (char *c = tok; *c; c++) if (*c == '_') *c = '-';
+            for (size_t i = 0; i < sizeof(placement) / sizeof(*placement); i++)
+                if (!strcmp(tok, placement[i])) return placement[i];
+        }
+    }
+    return NULL;
+}
+
 /* --- monitor thread ------------------------------------------------------- */
+
+/* --- engine-log watch ------------------------------------------------------
+ *
+ * Contract and the reasoning about upstream's wording: the header. Kept as a
+ * pure function of the text so coord --selftest can drive it with a real log
+ * line AND with lines that must NOT match. */
+int idletoken_llama_log_fit_failed(const char *text) {
+    if (!text) return 0;
+    /* The sentence, not the function name: __func__ could be renamed upstream
+     * without the message changing meaning, and matching both would make this
+     * more brittle for no gain. Deliberately NOT matching the milder
+     * "encountered an error while trying to fit params" — that one means the
+     * fit itself broke (no model at the path etc.), and the engine's own exit
+     * already reports it. */
+    return strstr(text, "failed to fit params to free device memory") != NULL;
+}
+
+/* Read whatever the child appended since the last poll and look for conditions
+ * the coordinator must refuse over. Called with the mutex held. Line-oriented:
+ * a trailing partial line is left for the next poll rather than half-matched. */
+static void llama_scan_log(idletoken_llama *lc) {
+    if (!lc->log_path[0] || lc->fatal[0]) return;
+    FILE *f = fopen(lc->log_path, "rb");
+    if (!f) return;                       /* not written yet — nothing to read */
+    if (fseek(f, (long)lc->log_off, SEEK_SET) != 0) { fclose(f); return; }
+
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        const size_t n = strlen(line);
+        if (n == 0) break;
+        if (line[n - 1] != '\n' && n < sizeof(line) - 1)
+            break;   /* the child is mid-line; re-read it whole next time */
+        lc->log_off += (long long)n;
+        if (!idletoken_llama_log_fit_failed(line)) continue;
+
+        const char *allow = getenv("IDLETOKEN_ALLOW_VRAM_OVERCOMMIT");
+        if (allow && !strcmp(allow, "1")) {
+            fprintf(stderr,
+                    "coord: ==========================================================\n"
+                    "coord: == IDLETOKEN_ALLOW_VRAM_OVERCOMMIT=1: the engine says it ==\n"
+                    "coord: == could not fit this model into free device memory, and ==\n"
+                    "coord: == we are starting anyway. On Windows the driver pages   ==\n"
+                    "coord: == VRAM to system memory instead of failing, which can   ==\n"
+                    "coord: == freeze the whole machine. Measurement only.           ==\n"
+                    "coord: ==========================================================\n");
+            lc->log_off = (long long)ftell(f);   /* consume the rest, stay quiet */
+            break;
+        }
+        snprintf(lc->fatal, sizeof(lc->fatal),
+                 "the inference engine could not fit this model into free "
+                 "device memory and started anyway (its log: \"%s\"). Serving "
+                 "in that state makes the GPU driver page video memory out to "
+                 "system memory — on Windows that can freeze the whole machine "
+                 "rather than fail. What to do: ask for a smaller --ctx-size, "
+                 "pick a smaller quantization of this model, close other GPU "
+                 "users, or add a machine to the cluster. Set "
+                 "IDLETOKEN_ALLOW_VRAM_OVERCOMMIT=1 to start anyway (for "
+                 "measurement — it is not a supported way to run)",
+                 line);
+        /* Trim the copied engine line to one line's worth of noise. */
+        for (char *p = lc->fatal; *p; p++) if (*p == '\n' || *p == '\r') *p = ' ';
+        fprintf(stderr, "coord: llama-sidecar: %s\n", lc->fatal);
+        break;
+    }
+    fclose(f);
+}
+
+/* Terminate the current child from INSIDE the monitor thread (shutdown() does
+ * the same from outside, after joining this thread — the two must not both
+ * run, which is why this one is static and leaves `stop` alone). */
+static void llama_kill_child(idletoken_llama *lc) {
+    if (lc->pid <= 0) return;
+#ifdef _WIN32
+    if (lc->child_handle) {
+        TerminateProcess(lc->child_handle, 1);
+        WaitForSingleObject(lc->child_handle, 2000);
+        CloseHandle(lc->child_handle);
+        lc->child_handle = NULL;
+    }
+#else
+    kill((pid_t)lc->pid, SIGTERM);
+    for (int i = 0; i < 20; i++) {
+        if (waitpid((pid_t)lc->pid, NULL, WNOHANG) == (pid_t)lc->pid) {
+            lc->pid = 0;
+            break;
+        }
+        llama_sleep_ms(100);
+    }
+    if (lc->pid > 0) {
+        kill((pid_t)lc->pid, SIGKILL);
+        waitpid((pid_t)lc->pid, NULL, 0);
+    }
+#endif
+    lc->pid = 0;
+}
 
 static void *llama_monitor(void *arg) {
     idletoken_llama *lc = (idletoken_llama *)arg;
@@ -519,6 +897,20 @@ static void *llama_monitor(void *arg) {
         if (lc->stop) { pthread_mutex_unlock(&lc->mu); return NULL; }
 
         long long now = llama_now_ms();
+
+        /* 0. What did the engine say about itself? A child that started but
+         * reported a condition we must not serve gets stopped here, and the
+         * state latches FAILED so nothing restarts it into the same wall.
+         * Runs before the reap so the kill below is not read as a crash. */
+        if (lc->pid > 0 && !lc->fatal[0]) llama_scan_log(lc);
+        if (lc->fatal[0] && lc->state != IDLETOKEN_LLAMA_FAILED) {
+            llama_kill_child(lc);
+            lc->state = IDLETOKEN_LLAMA_FAILED;
+            snprintf(lc->fail, sizeof(lc->fail), "%s", lc->fatal);
+            pthread_mutex_unlock(&lc->mu);
+            llama_sleep_ms(LLAMA_POLL_MS);
+            continue;
+        }
 
         /* 1. Reap. A dead child moves STARTING/READY -> RESTARTING or FAILED. */
         if (lc->pid > 0) {
@@ -559,7 +951,7 @@ static void *llama_monitor(void *arg) {
                 if (lc->quick_restarts >= LLAMA_MAX_QUICK_RESTARTS) {
                     lc->state = IDLETOKEN_LLAMA_FAILED;
                     snprintf(lc->fail, sizeof(lc->fail),
-                             "llama-server kept crashing (%d quick restarts, last: %s); "
+                             "idletoken-server kept crashing (%d quick restarts, last: %s); "
                              "a restart will not help — check the engine log",
                              lc->quick_restarts, how);
                     fprintf(stderr, "coord: llama-sidecar: %s (%s)\n",
@@ -571,7 +963,7 @@ static void *llama_monitor(void *arg) {
                     lc->restart_due_ms = now + delay_s * 1000;
                     lc->state = IDLETOKEN_LLAMA_RESTARTING;
                     fprintf(stderr,
-                            "coord: llama-sidecar: llama-server exited (%s); "
+                            "coord: llama-sidecar: idletoken-server exited (%s); "
                             "restarting in %llds (attempt %d/%d)\n",
                             how, delay_s, lc->quick_restarts, LLAMA_MAX_QUICK_RESTARTS);
                 }
@@ -583,7 +975,7 @@ static void *llama_monitor(void *arg) {
             if (llama_spawn(lc) == 0) {
                 lc->restarts_total++;
                 lc->state = IDLETOKEN_LLAMA_STARTING;
-                fprintf(stderr, "coord: llama-sidecar: respawned llama-server "
+                fprintf(stderr, "coord: llama-sidecar: respawned idletoken-server "
                                 "(pid %lld), waiting for /health\n", lc->pid);
             } else {
                 /* The binary itself is gone/broken now — retrying cannot fix
@@ -596,13 +988,13 @@ static void *llama_monitor(void *arg) {
         /* 3. Readiness probe while STARTING. Probing holds the mutex, which is
          * fine: /health on loopback answers in microseconds even mid-load. */
         if (lc->state == IDLETOKEN_LLAMA_STARTING && lc->pid > 0) {
-            int port = lc->port;
-            if (llama_health_ok(port)) {
+            if (llama_health_ok(lc->endpoint)) {
                 lc->state = IDLETOKEN_LLAMA_READY;
                 lc->became_ready_ms = llama_now_ms();
-                fprintf(stderr, "coord: llama-sidecar: llama-server ready on "
-                                "127.0.0.1:%d (%.1fs to load)\n",
-                        port, (double)(lc->became_ready_ms - lc->spawned_ms) / 1000.0);
+                fprintf(stderr, "coord: llama-sidecar: idletoken-server ready on "
+                                "%s (%.1fs to load)\n",
+                        lc->endpoint,
+                        (double)(lc->became_ready_ms - lc->spawned_ms) / 1000.0);
             }
         }
 
@@ -614,9 +1006,10 @@ static void *llama_monitor(void *arg) {
 /* --- public lifecycle ----------------------------------------------------- */
 
 idletoken_llama *idletoken_llama_start(const char *bin, const char *gguf,
-                                       int port, uint32_t ctx_size,
+                                       int port, const char *engine_sock,
+                                       uint32_t ctx_size, int n_parallel,
                                        const char *cluster_args,
-                                       const char *log_path,
+                                       const char *log_path, int shared,
                                        char *err, size_t err_cap) {
     idletoken_llama *lc = calloc(1, sizeof(*lc));
     if (!lc) {
@@ -630,8 +1023,113 @@ idletoken_llama *idletoken_llama_start(const char *bin, const char *gguf,
     snprintf(lc->log_path, sizeof(lc->log_path), "%s", log_path);
     lc->port = port;
     lc->ctx_size = ctx_size;
+    lc->n_parallel = n_parallel > 0 ? n_parallel : 1;
+    lc->shared = shared;
+    /* The endpoint is decided ONCE, here, and every later connect reads it —
+     * so there is no code path that can quietly reach the engine over TCP
+     * after we told the user the link is a socket. A .sock suffix is what the
+     * engine keys on, so a caller-supplied path without one would silently get
+     * a TCP listener on a nonsense host: caught here instead. */
+    if (engine_sock && engine_sock[0]) {
+        size_t n = strlen(engine_sock);
+        if (n < 6 || strcmp(engine_sock + n - 5, ".sock") != 0) {
+            if (err_cap)
+                snprintf(err, err_cap,
+                         "engine socket path must end in .sock (the engine "
+                         "switches address family on that suffix): %s",
+                         engine_sock);
+            free(lc);
+            return NULL;
+        }
+        if (n >= sizeof(lc->sock_path)) {
+            if (err_cap)
+                snprintf(err, err_cap, "engine socket path is too long: %s",
+                         engine_sock);
+            free(lc);
+            return NULL;
+        }
+        snprintf(lc->sock_path, sizeof(lc->sock_path), "%s", engine_sock);
+        snprintf(lc->endpoint, sizeof(lc->endpoint), "unix:%s", lc->sock_path);
+    } else {
+        snprintf(lc->endpoint, sizeof(lc->endpoint), "127.0.0.1:%d", port);
+    }
+    /* IDLETOKEN_LLAMA_ARGS is appended LAST at spawn, so whatever it contains
+     * wins over our own flags — including -v and --log-prompts-dir, which turn
+     * the engine into a prompt logger. That is fine for your own machine and
+     * unacceptable when the prompts belong to someone else, so shared mode
+     * drops the variable entirely (allow-list of extra args = empty set: a
+     * deny-list would leak the next time upstream adds a logging flag).
+     * The refusal is PRINTED: "no output" cannot be told apart from "never
+     * read the variable" — see G-SHARED-2 in docs/shared-mode-plan-2026-08.md. */
     const char *extra = getenv("IDLETOKEN_LLAMA_ARGS");
-    if (extra) snprintf(lc->extra_args, sizeof(lc->extra_args), "%s", extra);
+    if (extra && extra[0] && lc->shared) {
+        fprintf(stderr, "coord: shared mode: IDLETOKEN_LLAMA_ARGS ignored "
+                        "(engine args are locked while serving others)\n");
+    } else if (extra) {
+        /* ...but NOT the flags that decide where tensors live. Because the
+         * variable is appended last and llama.cpp's --device handler ASSIGNS
+         * rather than appends (common/arg.cpp: `params.devices =
+         * parse_device_list(value)`, and repeated args are documented
+         * last-wins), `IDLETOKEN_LLAMA_ARGS="--device RPC0"` replaced the
+         * coordinator's coordinator-first device list wholesale and moved
+         * layer 0 — with the embedding lookup — onto a remote node. That is
+         * hard invariant #10, the one measured at 17/17 prompt recovery when
+         * violated, and it failed SILENTLY: the "G-PRIV-7 precondition holds"
+         * line is printed before this string is appended, so the log asserted
+         * a safety the argv then removed.
+         *
+         * This is a deny-list, and the shared-mode comment above is right that
+         * deny-lists leak when upstream adds a flag. The reason it is
+         * acceptable here and not there: that set is open-ended (any future
+         * logging flag), this one is closed and small (the flags that place
+         * tensors), and the engine version is PINNED — a new placement flag can
+         * only arrive with a deliberate version bump, which has its own
+         * acceptance. Recheck this list when the pin moves.
+         *
+         * Refuse rather than silently drop: a user who set the variable is
+         * trying to do something, and a dropped flag would look like the engine
+         * ignoring them for no reason. */
+        const char *hit = idletoken_llama_placement_flag(extra);
+        if (hit) {
+            /* The caller's buffer is small (256 B at the only call site) and
+             * snprintf truncates silently, so the WHY goes to stderr, which has
+             * no cap, and `err` carries only the short actionable sentence.
+             * The first version of this message was ~380 B and reached the user
+             * cut off mid-word. */
+            fprintf(stderr,
+                    "coord: refusing IDLETOKEN_LLAMA_ARGS: it sets %s, which "
+                    "decides where tensors live.\n"
+                    "coord: layer 0 and the token embedding must stay on this "
+                    "machine — with layer 0 remote, prompts were recovered from "
+                    "the public GGUF 17 times out of 17 (privacy invariant "
+                    "#10).\n"
+                    "coord: --rpc/--device/--tensor-split are computed from the "
+                    "scheduler plan; IDLETOKEN_LLAMA_ARGS is appended after "
+                    "them, so setting %s here would silently win.\n", hit, hit);
+            if (err && err_cap)
+                snprintf(err, err_cap,
+                         "IDLETOKEN_LLAMA_ARGS sets %s, which would move layer 0 "
+                         "off this machine (privacy invariant #10). Remove it: "
+                         "placement is computed from the scheduler plan.", hit);
+            free(lc);
+            return NULL;
+        }
+        snprintf(lc->extra_args, sizeof(lc->extra_args), "%s", extra);
+    }
+    if (lc->shared) {
+        fprintf(stderr, "coord: shared mode: engine args locked, "
+                        "prompt logging off\n");
+        /* Say which transport, in the log the acceptance script greps. Shared
+         * mode without a socket is a real (if unlikely) configuration — say so
+         * plainly rather than let the reader assume the stronger one. */
+        if (lc->sock_path[0])
+            fprintf(stderr, "coord: shared mode: engine link is a unix socket "
+                            "(%s), not loopback TCP\n", lc->sock_path);
+        else
+            fprintf(stderr, "coord: shared mode: WARNING engine link is loopback "
+                            "TCP — prompts are readable to anyone who can "
+                            "capture loopback on this machine\n");
+    }
     pthread_mutex_init(&lc->mu, NULL);
 
 #ifdef _WIN32
@@ -657,8 +1155,12 @@ idletoken_llama *idletoken_llama_start(const char *bin, const char *gguf,
         return NULL;
     }
     lc->state = IDLETOKEN_LLAMA_STARTING;
-    fprintf(stderr, "coord: llama-sidecar: spawned %s (pid %lld) on 127.0.0.1:%d, "
-                    "engine log: %s\n", lc->bin, lc->pid, lc->port, lc->log_path);
+    fprintf(stderr, "coord: llama-sidecar: spawned %s (pid %lld) on %s, "
+                    "%d slot(s) of %u tokens each (-c %llu -np %d), "
+                    "engine log: %s\n", lc->bin, lc->pid, lc->endpoint,
+            lc->n_parallel, lc->ctx_size,
+            (unsigned long long)lc->ctx_size * (unsigned long long)lc->n_parallel,
+            lc->n_parallel, lc->log_path);
     if (pthread_create(&lc->tid, NULL, llama_monitor, lc) != 0) {
         if (err_cap) snprintf(err, err_cap, "pthread_create: %s", strerror(errno));
 #ifdef _WIN32
@@ -714,6 +1216,17 @@ void idletoken_llama_shutdown(idletoken_llama *lc) {
 #ifdef _WIN32
     if (lc->job) CloseHandle(lc->job);
 #endif
+    /* Take the socket file with us. Leaving it behind is not a security hole
+     * (nothing listens on it once the engine is gone) but it does leave a
+     * dead entry in the user's state directory, and the next run would have to
+     * decide whether it was stale or live. */
+    if (lc->sock_path[0]) {
+#ifdef _WIN32
+        DeleteFileA(lc->sock_path);
+#else
+        unlink(lc->sock_path);
+#endif
+    }
     pthread_mutex_destroy(&lc->mu);
     free(lc);
 }
@@ -734,8 +1247,9 @@ int idletoken_llama_restart_count(idletoken_llama *lc) {
     return n;
 }
 
-int idletoken_llama_port_of(idletoken_llama *lc) {
-    return lc ? lc->port : 0;
+const char *idletoken_llama_endpoint_of(idletoken_llama *lc) {
+    /* No lock: set once before the monitor thread exists, never written after. */
+    return lc ? lc->endpoint : "";
 }
 
 void idletoken_llama_fail_reason(idletoken_llama *lc, char *out, size_t cap) {
@@ -744,5 +1258,14 @@ void idletoken_llama_fail_reason(idletoken_llama *lc, char *out, size_t cap) {
     if (!lc) return;
     pthread_mutex_lock(&lc->mu);
     snprintf(out, cap, "%s", lc->fail);
+    pthread_mutex_unlock(&lc->mu);
+}
+
+void idletoken_llama_fatal_reason(idletoken_llama *lc, char *out, size_t cap) {
+    if (!cap) return;
+    out[0] = '\0';
+    if (!lc) return;
+    pthread_mutex_lock(&lc->mu);
+    snprintf(out, cap, "%s", lc->fatal);
     pthread_mutex_unlock(&lc->mu);
 }

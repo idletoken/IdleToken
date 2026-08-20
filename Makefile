@@ -27,7 +27,6 @@ else ifeq ($(UNAME_S),Darwin)
   endif
 else
   $(info IdleToken Cluster builds on Linux + NVIDIA CUDA, or macOS + Apple Silicon.)
-  $(info Detected host: $(UNAME_S). Use ./scripts/sync-to-spark.sh to build remotely.)
   $(error unsupported build host)
 endif
 
@@ -53,7 +52,7 @@ DS4 := vendor/ds4
 # a build annoyance, it is a false green — a negative control run this way
 # "passed" against a binary that never contained the change being tested.
 CFLAGS_BASE := -O3 -ffast-math $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99 \
-               -MMD -MP -I$(DS4) -Iinclude -Ivendor/tweetnacl
+               -MMD -MP -I$(DS4) -Iinclude -Ivendor/tweetnacl -Ivendor/blake2
 ifeq ($(IDLETOKEN_GPU),cuda)
   CFLAGS_BASE += -D_GNU_SOURCE -fno-finite-math-only
 endif
@@ -74,6 +73,20 @@ CFLAGS_COORD  := $(CFLAGS_BASE) -DDS4_NO_GPU
 ifeq ($(IDLETOKEN_GPU),cuda)
   # resource.c (now in the coord too, v2 WS-B2) includes nvml.h on Linux.
   CFLAGS_COORD += -I$(CUDA_HOME)/include
+endif
+# Overflow routing's trust anchor (docs/api-surface.md §5.1c): the ed25519 key
+# the platform signs its encryption key with, pinned into the coordinator the
+# way the client pins its updater key. Release builds pass it:
+#
+#   make coord IDLETOKEN_PLATFORM_VERIFY_KEY_B64=<base64 32 bytes>
+#
+# Left empty here on purpose. A wrong default would be worse than none: an
+# unpinned build refuses to enable overflow, which is visible, while a build
+# pinning a stale key would fail verification against the live platform and read
+# as "the platform is down".
+IDLETOKEN_PLATFORM_VERIFY_KEY_B64 ?=
+ifneq ($(IDLETOKEN_PLATFORM_VERIFY_KEY_B64),)
+  CFLAGS_COORD += -DIDLETOKEN_PLATFORM_VERIFY_KEY_B64='"$(IDLETOKEN_PLATFORM_VERIFY_KEY_B64)"'
 endif
 
 # Objective-C for the Metal sources. -fobjc-arc matches vendor/ds4's Makefile;
@@ -103,6 +116,21 @@ ifeq ($(IDLETOKEN_GPU),cuda)
 else
   DS4_GPU_OBJ := $(WORKER_BUILD)/vendor/ds4_metal.o
 endif
+# ds4/ds4x are SHELVED (2026-08-16): the engine is llama.cpp, and these are our
+# own generic kernels — not a selectable backend, not tested, not published.
+# Default builds link src/common/ds4_stub.c instead: the ~66 call sites per main
+# file stay untouched (that code is frozen, not to be edited), the real objects
+# are simply never compiled.
+#
+# What this buys, measured: a Windows worker no longer needs the CUDA Toolkit to
+# build (win_PC2 has only the driver and could not build at all), and the build
+# stops spending ~10 minutes in nvcc on kernels that never execute.
+#
+# IDLETOKEN_WITH_DS4=1 links the real thing again — for archaeology on the
+# frozen line, not for shipping. tweetnacl is NOT part of this: it is the
+# pairing crypto, needed either way.
+IDLETOKEN_WITH_DS4 ?= 0
+ifeq ($(IDLETOKEN_WITH_DS4),1)
 DS4_WORKER_OBJ := $(WORKER_BUILD)/vendor/ds4.o \
                   $(DS4_GPU_OBJ) \
                   $(WORKER_BUILD)/vendor/rax.o \
@@ -110,6 +138,16 @@ DS4_WORKER_OBJ := $(WORKER_BUILD)/vendor/ds4.o \
 DS4_COORD_OBJ  := $(COORD_BUILD)/vendor/ds4.o \
                   $(COORD_BUILD)/vendor/rax.o \
                   $(COORD_BUILD)/vendor/tweetnacl.o
+else
+DS4_WORKER_OBJ := $(WORKER_BUILD)/common/ds4_stub.o \
+                  $(WORKER_BUILD)/vendor/tweetnacl.o
+DS4_COORD_OBJ  := $(COORD_BUILD)/common/ds4_stub.o \
+                  $(COORD_BUILD)/vendor/tweetnacl.o
+endif
+# BLAKE2b: the nonce of the libsodium-shape sealed box the coordinator seals
+# overflow requests with (src/common/sodium_seal.c). Not part of the ds4 switch
+# above -- like tweetnacl it is crypto we need either way.
+DS4_COORD_OBJ  += $(COORD_BUILD)/vendor/blake2b.o
 
 # common (resource.c is worker-only — pulls in NVML; http.c is coord-only)
 # nodecrypt.c + privacy.c: token-id encryption on the coord<->worker link
@@ -117,8 +155,13 @@ DS4_COORD_OBJ  := $(COORD_BUILD)/vendor/ds4.o \
 # primitive and was already used by the privacy proxy; nodecrypt.c adds the
 # counter-nonce framing. TweetNaCl is vendored with no external dependency,
 # which is the whole reason this is cheap -- see the design's §4.
+# modelsize.c: the one place that answers "how big is the model we are about to
+# load?" (T8). Shared because the coordinator's budget and the worker's
+# capability advisor must not resolve the precision differently — that drift is
+# how the advisor starts promising what the planner refuses.
 COMMON_SRC_SHARED   := src/common/net.c src/common/discovery.c src/common/model.c \
-                       src/common/nodecrypt.c src/common/privacy.c src/common/enginever.c
+                       src/common/nodecrypt.c src/common/privacy.c src/common/enginever.c \
+                       src/common/modelsize.c
 # advise.c (capability table) needs plan.c, which used to be coord-only — the
 # worker now links both so `--advise` can answer "what can THIS machine run?"
 # with the planner's own verdict instead of a second estimate.
@@ -128,18 +171,25 @@ COMMON_SRC_WORKER   := $(COMMON_SRC_SHARED) src/common/resource.c src/common/wei
 # (v2 WS-B2/B4): the coord now probes ITS OWN machine (single-machine fit
 # check + ctx sizing) and builds a runtime model spec from any GGUF header.
 # On Linux that pulls NVML into the coord link — see the idletoken-coord rule.
+# b64.c: the base64 the sealed envelope is spelled in. Shared with the platform
+# agent (Makefile.platform) so the side that seals and the side that opens
+# cannot drift.
 COMMON_SRC_COORD    := $(COMMON_SRC_SHARED) src/common/http.c src/common/plan.c src/common/gguf.c \
                        src/common/advise.c src/common/resource.c src/common/model_auto.c \
-                       src/common/apiconv.c
+                       src/common/apiconv.c src/common/b64.c src/common/sodium_seal.c
 WORKER_COMMON_OBJ   := $(patsubst src/common/%.c,$(WORKER_BUILD)/common/%.o,$(COMMON_SRC_WORKER))
 
 # ds4x generic CPU backend (small models: Qwen3 GQA, GLM/Kimi MLA). Pure C, no
 # CUDA — links into the worker so a ds4x cluster serves on CPU (a CUDA kernel is
 # a later speed-up, not a correctness gate). small-model-design.md §S-C.
 DS4X_UNITS          := ds4x_config ds4x_model ds4x_forward ds4x_runner ds4x_quant
+ifeq ($(IDLETOKEN_WITH_DS4),1)
 DS4X_WORKER_OBJ     := $(patsubst %,$(WORKER_BUILD)/ds4x/%.o,$(DS4X_UNITS))
 ifeq ($(IDLETOKEN_GPU),cuda)
   DS4X_WORKER_OBJ   += $(WORKER_BUILD)/ds4x/ds4x_cuda.o
+endif
+else
+DS4X_WORKER_OBJ     :=   # shelved — ds4_stub.c satisfies the call sites
 endif
 
 # macOS-only: the Metal facts resource.c cannot reach from plain C. Worker only
@@ -152,21 +202,28 @@ else
 endif
 # Coord only needs the GGUF byte-BPE tokenizer (prompt encode + detokenize for
 # ds4x models); embed/lm_head run on the workers.
+ifeq ($(IDLETOKEN_WITH_DS4),1)
 DS4X_COORD_OBJ      := $(COORD_BUILD)/ds4x/ds4x_tokenizer.o
+else
+DS4X_COORD_OBJ      :=   # shelved — ds4_stub.c satisfies the call sites
+endif
 COORD_COMMON_OBJ    := $(patsubst src/common/%.c,$(COORD_BUILD)/common/%.o,$(COMMON_SRC_COORD))
 
 # binary-specific
 WORKER_MAIN_OBJ := $(WORKER_BUILD)/worker_main.o
-COORD_MAIN_OBJ  := $(COORD_BUILD)/coord_main.o $(COORD_BUILD)/llama_sidecar.o
+COORD_MAIN_OBJ  := $(COORD_BUILD)/coord_main.o $(COORD_BUILD)/llama_sidecar.o \
+                   $(COORD_BUILD)/overflow.o
 
-.PHONY: all worker coord clean check info plantest disctest autotest apitest
+.PHONY: all worker coord clean check info plantest disctest autotest apitest sidecartest
 
 all: worker coord
 
 # Unit tests for the planning core (mode decision + layer split). Pure C —
 # also runs on the mac control machine with plain cc.
 plantest:
-	$(CC) -Wall -Wextra -std=c99 -Iinclude src/common/plan.c src/common/model.c src/common/advise.c src/tools/plan_test.c -o build/plan_test
+	@mkdir -p build
+	$(CC) -Wall -Wextra -std=c99 -Iinclude src/common/plan.c src/common/model.c \
+	    src/common/modelsize.c src/common/advise.c src/tools/plan_test.c -o build/plan_test
 	./build/plan_test
 
 # Unit tests for the API surface helpers: Anthropic<->OpenAI translation
@@ -179,74 +236,37 @@ apitest:
 	    src/common/net.c src/common/http.c src/tools/api_test.c -o build/api_test
 	./build/api_test
 
+# P0-4: does the coordinator↔engine link really leave the IP stack in shared
+# mode? Needs a real engine binary and a real (small) GGUF, so it is NOT part
+# of `make check` — it starts a model twice and takes a minute.
+#
+#   make sidecartest ENGINE=... GGUF=...
+#
+# The local-mode half is the positive control: it must find a TCP listener,
+# or the shared-mode "no listener" says nothing about the checker.
+ENGINE ?= vendor/llama.cpp/build/bin/llama-server
+GGUF   ?=
+# The prompt string the disk sweep afterwards looks for. The gate passes a
+# per-run value: a fixed one is a literal in our own sources, so the sweep
+# would match any copy of them and report our comments as a leak.
+MARKER ?= IdleTokenCanaryDefault
+sidecartest:
+	@mkdir -p build
+	@[ -n "$(GGUF)" ] || { echo "usage: make sidecartest GGUF=/path/to/small.gguf [ENGINE=...]"; exit 2; }
+	$(CC) -Wall -Wextra -std=c99 -D_GNU_SOURCE -Iinclude src/common/net.c \
+	    src/coord/llama_sidecar.c src/tools/llama_sidecar_test.c \
+	    -o build/llama_sidecar_test -lpthread
+	./build/llama_sidecar_test "$(ENGINE)" "$(GGUF)" "$(MARKER)"
+
 # Unit tests for the open-model intake (GGUF header -> runtime model spec,
 # v2 WS-B4). Pure C — reuses the metadata-only fixtures.
 autotest:
 	@mkdir -p build
 	python3 scripts/make_test_gguf.py build/fixtures
 	$(CC) -Wall -Wextra -std=c99 -Iinclude src/common/gguf.c src/common/model.c \
-	    src/common/model_auto.c src/tools/model_auto_test.c -o build/model_auto_test
+	    src/common/modelsize.c src/common/model_auto.c src/tools/model_auto_test.c \
+	    -o build/model_auto_test
 	./build/model_auto_test build/fixtures
-
-# Unit tests for the ds4x runtime config (GGUF-metadata-driven, Phase B).
-# Pure C — fixtures are metadata-only GGUFs generated by a small script.
-ds4xtest:
-	@mkdir -p build
-	python3 scripts/make_test_gguf.py build/fixtures
-	$(CC) -Wall -Wextra -std=c99 -Iinclude src/common/gguf.c src/common/model.c \
-	    src/ds4x/ds4x_config.c src/tools/ds4x_config_test.c -o build/ds4x_config_test
-	./build/ds4x_config_test build/fixtures
-	$(CC) -Wall -Wextra -std=c99 -Iinclude src/ds4x/ds4x_quant.c \
-	    src/tools/ds4x_quant_test.c -o build/ds4x_quant_test -lm
-	./build/ds4x_quant_test
-	python3 scripts/ds4x_ref.py build/fixtures/ds4x_vectors.bin
-	$(CC) -Wall -Wextra -std=c99 -Iinclude src/common/model.c \
-	    src/ds4x/ds4x_config.c src/ds4x/ds4x_forward.c src/ds4x/ds4x_model.c \
-	    src/ds4x/ds4x_runner.c src/ds4x/ds4x_quant.c src/common/gguf.c \
-	    src/tools/ds4x_forward_test.c -o build/ds4x_forward_test -lm
-	./build/ds4x_forward_test build/fixtures/ds4x_vectors.bin build/fixtures/ds4x_vectors.bin.gguf
-	python3 scripts/ds4x_ref.py build/fixtures/ds4x_noqlora.bin --q-rank 0
-	./build/ds4x_forward_test build/fixtures/ds4x_noqlora.bin build/fixtures/ds4x_noqlora.bin.gguf
-	python3 scripts/ds4x_ref.py build/fixtures/ds4x_q8.bin --quant q8_0
-	./build/ds4x_forward_test build/fixtures/ds4x_q8.bin build/fixtures/ds4x_q8.bin.gguf
-	python3 scripts/ds4x_ref.py build/fixtures/ds4x_qwen3.bin --arch qwen3
-	$(CC) -Wall -Wextra -std=c99 -Iinclude src/common/model.c \
-	    src/ds4x/ds4x_config.c src/ds4x/ds4x_forward.c src/ds4x/ds4x_model.c \
-	    src/ds4x/ds4x_runner.c src/ds4x/ds4x_quant.c src/common/gguf.c \
-	    src/tools/ds4x_gqa_test.c -o build/ds4x_gqa_test -lm
-	./build/ds4x_gqa_test build/fixtures/ds4x_qwen3.bin build/fixtures/ds4x_qwen3.bin.gguf
-	python3 scripts/ds4x_ref.py build/fixtures/ds4x_gdn.bin --arch qwen3next
-	$(CC) -Wall -Wextra -std=c99 -Iinclude src/common/model.c \
-	    src/ds4x/ds4x_config.c src/ds4x/ds4x_forward.c src/ds4x/ds4x_model.c \
-	    src/ds4x/ds4x_runner.c src/ds4x/ds4x_quant.c src/common/gguf.c \
-	    src/tools/ds4x_gdn_test.c -o build/ds4x_gdn_test -lm
-	./build/ds4x_gdn_test build/fixtures/ds4x_gdn.bin
-	$(CC) -Wall -Wextra -std=c99 -Iinclude src/common/gguf.c \
-	    src/ds4x/ds4x_tokenizer.c src/tools/ds4x_tok_test.c -o build/ds4x_tok_test
-	./build/ds4x_tok_test build/fixtures
-	$(CC) -Wall -Wextra -std=c99 -Iinclude src/common/model.c \
-	    src/ds4x/ds4x_config.c src/ds4x/ds4x_forward.c src/ds4x/ds4x_model.c \
-	    src/ds4x/ds4x_runner.c src/ds4x/ds4x_tokenizer.c src/ds4x/ds4x_quant.c \
-	    src/common/gguf.c \
-	    src/ds4x/ds4x_infer.c -o build/ds4x_infer -lm
-	./build/ds4x_infer build/fixtures/ds4x_vectors.bin.gguf --selftest build/fixtures/ds4x_vectors.bin
-
-# CUDA parity gate: GPU dequant+matvec must match the CPU reference for every
-# quant type (small-model-design §S-C). Needs nvcc + a device; on a machine
-# without CUDA the binary reports SKIP (loudly) instead of a false green.
-.PHONY: cudatest
-cudatest:
-	@mkdir -p build
-	$(NVCC) $(NVCCFLAGS) -Iinclude -c -o build/ds4x_cuda.o src/ds4x/ds4x_cuda.cu
-	$(CC) -Wall -Wextra -std=c99 -Iinclude -c -o build/ds4x_quant_for_cuda.o src/ds4x/ds4x_quant.c
-	@# ds4x_forward.c WITHOUT -DIDLETOKEN_DS4X_CUDA: the test's reference must be
-	@# the CPU path itself (ds4x_gdn_recur_cpu), never a copy of it in the test.
-	$(CC) -Wall -Wextra -std=c99 -Iinclude -c -o build/ds4x_forward_for_cuda.o src/ds4x/ds4x_forward.c
-	$(CC) -Wall -Wextra -std=c99 -Iinclude -c -o build/ds4x_cuda_test.o src/tools/ds4x_cuda_test.c
-	$(NVCC) $(NVCCFLAGS) -o build/ds4x_cuda_test \
-	    build/ds4x_cuda_test.o build/ds4x_quant_for_cuda.o \
-	    build/ds4x_forward_for_cuda.o build/ds4x_cuda.o $(CUDA_LDLIBS)
-	./build/ds4x_cuda_test
 
 # CUDA-accelerated standalone inference tool (same binary as ds4x_infer, but
 # with the GPU matvec compiled in). Run with IDLETOKEN_DS4X_CUDA=1 to use the GPU;
@@ -332,6 +352,9 @@ $(COORD_BUILD)/vendor/ds4.o: $(DS4)/ds4.c $(DS4)/ds4.h $(DS4)/ds4_gpu.h | $(COOR
 	$(CC) $(CFLAGS_COORD) -c -o $@ $<
 
 $(COORD_BUILD)/vendor/rax.o: $(DS4)/rax.c $(DS4)/rax.h $(DS4)/rax_malloc.h | $(COORD_BUILD)/vendor
+	$(CC) $(CFLAGS_COORD) -c -o $@ $<
+
+$(COORD_BUILD)/vendor/blake2b.o: vendor/blake2/blake2b.c vendor/blake2/blake2.h | $(COORD_BUILD)/vendor
 	$(CC) $(CFLAGS_COORD) -c -o $@ $<
 
 $(COORD_BUILD)/vendor/tweetnacl.o: vendor/tweetnacl/tweetnacl.c vendor/tweetnacl/tweetnacl.h | $(COORD_BUILD)/vendor

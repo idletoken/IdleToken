@@ -47,7 +47,7 @@ REM file there is NOT enough -- a file missing here surfaces only as a Windows
 REM link error, on a machine nobody builds on daily (it did: nodecrypt/privacy/
 REM resource/model_auto were all absent, so the coord had no Windows build at
 REM all after the pivot and the release gate died on a missing exe).
-for %%F in (net discovery model http plan gguf advise enginever resource model_auto apiconv) do (
+for %%F in (net discovery model modelsize http plan gguf advise enginever resource model_auto apiconv) do (
     gcc -c src/common/%%F.c %CF% -o c_%%F.o >> coord_build.log 2>&1
     if errorlevel 1 goto :fail
 )

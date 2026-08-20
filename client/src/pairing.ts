@@ -30,6 +30,15 @@ export interface PeerNode {
    *  timeout (audit 2.8). Optional so absence (older snapshot shapes) reads as
    *  online — which is what absence used to mean. */
   online?: boolean;
+  /** What this machine brings to the pool, as its OWN probe measured it
+   *  (2026-08-15): free VRAM and free RAM in bytes, and whether the two are
+   *  one physical pool (Apple Silicon). Carried by the roster so any member
+   *  can total the cluster and answer "does the model fit on all of us" before
+   *  anyone presses Start. 0/absent = a member that does not report it — the
+   *  total is then incomplete and the UI must say so, not guess. */
+  vramFree?: number;
+  ramFree?: number;
+  unifiedMemory?: boolean;
 }
 
 export interface SelfInfo {
@@ -137,7 +146,7 @@ export function isValidCode(code: string): boolean {
 // the raw email, and NOT the JWT which differs per login) + the normalized
 // platform URL (accounts from different platforms never collide) + the cluster
 // name (lets one account run separate clusters side by side; machines must
-// share the setting — default "home"). The secret itself is never broadcast:
+// share the setting — default "IdleToken-Home"). The secret itself is never broadcast:
 // the UDP beacon carries only its FNV-1a hash, and the full value travels only
 // inside the LAN TCP join as proof — the same trust level as a shared code.
 // Honesty: this proves "derived from the same account material", which matches
@@ -149,7 +158,7 @@ export async function accountPairSecret(
   clusterName: string
 ): Promise<string> {
   const url = platformUrl.trim().replace(/\/+$/, "").toLowerCase();
-  const name = clusterName.trim() || "home";
+  const name = clusterName.trim() || "IdleToken-Home";
   const material = `idletoken-account-pair|v1|${userId}|${url}|${name}`;
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(material));
   const hex = Array.from(new Uint8Array(buf))
@@ -194,7 +203,10 @@ class DevSimPairing implements PairingProvider {
   }
 
   private selfPeer(self: SelfInfo, role: NodeRole): PeerNode {
-    return { id: "self", hostname: self.hostname, gpu: self.gpu, role, self: true, stage: "joined", online: true };
+    // Memory the dev-sim reports for this machine, so the pooled verdict can
+    // be exercised in a browser (the real path fills these from the probe).
+    return { id: "self", hostname: self.hostname, gpu: self.gpu, role, self: true, stage: "joined", online: true,
+             vramFree: 13.2 * 1024 ** 3, ramFree: 20.6 * 1024 ** 3, unifiedMemory: false };
   }
 
   async create(self: SelfInfo, code?: string): Promise<void> {
@@ -222,7 +234,8 @@ class DevSimPairing implements PairingProvider {
     this.state = {
       code: _code.trim().toUpperCase(),
       peers: [
-        { id: "peer-coord", hostname: "win-pc-01", gpu: "RTX 5060 Ti", role: "coordinator", self: false, stage: "joined", online: true },
+        { id: "peer-coord", hostname: "win-pc-01", gpu: "RTX 5060 Ti", role: "coordinator", self: false, stage: "joined", online: true,
+          vramFree: 13.2 * 1024 ** 3, ramFree: 20.6 * 1024 ** 3, unifiedMemory: false },
         this.selfPeer(self, "worker"),
       ],
       coordinatorId: "peer-coord",
@@ -281,7 +294,11 @@ class DevSimPairing implements PairingProvider {
 
   private addSimPeer(hostname: string, gpu: string) {
     this.seq += 1;
-    this.state.peers.push({ id: `sim-${this.seq}`, hostname, gpu, role: "worker", self: false, stage: "joined", online: true });
+    // Unified-memory machines report one pool (the max, not the sum) — the
+    // same rule the engine applies, exercised here by the DGX fixture.
+    const unified = /unified/i.test(gpu);
+    this.state.peers.push({ id: `sim-${this.seq}`, hostname, gpu, role: "worker", self: false, stage: "joined", online: true,
+      vramFree: (unified ? 96 : 6.5) * 1024 ** 3, ramFree: (unified ? 96 : 12) * 1024 ** 3, unifiedMemory: unified });
     this.emit();
   }
 

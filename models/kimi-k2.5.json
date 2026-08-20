@@ -2,9 +2,9 @@
   "id": "kimi-k2.5",
   "label": "Kimi K2.5",
   "family": "kimi",
-  "backend": "ds4x",
+  "backend": "llamacpp",
   "arch": "deepseek2",
-  "available": false,
+  "available": true,
   "deployment": "cluster",
   "license": "Modified MIT",
   "params_summary": "1T · 32B active · ~1.8-bit ≈ 240 GB",
@@ -12,16 +12,1907 @@
   "n_embd": 7168,
   "hc_streams": 1,
   "n_vocab": 163840,
-  "layer_weight_bytes": 253403070464,
-  "shared_weight_bytes": 2147483648,
+  "layer_weight_bytes": 210299214240,
+  "shared_weight_bytes": 0,
   "context_max": 262144,
-  "split": { "boundary_multiple": 0 },
-  "kv": { "kind": "mla", "bytes_per_token_per_layer": 1152 },
+  "split": {
+    "boundary_multiple": 0
+  },
+  "kv": {
+    "kind": "mla",
+    "bytes_per_token_per_layer": 1152
+  },
   "overhead_base_bytes": 3221225472,
-  "default_gguf": "kimi-k2.5-q2.gguf",
+  "default_gguf": "moonshotai_Kimi-K2.5-IQ1_S/moonshotai_Kimi-K2.5-IQ1_S-00001-of-00006.gguf",
   "chat_template": "gguf",
   "sources": [
-    { "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF", "quant": "IQ1_M" }
+    {
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "quant": "IQ1_S"
+    },
+    {
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "quant": "IQ1_M"
+    },
+    {
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "quant": "IQ2_XXS"
+    },
+    {
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "quant": "IQ2_XS"
+    },
+    {
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "quant": "IQ2_S"
+    },
+    {
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "quant": "IQ2_M"
+    },
+    {
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "quant": "Q2_K"
+    },
+    {
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "quant": "Q2_K_L"
+    },
+    {
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "quant": "IQ3_XXS"
+    },
+    {
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "quant": "IQ3_XS"
+    },
+    {
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "quant": "Q3_K_S"
+    },
+    {
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "quant": "IQ3_M"
+    },
+    {
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "quant": "Q3_K_M"
+    },
+    {
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "quant": "Q3_K_L"
+    },
+    {
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "quant": "Q3_K_XL"
+    },
+    {
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "quant": "IQ4_XS"
+    },
+    {
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "quant": "IQ4_NL"
+    },
+    {
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "quant": "Q4_K_S"
+    },
+    {
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "quant": "Q4_K_M"
+    },
+    {
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "quant": "Q5_K_S"
+    },
+    {
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "quant": "Q4_K_L"
+    },
+    {
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "quant": "Q5_K_M"
+    },
+    {
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "quant": "Q6_K"
+    },
+    {
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "quant": "Q8_0"
+    },
+    {
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "quant": "Q4_0"
+    },
+    {
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "quant": "Q4_1"
+    }
   ],
-  "note": "ds4x backend pending (Phase B/C) — DeepSeek2-shaped, near-zero extra kernel work"
+  "default_quant": "IQ1_S",
+  "variants": [
+    {
+      "quant": "IQ1_S",
+      "layer_weight_bytes": 210299214240,
+      "shared_weight_bytes": 0,
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "gguf": "moonshotai_Kimi-K2.5-IQ1_S/moonshotai_Kimi-K2.5-IQ1_S-00001-of-00006.gguf",
+      "sha256": "331c92ab6087fe9eb4eb3d02f10f7eee4254079d1b1e373b78660b27bc599564",
+      "revision": "5b64e856ff9f4d062857d952451f38219dff1382",
+      "parts": [
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ1_S/moonshotai_Kimi-K2.5-IQ1_S-00002-of-00006.gguf",
+          "bytes": 39489568448,
+          "sha256": "0354f883625e044f007fdd3762637c7acb1a4f27dbebaa02676c7eaf793f262a"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ1_S/moonshotai_Kimi-K2.5-IQ1_S-00003-of-00006.gguf",
+          "bytes": 39429437024,
+          "sha256": "665def75a9ff8fb6d4851682b529096456ea9dd2fb1ac7027b3e27528abf68cd"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ1_S/moonshotai_Kimi-K2.5-IQ1_S-00004-of-00006.gguf",
+          "bytes": 39469354560,
+          "sha256": "2eb5b6e8a1a1414f7c942be5abe3ec194c44f038ae29c8852f8a65f5965a5eb2"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ1_S/moonshotai_Kimi-K2.5-IQ1_S-00005-of-00006.gguf",
+          "bytes": 39879816640,
+          "sha256": "2b849a09afa05fd718f773f8b35d484b046a760bd8eb139419e958c2918bd105"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ1_S/moonshotai_Kimi-K2.5-IQ1_S-00006-of-00006.gguf",
+          "bytes": 12637663424,
+          "sha256": "b41dce81608109c0499396ccbd2e2c025a5249c784ac68151425fd291a9ed8e9"
+        }
+      ]
+    },
+    {
+      "quant": "IQ1_M",
+      "layer_weight_bytes": 219584616864,
+      "shared_weight_bytes": 0,
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "gguf": "moonshotai_Kimi-K2.5-IQ1_M/moonshotai_Kimi-K2.5-IQ1_M-00001-of-00006.gguf",
+      "sha256": "1ffc884e95e954d2d0b253f1324b38e9da50c2f5b277f4bc10ecd02946f4e88e",
+      "revision": "5b64e856ff9f4d062857d952451f38219dff1382",
+      "parts": [
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ1_M/moonshotai_Kimi-K2.5-IQ1_M-00002-of-00006.gguf",
+          "bytes": 39447606880,
+          "sha256": "3d30450c7f5db15880f8dfdeb82bae095f0ecb80838a78fe604b5da3d4c976b3"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ1_M/moonshotai_Kimi-K2.5-IQ1_M-00003-of-00006.gguf",
+          "bytes": 39487622720,
+          "sha256": "fc6bb86af6996cae4366dff478529eca9aa8259fe3059628aad710df30dc990d"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ1_M/moonshotai_Kimi-K2.5-IQ1_M-00004-of-00006.gguf",
+          "bytes": 39498661568,
+          "sha256": "b499b20797705e85a8c3c0a5962acf05d75f9d48deeb0f8a3413c8aefe15f11c"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ1_M/moonshotai_Kimi-K2.5-IQ1_M-00005-of-00006.gguf",
+          "bytes": 39395050688,
+          "sha256": "669343bac8b8e34b2b4fa69b3c9f779214a29abf65d5551e879f6d69660bb2ef"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ1_M/moonshotai_Kimi-K2.5-IQ1_M-00006-of-00006.gguf",
+          "bytes": 22239943904,
+          "sha256": "2da51b18e839fc5af6d802572e16ad2e33642d19038eac7ee18a61690103b2a8"
+        }
+      ]
+    },
+    {
+      "quant": "IQ2_XXS",
+      "layer_weight_bytes": 245277612576,
+      "shared_weight_bytes": 0,
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "gguf": "moonshotai_Kimi-K2.5-IQ2_XXS/moonshotai_Kimi-K2.5-IQ2_XXS-00001-of-00007.gguf",
+      "sha256": "6fd0c05097d8738f19ee73fbcd3af79818592941f589574ead4ddbc9d2fd464b",
+      "revision": "5b64e856ff9f4d062857d952451f38219dff1382",
+      "parts": [
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ2_XXS/moonshotai_Kimi-K2.5-IQ2_XXS-00002-of-00007.gguf",
+          "bytes": 39092327200,
+          "sha256": "a25ba2f6f026015732bc8a2d562f76700fea5d9f369388b1339c86a8f3a8ef23"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ2_XXS/moonshotai_Kimi-K2.5-IQ2_XXS-00003-of-00007.gguf",
+          "bytes": 39065881280,
+          "sha256": "b8b8cf38ce1eeb7f5a6033a0ada30c2b9e54290f5e45a2f2e7f249ba4aa486ed"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ2_XXS/moonshotai_Kimi-K2.5-IQ2_XXS-00004-of-00007.gguf",
+          "bytes": 39052147520,
+          "sha256": "9ba0522bc83f446b1e70ed861a72924a08fd50c9307fcf310adc433763985045"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ2_XXS/moonshotai_Kimi-K2.5-IQ2_XXS-00005-of-00007.gguf",
+          "bytes": 39117099808,
+          "sha256": "6c72f5807f2b9c1db8865127ae71b51d67ffb0140eed4bebb9fb8dc2e330b847"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ2_XXS/moonshotai_Kimi-K2.5-IQ2_XXS-00006-of-00007.gguf",
+          "bytes": 38382978720,
+          "sha256": "687d9edae7647980658ef36fdeb10cbfab33e9fd60b24f3e6b0702261606ee63"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ2_XXS/moonshotai_Kimi-K2.5-IQ2_XXS-00007-of-00007.gguf",
+          "bytes": 11615221280,
+          "sha256": "c6c748ac2543a34f9b81eb21eb208542ad685825792f8fefcdc3e9fa9d648497"
+        }
+      ]
+    },
+    {
+      "quant": "IQ2_XS",
+      "layer_weight_bytes": 283113380512,
+      "shared_weight_bytes": 0,
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "gguf": "moonshotai_Kimi-K2.5-IQ2_XS/moonshotai_Kimi-K2.5-IQ2_XS-00001-of-00008.gguf",
+      "sha256": "844f750941c76aeeb8ee60b72352fc4dad7c22eef96e4f5f6f814ed2fafc969d",
+      "revision": "5b64e856ff9f4d062857d952451f38219dff1382",
+      "parts": [
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ2_XS/moonshotai_Kimi-K2.5-IQ2_XS-00002-of-00008.gguf",
+          "bytes": 38861987424,
+          "sha256": "7224ee22d01e774f828051f9fee904c166fcdb0a5394ef33ef6a4827a1dac1a5"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ2_XS/moonshotai_Kimi-K2.5-IQ2_XS-00003-of-00008.gguf",
+          "bytes": 39986073504,
+          "sha256": "0a5041d0361b5be73d3ba9fd7fa5a8ce2161b341ee693c1e1bfbcce6eac46309"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ2_XS/moonshotai_Kimi-K2.5-IQ2_XS-00004-of-00008.gguf",
+          "bytes": 39986073504,
+          "sha256": "aa1ee15136a12790956ece9dc32f625e5f43349d5dd0c17a4fc0e546bba58c0f"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ2_XS/moonshotai_Kimi-K2.5-IQ2_XS-00005-of-00008.gguf",
+          "bytes": 39986073504,
+          "sha256": "c8b5e02b91a6bfdedb572bda6479d91204322b8d9d02332767b7466f644227be"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ2_XS/moonshotai_Kimi-K2.5-IQ2_XS-00006-of-00008.gguf",
+          "bytes": 39986073504,
+          "sha256": "e4c7a13b8d3e72f79e8c44ea8f283e362350364bcfe93b8b92ed80561579d7b7"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ2_XS/moonshotai_Kimi-K2.5-IQ2_XS-00007-of-00008.gguf",
+          "bytes": 38675336064,
+          "sha256": "79f0651ee6a994814ff28e885b04055f54f2434c58a2c8a59e401f38ad2b1de8"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ2_XS/moonshotai_Kimi-K2.5-IQ2_XS-00008-of-00008.gguf",
+          "bytes": 7333149600,
+          "sha256": "0b73c69daeb35b367f8827378c1a0f0a129cb471bbc5bfa935e6f9f39772644f"
+        }
+      ]
+    },
+    {
+      "quant": "IQ2_S",
+      "layer_weight_bytes": 283797330528,
+      "shared_weight_bytes": 0,
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "gguf": "moonshotai_Kimi-K2.5-IQ2_S/moonshotai_Kimi-K2.5-IQ2_S-00001-of-00008.gguf",
+      "sha256": "258d1acf08d005f3abcf2b70d7b7dd9b37867e04b1b90f346727b8e16faf2451",
+      "revision": "5b64e856ff9f4d062857d952451f38219dff1382",
+      "parts": [
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ2_S/moonshotai_Kimi-K2.5-IQ2_S-00002-of-00008.gguf",
+          "bytes": 38945300064,
+          "sha256": "7ae2c928f670a75365b5054896bbc7948594b91fe67786a86476c1db7e00baf8"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ2_S/moonshotai_Kimi-K2.5-IQ2_S-00003-of-00008.gguf",
+          "bytes": 38604017408,
+          "sha256": "33248f8d8f1bcb1803cb1baf3af07e9b6ce680f35bcb6e1c4a2e99fcc737b4cc"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ2_S/moonshotai_Kimi-K2.5-IQ2_S-00004-of-00008.gguf",
+          "bytes": 38551209632,
+          "sha256": "60dae955d83f5de4d8a5b46195f69444dddb7c67fe810964e3bd2d855cf78563"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ2_S/moonshotai_Kimi-K2.5-IQ2_S-00005-of-00008.gguf",
+          "bytes": 38600777376,
+          "sha256": "ce1c94b8a95669871db2131e4276e800f2bb68b698c2c64df817359e4e9aa18b"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ2_S/moonshotai_Kimi-K2.5-IQ2_S-00006-of-00008.gguf",
+          "bytes": 38611816192,
+          "sha256": "4848453089c7c19ecdda5041468d4685aa067d406b02fc1a7560eae16dccb1cb"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ2_S/moonshotai_Kimi-K2.5-IQ2_S-00007-of-00008.gguf",
+          "bytes": 39125142528,
+          "sha256": "7681208d47fe713885ee0c07d056c15917efd3dff06daee57d7c12ee3ff5ca24"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ2_S/moonshotai_Kimi-K2.5-IQ2_S-00008-of-00008.gguf",
+          "bytes": 12867122720,
+          "sha256": "ed873717dd5bf80bb602ae1d56a6916e74a46d2383484e2c63213e0674252194"
+        }
+      ]
+    },
+    {
+      "quant": "IQ2_M",
+      "layer_weight_bytes": 322954304224,
+      "shared_weight_bytes": 0,
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "gguf": "moonshotai_Kimi-K2.5-IQ2_M/moonshotai_Kimi-K2.5-IQ2_M-00001-of-00009.gguf",
+      "sha256": "b8b8092a0547da31421cddce57d57c06a5f8d4cac8d725fd131243bc9efcd2cb",
+      "revision": "5b64e856ff9f4d062857d952451f38219dff1382",
+      "parts": [
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ2_M/moonshotai_Kimi-K2.5-IQ2_M-00002-of-00009.gguf",
+          "bytes": 38702670656,
+          "sha256": "9058cdf21054f92cb2ab4aa6a95d3d91a32046794be48050f652a86940e3193c"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ2_M/moonshotai_Kimi-K2.5-IQ2_M-00003-of-00009.gguf",
+          "bytes": 39838799104,
+          "sha256": "7fcaff5adb6c8b987d487f75c9088f493d0477363f81aea955a1d9b68c456ccf"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ2_M/moonshotai_Kimi-K2.5-IQ2_M-00004-of-00009.gguf",
+          "bytes": 39860819200,
+          "sha256": "28d0a6a1749c8c4b3757340f9d0945cd848f6428987b98b8371b85a02afd8158"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ2_M/moonshotai_Kimi-K2.5-IQ2_M-00005-of-00009.gguf",
+          "bytes": 39860819200,
+          "sha256": "047cd2f2c5e04c61eac92b4c5e0e1a0125f4defd96e3c3881c641adb8b3f5dff"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ2_M/moonshotai_Kimi-K2.5-IQ2_M-00006-of-00009.gguf",
+          "bytes": 39838799104,
+          "sha256": "1962c21b49d1aee22a0a820ebd5e4a7f5afced77fe2161f2d06167879545cdf9"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ2_M/moonshotai_Kimi-K2.5-IQ2_M-00007-of-00009.gguf",
+          "bytes": 39882839296,
+          "sha256": "c61d410745fda46873075549b90c474abcf6c4c025e7bf393be6578f76bbc848"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ2_M/moonshotai_Kimi-K2.5-IQ2_M-00008-of-00009.gguf",
+          "bytes": 39490871264,
+          "sha256": "e82d63bfbb6785b788b0224be25f717b4541a5409f2ede65eab5827ed332e625"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ2_M/moonshotai_Kimi-K2.5-IQ2_M-00009-of-00009.gguf",
+          "bytes": 6521074336,
+          "sha256": "fa3d04d27bd4ace2c0e23aaf4f4d1934bfa3b2bd00c3417516fb47b1e64e2ed7"
+        }
+      ]
+    },
+    {
+      "quant": "Q2_K",
+      "layer_weight_bytes": 358637722528,
+      "shared_weight_bytes": 0,
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "gguf": "moonshotai_Kimi-K2.5-Q2_K/moonshotai_Kimi-K2.5-Q2_K-00001-of-00010.gguf",
+      "sha256": "e5c1916cae093daf8674619c66a824e6b72356ea11ef22a28446a88a2c393e9f",
+      "revision": "5b64e856ff9f4d062857d952451f38219dff1382",
+      "parts": [
+        {
+          "file": "moonshotai_Kimi-K2.5-Q2_K/moonshotai_Kimi-K2.5-Q2_K-00002-of-00010.gguf",
+          "bytes": 39426543936,
+          "sha256": "6bab3b31abf7437f95696bef96660348d6949e9018c857c3aac9e2966c11c3e2"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q2_K/moonshotai_Kimi-K2.5-Q2_K-00003-of-00010.gguf",
+          "bytes": 38904654208,
+          "sha256": "879a6b188fb746be87a115bd3ea62d77925524028dac4c81e5cdd85dda256e9a"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q2_K/moonshotai_Kimi-K2.5-Q2_K-00004-of-00010.gguf",
+          "bytes": 38908352992,
+          "sha256": "a04e5e0479f1dcddaac55d02310cac6f37a48dea5620c061a1ef2aff0bb35602"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q2_K/moonshotai_Kimi-K2.5-Q2_K-00005-of-00010.gguf",
+          "bytes": 38839341440,
+          "sha256": "e2bcde0e0bd7b311789aa1f3618592ee0710aa71ec1b46db05f87e3dc1692744"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q2_K/moonshotai_Kimi-K2.5-Q2_K-00006-of-00010.gguf",
+          "bytes": 39477176704,
+          "sha256": "03eadde3eb7176c80fd36b85b11f3b85a3fcc17276dd62a56799a98bcbdbfeea"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q2_K/moonshotai_Kimi-K2.5-Q2_K-00007-of-00010.gguf",
+          "bytes": 38923033056,
+          "sha256": "31efe5fc0e7c97138503ddbe16fd13cdc25fd474e4ab7415a6f134e41c14158c"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q2_K/moonshotai_Kimi-K2.5-Q2_K-00008-of-00010.gguf",
+          "bytes": 39426544000,
+          "sha256": "44313e8a848290de75962e7a315940f54be67e5a633f1457bb4a813c7f3f0d86"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q2_K/moonshotai_Kimi-K2.5-Q2_K-00009-of-00010.gguf",
+          "bytes": 39424878816,
+          "sha256": "4f8608cd2a85a5ae4ccd885d84a4d1bf831f370b7e2ba284ed5c7b0d3a45f482"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q2_K/moonshotai_Kimi-K2.5-Q2_K-00010-of-00010.gguf",
+          "bytes": 6179418784,
+          "sha256": "c1ad4289a977b410a7e9e36142d2c20d3155ad639a5591d889592d7ca731fed7"
+        }
+      ]
+    },
+    {
+      "quant": "Q2_K_L",
+      "layer_weight_bytes": 359784602528,
+      "shared_weight_bytes": 0,
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "gguf": "moonshotai_Kimi-K2.5-Q2_K_L/moonshotai_Kimi-K2.5-Q2_K_L-00001-of-00010.gguf",
+      "sha256": "6f4322482fc297fe665bf0f2a708a001ba0d16bac3db77f7c3933228cc36195c",
+      "revision": "5b64e856ff9f4d062857d952451f38219dff1382",
+      "parts": [
+        {
+          "file": "moonshotai_Kimi-K2.5-Q2_K_L/moonshotai_Kimi-K2.5-Q2_K_L-00002-of-00010.gguf",
+          "bytes": 39484516672,
+          "sha256": "b340eaf057806954a98e70c451d62ac27e84d117b1b4ba118d46bf54010518fd"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q2_K_L/moonshotai_Kimi-K2.5-Q2_K_L-00003-of-00010.gguf",
+          "bytes": 38923033056,
+          "sha256": "4294df670d2328fe59314183b77a2ff09034877855cc765dceaf5a6f0fe774f8"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q2_K_L/moonshotai_Kimi-K2.5-Q2_K_L-00004-of-00010.gguf",
+          "bytes": 38839341440,
+          "sha256": "7b2570efa184c7ea805f7588978703489a44c23a333b5103ad7118301aa642c9"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q2_K_L/moonshotai_Kimi-K2.5-Q2_K_L-00005-of-00010.gguf",
+          "bytes": 38897314176,
+          "sha256": "1cf706f3233eb68485be320ce82184afff4e442bf62569cf18f6cd1fa9303f3c"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q2_K_L/moonshotai_Kimi-K2.5-Q2_K_L-00006-of-00010.gguf",
+          "bytes": 38908352992,
+          "sha256": "9bf42587d8c48f436c89fff6590b875b79c82d1729bb29796acdcd37d9a87883"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q2_K_L/moonshotai_Kimi-K2.5-Q2_K_L-00007-of-00010.gguf",
+          "bytes": 39426544000,
+          "sha256": "ee64398f276ef88e7ac1c5e62b71602d9e30c5ff8878703429762c658746b147"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q2_K_L/moonshotai_Kimi-K2.5-Q2_K_L-00008-of-00010.gguf",
+          "bytes": 39484516736,
+          "sha256": "dd6da4095b2a61f9bd309942494aedeafc389a96e4911e57362823d995d8f623"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q2_K_L/moonshotai_Kimi-K2.5-Q2_K_L-00009-of-00010.gguf",
+          "bytes": 39366906080,
+          "sha256": "a62c2f20400d07cc229ca336a337fcd39e824dde13cd4245aa6aadb4599c2457"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q2_K_L/moonshotai_Kimi-K2.5-Q2_K_L-00010-of-00010.gguf",
+          "bytes": 8113716128,
+          "sha256": "05a7b83563311e255236b2fb9fcbdac97896ffb83c218511603e99f22d615829"
+        }
+      ]
+    },
+    {
+      "quant": "IQ3_XXS",
+      "layer_weight_bytes": 404581325856,
+      "shared_weight_bytes": 0,
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "gguf": "moonshotai_Kimi-K2.5-IQ3_XXS/moonshotai_Kimi-K2.5-IQ3_XXS-00001-of-00011.gguf",
+      "sha256": "3e90adc3617e921f6196fcd9852453dd3f3389fdf62e855c1b67a765d7228891",
+      "revision": "5b64e856ff9f4d062857d952451f38219dff1382",
+      "parts": [
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_XXS/moonshotai_Kimi-K2.5-IQ3_XXS-00002-of-00011.gguf",
+          "bytes": 37866725152,
+          "sha256": "59123c77a8ca7fdf301003a6c5c6dc447c09d0fac998659224c8f65c9b3760cc"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_XXS/moonshotai_Kimi-K2.5-IQ3_XXS-00003-of-00011.gguf",
+          "bytes": 39998783680,
+          "sha256": "51ac9b01343b2555babea9e2e6e0bb55e3491d233ba959252a31870585e14b4c"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_XXS/moonshotai_Kimi-K2.5-IQ3_XXS-00004-of-00011.gguf",
+          "bytes": 39976525728,
+          "sha256": "fe1fa676c3f690daa706b55134bbc290a4cc094213d6520f0e07d41a6b9e676a"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_XXS/moonshotai_Kimi-K2.5-IQ3_XXS-00005-of-00011.gguf",
+          "bytes": 37844350560,
+          "sha256": "f872abfac2c42d014f082501dc5d635eea1655850b183e4056c88dd57e04b41f"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_XXS/moonshotai_Kimi-K2.5-IQ3_XXS-00006-of-00011.gguf",
+          "bytes": 39998058272,
+          "sha256": "86513e76a3f97445f1378c0dd0c32412deef2cedf79a872a66be8a6e869dbf0f"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_XXS/moonshotai_Kimi-K2.5-IQ3_XXS-00007-of-00011.gguf",
+          "bytes": 37858926496,
+          "sha256": "23ddc5a5a1b6a7157f19ceb4d5c081a2e907ada9be861e89b94f46b6a956fe81"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_XXS/moonshotai_Kimi-K2.5-IQ3_XXS-00008-of-00011.gguf",
+          "bytes": 37851127648,
+          "sha256": "abdb8450d20e0278a970d5ae87a608c9a60fd9342c9836ecb2b69fa6be4be2a4"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_XXS/moonshotai_Kimi-K2.5-IQ3_XXS-00009-of-00011.gguf",
+          "bytes": 39998783680,
+          "sha256": "9a7be50fb18f47694fc6aa80a152fc00c3cfb45f66ee3628af2815a6968bd91c"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_XXS/moonshotai_Kimi-K2.5-IQ3_XXS-00010-of-00011.gguf",
+          "bytes": 38946731552,
+          "sha256": "c9a1eb30ef0d6508f1cdbd085abd121fd70964d64fb0f0fbc17bbd484aac751e"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_XXS/moonshotai_Kimi-K2.5-IQ3_XXS-00011-of-00011.gguf",
+          "bytes": 15896049184,
+          "sha256": "74950b852e2350fb0647762b5ab57ae97e2d9544d6715c73372cc690d9ee77bf"
+        }
+      ]
+    },
+    {
+      "quant": "IQ3_XS",
+      "layer_weight_bytes": 420081867776,
+      "shared_weight_bytes": 0,
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "gguf": "moonshotai_Kimi-K2.5-IQ3_XS/moonshotai_Kimi-K2.5-IQ3_XS-00001-of-00011.gguf",
+      "sha256": "9cd9a03069be088cd9b486f9b2a9e9d16cb206eed78aa48af949852a6aa0646d",
+      "revision": "5b64e856ff9f4d062857d952451f38219dff1382",
+      "parts": [
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_XS/moonshotai_Kimi-K2.5-IQ3_XS-00002-of-00011.gguf",
+          "bytes": 39394711200,
+          "sha256": "7ffa236a8c0bf4ac454ef8d2cf2337e8b5918ff3dd67dd3f60c6da2d5523e5dd"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_XS/moonshotai_Kimi-K2.5-IQ3_XS-00003-of-00011.gguf",
+          "bytes": 38897053408,
+          "sha256": "99400d56d4f7889f65945e4b42116afea1ca459c9472ed670bac62ad2b0ce94e"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_XS/moonshotai_Kimi-K2.5-IQ3_XS-00004-of-00011.gguf",
+          "bytes": 38643851104,
+          "sha256": "5e643b7c1145c64b33b94d7fadcddfd94ded4d44a29875edb87356585c1c41ad"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_XS/moonshotai_Kimi-K2.5-IQ3_XS-00005-of-00011.gguf",
+          "bytes": 38835033824,
+          "sha256": "c974534a7f9a0fc09a6f3543fe7e348d6a2366b7b641953159bf65fdc64ec1d5"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_XS/moonshotai_Kimi-K2.5-IQ3_XS-00006-of-00011.gguf",
+          "bytes": 38889254624,
+          "sha256": "ef82bcfe0a8461c1c7c2674bdde9c42a9e3f64cf083e056923047511b981e56f"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_XS/moonshotai_Kimi-K2.5-IQ3_XS-00007-of-00011.gguf",
+          "bytes": 38636052320,
+          "sha256": "bec28c418c53ea846aafdd2c8796ad7da70380530ae121ffbc2447b965e4c923"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_XS/moonshotai_Kimi-K2.5-IQ3_XS-00008-of-00011.gguf",
+          "bytes": 38842832608,
+          "sha256": "b2cfdf96a92740fbcbbd5a8f56af04ba746b952e22b68d6c432ea9e2131618db"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_XS/moonshotai_Kimi-K2.5-IQ3_XS-00009-of-00011.gguf",
+          "bytes": 38897053408,
+          "sha256": "44d34f920515f4aae04055a13a55224e55af5daec392ffc35d8e68c896d47499"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_XS/moonshotai_Kimi-K2.5-IQ3_XS-00010-of-00011.gguf",
+          "bytes": 38324901472,
+          "sha256": "cbc913d31340ce0b181ceb6c7ca15d8bd2474184ed1e994b04e5816cde8c0e3e"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_XS/moonshotai_Kimi-K2.5-IQ3_XS-00011-of-00011.gguf",
+          "bytes": 31996701504,
+          "sha256": "a70743435a3c32a0caec3f28d2c15ad356b4d8d60e8cda620a93844c74f58e14"
+        }
+      ]
+    },
+    {
+      "quant": "Q3_K_S",
+      "layer_weight_bytes": 444827360352,
+      "shared_weight_bytes": 0,
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "gguf": "moonshotai_Kimi-K2.5-Q3_K_S/moonshotai_Kimi-K2.5-Q3_K_S-00001-of-00012.gguf",
+      "sha256": "4e97a437e0600de15b4dcdf5597efd0a92b93d52d8c1b2c10bb4c480c01b4890",
+      "revision": "5b64e856ff9f4d062857d952451f38219dff1382",
+      "parts": [
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_S/moonshotai_Kimi-K2.5-Q3_K_S-00002-of-00012.gguf",
+          "bytes": 39366649248,
+          "sha256": "984e9b49d7656f5dfcfffb48d4d5e5844ecb51289461a5487b0fde2bebe26574"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_S/moonshotai_Kimi-K2.5-Q3_K_S-00003-of-00012.gguf",
+          "bytes": 39355668064,
+          "sha256": "73a334e2ec58822aee9fdebb07e819f7485d33b9b739397f776c46bd8bffeec7"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_S/moonshotai_Kimi-K2.5-Q3_K_S-00004-of-00012.gguf",
+          "bytes": 39408135744,
+          "sha256": "ebc4afca2185659118eef58c895040c4bff99dc4f43fbbf005d1ca7d418aaa1e"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_S/moonshotai_Kimi-K2.5-Q3_K_S-00005-of-00012.gguf",
+          "bytes": 39350134240,
+          "sha256": "9cff045cfc93d4c1ec19d29406620b994bed3931a423b1a530da5743fbb7bae8"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_S/moonshotai_Kimi-K2.5-Q3_K_S-00006-of-00012.gguf",
+          "bytes": 39361173088,
+          "sha256": "6bb6881cf48a1b184bffddcb85cdb7951dc4fb00286814f5638430058e65e3d8"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_S/moonshotai_Kimi-K2.5-Q3_K_S-00007-of-00012.gguf",
+          "bytes": 39419145792,
+          "sha256": "6b3a970a46f7fe60d7d10b166e7b0537688a8f571a38dde47e300660b28dbaad"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_S/moonshotai_Kimi-K2.5-Q3_K_S-00008-of-00012.gguf",
+          "bytes": 39339124192,
+          "sha256": "5e70f2e6d56c484531206676725da2faa83c2d94056b9fb793978d85c9edd4e3"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_S/moonshotai_Kimi-K2.5-Q3_K_S-00009-of-00012.gguf",
+          "bytes": 39355668064,
+          "sha256": "3fd8b2be8184b5ca3a606c808170a05487c9c2d31897daee50936039f2ea3886"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_S/moonshotai_Kimi-K2.5-Q3_K_S-00010-of-00012.gguf",
+          "bytes": 39435660864,
+          "sha256": "adbedcf964380b2f47216f7397de0aad6d631263dfb27751b5e6aa47a1cb661f"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_S/moonshotai_Kimi-K2.5-Q3_K_S-00011-of-00012.gguf",
+          "bytes": 39405184480,
+          "sha256": "96b580b4db58b0b55316efc1b3058c4b5c5e6adfb36f59399726410f7a3cb904"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_S/moonshotai_Kimi-K2.5-Q3_K_S-00012-of-00012.gguf",
+          "bytes": 12280130720,
+          "sha256": "39671ff42100753ef61f23efeb9a2976ae3a5cb65f64c6c85873beea25b7fb22"
+        }
+      ]
+    },
+    {
+      "quant": "IQ3_M",
+      "layer_weight_bytes": 466870099264,
+      "shared_weight_bytes": 0,
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "gguf": "moonshotai_Kimi-K2.5-IQ3_M/moonshotai_Kimi-K2.5-IQ3_M-00001-of-00013.gguf",
+      "sha256": "06723ab694c0fdc09626f54e1cd8045cc292c20ae1dcabec1b32c78ae8754f16",
+      "revision": "5b64e856ff9f4d062857d952451f38219dff1382",
+      "parts": [
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_M/moonshotai_Kimi-K2.5-IQ3_M-00002-of-00013.gguf",
+          "bytes": 39147873536,
+          "sha256": "4eaa75da440eb4161f483edcec37b742028eac902eb386807eed5ca99b9eb9ef"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_M/moonshotai_Kimi-K2.5-IQ3_M-00003-of-00013.gguf",
+          "bytes": 37611513184,
+          "sha256": "5d3aef92ae5784e27c436d1a791afc8980e6ebcf680e58548dd44579448f1889"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_M/moonshotai_Kimi-K2.5-IQ3_M-00004-of-00013.gguf",
+          "bytes": 38375794016,
+          "sha256": "5fa003b54a271df4c9623962e86a3777986e52d79e5ceb62354f4ffa5b7e78fd"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_M/moonshotai_Kimi-K2.5-IQ3_M-00005-of-00013.gguf",
+          "bytes": 38367995232,
+          "sha256": "4e6172b25b4c501f8730e8f6858fbd1310b3aa392f7acafbeeb9ac9f5686ac5a"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_M/moonshotai_Kimi-K2.5-IQ3_M-00006-of-00013.gguf",
+          "bytes": 37611513184,
+          "sha256": "82ecf15b4ca86c28ecf7476ab6aac5e25c871372bcf252171447a33cd8e21321"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_M/moonshotai_Kimi-K2.5-IQ3_M-00007-of-00013.gguf",
+          "bytes": 38375794016,
+          "sha256": "17b01a49368522c714017df32e0ea17a090134cb626a1881dae9bf7e736fe792"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_M/moonshotai_Kimi-K2.5-IQ3_M-00008-of-00013.gguf",
+          "bytes": 38367995232,
+          "sha256": "f69f291c7ceddee29f36a047c457f38709b76d3a749bdf8a9ad35c65257da2c0"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_M/moonshotai_Kimi-K2.5-IQ3_M-00009-of-00013.gguf",
+          "bytes": 37611513184,
+          "sha256": "2bed38f98a59f972c6fdc4c6f8c8b59c35f6fbd13313343204f65230d62f80b4"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_M/moonshotai_Kimi-K2.5-IQ3_M-00010-of-00013.gguf",
+          "bytes": 38375794016,
+          "sha256": "1e210c0c96e9f38ee54f6df8ce3f435537349e9d8017f7cac6dd16978b776a9d"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_M/moonshotai_Kimi-K2.5-IQ3_M-00011-of-00013.gguf",
+          "bytes": 39912154464,
+          "sha256": "511b37fabcb6e39ef01f985e48357a10e389d8cf9363331f1fd47e2cabd2cda4"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_M/moonshotai_Kimi-K2.5-IQ3_M-00012-of-00013.gguf",
+          "bytes": 38243185728,
+          "sha256": "5c47e86c780c6ebb4469e2583b7a0b2973e146eb6cd42379c9d01e49b922408a"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ3_M/moonshotai_Kimi-K2.5-IQ3_M-00013-of-00013.gguf",
+          "bytes": 4886655488,
+          "sha256": "2b6df9f96b77438bff1b0ca5ea9275785e7d6538e6d04853c763343ab8c9a096"
+        }
+      ]
+    },
+    {
+      "quant": "Q3_K_M",
+      "layer_weight_bytes": 467321920864,
+      "shared_weight_bytes": 0,
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "gguf": "moonshotai_Kimi-K2.5-Q3_K_M/moonshotai_Kimi-K2.5-Q3_K_M-00001-of-00013.gguf",
+      "sha256": "f039151f20643575c12be51af7de0ae54dd7641b4ea091304e7d52d0e276c2af",
+      "revision": "5b64e856ff9f4d062857d952451f38219dff1382",
+      "parts": [
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_M/moonshotai_Kimi-K2.5-Q3_K_M-00002-of-00013.gguf",
+          "bytes": 39196022144,
+          "sha256": "b3e98754a630b73bdd6d461f7cd37dfea4ade2c886bbd43d41e86a8b966e3831"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_M/moonshotai_Kimi-K2.5-Q3_K_M-00003-of-00013.gguf",
+          "bytes": 37655504224,
+          "sha256": "eb159892441cb8da80fda895575fc2743e416ee872e07b9f2691f966a85db862"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_M/moonshotai_Kimi-K2.5-Q3_K_M-00004-of-00013.gguf",
+          "bytes": 38415197536,
+          "sha256": "48e6b11cb1d65c812806959b7dbc4bcb872fb3f419ed752f59a781394f827ea9"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_M/moonshotai_Kimi-K2.5-Q3_K_M-00005-of-00013.gguf",
+          "bytes": 38409692512,
+          "sha256": "40f3cee04e48ccdb5525d9c08a9dc8c64e4feaeb49cfb69808b0725e7f071185"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_M/moonshotai_Kimi-K2.5-Q3_K_M-00006-of-00013.gguf",
+          "bytes": 37655504224,
+          "sha256": "27463c6d6e354bc372d8c4eada31dd278be11a35f3b0a1df3d6b21b4700505e6"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_M/moonshotai_Kimi-K2.5-Q3_K_M-00007-of-00013.gguf",
+          "bytes": 38415197536,
+          "sha256": "c8cd5ccb8e3227474a0993e27b959f83b8dad973184a08fc56c2383da39a34ba"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_M/moonshotai_Kimi-K2.5-Q3_K_M-00008-of-00013.gguf",
+          "bytes": 38409692512,
+          "sha256": "c0bdce3cc88904f2d189b18ca6c1eef7b4208122ab1f000bfc376f46c219430b"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_M/moonshotai_Kimi-K2.5-Q3_K_M-00009-of-00013.gguf",
+          "bytes": 37655504224,
+          "sha256": "61f1a6a5e2a4311da922e8523e0de7e67952346ee923ce7f53fb3fe8ae1355d8"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_M/moonshotai_Kimi-K2.5-Q3_K_M-00010-of-00013.gguf",
+          "bytes": 38415197536,
+          "sha256": "fcc6ea639dc0042bde7cfa8ca3b77ad9426983f3fc40b7fc6c8b76ad048213f0"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_M/moonshotai_Kimi-K2.5-Q3_K_M-00011-of-00013.gguf",
+          "bytes": 39940089184,
+          "sha256": "a4e3ab935d926d5514a7fff1abbb947d3b2a8809c8d3737b5cdd6645b9703202"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_M/moonshotai_Kimi-K2.5-Q3_K_M-00012-of-00013.gguf",
+          "bytes": 38261945408,
+          "sha256": "839867d0173c263066ae241f762cc5f2280600f8cbb6fb48fce335b2dc0ef927"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_M/moonshotai_Kimi-K2.5-Q3_K_M-00013-of-00013.gguf",
+          "bytes": 4886655488,
+          "sha256": "8bd57439ce8baf6b16056401c2a4ac060716152f8af55c3791bc3103b1a3c643"
+        }
+      ]
+    },
+    {
+      "quant": "Q3_K_L",
+      "layer_weight_bytes": 487537745216,
+      "shared_weight_bytes": 0,
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "gguf": "moonshotai_Kimi-K2.5-Q3_K_L/moonshotai_Kimi-K2.5-Q3_K_L-00001-of-00013.gguf",
+      "sha256": "f068eff62b5db84d4817a8d1756b2db800a0ffabcd554ce668730e784206ff2e",
+      "revision": "5b64e856ff9f4d062857d952451f38219dff1382",
+      "parts": [
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_L/moonshotai_Kimi-K2.5-Q3_K_L-00002-of-00013.gguf",
+          "bytes": 38732454912,
+          "sha256": "c7f2b0d3e2d474831371c2079a61494835cecfd81226af1c0baf1bec78a669f6"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_L/moonshotai_Kimi-K2.5-Q3_K_L-00003-of-00013.gguf",
+          "bytes": 39748789600,
+          "sha256": "ddbb2ee4af19dd0435b4fb909da3fa24307390484f290c562f5e0ae3f9202e58"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_L/moonshotai_Kimi-K2.5-Q3_K_L-00004-of-00013.gguf",
+          "bytes": 39743284576,
+          "sha256": "4c064e9dc05e999a68b584699a29fda0dc9962c4028ff6d142ec935561ee7596"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_L/moonshotai_Kimi-K2.5-Q3_K_L-00005-of-00013.gguf",
+          "bytes": 38284453216,
+          "sha256": "425340d68b750250cd4e135494d4c94c8ca5942a7ae226aecc159bf380e264c7"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_L/moonshotai_Kimi-K2.5-Q3_K_L-00006-of-00013.gguf",
+          "bytes": 39748789600,
+          "sha256": "6374df99fd29ae106d13a72f54d2245efe265f87d153871cb916f6781eca5981"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_L/moonshotai_Kimi-K2.5-Q3_K_L-00007-of-00013.gguf",
+          "bytes": 39743284576,
+          "sha256": "e360be226665bf76dca2082a0b2768993bb2fadf4392e51ccd06fc4b59402bab"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_L/moonshotai_Kimi-K2.5-Q3_K_L-00008-of-00013.gguf",
+          "bytes": 38284453216,
+          "sha256": "e55901a7f0351aae39f1b1fac74d781e22e762128f4c6a33b4df42ac97f15dd5"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_L/moonshotai_Kimi-K2.5-Q3_K_L-00009-of-00013.gguf",
+          "bytes": 39748789600,
+          "sha256": "b1365b6fba51de490557b0841bbca62c3f482089a1b28933537829b065ac6f01"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_L/moonshotai_Kimi-K2.5-Q3_K_L-00010-of-00013.gguf",
+          "bytes": 39743284576,
+          "sha256": "6e456052bb71d2797deb9d2aa18c92b73a58556dc71da52800b4a1457e6a328e"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_L/moonshotai_Kimi-K2.5-Q3_K_L-00011-of-00013.gguf",
+          "bytes": 38769783872,
+          "sha256": "dc6ac5f9777929deb78c66d5e8543656d159585a531384e4a7b436e47855bf7e"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_L/moonshotai_Kimi-K2.5-Q3_K_L-00012-of-00013.gguf",
+          "bytes": 37775498176,
+          "sha256": "20d5d51e2658a383f1eb7000bc0b3b0b71bf0d1e5510efb2f0cff1f9eae21de8"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_L/moonshotai_Kimi-K2.5-Q3_K_L-00013-of-00013.gguf",
+          "bytes": 20101133856,
+          "sha256": "10474a86ecab0ea07142a3dfd74f7155db9024b7b71f2d28bf9d06bf67e6d9dc"
+        }
+      ]
+    },
+    {
+      "quant": "Q3_K_XL",
+      "layer_weight_bytes": 488565349696,
+      "shared_weight_bytes": 0,
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "gguf": "moonshotai_Kimi-K2.5-Q3_K_XL/moonshotai_Kimi-K2.5-Q3_K_XL-00001-of-00013.gguf",
+      "sha256": "2f07a68eca463f7736fb537d1e3fb80ea928c708469b19d39885dfcdc8afd961",
+      "revision": "5b64e856ff9f4d062857d952451f38219dff1382",
+      "parts": [
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_XL/moonshotai_Kimi-K2.5-Q3_K_XL-00002-of-00013.gguf",
+          "bytes": 38732454912,
+          "sha256": "c7f2b0d3e2d474831371c2079a61494835cecfd81226af1c0baf1bec78a669f6"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_XL/moonshotai_Kimi-K2.5-Q3_K_XL-00003-of-00013.gguf",
+          "bytes": 39748789600,
+          "sha256": "ddbb2ee4af19dd0435b4fb909da3fa24307390484f290c562f5e0ae3f9202e58"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_XL/moonshotai_Kimi-K2.5-Q3_K_XL-00004-of-00013.gguf",
+          "bytes": 39743284576,
+          "sha256": "4c064e9dc05e999a68b584699a29fda0dc9962c4028ff6d142ec935561ee7596"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_XL/moonshotai_Kimi-K2.5-Q3_K_XL-00005-of-00013.gguf",
+          "bytes": 38284453216,
+          "sha256": "425340d68b750250cd4e135494d4c94c8ca5942a7ae226aecc159bf380e264c7"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_XL/moonshotai_Kimi-K2.5-Q3_K_XL-00006-of-00013.gguf",
+          "bytes": 39748789600,
+          "sha256": "6374df99fd29ae106d13a72f54d2245efe265f87d153871cb916f6781eca5981"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_XL/moonshotai_Kimi-K2.5-Q3_K_XL-00007-of-00013.gguf",
+          "bytes": 39743284576,
+          "sha256": "e360be226665bf76dca2082a0b2768993bb2fadf4392e51ccd06fc4b59402bab"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_XL/moonshotai_Kimi-K2.5-Q3_K_XL-00008-of-00013.gguf",
+          "bytes": 38284453216,
+          "sha256": "e55901a7f0351aae39f1b1fac74d781e22e762128f4c6a33b4df42ac97f15dd5"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_XL/moonshotai_Kimi-K2.5-Q3_K_XL-00009-of-00013.gguf",
+          "bytes": 39748789600,
+          "sha256": "b1365b6fba51de490557b0841bbca62c3f482089a1b28933537829b065ac6f01"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_XL/moonshotai_Kimi-K2.5-Q3_K_XL-00010-of-00013.gguf",
+          "bytes": 39743284576,
+          "sha256": "6e456052bb71d2797deb9d2aa18c92b73a58556dc71da52800b4a1457e6a328e"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_XL/moonshotai_Kimi-K2.5-Q3_K_XL-00011-of-00013.gguf",
+          "bytes": 38769783872,
+          "sha256": "dc6ac5f9777929deb78c66d5e8543656d159585a531384e4a7b436e47855bf7e"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_XL/moonshotai_Kimi-K2.5-Q3_K_XL-00012-of-00013.gguf",
+          "bytes": 37775498176,
+          "sha256": "20d5d51e2658a383f1eb7000bc0b3b0b71bf0d1e5510efb2f0cff1f9eae21de8"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q3_K_XL/moonshotai_Kimi-K2.5-Q3_K_XL-00013-of-00013.gguf",
+          "bytes": 20101133856,
+          "sha256": "10474a86ecab0ea07142a3dfd74f7155db9024b7b71f2d28bf9d06bf67e6d9dc"
+        }
+      ]
+    },
+    {
+      "quant": "IQ4_XS",
+      "layer_weight_bytes": 547605634464,
+      "shared_weight_bytes": 0,
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "gguf": "moonshotai_Kimi-K2.5-IQ4_XS/moonshotai_Kimi-K2.5-IQ4_XS-00001-of-00014.gguf",
+      "sha256": "e40e1dfd5be2454837930d8eff4e3e6d7cdcd0ecbbf55bfd690e9a58a26d495f",
+      "revision": "5b64e856ff9f4d062857d952451f38219dff1382",
+      "parts": [
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ4_XS/moonshotai_Kimi-K2.5-IQ4_XS-00002-of-00014.gguf",
+          "bytes": 39408298752,
+          "sha256": "bee05c1fd696083600bb0f03f5d1fdec6cf3ae6fe6a0d636b6356e2a063bfb8d"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ4_XS/moonshotai_Kimi-K2.5-IQ4_XS-00003-of-00014.gguf",
+          "bytes": 39388142528,
+          "sha256": "ad7d974544aa615047673e00c59ae026d28ad601f1e8955df7efb625b4148059"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ4_XS/moonshotai_Kimi-K2.5-IQ4_XS-00004-of-00014.gguf",
+          "bytes": 39434564544,
+          "sha256": "b51900bfdb6a922709bb9b3da5b596ae97535845118caea738771c5d1588c3ef"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ4_XS/moonshotai_Kimi-K2.5-IQ4_XS-00005-of-00014.gguf",
+          "bytes": 39369304928,
+          "sha256": "8434476aa928bb617fc87666ce8596631868d64266513e5e0ed227648b34996c"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ4_XS/moonshotai_Kimi-K2.5-IQ4_XS-00006-of-00014.gguf",
+          "bytes": 39388142528,
+          "sha256": "d6bda2beb33b44e96ea6e976f7f57915ddf7744fa5a3064341a3e9fc9372daf9"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ4_XS/moonshotai_Kimi-K2.5-IQ4_XS-00007-of-00014.gguf",
+          "bytes": 39426765760,
+          "sha256": "adbeaad7f4bee278e45c4bc5ceea246c2937069c9100061294e204318b6ea56a"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ4_XS/moonshotai_Kimi-K2.5-IQ4_XS-00008-of-00014.gguf",
+          "bytes": 39384902496,
+          "sha256": "76e6e94ccc68020804f34c590d5302180bba0b8a04c90112081269955afecd6d"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ4_XS/moonshotai_Kimi-K2.5-IQ4_XS-00009-of-00014.gguf",
+          "bytes": 39372544960,
+          "sha256": "de249451ee86a8750e96574fc6f935613e4e6ee8218aa12a61b997eb28bfd032"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ4_XS/moonshotai_Kimi-K2.5-IQ4_XS-00010-of-00014.gguf",
+          "bytes": 39450162112,
+          "sha256": "cbb555d793cdd15fef3ee2691ca1876b6494b83461ae711341cc9895d0807bda"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ4_XS/moonshotai_Kimi-K2.5-IQ4_XS-00011-of-00014.gguf",
+          "bytes": 39361506144,
+          "sha256": "09b4aeb75cfca34c8add75f1d9bd0d4d6bd3ca4187849735425c9f36800dc500"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ4_XS/moonshotai_Kimi-K2.5-IQ4_XS-00012-of-00014.gguf",
+          "bytes": 39388142528,
+          "sha256": "346f09e0603c641579fc1afd81392bffcb2c04baf69408e8a5bc4a943e13a74e"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ4_XS/moonshotai_Kimi-K2.5-IQ4_XS-00013-of-00014.gguf",
+          "bytes": 39504753600,
+          "sha256": "8e29727291127125f357d3affa38d096a706acb5feda720f053aa10ced1df1b5"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ4_XS/moonshotai_Kimi-K2.5-IQ4_XS-00014-of-00014.gguf",
+          "bytes": 36363903584,
+          "sha256": "fd67bf6da6b74ad9358b7fcc7f6da50dc57d53b8e81b334228ce717be4262503"
+        }
+      ]
+    },
+    {
+      "quant": "IQ4_NL",
+      "layer_weight_bytes": 579469909568,
+      "shared_weight_bytes": 0,
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "gguf": "moonshotai_Kimi-K2.5-IQ4_NL/moonshotai_Kimi-K2.5-IQ4_NL-00001-of-00016.gguf",
+      "sha256": "b5e0ac0685dc4e2e26571383ceded53110cdda6ad35d332ba0ab62c2e776f10e",
+      "revision": "5b64e856ff9f4d062857d952451f38219dff1382",
+      "parts": [
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ4_NL/moonshotai_Kimi-K2.5-IQ4_NL-00002-of-00016.gguf",
+          "bytes": 38532672128,
+          "sha256": "9e448186f1e633e65f6cc3cd63cca5618789ad0958d37f8fc45480b3646499d3"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ4_NL/moonshotai_Kimi-K2.5-IQ4_NL-00003-of-00016.gguf",
+          "bytes": 38481291936,
+          "sha256": "12d2618971796e1f822695fd795e702aa997aa684fd8ac80cf693130e265de32"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ4_NL/moonshotai_Kimi-K2.5-IQ4_NL-00004-of-00016.gguf",
+          "bytes": 38495972032,
+          "sha256": "1a5288f9aed826881858a01d10d471ff2f896f19bf8d3c930a90d63284bb30fa"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ4_NL/moonshotai_Kimi-K2.5-IQ4_NL-00005-of-00016.gguf",
+          "bytes": 38488632000,
+          "sha256": "4ff77033c83fb97363e20cd064c532479269757f2a35273b63e5067cdb5d9bc1"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ4_NL/moonshotai_Kimi-K2.5-IQ4_NL-00006-of-00016.gguf",
+          "bytes": 38481291968,
+          "sha256": "a4bc41bac481033bff2d770d2024a84c86a1aa2746bef25f2d88fcc2c4d8782a"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ4_NL/moonshotai_Kimi-K2.5-IQ4_NL-00007-of-00016.gguf",
+          "bytes": 38495972032,
+          "sha256": "0fa3dbfb6c7d9d2c5510590ac85d9d6cfdedc004da3cb14e4dd4e6fa1274fce9"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ4_NL/moonshotai_Kimi-K2.5-IQ4_NL-00008-of-00016.gguf",
+          "bytes": 38488632000,
+          "sha256": "e232acd1b059a35fe0c9c1cc8b5a890a4ceca20c946ce2ddef7a12d776a313ca"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ4_NL/moonshotai_Kimi-K2.5-IQ4_NL-00009-of-00016.gguf",
+          "bytes": 38481291968,
+          "sha256": "2ba2a8277d8c18933e57cf282b5d4908d882fc688a956d14cd8cbada91767d53"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ4_NL/moonshotai_Kimi-K2.5-IQ4_NL-00010-of-00016.gguf",
+          "bytes": 38495972032,
+          "sha256": "c34cb928fb4ce45a8b89428128fc9fab348fff81025434d9784c83570f276d61"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ4_NL/moonshotai_Kimi-K2.5-IQ4_NL-00011-of-00016.gguf",
+          "bytes": 38488632000,
+          "sha256": "ba837ad49f098d94658c4307771be132e4761c84971c370ec9135d09d439814f"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ4_NL/moonshotai_Kimi-K2.5-IQ4_NL-00012-of-00016.gguf",
+          "bytes": 38481291968,
+          "sha256": "6a982ce60911754f01da56fba3c0e58de904074b673ea0159feee77a92fcc7c3"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ4_NL/moonshotai_Kimi-K2.5-IQ4_NL-00013-of-00016.gguf",
+          "bytes": 38495972032,
+          "sha256": "8834bf7d2e1517368944340518f618d6f5a1bcc277cb5ca6657d8e99f3925253"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ4_NL/moonshotai_Kimi-K2.5-IQ4_NL-00014-of-00016.gguf",
+          "bytes": 38547352256,
+          "sha256": "7225e67e77772bef5a74030745e028d60666498bb3f33e75f66587dd7b619536"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ4_NL/moonshotai_Kimi-K2.5-IQ4_NL-00015-of-00016.gguf",
+          "bytes": 38547352256,
+          "sha256": "ccc766617465883e18a7f4d6299145a0fc42299f723a42ddf8c2fd43bccf23d4"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-IQ4_NL/moonshotai_Kimi-K2.5-IQ4_NL-00016-of-00016.gguf",
+          "bytes": 3186491648,
+          "sha256": "9143fb572c1db726ea286add9f504141944baff8c3ed30f4a86d9e5649c14358"
+        }
+      ]
+    },
+    {
+      "quant": "Q4_K_S",
+      "layer_weight_bytes": 579815480896,
+      "shared_weight_bytes": 0,
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "gguf": "moonshotai_Kimi-K2.5-Q4_K_S/moonshotai_Kimi-K2.5-Q4_K_S-00001-of-00016.gguf",
+      "sha256": "ae2bbd4cb940c4df57ea5ed3f4985893e9b679941e610e7444109d57c72f1407",
+      "revision": "5b64e856ff9f4d062857d952451f38219dff1382",
+      "parts": [
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_S/moonshotai_Kimi-K2.5-Q4_K_S-00002-of-00016.gguf",
+          "bytes": 38547090048,
+          "sha256": "345cc95be1ce491b4aa8b47e13e41a930907dc32fbf9667a3bfae9889f4f2b32"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_S/moonshotai_Kimi-K2.5-Q4_K_S-00003-of-00016.gguf",
+          "bytes": 38508554912,
+          "sha256": "aff57ce4f89a08cb9fdb4c59410b6d7b81cbd1317de866c9e29bb0e9b0ef597f"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_S/moonshotai_Kimi-K2.5-Q4_K_S-00004-of-00016.gguf",
+          "bytes": 38519564992,
+          "sha256": "a8c1ffe37a617d47677370e841feccb7bace4aeae37f2edee58294b6dbc595de"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_S/moonshotai_Kimi-K2.5-Q4_K_S-00005-of-00016.gguf",
+          "bytes": 38514059968,
+          "sha256": "8728457d81e336411ef17b6ad510807b407b5e59d98ab896c04f6dd2d56cfafe"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_S/moonshotai_Kimi-K2.5-Q4_K_S-00006-of-00016.gguf",
+          "bytes": 38508554944,
+          "sha256": "30ab141c063dbcba291720f39055ed8376353e7f6be07532f6c80c266669763b"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_S/moonshotai_Kimi-K2.5-Q4_K_S-00007-of-00016.gguf",
+          "bytes": 38519564992,
+          "sha256": "f8d708302431f0931591c6bf8655774bf4d2814d043fb2b10a4de9cff0199139"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_S/moonshotai_Kimi-K2.5-Q4_K_S-00008-of-00016.gguf",
+          "bytes": 38514059968,
+          "sha256": "18beb5142749561d11cc028660cbfa676403d6c42b66f41ba6b7519725dca6db"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_S/moonshotai_Kimi-K2.5-Q4_K_S-00009-of-00016.gguf",
+          "bytes": 38508554944,
+          "sha256": "9af7fade56719cf0fa695c07679d4c030e5ac9d3ba3bf3b66ddbe58db10b1177"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_S/moonshotai_Kimi-K2.5-Q4_K_S-00010-of-00016.gguf",
+          "bytes": 38519564992,
+          "sha256": "071f163d5b2092b24b3b5647071a7027207032c69324324caf6fbff571241ebb"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_S/moonshotai_Kimi-K2.5-Q4_K_S-00011-of-00016.gguf",
+          "bytes": 38514059968,
+          "sha256": "fd3bc003019b0c69e1a29504d5d2e3ac579ac26aceccf5c8b7eb56dd4beb688b"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_S/moonshotai_Kimi-K2.5-Q4_K_S-00012-of-00016.gguf",
+          "bytes": 38508554944,
+          "sha256": "027aea9015fe53fe1e6a62522d4b643871b6eec5f4d8469cb2f4af9079fccf6a"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_S/moonshotai_Kimi-K2.5-Q4_K_S-00013-of-00016.gguf",
+          "bytes": 38519564992,
+          "sha256": "6d8905428de279d36ef9ad69465c4c42fa657e615809e5c1065706252bab8c46"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_S/moonshotai_Kimi-K2.5-Q4_K_S-00014-of-00016.gguf",
+          "bytes": 38558100160,
+          "sha256": "0c27a0523010566684330d2236a6f941786b978d6204bd64e896119c95c7cb81"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_S/moonshotai_Kimi-K2.5-Q4_K_S-00015-of-00016.gguf",
+          "bytes": 38558100160,
+          "sha256": "20fe9f4468105a8eb24eb99d2a2f2a382d7acf55a56c87bd8c4aae89fa26a9eb"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_S/moonshotai_Kimi-K2.5-Q4_K_S-00016-of-00016.gguf",
+          "bytes": 3186491648,
+          "sha256": "c282c76bc370c3bfea1d8c8d6015d67cbd14d4b6a3b75e881bfa396816fd4874"
+        }
+      ]
+    },
+    {
+      "quant": "Q4_K_M",
+      "layer_weight_bytes": 580355550784,
+      "shared_weight_bytes": 0,
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "gguf": "moonshotai_Kimi-K2.5-Q4_K_M/moonshotai_Kimi-K2.5-Q4_K_M-00001-of-00016.gguf",
+      "sha256": "e8d08f443c853d4e8e97e2082bf7821c163a5e28610dc58e2f6d601594882f0e",
+      "revision": "5b64e856ff9f4d062857d952451f38219dff1382",
+      "parts": [
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_M/moonshotai_Kimi-K2.5-Q4_K_M-00002-of-00016.gguf",
+          "bytes": 38573746816,
+          "sha256": "ae9fb5cac7726c854b7c05dd7fb1290b5db54050fe26d23ca0d11fddcec27809"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_M/moonshotai_Kimi-K2.5-Q4_K_M-00003-of-00016.gguf",
+          "bytes": 38548859552,
+          "sha256": "7ff1cce9504897914578a2e797784e5ab42ff7283031d6217c905cd4e1827443"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_M/moonshotai_Kimi-K2.5-Q4_K_M-00004-of-00016.gguf",
+          "bytes": 38555970240,
+          "sha256": "669120e330da55abb0f571d0eb7d4f9a4152b636ab80cd3169a57b1677368f70"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_M/moonshotai_Kimi-K2.5-Q4_K_M-00005-of-00016.gguf",
+          "bytes": 38552414912,
+          "sha256": "cde7b60c6ab3a2a93882bc08f3a64933f3b915fd4c31d5c92ffd6529282b5f3a"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_M/moonshotai_Kimi-K2.5-Q4_K_M-00006-of-00016.gguf",
+          "bytes": 38548859584,
+          "sha256": "93a4776f03daeecd7078df1cc89db9fcd48f64f6112f2b5c511edadf3b4e9c94"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_M/moonshotai_Kimi-K2.5-Q4_K_M-00007-of-00016.gguf",
+          "bytes": 38555970240,
+          "sha256": "fafaa008d111429980d83649d001cf68bc528734a4bca22e00f8984a7a31c244"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_M/moonshotai_Kimi-K2.5-Q4_K_M-00008-of-00016.gguf",
+          "bytes": 38552414912,
+          "sha256": "a231fca8c0315b94de8cfda8411287c2dfb3ceaa1d3b849a15f82a87e070306c"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_M/moonshotai_Kimi-K2.5-Q4_K_M-00009-of-00016.gguf",
+          "bytes": 38548859584,
+          "sha256": "b6af4c3abf7038163628e85dbc53f34bce5bfb9fe04db97e7e09ecca84d1d9d2"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_M/moonshotai_Kimi-K2.5-Q4_K_M-00010-of-00016.gguf",
+          "bytes": 38555970240,
+          "sha256": "1f7218b864fd55061ec08534cdb78c4c12e768810986eccb4c9d20549865ef78"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_M/moonshotai_Kimi-K2.5-Q4_K_M-00011-of-00016.gguf",
+          "bytes": 38552414912,
+          "sha256": "8ac9bb22a48e301e4220b70911df76d02b96e2f373a8ef11d0afab4175644a80"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_M/moonshotai_Kimi-K2.5-Q4_K_M-00012-of-00016.gguf",
+          "bytes": 38548859584,
+          "sha256": "2dde17960e3313259b183a4bdae1b1e78f9373665ac193909297e168cbdebd87"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_M/moonshotai_Kimi-K2.5-Q4_K_M-00013-of-00016.gguf",
+          "bytes": 38555970240,
+          "sha256": "633a87502da656d8e71b24d4f6536023e5444b0c43d8898319dbc280d40c27a3"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_M/moonshotai_Kimi-K2.5-Q4_K_M-00014-of-00016.gguf",
+          "bytes": 38580857536,
+          "sha256": "8663bdfc0e03e1af0d2090d1424f478f232ed4d30e2f9f93e015016daf4a1c15"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_M/moonshotai_Kimi-K2.5-Q4_K_M-00015-of-00016.gguf",
+          "bytes": 38580857536,
+          "sha256": "119643e68f7c3305c5a5bd9ba27d46d16a8d201e6cdb5ba9757099293f37933d"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_M/moonshotai_Kimi-K2.5-Q4_K_M-00016-of-00016.gguf",
+          "bytes": 3186491648,
+          "sha256": "c282c76bc370c3bfea1d8c8d6015d67cbd14d4b6a3b75e881bfa396816fd4874"
+        }
+      ]
+    },
+    {
+      "quant": "Q5_K_S",
+      "layer_weight_bytes": 580517834304,
+      "shared_weight_bytes": 0,
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "gguf": "moonshotai_Kimi-K2.5-Q5_K_S/moonshotai_Kimi-K2.5-Q5_K_S-00001-of-00016.gguf",
+      "sha256": "be28d6b64b229369861d8ab2b5674703d68b3bce15601b318d9cd6e5a21a856f",
+      "revision": "5b64e856ff9f4d062857d952451f38219dff1382",
+      "parts": [
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_S/moonshotai_Kimi-K2.5-Q5_K_S-00002-of-00016.gguf",
+          "bytes": 38573746816,
+          "sha256": "ae9fb5cac7726c854b7c05dd7fb1290b5db54050fe26d23ca0d11fddcec27809"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_S/moonshotai_Kimi-K2.5-Q5_K_S-00003-of-00016.gguf",
+          "bytes": 38548859552,
+          "sha256": "7ff1cce9504897914578a2e797784e5ab42ff7283031d6217c905cd4e1827443"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_S/moonshotai_Kimi-K2.5-Q5_K_S-00004-of-00016.gguf",
+          "bytes": 38555970240,
+          "sha256": "669120e330da55abb0f571d0eb7d4f9a4152b636ab80cd3169a57b1677368f70"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_S/moonshotai_Kimi-K2.5-Q5_K_S-00005-of-00016.gguf",
+          "bytes": 38552414912,
+          "sha256": "cde7b60c6ab3a2a93882bc08f3a64933f3b915fd4c31d5c92ffd6529282b5f3a"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_S/moonshotai_Kimi-K2.5-Q5_K_S-00006-of-00016.gguf",
+          "bytes": 38548859584,
+          "sha256": "93a4776f03daeecd7078df1cc89db9fcd48f64f6112f2b5c511edadf3b4e9c94"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_S/moonshotai_Kimi-K2.5-Q5_K_S-00007-of-00016.gguf",
+          "bytes": 38555970240,
+          "sha256": "fafaa008d111429980d83649d001cf68bc528734a4bca22e00f8984a7a31c244"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_S/moonshotai_Kimi-K2.5-Q5_K_S-00008-of-00016.gguf",
+          "bytes": 38552414912,
+          "sha256": "a231fca8c0315b94de8cfda8411287c2dfb3ceaa1d3b849a15f82a87e070306c"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_S/moonshotai_Kimi-K2.5-Q5_K_S-00009-of-00016.gguf",
+          "bytes": 38548859584,
+          "sha256": "b6af4c3abf7038163628e85dbc53f34bce5bfb9fe04db97e7e09ecca84d1d9d2"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_S/moonshotai_Kimi-K2.5-Q5_K_S-00010-of-00016.gguf",
+          "bytes": 38555970240,
+          "sha256": "1f7218b864fd55061ec08534cdb78c4c12e768810986eccb4c9d20549865ef78"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_S/moonshotai_Kimi-K2.5-Q5_K_S-00011-of-00016.gguf",
+          "bytes": 38552414912,
+          "sha256": "8ac9bb22a48e301e4220b70911df76d02b96e2f373a8ef11d0afab4175644a80"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_S/moonshotai_Kimi-K2.5-Q5_K_S-00012-of-00016.gguf",
+          "bytes": 38548859584,
+          "sha256": "2dde17960e3313259b183a4bdae1b1e78f9373665ac193909297e168cbdebd87"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_S/moonshotai_Kimi-K2.5-Q5_K_S-00013-of-00016.gguf",
+          "bytes": 38555970240,
+          "sha256": "633a87502da656d8e71b24d4f6536023e5444b0c43d8898319dbc280d40c27a3"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_S/moonshotai_Kimi-K2.5-Q5_K_S-00014-of-00016.gguf",
+          "bytes": 38580857536,
+          "sha256": "8663bdfc0e03e1af0d2090d1424f478f232ed4d30e2f9f93e015016daf4a1c15"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_S/moonshotai_Kimi-K2.5-Q5_K_S-00015-of-00016.gguf",
+          "bytes": 38580857536,
+          "sha256": "119643e68f7c3305c5a5bd9ba27d46d16a8d201e6cdb5ba9757099293f37933d"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_S/moonshotai_Kimi-K2.5-Q5_K_S-00016-of-00016.gguf",
+          "bytes": 3186491648,
+          "sha256": "c282c76bc370c3bfea1d8c8d6015d67cbd14d4b6a3b75e881bfa396816fd4874"
+        }
+      ]
+    },
+    {
+      "quant": "Q4_K_L",
+      "layer_weight_bytes": 581227179584,
+      "shared_weight_bytes": 0,
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "gguf": "moonshotai_Kimi-K2.5-Q4_K_L/moonshotai_Kimi-K2.5-Q4_K_L-00001-of-00016.gguf",
+      "sha256": "f29914a27c6b5e866fe57f63565c45cc850d0ccdfa703c67f22ed5940e1e3da2",
+      "revision": "5b64e856ff9f4d062857d952451f38219dff1382",
+      "parts": [
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_L/moonshotai_Kimi-K2.5-Q4_K_L-00002-of-00016.gguf",
+          "bytes": 38573746816,
+          "sha256": "ae9fb5cac7726c854b7c05dd7fb1290b5db54050fe26d23ca0d11fddcec27809"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_L/moonshotai_Kimi-K2.5-Q4_K_L-00003-of-00016.gguf",
+          "bytes": 38548859552,
+          "sha256": "7ff1cce9504897914578a2e797784e5ab42ff7283031d6217c905cd4e1827443"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_L/moonshotai_Kimi-K2.5-Q4_K_L-00004-of-00016.gguf",
+          "bytes": 38555970240,
+          "sha256": "669120e330da55abb0f571d0eb7d4f9a4152b636ab80cd3169a57b1677368f70"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_L/moonshotai_Kimi-K2.5-Q4_K_L-00005-of-00016.gguf",
+          "bytes": 38552414912,
+          "sha256": "cde7b60c6ab3a2a93882bc08f3a64933f3b915fd4c31d5c92ffd6529282b5f3a"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_L/moonshotai_Kimi-K2.5-Q4_K_L-00006-of-00016.gguf",
+          "bytes": 38548859584,
+          "sha256": "93a4776f03daeecd7078df1cc89db9fcd48f64f6112f2b5c511edadf3b4e9c94"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_L/moonshotai_Kimi-K2.5-Q4_K_L-00007-of-00016.gguf",
+          "bytes": 38555970240,
+          "sha256": "fafaa008d111429980d83649d001cf68bc528734a4bca22e00f8984a7a31c244"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_L/moonshotai_Kimi-K2.5-Q4_K_L-00008-of-00016.gguf",
+          "bytes": 38552414912,
+          "sha256": "a231fca8c0315b94de8cfda8411287c2dfb3ceaa1d3b849a15f82a87e070306c"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_L/moonshotai_Kimi-K2.5-Q4_K_L-00009-of-00016.gguf",
+          "bytes": 38548859584,
+          "sha256": "b6af4c3abf7038163628e85dbc53f34bce5bfb9fe04db97e7e09ecca84d1d9d2"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_L/moonshotai_Kimi-K2.5-Q4_K_L-00010-of-00016.gguf",
+          "bytes": 38555970240,
+          "sha256": "1f7218b864fd55061ec08534cdb78c4c12e768810986eccb4c9d20549865ef78"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_L/moonshotai_Kimi-K2.5-Q4_K_L-00011-of-00016.gguf",
+          "bytes": 38552414912,
+          "sha256": "8ac9bb22a48e301e4220b70911df76d02b96e2f373a8ef11d0afab4175644a80"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_L/moonshotai_Kimi-K2.5-Q4_K_L-00012-of-00016.gguf",
+          "bytes": 38548859584,
+          "sha256": "2dde17960e3313259b183a4bdae1b1e78f9373665ac193909297e168cbdebd87"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_L/moonshotai_Kimi-K2.5-Q4_K_L-00013-of-00016.gguf",
+          "bytes": 38555970240,
+          "sha256": "633a87502da656d8e71b24d4f6536023e5444b0c43d8898319dbc280d40c27a3"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_L/moonshotai_Kimi-K2.5-Q4_K_L-00014-of-00016.gguf",
+          "bytes": 38580857536,
+          "sha256": "8663bdfc0e03e1af0d2090d1424f478f232ed4d30e2f9f93e015016daf4a1c15"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_L/moonshotai_Kimi-K2.5-Q4_K_L-00015-of-00016.gguf",
+          "bytes": 38580857536,
+          "sha256": "119643e68f7c3305c5a5bd9ba27d46d16a8d201e6cdb5ba9757099293f37933d"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_K_L/moonshotai_Kimi-K2.5-Q4_K_L-00016-of-00016.gguf",
+          "bytes": 3186491648,
+          "sha256": "c282c76bc370c3bfea1d8c8d6015d67cbd14d4b6a3b75e881bfa396816fd4874"
+        }
+      ]
+    },
+    {
+      "quant": "Q5_K_M",
+      "layer_weight_bytes": 581232893504,
+      "shared_weight_bytes": 0,
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "gguf": "moonshotai_Kimi-K2.5-Q5_K_M/moonshotai_Kimi-K2.5-Q5_K_M-00001-of-00016.gguf",
+      "sha256": "bd2819e60176d84c61105de028248ebd3f86f4276c142f66f296f5ea2441e907",
+      "revision": "5b64e856ff9f4d062857d952451f38219dff1382",
+      "parts": [
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_M/moonshotai_Kimi-K2.5-Q5_K_M-00002-of-00016.gguf",
+          "bytes": 38605613696,
+          "sha256": "6031b1f68c8383160140f1a5a1c1cf527ecb44851443bc28334be86bf898efa7"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_M/moonshotai_Kimi-K2.5-Q5_K_M-00003-of-00016.gguf",
+          "bytes": 38605613728,
+          "sha256": "9cb4f666f57facb6c3a6e1d89059d7a0229da876b080ead1075e133143003da9"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_M/moonshotai_Kimi-K2.5-Q5_K_M-00004-of-00016.gguf",
+          "bytes": 38605613760,
+          "sha256": "f746e37cd0370669befa4769c88efdc11a3846baa9683edda17efa5c21d00af5"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_M/moonshotai_Kimi-K2.5-Q5_K_M-00005-of-00016.gguf",
+          "bytes": 38605613760,
+          "sha256": "6a97b18481487373bbf7f04d8988bce051d52c36609d380de09eaa81a88d14ef"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_M/moonshotai_Kimi-K2.5-Q5_K_M-00006-of-00016.gguf",
+          "bytes": 38605613760,
+          "sha256": "d0fa630d9d73686625a6e0b83223857ae46594c45ecea356ec555604cf52139c"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_M/moonshotai_Kimi-K2.5-Q5_K_M-00007-of-00016.gguf",
+          "bytes": 38605613760,
+          "sha256": "6fbeea562c2a86aeea0efb82434fc01af4bdb2bd24369fd68d16081ab8bb7bb5"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_M/moonshotai_Kimi-K2.5-Q5_K_M-00008-of-00016.gguf",
+          "bytes": 38605613760,
+          "sha256": "0446bbf2e9cc58a3701268377277f20fd90acc57537964c2be4106d4469ff2c2"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_M/moonshotai_Kimi-K2.5-Q5_K_M-00009-of-00016.gguf",
+          "bytes": 38605613760,
+          "sha256": "d01ef3bdd8fdcdea14ef5a146229d22e47b811ab346f49a201add66245d7d15f"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_M/moonshotai_Kimi-K2.5-Q5_K_M-00010-of-00016.gguf",
+          "bytes": 38605613760,
+          "sha256": "0b4c6b311642c95cb22e107dc7beb2ee03f8bcc1503cb55a43ff56d5e982a123"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_M/moonshotai_Kimi-K2.5-Q5_K_M-00011-of-00016.gguf",
+          "bytes": 38605613760,
+          "sha256": "3714fbf244e527412e7a1c56e77090b47bd169a7c67a092797359e3ce63645b7"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_M/moonshotai_Kimi-K2.5-Q5_K_M-00012-of-00016.gguf",
+          "bytes": 38605613760,
+          "sha256": "245c239a5db3810baaab475fe498e115268b49a3a964b1ef2d1234b679881246"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_M/moonshotai_Kimi-K2.5-Q5_K_M-00013-of-00016.gguf",
+          "bytes": 38605613760,
+          "sha256": "23e37926267d053a4f073c343aac39df6d0ad2ac79282064792211698a2cd56a"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_M/moonshotai_Kimi-K2.5-Q5_K_M-00014-of-00016.gguf",
+          "bytes": 38605613760,
+          "sha256": "3aa179b7ab7eed1e90c240c59d2ca4d1418cc9f0797f2d196c8379e24184a821"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_M/moonshotai_Kimi-K2.5-Q5_K_M-00015-of-00016.gguf",
+          "bytes": 38605613760,
+          "sha256": "76d025c105e988ba133130bb112314bd4de782a8d0b1f4aa37ade13ed003f931"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q5_K_M/moonshotai_Kimi-K2.5-Q5_K_M-00016-of-00016.gguf",
+          "bytes": 3186491648,
+          "sha256": "c282c76bc370c3bfea1d8c8d6015d67cbd14d4b6a3b75e881bfa396816fd4874"
+        }
+      ]
+    },
+    {
+      "quant": "Q6_K",
+      "layer_weight_bytes": 582178528832,
+      "shared_weight_bytes": 0,
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "gguf": "moonshotai_Kimi-K2.5-Q6_K/moonshotai_Kimi-K2.5-Q6_K-00001-of-00016.gguf",
+      "sha256": "78ec2fc2b03199c58a220bc825baf68e7e5f775a01238ebbd2ecd1bbdabba299",
+      "revision": "5b64e856ff9f4d062857d952451f38219dff1382",
+      "parts": [
+        {
+          "file": "moonshotai_Kimi-K2.5-Q6_K/moonshotai_Kimi-K2.5-Q6_K-00002-of-00016.gguf",
+          "bytes": 38655093376,
+          "sha256": "93787ff129ad5aa2a4d0bc85860ff6bd8be72335b6f4da2ce175104c34f3a55d"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q6_K/moonshotai_Kimi-K2.5-Q6_K-00003-of-00016.gguf",
+          "bytes": 38655093408,
+          "sha256": "19090039e182a4e820f723f74e7b24109d8a4dbb7ad57063c8fb7e66e3b4a306"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q6_K/moonshotai_Kimi-K2.5-Q6_K-00004-of-00016.gguf",
+          "bytes": 38655093440,
+          "sha256": "d27137e180e4ae4c4ef9f63eca668584ac689944806735f3720e803ee49417de"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q6_K/moonshotai_Kimi-K2.5-Q6_K-00005-of-00016.gguf",
+          "bytes": 38655093440,
+          "sha256": "6cd7a58b57003eeab838fafcd4b00f007f0b598e8fc3dc1ef36ff42bf8c0ba6c"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q6_K/moonshotai_Kimi-K2.5-Q6_K-00006-of-00016.gguf",
+          "bytes": 38655093440,
+          "sha256": "0188c1d59eaa0593de3021ae10d5900b6a8dd4d8e4407776804f600e7ea0a8c3"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q6_K/moonshotai_Kimi-K2.5-Q6_K-00007-of-00016.gguf",
+          "bytes": 38655093440,
+          "sha256": "9dbd1caa428733c1b23ce0b0c69c30915e2a55738de2f4e1ad71586548af871d"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q6_K/moonshotai_Kimi-K2.5-Q6_K-00008-of-00016.gguf",
+          "bytes": 38655093440,
+          "sha256": "ca0cce3f0b51b6b85761e1e7a8cb52673142779f978fec7a56e23aca12705da1"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q6_K/moonshotai_Kimi-K2.5-Q6_K-00009-of-00016.gguf",
+          "bytes": 38655093440,
+          "sha256": "200fe95e0692c56faa67820839f2fe68e6dee728dddf358cff8d4310eb4562b9"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q6_K/moonshotai_Kimi-K2.5-Q6_K-00010-of-00016.gguf",
+          "bytes": 38655093440,
+          "sha256": "a561bf8d064434003a793323a81bf2c33e94a3c72f84ac78b85cef5021ebcf59"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q6_K/moonshotai_Kimi-K2.5-Q6_K-00011-of-00016.gguf",
+          "bytes": 38655093440,
+          "sha256": "03a43680d89f43086f24ee9707949683ce296a81418ace44f7ecfa88a918c7cf"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q6_K/moonshotai_Kimi-K2.5-Q6_K-00012-of-00016.gguf",
+          "bytes": 38655093440,
+          "sha256": "43c71c5889c2929192605416605998ebf2f0d13f3a765d70ba92b58d80cba289"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q6_K/moonshotai_Kimi-K2.5-Q6_K-00013-of-00016.gguf",
+          "bytes": 38655093440,
+          "sha256": "adcff8850f1ec3e312e285ecbac75135135f12796099cd021d4bb97e462b6c7e"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q6_K/moonshotai_Kimi-K2.5-Q6_K-00014-of-00016.gguf",
+          "bytes": 38655093440,
+          "sha256": "30e4bf3122a0a0f1bef43594df87993f148233fa138c75a0f8e425bc60b5f546"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q6_K/moonshotai_Kimi-K2.5-Q6_K-00015-of-00016.gguf",
+          "bytes": 38655093440,
+          "sha256": "c0e3fa632d643df4d819e32aed46f3308a6f7f551abc80701f3f1d981a514394"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q6_K/moonshotai_Kimi-K2.5-Q6_K-00016-of-00016.gguf",
+          "bytes": 3186491648,
+          "sha256": "c282c76bc370c3bfea1d8c8d6015d67cbd14d4b6a3b75e881bfa396816fd4874"
+        }
+      ]
+    },
+    {
+      "quant": "Q8_0",
+      "layer_weight_bytes": 583710875200,
+      "shared_weight_bytes": 0,
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "gguf": "moonshotai_Kimi-K2.5-Q8_0/moonshotai_Kimi-K2.5-Q8_0-00001-of-00016.gguf",
+      "sha256": "00c52124fe9ffa0002f064f21c64ef0db0547c3c9ede7e2075cd22b3652a8f64",
+      "revision": "5b64e856ff9f4d062857d952451f38219dff1382",
+      "parts": [
+        {
+          "file": "moonshotai_Kimi-K2.5-Q8_0/moonshotai_Kimi-K2.5-Q8_0-00002-of-00016.gguf",
+          "bytes": 38711978624,
+          "sha256": "24971d5200652ecf649a805f7216ea431379c6f24c25760932e847a59f336c25"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q8_0/moonshotai_Kimi-K2.5-Q8_0-00003-of-00016.gguf",
+          "bytes": 38711978656,
+          "sha256": "a30f2b769ef4d805a0bedf7b62b984b223411abcb22cd57570a2bb22153fefff"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q8_0/moonshotai_Kimi-K2.5-Q8_0-00004-of-00016.gguf",
+          "bytes": 38711978688,
+          "sha256": "5853ea311b4ddd21735f5428b371e9a2d4d36443e234da9c27feb7b970cb6b0c"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q8_0/moonshotai_Kimi-K2.5-Q8_0-00005-of-00016.gguf",
+          "bytes": 38711978688,
+          "sha256": "a3f6e959d78a80bf48dc1220758a12b1d02778dc8f58edeeb4e75a5bb4ee1667"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q8_0/moonshotai_Kimi-K2.5-Q8_0-00006-of-00016.gguf",
+          "bytes": 38711978688,
+          "sha256": "88df72b2b5bd467ac1dd849535e18050cb11679e19f0dc9af023e7164c71443e"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q8_0/moonshotai_Kimi-K2.5-Q8_0-00007-of-00016.gguf",
+          "bytes": 38711978688,
+          "sha256": "4ddcbd9d37e481b84ed25ef421390256a81be08fb9891e2581eddfc10acf7a85"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q8_0/moonshotai_Kimi-K2.5-Q8_0-00008-of-00016.gguf",
+          "bytes": 38711978688,
+          "sha256": "3fc407d9bc5da4265150c34140498dfc5f61ce04e989b3f4db7ff0a4e21fb578"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q8_0/moonshotai_Kimi-K2.5-Q8_0-00009-of-00016.gguf",
+          "bytes": 38711978688,
+          "sha256": "d7bbb63d68f57bb2dfa5a755275fce4bd5a885f0d1fad914831ea93e003eae48"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q8_0/moonshotai_Kimi-K2.5-Q8_0-00010-of-00016.gguf",
+          "bytes": 38711978688,
+          "sha256": "de1e1335981617b0655392a0738290d58bc1b4a30061c1a14d0395306e923065"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q8_0/moonshotai_Kimi-K2.5-Q8_0-00011-of-00016.gguf",
+          "bytes": 38711978688,
+          "sha256": "cddc65fdb114bdb1b3d2def3550483b507527031c88d0b78653ac717a4302a94"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q8_0/moonshotai_Kimi-K2.5-Q8_0-00012-of-00016.gguf",
+          "bytes": 38711978688,
+          "sha256": "60fc2e6122ad7435ac663f769c0b90e5518d57ce41d8b35cf739c7960e13a7e7"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q8_0/moonshotai_Kimi-K2.5-Q8_0-00013-of-00016.gguf",
+          "bytes": 38711978688,
+          "sha256": "72d169942ea325716f56815172547a726c7a5d2af426a15086c99145b16be6ef"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q8_0/moonshotai_Kimi-K2.5-Q8_0-00014-of-00016.gguf",
+          "bytes": 38711978688,
+          "sha256": "bdf6788de10556c639050fd8baaf19d999e68362b327e13880305d672461393e"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q8_0/moonshotai_Kimi-K2.5-Q8_0-00015-of-00016.gguf",
+          "bytes": 38711978688,
+          "sha256": "a555e16b84d2ddb61d15caa9013121e86dd2954a39afb629f5c3a23e53cf88eb"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q8_0/moonshotai_Kimi-K2.5-Q8_0-00016-of-00016.gguf",
+          "bytes": 3186491648,
+          "sha256": "c282c76bc370c3bfea1d8c8d6015d67cbd14d4b6a3b75e881bfa396816fd4874"
+        }
+      ]
+    },
+    {
+      "quant": "Q4_0",
+      "layer_weight_bytes": 589765221952,
+      "shared_weight_bytes": 0,
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "gguf": "moonshotai_Kimi-K2.5-Q4_0/moonshotai_Kimi-K2.5-Q4_0-00001-of-00016.gguf",
+      "sha256": "7451bfbaaba5ab6870a6488b1d43fb122b6aa42c849dc73ab18e17823ee4ccd8",
+      "revision": "5b64e856ff9f4d062857d952451f38219dff1382",
+      "parts": [
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_0/moonshotai_Kimi-K2.5-Q4_0-00002-of-00016.gguf",
+          "bytes": 39563946624,
+          "sha256": "76a6c02bcee7d52998438748f27cfb6573662d831f53274ddc79e39b1b556863"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_0/moonshotai_Kimi-K2.5-Q4_0-00003-of-00016.gguf",
+          "bytes": 38820768416,
+          "sha256": "0935cad4de4ba43edde97f224ba94ef10444789f4f741096ef6c774635e683a5"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_0/moonshotai_Kimi-K2.5-Q4_0-00004-of-00016.gguf",
+          "bytes": 39184100032,
+          "sha256": "27a121562d14ec85bfbab9f4aff767e938b1d78f5c3ae164350973333357378d"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_0/moonshotai_Kimi-K2.5-Q4_0-00005-of-00016.gguf",
+          "bytes": 38826273472,
+          "sha256": "e9fefe01aaa05ead1df402abf5b16d5c7e43d684fc38f7d5e8b9f9dbce644159"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_0/moonshotai_Kimi-K2.5-Q4_0-00006-of-00016.gguf",
+          "bytes": 38820768448,
+          "sha256": "87fcf08cfbed3919e9ed0bb9c972368ff71057ab8bbd3b82faf1f4744cbef7b5"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_0/moonshotai_Kimi-K2.5-Q4_0-00007-of-00016.gguf",
+          "bytes": 39184100032,
+          "sha256": "806eaf2ad339c5d7fc3c41261c0b05bee1424884666fedc0de56487a2d8fee83"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_0/moonshotai_Kimi-K2.5-Q4_0-00008-of-00016.gguf",
+          "bytes": 38826273472,
+          "sha256": "8a8c4c5b5382deb95bba3b09d4c331c61f835b785ba1205aaf3765dea1d07108"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_0/moonshotai_Kimi-K2.5-Q4_0-00009-of-00016.gguf",
+          "bytes": 38820768448,
+          "sha256": "ef6847d0e6957990d3e3ccb3fa6c83111b3a5e9aed83994674c94f3d3183561c"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_0/moonshotai_Kimi-K2.5-Q4_0-00010-of-00016.gguf",
+          "bytes": 39184100032,
+          "sha256": "d1e43f36d85d58958125525032b3bc4d3f91324f76655cd51f6537d82c06afc1"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_0/moonshotai_Kimi-K2.5-Q4_0-00011-of-00016.gguf",
+          "bytes": 38826273472,
+          "sha256": "56bac9b3a703823f4707dea976a52412379f9ec31b8c09b5f36d01da6b4f4e70"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_0/moonshotai_Kimi-K2.5-Q4_0-00012-of-00016.gguf",
+          "bytes": 38820768448,
+          "sha256": "0cdf16563c9d66c87f7bd5161f4a4d080f0378ab3e0dba860e20c910198fa242"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_0/moonshotai_Kimi-K2.5-Q4_0-00013-of-00016.gguf",
+          "bytes": 39184100032,
+          "sha256": "d95c88d5bbb8e39977956d2f224b75cd3a7d398407b062db1d264b3a94a7c0b1"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_0/moonshotai_Kimi-K2.5-Q4_0-00014-of-00016.gguf",
+          "bytes": 39927278272,
+          "sha256": "5d806189982949d14229f33ffdd75192504c4d7535b6006adb81518bf6c9b7df"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_0/moonshotai_Kimi-K2.5-Q4_0-00015-of-00016.gguf",
+          "bytes": 39927278272,
+          "sha256": "bc88d955789e0a350f3efd2be985ade956c59c89f90620df47a97b3939fc4a67"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_0/moonshotai_Kimi-K2.5-Q4_0-00016-of-00016.gguf",
+          "bytes": 3186491648,
+          "sha256": "c282c76bc370c3bfea1d8c8d6015d67cbd14d4b6a3b75e881bfa396816fd4874"
+        }
+      ]
+    },
+    {
+      "quant": "Q4_1",
+      "layer_weight_bytes": 643155730176,
+      "shared_weight_bytes": 0,
+      "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+      "gguf": "moonshotai_Kimi-K2.5-Q4_1/moonshotai_Kimi-K2.5-Q4_1-00001-of-00017.gguf",
+      "sha256": "28735131ea99e13297f86dd874bd4d6a4cfbd0f339d7591c12cd99dda94f9b6b",
+      "revision": "5b64e856ff9f4d062857d952451f38219dff1382",
+      "parts": [
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_1/moonshotai_Kimi-K2.5-Q4_1-00002-of-00017.gguf",
+          "bytes": 39231285728,
+          "sha256": "4cbbfe4909fbc5186d328b752eb5387aa7618ca3005907c59c76c97a4f1adae1"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_1/moonshotai_Kimi-K2.5-Q4_1-00003-of-00017.gguf",
+          "bytes": 39129538976,
+          "sha256": "53b0d7e52b230f9fad4e7790958bd92d73f188eaddb11ed771e31c4d6a34b7cd"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_1/moonshotai_Kimi-K2.5-Q4_1-00004-of-00017.gguf",
+          "bytes": 39183546816,
+          "sha256": "15b6a9228b8924decb86fbca58e4685a9b9922daa5e622a46697262e54fd7d66"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_1/moonshotai_Kimi-K2.5-Q4_1-00005-of-00017.gguf",
+          "bytes": 39194585664,
+          "sha256": "e4c62fcaa7010fe501d1e95af71fa02b93243b10eca9391e6cc02c48f73a8414"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_1/moonshotai_Kimi-K2.5-Q4_1-00006-of-00017.gguf",
+          "bytes": 39138714048,
+          "sha256": "b53d95d4415d2fe1bb12ddab8d3d427c447f1967073ac476bd4c86f20ac36f8b"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_1/moonshotai_Kimi-K2.5-Q4_1-00007-of-00017.gguf",
+          "bytes": 39188134336,
+          "sha256": "142638c49e284946575183ee96bee161744429a02250cacb5cecd8b878290488"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_1/moonshotai_Kimi-K2.5-Q4_1-00008-of-00017.gguf",
+          "bytes": 39194585664,
+          "sha256": "cc7eff8620e3ee14395ac9c75d3f14a9e1fc726e6802c42dfa6e590fcde63ac6"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_1/moonshotai_Kimi-K2.5-Q4_1-00009-of-00017.gguf",
+          "bytes": 39129539008,
+          "sha256": "4c6407219188663314a005049123e7744d56c41c5228e7c827d6ca24862281dc"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_1/moonshotai_Kimi-K2.5-Q4_1-00010-of-00017.gguf",
+          "bytes": 39188134336,
+          "sha256": "a9c3a65184b4ffb4ca33211ca07d432a2612b979f487a2c0acca304fb00bbefb"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_1/moonshotai_Kimi-K2.5-Q4_1-00011-of-00017.gguf",
+          "bytes": 39203760704,
+          "sha256": "bda09689da29b9117b8d40177f422dad53fc8bbd47c70909a552c9c1aa028bf9"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_1/moonshotai_Kimi-K2.5-Q4_1-00012-of-00017.gguf",
+          "bytes": 39129539008,
+          "sha256": "b747f9ac096870ec7de2dcea592de987993e6f94094277be953c56f4232808bd"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_1/moonshotai_Kimi-K2.5-Q4_1-00013-of-00017.gguf",
+          "bytes": 39183546816,
+          "sha256": "bc1ad42dee4a3a0a9e5a19f156ed162ce8ec74872c17e675681f6a4dc0647a1d"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_1/moonshotai_Kimi-K2.5-Q4_1-00014-of-00017.gguf",
+          "bytes": 39194585664,
+          "sha256": "a88cd0fb4bf0cf8b301eb38c227f4a67ce9abfbf5fb3fa209aa83cc31a64c194"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_1/moonshotai_Kimi-K2.5-Q4_1-00015-of-00017.gguf",
+          "bytes": 39166239168,
+          "sha256": "879491721b8746243e6cf61a71f4da2b59b6d0e65d4a3ca57753fcfc08fc1dee"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_1/moonshotai_Kimi-K2.5-Q4_1-00016-of-00017.gguf",
+          "bytes": 39220246976,
+          "sha256": "b876e3c26f8c039ddba90841e968c7f630201d2e3621bf7eb35cb2a3286b3836"
+        },
+        {
+          "file": "moonshotai_Kimi-K2.5-Q4_1/moonshotai_Kimi-K2.5-Q4_1-00017-of-00017.gguf",
+          "bytes": 17781189792,
+          "sha256": "0d274058b452adb66889ba8b0f32a479984222d893a765ccfbee93bc6b9014c4"
+        }
+      ]
+    }
+  ]
 }

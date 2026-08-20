@@ -24,8 +24,8 @@
 # Topology: two processes on this machine over loopback, with a userspace tap
 # (scripts/rpc_tap.py) in front of the rpc-server so the exact wire bytes are
 # recorded (loopback packet capture needs BPF privileges this session lacks).
-# The task allows loopback two-process on the Mac; we drive llama-server +
-# ggml-rpc-server DIRECTLY (not through the coordinator) precisely because the
+# The task allows loopback two-process on the Mac; we drive idletoken-server +
+# idletoken-rpc-server DIRECTLY (not through the coordinator) precisely because the
 # bad case must BYPASS the coordinator's layer-0 pin -- the coordinator refuses
 # to produce the leaking configuration, which is the property under test.
 #
@@ -38,9 +38,9 @@ ENGINE_DIR="${IDLETOKEN_ENGINE_DIR:-$REPO/vendor/llama.cpp/build/bin}"
 GGUF="${IDLETOKEN_SMOKE_GGUF:-}"
 GGUF_PY="${IDLETOKEN_GGUF_PY:-$REPO/vendor/llama.cpp/gguf-py}"
 BASE="${IDLETOKEN_PRIV7_PORT:-51880}"
-RPC_PORT=$BASE                 # ggml-rpc-server
-TAP_PORT=$((BASE + 1))         # tap listen (llama-server dials this)
-API_PORT=$((BASE + 2))         # llama-server HTTP
+RPC_PORT=$BASE                 # idletoken-rpc-server
+TAP_PORT=$((BASE + 1))         # tap listen (idletoken-server dials this)
+API_PORT=$((BASE + 2))         # idletoken-server HTTP
 PROMPT="The quick brown fox jumps over the lazy dog near the river."
 PREFIX_FLOATS="${IDLETOKEN_PRIV7_PREFIX:-8}"
 
@@ -51,8 +51,8 @@ die()  { say "G_PRIV7_FAIL: $*"; cleanup; exit 1; }
 # --- dependency checks (SKIP, not FAIL: a missing engine/model is a
 #     provisioning gap, not a privacy failure) --------------------------------
 command -v python3 >/dev/null 2>&1 || skip "python3 not available"
-[ -x "$ENGINE_DIR/llama-server" ]    || skip "no llama-server in $ENGINE_DIR (scripts/build_llamacpp.sh)"
-[ -x "$ENGINE_DIR/ggml-rpc-server" ] || skip "no ggml-rpc-server in $ENGINE_DIR (build with -DGGML_RPC=ON)"
+[ -x "$ENGINE_DIR/llama-server" ]    || skip "no idletoken-server in $ENGINE_DIR (scripts/build_llamacpp.sh)"
+[ -x "$ENGINE_DIR/ggml-rpc-server" ] || skip "no idletoken-rpc-server in $ENGINE_DIR (build with -DGGML_RPC=ON)"
 [ -n "$GGUF" ] || skip "set IDLETOKEN_SMOKE_GGUF to a small local GGUF (the public model the attack dequantizes)"
 [ -r "$GGUF" ] || skip "IDLETOKEN_SMOKE_GGUF is set but unreadable: $GGUF"
 [ -d "$GGUF_PY" ] || skip "no gguf-py at $GGUF_PY (needed to dequantize token_embd) -- set IDLETOKEN_GGUF_PY"

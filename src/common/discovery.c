@@ -834,6 +834,164 @@ static void auth_tag(const idletoken_pair_id *id, const char *label,
     memcpy(out, full, IDLETOKEN_PAIR_TAG_BYTES);
 }
 
+/* ---- online-guessing throttle (threat-model.md §2, plan D2) --------------
+ *
+ * A join code is six characters over a 32-symbol alphabet: ~30 bits. That is
+ * the right trade for something a person types, but ONLY if guesses cost
+ * something — unthrottled, an attacker on the LAN can walk the whole space
+ * against this handshake. So failures are counted per source address and,
+ * past a free allowance, the source is refused for an exponentially growing
+ * window.
+ *
+ * Deliberately tuned so a human never notices it: the first
+ * THROTTLE_FREE_TRIES failures are free (typos), and only then does the wait
+ * start at 1 s and double to a 30 s ceiling. Reaching even 1 s takes five
+ * consecutive wrong codes from the same machine.
+ *
+ * While a source is in its window it is refused WITHOUT verifying the proof —
+ * a correct code would otherwise let an attacker who happened to guess right
+ * skip the penalty, and (more importantly) the refusal must look identical
+ * either way, or the timing itself answers "was that code correct?".
+ * One success clears the source's record entirely. */
+#define THROTTLE_SLOTS       32
+#define THROTTLE_FREE_TRIES  5
+#define THROTTLE_BASE_MS     1000
+#define THROTTLE_MAX_MS      30000
+/* No failure for this long ⇒ forget the source (a shared NAT/DHCP address
+ * must not inherit yesterday's attacker's penalty). */
+#define THROTTLE_FORGET_MS   600000
+
+typedef struct {
+    uint8_t  addr[16];        /* peer address, v4-mapped into 16 bytes */
+    int      used;
+    int      fails;
+    long long last_ms;
+    long long blocked_until_ms;
+} throttle_slot;
+
+static throttle_slot g_throttle[THROTTLE_SLOTS];
+
+#if defined(_WIN32)
+static CRITICAL_SECTION g_throttle_lock;
+static INIT_ONCE g_throttle_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK throttle_init_cb(PINIT_ONCE o, PVOID p, PVOID *c) {
+    (void)o; (void)p; (void)c; InitializeCriticalSection(&g_throttle_lock); return TRUE;
+}
+static void throttle_lock(void) {
+    InitOnceExecuteOnce(&g_throttle_once, throttle_init_cb, NULL, NULL);
+    EnterCriticalSection(&g_throttle_lock);
+}
+static void throttle_unlock(void) { LeaveCriticalSection(&g_throttle_lock); }
+#else
+static pthread_mutex_t g_throttle_lock = PTHREAD_MUTEX_INITIALIZER;
+static void throttle_lock(void) { pthread_mutex_lock(&g_throttle_lock); }
+static void throttle_unlock(void) { pthread_mutex_unlock(&g_throttle_lock); }
+#endif
+
+static long long throttle_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* How long a source waits after `fails` consecutive failures. Pure function so
+ * the curve can be unit-tested without sockets or a clock. */
+long long idletoken_pair_backoff_ms(int fails) {
+    if (fails <= THROTTLE_FREE_TRIES) return 0;
+    int steps = fails - THROTTLE_FREE_TRIES - 1;   /* first paid failure = BASE */
+    long long ms = THROTTLE_BASE_MS;
+    for (int i = 0; i < steps && ms < THROTTLE_MAX_MS; i++) ms *= 2;
+    return ms > THROTTLE_MAX_MS ? THROTTLE_MAX_MS : ms;
+}
+
+/* Peer address of `fd` as 16 bytes (v4 mapped). 0 on success. A peer we cannot
+ * name (getpeername failed, or an address family we do not handle) is given the
+ * all-zero key: it still gets throttled, just pooled with other unnamed peers —
+ * never exempted, because "unidentifiable" must not be the way around the gate. */
+static void peer_key(int fd, uint8_t out[16]) {
+    memset(out, 0, 16);
+    struct sockaddr_storage ss;
+#if defined(_WIN32)
+    int slen = (int)sizeof(ss);
+#else
+    socklen_t slen = sizeof(ss);
+#endif
+    if (getpeername(fd, (struct sockaddr *)&ss, &slen) != 0) return;
+    if (ss.ss_family == AF_INET) {
+        const struct sockaddr_in *a = (const struct sockaddr_in *)&ss;
+        out[10] = 0xff; out[11] = 0xff;               /* v4-mapped prefix */
+        memcpy(out + 12, &a->sin_addr, 4);
+    } else if (ss.ss_family == AF_INET6) {
+        const struct sockaddr_in6 *a = (const struct sockaddr_in6 *)&ss;
+        memcpy(out, &a->sin6_addr, 16);
+    }
+}
+
+/* Find the slot for `key`, or claim one (free slot, or the least recently
+ * active). Caller holds the lock. */
+static throttle_slot *throttle_slot_for(const uint8_t key[16], long long now) {
+    throttle_slot *oldest = &g_throttle[0];
+    for (int i = 0; i < THROTTLE_SLOTS; i++) {
+        throttle_slot *s = &g_throttle[i];
+        if (s->used && memcmp(s->addr, key, 16) == 0) {
+            if (now - s->last_ms > THROTTLE_FORGET_MS) { s->fails = 0; s->blocked_until_ms = 0; }
+            return s;
+        }
+        if (!s->used) { oldest = s; break; }
+        if (s->last_ms < oldest->last_ms) oldest = s;
+    }
+    memcpy(oldest->addr, key, 16);
+    oldest->used = 1;
+    oldest->fails = 0;
+    oldest->blocked_until_ms = 0;
+    oldest->last_ms = now;
+    return oldest;
+}
+
+/* Milliseconds this peer must still wait; 0 = may attempt now. */
+static long long throttle_check(int fd) {
+    uint8_t key[16]; peer_key(fd, key);
+    long long now = throttle_now_ms(), wait = 0;
+    throttle_lock();
+    throttle_slot *s = throttle_slot_for(key, now);
+    if (s->blocked_until_ms > now) wait = s->blocked_until_ms - now;
+    throttle_unlock();
+    return wait;
+}
+
+static void throttle_record(int fd, int success) {
+    uint8_t key[16]; peer_key(fd, key);
+    long long now = throttle_now_ms();
+    throttle_lock();
+    throttle_slot *s = throttle_slot_for(key, now);
+    s->last_ms = now;
+    if (success) {
+        s->fails = 0;
+        s->blocked_until_ms = 0;
+    } else {
+        if (s->fails < 1000000) s->fails++;
+        long long back = idletoken_pair_backoff_ms(s->fails);
+        s->blocked_until_ms = back > 0 ? now + back : 0;
+        if (back > 0) {
+            /* Loud on purpose: a machine being walked through the code space is
+             * something the owner should be able to see in the log. */
+            fprintf(stderr, "[pair] refused join #%d from this peer; "
+                            "further attempts ignored for %lld ms "
+                            "(online-guessing throttle)\n", s->fails, back);
+            fflush(stderr);
+        }
+    }
+    throttle_unlock();
+}
+
+/* Test hook: forget every recorded source. Not part of the public header —
+ * the unit test declares it. */
+void idletoken_pair_throttle_reset(void) {
+    throttle_lock();
+    memset(g_throttle, 0, sizeof(g_throttle));
+    throttle_unlock();
+}
+
 int idletoken_pair_client_auth(int fd, const idletoken_pair_id *id,
                             uint8_t session_key[IDLETOKEN_SESSION_KEY_BYTES]) {
     uint8_t wnonce[IDLETOKEN_PAIR_NONCE_BYTES];
@@ -882,12 +1040,18 @@ int idletoken_pair_server_auth(int fd, const idletoken_pair_id *id,
     idletoken_buf_get_bytes(&rb, wnonce, sizeof(wnonce));
     idletoken_buf_get_bytes(&rb, wtag, sizeof(wtag));
 
-    int ok = !rb.err
-             && ct_equal(gid, id->group_id, IDLETOKEN_GROUP_ID_BYTES);
-    if (ok) {
-        uint8_t expect[IDLETOKEN_PAIR_TAG_BYTES];
-        auth_tag(id, "pair-w", wnonce, NULL, expect);
-        ok = ct_equal(expect, wtag, IDLETOKEN_PAIR_TAG_BYTES);
+    /* Throttled sources are refused without looking at the proof at all (see
+     * the throttle block above): same reply, same timing, no free guesses. */
+    long long wait_ms = throttle_check(fd);
+    int ok = 0;
+    if (wait_ms == 0) {
+        ok = !rb.err && ct_equal(gid, id->group_id, IDLETOKEN_GROUP_ID_BYTES);
+        if (ok) {
+            uint8_t expect[IDLETOKEN_PAIR_TAG_BYTES];
+            auth_tag(id, "pair-w", wnonce, NULL, expect);
+            ok = ct_equal(expect, wtag, IDLETOKEN_PAIR_TAG_BYTES);
+        }
+        throttle_record(fd, ok);
     }
 
     uint8_t cnonce[IDLETOKEN_PAIR_NONCE_BYTES];
