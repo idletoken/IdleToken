@@ -1,6 +1,6 @@
 [package]
 name = "idletoken-client"
-version = "0.1.0"
+version = "0.1.1"
 description = "IdleToken desktop/mobile client"
 authors = ["IdleToken"]
 edition = "2021"

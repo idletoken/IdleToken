@@ -1589,6 +1589,14 @@ int main(int argc, char **argv) {
         const char *t = getenv("IDLETOKEN_API_TOKEN");
         if (t && t[0]) snprintf(g_coord_token, sizeof g_coord_token, "%s", t);
     }
+    /* Same for the platform JWT (A-P0-4): the more valuable of the two — it
+     * authenticates every poll and spends the account's credits. Env keeps it
+     * out of argv, where /proc/<pid>/cmdline exposes it to any local user. An
+     * explicit --jwt still wins (set below in the loop). */
+    {
+        const char *j = getenv("IDLETOKEN_PLATFORM_JWT");
+        if (j && j[0]) jwt = j;
+    }
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];

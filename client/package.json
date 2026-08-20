@@ -1,6 +1,6 @@
 {
   "name": "idletoken-client",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "IdleToken desktop/mobile client — Tauri v2 shell over a decoupled web frontend that drives the native inference engine as a sidecar.",
   "type": "module",

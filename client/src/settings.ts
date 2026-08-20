@@ -360,7 +360,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
 // which package.json mirrors — keep this literal in step with it. (Not read
 // from the Tauri API because it renders synchronously in the About note and
 // must also work in the browser dev build, where there is no shell to ask.)
-export const APP_VERSION = "0.1.0";
+export const APP_VERSION = "0.1.1";
 
 const KEY = "idletoken.settings";
 

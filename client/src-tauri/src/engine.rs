@@ -717,14 +717,11 @@ pub fn engine_logs(state: State<'_, Engine>, max_lines: Option<usize>) -> Vec<Lo
 /// could read it. `/proc/<pid>/environ` is owner-only, and the variable is set
 /// on the child (`Command::env`), never on this process.
 ///
-/// ⚠ `jwt` is STILL in argv, and it is the more valuable of the two: it can
-/// spend this account's Sparks. `src/tools/platform_agent.c` has an env
-/// fallback for the coord token (`IDLETOKEN_API_TOKEN`) but none for `--jwt`,
-/// and that file is another session's tree. Passing it through a variable the
-/// agent does not read would silently leave the agent unauthenticated, which
-/// is worse than the exposure. Tracked as a cross-tree follow-up; the fix is a
-/// `getenv("IDLETOKEN_PLATFORM_JWT")` fallback next to the existing one, after
-/// which the two lines below move into `env`.
+/// Both secrets now travel this way: the coord token as `IDLETOKEN_API_TOKEN`
+/// and the platform JWT as `IDLETOKEN_PLATFORM_JWT` (A-P0-4, closed 2026-08-21).
+/// The agent reads both from the environment (`src/tools/platform_agent.c`),
+/// with an explicit `--jwt`/`--coord-token` flag still winning if given, so
+/// nothing account-spending sits in argv where any local user could read it.
 ///
 /// Do NOT log either — push_log never prints slot args or env, and nothing here
 /// persists them; the frontend passes the live session token on each start.
@@ -773,8 +770,6 @@ pub fn platform_agent_start(
         "--relay".into(),
         "--platform".into(),
         platform_url,
-        "--jwt".into(),
-        jwt,
         "--name".into(),
         name,
         "--coord".into(),
@@ -791,6 +786,11 @@ pub fn platform_agent_start(
     // src/tools/platform_agent.c before switching, because a token the agent
     // never receives means every dispatched job comes back 401.
     let mut env: Vec<(String, String)> = Vec::new();
+    // The platform JWT goes the same way (A-P0-4). It is the more valuable of
+    // the two — it spends this account's Sparks — so it must not sit in argv
+    // where /proc/<pid>/cmdline exposes it to any local user. The agent reads
+    // IDLETOKEN_PLATFORM_JWT as its fallback (src/tools/platform_agent.c).
+    env.push(("IDLETOKEN_PLATFORM_JWT".into(), jwt));
     if !coord_token.trim().is_empty() {
         env.push(("IDLETOKEN_API_TOKEN".into(), coord_token.trim().to_string()));
     }
