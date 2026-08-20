@@ -2,7 +2,8 @@
 # Does the coordinator's memory budget follow the GGUF it is actually going to
 # open — and does it SAY where its number came from?
 #
-# WHY (2026-08-19, win_PC2, measured — results/llamacpp-multislot-big-win-20260819.md
+# WHY (2026-08-19, measured on a 16 GiB discrete card — see
+# results/llamacpp-multislot-big-win-20260819.md
 # §4). `--model-id qwen3.5-27b --llama-gguf <...Q4_K_M.gguf>` planned against the
 # manifest's DEFAULT quant (IQ2_XXS, 7.98 GiB) while the engine opened the real
 # file (15.59 GiB), understating the weights by 7.6 GiB and deriving 2 sequence
@@ -42,7 +43,7 @@ command -v python3 >/dev/null 2>&1 || { echo "BUDGET_GATE_SKIP: no python3 — t
 # failure to be read, not as two numbers agreeing with each other by
 # construction.
 IQ2_XXS_BYTES=8573593504     # variants[default_variant] — what the bug used
-Q4_K_M_BYTES=16740812704     # the file win_PC2 was really serving
+Q4_K_M_BYTES=16740812704     # the file that machine was really serving
 ODD_BYTES=13000000000        # ~12.11 GiB: between Q3_K_M and Q3_K_XL, matching
                              # neither within 1%
 

@@ -346,8 +346,8 @@
     "The recurrent state of a linear layer is fixed size and independent of context length, so long contexts cost far less memory than in a pure GQA model of the same size.",
     "The two gates use different activations: silu for the linear layer z gate, sigmoid for the full layer output gate.",
     "The q projection of a full layer emits [q|gate] interleaved per head (512 per head = 256 q + 256 gate).",
-    "Aligned against llama.cpp layer by layer and token by token on real Q4_K_M weights, DGX, 2026-07-28 (docs/linear-attention-design.md §4d).",
-    "All five precisions load and infer on real GGUF files (DGX, 2026-07-28); Q5_K_M/Q6_K/Q8_0/BF16 answer \"Paris\" correctly, Q4_K_M does not -- quantization loss is perceptible at 0.8B.",
+    "Aligned against llama.cpp layer by layer and token by token on real Q4_K_M weights on a unified-memory Linux node, 2026-07-28 (docs/linear-attention-design.md §4d).",
+    "All five precisions load and infer on real GGUF files (unified-memory Linux node, 2026-07-28); Q5_K_M/Q6_K/Q8_0/BF16 answer \"Paris\" correctly, Q4_K_M does not -- quantization loss is perceptible at 0.8B.",
     "layer_weight_bytes / shared_weight_bytes are **measured**, not estimated from bits per weight: summed tensor by tensor from the GGUF tensor directory, with blk.N.* counted as layer weights and everything else as shared."
   ]
 }

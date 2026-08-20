@@ -1054,7 +1054,7 @@ g6_e2e() {
     # needs more than one machine. The small curated models are the vehicle for
     # P3-P6 (orchestration and API exposure, where load time is dead weight);
     # G6 is the end-to-end product claim, so it drives the big one. Weights are
-    # already staged on DGX and win_PC2 from T14.
+    # already staged on both testbed nodes from T14.
     #
     # TIMEOUTS: the ready window is 900 s, not the old 240 s. Basis:
     # matrix_cell_cluster_llamacpp.sh measured 306 s to ready for this model at
@@ -3796,12 +3796,12 @@ g_wedge() {
     esac
 }
 
-# G-FIT-FAIL (plans/multislot-vram-budget-fix.md): an engine that reports it
-# cannot fit the model into free device memory must stop the start (refuse,
-# exit 3) instead of being served into WDDM paging that can freeze the whole
-# machine. Local — the fixture is the same stub engine the wedge gate uses; the
-# script carries its own control run (no warning -> must serve normally), so a
-# refuse-everything implementation cannot pass it.
+# G-FIT-FAIL (evidence: results/multislot-vram-fix-win-20260818.md): an engine
+# that reports it cannot fit the model into free device memory must stop the
+# start (refuse, exit 3) instead of being served into WDDM paging that can
+# freeze the whole machine. Local — the fixture is the same stub engine the
+# wedge gate uses; the script carries its own control run (no warning -> must
+# serve normally), so a refuse-everything implementation cannot pass it.
 g_fit_fail() {
     local name="$1" out
     out=$(bash scripts/fit_fail_gate.sh 2>&1 | grep -E "^FIT_GATE_(OK|FAIL|SKIP)" | tail -1)

@@ -352,7 +352,7 @@
     "The linear path shares k heads at grp=3 (k_heads 16 / v_heads 48); 4B and 9B are grp=2 and 0.8B is grp=1 -- all three ratios have now run on real weights.",
     "Full layers: 24 q heads / 4 KV heads × 256; conv channels 10240 = k_dim*2 + v_dim(6144); FFN width 17408. All derived from GGUF metadata, so the loader needs no change.",
     "Full layers: 4 KV heads × 256 × 2 (K+V) × 4 B = 8192 B per token per layer. Linear layers: state 48×128×128×4 plus conv window 3×10240×4 = 3268608 B, independent of context length.",
-    "Verified on DGX 2026-07-28: greedy continuation of \"Count: 1, 2, 3,\" matches llama.cpp character for character (\" 4, 5, 6, \"); layer 0 attn_output 3.9443 vs 3.9477 and final_output 10.1229 vs 10.1200 (<0.1%). CPU and CUDA produce the same recurrence token ids.",
+    "Verified on a unified-memory Linux node 2026-07-28: greedy continuation of \"Count: 1, 2, 3,\" matches llama.cpp character for character (\" 4, 5, 6, \"); layer 0 attn_output 3.9443 vs 3.9477 and final_output 10.1229 vs 10.1200 (<0.1%). CPU and CUDA produce the same recurrence token ids.",
     "Stated honestly: on a reasoning prompt (\"What is the capital of France?\") we diverge from llama.cpp after <think> at a near-tie. Both continuations are reasonable and layer 0 agrees to within quantization noise, **but we have not established token-for-token equality over a long output the way we did for 4B and 9B**.",
     "layer_weight_bytes / shared_weight_bytes are measured, summed tensor by tensor via scripts/gguf_shard.py index.",
     "Only Q4_K_M is registered."

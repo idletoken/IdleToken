@@ -85,6 +85,29 @@ const Markdown = memo(function Markdown(props: { text: string }) {
               </a>
             );
           },
+          // Remote images are NOT loaded (2026-08-20, audit A-P2-3).
+          //
+          // A reply is untrusted text, and `![](https://someone/pixel.png)` in
+          // one turns this window into a beacon: the fetch happens with no
+          // interaction, and it tells whoever owns that host that this machine
+          // read this reply — from the product whose entire claim is that
+          // nothing about a conversation leaves the machine. There is nothing
+          // the model can legitimately illustrate an answer with, either: it
+          // has no images to serve.
+          //
+          // The CSP in tauri.conf.json (`img-src 'self' data:`) is the
+          // backstop; this renderer is the part that says so out loud instead
+          // of leaving a silently broken image icon. `data:` images — the ones
+          // that arrive inside the reply and need no network — still render.
+          img({ src, alt }) {
+            const inline = typeof src === "string" && src.startsWith("data:");
+            if (inline) return <img src={src} alt={alt ?? ""} className="md-img" />;
+            return (
+              <span className="md-img-blocked" title={typeof src === "string" ? src : undefined}>
+                {alt ? `🖼 ${alt}` : "🖼"}
+              </span>
+            );
+          },
           table({ children }) { return <div className="md-tablewrap"><table>{children}</table></div>; },
         }}
       >

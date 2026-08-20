@@ -8,7 +8,7 @@
   "deployment": "cluster",
   "license": "MIT",
   "params_summary": "671B · 37B active",
-  "release": "0731",
+  "release": "0813",
   "n_layers": 61,
   "n_embd": 7168,
   "hc_streams": 1,
@@ -37,33 +37,11 @@
     }
   ],
   "default_quant": "Q4_K_XL",
-  "speculative": {
-    "kind": "dspark",
-    "available": false,
-    "gguf": "DeepSeek-V4-Flash-DSpark-support.gguf",
-    "repo": "antirez/deepseek-v4-gguf",
-    "weight_bytes": 5989114272,
-    "block_size": 5,
-    "stage_count": 3,
-    "markov_rank": 256,
-    "noise_token_id": 128799,
-    "target_layer_ids": [
-      40,
-      41,
-      42
-    ],
-    "placement": "last_stage",
-    "status": "parked-2026-08-03"
-  },
   "notes": [
-    "Since 2026-08-03 the **release build DeepSeek-V4-Flash-0731** is the source of truth (deepseek-ai/DeepSeek-V4-Flash-0731, MIT). The official model card marks the preview, deepseek-ai/DeepSeek-V4-Flash, as superseded; this project no longer references it.",
-    "The release and preview GGUFs have **identical tensor layout**: 1328 tensors, arch string deepseek4, block_count 43, and equal byte sizes tensor for tensor. Only the weight values differ, so the ds4 inference path needs no change.",
-    "compress_ratios has 46 entries in the official config.json (44 in the preview), but antirez's converted GGUF metadata still carries 44; ds4 validates only the first n_layers (43) entries and requires length >= 43, so both pass.",
-    "The model card states 304B (284B for the preview). The extra ~20B is the DSpark speculative decoding module, **packaged separately** as DeepSeek-V4-Flash-DSpark-support.gguf (5.6 GiB) and absent from the main weight file -- which is why the main GGUF is byte for byte the same size as the preview.",
-    "layer_weight_bytes / shared_weight_bytes are **measured**: summed tensor by tensor from the GGUF tensor directory (blk.N.* counted as layer weights, everything else as shared), reading only the header over HTTP Range. Self-check: layer + shared + data_start == file size, exactly, for both variants.",
-    "The previously registered 81 GiB / 1 GiB were estimates and were off by a visible margin (measured: 79.249 GiB / 1.510 GiB). Within shared, token_embd (1.06 GB) lands on the first stage and output (0.56 GB) on the last, so a wrong estimate skews the pipeline-parallel plan directly.",
-    "speculative.weight_bytes lands on the **last stage only** -- the draft module consumes the hidden states of layers 40/41/42 -- unlike shared_weight_bytes, which every stage loads. available=false means the weights are confirmed fetchable but the engine forward pass is not implemented yet (see docs/dspark-design.md).",
-    "DSpark is shelved (decided 2026-08-03): the code and analysis stay in the tree but are not enabled, speculative.available=false, there are zero production call sites, and the G_DSPARK gate defaults to SKIP (set HOMEAI_DSPARK_GATE=1 to run it). Read the shelving note at the top of docs/dspark-design.md before restarting the work."
+    "Cluster-tier model: the smallest published quant is ~791 GiB, so it needs a sizable cluster. 671B/37B-active, 61 layers, arch deepseek4 — a different model from Flash, read by the pinned llama.cpp.",
+    "Every number above is measured metadata: byte counts, sha256 digests and the revision come from the HF API and from HTTP Range reads of the GGUF headers (unsloth/DeepSeek-V4-Pro-0813-GGUF).",
+    "Geometry is read from the model's own config.json and GGUF header: 671B total / 37B active, 61 decode layers, n_embd 7168, MLA KV. This is a DIFFERENT model from DeepSeek-V4-Flash (304B, 43 layers), not another precision of it.",
+    "The notes that used to sit here were copied wholesale from deepseek-v4-flash.json and described that model instead -- its 43 blocks, its compress_ratios, and a DSpark draft module that belongs to Flash and targets layers 40/41/42 of a 43-layer stack. The `speculative` block carrying those same Flash values was removed for the same reason: it was never measured against this model, and it has no consumer outside the frozen ds4 tree. `release` said 0731 (Flash's date); the Pro build is 0813, as the GGUF filenames say."
   ],
   "variants": [
     {

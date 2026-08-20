@@ -16,7 +16,6 @@ import qwen3827b from "../../models/qwen3.8-27b.json";
 import qwen3535ba3b from "../../models/qwen3.5-35b-a3b.json";
 import glm52 from "../../models/glm-5.2.json";
 import kimiK25 from "../../models/kimi-k2.5.json";
-import kimiK3 from "../../models/kimi-k3.json";
 
 // One selectable precision of a model (small-model-design.md §3.1). The
 // top-level layer_weight_bytes/shared_weight_bytes mirror the default variant,
@@ -122,7 +121,7 @@ export interface ModelSpec {
 const MANIFESTS = [
   dsv4, dsv4pro,
   qwen3508b, qwen354b, qwen38b, qwen359b, qwen3527b, qwen3827b, qwen3535ba3b,
-  glm52, kimiK25, kimiK3,
+  glm52, kimiK25,
 ] as ModelManifest[];
 
 /** Parameter counts only — "304B · 13B active", nothing else. The manifest's

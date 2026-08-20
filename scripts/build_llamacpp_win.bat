@@ -10,7 +10,7 @@ REM   vendor\llama.cpp\build\bin\Release\llama-perplexity.exe  numeric gate
 REM
 REM Runtime DLL note for packaging: cudart is linked statically (GGML_STATIC).
 REM cublas64_12.dll still appears as a string inside the exe, but it is NOT
-REM needed at load time -- measured 2026-08-20 at pin b10502 on win_PC2, a box
+REM needed at load time -- measured 2026-08-20 at pin b10502 on a Windows box
 REM with the NVIDIA driver and NO CUDA Toolkit (all of cublas64_12.dll,
 REM cublasLt64_12.dll, cudart64_12.dll absent from System32): llama-server.exe
 REM started, loaded Qwen3.5-0.8B-Q4_K_M with -ngl 99, appeared in nvidia-smi as a

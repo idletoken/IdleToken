@@ -8,6 +8,7 @@
 //     each other) and the marketplace.
 // The selector picks by the `platformUrl` setting; the UI is unchanged.
 import { loadSettings } from "./settings";
+import { SESSION_KEY, clearSecret, getSecret, setSecret } from "./secrets";
 
 export interface Session {
   email: string;
@@ -61,6 +62,59 @@ async function sha256Hex(s: string): Promise<string> {
     .join("");
 }
 
+/**
+ * Password hashing for the local (offline) identity.
+ *
+ * Until 2026-08-20 this was one round of SHA-256 over `salt:password` (audit
+ * A-P2-2). SHA-256 is built to be fast, which is the opposite of what a
+ * password hash is for: a consumer GPU tries billions of candidates a second
+ * against a stolen table, and the salt only stops one attack from covering
+ * every account at once — it does nothing about the speed.
+ *
+ * PBKDF2-SHA256 at the OWASP-2023 iteration count instead. Not argon2 or
+ * scrypt, which are better, because both mean a WebAssembly dependency and
+ * bundle size is a hard constraint here (principle 10); PBKDF2 is in the Web
+ * Crypto API every platform already ships, so this costs nothing but the work
+ * factor it is supposed to cost.
+ */
+const KDF_ITERATIONS = 210_000;
+
+async function derivePasswordHash(password: string, saltHex: string): Promise<string> {
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, [
+    "deriveBits",
+  ]);
+  const salt = Uint8Array.from(saltHex.match(/../g) ?? [], (h) => parseInt(h, 16));
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", hash: "SHA-256", salt, iterations: KDF_ITERATIONS },
+    key,
+    256
+  );
+  return Array.from(new Uint8Array(bits))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
+ * Check a password against a stored record, whichever scheme wrote it.
+ *
+ * Records written before the change carry no `kdf` field and are verified with
+ * the old SHA-256 — refusing them would lock people out of their own machine
+ * over a change they did not make. `upgraded` says the record should be
+ * rewritten with the real KDF, which the caller does using the password it has
+ * in hand right now (the only moment it can).
+ */
+async function verifyPassword(
+  user: StoredUser,
+  password: string
+): Promise<{ ok: boolean; upgraded?: StoredUser }> {
+  if (user.kdf === "pbkdf2") {
+    return { ok: (await derivePasswordHash(password, user.salt)) === user.hash };
+  }
+  if ((await sha256Hex(`${user.salt}:${password}`)) !== user.hash) return { ok: false };
+  const salt = randomHex(16);
+  return { ok: true, upgraded: { salt, hash: await derivePasswordHash(password, salt), kdf: "pbkdf2" } };
+}
+
 function randomHex(bytes: number): string {
   const a = new Uint8Array(bytes);
   crypto.getRandomValues(a);
@@ -73,11 +127,13 @@ function randomHex(bytes: number): string {
 interface StoredUser {
   salt: string;
   hash: string;
+  /** Which scheme produced `hash`. Absent = the pre-2026-08-20 single-round
+   *  SHA-256; see verifyPassword for why those still work. */
+  kdf?: "pbkdf2";
 }
 type UserTable = Record<string, StoredUser>;
 
 const USERS_KEY = "idletoken.auth.users";
-const SESSION_KEY = "idletoken.auth.session";
 
 function readUsers(): UserTable {
   try {
@@ -96,7 +152,7 @@ export const localAuthProvider: AuthProvider = {
 
   currentSession(): Session | null {
     try {
-      const raw = localStorage.getItem(SESSION_KEY);
+      const raw = getSecret(SESSION_KEY);
       return raw ? (JSON.parse(raw) as Session) : null;
     } catch {
       return null;
@@ -110,7 +166,7 @@ export const localAuthProvider: AuthProvider = {
     const users = readUsers();
     if (users[e]) throw new AuthError("auth.err.exists");
     const salt = randomHex(16);
-    users[e] = { salt, hash: await sha256Hex(`${salt}:${password}`) };
+    users[e] = { salt, hash: await derivePasswordHash(password, salt), kdf: "pbkdf2" };
     writeUsers(users);
     return persistSession({ email: e, token: randomHex(24), createdAt: Date.now(), provider: "local" });
   },
@@ -118,20 +174,27 @@ export const localAuthProvider: AuthProvider = {
   async signIn(email: string, password: string): Promise<Session> {
     const e = normalizeEmail(email);
     if (!EMAIL_RE.test(e)) throw new AuthError("auth.err.email");
-    const user = readUsers()[e];
+    const users = readUsers();
+    const user = users[e];
     if (!user) throw new AuthError("auth.err.invalid");
-    const hash = await sha256Hex(`${user.salt}:${password}`);
-    if (hash !== user.hash) throw new AuthError("auth.err.invalid");
+    const { ok, upgraded } = await verifyPassword(user, password);
+    if (!ok) throw new AuthError("auth.err.invalid");
+    // A correct password is the only moment the plaintext exists, so it is the
+    // only moment an old record can be rehashed with the real KDF.
+    if (upgraded) {
+      users[e] = upgraded;
+      writeUsers(users);
+    }
     return persistSession({ email: e, token: randomHex(24), createdAt: Date.now(), provider: "local" });
   },
 
   signOut(): void {
-    localStorage.removeItem(SESSION_KEY);
+    clearSecret(SESSION_KEY);
   },
 };
 
 function persistSession(s: Session): Session {
-  localStorage.setItem(SESSION_KEY, JSON.stringify(s));
+  setSecret(SESSION_KEY, JSON.stringify(s));
   return s;
 }
 

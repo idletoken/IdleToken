@@ -2,8 +2,9 @@
 # Does the coordinator refuse when the engine says it could not fit the model
 # into device memory — and only then?
 #
-# WHY (2026-08-18, win_PC). A 16 GiB card was started with 4 sequence slots of
-# 40960 tokens each, ~22 GiB of KV. The engine warned on its first line that it
+# WHY (2026-08-18, measured on a Windows test node). A 16 GiB card was started
+# with 4 sequence slots of 40960 tokens each, ~22 GiB of KV. The engine warned
+# on its first line that it
 # could not fit the parameters into free device memory, then started anyway
 # because we pin -ngl and -c. Windows WDDM did not fail the allocation either:
 # it paged video memory out to system memory, and since the desktop compositor

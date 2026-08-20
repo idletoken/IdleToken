@@ -43,6 +43,12 @@ serde_json = "1"
 # does not match. A hash we implement ourselves is not evidence of anything,
 # so the crate is justified despite the bundle-size constraint.
 sha2 = "0.10"
+# OS entropy for the roster's per-member tokens and the discovery beacon's
+# session id/nonce (pairing.rs). It has to come from the operating system's
+# CSPRNG: a token an attacker can predict is not a token, and the beacon's
+# nonce is the thing that must not be a function of anything guessable. Already
+# in the tree as a transitive dependency of tauri, so this costs no new code.
+getrandom = "0.2"
 # Backoff sleeps in the engine supervisor; tauri's async runtime is tokio.
 tokio = { version = "1", features = ["time"] }
 # Weight downloads (weights.rs). Why the client downloads them rather than the
@@ -62,3 +68,9 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 [features]
 # by default Tauri runs in production mode; `tauri dev` toggles custom-protocol
 custom-protocol = ["tauri/custom-protocol"]
+# Honour IDLETOKEN_UPDATE_URL / IDLETOKEN_UPDATE_PUBKEY in an optimized build
+# (update.rs). Debug builds honour them anyway; this exists only for a release
+# build the acceptance gate drives against a feed it signed itself. NEVER
+# enable it for a build that ships: it makes the update trust root replaceable
+# by anyone who can set the process environment. See update.rs A-P0-1.
+updater-override = []

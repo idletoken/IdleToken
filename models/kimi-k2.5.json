@@ -132,6 +132,10 @@
     }
   ],
   "default_quant": "IQ1_S",
+  "notes": [
+    "Cluster-tier model: the smallest published quant is ~196 GiB, so it needs a cluster. 1T total / 32B active, DeepSeek2-shaped, read by the pinned llama.cpp.",
+    "Every number in this manifest is measured metadata: byte counts, sha256 digests and the revision come from the HF API and from HTTP Range reads of the GGUF headers."
+  ],
   "variants": [
     {
       "quant": "IQ1_S",

@@ -64,8 +64,8 @@ call :cc "src/worker/worker_main.c"  "%CF% -include src/platform/win/win_compat.
 
 echo === link ===>> "%LOG%"
 REM -static-libgcc + static winpthread: the exe gets copied to machines with no
-REM MinGW on PATH (win_PC2 has no toolchain at all — it receives binaries from
-REM the build node). Without it the process dies before main() with NO output.
+REM MinGW on PATH (a deploy-only node has no toolchain at all — it receives
+REM binaries from the build node). Without it the process dies before main() with NO output.
 REM Link EVERY object this script compiled, by glob -- the same shape
 REM build_coord_win.bat uses. It used to enumerate them by hand, and the list
 REM drifted: modelsize.c was compiled but never linked, so once advise.c started
@@ -83,7 +83,7 @@ if errorlevel 1 (echo WORKER_BUILD_FAIL: link failed ^(see %LOG%^) & exit /b 1)
 if not exist idletoken-worker.exe (echo WORKER_BUILD_FAIL: no idletoken-worker.exe produced & exit /b 1)
 
 REM Prove the binary actually starts. A link can succeed and the exe still die
-REM before main() on a missing runtime DLL — measured on win_PC2, where
+REM before main() on a missing runtime DLL — measured on a Windows node, where
 REM llama-server.exe exited 0 with zero output until the CUDA runtime DLLs sat
 REM next to it. "It linked" is not "it runs".
 idletoken-worker.exe --help >NUL 2>&1

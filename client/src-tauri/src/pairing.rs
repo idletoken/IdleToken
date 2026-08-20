@@ -4,12 +4,14 @@
 // owns the UX-level orchestration).
 //
 // Flow:
-//   create  → mint code (JS side), broadcast a UDP beacon carrying a HASH of
-//             the code (never the code itself) + our roster TCP port, and
-//             serve a tiny newline-JSON roster protocol over TCP.
-//   join    → listen for a beacon whose hash matches the typed code, then
-//             register over TCP (the full code is the proof) and poll the
-//             roster.
+//   create  → mint code (JS side), broadcast a UDP beacon carrying a random
+//             session id + a per-packet nonce + our roster TCP port — nothing
+//             derived from the code (see BEACON_MAGIC) — and serve a tiny
+//             newline-JSON roster protocol over TCP.
+//   join    → collect the machines whose beacons we hear (or the manual peer
+//             list), then offer the typed code to each over TCP until one
+//             accepts. The reply carries a per-member token that every later
+//             roster/leave request must present.
 //   start   → the creator freezes the roster: the chosen coordinator starts
 //             idletoken-coord in llama.cpp mode; every other machine starts
 //             idletoken-worker --rpc-supervisor. Pairing transports the RPC
@@ -59,8 +61,10 @@ pub struct Tuning {
     /// Coord HTTP API port (settings.apiPort). The creator broadcasts it via
     /// the roster so joiners poll /idletoken/v1/cluster/status on the right port.
     api_port: u16,
-    /// Coord API access token (settings.apiToken) → `--api-token`. Empty =
-    /// no auth (LAN default). Never broadcast over the roster.
+    /// Coord API access token (settings.apiToken) → the coordinator's
+    /// `IDLETOKEN_API_TOKEN` environment variable (A-P0-4: not `--api-token`,
+    /// because argv is world-readable). Empty = no auth. Never broadcast over
+    /// the roster.
     api_token: String,
     /// Worker inter-stage bind port (settings.interStagePort) → `--bind`.
     inter_stage_port: u16,
@@ -183,7 +187,81 @@ impl Default for Tuning {
     }
 }
 
-const BEACON_MAGIC: &str = "IDLETOKEN1";
+/// Discovery beacon wire version.
+///
+/// `IDLETOKEN1` broadcast `fnv1a(code)` once a second. A join code is six
+/// characters of a 32-symbol alphabet — 30 bits — and FNV-1a is not a password
+/// hash, so anyone who could hear the beacon could recover the code offline in
+/// seconds and then join as a worker, which hands them model layers, hidden
+/// states and the cluster TLS PSK (2026-08-20 audit A-P0-3). The old comment
+/// here called that hash "protection"; it was not.
+///
+/// `IDLETOKEN2` carries **nothing derived from the code**: a random session id
+/// (so a machine's own beacons can be told apart from another cluster's) and a
+/// fresh random nonce per packet, which is the whole point — there is no
+/// function of the code on the wire to invert. Discovery and proof are
+/// separate now: the beacon only says "a cluster answers at this address", and
+/// the code is proved to that address over the unicast TCP join.
+const BEACON_MAGIC: &str = "IDLETOKEN2";
+/// Still accepted when *listening*: an older creator's beacon is a perfectly
+/// good "someone is forming a cluster here" signal, and the join below is what
+/// decides whether it is OUR cluster. Its hash field is ignored.
+const BEACON_MAGIC_LEGACY: &str = "IDLETOKEN1";
+
+/// Cryptographically random hex, from the OS. Used for the roster's per-member
+/// tokens and the beacon's session id/nonce.
+///
+/// Panics rather than falling back to anything cheaper: a predictable token is
+/// not a token, and "no silent fallback" (CLAUDE.md hard constraint 11) applies
+/// hardest where the value's only job is to be unguessable.
+fn random_hex(bytes: usize) -> String {
+    let mut buf = vec![0u8; bytes];
+    getrandom::getrandom(&mut buf).expect("the operating system's CSPRNG is unavailable");
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Constant-time-ish comparison for the roster tokens. Both values are hex of
+/// the same length, so this only has to avoid the early return of `==`.
+fn token_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() || a.is_empty() {
+        return false;
+    }
+    a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Proof that the sender knows the join code, bound to one nonce and one
+/// direction ("creator" or "joiner").
+///
+/// Why this exists at all: the beacon no longer identifies which cluster it
+/// belongs to (A-P0-3), so a joiner has to try every machine it heard from.
+/// Sending the raw code to each of them would hand it to anything on the LAN
+/// willing to broadcast a beacon — trading an offline break for an online one.
+/// So the CREATOR proves the code first, against a nonce the joiner chose, and
+/// only a creator that passes ever sees the joiner's own proof.
+///
+/// SHA-256 of a domain-separated concatenation rather than HMAC: what HMAC buys
+/// over `H(key || msg)` is length-extension resistance, and there is nothing to
+/// extend here — both fields are fixed-format, the digest is compared whole and
+/// never used as a prefix. Using it avoids adding a crate to a bundle whose
+/// size is a hard constraint. The `v1` tag is there so a future change of
+/// scheme cannot be replayed as this one.
+fn pair_proof(role: &str, code: &str, nonce: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"idletoken-pair-v1|");
+    h.update(role.as_bytes());
+    h.update(b"|");
+    h.update(code.as_bytes());
+    h.update(b"|");
+    h.update(nonce.as_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// How long a nonce the creator handed out stays usable, and how many are kept.
+/// Both are small on purpose: the window only has to cover one round trip on a
+/// LAN, and an unbounded list is a memory leak anyone on the network can drive.
+const CHALLENGE_TTL: Duration = Duration::from_secs(60);
+const MAX_CHALLENGES: usize = 64;
 
 /// Windows only: allow the pairing traffic *inbound* before we start listening.
 ///
@@ -277,6 +355,22 @@ pub struct Peer {
     hb_secs: u32,
     #[serde(skip)]
     ip: String,
+    /// Proof of membership, minted by the creator when this machine's `join`
+    /// was accepted and handed back in that reply (2026-08-20 audit A-P0-2).
+    ///
+    /// Every later `roster`/`leave` request must present it, or the creator
+    /// drops the request: until this existed, only `join` checked the code, so
+    /// anything on the LAN that could open TCP 14098 could read the whole
+    /// roster — hostnames, GPUs, LAN addresses, free VRAM, the model, the API
+    /// port — and could evict members by sending `leave`. The join code is
+    /// deliberately NOT reused for this: it is 30 bits and it is a *shared*
+    /// secret, whereas this is per member, 128 bits, and dies with the
+    /// cluster (the peer list is cleared on every generation bump).
+    ///
+    /// Never serialized: it must not travel in the roster broadcast or in the
+    /// snapshot the webview sees.
+    #[serde(skip)]
+    token: String,
     /// What this member brings to the pool: free VRAM and free RAM in bytes,
     /// as ITS OWN probe measured them (2026-08-15). Every machine already
     /// knows its own memory; sending it with the join is what lets the whole
@@ -342,6 +436,9 @@ struct Inner {
     /// the variable part (the discovery port, or the creator's verbatim
     /// rejection). Cleared on every new create/join/leave.
     last_error: Option<(String, String)>,
+    /// Nonces this creator issued in `hello` replies and has not seen used yet
+    /// (see pair_proof). Consumed by the matching `join`, swept by age.
+    challenges: Vec<(String, std::time::Instant)>,
     generation: u64,
     /// Settings-derived engine tuning (defaults = historical hard-coded
     /// ports). On a joiner, `api_port` is overwritten by the roster so it
@@ -371,21 +468,11 @@ impl Default for Pairing {
             engine_started: false,
             account_mode: false,
             last_error: None,
+            challenges: Vec::new(),
             generation: 0,
             tuning: Tuning::default(),
         }))
     }
-}
-
-/// FNV-1a of the code — enough to match a beacon to a typed code without
-/// broadcasting the code itself (the TCP join carries the real code as proof).
-fn code_hash(code: &str) -> String {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in code.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    format!("{h:016x}")
 }
 
 /// Convert the roster proof into the native engine's six-character pairing
@@ -556,6 +643,10 @@ fn apply_roster(inner: &mut Inner, v: &Value) -> RosterEffect {
                 last_seen: None,
                 hb_secs: 0,
                 ip: m["ip"].as_str().unwrap_or("").to_string(),
+                // Joiner-side mirror: tokens are the creator's bookkeeping and
+                // are never broadcast, so every entry here is blank. This
+                // machine's own token lives in its roster loop.
+                token: String::new(),
                 // Memory travels with the roster so every machine can total
                 // the pool, not just the creator (0 = an older peer).
                 vram_free: m["vramFree"].as_u64().unwrap_or(0),
@@ -665,6 +756,10 @@ fn usage_cap_args(tuning: &Tuning) -> Vec<String> {
 /// presence as the switch, so passing one without the other would ask it to
 /// enable a feature it cannot use and it would refuse to start.
 ///
+/// The KEY does not appear here — it goes through `secret_env` below. The URL
+/// does, because it is not a secret and a command line that says which platform
+/// this machine borrows from is worth having in a log.
+///
 /// Deliberately NOT guarded on api_token here. The coordinator's own refusal is
 /// the guard, and duplicating it would mean a client that silently drops the
 /// flags instead of surfacing why -- the user would see sharing "on" in the
@@ -675,7 +770,6 @@ fn overflow_args(tuning: &Tuning) -> Vec<String> {
     }
     let mut v = vec![
         "--overflow-url".into(), tuning.overflow_url.clone(),
-        "--overflow-key".into(), tuning.overflow_key.clone(),
         "--overflow-wait-s".into(), tuning.overflow_wait_s.to_string(),
     ];
     // 0 means "use the coordinator's own default", which is a real ceiling --
@@ -685,6 +779,32 @@ fn overflow_args(tuning: &Tuning) -> Vec<String> {
         v.push(tuning.overflow_daily_cap_milli.to_string());
     }
     v
+}
+
+/// Credentials for the coordinator, as environment variables rather than
+/// command-line arguments (2026-08-20 audit A-P0-4).
+///
+/// `/proc/<pid>/cmdline` is world-readable on Linux and `ps` shows the same
+/// thing everywhere, so anything in argv is readable by every other account on
+/// the machine — including the one that gates this machine's inference API and
+/// the one that spends this account's Sparks. A child's environment is not:
+/// `/proc/<pid>/environ` is owner-only, and the client passes these per child
+/// (`Command::env`) rather than setting them on itself.
+///
+/// The names are the ones `src/coord/coord_main.c` already reads as fallbacks
+/// (`IDLETOKEN_API_TOKEN`, `IDLETOKEN_OVERFLOW_URL/KEY`), so this is a change of
+/// channel, not of contract — verified against the coordinator's own argument
+/// parser before switching, because "passed it but the engine never read it"
+/// would silently turn the API token off.
+fn secret_env(tuning: &Tuning) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = Vec::new();
+    if !tuning.api_token.is_empty() {
+        env.push(("IDLETOKEN_API_TOKEN".into(), tuning.api_token.clone()));
+    }
+    if !tuning.overflow_url.is_empty() && !tuning.overflow_key.is_empty() {
+        env.push(("IDLETOKEN_OVERFLOW_KEY".into(), tuning.overflow_key.clone()));
+    }
+    env
 }
 
 /// Start this machine's engine(s) per its role in the frozen roster. The
@@ -752,15 +872,19 @@ fn materialize_engine(app: &AppHandle) {
         if remote_workers > 0 {
             coord_args.push("--num-workers".into());
             coord_args.push(remote_workers.to_string());
+            // ⚠ Still argv, unlike the API token below: the coordinator has no
+            // IDLETOKEN_PAIR_CODE fallback (the worker does — see the worker
+            // branch). Moving it needs a one-line env read in
+            // src/coord/coord_main.c, which is another session's tree; passing
+            // it through a variable the engine does not read would leave the
+            // cluster with no pairing code at all. Tracked as a cross-tree
+            // follow-up in the A-P0-4 report.
             coord_args.push("--pair-code".into());
             coord_args.push(engine_code);
         }
-        if !tuning.api_token.is_empty() {
-            coord_args.push("--api-token".into());
-            coord_args.push(tuning.api_token.clone());
-        }
         coord_args.extend(overflow_args(&tuning));
-        if let Err(e) = crate::engine::start_engine(app, "coordinator".into(), coord_args, Vec::new()) {
+        // Credentials go through the environment, never argv (A-P0-4).
+        if let Err(e) = crate::engine::start_engine(app, "coordinator".into(), coord_args, secret_env(&tuning)) {
             eprintln!("[pairing] coord start failed: {e}");
         }
     } else {
@@ -774,14 +898,18 @@ fn materialize_engine(app: &AppHandle) {
         let mut worker_args = vec![
             "--rpc-supervisor".into(),
             "--engine-dir".into(), engine_dir.to_string_lossy().into_owned(),
-            "--pair-code".into(), engine_code,
             "--coordinator".into(), format!("{coord_ip}:{COORD_PORT}"),
             "--discovery-port".into(), tuning.discovery_port.to_string(),
             "--rpc-host".into(), self_ip(&tuning),
             "--rpc-port".into(), tuning.inter_stage_port.to_string(),
         ];
         worker_args.extend(usage_cap_args(&tuning));
-        if let Err(e) = crate::engine::start_engine(app, "worker".into(), worker_args, Vec::new()) {
+        // The pairing code is the secret the cluster TLS PSK is derived from,
+        // so it does not belong in a world-readable command line (A-P0-4).
+        // `src/worker/worker_main.c` reads IDLETOKEN_PAIR_CODE as a fallback,
+        // which is what makes this safe to switch.
+        let worker_env = vec![("IDLETOKEN_PAIR_CODE".to_string(), engine_code)];
+        if let Err(e) = crate::engine::start_engine(app, "worker".into(), worker_args, worker_env) {
             eprintln!("[pairing] worker start failed: {e}");
         }
     }
@@ -894,6 +1022,35 @@ fn merge_engine_status(app: &AppHandle) -> bool {
     true
 }
 
+/// The refusal every unauthenticated `roster`/`leave` gets.
+///
+/// One string, and an explicit one: a request that arrives without a valid
+/// token is REFUSED, never quietly served a trimmed reply. An older client
+/// that does not send the field sees this and can say why (the joiner maps it
+/// to a re-join); a stranger on the LAN sees it and gets nothing.
+const ERR_UNAUTHORIZED: &str = "unauthorized: this request needs the member token issued at join";
+
+/// Does this request carry the token the creator minted for `id`, from the
+/// address that member joined from?
+///
+/// Both halves matter. The token alone would still let someone who saw one go
+/// on using it from anywhere; the address alone is trivially spoofable on a
+/// LAN. A member whose address changed (DHCP lease, reconnect) fails this,
+/// gets `ERR_UNAUTHORIZED`, and its loop re-joins — which re-records the new
+/// address. That is the intended path, not an error state.
+fn member_authorized(inner: &Inner, req: &Value, peer_ip: &str) -> Option<String> {
+    let id = req["id"].as_str().unwrap_or("");
+    let token = req["token"].as_str().unwrap_or("");
+    if id.is_empty() || token.is_empty() {
+        return None;
+    }
+    let p = inner.peers.iter().find(|p| p.id == id)?;
+    if !token_eq(&p.token, token) || p.ip != peer_ip {
+        return None;
+    }
+    Some(id.to_string())
+}
+
 /// One roster-protocol request on the creator side.
 fn handle_roster_conn(app: &AppHandle, stream: TcpStream, generation: u64) {
     let peer_ip = stream.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
@@ -909,18 +1066,65 @@ fn handle_roster_conn(app: &AppHandle, stream: TcpStream, generation: u64) {
     if inner.generation != generation || inner.mode != Mode::Creator {
         return;
     }
+    // "Only same subnet": refuse before anything else is considered, and say
+    // why. A silent drop here is indistinguishable from a firewall and would
+    // send someone hunting the wrong problem. Applied to `hello` too, because
+    // that step is where THIS machine proves it knows the code — a restriction
+    // that leaks the proof to the excluded network is not one.
+    let wrong_subnet = inner.tuning.same_subnet_only && !same_subnet(&peer_ip, &self_ip(&inner.tuning));
+    let subnet_err = json!({"ok": false, "err": "different subnet (this cluster is restricted to one subnet)"});
+
     let reply = match req["op"].as_str() {
-        Some("join") => {
-            // "Only same subnet": refuse before the code is even considered, and
-            // say why. A silent drop here is indistinguishable from a firewall
-            // and would send someone hunting the wrong problem.
-            if inner.tuning.same_subnet_only && !same_subnet(&peer_ip, &self_ip(&inner.tuning)) {
-                json!({"ok": false, "err": "different subnet (this cluster is restricted to one subnet)"})
-            } else if req["code"].as_str() != inner.code.as_deref() {
-                json!({"ok": false, "err": "bad code"})
+        // Step one of the join handshake (A-P0-3): answer the caller's nonce
+        // with proof that we hold the same join code, and hand out a nonce of
+        // our own for its answering proof. A caller that cannot verify this
+        // never sends us anything.
+        Some("hello") if wrong_subnet => subnet_err,
+        Some("hello") => {
+            let their_nonce = req["nonce"].as_str().unwrap_or("");
+            let code = inner.code.clone().unwrap_or_default();
+            if their_nonce.is_empty() || code.is_empty() {
+                json!({"ok": false, "err": "bad hello"})
             } else {
+                let ours = random_hex(16);
+                let now = std::time::Instant::now();
+                inner.challenges.retain(|(_, at)| now.duration_since(*at) < CHALLENGE_TTL);
+                // Oldest out first if someone is spraying hellos; a live joiner
+                // uses its nonce within one round trip.
+                while inner.challenges.len() >= MAX_CHALLENGES {
+                    inner.challenges.remove(0);
+                }
+                inner.challenges.push((ours.clone(), now));
+                json!({
+                    "ok": true,
+                    "proof": pair_proof("creator", &code, their_nonce),
+                    "nonce": ours,
+                })
+            }
+        }
+        Some("join") if wrong_subnet => subnet_err,
+        Some("join") => {
+            // The code itself no longer travels: the joiner answers the nonce
+            // we issued above. An unknown or expired nonce is refused rather
+            // than treated as a fresh handshake — otherwise the challenge is
+            // decoration.
+            let proof = req["proof"].as_str().unwrap_or("");
+            let code = inner.code.clone().unwrap_or_default();
+            let now = std::time::Instant::now();
+            inner.challenges.retain(|(_, at)| now.duration_since(*at) < CHALLENGE_TTL);
+            let matched = inner
+                .challenges
+                .iter()
+                .position(|(n, _)| token_eq(&pair_proof("joiner", &code, n), proof));
+            if let Some(at) = matched {
+                inner.challenges.remove(at);
                 let id = req["hostname"].as_str().unwrap_or("?").to_string();
                 let hb = req["hb"].as_u64().unwrap_or(0) as u32;
+                // A fresh token on every accepted join, including a re-join.
+                // Rotating it is what keeps a token that leaked from outliving
+                // the session it was seen in; the member always gets the new
+                // one in this very reply, so nothing has to be reconciled.
+                let token = random_hex(16);
                 if let Some(p) = inner.peers.iter_mut().find(|p| p.id == id) {
                     // Re-register under a known id: the machine is back (or
                     // re-joined after a creator restart). Refresh liveness and
@@ -929,6 +1133,7 @@ fn handle_roster_conn(app: &AppHandle, stream: TcpStream, generation: u64) {
                     p.last_seen = Some(std::time::Instant::now());
                     p.hb_secs = hb;
                     p.ip = peer_ip.clone();
+                    p.token = token.clone();
                 } else {
                     inner.peers.push(Peer {
                         id: id.clone(),
@@ -943,6 +1148,7 @@ fn handle_roster_conn(app: &AppHandle, stream: TcpStream, generation: u64) {
                         last_seen: Some(std::time::Instant::now()),
                         hb_secs: hb,
                         ip: peer_ip.clone(),
+                        token: token.clone(),
                         vram_free: req["vramFree"].as_u64().unwrap_or(0),
                         ram_free: req["ramFree"].as_u64().unwrap_or(0),
                         unified_memory: req["unifiedMemory"].as_bool().unwrap_or(false),
@@ -962,14 +1168,26 @@ fn handle_roster_conn(app: &AppHandle, stream: TcpStream, generation: u64) {
                 }
                 let mut r = roster_reply(&inner);
                 r["id"] = json!(id);
+                // The member's proof for every later request. It travels only
+                // in the reply to the machine that just proved the code.
+                r["token"] = json!(token);
                 r
+            } else {
+                json!({"ok": false, "err": "bad code"})
             }
         }
-        Some("roster") => {
-            // Live per-node progress: a member's poll carries its engine state.
-            let id = req["id"].as_str().unwrap_or("");
-            let eng = req["engine"].as_str().unwrap_or("");
-            if !id.is_empty() {
+        Some("roster") => match member_authorized(&inner, &req, &peer_ip) {
+            None => {
+                eprintln!(
+                    "[pairing] refused an unauthenticated roster request from {peer_ip} \
+                     (id={:?}) — the roster is only served to machines that joined",
+                    req["id"].as_str().unwrap_or("")
+                );
+                json!({"ok": false, "err": ERR_UNAUTHORIZED})
+            }
+            Some(id) => {
+                // Live per-node progress: a member's poll carries its engine state.
+                let eng = req["engine"].as_str().unwrap_or("");
                 let forming = inner.phase == "idle"; // read before the &mut borrow below
                 if let Some(p) = inner.peers.iter_mut().find(|p| p.id == id) {
                     // The poll IS the liveness signal: hearing it revives a
@@ -981,14 +1199,26 @@ fn handle_roster_conn(app: &AppHandle, stream: TcpStream, generation: u64) {
                         p.stage = stage_for_engine(eng).to_string();
                     }
                 }
+                roster_reply(&inner)
             }
-            roster_reply(&inner)
-        }
-        Some("leave") => {
-            let id = req["id"].as_str().unwrap_or("");
-            inner.peers.retain(|p| p.id != id);
-            json!({"ok": true})
-        }
+        },
+        Some("leave") => match member_authorized(&inner, &req, &peer_ip) {
+            None => {
+                eprintln!(
+                    "[pairing] refused an unauthenticated leave from {peer_ip} (id={:?}) \
+                     — evicting a member needs that member's own token",
+                    req["id"].as_str().unwrap_or("")
+                );
+                json!({"ok": false, "err": ERR_UNAUTHORIZED})
+            }
+            // Only the entry the token belongs to. `member_authorized` returns
+            // the id the TOKEN maps to, not the one the request asked for, so
+            // "leave" cannot be aimed at anybody else's machine.
+            Some(id) => {
+                inner.peers.retain(|p| p.id != id);
+                json!({"ok": true})
+            }
+        },
         _ => json!({"ok": false, "err": "bad op"}),
     };
     drop(inner);
@@ -997,7 +1227,15 @@ fn handle_roster_conn(app: &AppHandle, stream: TcpStream, generation: u64) {
     let _ = writeln!(stream, "{reply}");
 }
 
-fn spawn_creator_tasks(app: AppHandle, generation: u64, code: String, discovery_port: u16) {
+/// One discovery beacon packet: `IDLETOKEN2|<session>|<nonce>|<roster port>`.
+///
+/// Split out so a test can assert the property the whole change rests on — the
+/// bytes on the wire do not depend on the join code (A-P0-3).
+fn beacon_packet(session: &str, nonce: &str, roster_port: u16) -> String {
+    format!("{BEACON_MAGIC}|{session}|{nonce}|{roster_port}")
+}
+
+fn spawn_creator_tasks(app: AppHandle, generation: u64, _code: String, discovery_port: u16) {
     // "LAN auto-discovery" off: stay silent and let the roster service below do
     // the work — machines that were given our IP by hand still get in. Read
     // once here, not per tick: the cluster's discovery mode is decided when it
@@ -1008,16 +1246,17 @@ fn spawn_creator_tasks(app: AppHandle, generation: u64, code: String, discovery_
         let inner = pairing.0.lock().unwrap();
         inner.tuning.lan_discovery
     };
-    // UDP beacon: `IDLETOKEN1|<fnv1a(code)>|<roster_port>` once a second.
+    // UDP beacon: `IDLETOKEN2|<session>|<nonce>|<roster_port>` once a second.
+    // Nothing in it is derived from the join code (see BEACON_MAGIC) — the
+    // session id is random and per cluster, the nonce is random and per packet.
     let beacon_app = app.clone();
-    let hash = code_hash(&code);
+    let session = random_hex(8);
     std::thread::spawn(move || {
         if !announce {
             return;
         }
         let Ok(sock) = UdpSocket::bind(("0.0.0.0", 0)) else { return };
         let _ = sock.set_broadcast(true);
-        let msg = format!("{BEACON_MAGIC}|{hash}|{ROSTER_PORT}");
         loop {
             {
                 let pairing = beacon_app.state::<Pairing>();
@@ -1030,6 +1269,7 @@ fn spawn_creator_tasks(app: AppHandle, generation: u64, code: String, discovery_
                     return;
                 }
             }
+            let msg = beacon_packet(&session, &random_hex(8), ROSTER_PORT);
             let _ = sock.send_to(msg.as_bytes(), ("255.255.255.255", discovery_port));
             let _ = sock.send_to(msg.as_bytes(), ("127.0.0.1", discovery_port)); // same-host joiners
             std::thread::sleep(Duration::from_secs(1));
@@ -1112,7 +1352,19 @@ fn spawn_creator_tasks(app: AppHandle, generation: u64, code: String, discovery_
     });
 }
 
-/// Joiner: wait for a matching beacon, register, then poll the roster.
+/// One newline-JSON round trip to a roster service. `None` = did not answer.
+fn roster_call(ip: &str, req: &Value) -> Option<Value> {
+    let addr: SocketAddr = format!("{ip}:{ROSTER_PORT}").parse().ok()?;
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    writeln!(s, "{req}").ok()?;
+    let mut line = String::new();
+    BufReader::new(s).read_line(&mut line).ok()?;
+    serde_json::from_str(&line).ok()
+}
+
+/// Joiner: collect the machines announcing themselves, offer the code to each,
+/// then poll the one that accepted it.
 /// `discovery_port` is this machine's settings.discoveryPort — creator and
 /// joiner must be configured alike for the beacon to be heard.
 fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_port: u16) {
@@ -1132,67 +1384,188 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
             )
         };
 
-        // 1) discover the creator via beacon — unless LAN auto-discovery is off,
-        //    in which case we go straight to the addresses we were given.
-        let hash = code_hash(&code);
-        let beacon_ip: Option<String> = if !listen {
-            None
-        } else {
-            (|| {
-                let sock = UdpSocket::bind(("0.0.0.0", discovery_port)).ok()?;
-                sock.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
+        // 1) collect the machines announcing themselves — every one of them, not
+        //    the one whose beacon "matches". Since A-P0-3 the beacon carries
+        //    nothing derived from the code (that is what stopped it from being
+        //    brute-forceable), so which cluster is ours is decided by offering
+        //    the code to each candidate in step 3 and seeing who accepts.
+        //    Skipped entirely when LAN auto-discovery is off.
+        let mut candidates: Vec<String> = Vec::new();
+        if listen {
+            if let Ok(sock) = UdpSocket::bind(("0.0.0.0", discovery_port)) {
+                let _ = sock.set_read_timeout(Some(Duration::from_secs(1)));
                 let mut buf = [0u8; 256];
                 for _ in 0..8 {
                     {
                         let pairing = app.state::<Pairing>();
                         if pairing.0.lock().unwrap().generation != generation {
-                            return None;
+                            return;
                         }
                     }
-                    if let Ok((n, src)) = sock.recv_from(&mut buf) {
-                        let msg = String::from_utf8_lossy(&buf[..n]);
-                        let parts: Vec<&str> = msg.trim().split('|').collect();
-                        if parts.len() == 3 && parts[0] == BEACON_MAGIC && parts[1] == hash {
-                            let ip = src.ip().to_string();
-                            // "Only same subnet" also filters what we LISTEN to,
-                            // not just what we accept: on a bridged VM or a VPN
-                            // the beacon can arrive from a network the user
-                            // deliberately excluded.
-                            if subnet_only && !same_subnet(&ip, &my_ip) {
-                                eprintln!("[pairing] ignoring beacon from {ip}: different subnet");
-                                continue;
-                            }
-                            return Some(ip);
-                        }
+                    let Ok((n, src)) = sock.recv_from(&mut buf) else { continue };
+                    let msg = String::from_utf8_lossy(&buf[..n]);
+                    let parts: Vec<&str> = msg.trim().split('|').collect();
+                    // v2 = magic|session|nonce|port, v1 = magic|hash|port. The
+                    // payload is not read either way: only the source address
+                    // matters, and an older creator is still a creator.
+                    let known = matches!(parts.first(), Some(&m) if m == BEACON_MAGIC || m == BEACON_MAGIC_LEGACY);
+                    if !known {
+                        continue;
+                    }
+                    let ip = src.ip().to_string();
+                    // "Only same subnet" also filters what we LISTEN to, not
+                    // just what we accept: on a bridged VM or a VPN the beacon
+                    // can arrive from a network the user deliberately excluded.
+                    if subnet_only && !same_subnet(&ip, &my_ip) {
+                        eprintln!("[pairing] ignoring beacon from {ip}: different subnet");
+                        continue;
+                    }
+                    if !candidates.contains(&ip) {
+                        candidates.push(ip);
                     }
                 }
-                None
-            })()
-        };
+            }
+        }
 
         // 2) manual peers are the fallback the beacon cannot be: broadcast does
-        //    not cross subnets and plenty of networks drop it entirely. Each
-        //    candidate is tried by simply attempting the join below.
-        let creator_ip: Option<String> = beacon_ip.or_else(|| {
-            manual
-                .iter()
-                .find(|ip| {
-                    if subnet_only && !same_subnet(ip, &my_ip) {
-                        eprintln!("[pairing] skipping manual peer {ip}: different subnet");
-                        return false;
-                    }
-                    let ok = format!("{ip}:{ROSTER_PORT}")
-                        .parse::<SocketAddr>()
-                        .ok()
-                        .and_then(|a| TcpStream::connect_timeout(&a, Duration::from_secs(2)).ok())
-                        .is_some();
-                    if !ok {
-                        eprintln!("[pairing] manual peer {ip} did not answer on {ROSTER_PORT}");
-                    }
-                    ok
-                })
-                .cloned()
-        });
+        //    not cross subnets and plenty of networks drop it entirely.
+        for ip in &manual {
+            if subnet_only && !same_subnet(ip, &my_ip) {
+                eprintln!("[pairing] skipping manual peer {ip}: different subnet");
+                continue;
+            }
+            if !candidates.contains(ip) {
+                candidates.push(ip.clone());
+            }
+        }
+
+        let (self_host, self_gpu) = {
+            let pairing = app.state::<Pairing>();
+            let inner = pairing.0.lock().unwrap();
+            (inner.self_host.clone(), inner.self_gpu.clone())
+        };
+
+        /// Why a join can fail before it is even sent.
+        enum Handshake {
+            /// The machine answered and holds the same join code; here is the
+            /// nonce to answer with.
+            Ok(String),
+            /// Answered, but could not prove the code: a different cluster, or
+            /// something pretending to be one. Never send it our proof.
+            NotOurs,
+            /// Answered, but does not speak the handshake at all — an older
+            /// IdleToken. Refused loudly rather than falling back to sending
+            /// the code in the clear, which is the hole the handshake closes.
+            TooOld,
+            /// Did not answer.
+            Silent,
+        }
+
+        // Step one of the join (A-P0-3): make the other machine prove it knows
+        // the code, against a nonce we pick, BEFORE we prove anything to it.
+        let hello = |ip: &str| -> Handshake {
+            let mine = random_hex(16);
+            let Some(v) = roster_call(ip, &json!({"op": "hello", "nonce": mine})) else {
+                return Handshake::Silent;
+            };
+            if v["ok"].as_bool() == Some(false) {
+                return match v["err"].as_str() {
+                    Some("bad op") => Handshake::TooOld,
+                    _ => Handshake::NotOurs,
+                };
+            }
+            let want = pair_proof("creator", &code, &mine);
+            if !token_eq(v["proof"].as_str().unwrap_or(""), &want) {
+                return Handshake::NotOurs;
+            }
+            match v["nonce"].as_str().filter(|n| !n.is_empty()) {
+                Some(n) => Handshake::Ok(n.to_string()),
+                None => Handshake::TooOld,
+            }
+        };
+
+        // The join request, answering the creator's nonce. Rebuilt on every
+        // attempt because the memory probe may have landed in between.
+        //   `prefer`: this machine's own "Prefer this machine as coordinator".
+        //   Sent on every (re)join so it survives the creator restarting the
+        //   roster.
+        //   Memory goes with the join: the machine that owns the numbers is the
+        //   one that measured them, and the roster is where the cluster totals
+        //   them up (pre-flight "will this model fit on all of us together").
+        let join_req = |nonce: &str| {
+            let (vram_free, ram_free, unified) = {
+                let pairing = app.state::<Pairing>();
+                let inner = pairing.0.lock().unwrap();
+                (inner.self_vram_free, inner.self_ram_free, inner.self_unified)
+            };
+            json!({"op": "join", "proof": pair_proof("joiner", &code, nonce),
+                   "hostname": self_host, "gpu": self_gpu,
+                   "prefer": prefer, "hb": poll.as_secs(),
+                   "vramFree": vram_free, "ramFree": ram_free, "unifiedMemory": unified})
+        };
+
+        // 3) offer the code to each candidate until one accepts. A refusal is
+        //    not fatal on its own — with several clusters on the LAN, "bad
+        //    code" simply means "not this one" — but the LAST refusal is kept,
+        //    because if nobody accepts it is the honest reason to show.
+        let mut creator_ip: Option<String> = None;
+        let mut member_token = String::new();
+        let mut first_reply: Option<Value> = None;
+        let mut last_refusal: Option<String> = None;
+        for cand in &candidates {
+            {
+                let pairing = app.state::<Pairing>();
+                if pairing.0.lock().unwrap().generation != generation {
+                    return;
+                }
+            }
+            let nonce = match hello(cand) {
+                Handshake::Ok(n) => n,
+                Handshake::Silent => {
+                    eprintln!("[pairing] {cand} did not answer on {ROSTER_PORT}");
+                    continue;
+                }
+                Handshake::NotOurs => {
+                    // Not an error worth showing on its own: with more than one
+                    // cluster on the network this is simply "not that one". It
+                    // becomes the reported reason only if nobody accepts.
+                    eprintln!("[pairing] {cand} could not prove the join code — not our cluster");
+                    last_refusal = Some("bad code".into());
+                    continue;
+                }
+                Handshake::TooOld => {
+                    eprintln!("[pairing] {cand} does not support the join handshake — older IdleToken");
+                    last_refusal = Some("old creator".into());
+                    continue;
+                }
+            };
+            let Some(v) = roster_call(cand, &join_req(&nonce)) else {
+                eprintln!("[pairing] {cand} did not answer on {ROSTER_PORT}");
+                continue;
+            };
+            if v["ok"].as_bool() == Some(false) {
+                let err = v["err"].as_str().unwrap_or("").to_string();
+                eprintln!("[pairing] {cand} refused this machine: {err}");
+                last_refusal = Some(err);
+                continue;
+            }
+            // The creator mints this when it accepts the code; every later
+            // roster/leave request carries it (A-P0-2). A creator that does not
+            // issue one is one this build cannot talk to past the join — say so
+            // rather than poll forever getting "unauthorized".
+            let Some(token) = v["token"].as_str().filter(|t| !t.is_empty()) else {
+                eprintln!(
+                    "[pairing] {cand} accepted the code but issued no member token — \
+                     that machine is running an older IdleToken; update it"
+                );
+                last_refusal = Some("no member token issued (the hosting machine needs an update)".into());
+                continue;
+            };
+            member_token = token.to_string();
+            creator_ip = Some(cand.clone());
+            first_reply = Some(v);
+            break;
+        }
 
         let Some(creator_ip) = creator_ip else {
             let pairing = app.state::<Pairing>();
@@ -1202,29 +1575,43 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
                 inner.phase = "idle".into();
                 inner.code = None;
                 // Tell the UI, not just stderr: a silent reset to idle is
-                // indistinguishable from the Join button doing nothing.
-                inner.last_error = Some(if listen {
-                    ("notFound".into(), discovery_port.to_string())
-                } else {
-                    ("notFoundManual".into(), String::new())
+                // indistinguishable from the Join button doing nothing. A
+                // refusal is a different answer from silence — somebody was
+                // there and said no.
+                inner.last_error = Some(match last_refusal.as_deref() {
+                    Some("bad code") => ("badCode".into(), String::new()),
+                    Some("old creator") => ("oldCreator".into(), String::new()),
+                    Some(e) if e.starts_with("different subnet") => ("subnet".into(), String::new()),
+                    Some(e) => ("rejected".into(), e.to_string()),
+                    None if listen => ("notFound".into(), discovery_port.to_string()),
+                    None => ("notFoundManual".into(), String::new()),
                 });
             }
             drop(inner);
             emit_snapshot(&app);
             eprintln!(
-                "[pairing] no cluster found for that code{}",
+                "[pairing] no cluster accepted that code{}",
                 if listen { " on this LAN" } else { " (LAN auto-discovery is off; add the host's IP under Manual peer IPs)" }
             );
             return;
         };
 
-        // 3) join + poll loop over the roster protocol
-        let (self_host, self_gpu) = {
-            let pairing = app.state::<Pairing>();
-            let inner = pairing.0.lock().unwrap();
-            (inner.self_host.clone(), inner.self_gpu.clone())
-        };
-        let mut joined = false;
+        // 4) apply the accepted join, then poll the roster
+        let mut joined = true;
+        if let Some(v) = first_reply {
+            let eff = {
+                let pairing = app.state::<Pairing>();
+                let mut inner = pairing.0.lock().unwrap();
+                if inner.generation != generation {
+                    return;
+                }
+                apply_roster(&mut inner, &v)
+            };
+            emit_snapshot(&app);
+            if eff.rejoin {
+                joined = false;
+            }
+        }
         // Creator-loss detection (the inverse of the member sweep): the polls
         // this loop already sends are the liveness probe. Silence longer than
         // max(30s, 3×interval) flips the snapshot to "creator lost" — members
@@ -1247,39 +1634,40 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
             // heartbeat must not read as a dead machine).
             let req = if joined {
                 // report this machine's live engine state so the whole roster
-                // sees per-node progress (P4)
-                json!({"op": "roster", "id": self_host,
+                // sees per-node progress (P4). The token is what makes this a
+                // MEMBER's poll rather than anyone's TCP connection (A-P0-2).
+                json!({"op": "roster", "id": self_host, "token": member_token,
                        "engine": crate::engine::current_state_str(&app),
                        "hb": poll.as_secs()})
             } else {
-                // `prefer`: this machine's own "Prefer this machine as
-                // coordinator". Sent on every (re)join so it survives the
-                // creator restarting the roster.
-                // Memory goes with the join: the machine that owns the
-                // numbers is the one that measured them, and the roster is
-                // where the cluster totals them up (pre-flight "will this
-                // model fit on all of us together").
-                let (vram_free, ram_free, unified) = {
-                    let pairing = app.state::<Pairing>();
-                    let inner = pairing.0.lock().unwrap();
-                    (inner.self_vram_free, inner.self_ram_free, inner.self_unified)
-                };
-                json!({"op": "join", "code": code, "hostname": self_host, "gpu": self_gpu,
-                       "prefer": prefer, "hb": poll.as_secs(),
-                       "vramFree": vram_free, "ramFree": ram_free, "unifiedMemory": unified})
+                // Re-joining (the creator restarted, or our token aged out).
+                // A fresh handshake every time: the creator consumed the last
+                // nonce, and reusing one would be a replay by definition.
+                match hello(&creator_ip) {
+                    Handshake::Ok(n) => join_req(&n),
+                    _ => {
+                        // Keep retrying. The creator is very likely mid-restart,
+                        // and the loop's own "creator lost" timer is what turns
+                        // a lasting silence into a message.
+                        std::thread::sleep(poll);
+                        continue;
+                    }
+                }
             };
-            let reply: Option<Value> = (|| {
-                let addr: SocketAddr = format!("{creator_ip}:{ROSTER_PORT}").parse().ok()?;
-                let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).ok()?;
-                s.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
-                writeln!(s, "{req}").ok()?;
-                let mut line = String::new();
-                BufReader::new(s).read_line(&mut line).ok()?;
-                serde_json::from_str(&line).ok()
-            })();
+            let reply: Option<Value> = roster_call(&creator_ip, &req);
             if let Some(v) = reply {
                 if v["ok"].as_bool() == Some(false) {
                     let err = v["err"].as_str().unwrap_or("").to_string();
+                    // Our token stopped being accepted: the creator rotated the
+                    // roster (restart), or this machine's address changed under
+                    // it. Re-join rather than die — the join is the one request
+                    // that does not need a token, and it hands us a fresh one.
+                    if err.starts_with("unauthorized") {
+                        eprintln!("[pairing] member token no longer accepted — re-joining");
+                        joined = false;
+                        std::thread::sleep(poll);
+                        continue;
+                    }
                     eprintln!("[pairing] join rejected: {err}");
                     // Surface the rejection and reset to idle, mirroring the
                     // not-found path: the roster said no, and retrying with the
@@ -1301,6 +1689,11 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
                     drop(inner);
                     emit_snapshot(&app);
                     return;
+                }
+                // A join reply carries a fresh token; a roster reply does not
+                // (and must not clear the one we hold).
+                if let Some(tok) = v["token"].as_str().filter(|t| !t.is_empty()) {
+                    member_token = tok.to_string();
                 }
                 joined = true;
                 let eff = {
@@ -1456,6 +1849,7 @@ pub fn pairing_create(
         inner.model_path = model_path.unwrap_or_default();
         inner.engine_started = false;
         inner.last_error = None;
+        inner.challenges.clear();
         inner.tuning = tuning.unwrap_or_default();
         discovery_port = inner.tuning.discovery_port;
         inner.peers = vec![Peer {
@@ -1472,6 +1866,9 @@ pub fn pairing_create(
             last_seen: None,
             hb_secs: 0,
             ip: String::new(),
+            // The creator never authenticates to itself: its own entry is
+            // written in-process, never over the roster socket.
+            token: String::new(),
             // Filled by pairing_report_memory once the probe has run — the
             // creator's own numbers come from the same command the joiners
             // send, so one path fills every entry.
@@ -1516,6 +1913,7 @@ pub fn pairing_join(
         inner.model_path = model_path.unwrap_or_default();
         inner.engine_started = false;
         inner.last_error = None;
+        inner.challenges.clear();
         inner.peers = Vec::new();
         inner.tuning = tuning.unwrap_or_default();
         discovery_port = inner.tuning.discovery_port;
@@ -1656,6 +2054,7 @@ pub fn pairing_leave(app: AppHandle, state: State<'_, Pairing>) -> Result<(), St
         inner.engine_started = false;
         inner.account_mode = false;
         inner.last_error = None;
+        inner.challenges.clear();
     }
     // Leaving the cluster also stops this machine's engine process.
     let _ = crate::engine::stop_engine(&app);
@@ -1864,7 +2263,7 @@ mod pairing_settings_tests {
         });
         assert_eq!(
             overflow_args(&t),
-            vec!["--overflow-url", "http://p", "--overflow-key", "sk",
+            vec!["--overflow-url", "http://p",
                  "--overflow-wait-s", "5", "--overflow-daily-cap", "2500"]
         );
         // A cap of 0 means "the coordinator's own default", which is a real
@@ -1904,6 +2303,268 @@ mod pairing_settings_tests {
         assert!(t.prefer_coordinator);
         assert!(t.same_subnet_only);
         assert_eq!(bind_host(&t), "192.168.1.9");
+    }
+
+    /// A-P0-4: nothing secret may reach a command line. `ps` and
+    /// `/proc/<pid>/cmdline` are readable by every account on the machine;
+    /// `/proc/<pid>/environ` is not.
+    #[test]
+    fn credentials_travel_in_the_environment_not_in_argv() {
+        let t = tuning(|t| {
+            t.api_token = "tok-should-not-be-in-argv".into();
+            t.overflow_url = "http://platform".into();
+            t.overflow_key = "sk-should-not-be-in-argv".into();
+            t.overflow_wait_s = 5;
+        });
+        let argv = overflow_args(&t).join(" ");
+        assert!(!argv.contains("sk-should-not-be-in-argv"), "{argv}");
+        assert!(!argv.contains("tok-should-not-be-in-argv"), "{argv}");
+        // The URL is not a secret and stays visible — a log that says which
+        // platform this machine borrows from is worth having.
+        assert!(argv.contains("--overflow-url http://platform"), "{argv}");
+
+        // ...and they are handed over as the variables the engine actually
+        // reads. The names are checked literally: a typo here would not fail
+        // to compile, it would silently start an engine with no API token.
+        let env = secret_env(&t);
+        assert!(env.contains(&("IDLETOKEN_API_TOKEN".into(), "tok-should-not-be-in-argv".into())));
+        assert!(env.contains(&("IDLETOKEN_OVERFLOW_KEY".into(), "sk-should-not-be-in-argv".into())));
+
+        // No token configured = no variable at all, so an empty string can
+        // never be mistaken for "auth is on with a blank token".
+        assert!(secret_env(&Tuning::default()).is_empty());
+        // Overflow needs both halves; half a credential is not one.
+        assert!(secret_env(&tuning(|t| t.overflow_key = "sk".into())).is_empty());
+    }
+
+    // ---- A-P0-3: the beacon must not leak the join code -------------------
+    //
+    // The beacon used to broadcast `fnv1a(code)` once a second. The reverse
+    // verification the audit asks for is below, and it is the whole argument:
+    // `legacy_code_hash` is the function that shipped, and a plain search
+    // recovers the code from its output. The new packet is asserted to be a
+    // function of the session id, the nonce and the port ONLY — so there is
+    // nothing on the wire to search against.
+
+    /// The function `IDLETOKEN1` beacons used. Kept here, and only here, so the
+    /// claim "the old one was breakable" is demonstrated rather than asserted.
+    fn legacy_code_hash(code: &str) -> String {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in code.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        format!("{h:016x}")
+    }
+
+    const CODE_ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+    #[test]
+    fn the_old_beacon_gave_the_code_away() {
+        // A real code is 6 characters of this alphabet — 32^6 ≈ 1.07e9, which
+        // a laptop grinds through in seconds because FNV-1a is a table hash,
+        // not a password hash. Searching the full space would make this test
+        // take minutes for no extra information, so it searches the same way
+        // over the last three characters with the first three known. What the
+        // assertion establishes is the METHOD: given the broadcast digest, the
+        // code falls out of an offline search of the code space.
+        let secret = "QK7MZ3";
+        let seen_on_the_wire = legacy_code_hash(secret);
+        let mut recovered = None;
+        'outer: for a in CODE_ALPHABET {
+            for b in CODE_ALPHABET {
+                for c in CODE_ALPHABET {
+                    let guess = format!("QK7{}{}{}", *a as char, *b as char, *c as char);
+                    if legacy_code_hash(&guess) == seen_on_the_wire {
+                        recovered = Some(guess);
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            recovered.as_deref(),
+            Some(secret),
+            "this is the failure the old beacon had: the digest it broadcast is invertible"
+        );
+    }
+
+    #[test]
+    fn the_new_beacon_carries_nothing_derived_from_the_code() {
+        // The property, stated directly: two clusters with different codes and
+        // the same session/nonce put identical bytes on the wire. There is
+        // therefore no function of the code to invert, whatever the attacker's
+        // budget — which is what the test above cannot say about the old one.
+        let a = beacon_packet("0123456789abcdef", "fedcba9876543210", ROSTER_PORT);
+        let b = beacon_packet("0123456789abcdef", "fedcba9876543210", ROSTER_PORT);
+        assert_eq!(a, b);
+        assert!(a.starts_with("IDLETOKEN2|"), "{a}");
+        assert!(a.ends_with(&format!("|{ROSTER_PORT}")), "{a}");
+        // And no packet built by the running code repeats: the nonce moves.
+        let live = |session: &str| beacon_packet(session, &random_hex(8), ROSTER_PORT);
+        let s = random_hex(8);
+        assert_ne!(live(&s), live(&s), "the nonce must change per packet");
+
+        // Belt and braces against a future edit reintroducing a code-derived
+        // field: for every code we can think of, the digest the old beacon
+        // would have carried appears nowhere in the new packet.
+        //
+        // Positive control first (CLAUDE.md: a check that cannot fail proves
+        // nothing) — the same assertion against the packet the OLD code built
+        // has to red, or the loop below is decoration.
+        let old_style = format!("IDLETOKEN1|{}|{ROSTER_PORT}", legacy_code_hash("QK7MZ3"));
+        assert!(
+            old_style.contains(&legacy_code_hash("QK7MZ3")),
+            "positive control: this check must be able to catch a leaking beacon"
+        );
+        for code in ["QK7MZ3", "AAAAAA", "999999", "ACCT-deadbeef"] {
+            assert!(
+                !a.contains(&legacy_code_hash(code)),
+                "the beacon must not carry anything derived from {code}"
+            );
+        }
+    }
+
+    /// A-P0-3, second half. Removing the code's fingerprint from the beacon
+    /// means a joiner can no longer tell which broadcaster is its cluster, so it
+    /// has to ask each one. It must not ask by handing over the code — that
+    /// would trade an offline break for an online one, where anything on the
+    /// LAN broadcasts a beacon and collects codes from whoever is joining.
+    #[test]
+    fn the_creator_proves_the_code_before_the_joiner_does() {
+        let code = "QK7MZ3";
+        let joiner_nonce = "0f0e0d0c0b0a09080706050403020100";
+
+        // What an impostor can produce with no code: nothing that verifies.
+        let expected = pair_proof("creator", code, joiner_nonce);
+        assert!(!token_eq(&pair_proof("creator", "AAAAAA", joiner_nonce), &expected));
+        assert!(!token_eq("", &expected));
+        assert!(!token_eq(&"0".repeat(64), &expected));
+        assert!(token_eq(&pair_proof("creator", code, joiner_nonce), &expected));
+
+        // Direction matters: a creator's proof must not be replayable as the
+        // joiner's answer, or an eavesdropper could join with what it heard.
+        assert_ne!(
+            pair_proof("creator", code, joiner_nonce),
+            pair_proof("joiner", code, joiner_nonce)
+        );
+        // And so does the nonce: one exchange proves nothing about the next.
+        assert_ne!(pair_proof("joiner", code, "aaaa"), pair_proof("joiner", code, "bbbb"));
+
+        // The proof is not the code, and does not contain it — this is the
+        // whole reason the code stops travelling on the wire.
+        let p = pair_proof("joiner", code, joiner_nonce);
+        assert_eq!(p.len(), 64);
+        assert!(!p.contains(code));
+        assert!(!p.to_uppercase().contains(code));
+    }
+
+    // ---- A-P0-2: roster/leave need the member token ------------------------
+
+    fn joined_member(id: &str, ip: &str, token: &str) -> Peer {
+        Peer {
+            id: id.into(),
+            hostname: id.into(),
+            gpu: String::new(),
+            role: "worker",
+            is_self: false,
+            stage: "joined".into(),
+            layer_lo: None,
+            layer_hi: None,
+            online: true,
+            last_seen: None,
+            hb_secs: 0,
+            ip: ip.into(),
+            token: token.into(),
+            vram_free: 0,
+            ram_free: 0,
+            unified_memory: false,
+        }
+    }
+
+    fn inner_with(peers: Vec<Peer>) -> Inner {
+        let Pairing(m) = Pairing::default();
+        Inner { mode: Mode::Creator, peers, ..m.into_inner().unwrap() }
+    }
+
+    #[test]
+    fn roster_and_leave_require_the_member_token() {
+        let inner = inner_with(vec![joined_member("machine-a", "192.168.1.50", "a1b2c3")]);
+        let ip = "192.168.1.50";
+
+        // What anybody on the LAN could send before A-P0-2 — and what used to
+        // be answered with the whole roster.
+        assert_eq!(member_authorized(&inner, &json!({"op": "roster", "id": "machine-a"}), ip), None);
+        assert_eq!(member_authorized(&inner, &json!({"op": "roster"}), ip), None);
+        // An empty token is not a token; a missing field must not read as one
+        // either (no silent downgrade — the request is refused, not trimmed).
+        assert_eq!(
+            member_authorized(&inner, &json!({"id": "machine-a", "token": ""}), ip),
+            None
+        );
+        assert_eq!(
+            member_authorized(&inner, &json!({"id": "machine-a", "token": "guess"}), ip),
+            None
+        );
+        // Right token, wrong source: a stolen token does not travel.
+        assert_eq!(
+            member_authorized(&inner, &json!({"id": "machine-a", "token": "a1b2c3"}), "192.168.1.99"),
+            None
+        );
+        // Unknown member.
+        assert_eq!(
+            member_authorized(&inner, &json!({"id": "machine-z", "token": "a1b2c3"}), ip),
+            None
+        );
+        // The real member's own poll still works.
+        assert_eq!(
+            member_authorized(&inner, &json!({"id": "machine-a", "token": "a1b2c3"}), ip),
+            Some("machine-a".to_string())
+        );
+    }
+
+    #[test]
+    fn leave_can_only_evict_the_token_holder() {
+        // The id the request ASKS for is irrelevant: member_authorized answers
+        // with the id the TOKEN belongs to, which is what "leave" then removes.
+        // Aiming someone else's machine at the door was the second half of
+        // A-P0-2.
+        let inner = inner_with(vec![
+            joined_member("machine-a", "192.168.1.50", "aaaa"),
+            joined_member("machine-b", "192.168.1.51", "bbbb"),
+        ]);
+        assert_eq!(
+            member_authorized(&inner, &json!({"id": "machine-b", "token": "aaaa"}), "192.168.1.50"),
+            None,
+            "machine-a's token must not authenticate as machine-b"
+        );
+        assert_eq!(
+            member_authorized(&inner, &json!({"id": "machine-a", "token": "aaaa"}), "192.168.1.50"),
+            Some("machine-a".to_string())
+        );
+    }
+
+    #[test]
+    fn member_tokens_are_unpredictable_and_never_serialized() {
+        let a = random_hex(16);
+        let b = random_hex(16);
+        assert_eq!(a.len(), 32, "128 bits, not the 30 of a join code");
+        assert_ne!(a, b);
+        assert!(!token_eq(&a, &b));
+        assert!(token_eq(&a, &a));
+        assert!(!token_eq("", ""), "an empty token can never match");
+
+        // The token must not reach the webview snapshot or the roster
+        // broadcast — both go through serde, so one #[serde(skip)] covers it,
+        // and this is the test that notices if it is ever removed.
+        let peer = joined_member("machine-a", "192.168.1.50", "s3cr3t");
+        let as_json = serde_json::to_string(&peer).unwrap();
+        assert!(!as_json.contains("s3cr3t"), "{as_json}");
+        let inner = inner_with(vec![peer]);
+        let roster = roster_reply(&inner).to_string();
+        assert!(!roster.contains("s3cr3t"), "{roster}");
+        let snap = snapshot_json(&inner).to_string();
+        assert!(!snap.contains("s3cr3t"), "{snap}");
     }
 
     /// An older/hand-written payload without the new keys must behave exactly

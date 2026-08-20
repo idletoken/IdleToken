@@ -11,9 +11,12 @@
 
 [English](README.md)
 
-<p align="center">
-  <img src="docs/images/screenshot.png" alt="IdleToken" width="820">
-</p>
+<!-- The screenshot that used to sit here was the marketing site, not the app:
+     it carried an "IN BETA" ribbon and a "get 100 Sparks" signup offer that no
+     longer exists. Rather than show visitors a picture of something else,
+     there is no image until a real client screenshot is taken on a machine
+     that is serving (model picker + running state). Drop it in at
+     docs/images/screenshot.png and restore the <img> block. -->
 
 ---
 
@@ -39,14 +42,16 @@ export ANTHROPIC_API_KEY='<你的平台 API key>'
 claude
 ```
 
-OpenAI 兼容接口使用同一地址。请求运行在他人分享的集群上，按火花计费；新账户赠 100 火花。
+OpenAI 兼容接口使用同一地址。请求运行在他人分享的集群上，按火花计费。新账户余额为 0；火花来自分享自己的机器、兑换码或他人转赠。
 
 ### 有机器：自己部署
 
 IdleToken 是一个桌面客户端，日常使用不需要命令行。Windows、Linux 和 macOS 安装包见 [Releases](https://github.com/idletoken/IdleToken/releases) 页面。
 
 1. **选一个模型**——从内置列表中选择。客户端会根据本机可用显存和内存判断能否运行。
-2. **启动服务**——缺少的权重自动下载。API 默认监听 `:8000`，客户端会显示地址和生成的 API key。
+2. **启动服务**——缺少的权重自动下载。API 监听 `127.0.0.1:8000`，仅本机可达；客户端会显示地址和生成的 API key。
+
+权重从 Hugging Face 获取。若 `huggingface.co` 连不上，客户端不会直接失败，而是改从镜像 `hf-mirror.com` 重试同一个文件——如果你在意字节来自哪里，这条兜底值得知道。两种来源下，下载完成的文件都会先与 manifest 里记录的 SHA-256 比对，对不上就丢弃。
 
 Claude Code 接入：
 
@@ -77,15 +82,16 @@ IdleToken 提供一份精选的 GGUF 格式文本生成模型列表。列表中�
 
 | 模型 | 默认权重大小 | 默认量化 | 说明 |
 | --- | --- | --- | --- |
-| Qwen3.5-0.8B | 0.49 GiB | Q4_K_M |  |
-| Qwen3.5-4B | 2.54 GiB | Q4_K_M |  |
+| Qwen3.5-0.8B | 0.31 GiB | IQ2_XXS |  |
+| Qwen3.5-4B | 1.42 GiB | IQ2_XXS |  |
 | Qwen3-8B | 4.68 GiB | Q4_K_M |  |
-| Qwen3.5-9B | 5.28 GiB | Q4_K_M |  |
-| Qwen3.5-27B | 15.58 GiB | Q4_K_M |  |
-| Qwen3.5-35B-A3B | 20.49 GiB | Q4_K_M | 3B 激活参数 |
-| DeepSeek-V4-Flash-0731 | 80.76 GiB | IQ2_XXS + Q2_K | 304B 总参数、13B 激活参数 |
+| Qwen3.5-9B | 2.97 GiB | IQ2_XXS |  |
+| Qwen3.8-27B | 5.77 GiB | IQ1_S | 困惑度门跑的是 Q4_K_M，不是这个默认档 |
+| Qwen3.5-27B | 7.98 GiB | IQ2_XXS |  |
+| Qwen3.5-35B-A3B | 9.93 GiB | IQ2_XXS | 3B 激活参数 |
+| DeepSeek-V4-Flash-0731 | 76.87 GiB | IQ1_S | 304B 总参数、13B 激活参数 |
 
-多款 Qwen 模型另有 Q5、Q6、Q8 和 BF16 版本。DeepSeek-V4-Flash 支持集群运行，其余内置模型为单机运行。
+默认档取的是已发布的最小精度，为的是让每个模型覆盖尽量多的机器；机器装得下时，客户端也提供更高的档位（多款 Qwen 模型最高到 Q8 与 BF16）。Qwen3.8-27B 这一条要说清楚：它的困惑度带是在 Q4_K_M（16.46 GiB）上测的，而默认的 IQ1_S 没有过那道门。DeepSeek-V4-Flash 支持集群运行，其余内置模型为单机运行。
 
 ## 硬件要求
 
@@ -94,9 +100,10 @@ IdleToken 提供一份精选的 GGUF 格式文本生成模型列表。列表中�
 | 平台 | 计算硬件 | 另需 |
 | --- | --- | --- |
 | Windows 10/11 | NVIDIA，计算能力 ≥ 7.5（RTX 20 系及以后），显存 ≥ 4 GB | 驱动 ≥ 527.41，CUDA Toolkit 12.x |
-| Linux | NVIDIA，计算能力 ≥ 7.5（RTX 20 系及以后），显存 ≥ 4 GB | 驱动 ≥ 580.65，CUDA Toolkit 13.0 |
+| Linux | NVIDIA，计算能力 ≥ 7.5（RTX 20 系及以后），显存 ≥ 4 GB | 驱动 ≥ 580.65，CUDA Toolkit 13.0；**预编译包只有 arm64**——x86_64 需从源码构建 |
 | macOS | 支持 Metal 的 Apple Silicon，统一内存足以容纳所选模型 | 不需要安装 CUDA |
 
+- Releases 页面的 Linux 安装包是 arm64 的 `.deb` 与 AppImage。x86_64 Linux 功能上完全支持，但还没有预编译包；`.rpm` 构建脚本能出，但也还没发布过——这两条都是打包的缺口，不是功能的缺口。
 - 操作系统可混合组网，各节点的 IdleToken 版本必须一致。
 - 集群机器之间需要可直连的局域网；张量流量不经过 VPN / 覆盖网络（如 Tailscale）。建议千兆有线或更快。
 - 纯 CPU 机器、AMD 显卡、Intel Mac 与手机不能参与计算，但可运行客户端登录、聊天和控制集群。
@@ -125,7 +132,7 @@ Windows：先用 `scripts\build_llamacpp_win.bat` 构建引擎，构建 coordina
 
 **本机开着 HTTP 代理时聊天流卡住。** Clash 等代理可能吞掉 loopback 的 SSE 流。在运行 `claude` 或 `curl` 的终端设置 `NO_PROXY=127.0.0.1,localhost`，或在代理中为 `127.0.0.1` 添加直连规则。
 
-**Windows 防火墙拦截组网或集群流量。** 以管理员身份运行一次 IdleToken，或以管理员身份执行日志中打印的 `netsh` 命令。端口：UDP 14097、14099（发现与组网），TCP 14100、14101（集群控制），TCP 50052（工作节点 rpc-server，可配置），TCP 8000（API，仅当其它设备调用时需要）。
+**Windows 防火墙拦截组网或集群流量。** 以管理员身份运行一次 IdleToken，或以管理员身份执行日志中打印的 `netsh` 命令。端口：UDP 14097、14099（发现与组网），TCP 14100、14101（集群控制），TCP 50052（工作节点 rpc-server，可配置）。API 的 8000 口**有意不在这个列表里**：它绑定在 127.0.0.1，本来就不对其它机器可达，没有需要放行的东西。想从别的设备用自己的集群，走平台中继，而不是开端口。
 
 **Linux 客户端白屏。** 启动时加 `WEBKIT_DISABLE_DMABUF_RENDERER=1 idletoken-client`。
 
@@ -137,13 +144,12 @@ Windows：先用 `scripts\build_llamacpp_win.bat` 构建引擎，构建 coordina
 
 IdleToken 的实现离不开许多优秀的开源项目，特别感谢：
 
-- [ds4](https://github.com/antirez/ds4)
-- [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)
-- [Ollama](https://github.com/ollama/ollama)
+- [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)——IdleToken 运行所依赖的推理引擎
 - [Tauri](https://github.com/tauri-apps/tauri)
 - [TweetNaCl](https://tweetnacl.cr.yp.to/)
 - [BLAKE2](https://github.com/BLAKE2/BLAKE2)
 - [DeepSeek](https://github.com/deepseek-ai)
 - [Qwen](https://github.com/QwenLM)
+- [ds4](https://github.com/antirez/ds4)——IdleToken 早期原型的引擎，项目后来改用 llama.cpp
 
 以及所有 IdleToken 所依赖的开源项目和它们的贡献者。

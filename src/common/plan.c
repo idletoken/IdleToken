@@ -273,7 +273,7 @@ int idletoken_plan_layers(const idletoken_model_spec *model,
 /* Per-node engine overhead beyond weights + KV. CALIBRATED 2026-08-15 on all
  * three backends (Qwen3.5-0.8B Q4_K_M, ctx 4096, llama-server -lv 5 buffer
  * report + nvidia-smi / RSS; results/resource-calibration-20260815.md):
- *   - CUDA context on a discrete card:      ~550 MiB (win_PC RTX 5060 Ti:
+ *   - CUDA context on a discrete card:      ~550 MiB (RTX 5060 Ti:
  *     1171 GPU-MiB used − 497 weights − 122 engine buffers)
  *   - engine buffers (RS+compute+output):   ~133 MiB on every backend at 0.8B,
  *     and they scale with model width — so a fixed constant alone is wrong in
@@ -631,12 +631,13 @@ int idletoken_plan_llamacpp(const idletoken_llm_model_size *model,
      * That is exactly the question idletoken_llama_kv_pool() answers — "what
      * can the engine backend on this node allocate" — so this reuses it
      * instead of adding a second function that could drift from it. The KV was
-     * merely the first caller to discover the distinction (win_PC, 2026-08-18,
-     * the WDDM freeze); the weight slice is the second.
+     * merely the first caller to discover the distinction (2026-08-18, the
+     * WDDM freeze on a Windows desktop); the weight slice is the second.
      *
      * Measured (results/t14-engine-bump-phaseb-20260820.md): DSv4-Flash,
-     * 80.76 GiB, across DGX_Spark (107.61 GiB unified) and win_PC2 (13.2 GiB
-     * VRAM + 37.3 GiB RAM). Budgeted against the machine, win_PC2's share came
+     * 80.76 GiB, across a unified-memory node (107.61 GiB) and a discrete-GPU
+     * node (13.2 GiB VRAM + 37.3 GiB RAM). Budgeted against the machine, the
+     * joiner's share came
      * out 50.48/158.09 = 0.3193 = 25.8 GiB onto a 13.2 GiB card; the driver
      * paged VRAM out to system memory and the rpc-server died mid-decode. The
      * same split was produced for a 0.5 GiB model and an 80.76 GiB one, which

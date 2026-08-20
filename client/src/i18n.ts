@@ -29,7 +29,7 @@ export const STRINGS = {
     "weights.note.noResume": "the server does not support resumption; restarting from the beginning",
     "weights.note.verifying": "verifying the file against the curated model hash…",
     "weights.err.sha256Mismatch":
-      "The file does not match the curated model ({detail}). It was deleted for safety — download it again. If this repeats, the download source may be compromised; please report it.",
+      "The file does not match the curated model ({detail}). It was deleted for safety — download it again. If this repeats, the download source may be compromised: please report it through Settings → Data & about → Report a problem.",
     "weights.resume": "Continue download",
     "weights.lastStop": "last attempt stopped: {why}",
     "weights.goSettings": "Download in Settings",
@@ -123,6 +123,7 @@ export const STRINGS = {
     "auth.email": "Email",
     "auth.password": "Password",
     "auth.passwordHint": "At least 8 characters.",
+    "auth.forgotPassword": "Forgot your password?",
     "auth.submitSignIn": "Sign in",
     "auth.submitSignUp": "Create account",
     "auth.working": "Working…",
@@ -163,10 +164,15 @@ export const STRINGS = {
     // Join failures (pairing.rs lastError codes). A failed join used to reset
     // silently to idle — indistinguishable from the button doing nothing.
     "pairing.err.notFound":
-      "No cluster with that code was found. Check the code, make sure both machines are on the same LAN, and allow UDP port {port} (discovery) and TCP 14098 (roster) through the firewall on both machines.",
+      "No cluster with that code was found. Check the code, make sure both machines are on the same network, and allow UDP port {port} and TCP port 14098 through the firewall on both machines.",
     "pairing.err.notFoundManual":
       "No cluster answered. LAN auto-discovery is off on this machine — add the hosting machine's IP under Manual peer IPs in Settings, then try again.",
     "pairing.err.badCode": "The code was not accepted. Check it on the hosting machine and try again.",
+    // The hosting machine answered but does not speak the current join
+    // handshake, so this machine refuses rather than sending the code in a form
+    // that older build understands (2026-08-20, audit A-P0-3).
+    "pairing.err.oldCreator":
+      "The hosting machine is running an older version of IdleToken. Update it, then create the cluster again.",
     "pairing.err.subnet":
       "The cluster refused this machine: it is on a different subnet, and that cluster is restricted to one subnet.",
     "pairing.err.rejected": "The cluster refused this machine: {detail}",
@@ -177,7 +183,7 @@ export const STRINGS = {
     "pairing.err.notCreator": "Only the cluster creator can do that.",
     "pairing.err.needTwo": "The cluster needs at least 2 machines before it can start.",
     "pairing.err.started": "The cluster has already started.",
-    "pairing.err.noMember": "That machine is no longer in the cluster roster.",
+    "pairing.err.noMember": "That machine is no longer in the cluster.",
     "pairing.yourCode": "Share this code to add machines:",
     "pairing.addMachine": "Add another machine…",
     "pairing.singleNodeModel": "This model is served by one machine, so there is no join code to share. Switch to a cluster model in Settings to pool machines.",
@@ -214,7 +220,7 @@ export const STRINGS = {
     "engine.state.restarting": "Restarting…",
     "engine.state.crashed": "Crashed",
     "engine.restarts": "{n} auto-restart(s)",
-    "engine.crashedHint": "The engine kept crashing (last exit {code}) — check the log, then start it again.",
+    "engine.crashedHint": "The engine kept crashing — open the log below for the reason, then start it again.",
     // A refusal, unlike a crash, was NOT retried: the engine decided this
     // machine will not join. The reason comes from the engine verbatim.
     "engine.refused": "This machine did not join:",
@@ -222,9 +228,14 @@ export const STRINGS = {
     // Client-authored engine errors (ERROR_KEYS below). Real engine refusals
     // pass through verbatim; only sentences this client writes are localized.
     "engine.err.binMissing":
-      "The idletoken-server engine binary is missing ({detail}). Dev checkout: build it (scripts/build_llamacpp.sh) and stage it (scripts/stage_sidecars.sh). Installed app: the package is broken — reinstall.",
+      "The IdleToken engine is missing from this installation ({detail}). The package is incomplete — reinstall IdleToken.",
+    // Development builds only (see ERROR_KEYS): the fix there is to build and
+    // stage the engine, and naming a shell script at an installed user is
+    // noise they cannot act on.
+    "engine.err.binMissingDev":
+      "The idletoken-server engine binary is missing ({detail}). Build it with scripts/build_llamacpp.sh, then stage it with scripts/stage_sidecars.sh.",
     "engine.err.refusedSilent":
-      "The engine refused to start (exit 3) with no reason on stderr — check the engine log.",
+      "The engine refused to start and gave no reason — open the engine log below.",
     "fixture.badge": "DEV FIXTURE",
     "fixture.title": "Placeholder data",
     "fixture.body": "The client is running outside the engine, so these numbers are a development placeholder — not a real probe.",
@@ -264,7 +275,7 @@ export const STRINGS = {
     "preset.custom": "Custom",
     "settings.reset": "Restore defaults",
     "platform.guide.noUrl":
-      "Share this cluster's compute on the IdleToken platform to earn Sparks. Set the platform server URL under Cluster & API → Platform account, then sign in with your email.",
+      "This build has no IdleToken platform configured, so there is nothing to share compute with. Download a release build from the website to lend this machine and earn Sparks.",
     "platform.guide.needSignIn": "Platform URL is set — sign in with your email to open the console.",
     "platform.guide.needCloud": "You are signed in with a local identity — sign in again to get a platform session.",
     "platform.goSettings": "Set the platform URL",
@@ -279,7 +290,7 @@ export const STRINGS = {
     "platform.ledger": "Recent activity",
     "platform.ledger.empty": "No activity yet.",
     "platform.providers": "My providers",
-    "platform.providers.empty": "No provider registered yet — start sharing above and the agent registers this cluster automatically.",
+    "platform.providers.empty": "No provider registered yet — turn sharing on above and this cluster is registered automatically.",
     "platform.provider.online": "Online",
     "platform.provider.offline": "Offline",
     "platform.provider.suspended": "Suspended",
@@ -305,7 +316,7 @@ export const STRINGS = {
     // The one guard rail on a switch that can both earn and spend — so it is
     // shown next to the switch, not filed under advanced.
     "platform.share.cap": "Daily borrowing limit",
-    "platform.share.capUnit": "credits per day",
+    "platform.share.capUnit": "Sparks per day",
     "platform.share.capHint": "The most borrowing may cost in one day (UTC). It cannot be removed — sharing spends without asking, and an unlimited spender empties a balance overnight. The platform's own record is the one that counts.",
     "platform.share.wait": "Borrow only after waiting",
     "platform.share.waitUnit": "seconds",
@@ -327,6 +338,8 @@ export const STRINGS = {
     "cluster.create": "Create a cluster",
     "cluster.serveLocal": "Run it here",
     "deploy.local": "On this machine only",
+    // Said next to the disabled button, not on a page you reach by pressing it.
+    "deploy.local.tooBig": "The selected model does not fit on this machine. Pick a smaller one, or run it across several machines.",
     "deploy.cluster": "Across several machines",
     "cluster.title": "Cluster",
     "cluster.machines": "{n} machines",
@@ -412,7 +425,8 @@ export const STRINGS = {
     // Curated registry only (the open intake was removed 2026-08-15): every
     // listed model is one we have verified on real hardware. Missing one is a
     // request, not a file box.
-    "model.request.hint": "Every listed model is verified on real hardware. Missing one you need? Request it in a GitHub issue.",
+    "model.request.hint": "Every listed model is verified on real hardware. Missing one you need?",
+    "model.request.link": "Request it on GitHub",
     // Usage ordering (platform leaderboard). The label is the SIGNAL that the
     // order came from real usage: no platform, no label, no numbers — never a
     // reordered list that pretends to be ranked.
@@ -433,7 +447,7 @@ export const STRINGS = {
     // Cluster panel: the inference engine's health, mirrored from the
     // coordinator's /health (engine_state). Chat answers 503 until ready — the
     // panel says so instead of letting a silent 503 look like a broken chat.
-    "cluster.engine.starting": "Inference engine is loading the model — chat answers 503 until it is ready.",
+    "cluster.engine.starting": "The inference engine is loading the model. Chat is unavailable until it is ready.",
     "cluster.engine.restarting": "Inference engine crashed and is restarting…",
     "cluster.engine.failed": "Inference engine failed — a restart will not help; check the engine log.",
     "cluster.engine.restarts": "{n} engine restart(s)",
@@ -494,7 +508,7 @@ export const STRINGS = {
     "weights.note.noResume": "服务器不支持断点续传；已从头开始下载",
     "weights.note.verifying": "正在按精选模型哈希校验文件…",
     "weights.err.sha256Mismatch":
-      "文件与精选模型不一致（{detail}）。已删除该文件，请重新下载。若反复出现，下载源可能已被污染，请向我们反馈。",
+      "文件与精选模型不一致（{detail}）。已删除该文件，请重新下载。若反复出现，下载源可能已被污染：请通过 设置 → 数据与关于 → 反馈问题 告知我们。",
     "weights.resume": "继续下载",
     "weights.lastStop": "上次中断：{why}",
     "weights.goSettings": "前往设置下载",
@@ -554,11 +568,11 @@ export const STRINGS = {
     "cap.singleNodeNote": "单机运行",
     "cap.hybridNote": "一部分模型放在内存里跑",
     "cap.footer": "新加入的机器会并入其显存与内存，可能让「无法运行」变为「可运行」；标注「单机运行」的模型不受机器数量影响。",
-    "spine.fits": "本机能放下全部",
-    "spine.no": "本机放不下",
-    "spine.clusterFits": "这 {n} 台机器能放下全部",
-    "spine.clusterNo": "这 {n} 台机器加起来也放不下",
-    "spine.unknown": "暂时无法判断——有机器还没上报可用内存",
+    "spine.fits": "本机能放下全部。",
+    "spine.no": "本机放不下。",
+    "spine.clusterFits": "这 {n} 台机器能放下全部。",
+    "spine.clusterNo": "这 {n} 台机器加起来也放不下。",
+    "spine.unknown": "暂时无法判断——有机器还没上报可用内存。",
     "auth.title": "登录 IdleToken",
     "auth.subtitle": "用邮箱把你的机器组成一个集群。",
     "auth.tabSignIn": "登录",
@@ -568,10 +582,11 @@ export const STRINGS = {
     "auth.email": "邮箱",
     "auth.password": "密码",
     "auth.passwordHint": "至少 8 位。",
+    "auth.forgotPassword": "忘记密码？",
     "auth.submitSignIn": "登录",
     "auth.submitSignUp": "注册",
     "auth.working": "处理中…",
-    "auth.localNote": "此构建未配置平台服务器，账号只保存在本机。提示：验证码组网本就无需账号。",
+    "auth.localNote": "此构建未配置平台服务器，账号只保存在本机。提示：组网码组网本就无需账号。",
     "auth.cloudNote": "账号保存在 IdleToken 平台——登录同一账号的机器可自动组网。",
     "auth.signOut": "退出登录",
     "auth.err.email": "请输入有效的邮箱地址。",
@@ -592,24 +607,25 @@ export const STRINGS = {
     "pairing.chooseCreate": "创建集群",
     "pairing.chooseCreateHint": "本机作为主机与协调者。",
     "pairing.chooseJoin": "加入集群",
-    "pairing.chooseJoinHint": "输入主机上显示的验证码。",
+    "pairing.chooseJoinHint": "输入主机上显示的组网码。",
     "pairing.accountTitle": "账号模式",
     "pairing.accountCreate": "用账号创建集群",
-    "pairing.accountCreateHint": "无需验证码——本机作主机，同账号机器自动加入。",
+    "pairing.accountCreateHint": "无需组网码——本机作主机，同账号机器自动加入。",
     "pairing.accountJoin": "自动加入同账号集群",
     "pairing.accountJoinHint": "在本局域网内查找 {email} 创建的集群。",
     "pairing.accountLanHint":
-      "目前仅限同一局域网：各机器需登录同一平台账号且集群名称一致（“{name}”，见设置）。跨网发现将随云 rendezvous 上线。",
-    "pairing.accountNeedLogin": "登录（右上角）后，同账号机器可免码互相发现；上方验证码模式离线即可用。",
+      "目前仅限同一局域网：各机器需登录同一平台账号且集群名称一致（“{name}”，见设置）。跨网发现将随云端中继上线。",
+    "pairing.accountNeedLogin": "登录（右上角）后，同账号机器可免码互相发现；上方组网码模式离线即可用。",
     "pairing.accountCluster": "账号集群——本局域网内登录 {email} 的机器免码加入。",
-    "pairing.enterCode": "输入验证码",
+    "pairing.enterCode": "输入组网码",
     "pairing.join": "加入",
-    "pairing.invalidCode": "验证码为 6 位字母和数字。",
+    "pairing.invalidCode": "组网码为 6 位字母和数字。",
     "pairing.err.notFound":
-      "没有找到使用这个验证码的集群。请核对验证码、确认两台机器在同一局域网，并在两台机器的防火墙上放行 UDP {port}（发现）与 TCP 14098（名册）端口。",
+      "没有找到使用这个组网码的集群。请核对组网码、确认两台机器在同一局域网，并在两台机器的防火墙上放行 UDP {port} 与 TCP 14098 端口。",
     "pairing.err.notFoundManual":
       "没有集群应答。本机已关闭局域网自动发现——请到设置的「手动节点 IP」里填入主机的 IP 后重试。",
-    "pairing.err.badCode": "验证码未被接受。请到主机上核对后重试。",
+    "pairing.err.badCode": "组网码未被接受。请到主机上核对后重试。",
+    "pairing.err.oldCreator": "主机上的 IdleToken 版本过旧。请先更新那台机器，然后重新创建集群。",
     "pairing.err.subnet": "集群拒绝了本机：本机与集群不在同一子网，而该集群限制了「仅限同子网」。",
     "pairing.err.rejected": "集群拒绝了本机：{detail}",
     "pairing.err.portBusy":
@@ -620,9 +636,9 @@ export const STRINGS = {
     "pairing.err.needTwo": "至少要有 2 台机器才能启动集群。",
     "pairing.err.started": "集群已经启动。",
     "pairing.err.noMember": "这台机器已不在集群成员名单里。",
-    "pairing.yourCode": "分享此验证码以添加机器：",
+    "pairing.yourCode": "分享此组网码以添加机器：",
     "pairing.addMachine": "添加机器…",
-    "pairing.singleNodeModel": "该模型只在单台机器上运行，因此没有可分享的验证码。要合并多台机器，请在「设置」里换一个支持集群的模型。",
+    "pairing.singleNodeModel": "该模型只在单台机器上运行，因此没有可分享的组网码。要合并多台机器，请在「设置」里换一个支持集群的模型。",
     "pairing.copy": "复制",
     "pairing.copied": "已复制",
     "pairing.members": "集群 · {n} 台机器",
@@ -631,7 +647,7 @@ export const STRINGS = {
     "pairing.worker": "工作节点",
     "pairing.makeCoord": "设为协调者",
     "pairing.waiting": "等待其他机器加入…",
-    "pairing.startCluster": "开始组建（{n} 台）",
+    "pairing.startCluster": "启动集群（{n} 台机器）",
     "pairing.leave": "退出集群",
     "pairing.back": "返回",
     "pairing.stage.joined": "已加入",
@@ -656,12 +672,13 @@ export const STRINGS = {
     "engine.state.restarting": "重启中…",
     "engine.state.crashed": "已崩溃",
     "engine.restarts": "自动重启 {n} 次",
-    "engine.crashedHint": "引擎连续崩溃（最后退出码 {code}）——请查看日志后重新启动。",
+    "engine.crashedHint": "引擎连续崩溃——请在下方日志中查看原因，然后重新启动。",
     "engine.refused": "这台机器没有加入集群：",
     "engine.logs": "最近引擎日志",
-    "engine.err.binMissing":
-      "缺少 idletoken-server 引擎二进制（{detail}）。开发环境：先构建（scripts/build_llamacpp.sh）再放置（scripts/stage_sidecars.sh）；安装版：安装包已损坏，请重新安装。",
-    "engine.err.refusedSilent": "引擎拒绝启动（退出码 3），且 stderr 里没有给出原因——请查看引擎日志。",
+    "engine.err.binMissing": "本次安装缺少 IdleToken 引擎（{detail}）。安装包不完整，请重新安装 IdleToken。",
+    "engine.err.binMissingDev":
+      "缺少 idletoken-server 引擎二进制（{detail}）。请先用 scripts/build_llamacpp.sh 构建，再用 scripts/stage_sidecars.sh 放置。",
+    "engine.err.refusedSilent": "引擎拒绝启动，且没有给出原因——请查看下方引擎日志。",
     "fixture.badge": "开发占位",
     "fixture.title": "占位数据",
     "fixture.body": "客户端未连接引擎，这些数字只是开发占位——不是真实探测结果。",
@@ -700,7 +717,7 @@ export const STRINGS = {
     "preset.max": "全力",
     "preset.custom": "自定义",
     "settings.reset": "恢复默认设置",
-    "platform.guide.noUrl": "将集群算力分享到 IdleToken 平台可获得火花。先在「集群与 API → 平台账号」填写平台服务器地址，再使用邮箱登录。",
+    "platform.guide.noUrl": "此构建未配置 IdleToken 平台，无法分享算力。请到官网下载正式版，即可出借本机算力、赚取火花。",
     "platform.guide.needSignIn": "已配置平台地址，使用邮箱登录即可打开控制台。",
     "platform.guide.needCloud": "当前为本机身份，请重新登录以获取平台会话。",
     "platform.goSettings": "前往设置平台地址",
@@ -715,7 +732,7 @@ export const STRINGS = {
     "platform.ledger": "最近流水",
     "platform.ledger.empty": "暂无流水。",
     "platform.providers": "我的算力节点",
-    "platform.providers.empty": "尚未注册算力节点——点击上方「开始分享」后，会自动注册本集群。",
+    "platform.providers.empty": "尚未注册算力节点——在上方开启共享后，本集群会自动注册。",
     "platform.provider.online": "在线",
     "platform.provider.offline": "离线",
     "platform.provider.suspended": "已停用",
@@ -733,8 +750,8 @@ export const STRINGS = {
     "platform.share.failed": "开启共享失败：{msg}。未做任何更改。",
     "platform.share.offFailed": "关闭共享未能完全完成：{msg}。",
     "platform.share.cap": "每日借用上限",
-    "platform.share.capUnit": "积分／天",
-    "platform.share.capHint": "一个自然日（UTC）内借用最多可花费的额度。该上限不可取消——共享会在无人确认的情况下消费，没有上限时一夜之间即可花光余额。以平台流水为准。",
+    "platform.share.capUnit": "火花／天",
+    "platform.share.capHint": "一个自然日（UTC）内借用最多可花费的火花。该上限不可取消——共享会在无人确认的情况下消费，没有上限时一夜之间即可花光余额。以平台流水为准。",
     "platform.share.wait": "等待超过此时长才借用",
     "platform.share.waitUnit": "秒",
     "platform.share.waitHint": "0 = 本机一满即借用。数值越大，越倾向于先在本机排队，只在等待较久时才付费借用。",
@@ -752,9 +769,10 @@ export const STRINGS = {
     "platform.rdv.new": "获取令牌",
     "platform.rdv.warn": "同一集群的所有机器须使用同一份令牌。有效期 {days} 天。",
     "cluster.emptyTitle": "选择运行方式",
-    "cluster.create": "组建集群",
+    "cluster.create": "创建集群",
     "cluster.serveLocal": "仅在本机运行",
     "deploy.local": "仅用本机",
+    "deploy.local.tooBig": "所选模型在本机放不下。请改选更小的模型，或用多台机器一起运行。",
     "deploy.cluster": "多台机器一起",
     "cluster.title": "集群",
     "cluster.machines": "{n} 台机器",
@@ -765,9 +783,9 @@ export const STRINGS = {
     "cluster.loadingHint": "首次启动需下载本机的模型分片——视网速可能需要几分钟。",
     "capacity.ratio": "可用 {have} GB / 需求 {need} GB（预估）",
     "stats.requests": "次请求",
-    "stats.tokens": "token",
+    "stats.tokens": "词元",
     "stats.cache": "KV 复用省",
-    "stats.cacheTitle": "前缀缓存复用省下的 prefill token 数",
+    "stats.cacheTitle": "前缀缓存复用省下的预填充词元数",
     "stats.uptime": "在线",
     "stats.mins": "{n} 分钟",
     "stats.hours": "{n} 小时",
@@ -786,15 +804,15 @@ export const STRINGS = {
     "chat.copied": "已复制",
     "chat.regen": "重新生成",
     "chat.thinking": "正在思考…",
-    "chat.prefill": "正在读取提示词… {done}/{total} token",
+    "chat.prefill": "正在读取提示词… {done}/{total} 词元",
     "chat.copyError": "复制错误信息",
     "chat.err.timeoutMid":
       "生成中途集群 300 秒没有任何响应，本次生成已被截断（已收到的内容会保留）。请检查协调者——它很可能已经卡住，而不只是响应慢。",
     "chat.err.timeoutNone": "300 秒内没有收到集群的任何响应。请确认协调者在运行，且没有卡在加载模型。",
     "chat.err.busy": "集群没有空闲槽位，这一轮没有执行（{detail}）。等其中一条正在生成的回复结束后再发一次。",
-    "chat.prefillCached": "正在读取提示词… {done}/{total} token（复用缓存 {reused}，新算 {fresh}）",
-    "chat.kvHit": "命中 KV 缓存 · 复用 {reused}/{total} 提示词 token",
-    "chat.kvMiss": "未命中 KV 缓存 · {total} 个提示词 token 全部重算",
+    "chat.prefillCached": "正在读取提示词… {done}/{total} 词元（复用缓存 {reused}，新算 {fresh}）",
+    "chat.kvHit": "命中 KV 缓存 · 复用 {reused}/{total} 提示词词元",
+    "chat.kvMiss": "未命中 KV 缓存 · {total} 个提示词词元全部重算",
     "chat.needCluster": "聊天需要集群正在运行且 API 在线。",
     "chat.goCluster": "前往集群页",
     "chat.you": "你",
@@ -814,13 +832,14 @@ export const STRINGS = {
     "model.pick.title": "选择模型",
     "model.switch.title": "切换到 {model}？",
     "model.switch.solo": "这会重启本机引擎：新模型加载完成之前无法服务，正在生成的回复会丢失。模型目录下缺少的权重会先下载。",
-    "model.switch.cluster": "这会重启整个集群。服务会中断，另外 {n} 台机器用同一个验证码自动重新加入——它们回来后再按「启动」。正在生成的回复会丢失。",
+    "model.switch.cluster": "这会重启整个集群。服务会中断，另外 {n} 台机器用同一个组网码自动重新加入——它们回来后再按「启动」。正在生成的回复会丢失。",
     "model.switch.cancel": "保持不变",
     "model.pick.apply": "确定",
     "model.switch.go": "切换并重启",
-    "model.request.hint": "列表中的每个模型都经过真机验证。需要其他模型？请在 GitHub 提一个 issue。",
+    "model.request.hint": "列表中的每个模型都经过真机验证。需要其他模型？",
+    "model.request.link": "去 GitHub 提交需求",
     "model.rank.byUsage": "按平台近 7 天调用量排序",
-    "model.rank.tokens": "近 7 天 {n} tokens",
+    "model.rank.tokens": "近 7 天 {n} 词元",
     "local.title": "本机引擎",
     "local.note": "本机的协调进程驱动一个本地 llama.cpp 引擎来服务下面这个文件。模型信息来自 GGUF 文件本身。",
     "local.state.starting": "正在加载模型…",
@@ -832,12 +851,12 @@ export const STRINGS = {
     "local.refusedTitle": "引擎拒绝启动这个模型",
     "local.stop": "停止服务",
     "local.starting": "正在启动引擎…",
-    "cluster.engine.starting": "推理引擎正在加载模型——就绪前聊天会返回 503。",
+    "cluster.engine.starting": "推理引擎正在加载模型，就绪前无法聊天。",
     "cluster.engine.restarting": "推理引擎崩溃，正在重启…",
     "cluster.engine.failed": "推理引擎已失败——重启也没用，请查看引擎日志。",
     "cluster.engine.restarts": "引擎重启 {n} 次",
     "cluster.refusedTitle": "引擎拒绝",
-    "tryit.stats": "首字 {ttft} 秒 · 约 {n} tokens · {rate} tok/s",
+    "tryit.stats": "首字 {ttft} 秒 · 约 {n} 词元 · 每秒 {rate} 词元",
     "cluster.errorHint": "有机器引擎异常——打开「管理集群」查看，或在那台机器上重启引擎。",
     "cluster.offlineHint": "有机器失去响应——请检查那台机器的电源、网络与防火墙。恢复连通后它会自动回到集群。",
     "cluster.apiOffline": "离线",
@@ -878,6 +897,11 @@ export type StringKey = keyof (typeof STRINGS)["en"];
 // detail as the {detail} / {port} variable where the sentence wants it.
 // Engine VERBATIM output never carries the prefix and passes through
 // untouched — that channel is by design not translated.
+
+/** True in `pnpm dev` / `tauri dev`, false in anything a user installs. */
+const IS_DEV_BUILD: boolean =
+  !!(typeof import.meta !== "undefined" && (import.meta as any).env?.DEV);
+
 const ERROR_KEYS: Record<string, StringKey> = {
   CHAT_TIMEOUT_MID: "chat.err.timeoutMid",
   CHAT_TIMEOUT_NONE: "chat.err.timeoutNone",
@@ -888,7 +912,10 @@ const ERROR_KEYS: Record<string, StringKey> = {
   WEIGHTS_NOT_DOWNLOADED: "weights.err.notDownloaded",
   WEIGHTS_VERIFYING: "weights.note.verifying",
   WEIGHTS_SHA256_MISMATCH: "weights.err.sha256Mismatch",
-  ENGINE_BIN_MISSING: "engine.err.binMissing",
+  // A-P1-4: an installed user cannot run scripts/build_llamacpp.sh — telling
+  // them to is noise that also leaks the development layout into a shipped
+  // error message. Their fix is to reinstall; the developer's is to build.
+  ENGINE_BIN_MISSING: IS_DEV_BUILD ? "engine.err.binMissingDev" : "engine.err.binMissing",
   ENGINE_REFUSED_SILENT: "engine.err.refusedSilent",
   PLATFORM_URL_EMPTY: "platform.err.noUrl",
   PLATFORM_NO_SESSION: "platform.err.noSession",

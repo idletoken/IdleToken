@@ -1,5 +1,10 @@
 /* dspark_verify_test.c — G-DSPARK-VERIFY: does speculation change the output?
  *
+ * SHELVED 2026-08-03; the ds4 line it tests was shelved 2026-08-16 and is no
+ * longer compiled into any binary (src/common/ds4_stub.c stands in for it).
+ * Nothing here is built by default, nothing calls it, and the G_DSPARK gate
+ * SKIPs unless IDLETOKEN_DSPARK_GATE=1. Kept for the record, not for use.
+ *
  * The whole point of speculative decoding is that it must not. Greedy decoding
  * with the drafter ON has to produce exactly the same token stream as greedy
  * decoding with it OFF — the drafter only proposes, the target model decides.

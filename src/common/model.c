@@ -287,23 +287,6 @@ static const idletoken_model_variant KIMI_K25_VARIANTS[] = {
     { .quant = "Q4_1", .layer_weight_bytes = 643155730176ull, .shared_weight_bytes = 0ull, .gguf = "moonshotai_Kimi-K2.5-Q4_1/moonshotai_Kimi-K2.5-Q4_1-00001-of-00017.gguf" },  /* 17 parts, 599 GiB */
 };
 
-/* Kimi K3: measured from the repo named in models/kimi-k3.json (HF API,
- * 2026-08-15). Every quant here is a SPLIT GGUF — .gguf names part one,
- * which is what the engine is handed; llama.cpp opens the rest by name.
- * llama.cpp reads all of these, including the sub-2-bit ones (the frozen
- * ds4x dequantizer does not, but these models do not run on it). */
-static const idletoken_model_variant KIMI_K3_VARIANTS[] = {
-    { .quant = "Q1_0", .layer_weight_bytes = 466369456320ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q1_0/Kimi-K3-UD-Q1_0-00001-of-00011.gguf" },  /* 11 parts, 434 GiB */
-    { .quant = "TQ1_0", .layer_weight_bytes = 508912281952ull, .shared_weight_bytes = 0ull, .gguf = "UD-TQ1_0/Kimi-K3-UD-TQ1_0-00001-of-00012.gguf" },  /* 12 parts, 474 GiB */
-    { .quant = "TQ2_0", .layer_weight_bytes = 551455107488ull, .shared_weight_bytes = 0ull, .gguf = "UD-TQ2_0/Kimi-K3-UD-TQ2_0-00001-of-00013.gguf" },  /* 13 parts, 514 GiB */
-    { .quant = "IQ1_S", .layer_weight_bytes = 594040923616ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ1_S/Kimi-K3-UD-IQ1_S-00001-of-00014.gguf" },  /* 14 parts, 553 GiB */
-    { .quant = "IQ1_M", .layer_weight_bytes = 648872012448ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ1_M/Kimi-K3-UD-IQ1_M-00001-of-00015.gguf" },  /* 15 parts, 604 GiB */
-    { .quant = "IQ2_XXS", .layer_weight_bytes = 711067773664ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ2_XXS/Kimi-K3-UD-IQ2_XXS-00001-of-00016.gguf" },  /* 16 parts, 662 GiB */
-    { .quant = "Q2_K_XL", .layer_weight_bytes = 861277858912ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q2_K_XL/Kimi-K3-UD-Q2_K_XL-00001-of-00019.gguf" },  /* 19 parts, 802 GiB */
-    { .quant = "Q4_K_XL", .layer_weight_bytes = 1508668683104ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q4_K_XL/Kimi-K3-UD-Q4_K_XL-00001-of-00032.gguf" },  /* 32 parts, 1405 GiB */
-    { .quant = "Q8_K_XL", .layer_weight_bytes = 1561157884384ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q8_K_XL/Kimi-K3-UD-Q8_K_XL-00001-of-00034.gguf" },  /* 34 parts, 1454 GiB */
-};
-
 /* DeepSeek V4 Pro: measured from unsloth/DeepSeek-V4-Pro-0813-GGUF
  * (HF API, 2026-08-15). 671B/37B-active, 61 layers — a different model
  * from Flash (43 layers), not one of its precisions. */
@@ -341,9 +324,11 @@ static const idletoken_model_spec MODELS[] = {
         .default_variant = 0,      /* IQ2_XXS+Q2_K */
     },
     {
-        /* DeepSeek V4 Pro (2026-08-13 release). Enabled for users with the
-         * memory to hold it; ~791 GiB at the smallest published quant, which
-         * is far past this project's testbed. */
+        /* DeepSeek V4 Pro (2026-08-13 release). 671B/37B-active, 61 layers —
+         * a different model from Flash, not one of its precisions. Cluster-tier:
+         * ~791 GiB at the smallest published quant, so it needs a sizable
+         * cluster. Architecture deepseek4 is read by the pinned llama.cpp; the
+         * numbers below are measured from the GGUF headers (HF API). */
         .id      = "deepseek-v4-pro",
         .label   = "DeepSeek V4 Pro",
         .backend = IDLETOKEN_BACKEND_LLAMACPP,
@@ -597,10 +582,10 @@ static const idletoken_model_spec MODELS[] = {
     },
     {
         /* MEASURED from unsloth/GLM-5.2-GGUF UD-IQ1_S (2026-08-15, HF API):
-         * 6 parts, 201.8 GiB. Architecture from zai-org/GLM-5.2 config.json.
-         * MLA KV: (kv_lora_rank 512 + rope 64) × 2 bytes ≈ 1152 B/token/layer.
-         * Enabled for users whose hardware can hold it; the project's own
-         * testbed cannot (~277 GiB pooled, and that is the whole cluster). */
+         * 6 parts, 201.8 GiB. Architecture GLM_DSA from zai-org/GLM-5.2
+         * config.json, read by the pinned llama.cpp. MLA KV: (kv_lora_rank 512
+         * + rope 64) × 2 bytes ≈ 1152 B/token/layer. Cluster-tier: the smallest
+         * published quant is ~202 GiB, so it needs a multi-machine cluster. */
         .id      = "glm-5.2",
         .label   = "GLM-5.2",
         .backend = IDLETOKEN_BACKEND_LLAMACPP,
@@ -625,7 +610,8 @@ static const idletoken_model_spec MODELS[] = {
     {
         /* MEASURED from bartowski/moonshotai_Kimi-K2.5-GGUF IQ1_M
          * (2026-08-15, HF API): 6 parts, 204.5 GiB. 1T total / 32B active,
-         * DeepSeek2-shaped. Enabled for users with the hardware. */
+         * DeepSeek2-shaped, read by the pinned llama.cpp. Cluster-tier: the
+         * smallest published quant is ~196 GiB, so it needs a cluster. */
         .id      = "kimi-k2.5",
         .label   = "Kimi K2.5",
         .backend = IDLETOKEN_BACKEND_LLAMACPP,
@@ -645,33 +631,6 @@ static const idletoken_model_spec MODELS[] = {
         .default_gguf = "moonshotai_Kimi-K2.5-IQ1_S/moonshotai_Kimi-K2.5-IQ1_S-00001-of-00006.gguf",
         .variants = KIMI_K25_VARIANTS,
         .n_variants = sizeof(KIMI_K25_VARIANTS) / sizeof(KIMI_K25_VARIANTS[0]),
-        .default_variant = 0,
-    },
-    {
-        /* MEASURED from unsloth/Kimi-K3-GGUF UD-Q1_0 (2026-08-15, HF API):
-         * 11 parts, 434.3 GiB — the smallest published quant. Architecture
-         * from moonshotai/Kimi-K3 config.json (2.8T total, 93 layers).
-         * Enabled for users with server-class memory; far beyond this
-         * project's testbed. */
-        .id      = "kimi-k3",
-        .label   = "Kimi K3",
-        .backend = IDLETOKEN_BACKEND_LLAMACPP,
-        .available = 1,
-        .deployment = IDLETOKEN_DEPLOY_CLUSTER,
-        .n_layers = 93,
-        .n_embd   = 7168,
-        .hc_streams = 1,
-        .n_vocab  = 163840,
-        .layer_weight_bytes  = 466369456320ull,
-        .shared_weight_bytes = 0ull,
-        .ctx_max  = 1048576,
-        .split_boundary_multiple = 0,
-        .kv_kind  = IDLETOKEN_KV_MLA,
-        .kv_bytes_per_token_layer = 1152,
-        .overhead_base_bytes = 3ull * GiB,
-        .default_gguf = "UD-Q1_0/Kimi-K3-UD-Q1_0-00001-of-00011.gguf",
-        .variants = KIMI_K3_VARIANTS,
-        .n_variants = sizeof(KIMI_K3_VARIANTS) / sizeof(KIMI_K3_VARIANTS[0]),
         .default_variant = 0,
     },
 };

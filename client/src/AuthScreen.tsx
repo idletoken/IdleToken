@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useI18n, type StringKey } from "./i18n";
 import { AuthError, getAuthProvider, openExternal, portalRegisterUrl, resendVerification, type ResendResult, type Session } from "./auth";
+import { portalSignInUrl } from "./links";
 import { useDialog } from "./useDialog";
 
 type Mode = "signIn" | "signUp";
@@ -15,6 +16,11 @@ export default function AuthScreen(props: {
   // form survives ONLY in builds with no platform configured, where there is no
   // website and the local provider is the sole way to get an identity.
   const registerUrl = portalRegisterUrl();
+  // A-P1-5: a forgotten password had no exit at all — the reset link arrives by
+  // email and lands on the website, so the client cannot own the flow, but it
+  // can stop being a dead end. Absent in an offline build, where the local
+  // provider keeps the only account and there is no website to send anyone to.
+  const resetUrl = portalSignInUrl();
   const [mode, setMode] = useState<Mode>("signIn");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -115,6 +121,11 @@ export default function AuthScreen(props: {
               placeholder="••••••••"
             />
             {mode === "signUp" ? <span className="field__hint">{t("auth.passwordHint")}</span> : null}
+            {mode === "signIn" && resetUrl ? (
+              <button type="button" className="linkbtn field__hint" onClick={() => openExternal(resetUrl)}>
+                {t("auth.forgotPassword")} ↗
+              </button>
+            ) : null}
           </label>
 
           {error ? (

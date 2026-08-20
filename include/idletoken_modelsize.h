@@ -1,7 +1,7 @@
 /* idletoken_modelsize.h — ONE answer to "how big is the model we are about to
  * load?", for every consumer of idletoken_llm_model_size.
  *
- * WHY THIS EXISTS (2026-08-19, win_PC2, measured — see
+ * WHY THIS EXISTS (2026-08-19, measured on a 16 GiB discrete card — see
  * results/llamacpp-multislot-big-win-20260819.md §4). The coordinator sized its
  * memory budget from `variants[default_variant]` while `--llama-gguf` decided
  * which file the engine actually opened. Serving Qwen3.5-27B Q4_K_M (15.59 GiB)

@@ -1,5 +1,10 @@
 /* dspark_verifyn_test.c — is the N-position verifier the same function?
  *
+ * SHELVED 2026-08-03; the ds4 line it tests was shelved 2026-08-16 and is no
+ * longer compiled into any binary (src/common/ds4_stub.c stands in for it).
+ * Nothing here is built by default, nothing calls it, and the G_DSPARK gate
+ * SKIPs unless IDLETOKEN_DSPARK_GATE=1. Kept for the record, not for use.
+ *
  * DSpark needs N = block_size + 1 verification positions; ds4 shipped a
  * hardcoded N=2 verifier for MTP. Generalising it touches the path that
  * produces the target model's committed tokens, so the generalisation needs

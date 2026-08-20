@@ -1,5 +1,10 @@
 /* dspark_draft_test.c — G-DSPARK-DRAFT: does the drafter produce a block?
  *
+ * SHELVED 2026-08-03; the ds4 line it tests was shelved 2026-08-16 and is no
+ * longer compiled into any binary (src/common/ds4_stub.c stands in for it).
+ * Nothing here is built by default, nothing calls it, and the G_DSPARK gate
+ * SKIPs unless IDLETOKEN_DSPARK_GATE=1. Kept for the record, not for use.
+ *
  * The gate criterion at this stage is deliberately modest: the block forward
  * runs, returns n candidate tokens, they are in range, and the pass leaves the
  * target model's own state alone. Whether the candidates are GOOD is not

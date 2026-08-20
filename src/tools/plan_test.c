@@ -69,16 +69,22 @@ int main(void) {
        "default model is DSv4-Flash and available");
     ok(idletoken_model_get("deepseek-v4-flash") == M, "lookup by id hits default");
     ok(idletoken_model_get("no-such-model") == NULL, "unknown id → NULL");
-    /* Availability flipped on 2026-08-15: GLM-5.2 / Kimi K2.5 / Kimi K3 are
-     * enabled (llama.cpp reads their published quants; whether a given user
-     * can HOLD 200-434 GiB is a resource question the planner answers, not a
-     * curation one). The invariant worth asserting is that they are
-     * registered and runnable — the refusal path is exercised below against a
-     * spec built for it, so no shipped model has to stay broken to keep a
-     * test honest. */
+    /* Availability restored on 2026-08-20: GLM-5.2 / Kimi K2.5 / DeepSeek V4
+     * Pro are cluster-tier models whose architectures the pinned llama.cpp
+     * reads, so they are registered AND available (the client filters the
+     * picker by this flag). Kimi K3 was dropped from the curated list entirely:
+     * its 2.8T KDA+AttnRes architecture is not in the pinned engine — upstream
+     * support is still an unmerged PR — so the client cannot load it at all. */
     ok(idletoken_model_get("glm-5.2") != NULL &&
        idletoken_model_get("glm-5.2")->available,
        "GLM-5.2 registered and available");
+    ok(idletoken_model_get("kimi-k2.5") != NULL &&
+       idletoken_model_get("kimi-k2.5")->available &&
+       idletoken_model_get("deepseek-v4-pro") != NULL &&
+       idletoken_model_get("deepseek-v4-pro")->available,
+       "Kimi K2.5 / DSv4-Pro registered and available");
+    ok(idletoken_model_get("kimi-k3") == NULL,
+       "Kimi K3 dropped from the curated list");
 
     /* DSv4-Flash tracks the OFFICIAL release repo (unsloth/DeepSeek-V4-Flash-GGUF)
      * since 2026-08-15, with every precision it publishes — the two hand-mixed
@@ -176,7 +182,7 @@ int main(void) {
     /* ---- mode: plenty of VRAM → GPU_ONLY ----------------------------- */
     {
         idletoken_node_mem nodes[] = {
-            NM(g(108), g(108), 1),   /* DGX-like unified */
+            NM(g(108), g(108), 1),   /* unified memory   */
             NM(g(13.2), g(18.3), 0), /* 5060 Ti */
             NM(g(5.3), g(6.4), 0), /* 2070 */
         };
@@ -187,9 +193,10 @@ int main(void) {
     /* ---- unavailable model refuses regardless of resources ----------- */
     {
         idletoken_node_mem huge[] = { NM(g(1000), g(1000), 0) };
-        /* A spec that is registered but not runnable. Every model in the
-         * registry is available since 2026-08-15, and this rule must keep
-         * being tested regardless of what the catalogue happens to hold. */
+        /* A spec that is registered but not runnable. Built locally rather
+         * than picked from the catalogue: which models carry available=0 is a
+         * curation decision that moves, and this rule must keep being tested
+         * regardless of what the catalogue happens to hold. */
         idletoken_model_spec unavailable = *idletoken_model_get("glm-5.2");
         unavailable.available = 0;
         idletoken_mode m = idletoken_mode_decide(&unavailable,
@@ -673,7 +680,7 @@ int main(void) {
                "MoE working set is a fraction of the file, not the whole file");
         }
 
-        /* Unified pool counted once (the M4/DGX case): 50 GiB vram aliasing
+        /* Unified pool counted once (Apple Silicon / Grace): 50 GiB vram aliasing
          * 50 GiB ram is 50, not 100.
          *
          * Asserted through the SPEED verdict since 2026-08-16 — the old form
@@ -774,7 +781,8 @@ int main(void) {
 
         /* ---- the KV pool: discrete cards budget VRAM, not VRAM+RAM -------
          *
-         * Regression fixtures for the 2026-08-18 win_PC freeze. The machine:
+         * Regression fixtures for the 2026-08-18 desktop freeze on a Windows
+         * test node. The machine:
          * RTX 5060 Ti, 16 GiB VRAM + 64 GiB system RAM; qwen3-8b Q4_K_M is
          * ~5 GiB of weights at ~144 KiB of KV per token; the client asked for
          * 40960 tokens per slot.
@@ -786,13 +794,13 @@ int main(void) {
          * memory instead of failing, and the desktop froze. */
         idletoken_llm_model_size q8 = { .total_bytes = g(5), .n_layers = 36,
                                         .kv_bytes_per_token = 144 * 1024 };
-        idletoken_node_mem win_pc = NM(g(16), g(64), 0);
-        ok(idletoken_llama_node_usable(&win_pc) == g(80),
-           "win_PC fixture: 80 GiB across the machine (what the old budget used)");
-        ok(idletoken_llama_kv_pool(&win_pc) == g(16),
-           "win_PC fixture: but only 16 GiB of it can hold KV");
+        idletoken_node_mem discrete16 = NM(g(16), g(64), 0);
+        ok(idletoken_llama_node_usable(&discrete16) == g(80),
+           "16+64 fixture: 80 GiB across the machine (what the old budget used)");
+        ok(idletoken_llama_kv_pool(&discrete16) == g(16),
+           "16+64 fixture: but only 16 GiB of it can hold KV");
         /* 16 − 5 − 0.83 = 10.17 GiB over 5.625 GiB/seq → 1. */
-        ok(idletoken_llama_seq_slots(&win_pc, &q8, 40960, 1.0, 4) == 1,
+        ok(idletoken_llama_seq_slots(&discrete16, &q8, 40960, 1.0, 4) == 1,
            "discrete 16 GiB card at 40K ctx → 1 slot (was 4: the freeze)");
 
         /* Same model and context on a unified machine with a genuinely large
@@ -831,9 +839,9 @@ int main(void) {
          * which is the point of clustering — but the budget is still 16, not
          * 80, so a node that would overflow its card cannot hide behind its
          * host RAM. */
-        ok(idletoken_llama_seq_slots(&win_pc, &q8, 40960, 0.25, 4) == 4,
+        ok(idletoken_llama_seq_slots(&discrete16, &q8, 40960, 0.25, 4) == 4,
            "cluster share on a discrete node: a quarter of the KV fits VRAM");
-        ok(idletoken_llama_seq_slots(&win_pc, &q8, 40960, 0.75, 4) == 2,
+        ok(idletoken_llama_seq_slots(&discrete16, &q8, 40960, 0.75, 4) == 2,
            "cluster share on a discrete node: three quarters gets fewer");
         /* In-test positive control for the pair above: hand the SAME numbers a
          * node whose pool is the old whole-machine figure (80 GiB, expressed
@@ -850,12 +858,12 @@ int main(void) {
      *
      * Replay of the cell that crashed on 2026-08-19
      * (results/t14-engine-bump-phaseb-20260820.md, "Why that run could not
-     * answer the question it was asked"): DGX_Spark coordinating with 107.61
-     * GiB of unified memory, win_PC2 joining with 13.2 GiB of VRAM behind 37.3
+     * answer the question it was asked"): a unified-memory node coordinating with
+     * 107.61 GiB, a discrete-GPU node joining with 13.2 GiB of VRAM behind 37.3
      * GiB of system RAM, DeepSeek-V4-Flash IQ2_XXS at 80.76 GiB.
      *
      * The split was the ratio of idletoken_llama_node_usable() and nothing
-     * else, so win_PC2 was handed 50.48/158.09 = 0.3193 = 25.8 GiB onto a card
+     * else, so the joiner was handed 50.48/158.09 = 0.3193 = 25.8 GiB onto a card
      * that holds 13.2 — and its rpc-server, started `-d CUDA0`, can reach
      * nothing else. Windows paged VRAM to system memory instead of failing and
      * the rpc-server died mid-decode. Same disease as the slot budget above:
@@ -867,13 +875,13 @@ int main(void) {
             .n_layers = 43, .kv_bytes_per_token = 65536,
         };
         idletoken_node_mem cell[] = {
-            NM(g(107.61), g(107.61), 1),                 /* DGX_Spark, unified */
-            NM(g(13.2),   g(37.3),   0),                 /* win_PC2, discrete  */
+            NM(g(107.61), g(107.61), 1),                 /* unified memory    */
+            NM(g(13.2),   g(37.3),   0),                 /* discrete GPU      */
         };
         /* The layer bytes the split divides: weights + the KV it sizes. */
         const double  slice = 80.76 + 2.0;               /* GiB, ctx 32768 */
         /* allow_small_cluster = 1 throughout this block, because that is how
-         * the cell ran: 80.76 GiB fits the DGX's 107.61 GiB on its own, so the
+         * the cell ran: 80.76 GiB fits the 107.61 GiB node on its own, so the
          * matrix harness sets IDLETOKEN_ALLOW_SMALL_CLUSTER=1 to get a cluster
          * at all (hard invariant #5 — fits → don't cluster). Without it these
          * fixtures would all return SINGLE and assert nothing about splitting. */
@@ -887,13 +895,13 @@ int main(void) {
             (double)(idletoken_llama_node_usable(&cell[0]) +
                      idletoken_llama_node_usable(&cell[1]));
         ok(old_share > 0.318 && old_share < 0.320,
-           "fixture replays the incident: the old rule hands win_PC2 0.3193");
+           "fixture replays the incident: the old rule hands the joiner 0.3193");
         ok(old_share * slice > 25.0 && old_share * slice > 13.2,
            "...which is 25.8 GiB onto a 13.2 GiB card (the crash)");
 
         ok(idletoken_plan_llamacpp(&dsv4, cell, 2, 0, 32768, 1, &p) == 0 &&
                p.kind == IDLETOKEN_LLPLAN_CLUSTER && p.order[1] == 1,
-           "DGX + Windows worker on DSv4 → CLUSTER");
+           "unified coordinator + discrete-GPU worker on DSv4 → CLUSTER");
         /* THE regression: whatever the split says, the discrete worker's share
          * must fit the memory its rpc-server can address. */
         ok(p.tensor_split[1] * slice <= 13.2,
@@ -913,7 +921,7 @@ int main(void) {
 
         /* Control 1 — unified nodes are untouched. Both answers coincide on a
          * machine with one physical pool, which is why this bug was invisible
-         * on every Mac and DGX cell we ran: the split here must still be the
+         * on every unified-memory cell we ran: the split here must still be the
          * plain usable ratio. */
         idletoken_node_mem uni2[] = { NM(g(107.61), g(107.61), 1),
                                       NM(g(50.48),  g(50.48),  1) };
@@ -961,7 +969,7 @@ int main(void) {
 
     /* ---- where the budget's byte count comes from (T8) ------------------
      *
-     * Regression fixtures for the 2026-08-19 win_PC2 measurement
+     * Regression fixtures for the 2026-08-19 discrete-16-GiB measurement
      * (results/llamacpp-multislot-big-win-20260819.md §4): the coordinator
      * budgeted 7.98 GiB (the manifest's DEFAULT quant, IQ2_XXS) while the
      * engine opened a 15.59 GiB Q4_K_M file, and derived 2 sequence slots
@@ -976,7 +984,7 @@ int main(void) {
 
         /* The machine, as measured: RTX 5060 Ti, 13.17 GiB of usable VRAM next
          * to 64 GiB of system RAM, serving at 4096 tokens per slot. */
-        idletoken_node_mem win_pc2 = NM((uint64_t)(13.17 * (double)GiB), g(64), 0);
+        idletoken_node_mem discrete13 = NM((uint64_t)(13.17 * (double)GiB), g(64), 0);
         const uint64_t IQ2_XXS_BYTES = 8573593504ull;   /* variants[default] */
         const uint64_t Q4_K_M_BYTES  = 16740812704ull;  /* the file it served */
 
@@ -994,7 +1002,7 @@ int main(void) {
          * a future change makes the default source produce 1 anyway, the
          * assertions below would pass for the wrong reason. */
         const int slots_from_default =
-            idletoken_llama_seq_slots(&win_pc2, &ms, 4096, 1.0, 4);
+            idletoken_llama_seq_slots(&discrete13, &ms, 4096, 1.0, 4);
         ok(slots_from_default == 2,
            "control: the pre-fix source (default quant) really does say 2 slots");
 
@@ -1004,7 +1012,7 @@ int main(void) {
            "--quant Q4_K_M → that variant's bytes");
         ok(strstr(rwhy, "Q4_K_M") != NULL && strstr(rwhy, "WARNING") == NULL,
            "...named explicitly, so nothing to warn about");
-        ok(idletoken_llama_seq_slots(&win_pc2, &ms, 4096, 1.0, 4) == 1,
+        ok(idletoken_llama_seq_slots(&discrete13, &ms, 4096, 1.0, 4) == 1,
            "15.59 GiB of weights vs a 13.17 GiB KV pool → 1 slot");
 
         /* An unknown quant name falls back to the default — as it always has —
@@ -1053,7 +1061,7 @@ int main(void) {
                    "T3 replay: --llama-gguf with no --quant → the file's real size");
                 ok(strstr(rwhy, "GGUF on disk") != NULL && strstr(rwhy, "Q4_K_M") != NULL,
                    "...and it names the file and the quant it recognised");
-                ok(idletoken_llama_seq_slots(&win_pc2, &ms, 4096, 1.0, 4) == 1 &&
+                ok(idletoken_llama_seq_slots(&discrete13, &ms, 4096, 1.0, 4) == 1 &&
                        slots_from_default == 2,
                    "T3 replay: 27B Q4_K_M on the 16 GiB card → 1 slot (was 2)");
 

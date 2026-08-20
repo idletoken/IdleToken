@@ -2208,8 +2208,9 @@ static int coord_selftest(void) {
     }
 
     /* --- Engine "could not fit" detector (2026-08-18) --------------------
-     * The line under test is COPIED FROM A REAL ENGINE LOG — win_PC's
-     * ~/.idletoken/idletoken-server-<port>.log the night the machine froze —
+     * The line under test is COPIED FROM A REAL ENGINE LOG —
+     * ~/.idletoken/idletoken-server-<port>.log from the night a test machine
+     * froze —
      * and its wording is the pinned engine's own (vendor/llama.cpp
      * common/fit.cpp). The negative cases are the point of the block: this
      * detector's failure mode is matching too eagerly and refusing a start
@@ -2469,10 +2470,11 @@ static int coord_selftest(void) {
     }
 
     /* The cluster split is charged to the memory a node's engine can ADDRESS
-     * (T16, 2026-08-20). One case, replayed from the machine it happened on:
-     * DGX_Spark coordinating (107.61 GiB unified) with win_PC2 joining (13.2
-     * GiB of VRAM behind 37.3 GiB of system RAM), DeepSeek-V4-Flash at 80.76
-     * GiB. Budgeted against the machine the worker's share was 0.3193 = 25.8
+     * (T16, 2026-08-20). One case, replayed from the machines it happened on:
+     * a unified-memory node coordinating (107.61 GiB) with a discrete-GPU node
+     * joining (13.2 GiB of VRAM behind 37.3 GiB of system RAM), serving
+     * DeepSeek-V4-Flash at 80.76 GiB.
+     * Budgeted against the machine the worker's share was 0.3193 = 25.8
      * GiB onto a 13.2 GiB card, and its rpc-server — started `-d CUDA0` — can
      * reach nothing else; Windows paged VRAM to host memory and it died
      * mid-decode (results/t14-engine-bump-phaseb-20260820.md).
@@ -6516,7 +6518,7 @@ static int run_llamacpp_cluster_mode(
 
         /* "Bound" is not "reachable from here": Windows Firewall filters the
          * inbound port silently, so the worker honestly reports READY while
-         * this machine cannot connect (measured, win_PC2 2026-08-15) — and the
+         * this machine cannot connect (measured on Windows, 2026-08-15) — and the
          * engine's later failure would read as a coordinator problem. Probe
          * once now and, if blocked, name the machine that can fix it. The
          * rpc-server survives a bare connect+close (same probe the health
@@ -7031,7 +7033,7 @@ int main(int argc, char **argv) {
              * (slot count, SINGLE vs cluster, tensor split, ctx grant) is built
              * on. Without it a log months later cannot answer "what was it
              * budgeting against?" — which is exactly the question the 08-19
-             * win_PC2 run had to reverse-engineer from a byte count. */
+             * run had to reverse-engineer from a byte count. */
             fprintf(stderr, "coord: budget from: %s\n", budget_src);
 
             idletoken_node_mem me;

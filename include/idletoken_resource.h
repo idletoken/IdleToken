@@ -38,8 +38,9 @@
  * planning to the last byte really did starve the machine.
  *
  * llama.cpp mmaps the weights instead: they are page cache, and the kernel
- * evicts them under pressure. Measured 2026-08-16 on DGX (119.6 GiB RAM,
- * GLM-5.2 IQ2_XXS = 222 GiB — nearly 2x physical): the model loaded, served,
+ * evicts them under pressure. Measured 2026-08-16 on a unified-memory Linux
+ * node (119.6 GiB RAM, GLM-5.2 IQ2_XXS = 222 GiB — nearly 2x physical): the
+ * model loaded, served,
  * and generated at 0.91 tok/s, RSS plateaued at physical RAM, and
  * **MemAvailable never fell below 113 GiB** across 245 samples. The failure
  * the proportional ceiling defends against does not occur on this engine.
@@ -137,7 +138,7 @@
 #endif
 
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
-  /* CUDA 13.x. Linux figure verified on the DGX Spark (driver 580.126.09). */
+  /* CUDA 13.x. Linux figure verified on a DGX Spark (driver 580.126.09). */
   #ifdef _WIN32
     #define IDLETOKEN_MIN_DRIVER_MAJOR 580
     #define IDLETOKEN_MIN_DRIVER_MINOR 88

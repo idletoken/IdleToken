@@ -5,28 +5,33 @@ on:
 permissions: {contents: read}
 
 jobs:
-  # Engine-side model registry, planner, and ds4x forward-pass alignment.
-  # This is the one gate in the acceptance ladder that needs NO hardware, which
-  # is why it is the one that can live in CI. Every other gate ssh's into real
-  # machines with NVIDIA GPUs; a GitHub runner has none.
+  # Engine-side model registry and planner. This is the one gate in the
+  # acceptance ladder that needs NO hardware, which is why it is the one that
+  # can live in CI. Every other gate ssh's into real machines with NVIDIA GPUs;
+  # a GitHub runner has none.
+  #
+  # G_MODEL used to also run the ds4x forward-pass alignment, which needed numpy
+  # for its reference vectors. That line is frozen (2026-08-14) and parked behind
+  # IDLETOKEN_DS4X_GATE=1, and scripts/ds4x_ref.py is not published at all — so
+  # the numpy install went with it. What still runs here is engine-agnostic:
+  # registry + planner, the no-hardcode scan, and model identity on the wire.
   engine:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # The ds4x alignment reference generates its vectors with numpy, which the
-      # runner does not preinstall. The very first CI run went red on this, with
-      # an empty error message (`ds4x forward alignment failed ()`).
-      - run: pip install --quiet numpy
-      - name: Acceptance gate G_MODEL (registry + planner + ds4x forward)
+      - name: Acceptance gate G_MODEL (registry + planner)
         run: scripts/acceptance.sh --gate G_MODEL
+      # G_MODEL already runs this, but it is worth its own red line in the log,
+      # and it must actually run: the previous version built the dumper with a
+      # target that does not produce it, then skipped itself when the binary was
+      # missing — a check that could not fail, which is the one thing this repo
+      # keeps promising not to ship.
       - name: Manifests match the compiled registry
         run: |
-          make -f Makefile plantest >/dev/null 2>&1 || true
-          if [ -x build/model_registry_dump ]; then
-            python3 scripts/model_manifest_check.py
-          else
-            echo "no registry dumper on this runner — skipped (G_MODEL already covers the registry)"
-          fi
+          mkdir -p build
+          cc -Wall -Wextra -std=c99 -Iinclude src/common/model.c \
+             src/tools/model_registry_dump.c -o build/model_registry_dump
+          python3 scripts/model_manifest_check.py build/model_registry_dump
 
   client:
     runs-on: ubuntu-latest

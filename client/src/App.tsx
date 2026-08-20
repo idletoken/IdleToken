@@ -23,6 +23,8 @@ import { recordProblem } from "./problems";
 import { useClusterStats, servedModelOf, type ClusterStats } from "./clusterStats";
 import { fmtGiB, pct } from "./format";
 import UpdateDialog, { type UpdateResult } from "./UpdateDialog";
+import Capability from "./Capability";
+import PopularModels from "./Popularity";
 import { getUpdateProvider } from "./provider/update";
 import { quitApp, setAutostart, syncTray, syncWindowPrefs, windowState } from "./system";
 
@@ -618,6 +620,14 @@ function ClusterCard(props: {
                 {t("weights.goSettings")}
               </button>
             </span>
+          ) : !fits ? (
+            // A-P1-3: the button is grey and the weights ARE here, so the only
+            // remaining reason is that the model does not fit on this machine —
+            // which used to be said nowhere on this card. A disabled control
+            // with no reason beside it reads as a broken app.
+            <span className="wrow">
+              <span className="wrow__msg">{t("deploy.local.tooBig")}</span>
+            </span>
           ) : null}
         </div>
 
@@ -637,6 +647,27 @@ function ClusterCard(props: {
               {t("cluster.create")}
             </button>
           </div>
+          {/* A-P1-3: the reason, next to the button it is about. This sentence
+              existed — `pairing.singleNodeModel` — but only ever rendered
+              inside the pairing panel, which is precisely the place this
+              disabled button prevents you from reaching. */}
+          {!clusterable ? (
+            <span className="wrow">
+              <span className="wrow__msg">{t("pairing.singleNodeModel")}</span>
+            </span>
+          ) : null}
+        </div>
+
+        {/* A-P1-3: the two questions a new user has before anything else —
+            "which model do people use" and "what can this machine run" — used
+            to live inside a popover and at the bottom of Settings → Models.
+            Same components, rendered where the questions are asked. */}
+        <div className="cluster-empty__capability">
+          <PopularModels
+            selectedId={props.settingModelId}
+            onPick={(id) => props.onSwitchModel(id, defaultQuant(id))}
+          />
+          <Capability apiBaseUrl={snap?.api?.status === "online" ? snap.api.baseUrl : null} />
         </div>
       </section>
     );

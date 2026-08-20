@@ -58,6 +58,11 @@ REM Old-name binaries from before the 2026-08-04 IdleToken rename. Same reason
 REM as the CUDA dlls below: dist\ is a directory, so anything an earlier build
 REM copied in stays until something deletes it — and the bundle would ship TWO
 REM engines under two names.
+REM
+REM This loop is the ONE place the pre-rename product name may still be spelled
+REM out, and only because deleting a file requires naming it. Everything else —
+REM binaries, environment variables, paths, log strings — is IDLETOKEN_*; if you
+REM find the old name anywhere else, it is a leftover to fix, not a precedent.
 for %%F in (homeai-worker.exe homeai-coord.exe homeai-platform-agent.exe) do (
   if exist dist\%%F (
     del /q dist\%%F

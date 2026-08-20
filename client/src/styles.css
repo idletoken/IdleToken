@@ -4367,3 +4367,77 @@ textarea {
   border: 1px solid var(--line);
   color: var(--ink-dim);
 }
+
+/* ---- 2026-08-20 audit additions ------------------------------------------ */
+
+/* About: the outbound links (Settings → Data & about). A column rather than a
+   row — the labels are sentences, not chips, and wrapping them mid-phrase is
+   how a link list stops looking like one. */
+.about-links {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+/* Terms / privacy policy, read in the app (see SettingsPanel LegalDocs). Tall
+   and scrollable: these are long documents, and a dialog that clips them is a
+   dialog that hides the clause someone came to read. */
+.modal--legal {
+  max-width: 760px;
+  max-height: 80vh;
+  overflow-y: auto;
+}
+
+/* "What can I run" on the cluster's empty state (A-P1-3). Separated from the
+   deploy options above it by a rule, because it answers a different question:
+   those are what to press, this is what is possible. */
+.cluster-empty__capability {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+/* A remote image in a model reply is not loaded (A-P2-3). Shown as a marker
+   rather than dropped: the reply did contain something, and a silent removal
+   would read as the model having produced nothing there. */
+.md-img-blocked {
+  display: inline-block;
+  padding: 1px 6px;
+  border: 1px dashed var(--line);
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+.md-img { max-width: 100%; border-radius: 6px; }
+
+/* "What is everyone running" on the cluster's empty state (A-P1-3). Shown only
+   when the platform has measured data, so it can be absent without leaving a
+   gap — hence no fixed height and no placeholder rows. */
+.popular { margin-bottom: 18px; }
+.popular__head {
+  font-size: 12px;
+  color: var(--ink-faint);
+  margin-bottom: 6px;
+}
+.popular__list { list-style: none; margin: 0; padding: 0; }
+.popular__row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 3px 0;
+}
+.popular__rank {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-faint);
+  min-width: 14px;
+}
+.popular__name { flex: 1 1 auto; text-align: left; }
+.popular__row.is-on .popular__name { font-weight: 600; }
+.popular__n {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-faint);
+}

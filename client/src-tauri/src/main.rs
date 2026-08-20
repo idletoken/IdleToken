@@ -7,6 +7,7 @@ use tauri_plugin_shell::ShellExt;
 
 mod engine;
 mod pairing;
+mod secrets;
 mod tray;
 mod update;
 mod weights;
@@ -223,9 +224,15 @@ async fn api_chat(
             .to_string();
         // Model id comes from the caller's settings; the engine echoes back
         // whatever it actually serves (it does not switch models per request).
+        //
+        // No fallback id (2026-08-20 audit A-P2-5): it used to default to
+        // "deepseek-v4-flash", so a caller that forgot the field silently asked
+        // for a model this cluster may not serve and got an engine-side error
+        // about a model the user never chose. An empty field is a bug in the
+        // caller, and it says so here.
         let model = model
             .filter(|m| !m.is_empty())
-            .unwrap_or_else(|| "deepseek-v4-flash".into());
+            .ok_or("no model id given — the caller must pass the model its cluster serves")?;
         let body = serde_json::json!({
             "model": model,
             "max_tokens": 200,
@@ -424,6 +431,13 @@ async fn api_chat_stream(
     // existing. A stop pressed in that window found no entry, api_chat_cancel
     // returned false — and the caller discards the return value, so the press
     // was silently lost and the generation ran to completion.
+    // Checked before anything is registered or spawned (A-P2-5): this used to
+    // fall back to a hardcoded "deepseek-v4-flash", which turned "the caller
+    // forgot the model id" into "the cluster answered about a model the user
+    // never picked".
+    let model = model
+        .filter(|m| !m.is_empty())
+        .ok_or("no model id given — the caller must pass the model its cluster serves")?;
     let cancel = chat_register(&id);
     tauri::async_runtime::spawn_blocking(move || {
         let emit = |kind: &str, text: Option<&str>, message: Option<&str>| {
@@ -432,9 +446,6 @@ async fn api_chat_stream(
                 serde_json::json!({ "id": id, "kind": kind, "text": text, "message": message }),
             );
         };
-        let model = model
-            .filter(|m| !m.is_empty())
-            .unwrap_or_else(|| "deepseek-v4-flash".into());
         let out = stream_chat_inner(
             &base_url, &messages, &token, &model, max_tokens, &cancel,
             &mut |t| emit("delta", Some(t), None),
@@ -867,6 +878,7 @@ fn main() {
         .manage(window::SysPrefs::default())
         .manage(tray::TrayState::default())
         .manage(update::Updates::default())
+        .manage(secrets::Secrets::default())
         .setup(|app| {
             // One line about how the shell came up. It is the first thing
             // asked for in every support conversation, and on Windows it is
@@ -974,6 +986,9 @@ fn main() {
             update::update_download,
             update::update_install,
             update::update_state,
+            secrets::secrets_load,
+            secrets::secrets_set,
+            secrets::secrets_clear,
         ])
         .build(tauri::generate_context!())
         .expect("error while building IdleToken client")

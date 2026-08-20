@@ -5,41 +5,65 @@ This product includes software developed as part of the IdleToken project,
 licensed under the Apache License, Version 2.0 (see LICENSE).
 
 --------------------------------------------------------------------------
-Third-party components vendored in this repository
+Third-party components
 --------------------------------------------------------------------------
 
-vendor/llama.cpp/ — llama.cpp, the inference engine (pinned commit recorded in
-    scripts/llamacpp-patches/UPSTREAM, built with the patches in that
-    directory). Not linked into IdleToken binaries: llama-server and the
-    ggml rpc-server are spawned as separate processes and are shipped inside
-    the installers.
+llama.cpp — the inference engine IdleToken runs on. It is NOT vendored here:
+    scripts/build_llamacpp.sh fetches the pinned upstream commit recorded in
+    scripts/llamacpp-patches/UPSTREAM and builds it with the patches in that
+    directory, so the source (and the licence that travels with it) comes from
+    upstream. It is not linked into any IdleToken binary either — llama-server
+    and the ggml rpc-server are spawned as separate processes. Those two
+    executables ARE shipped inside the installers, and this notice covers that
+    redistribution.
     Copyright (c) 2023-2026 The ggml authors
-    MIT License — full text in vendor/llama.cpp/LICENSE
+    MIT License — full text in the LICENSE file of the upstream checkout
     Upstream: https://github.com/ggml-org/llama.cpp
 
-vendor/ds4/ — ds4.c, the DeepSeek V4 Flash single-machine reference engine.
-    Compiled into and linked with both idletoken-worker and idletoken-coord
-    (ds4.c, ds4_cuda.cu / ds4_metal.m); the Metal shader sources are also read
-    at runtime. Not merely a reference.
+Mbed TLS (v3.6.7) — the TLS implementation used by IdleToken's transport patch
+    for the ggml RPC link. Not vendored here either: the patched llama.cpp
+    build pulls it through CMake FetchContent and links it statically, so it is
+    present in the llama-server and rpc-server executables shipped inside the
+    installers.
+    Copyright The Mbed TLS Contributors
+    Apache License 2.0 — full text in the LICENSE file of the fetched source
+    Upstream: https://github.com/Mbed-TLS/mbedtls
+
+ds4 — the generic kernels of IdleToken's early prototype (ds4.c, plus the
+    project's own ds4x layer). SHELVED since 2026-08-16 and NOT part of any
+    build: the call sites are satisfied by src/common/ds4_stub.c, no ds4 object
+    is compiled, and no released binary contains any of this code. The sources
+    stay in the private tree for reference only and are not part of the public
+    distribution. The MIT licence and copyright notice are reproduced anyway,
+    in vendor/ds4/LICENSE, because the terms travel with the material we did
+    take from upstream.
     Copyright (c) 2026 The ds4.c authors
     Copyright (c) 2023-2026 The ggml authors
     MIT License — full text in vendor/ds4/LICENSE
     Upstream: https://github.com/antirez/ds4 (pinned commit in vendor/ds4/UPSTREAM)
 
-vendor/ds4/rax.c, rax.h, rax_malloc.h — Rax, a radix tree implementation.
-    Also linked into both binaries. It sits inside vendor/ds4/ but is NOT
-    covered by that directory's MIT LICENSE, which is why it is listed
-    separately: the BSD 3-clause terms require this notice in binary
-    redistributions too.
+Rax (rax.c, rax.h, rax_malloc.h) — a radix tree implementation that ships
+    inside the ds4 sources. It is reached only through the shelved ds4 path
+    described above (IDLETOKEN_WITH_DS4=1), so it is neither distributed in
+    source form nor present in any released binary. Listed here as history:
+    it sits inside vendor/ds4/ but is NOT covered by that directory's MIT
+    LICENSE, and if the ds4 path is ever built and redistributed again, the
+    BSD 3-clause terms require this notice in binary form too.
     Copyright (c) 2017-2026, Salvatore Sanfilippo <antirez at gmail dot com>
     BSD 3-Clause — full text in the header of vendor/ds4/rax.c
 
+--------------------------------------------------------------------------
+Third-party components vendored in this repository
+--------------------------------------------------------------------------
+
 vendor/tweetnacl/ — TweetNaCl, "a crypto library in 100 tweets"
+    Linked into idletoken-worker and idletoken-coord.
     Public domain, dedicated by D. J. Bernstein, Bernard van Gastel,
     Wesley Janssen, Tanja Lange, Peter Schwabe, Sjaak Smetsers.
     Upstream: https://tweetnacl.cr.yp.to/20140427/
 
 vendor/blake2/ — BLAKE2b (RFC 7693), unkeyed one-shot subset
+    Linked into idletoken-coord.
     Public domain / CC0, matching the upstream reference dedication by
     Samuel Neves and Jean-Philippe Aumasson.
     Upstream: https://github.com/BLAKE2/BLAKE2

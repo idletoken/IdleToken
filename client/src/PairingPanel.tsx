@@ -115,6 +115,8 @@ export default function PairingPanel(props: {
         return t("pairing.err.notFoundManual");
       case "badCode":
         return t("pairing.err.badCode");
+      case "oldCreator":
+        return t("pairing.err.oldCreator");
       case "subnet":
         return t("pairing.err.subnet");
       case "rejected":

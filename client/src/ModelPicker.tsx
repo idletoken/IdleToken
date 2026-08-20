@@ -27,6 +27,8 @@ import { fmtBytes } from "./format";
 import { useDialog } from "./useDialog";
 import { loadCapability, type CapabilityMode, type CapabilityRow } from "./Capability";
 import { fetchLeaderboard } from "./platform";
+import { openExternal } from "./auth";
+import { ISSUES_URL } from "./links";
 
 /** What the cluster is running right now, which is what a switch would have to
  *  restart. `null` = nothing is running, so a pick costs nothing.
@@ -259,8 +261,14 @@ export default function ModelPicker(props: {
             })}
           </div>
           {/* A model you want that is not listed: the answer is a GitHub issue,
-              not a file box — see model.request.hint. */}
-          <p className="modelpick__open-hint">{t("model.request.hint")}</p>
+              not a file box — see model.request.hint. The sentence used to say
+              "request it in a GitHub issue" with nothing to click (A-P1-4). */}
+          <p className="modelpick__open-hint">
+            {t("model.request.hint")}{" "}
+            <button className="linkbtn" onClick={() => void openExternal(ISSUES_URL)}>
+              {t("model.request.link")} ↗
+            </button>
+          </p>
           {/* Precision belongs to the selected model, so it stays a separate row
               rather than multiplying the list by five. */}
           {hasQuantChoice(sel.modelId) ? (
@@ -280,8 +288,13 @@ export default function ModelPicker(props: {
             </div>
           ) : null}
           <div className="modelpick__actions">
+            {/* A-P2-6: "Keep current" belongs to the CONFIRM step above, where
+                the alternative really is keeping the running model. Here
+                nothing has been changed yet, so the button that closes the
+                list is just Cancel — "Keep current" read as a second choice
+                and made people look for the one that says "don't apply". */}
             <button className="btn-secondary" onClick={props.onClose}>
-              {t("model.switch.cancel")}
+              {t("weights.cancel")}
             </button>
             <button className="btn-primary" onClick={() => choose(sel.modelId, sel.quant)}>
               {t("model.pick.apply")}

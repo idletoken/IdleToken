@@ -711,9 +711,23 @@ pub fn engine_logs(state: State<'_, Engine>, max_lines: Option<usize>) -> Vec<Lo
 /// A missing `idletoken-platform-agent` sidecar binary fails exactly like a
 /// missing engine binary: "spawn failed: …" in the log, backoff, then crashed.
 ///
-/// SECURITY: `jwt` arrives over the local Tauri IPC only and ends up in the
-/// child's argv. Do NOT log it — push_log never prints slot args, and nothing
-/// here persists it; the frontend passes the live session token on each start.
+/// SECURITY (2026-08-20 audit A-P0-4): the coordinator token now travels in the
+/// child's ENVIRONMENT, not its argv — `/proc/<pid>/cmdline` is world-readable
+/// on Linux and `ps` shows argv everywhere, so any other account on the machine
+/// could read it. `/proc/<pid>/environ` is owner-only, and the variable is set
+/// on the child (`Command::env`), never on this process.
+///
+/// ⚠ `jwt` is STILL in argv, and it is the more valuable of the two: it can
+/// spend this account's Sparks. `src/tools/platform_agent.c` has an env
+/// fallback for the coord token (`IDLETOKEN_API_TOKEN`) but none for `--jwt`,
+/// and that file is another session's tree. Passing it through a variable the
+/// agent does not read would silently leave the agent unauthenticated, which
+/// is worse than the exposure. Tracked as a cross-tree follow-up; the fix is a
+/// `getenv("IDLETOKEN_PLATFORM_JWT")` fallback next to the existing one, after
+/// which the two lines below move into `env`.
+///
+/// Do NOT log either — push_log never prints slot args or env, and nothing here
+/// persists them; the frontend passes the live session token on each start.
 /// The socket the platform agent hands the buyer's plaintext to the
 /// coordinator over, in shared mode.
 ///
@@ -771,9 +785,14 @@ pub fn platform_agent_start(
     // switch turns lending and borrowing on together. Without this the
     // coordinator answers 401 to every dispatched job and the machine looks to
     // its owner like one the platform stopped sending work to.
+    //
+    // Through the environment, not `--coord-token` (A-P0-4). The agent reads
+    // IDLETOKEN_API_TOKEN as a fallback for exactly this argument — verified in
+    // src/tools/platform_agent.c before switching, because a token the agent
+    // never receives means every dispatched job comes back 401.
+    let mut env: Vec<(String, String)> = Vec::new();
     if !coord_token.trim().is_empty() {
-        args.push("--coord-token".into());
-        args.push(coord_token.trim().to_string());
+        env.push(("IDLETOKEN_API_TOKEN".into(), coord_token.trim().to_string()));
     }
     // Hand the plaintext over the socket instead of loopback TCP. The agent
     // treats this as exclusive: if the socket is not there it exits loudly
@@ -783,7 +802,7 @@ pub fn platform_agent_start(
         args.push(sock);
     }
     let args = args;
-    start_engine(&app, ROLE_PLATFORM_AGENT.into(), args, Vec::new())
+    start_engine(&app, ROLE_PLATFORM_AGENT.into(), args, env)
 }
 
 /// Stop only the platform agent (the engine sidecars keep running).
@@ -963,9 +982,12 @@ pub fn llamacpp_serve(
         args.push("--api-unix".into());
         args.push(sock);
     }
+    // Through the environment, not `--api-token` (A-P0-4): argv is readable by
+    // every account on the machine. The coordinator reads IDLETOKEN_API_TOKEN
+    // as a fallback for this exact flag.
+    let mut env: Vec<(String, String)> = Vec::new();
     if !api_token.is_empty() {
-        args.push("--api-token".into());
-        args.push(api_token);
+        env.push(("IDLETOKEN_API_TOKEN".into(), api_token));
     }
     // 0 = let the coordinator size the context from available memory (its
     // default asks for 32K and refuses below the 16K floor with a worded
@@ -1003,6 +1025,11 @@ pub fn llamacpp_serve(
                 s.state,
                 EngineState::Starting | EngineState::Running | EngineState::Restarting
             ) && s.args == args
+                // The env is part of the request now that the API token lives
+                // there (A-P0-4). Comparing args alone would make "same GGUF,
+                // new token" look identical and skip the restart, leaving the
+                // engine gated by the token the user just replaced.
+                && s.env == env
             {
                 return Ok(());
             }
@@ -1011,7 +1038,7 @@ pub fn llamacpp_serve(
     // Restart semantics: stop whatever engine sidecars run (the platform agent
     // keeps going — sharing compute is an independent lifecycle).
     stop_matching(&app, |r| r != ROLE_PLATFORM_AGENT);
-    start_engine(&app, "coordinator".into(), args, Vec::new())
+    start_engine(&app, "coordinator".into(), args, env)
 }
 
 /// "Clear my cache now" (acceptance P5): one-shot `idletoken-worker --kv-clear`.

@@ -1,5 +1,10 @@
 /* dspark_check.c — G-DSPARK-LOAD oracle (docs/dspark-design.md §8).
  *
+ * SHELVED 2026-08-03; the ds4 line it tests was shelved 2026-08-16 and is no
+ * longer compiled into any binary (src/common/ds4_stub.c stands in for it).
+ * Nothing here is built by default, nothing calls it, and the G_DSPARK gate
+ * SKIPs unless IDLETOKEN_DSPARK_GATE=1. Kept for the record, not for use.
+ *
  * Validates DeepSeek-V4-Flash-DSpark-support.gguf: the speculative-decoding
  * draft module that ships with the OFFICIAL 0731 release. This is the gate
  * that must pass BEFORE any forward pass is written, because it pins down

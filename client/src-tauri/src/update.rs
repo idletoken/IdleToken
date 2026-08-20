@@ -17,10 +17,19 @@
 //!    people run months-old builds believing they are current.
 //!
 //! The feed is a static JSON on the public repo's releases (the same place the
-//! user guide sends people to download from), one per channel. Both the URL
-//! and the pubkey can be overridden by environment variables so the acceptance
-//! gate can point the production code path at a local feed it signed itself —
-//! the gate exercises this file, not a copy of it.
+//! user guide sends people to download from), one per channel.
+//!
+//! **The environment overrides below are a development/test facility and are
+//! compiled OUT of release builds** (2026-08-20 audit A-P0-1). They exist so
+//! the acceptance gate can point the production code path at a local feed it
+//! signed itself — the gate exercises this file, not a copy of it. In a
+//! shipped build they would be a supply-chain hole rather than a convenience:
+//! anyone who can set this process's environment (a login item, a wrapper
+//! script, a launchd plist) could replace the feed URL *and* the pubkey
+//! together, at which point minisign happily verifies the attacker's own
+//! signature and the next update is remote code execution. The pubkey compiled
+//! into the binary (tauri.conf.json `plugins.updater.pubkey`) is the only
+//! trust root a release build has.
 
 use std::sync::Mutex;
 
@@ -36,16 +45,36 @@ use tauri_plugin_updater::{Update, UpdaterExt};
 const STABLE_FEED: &str = "https://github.com/idletoken/IdleToken/releases/latest/download/latest.json";
 const BETA_FEED: &str = "https://github.com/idletoken/IdleToken/releases/download/beta/latest.json";
 
-/// Test/self-host overrides. `IDLETOKEN_UPDATE_URL` also lets someone running
-/// their own build point at their own feed without patching the binary.
+/// Test-only overrides (see the module note). A self-hoster who wants their own
+/// feed builds with `--features updater-override`, which is a deliberate act
+/// with their own signing key — not something a stray environment variable can
+/// do to an installed app.
 const ENV_URL: &str = "IDLETOKEN_UPDATE_URL";
 const ENV_PUBKEY: &str = "IDLETOKEN_UPDATE_PUBKEY";
 
+/// Whether this build honours `ENV_URL` / `ENV_PUBKEY` at all.
+///
+/// `cfg!` rather than `#[cfg]` around each read: the compiler still folds it to
+/// a constant (the dead branch is removed from the release binary just the
+/// same), and it keeps one function that the test below can interrogate in
+/// BOTH profiles instead of a test that only ever sees the branch it was
+/// compiled with.
+const fn overrides_allowed() -> bool {
+    cfg!(any(debug_assertions, feature = "updater-override"))
+}
+
+/// The override value, or None in a release build — the single choke point, so
+/// there is no second place to forget the check.
+fn env_override(name: &str) -> Option<String> {
+    if !overrides_allowed() {
+        return None;
+    }
+    std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
 fn feed_url(channel: &str) -> String {
-    if let Ok(url) = std::env::var(ENV_URL) {
-        if !url.trim().is_empty() {
-            return url.trim().to_string();
-        }
+    if let Some(url) = env_override(ENV_URL) {
+        return url;
     }
     match channel {
         "beta" => BETA_FEED.to_string(),
@@ -87,10 +116,10 @@ fn build_updater(app: &AppHandle, channel: &str) -> Result<tauri_plugin_updater:
         .updater_builder()
         .endpoints(vec![parsed])
         .map_err(|e| format!("update endpoint rejected: {e}"))?;
-    if let Ok(pubkey) = std::env::var(ENV_PUBKEY) {
-        if !pubkey.trim().is_empty() {
-            builder = builder.pubkey(pubkey.trim());
-        }
+    // Release builds never reach past this: `env_override` returns None and the
+    // updater keeps the pubkey compiled in from tauri.conf.json.
+    if let Some(pubkey) = env_override(ENV_PUBKEY) {
+        builder = builder.pubkey(pubkey);
     }
     builder.build().map_err(|e| e.to_string())
 }
@@ -223,7 +252,7 @@ pub fn update_state(app: AppHandle, channel: String) -> serde_json::Value {
     serde_json::json!({
         "currentVersion": app.package_info().version.to_string(),
         "feed": feed_url(&channel),
-        "feedOverridden": std::env::var(ENV_URL).map(|v| !v.trim().is_empty()).unwrap_or(false),
+        "feedOverridden": env_override(ENV_URL).is_some(),
         "pending": state.pending.lock().unwrap().is_some(),
         "downloaded": state.bytes.lock().unwrap().as_ref().map(|b| b.len()),
     })
@@ -243,6 +272,7 @@ mod tests {
     fn feed_url_routing() {
         // Guard against the override leaking in from the developer's shell.
         std::env::remove_var(super::ENV_URL);
+        std::env::remove_var(super::ENV_PUBKEY);
         let stable = super::feed_url("stable");
         let beta = super::feed_url("beta");
         assert_ne!(stable, beta);
@@ -251,15 +281,40 @@ mod tests {
         // An unknown channel must fall back to stable, not to nothing.
         assert_eq!(super::feed_url("nonsense"), stable);
 
-        // The override wins on every channel — that is what lets the gate
-        // drive this exact code path against a feed it signed itself.
+        // A-P0-1: the override is a debug/test facility, so what it is allowed
+        // to do depends on the profile — and BOTH answers are asserted here.
+        // `cargo test` runs the debug branch, `cargo test --release` the
+        // shipped one; a release build that still honoured the variable would
+        // let anyone who can set this process's environment swap the feed and
+        // the pubkey together, which is a signed-update bypass.
         std::env::set_var(super::ENV_URL, "http://127.0.0.1:9/latest.json");
-        assert_eq!(super::feed_url("stable"), "http://127.0.0.1:9/latest.json");
-        assert_eq!(super::feed_url("beta"), "http://127.0.0.1:9/latest.json");
-        // An empty value is not an override; it is an unset variable that
-        // happens to exist (`env FOO= client`), and must not blank the feed.
-        std::env::set_var(super::ENV_URL, "");
-        assert_eq!(super::feed_url("stable"), stable);
+        std::env::set_var(super::ENV_PUBKEY, "not-our-key");
+        if super::overrides_allowed() {
+            assert_eq!(super::feed_url("stable"), "http://127.0.0.1:9/latest.json");
+            assert_eq!(super::feed_url("beta"), "http://127.0.0.1:9/latest.json");
+            assert_eq!(
+                super::env_override(super::ENV_PUBKEY).as_deref(),
+                Some("not-our-key"),
+                "the gate needs to be able to point at a feed it signed itself"
+            );
+            // An empty value is not an override; it is an unset variable that
+            // happens to exist (`env FOO= client`), and must not blank the feed.
+            std::env::set_var(super::ENV_URL, "");
+            assert_eq!(super::feed_url("stable"), stable);
+        } else {
+            assert_eq!(
+                super::feed_url("stable"),
+                stable,
+                "a release build must ignore IDLETOKEN_UPDATE_URL"
+            );
+            assert_eq!(super::feed_url("beta"), beta);
+            assert_eq!(
+                super::env_override(super::ENV_PUBKEY),
+                None,
+                "a release build must keep the compiled-in pubkey as its only trust root"
+            );
+        }
         std::env::remove_var(super::ENV_URL);
+        std::env::remove_var(super::ENV_PUBKEY);
     }
 }

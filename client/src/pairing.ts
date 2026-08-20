@@ -146,9 +146,11 @@ export function isValidCode(code: string): boolean {
 // the raw email, and NOT the JWT which differs per login) + the normalized
 // platform URL (accounts from different platforms never collide) + the cluster
 // name (lets one account run separate clusters side by side; machines must
-// share the setting — default "IdleToken-Home"). The secret itself is never broadcast:
-// the UDP beacon carries only its FNV-1a hash, and the full value travels only
-// inside the LAN TCP join as proof — the same trust level as a shared code.
+// share the setting — default "IdleToken-Home"). The secret itself is never
+// broadcast, and since 2026-08-20 (audit A-P0-3) neither is anything derived
+// from it: the UDP beacon carries a random session id and a per-packet nonce
+// only, and the full value travels solely inside the LAN TCP join as proof —
+// the same trust level as a shared code.
 // Honesty: this proves "derived from the same account material", which matches
 // the code-mode trust bar; it is not a platform-verified JWT handshake (that is
 // the engine's --pair-account path, a later convergence).
@@ -221,9 +223,12 @@ class DevSimPairing implements PairingProvider {
     };
     this.emit();
     // Simulate two machines joining, then auto-orchestrate (P4).
+    // Generic names on purpose (2026-08-20 audit, D-P1-5's client half): these
+    // used to be the maintainers' own test-bed machines, which then shipped in
+    // the public bundle as a list of somebody's real computers.
     this.timers.push(
-      setTimeout(() => this.addSimPeer("dgx-spark", "GB10 (unified)"), 1400),
-      setTimeout(() => this.addSimPeer("win-laptop", "RTX 2070"), 2800),
+      setTimeout(() => this.addSimPeer("machine-b", "GB10 (unified)"), 1400),
+      setTimeout(() => this.addSimPeer("machine-c", "RTX 2070"), 2800),
       setTimeout(() => this.orchestrate(), 3600)
     );
   }
@@ -234,7 +239,7 @@ class DevSimPairing implements PairingProvider {
     this.state = {
       code: _code.trim().toUpperCase(),
       peers: [
-        { id: "peer-coord", hostname: "win-pc-01", gpu: "RTX 5060 Ti", role: "coordinator", self: false, stage: "joined", online: true,
+        { id: "peer-coord", hostname: "machine-a", gpu: "RTX 5060 Ti", role: "coordinator", self: false, stage: "joined", online: true,
           vramFree: 13.2 * 1024 ** 3, ramFree: 20.6 * 1024 ** 3, unifiedMemory: false },
         this.selfPeer(self, "worker"),
       ],
@@ -336,7 +341,10 @@ class DevSimPairing implements PairingProvider {
         this.state.phase = "ready";
         setPeers("ready");
         // P6: API auto-listens on the coordinator once the cluster is ready.
-        this.state.api = { baseUrl: "http://192.168.1.100:8000", status: "online" };
+        // Loopback, like the real thing: the inference API is coordinator-local
+        // (2026-08-15), so a LAN address here was both a stale claim and a real
+        // internal address in a shipped bundle.
+        this.state.api = { baseUrl: "http://127.0.0.1:8000", status: "online" };
         this.emit();
       }, 2600)
     );

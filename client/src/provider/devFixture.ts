@@ -21,7 +21,9 @@ export const devFixtureProvider: ResourceProvider = {
     return {
       source: "dev-fixture",
       probedAt: Date.now(),
-      hostname: "win-pc-01",
+      // Generic, not a maintainer's own machine (2026-08-20 audit): the
+      // fixture ships in the public bundle.
+      hostname: "machine-a",
       os: "windows",
       cpu_count: 20,
       gpu_name: "NVIDIA GeForce RTX 5060 Ti",

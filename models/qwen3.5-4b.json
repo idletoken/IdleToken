@@ -345,7 +345,7 @@
     "Same architecture as qwen3.5-0.8b (qwen35, hybrid 3:1), but the linear path **shares k heads**: k_heads 16 < v_heads 32, so each k head serves 2 v heads (grp=2). The 0.8B model is 16/16 (grp=1) and can never exercise this path.",
     "Every shape is derived from GGUF metadata, so the loader needs no change: v_heads=ssm.time_step_rank(32), v_dim=ssm.inner_size/v_heads(4096/32=128), k_heads=ssm.group_count(16), k_dim=ssm.state_size(128).",
     "Full layers: 4 KV heads × 256 head_dim × 2 (K+V) × 4 B = 8192 B per token per layer. Linear layers: state 32×128×128×4 plus conv window 3×8192×4 = 2195456 B, independent of context length.",
-    "Verified on DGX 2026-07-28: CPU and CUDA agree token for token on two prompts; under HOMEAI_DS4X_GDN_CHECK the CPU/GPU recurrence differs by at most 5.960e-08 element-wise across 168 chunks (docs/linear-attention-design.md §4j).",
+    "Verified on a unified-memory Linux node 2026-07-28: CPU and CUDA agree token for token on two prompts; under IDLETOKEN_DS4X_GDN_CHECK the CPU/GPU recurrence differs by at most 5.960e-08 element-wise across 168 chunks (docs/linear-attention-design.md §4j).",
     "layer_weight_bytes / shared_weight_bytes are **measured**, not estimated from bits per weight: summed tensor by tensor via scripts/gguf_shard.py index, with blk.N.* counted as layer weights and everything else as shared.",
     "Only Q4_K_M is registered. Precisions we have not downloaded stay out of variants, so no unverified number ever appears here."
   ]

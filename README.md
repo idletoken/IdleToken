@@ -11,9 +11,12 @@ Put your idle compute to work, then tap into more Tokens when demand spikes.
 
 [中文](README.zh-CN.md)
 
-<p align="center">
-  <img src="docs/images/screenshot.png" alt="IdleToken" width="820">
-</p>
+<!-- The screenshot that used to sit here was the marketing site, not the app:
+     it carried an "IN BETA" ribbon and a "get 100 Sparks" signup offer that no
+     longer exists. Rather than show visitors a picture of something else,
+     there is no image until a real client screenshot is taken on a machine
+     that is serving (model picker + running state). Drop it in at
+     docs/images/screenshot.png and restore the <img> block. -->
 
 ---
 
@@ -39,14 +42,16 @@ export ANTHROPIC_API_KEY='<your platform API key>'
 claude
 ```
 
-The OpenAI-compatible endpoint works at the same base URL. Requests run on clusters other people share and are billed in Sparks; new accounts start with 100.
+The OpenAI-compatible endpoint works at the same base URL. Requests run on clusters other people share and are billed in Sparks. A new account starts at a zero balance; Sparks come from sharing your own machine, from a redemption code, or from a transfer.
 
 ### Your own machine: deploy IdleToken
 
 IdleToken is a desktop app; normal use needs no command line. Installers for Windows, Linux and macOS are on the [Releases](https://github.com/idletoken/IdleToken/releases) page.
 
 1. **Pick a model** — from the built-in list. The app checks it against this machine's available VRAM and RAM.
-2. **Start serving** — missing weights download automatically. The API listens on `:8000`; the app shows the address and the generated API key.
+2. **Start serving** — missing weights download automatically. The API listens on `127.0.0.1:8000`, this machine only; the app shows the address and the generated API key.
+
+Weights are fetched from Hugging Face. If `huggingface.co` cannot be reached, the client retries the same file from the `hf-mirror.com` mirror rather than failing — a fallback worth knowing about if your network policy cares where bytes come from. Either way the finished file is checked against the SHA-256 recorded in the model manifest before it is used, and a file that does not match is discarded.
 
 Connect Claude Code:
 
@@ -77,15 +82,16 @@ The built-in models:
 
 | Model                  |   Default weights | Default quant | Notes                  |
 | ---------------------- | ----------------: | ------------- | ---------------------- |
-| Qwen3.5-0.8B           |          0.49 GiB | Q4_K_M        |                        |
-| Qwen3.5-4B             |          2.54 GiB | Q4_K_M        |                        |
+| Qwen3.5-0.8B           |          0.31 GiB | IQ2_XXS       |                        |
+| Qwen3.5-4B             |          1.42 GiB | IQ2_XXS       |                        |
 | Qwen3-8B               |          4.68 GiB | Q4_K_M        |                        |
-| Qwen3.5-9B             |          5.28 GiB | Q4_K_M        |                        |
-| Qwen3.5-27B            |         15.58 GiB | Q4_K_M        |                        |
-| Qwen3.5-35B-A3B        |         20.49 GiB | Q4_K_M        | 3B active parameters   |
-| DeepSeek-V4-Flash-0731 |         80.76 GiB | IQ2_XXS + Q2_K | 304B total, 13B active |
+| Qwen3.5-9B             |          2.97 GiB | IQ2_XXS       |                        |
+| Qwen3.8-27B            |          5.77 GiB | IQ1_S         | the perplexity gate ran on Q4_K_M, not on this default |
+| Qwen3.5-27B            |          7.98 GiB | IQ2_XXS       |                        |
+| Qwen3.5-35B-A3B        |          9.93 GiB | IQ2_XXS       | 3B active parameters   |
+| DeepSeek-V4-Flash-0731 |         76.87 GiB | IQ1_S         | 304B total, 13B active |
 
-Several Qwen models also offer Q5, Q6, Q8 and BF16 variants. DeepSeek-V4-Flash can be distributed across a cluster; the other built-in models run on a single machine.
+The default is the smallest published precision, so that each model reaches as many machines as possible; the app offers the larger ones (up to Q8 and BF16 for several of the Qwen models) whenever the machine has room. Qwen3.8-27B is the exception worth stating plainly: its perplexity band was measured at Q4_K_M (16.46 GiB), and IQ1_S — the default — has not been through that gate. DeepSeek-V4-Flash can be distributed across a cluster; the other built-in models run on a single machine.
 
 ## Requirements
 
@@ -94,9 +100,10 @@ These apply to machines that run inference; using the platform requires no GPU a
 | Platform | Compute hardware | Also needs |
 | --- | --- | --- |
 | Windows 10/11 | NVIDIA, compute capability ≥ 7.5 (RTX 20-series or newer), ≥ 4 GB VRAM | driver ≥ 527.41 and CUDA Toolkit 12.x |
-| Linux | NVIDIA, compute capability ≥ 7.5 (RTX 20-series or newer), ≥ 4 GB VRAM | driver ≥ 580.65 and CUDA Toolkit 13.0 |
+| Linux | NVIDIA, compute capability ≥ 7.5 (RTX 20-series or newer), ≥ 4 GB VRAM | driver ≥ 580.65 and CUDA Toolkit 13.0; **prebuilt packages are arm64 only** — on x86_64, build from source |
 | macOS | Apple Silicon with Metal and enough unified memory for the selected model | no CUDA installation |
 
+- The Linux packages on the Releases page are arm64 `.deb` and AppImage. x86_64 Linux is fully supported but has no prebuilt package yet, and no `.rpm` has been published even though the build script can produce one — both are a packaging gap, not a functional one.
 - Operating systems can mix in one cluster; the IdleToken version must match on every node.
 - Cluster machines need a direct LAN route to each other; tensor traffic does not go through VPN or overlay networks such as Tailscale. Wired gigabit or faster is recommended.
 - CPU-only machines, AMD GPUs, Intel Macs and phones cannot compute, but can run the client to sign in, chat and control a cluster.
@@ -125,7 +132,7 @@ Packaging: `scripts\build_client_release.bat` (Windows NSIS installer), `scripts
 
 **Chat streams hang while a local HTTP proxy is running.** Proxies such as Clash can swallow loopback SSE streams. Set `NO_PROXY=127.0.0.1,localhost` in the terminal running `claude` or `curl`, or add a direct-connection rule for `127.0.0.1` to the proxy.
 
-**Windows Firewall blocks pairing or cluster traffic.** Run IdleToken elevated once, or run the `netsh` command printed in the log as administrator. Ports: UDP 14097 and 14099 (discovery and pairing), TCP 14100 and 14101 (cluster control), TCP 50052 (worker rpc-server, configurable), TCP 8000 (API, only when other devices call it).
+**Windows Firewall blocks pairing or cluster traffic.** Run IdleToken elevated once, or run the `netsh` command printed in the log as administrator. Ports: UDP 14097 and 14099 (discovery and pairing), TCP 14100 and 14101 (cluster control), TCP 50052 (worker rpc-server, configurable). The API port 8000 is deliberately **not** on that list: it is bound to 127.0.0.1 and is not reachable from another machine, so there is nothing to allow through. To use your cluster from another device, go through the platform relay rather than opening a port.
 
 **Linux client opens a blank window.** Launch with `WEBKIT_DISABLE_DMABUF_RENDERER=1 idletoken-client`.
 
@@ -137,13 +144,12 @@ Packaging: `scripts\build_client_release.bat` (Windows NSIS installer), `scripts
 
 IdleToken would not exist without a number of excellent open-source projects. Particular thanks to:
 
-* [ds4](https://github.com/antirez/ds4)
-* [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)
-* [Ollama](https://github.com/ollama/ollama)
+* [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) — the inference engine IdleToken runs on
 * [Tauri](https://github.com/tauri-apps/tauri)
 * [TweetNaCl](https://tweetnacl.cr.yp.to/)
 * [BLAKE2](https://github.com/BLAKE2/BLAKE2)
 * [DeepSeek](https://github.com/deepseek-ai)
 * [Qwen](https://github.com/QwenLM)
+* [ds4](https://github.com/antirez/ds4) — the engine of IdleToken's early prototype, before the project settled on llama.cpp
 
 and to every open-source project IdleToken depends on, and everyone who contributes to them.

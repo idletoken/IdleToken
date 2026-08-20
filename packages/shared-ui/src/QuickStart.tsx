@@ -3,6 +3,13 @@
 // client can point at localhost or anywhere else), so no domain is hardcoded.
 import { useState } from 'react';
 
+// The literal prefix of a real platform API key (gateway account.service.ts
+// mints `sk-idletoken-<32 hex>`). Sample keys in the snippets below MUST use it:
+// a reader who copies the shape from here and hand-builds a key with any other
+// prefix gets a 401 that says nothing about why.
+export const API_KEY_PREFIX = 'sk-idletoken-';
+const SAMPLE_KEY = `${API_KEY_PREFIX}...`;
+
 export function connectSnippets(apiBase: string): Record<string, string> {
   return {
     curl: `curl ${apiBase}/v1/chat/completions \\
@@ -11,20 +18,20 @@ export function connectSnippets(apiBase: string): Record<string, string> {
   -d '{"model":"dsv4-flash","messages":[{"role":"user","content":"Hello"}]}'`,
     openai: `from openai import OpenAI
 client = OpenAI(base_url="${apiBase}/v1",
-                api_key="itk_live_...")
+                api_key="${SAMPLE_KEY}")
 r = client.chat.completions.create(
   model="dsv4-flash",
   messages=[{"role":"user","content":"Hello"}])
 print(r.choices[0].message.content)`,
     anthropic: `import anthropic
 client = anthropic.Anthropic(base_url="${apiBase}",
-                             api_key="itk_live_...")
+                             api_key="${SAMPLE_KEY}")
 m = client.messages.create(model="dsv4-flash", max_tokens=512,
   messages=[{"role":"user","content":"Hello"}])
 print(m.content[0].text)`,
     claudecode: `# ~/.claude/settings.json, or environment variables
 export ANTHROPIC_BASE_URL="${apiBase}"
-export ANTHROPIC_API_KEY="itk_live_..."
+export ANTHROPIC_API_KEY="${SAMPLE_KEY}"
 # then run claude as usual`,
   };
 }

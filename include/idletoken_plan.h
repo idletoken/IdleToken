@@ -265,8 +265,9 @@ uint64_t idletoken_llama_node_usable(const idletoken_node_mem *node);
  * on a discrete card the host RAM cannot hold a layer either. There is
  * deliberately no second function — one number, one place to be wrong.
  *
- * WHY THIS EXISTS (2026-08-18, win_PC, measured): the slot count was budgeted
- * against vram+ram, so a 16 GiB card was told it had 80 GiB and opened 4 slots
+ * WHY THIS EXISTS (2026-08-18, measured on a Windows desktop): the slot count
+ * was budgeted against vram+ram, so a 16 GiB card was told it had 80 GiB and
+ * opened 4 slots
  * × 40960 ctx ≈ 22 GiB of KV. Windows WDDM does not fail that allocation — it
  * pages VRAM out to system memory, and because the desktop compositor shares
  * the card, the whole machine froze. A budget charged to memory the allocation

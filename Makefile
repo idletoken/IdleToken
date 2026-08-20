@@ -1,18 +1,28 @@
 # IdleToken Cluster top-level Makefile.
 #
+# The inference engine is llama.cpp, and it is NOT built from here: it is a
+# sidecar. scripts/build_llamacpp.sh builds the pinned commit plus our patches,
+# and the two binaries below spawn llama-server / ggml rpc-server as separate
+# processes. Nothing here links libllama.
+#
 # Builds two binaries:
-#   idletoken-worker  — inference shard. Links the GPU ds4 backend of the host
-#                       platform: CUDA on Linux, Metal on macOS.
-#   idletoken-coord   — scheduler + API server. CPU-only ds4 (-DDS4_NO_GPU),
-#                       identical on both platforms (it never touches a GPU).
+#   idletoken-worker  — supervises the rpc-server on a compute node: pairing,
+#                       credentials, NIC selection, resource reporting.
+#   idletoken-coord   — scheduler + API server. Drives llama-server on the
+#                       coordinator and speaks the OpenAI/Anthropic APIs.
+#
+# ds4 (our own generic kernels) is SHELVED since 2026-08-16 and is NOT part of
+# either binary: the call sites link src/common/ds4_stub.c and no ds4 object is
+# compiled. See the IDLETOKEN_WITH_DS4 block further down for the switch that
+# links the real thing again, which is for archaeology, not for shipping. The
+# ds4x* targets in this file are frozen leftovers of that line.
 #
 # Compute hosts: Linux + NVIDIA CUDA, or macOS + Apple Silicon (Metal).
 # Windows is built by scripts/build_*_win.bat, not from here.
 #
-# The Metal path is the SAME ds4 engine: vendor/ds4 implements ds4_gpu.h twice
-# (ds4_cuda.cu / ds4_metal.m) and every IdleToken PP extension sits above that
-# interface, so nothing under src/ is backend-specific. The only Mac-only file
-# is src/platform/mac/mac_gpu.m, the Metal facts the C resource probe needs.
+# macOS is Apple Silicon only because the engine's Mac backend is Metal on
+# unified memory. The only Mac-specific file under src/ is
+# src/platform/mac/mac_gpu.m, the Metal facts the C resource probe needs.
 
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
@@ -21,8 +31,8 @@ ifeq ($(UNAME_S),Linux)
 else ifeq ($(UNAME_S),Darwin)
   IDLETOKEN_GPU := metal
   ifneq ($(UNAME_M),arm64)
-    $(info IdleToken Cluster needs Apple Silicon on macOS: the ds4 Metal kernels)
-    $(info assume unified memory, which an Intel Mac's GPU does not have.)
+    $(info IdleToken Cluster needs Apple Silicon on macOS: the Mac compute path)
+    $(info is Metal on unified memory, which an Intel Mac's GPU does not have.)
     $(error unsupported mac architecture: $(UNAME_M))
   endif
 else
@@ -123,8 +133,9 @@ endif
 # are simply never compiled.
 #
 # What this buys, measured: a Windows worker no longer needs the CUDA Toolkit to
-# build (win_PC2 has only the driver and could not build at all), and the build
-# stops spending ~10 minutes in nvcc on kernels that never execute.
+# build (a test machine with only the driver installed could not build at all
+# before this), and the build stops spending ~10 minutes in nvcc on kernels that
+# never execute.
 #
 # IDLETOKEN_WITH_DS4=1 links the real thing again — for archaeology on the
 # frozen line, not for shipping. tweetnacl is NOT part of this: it is the

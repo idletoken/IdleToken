@@ -59,8 +59,8 @@ scripts/sync-provenance.sh "$NODE:$WHOME" > "$PROVENANCE_DIR/provenance.json"
 # the older exe already on the machine.
 #
 # `client/` is on the list too (added 2026-08-04): the installer is built on this
-# machine, and the client sources used to be **scp'd by hand** (one-off copies
-# like `homeai-client-src.tgz` are still lying around there). Hand copies drift,
+# machine, and the client sources used to be **scp'd by hand** (one-off client
+# source tarballs are still lying around there). Hand copies drift,
 # and after the rename the staged sidecar on the build machine still had the old
 # name, so a rebuilt package carried **both** engines. `client/dist` is
 # **deliberately excluded**: it is a build artifact, and which one you carry

@@ -21,6 +21,38 @@ export const DIAG_SETTING_KEYS = [
   "platformUrl",
 ] as const satisfies readonly (keyof AppSettings)[];
 
+/**
+ * The settings that may leave this machine in a file, and only those.
+ *
+ * Added 2026-08-20 (audit A-P2-1) because there were two exits and only one
+ * had a filter: "Export settings" serialized the whole `AppSettings` object,
+ * `apiToken` and `overflowKey` included, into a file whose entire purpose is
+ * to be moved to another machine or handed to someone helping. The same
+ * allowlist now governs both — a settings backup that omits the local API key
+ * costs one re-copy from the API page; one that includes it hands over the
+ * gate to this machine's inference API.
+ *
+ * A superset of the diagnostics keys: a backup is meant to be restorable, so it
+ * carries the preferences the diagnostics bundle has no reason to know about.
+ */
+export const EXPORT_SETTING_KEYS = [
+  ...DIAG_SETTING_KEYS,
+  "quant", "maxTokens", "tier",
+  "accent", "uiScale", "density", "reduceMotion",
+  "trayIcon", "closeToTray", "startMinimized", "rememberWindow", "autostart",
+  "autoUpdate", "updateChannel",
+  "modelDir", "mdns", "manualPeers", "heartbeatSec",
+  "schemaVersion",
+] as const satisfies readonly (keyof AppSettings)[];
+
+export function exportableSettings(settings: AppSettings): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  // Deduplicated: EXPORT_SETTING_KEYS spreads DIAG_SETTING_KEYS, which already
+  // holds several of the names repeated below for readability.
+  for (const k of new Set<keyof AppSettings>(EXPORT_SETTING_KEYS)) out[k] = settings[k];
+  return out;
+}
+
 /** The engine-side report plus the allowlisted settings = the file the user downloads. */
 export function buildDiagnosticsBundle(
   report: Record<string, unknown>,

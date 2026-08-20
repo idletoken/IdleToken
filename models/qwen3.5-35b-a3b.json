@@ -378,7 +378,7 @@
     "**The first MoE model we got running.** The MoE path used by DSv4 and GLM had never run on real weights before, because 80 GB / 240 GB would not fit. The architecture is qwen35moe: hybrid linear attention plus 256 experts, top-8.",
     "It adds exactly one thing to the existing MoE path: **the shared expert carries a scalar sigmoid gate** (ffn_gate_inp_shexp). In the llama.cpp graph this is shared_expert_gate → SIGMOID → MUL, whereas other MoE models (DSv4) add the shared expert ungated.",
     "Two settings are absent from the GGUF and hardcoded per architecture in llama.cpp, so we hardcode them the same way: top-k weights must be renormalized (SUM_ROWS→CLAMP→DIV in the graph), and expert_shared_count is missing, so we derive it from expert_shared_feed_forward_length -- otherwise the shared expert is silently skipped.",
-    "Verified on DGX 2026-07-28: the continuation of \"Count: 1, 2, 3,\" matches llama.cpp character for character (\" 4, 5, 6,\"); layer 0 l_out is -0.5434 against the oracle's -0.5504, and input_embed is identical on both sides.",
+    "Verified on a unified-memory Linux node 2026-07-28: the continuation of \"Count: 1, 2, 3,\" matches llama.cpp character for character (\" 4, 5, 6,\"); layer 0 l_out is -0.5434 against the oracle's -0.5504, and input_embed is identical on both sides.",
     "Falsification: ignoring the shared expert gate turns l_out-0 into -1.5660 and the output into garbage; dropping the shared expert entirely yields \" 4, 5, 5\" -- subtly wrong. Both injected faults were caught.",
     "layer_weight_bytes / shared_weight_bytes are measured, summed tensor by tensor via scripts/gguf_shard.py index.",
     "Only Q4_K_M is registered."

@@ -1,5 +1,10 @@
 /* dspark_aux_test.c — is the DSpark aux-hidden capture actually right?
  *
+ * SHELVED 2026-08-03; the ds4 line it tests was shelved 2026-08-16 and is no
+ * longer compiled into any binary (src/common/ds4_stub.c stands in for it).
+ * Nothing here is built by default, nothing calls it, and the G_DSPARK gate
+ * SKIPs unless IDLETOKEN_DSPARK_GATE=1. Kept for the record, not for use.
+ *
  * The drafter's context is main_norm(main_proj(concat(aux[40], aux[41],
  * aux[42]))), where aux[L] is the target model's hidden state at layer L
  * MEAN-REDUCED over the hc streams. Getting that reduction wrong (or capturing

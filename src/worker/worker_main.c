@@ -831,7 +831,7 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
     /* Self-provision the inbound rules this mode needs, same as the legacy
      * worker path. Without the TCP rule the rpc-server binds and reports
      * ready, the coordinator's connect times out, and the failure reads as a
-     * coordinator-side problem (measured on win_PC2, 2026-08-15) — the one
+     * coordinator-side problem (measured on Windows, 2026-08-15) — the one
      * machine that can fix it is this one. */
     {
         char rule[64];

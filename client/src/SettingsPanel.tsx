@@ -11,6 +11,7 @@ import {
   DEFAULT_SETTINGS,
   TIERS,
   effectiveCaps,
+  loadSettings,
   saveSettings,
   type AppSettings,
   type ResourcePreset,
@@ -21,7 +22,11 @@ import WeightsRow from "./WeightsRow";
 import StoredModels from "./StoredModels";
 import ProblemLog from "./ProblemLog";
 import { getEngineProvider } from "./provider/engine";
-import { buildDiagnosticsBundle, diagnosticsFileName } from "./diagnostics";
+import { buildDiagnosticsBundle, diagnosticsFileName, exportableSettings } from "./diagnostics";
+import PlatformPanel from "./PlatformPanel";
+import Markdown from "./Markdown";
+import { openExternal } from "./auth";
+import { GUIDE_URL, ISSUES_URL, NOTICE_URL, REPO_URL, SECURITY_URL, legalUrl } from "./links";
 
 type Theme = "dark" | "light";
 const MiB = 1024 ** 2;
@@ -36,7 +41,11 @@ type FieldType =
   /** Full-width block: the model folder's contents, with a Delete per file. */
   | "stored-models"
   /** Full-width block: the local problem log + its consent switch. */
-  | "problems";
+  | "problems"
+  /** Full-width block: the outbound links (guide, repository, notices). */
+  | "links"
+  /** Full-width block: the platform's terms and privacy policy, read in place. */
+  | "legal";
 interface Field {
   key?: keyof AppSettings;
   type: FieldType;
@@ -63,6 +72,9 @@ interface Category {
   label: Bi;
   note?: Bi;
   bespoke?: "quick" | "platform" | "endpoints" | "resources";
+  /** Only render this category when the predicate holds (the platform console
+   *  needs a build that has a platform to talk to). */
+  visible?: () => boolean;
   sections?: Section[];
 }
 
@@ -172,10 +184,17 @@ function ModelWeightsCell(props: {
 //                 manager, precision, the capability table, the folder.
 //   Cluster & API pairing, the API service, inference/cache knobs, and how to
 //                 connect a client.
-// "Sharing & earnings", "Platform account" and "Advanced (coming soon)" are
-// GONE, not moved: none of them does anything a user can feel yet, and a
-// settings page must not show controls that do nothing (principle 15). They
-// return together with the features they configure.
+// "Advanced (coming soon)" is GONE, not moved: it did nothing a user could
+// feel, and a settings page must not show controls that do nothing
+// (principle 15).
+//
+// "Sharing & earnings" is BACK (2026-08-20, audit A-P1-2). It was removed on
+// the same reasoning while the marketplace was not live. The marketplace IS
+// live now — balance, ledger, providers and the lend/borrow switch are all real
+// platform calls — and the client was the only place with no way in: you could
+// not see your balance, list this cluster, or turn sharing on from the app that
+// runs the cluster. The category renders `PlatformPanel`, which has been intact
+// and unreachable the whole time.
 const CATEGORIES: Category[] = [
   // The model page: download manager, capability table, storage, plus the
   // model-adjacent runtime knobs (context tier, resource caps). Language and
@@ -228,6 +247,16 @@ const CATEGORIES: Category[] = [
       ] },
     ],
   },
+  // A-P1-2: the marketplace console. Hidden when this build has no platform
+  // configured — an empty console is worse than no entry — but present the
+  // moment there is one, signed in or not (the panel's own Guide explains what
+  // to do next, which is what an entry that leads somewhere is for).
+  {
+    id: "platform",
+    bespoke: "platform",
+    label: { en: "Sharing & earnings", zh: "共享与收益" },
+    visible: () => !!loadSettings().platformUrl.trim(),
+  },
   {
     id: "network",
     label: { en: "Networking", zh: "联机组网" },
@@ -262,9 +291,31 @@ const CATEGORIES: Category[] = [
     // a privacy page read as marketing, and every claim beyond the mechanism
     // itself is another thing the page can be wrong about. The design doc
     // (docs/privacy-design.md) is where the full story lives.
+    // 2026-08-20 (audit A-P1-5): one line was too few. The three sentences
+    // added below are not prose assurances — each names a mechanism that is
+    // enforced in code and can be checked: the scheduler refuses to place
+    // layer 0 away from the embedding table, the RPC transport refuses to run
+    // without a PSK, and the coordinator rewrites any non-loopback API bind.
+    // They are the product's actual claim, and a privacy page that does not
+    // state them leaves the reader to take the marketing's word for it.
     sections: [
       { fields: [
-        { type: "note", label: { en: "Encryption: X25519 + AES-256-GCM envelope encryption.", zh: "加密方式：X25519 + AES-256-GCM 信封加密。" } },
+        { type: "note", label: {
+          en: "The machine you run the coordinator on holds the first layer of the model, because that is the layer that could otherwise be used to reconstruct your prompt. The scheduler enforces this and refuses to start rather than place it elsewhere.",
+          zh: "运行协调者的这台机器持有模型的第 0 层——因为这一层若放在别处，就足以还原出你的提示词。调度器强制这一点，宁可拒绝启动，也不会把它放到其它机器上。" } },
+        { type: "note", label: {
+          en: "Traffic between machines in a cluster is encrypted (TLS with a pre-shared key minted by the coordinator). A node that has no key refuses to start; there is no unencrypted fallback.",
+          zh: "集群内跨机流量全程加密（TLS，密钥由协调者铸造并下发）。拿不到密钥的节点会拒绝启动，没有明文回退。" } },
+        { type: "note", label: {
+          en: "The inference API listens on this machine only (127.0.0.1). It is not reachable from your network, and remote use goes through the platform relay with end-to-end encrypted prompts.",
+          zh: "推理 API 只监听本机（127.0.0.1），局域网内无法访问；远程调用走平台中继，提示词端到端加密。" } },
+        { type: "note", label: {
+          en: "Encryption: X25519 + AES-256-GCM envelope encryption.",
+          zh: "加密方式：X25519 + AES-256-GCM 信封加密。" } },
+        // The full documents, read in this window rather than opened as a page
+        // of raw JSON in a browser. Absent when no platform is configured —
+        // there is then nothing to link to, and a dead button is worse.
+        { type: "legal" },
         // "Share anonymous telemetry" was removed on 2026-08-13. There is no
         // telemetry client anywhere in the tree — not in the client, the engine
         // or the platform agent — so the switch never had a consumer. A privacy
@@ -311,17 +362,25 @@ const CATEGORIES: Category[] = [
       // bundle could say `logLevel: "debug"` about an engine that had never
       // been asked to run that way, and send whoever read it looking for logs
       // that were never produced.
-      // "Problems & diagnostics" hidden entirely (2026-08-15, user call): the
-      // problem log keeps recording locally (problems.ts) and the diagnostics
-      // bundle machinery stays in the codebase — only the surface is gone.
-      // Bring the section back here when a support flow needs it.
       // "Data folder" removed with them: the client's data lives in this
       // machine's app-data directory (Tauri decides it) and in localStorage,
       // and no code ever read the box. Typing a path did not move anything.
       { label: { en: "Data & backup", zh: "数据与备份" }, fields: [
-        { type: "action", action: "export", label: { en: "Export settings", zh: "导出设置" } },
+        { type: "action", action: "export", label: { en: "Export settings", zh: "导出设置" },
+          hint: { en: "Keys and tokens are left out of the file.", zh: "导出文件不包含密钥与令牌。" } },
         { type: "action", action: "import", label: { en: "Import settings", zh: "导入设置" } },
         { type: "action", action: "clearData", label: { en: "Clear all local data", zh: "清除全部本地数据" } },
+      ] },
+      // Back on screen 2026-08-20 (audit A-P1-5). It was hidden on 2026-08-15
+      // while the machinery stayed in the tree; what that left behind was a
+      // user whose cluster would not start and no way to get at the evidence —
+      // the failures were being recorded locally and shown to nobody. The
+      // bundle is still the only thing that leaves the machine, and only when
+      // the user exports it by hand.
+      { label: { en: "Problems & diagnostics", zh: "问题与诊断" }, fields: [
+        { type: "problems" },
+        { type: "action", action: "diagnostics", label: { en: "Export diagnostics", zh: "导出诊断信息" },
+          hint: { en: "A file with this machine's hardware, settings and recent failures. Attach it when you report a problem.", zh: "包含本机硬件、设置与最近失败记录的文件。反馈问题时请附上它。" } },
       ] },
       { label: { en: "About", zh: "关于" }, fields: [
         { type: "note", label: { en: `IdleToken client ${APP_VERSION}`, zh: `IdleToken 客户端 ${APP_VERSION}` } },
@@ -332,6 +391,9 @@ const CATEGORIES: Category[] = [
         // the attribution Apache-2.0 §4(d) actually requires, and an About box
         // that re-lists it is a second copy to keep true.
         { type: "note", label: { en: "Apache-2.0.", zh: "Apache-2.0 许可。" } },
+        // A-P1-5: until now the whole client had one outbound link. The
+        // addresses live in links.ts, not in this schema — see that file.
+        { type: "links" },
       ] },
     ],
   },
@@ -340,7 +402,113 @@ const CATEGORIES: Category[] = [
 // The "Advanced · coming soon" roadmap shelf is deleted outright (2026-08-15;
 // it had been hidden from the nav since 2026-08-11). AppSettings keys and
 // defaults for its reserved fields are unchanged, so nothing migrates.
-const VISIBLE_CATEGORIES = CATEGORIES;
+function visibleCategories(): Category[] {
+  return CATEGORIES.filter((c) => !c.visible || c.visible());
+}
+
+/** Where the engine keeps the KV cache when the field is left empty, per
+ *  platform — matching worker_main.c's own choice (LOCALAPPDATA on Windows,
+ *  XDG_CACHE_HOME/HOME elsewhere). Shown as a placeholder only; nothing here
+ *  is written to settings. */
+function defaultKvHint(): string {
+  const ua = typeof navigator !== "undefined" ? navigator.userAgent : "";
+  if (/Windows/i.test(ua)) return "%LOCALAPPDATA%\\IdleToken\\kv";
+  if (/Mac OS X|Macintosh/i.test(ua)) return "~/Library/Caches/idletoken/kv";
+  return "~/.cache/idletoken/kv";
+}
+
+/** The About link list. One row per destination, opened in the real browser
+ *  (never the app webview — see auth.openExternal). */
+function AboutLinks(props: { lang: Lang }) {
+  const items: { href: string; label: Bi }[] = [
+    { href: GUIDE_URL, label: { en: "User guide", zh: "使用指南" } },
+    { href: REPO_URL, label: { en: "Source code", zh: "源代码" } },
+    { href: ISSUES_URL, label: { en: "Report a problem or request a model", zh: "反馈问题 / 申请新模型" } },
+    { href: SECURITY_URL, label: { en: "Report a security issue", zh: "报告安全问题" } },
+    { href: NOTICE_URL, label: { en: "Third-party notices", zh: "第三方声明" } },
+  ];
+  return (
+    <div className="about-links">
+      {items.map((it) => (
+        <button key={it.href} className="linkbtn" onClick={() => void openExternal(it.href)}>
+          {L(it.label, props.lang)} ↗
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * Terms and privacy policy, fetched from the platform and rendered here.
+ *
+ * In the app rather than in a browser tab because the endpoint answers
+ * markdown inside JSON — the canonical text, but not something to hand a
+ * browser. Unreachable platform = the error, never a cached or paraphrased
+ * copy: a legal text the client made up would be worse than none.
+ */
+function LegalDocs(props: { lang: Lang }) {
+  const [open, setOpen] = useState<null | "tos" | "privacy">(null);
+  const [body, setBody] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  const show = async (doc: "tos" | "privacy") => {
+    const url = legalUrl(doc, props.lang);
+    if (!url) return;
+    setOpen(doc);
+    setBody(null);
+    setErr(null);
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const j = (await res.json()) as { markdown?: string };
+      if (!j.markdown) throw new Error("the platform returned no document");
+      setBody(j.markdown);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  // No platform configured: nothing to link to, so no buttons. A control that
+  // cannot do anything is the thing this audit round keeps removing.
+  if (!legalUrl("tos", props.lang)) return null;
+
+  return (
+    <div className="about-links">
+      <button className="linkbtn" onClick={() => void show("privacy")}>
+        {L({ en: "Privacy policy", zh: "隐私政策" }, props.lang)}
+      </button>
+      <button className="linkbtn" onClick={() => void show("tos")}>
+        {L({ en: "Terms of service", zh: "服务条款" }, props.lang)}
+      </button>
+      {open ? (
+        <div className="modal-scrim" onClick={() => setOpen(null)}>
+          <div className="modal modal--legal" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
+            <div className="modal__head">
+              <h2>
+                {open === "privacy"
+                  ? L({ en: "Privacy policy", zh: "隐私政策" }, props.lang)
+                  : L({ en: "Terms of service", zh: "服务条款" }, props.lang)}
+              </h2>
+              <button className="iconbtn" onClick={() => setOpen(null)} aria-label="close">
+                ✕
+              </button>
+            </div>
+            {err ? (
+              <p className="setting-hint">
+                {L({ en: "Could not load the document: ", zh: "无法加载文档：" }, props.lang)}
+                {err}
+              </p>
+            ) : body === null ? (
+              <p className="setting-hint">{L({ en: "Loading…", zh: "加载中…" }, props.lang)}</p>
+            ) : (
+              <Markdown text={body} />
+            )}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
 
 // ---- panel -----------------------------------------------------------------
 export default function SettingsPanel(props: {
@@ -389,8 +557,11 @@ export default function SettingsPanel(props: {
   apiBaseUrl?: string | null;
 }) {
   const { t, lang } = useI18n();
+  // Recomputed per render: the platform category appears the moment a
+  // platform URL is set, without a reload.
+  const cats = visibleCategories();
   const [active, setActive] = useState(
-    props.initialCategory && VISIBLE_CATEGORIES.some((c) => c.id === props.initialCategory) ? props.initialCategory : "quick"
+    props.initialCategory && cats.some((c) => c.id === props.initialCategory) ? props.initialCategory : "quick"
   );
   const [query, setQuery] = useState("");
   // "Clear my cache now" feedback (philosophy 15: every action has clear
@@ -450,7 +621,12 @@ export default function SettingsPanel(props: {
 
   const runAction = (a: Field["action"]) => {
     if (a === "export") {
-      const blob = new Blob([JSON.stringify(s, null, 2)], { type: "application/json" });
+      // A-P2-1: through the same allowlist the diagnostics bundle uses.
+      // "Export settings" wrote the file the user then mails to someone, and
+      // it used to carry `apiToken` and `overflowKey` in the clear with no
+      // warning — the exact credentials diagnostics.ts was written to keep out
+      // of a shared file. One allowlist, both exits.
+      const blob = new Blob([JSON.stringify(exportableSettings(s), null, 2)], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
@@ -520,7 +696,7 @@ export default function SettingsPanel(props: {
   const searchHits = useMemo(() => {
     if (!q) return null;
     const hits: { cat: Category; field: Field }[] = [];
-    for (const c of VISIBLE_CATEGORIES) {
+    for (const c of cats) {
       for (const sec of c.sections ?? []) {
         for (const f of sec.fields) {
           if (f.label && L(f.label, lang).toLowerCase().includes(q)) hits.push({ cat: c, field: f });
@@ -530,7 +706,7 @@ export default function SettingsPanel(props: {
     return hits;
   }, [q, lang]);
 
-  const cat = VISIBLE_CATEGORIES.find((c) => c.id === active) ?? VISIBLE_CATEGORIES[0];
+  const cat = cats.find((c) => c.id === active) ?? cats[0];
 
   const renderField = (f: Field, i: number) => {
     if (f.showIf && !f.showIf(s)) return null;
@@ -542,6 +718,8 @@ export default function SettingsPanel(props: {
     if (f.type === "stored-models")
       return <StoredModels key={i} modelDir={s.modelDir} onChanged={props.onWeightsChanged} />;
     if (f.type === "problems") return <ProblemLog key={i} />;
+    if (f.type === "links") return <AboutLinks key={i} lang={lang} />;
+    if (f.type === "legal") return <LegalDocs key={i} lang={lang} />;
     if (f.type === "action") {
       let btnLabel = label;
       if (f.action === "checkUpdate" && upd === "busy") btnLabel = t("update.checking");
@@ -797,8 +975,13 @@ export default function SettingsPanel(props: {
           Rendered through the same field renderer the schema pages use. */}
       <div className="setting-group">
         <div className="setting-group__label">{L({ en: "Inference & cache", zh: "推理与缓存" }, lang)}</div>
-        {renderField({ key: "maxTokens", type: "number", label: { en: "Max tokens per reply", zh: "单次最大生成 tokens" } }, 0)}
-        {renderField({ key: "kvDir", type: "text", label: { en: "KV cache directory", zh: "KV 缓存目录" }, placeholder: "/tmp/idletoken-kv" }, 1)}
+        {renderField({ key: "maxTokens", type: "number", label: { en: "Max tokens per reply", zh: "单次回复最大词元数" } }, 0)}
+        {/* A-P2-6: the placeholder used to suggest /tmp/idletoken-kv on every
+            platform, which on Windows is a path that does not exist and on
+            macOS is one the OS empties without warning. Empty means "let the
+            engine pick"; the hint says where that is on THIS machine. */}
+        {renderField({ key: "kvDir", type: "text", label: { en: "KV cache directory", zh: "KV 缓存目录" },
+                       placeholder: defaultKvHint(), hint: { en: "Empty = the engine's own location for this machine.", zh: "留空 = 由引擎按本机约定选择位置。" } }, 1)}
         {renderField({ type: "action", action: "clearKv", label: { en: "Clear KV cache", zh: "清除 KV 缓存" } }, 2)}
       </div>
       {/* "What can I run?" — the summary verdict, last on purpose (see the
@@ -843,9 +1026,13 @@ export default function SettingsPanel(props: {
           <div className="settings-nav__head">
             <h2>{t("settings.title")}</h2>
           </div>
-          <input className="settings-search" placeholder="🔍" value={query} onChange={(e) => setQuery(e.target.value)} aria-label={t("settings.searchLabel")} />
+          {/* A localized placeholder, not a bare 🔍 (A-P2-6): a magnifier
+              glyph alone renders as an unlabelled box in the two font stacks
+              this ships with, and it is the one control on the page that
+              cannot be guessed from its position. */}
+          <input className="settings-search" placeholder={t("settings.searchLabel")} value={query} onChange={(e) => setQuery(e.target.value)} aria-label={t("settings.searchLabel")} />
           <div className="settings-nav__list">
-            {VISIBLE_CATEGORIES.map((c) => (
+            {cats.map((c) => (
               <button key={c.id} className={`settings-nav__item${active === c.id && !q ? " is-on" : ""}`} onClick={() => { setActive(c.id); setQuery(""); }}>
                 {L(c.label, lang)}
               </button>
@@ -870,6 +1057,15 @@ export default function SettingsPanel(props: {
               {cat.bespoke === "quick" ? renderQuick() : null}
               {cat.bespoke === "resources" ? renderResources() : null}
               {cat.bespoke === "endpoints" ? <EndpointsPanel settings={s} /> : null}
+              {/* A-P1-2: the marketplace console, reachable again. */}
+              {cat.bespoke === "platform" ? (
+                <PlatformPanel
+                  settings={s}
+                  session={props.session ?? null}
+                  onOpenSettings={() => setActive("connect")}
+                  onSignIn={() => props.onSignIn?.()}
+                />
+              ) : null}
               {/* Language and theme live with the rest of Appearance (moved
                   from the model page 2026-08-15). They are not AppSettings
                   fields — the app shell owns them — so they render here rather

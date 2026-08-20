@@ -1,5 +1,10 @@
 /* dspark_markov_test.c — is the DSpark markov bias computed correctly?
  *
+ * SHELVED 2026-08-03; the ds4 line it tests was shelved 2026-08-16 and is no
+ * longer compiled into any binary (src/common/ds4_stub.c stands in for it).
+ * Nothing here is built by default, nothing calls it, and the G_DSPARK gate
+ * SKIPs unless IDLETOKEN_DSPARK_GATE=1. Kept for the record, not for use.
+ *
  *     bias = markov_w2( markov_w1[prev_token] )
  *
  * This is the whole of §4④ and the only source of intra-block dependency in an

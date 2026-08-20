@@ -179,12 +179,22 @@ if not exist "%ROOT%\client\dist\index.html" (
 
 REM --- bundle ------------------------------------------------------------
 REM NSIS only: the MSI target needs WiX, and both toolchains are fetched from
-REM GitHub release assets on first use. Tauri's downloader dies with
-REM `timeout: global` on this network even though the same URL downloads in 4s
-REM from PowerShell — so route it through a mirror unless the caller set one.
-REM Override with your own mirror (or point it at https://github.com to try
-REM direct) by setting TAURI_BUNDLER_TOOLS_GITHUB_MIRROR before running.
-if not defined TAURI_BUNDLER_TOOLS_GITHUB_MIRROR set "TAURI_BUNDLER_TOOLS_GITHUB_MIRROR=https://ghfast.top/https://github.com"
+REM GitHub release assets on first use.
+REM
+REM The default is the official source, github.com, and it must stay that way.
+REM What comes down here is the NSIS toolchain that builds the installer the
+REM user double-clicks, and Tauri's downloader verifies no hash on it: whoever
+REM serves those bytes can put anything into the installer. A third-party
+REM GitHub proxy is therefore a build-chain trust root, and it is not one this
+REM project can vouch for.
+REM
+REM On a network where the direct download fails (Tauri's downloader has been
+REM seen dying with `timeout: global` on a URL that PowerShell fetches in 4s),
+REM set TAURI_BUNDLER_TOOLS_GITHUB_MIRROR yourself before running this script.
+REM Do that only for a mirror you trust, and never for a build that will be
+REM published: an installer whose toolchain came from an unverifiable mirror
+REM should not be signed and shipped.
+if not defined TAURI_BUNDLER_TOOLS_GITHUB_MIRROR set "TAURI_BUNDLER_TOOLS_GITHUB_MIRROR=https://github.com"
 set "BUNDLE=%ROOT%\client\src-tauri\target\release\bundle\nsis"
 cd /d "%ROOT%\client"
 if "%IDLETOKEN_DEFER_UPDATER_SIGNING%"=="1" (
