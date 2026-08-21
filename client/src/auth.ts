@@ -9,6 +9,7 @@
 // The selector picks by the `platformUrl` setting; the UI is unchanged.
 import { loadSettings } from "./settings";
 import { SESSION_KEY, clearSecret, getSecret, setSecret } from "./secrets";
+import { platformRequest, replyJson } from "./platformHttp";
 
 export interface Session {
   email: string;
@@ -235,17 +236,18 @@ class CloudAuthProvider implements AuthProvider {
   }
 
   private async post(path: string, email: string, password: string): Promise<Session> {
-    let res: Response;
+    let res;
     try {
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
-      res = await fetch(this.baseUrl.replace(/\/+$/, "") + path, {
+      // Through the native side in the desktop app — see platformHttp.ts. This
+      // used to be a plain `fetch`, and on every desktop build the webview's
+      // CORS check killed it before it left the machine: the catch below then
+      // reported "cannot reach the platform" about a server that was answering
+      // fine. Nothing about the status handling changes; only the transport.
+      res = await platformRequest(this.baseUrl.replace(/\/+$/, "") + path, {
         method: "POST",
-        headers: { "content-type": "application/json" },
         body: JSON.stringify({ email, password }),
-        signal: ctrl.signal,
+        timeoutMs: FETCH_TIMEOUT_MS,
       });
-      clearTimeout(timer);
     } catch {
       // Unreachable / timed out / DNS — distinct from "wrong password" so the
       // user knows to check the platform URL or network, not their credentials.
@@ -259,12 +261,7 @@ class CloudAuthProvider implements AuthProvider {
     // "go click the link in your inbox" need completely different reactions.
     if (res.status === 403) throw new AuthError("auth.err.unverified");
     if (!res.ok) throw new AuthError("auth.err.server");
-    let body: { token?: string; user?: { id?: string; email?: string } };
-    try {
-      body = await res.json();
-    } catch {
-      throw new AuthError("auth.err.server");
-    }
+    const body = replyJson<{ token?: string; user?: { id?: string; email?: string } }>(res);
     if (!body?.token) throw new AuthError("auth.err.server");
     return persistSession({
       email: body.user?.email || email,
@@ -351,21 +348,16 @@ export type ResendResult = "sent" | "rate-limited" | "failed";
 export async function resendVerification(email: string): Promise<ResendResult> {
   const url = loadSettings().platformUrl.trim();
   if (!url) return "failed";
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
   try {
-    const res = await fetch(url.replace(/\/+$/, "") + "/auth/resend-verification", {
+    const res = await platformRequest(url.replace(/\/+$/, "") + "/auth/resend-verification", {
       method: "POST",
-      headers: { "content-type": "application/json" },
       body: JSON.stringify({ email: normalizeEmail(email) }),
-      signal: ctrl.signal,
+      timeoutMs: FETCH_TIMEOUT_MS,
     });
     if (res.status === 429) return "rate-limited";
     return res.ok ? "sent" : "failed";
   } catch {
     return "failed";
-  } finally {
-    clearTimeout(timer);
   }
 }
 

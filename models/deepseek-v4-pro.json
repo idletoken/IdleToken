@@ -13,7 +13,7 @@
   "n_embd": 7168,
   "hc_streams": 1,
   "n_vocab": 129280,
-  "layer_weight_bytes": 849683927055,
+  "layer_weight_bytes": 569417385408,
   "shared_weight_bytes": 0,
   "context_max": 1048576,
   "split": {
@@ -24,9 +24,17 @@
     "bytes_per_token_per_layer": 0
   },
   "overhead_base_bytes": 3221225472,
-  "default_gguf": "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00001-of-00020.gguf",
+  "default_gguf": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00001-of-00037.gguf",
   "chat_template": "ds4",
   "sources": [
+    {
+      "repo": "DevQuasar/deepseek-ai.DeepSeek-V4-Pro-0813-GGUF",
+      "quant": "Q2_K"
+    },
+    {
+      "repo": "DevQuasar/deepseek-ai.DeepSeek-V4-Pro-0813-GGUF",
+      "quant": "Q3_K_M"
+    },
     {
       "repo": "unsloth/DeepSeek-V4-Pro-0813-GGUF",
       "quant": "Q4_K_XL"
@@ -34,9 +42,13 @@
     {
       "repo": "unsloth/DeepSeek-V4-Pro-0813-GGUF",
       "quant": "Q8_K_XL"
+    },
+    {
+      "repo": "DevQuasar/deepseek-ai.DeepSeek-V4-Pro-0813-GGUF",
+      "quant": "Q4_K_M"
     }
   ],
-  "default_quant": "Q4_K_XL",
+  "default_quant": "Q2_K",
   "notes": [
     "Cluster-tier model: the smallest published quant is ~791 GiB, so it needs a sizable cluster. 671B/37B-active, 61 layers, arch deepseek4 — a different model from Flash, read by the pinned llama.cpp.",
     "Every number above is measured metadata: byte counts, sha256 digests and the revision come from the HF API and from HTTP Range reads of the GGUF headers (unsloth/DeepSeek-V4-Pro-0813-GGUF).",
@@ -44,6 +56,508 @@
     "The notes that used to sit here were copied wholesale from deepseek-v4-flash.json and described that model instead -- its 43 blocks, its compress_ratios, and a DSpark draft module that belongs to Flash and targets layers 40/41/42 of a 43-layer stack. The `speculative` block carrying those same Flash values was removed for the same reason: it was never measured against this model, and it has no consumer outside the frozen ds4 tree. `release` said 0731 (Flash's date); the Pro build is 0813, as the GGUF filenames say."
   ],
   "variants": [
+    {
+      "quant": "Q2_K",
+      "layer_weight_bytes": 569417385408,
+      "shared_weight_bytes": 0,
+      "repo": "DevQuasar/deepseek-ai.DeepSeek-V4-Pro-0813-GGUF",
+      "gguf": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00001-of-00037.gguf",
+      "sha256": "0b6652e7f74f03e72cde52fcc9702a036bf80e7f25b6dfed575212a49ee56244",
+      "revision": "f8f11efaafc01a87ea99c7e6673027f1cc5eebf6",
+      "parts": [
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00002-of-00037.gguf",
+          "bytes": 14997605472,
+          "sha256": "54ac622b21527246846c0a4c5d3f97e126fb8479a357070830edbed3f0a1d8be"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00003-of-00037.gguf",
+          "bytes": 15745610528,
+          "sha256": "e9a0ca6714157311304e309b3c553957521a05568098d1e36c23df69534cce4a"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00004-of-00037.gguf",
+          "bytes": 15846887808,
+          "sha256": "e97e116a933dc1801f84b1a5629f56def0e4b5912503be387875501ee9c12419"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00005-of-00037.gguf",
+          "bytes": 14991401472,
+          "sha256": "ef6022d3a0fa17bf5947f96f2a8fbdbeffee0b36e81bff04b7c4aab882631831"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00006-of-00037.gguf",
+          "bytes": 15748707072,
+          "sha256": "8c999108ce2cf331bde86c8be34ce3c669f950fbccca30dd4a543ff56f5674b4"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00007-of-00037.gguf",
+          "bytes": 15846887872,
+          "sha256": "d0712f6e6aabb1c951787129e028447a27fb83913be0f3935109c8bb7711f0de"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00008-of-00037.gguf",
+          "bytes": 14991401536,
+          "sha256": "fe20162a373ecccfaf309870eaab98e8a916c0649da5715db8d39f2cf4421a09"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00009-of-00037.gguf",
+          "bytes": 15745610592,
+          "sha256": "e3b0f4239ad4c7e7de3d37309abd2cad33e680bbcdcc7e555993163c14a8bf5e"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00010-of-00037.gguf",
+          "bytes": 15846887872,
+          "sha256": "2394658b6171ed9ca5e94de637e1de912534bf2c330a5056c3eea40bb07405b5"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00011-of-00037.gguf",
+          "bytes": 14991401536,
+          "sha256": "7b6312e167cae8c68328c2cd618059d58769fe1cc29b4dfe850f116a11254815"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00012-of-00037.gguf",
+          "bytes": 15748707104,
+          "sha256": "c722baeecffdc2f1a366e1fed26d3582ef062dfde9357742107a1b84f51b2371"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00013-of-00037.gguf",
+          "bytes": 15846887872,
+          "sha256": "6c7d5be2a10e628bebc5dca65ab3302daf1038feffa0ca04fd38578d2320d19d"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00014-of-00037.gguf",
+          "bytes": 14991401536,
+          "sha256": "3c12a641acce8f6d9e77ccaee18f7ecb9a4d5640fb6e2d84bab80c035f5f87bb"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00015-of-00037.gguf",
+          "bytes": 15745610592,
+          "sha256": "11d1a896b249a253633ee81c4309404ea2fe9fbefb9e15ac980f3e3a18d645dd"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00016-of-00037.gguf",
+          "bytes": 15846887872,
+          "sha256": "f2f6bcd951d9c7abe6a319aeae668272996ca25efc49c9facef3a5a29c9734ad"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00017-of-00037.gguf",
+          "bytes": 14991401536,
+          "sha256": "aba2bf7ab20a93ee00ff8c8f99861f29a58af3f15332249ac79697a22fa9e980"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00018-of-00037.gguf",
+          "bytes": 15748707104,
+          "sha256": "2ab60f2c2a59114a2c556256ce7cd7fc8d4831e6c34db7a168a2a44311481eb6"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00019-of-00037.gguf",
+          "bytes": 15846887872,
+          "sha256": "0b30e36c97a8a483bcedcc68ef788a20610cef0a1c6f1d238dd0e10a4adc6e30"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00020-of-00037.gguf",
+          "bytes": 14991401536,
+          "sha256": "91cc38d747ec0fb399f6f77ce25a517c41213a0036d0c02cc55a7066961b356b"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00021-of-00037.gguf",
+          "bytes": 15745610592,
+          "sha256": "5616920d47cbe3484ada9c3436574a6643ca98159e50ecec3ee60eaee96e6132"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00022-of-00037.gguf",
+          "bytes": 15846887872,
+          "sha256": "dcab8524f30529d9d6462c2ec5fea58d8a4b281982b02194c6a8d56b4efc9a7e"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00023-of-00037.gguf",
+          "bytes": 14991401536,
+          "sha256": "fac89e3423732959b88daa75370457e92c68a5b13c2fc88d168e33acbef797ca"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00024-of-00037.gguf",
+          "bytes": 15748707104,
+          "sha256": "a7ec876a7c50397e11b32bfebda8c4b17e5e80c30f526d7219cd666d002696d6"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00025-of-00037.gguf",
+          "bytes": 15846887872,
+          "sha256": "30e69b6bfeff7f7bf6d855f8c18329cec7d25f43edfd3a3a5bf4983c2667612f"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00026-of-00037.gguf",
+          "bytes": 14991401536,
+          "sha256": "8227dfa0b7557bd6d316c91839dcef9392586ddb45c390a828eded9b1343aaae"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00027-of-00037.gguf",
+          "bytes": 15745610592,
+          "sha256": "8e335204bdfb2fe9f686891dc515ace774096dc145c7b3c0e36d839fee7e5824"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00028-of-00037.gguf",
+          "bytes": 15846887872,
+          "sha256": "8505bb83d9c50917ad22b9c04dad39082f7246aa7548ee45fd2fdcea87f8c710"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00029-of-00037.gguf",
+          "bytes": 14991401536,
+          "sha256": "9537b0b02f7f54d46cc5b3acca8dde3278930e4b948f970cd21a06576496d4f5"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00030-of-00037.gguf",
+          "bytes": 15748707104,
+          "sha256": "c6ab93bc1590fe0f9c653246f6f9bda22739e014095d22d0e115f7fe3810db67"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00031-of-00037.gguf",
+          "bytes": 15846887872,
+          "sha256": "bbef369baeabf4ec9b5da79f6b6c92c7a044c28be30258ef580f64bd0c643d93"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00032-of-00037.gguf",
+          "bytes": 14991401536,
+          "sha256": "6335c63373796c8c19eeada16883a827d7be0c2844c43d0a544de6f170dff76e"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00033-of-00037.gguf",
+          "bytes": 15745610592,
+          "sha256": "2efbeca1d3bc57acdb1aa6121c3d919fb5d72fffb1aa1f0af45352b66fb909fa"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00034-of-00037.gguf",
+          "bytes": 15846887872,
+          "sha256": "2643a7b69a49fb50cd92a7291b67783d9043f2e23d9c2c9bdd42af45f8fbb5e6"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00035-of-00037.gguf",
+          "bytes": 14991401536,
+          "sha256": "2d5bd078dea9b885744d14beb4433e7e3e66313bbe403152e44c952791b99cc8"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00036-of-00037.gguf",
+          "bytes": 15748707104,
+          "sha256": "4eaaf945601c05a8f54f3a574e13acba4b6eb1620f505141448cca96b397685f"
+        },
+        {
+          "file": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00037-of-00037.gguf",
+          "bytes": 12103236032,
+          "sha256": "4680474e5724aa484ac66d661d084c261b4c8a2276308c72882e073e40701cc4"
+        }
+      ]
+    },
+    {
+      "quant": "Q3_K_M",
+      "layer_weight_bytes": 748403475872,
+      "shared_weight_bytes": 0,
+      "repo": "DevQuasar/deepseek-ai.DeepSeek-V4-Pro-0813-GGUF",
+      "gguf": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00001-of-00061.gguf",
+      "sha256": "86fad2870efd8628a09a77bc525bcc8c763affcc3e90a29f4923001fa178e1e0",
+      "revision": "f8f11efaafc01a87ea99c7e6673027f1cc5eebf6",
+      "parts": [
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00002-of-00061.gguf",
+          "bytes": 13258438464,
+          "sha256": "4e9a4fa942fbf5a46ac6cdacec6ba3299b52818bc730c1414f1318c989e7a416"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00003-of-00061.gguf",
+          "bytes": 13262494720,
+          "sha256": "57a13fe80d02447051f0e3ec05fb5a6d1e87aed956bcbfc325a4753a64b0b928"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00004-of-00061.gguf",
+          "bytes": 12195620160,
+          "sha256": "9938c2767872ccbbdbf78d33d48da36bc7ca2ba06070fbf9f2f7096542483422"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00005-of-00061.gguf",
+          "bytes": 12199674816,
+          "sha256": "e2520df1d047243dd168986ec092d884f8a16976cf1c4fa93b0facabd4d2094c"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00006-of-00061.gguf",
+          "bytes": 12195620160,
+          "sha256": "64508e25ca0fe2a21cd77e268c9c79044935abf3c3ac21239f32f9458d66317f"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00007-of-00061.gguf",
+          "bytes": 12199674816,
+          "sha256": "be62c1abad9c97fda0e72f7492f0d8b545f84bc8d65283badbef174bb803e944"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00008-of-00061.gguf",
+          "bytes": 12195620160,
+          "sha256": "971ebd842ece715523f17f71835960ebf42d46e627d2056f9f8e4f5fb78c8841"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00009-of-00061.gguf",
+          "bytes": 12199674816,
+          "sha256": "6a11bfe6201526bc34c127ccf312b387c31a5235e729e5419fe49ecf11e469b2"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00010-of-00061.gguf",
+          "bytes": 12195620160,
+          "sha256": "bb2c2ee57c4f31a5d40e0b8aad50167404d48e06e3dd1711ac29e326a6597848"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00011-of-00061.gguf",
+          "bytes": 12199674848,
+          "sha256": "4b0117e4316770e6a319c7a6ccb84063d652f2b6b9eccbd72c89fadfdd37565f"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00012-of-00061.gguf",
+          "bytes": 12195620192,
+          "sha256": "cb7b2d3f35903f1a7d76aaf42cee03964c367a3d3f9cd5e8fe89a080e4bf9128"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00013-of-00061.gguf",
+          "bytes": 12199674848,
+          "sha256": "1b4e2bdea7e9f7d95a99e554c3a2776b49d9d6d9506ec77be10da999712c8b1e"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00014-of-00061.gguf",
+          "bytes": 12195620192,
+          "sha256": "dac9a5e3b77567ae53b5d1539b726ae1561a34243fcc6e604379f9c121a298ef"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00015-of-00061.gguf",
+          "bytes": 12199674848,
+          "sha256": "759219c316463841d077182e09555ae49ba5714c90abb45022cdcb2253994b6b"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00016-of-00061.gguf",
+          "bytes": 12195620192,
+          "sha256": "786298a0fb3853a4ed5a087908ba05dfbcc8cc9a7cc15d7c24d48029fb3ce5ea"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00017-of-00061.gguf",
+          "bytes": 12199674848,
+          "sha256": "ebf86480c7e65a181a96c78c39883faf971ae73eeb5c22830dbd1ff2a2f0c9d2"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00018-of-00061.gguf",
+          "bytes": 12195620192,
+          "sha256": "8622c375f4057581d373b1028372276bb7f4279871e71ed3d6f4b69e463eb151"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00019-of-00061.gguf",
+          "bytes": 12199674848,
+          "sha256": "44b982819eae636732ab394e52d3466e4f8bb82be74fa1fff306947269b2ab90"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00020-of-00061.gguf",
+          "bytes": 12195620192,
+          "sha256": "c4935aeddf007002bb81981122c413a211e311b57f74dc67f26214aac84a6b0e"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00021-of-00061.gguf",
+          "bytes": 12199674848,
+          "sha256": "3a3bec6db0538007c753c469a957fcf3490f4dafa2f12c8f49d78aae50f3e988"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00022-of-00061.gguf",
+          "bytes": 12195620192,
+          "sha256": "2e57a8d5a4494ade9645efafee6199ff4f206b51e4e9c60ea3c883483ff7a639"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00023-of-00061.gguf",
+          "bytes": 12199674848,
+          "sha256": "be4f899f97a694affeab43bb1218b6984569afdc4040d3bb32da4e0ee686f3b3"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00024-of-00061.gguf",
+          "bytes": 12195620192,
+          "sha256": "e6c185f0283a40adde344deb048134511039e3d14caf1bdf470d63821cd5ed57"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00025-of-00061.gguf",
+          "bytes": 12199674848,
+          "sha256": "2b8aae96a6bd104e8e265cd4c11d5562a56e6d58b723a75e0e1148f78d8b5bcb"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00026-of-00061.gguf",
+          "bytes": 12195620192,
+          "sha256": "c407fd187b7798cb283cc15f8d6a52c3769c3d733925959ec89de14d5ec966b8"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00027-of-00061.gguf",
+          "bytes": 12199674848,
+          "sha256": "f3faa0ae2902ba554e5bc0bcf58230bfa9e8c8a5ad40f5fa1977267d64999fa4"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00028-of-00061.gguf",
+          "bytes": 12195620192,
+          "sha256": "2ce8e5d4ca7cbfcf52d84f8359bcea85ff7b873207c34a47aa0fa96083a96243"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00029-of-00061.gguf",
+          "bytes": 12199674848,
+          "sha256": "7d9285e03ca6dad411ed13f59c037f95dd53247c047946cac8dae0cd488b8b9a"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00030-of-00061.gguf",
+          "bytes": 12195620192,
+          "sha256": "6ad10a8c083a33b2b62090e83bbf227d75e17b9ad1f097fe625cc77f3c0f3eed"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00031-of-00061.gguf",
+          "bytes": 12199674848,
+          "sha256": "38b72cfa82e3deaa4750dff9ee9ed14e7ebf81b3f25f2a375cbd7662ec2debdb"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00032-of-00061.gguf",
+          "bytes": 12195620192,
+          "sha256": "1acfe74c236316492ee201e8941cb006d257bed995742b02a5ffeab19a2e5449"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00033-of-00061.gguf",
+          "bytes": 12199674848,
+          "sha256": "c5e67fc856c2b9a9323cd58894513a0cc2dabc61d34000deb4ea7f6c94a88370"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00034-of-00061.gguf",
+          "bytes": 12195620192,
+          "sha256": "81355b30e9d44b119d54adb543627c34b69051a4a1d406a20add018043b6624b"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00035-of-00061.gguf",
+          "bytes": 12199674848,
+          "sha256": "c02459ce3e0987f6082c7d710b4e90133b62c970dbffa578e9123dd8bbcd0423"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00036-of-00061.gguf",
+          "bytes": 12195620192,
+          "sha256": "968e1656b1f2ce45fdcdfc8acacae55aa549d5cb35632484667bc868aae90346"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00037-of-00061.gguf",
+          "bytes": 12199674848,
+          "sha256": "38eff784267331808454f05af8665956d7aa2ce0527c4797c456c8adb56d6aef"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00038-of-00061.gguf",
+          "bytes": 12195620192,
+          "sha256": "b0aa94493f12d9292b68f9ba7c5ad605c27ce0afb63e767b8df05365195589e7"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00039-of-00061.gguf",
+          "bytes": 12199674848,
+          "sha256": "9dab566cfe1bc6ee8e677bc2224088250b90b9585112a7f74ffb6ca482f0a8f3"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00040-of-00061.gguf",
+          "bytes": 12195620192,
+          "sha256": "7be05af6dd1ac363fab476b22bb78dfd2b67902111b8466a89648da859d16de1"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00041-of-00061.gguf",
+          "bytes": 12199674848,
+          "sha256": "8bb03598ca6dadcd5cf8dccff7d6835b0f11f16c8728052542cdf5073ae9f649"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00042-of-00061.gguf",
+          "bytes": 12195620192,
+          "sha256": "3d6dbb08dda6b649854fb44b9cdb6d13cba88870ee48b03febe4a5def3f561b8"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00043-of-00061.gguf",
+          "bytes": 12199674848,
+          "sha256": "8ad4352b1860ff9441b87d02164a45d254d09269ce196613dfc47a127261f0e5"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00044-of-00061.gguf",
+          "bytes": 12195620192,
+          "sha256": "0884c7ace7b8dd3a8811ba2a599c53d4b4e72ea8095b81426ccf292d7de7571a"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00045-of-00061.gguf",
+          "bytes": 12199674848,
+          "sha256": "286f25d944df250a6773c70781c5c216238c6648febad9c1ba95f9ecd4ade51d"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00046-of-00061.gguf",
+          "bytes": 12195620192,
+          "sha256": "874e3e156660b79e1341fc8dd596a8f14cd31b873467a96df62186152381d769"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00047-of-00061.gguf",
+          "bytes": 12199674848,
+          "sha256": "c5d86ebc5b792c3a531c38b41bbd8b0f351bda07d943e090e12f9cd65e58a1a0"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00048-of-00061.gguf",
+          "bytes": 12195620192,
+          "sha256": "c286d383de6ed1ebb4d63c09d194d831b15f2860fdb42843018dc1cfa4eadaaf"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00049-of-00061.gguf",
+          "bytes": 12199674848,
+          "sha256": "a5d82da9d842db4fcdc180a0ea5317ee04c952e33aca1a72ced3e3c13f1c340d"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00050-of-00061.gguf",
+          "bytes": 12195620192,
+          "sha256": "2947d00f864db07a8082987181a1e200e2983ea1a36b75aa20500c7c3bb48262"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00051-of-00061.gguf",
+          "bytes": 12199674848,
+          "sha256": "375a133b2b8ae5a426fc3e1b6b8f25476ddd138b03a6b8d5dc1f054cf30b4312"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00052-of-00061.gguf",
+          "bytes": 12195620192,
+          "sha256": "cd77c813339efd191ff84e12f4c2b3975afb77279393de193ce2e7d2c2d4f7ba"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00053-of-00061.gguf",
+          "bytes": 12199674848,
+          "sha256": "e911458ca1178aab55a29f7d21f491f9ff29946f6f477954dbb48dde059a9eec"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00054-of-00061.gguf",
+          "bytes": 12195620192,
+          "sha256": "e5a96b74af4436901288238a8ec616cc1bbc8e7f3d246ba3df6053e9f984af62"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00055-of-00061.gguf",
+          "bytes": 12199674848,
+          "sha256": "354dec79b7603f1135b41e5f0ca64b16ac57e346c255f4bf589256ef3ffb9904"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00056-of-00061.gguf",
+          "bytes": 12195620192,
+          "sha256": "c81a1d0c548e20f6cdf69d9126c7e8abe594d0c8d4cded43d6bc94462e7089f4"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00057-of-00061.gguf",
+          "bytes": 12199674848,
+          "sha256": "a7e0582b0697be805b1db695c9091c4c921c2879d8bf7a3ed79145d3dc868d11"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00058-of-00061.gguf",
+          "bytes": 12195620192,
+          "sha256": "2e67bfb453e11645c14d1c5d071a11f576ceea17526ccb710bf66c7cfac01e24"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00059-of-00061.gguf",
+          "bytes": 12199674848,
+          "sha256": "250ec49d3c34f7c96fe9c574be7bf5455caccd18e5bb4a3d6ada093ad1619c70"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00060-of-00061.gguf",
+          "bytes": 12195620192,
+          "sha256": "dedc2992eae4be01e1e8173e9b033660b88692f38a4bcb695784685fc5053027"
+        },
+        {
+          "file": "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00061-of-00061.gguf",
+          "bytes": 12067590784,
+          "sha256": "5788ef73817d8a936f0d17a8fbc1ef67ca8c29ba43e8e778090253823ed831d2"
+        }
+      ]
+    },
     {
       "quant": "Q4_K_XL",
       "layer_weight_bytes": 849683927055,
@@ -253,6 +767,392 @@
           "file": "UD-Q8_K_XL/DeepSeek-V4-Pro-0813-UD-Q8_K_XL-00020-of-00020.gguf",
           "bytes": 18823737120,
           "sha256": "27fbe4c1ab2928bb63a8871273255891277653f4fbba37f16383f3a6712ebedc"
+        }
+      ]
+    },
+    {
+      "quant": "Q4_K_M",
+      "layer_weight_bytes": 950879580768,
+      "shared_weight_bytes": 0,
+      "repo": "DevQuasar/deepseek-ai.DeepSeek-V4-Pro-0813-GGUF",
+      "gguf": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00001-of-00076.gguf",
+      "sha256": "2b2c9817c9d9d2b42bfad6f0c215b922cd8c58698abf9a91f9629ba65361f675",
+      "revision": "f8f11efaafc01a87ea99c7e6673027f1cc5eebf6",
+      "parts": [
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00002-of-00076.gguf",
+          "bytes": 11896791328,
+          "sha256": "543af291e318c4bc44a5aef327da71fb071157594bad491516cfef295f2abddd"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00003-of-00076.gguf",
+          "bytes": 9723855584,
+          "sha256": "9a57f4f554a9c3401d098b05365f04b86e9f3355747138720292a6419118260a"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00004-of-00076.gguf",
+          "bytes": 11731757632,
+          "sha256": "ab5288ba84e618af635543318c5dacc790ce9f32ef6426d5eccb0605cba53b97"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00005-of-00076.gguf",
+          "bytes": 11906194752,
+          "sha256": "feb5e5fb75f5f3299521051146cc71f4807b204efae99bbf572d0d3f43b4373c"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00006-of-00076.gguf",
+          "bytes": 9720754400,
+          "sha256": "1129cdef8757fba8dbfb87fb078cfde6fdb8b0224afb617e264db60aced3f313"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00007-of-00076.gguf",
+          "bytes": 11728654848,
+          "sha256": "9f67d5d85be7a67930b9b0768ed0c473ae149e0b22a754e22cc18e9c9312bc06"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00008-of-00076.gguf",
+          "bytes": 11906194752,
+          "sha256": "b57f9a4300f6d91b63436eba408b3cd85aecfb6c62877e80467b83bd09e8bb6f"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00009-of-00076.gguf",
+          "bytes": 9720754400,
+          "sha256": "87eab39d90f53c20674fd0960d2eb590f562cec49dac6536587d1fddb37914ab"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00010-of-00076.gguf",
+          "bytes": 11728654848,
+          "sha256": "8a2f34a8e29895de668e58555616abd9ed6d8e18c4f16f726d82e320502cef27"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00011-of-00076.gguf",
+          "bytes": 14494789184,
+          "sha256": "8c285dc1d81d85a1ffefa3fd4b9f0cd64c305fea939e0a3e0ee4a357347b27ad"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00012-of-00076.gguf",
+          "bytes": 14489481568,
+          "sha256": "c2fc8187651acd49ad32a25d6e8ca1035e06479e9e9118cf7895da5dab8b98d2"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00013-of-00076.gguf",
+          "bytes": 11906194752,
+          "sha256": "65a81fe6ea7dd206df62787d07a31a84640001b6d72240e9e9a82f60e3f8acef"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00014-of-00076.gguf",
+          "bytes": 14489481568,
+          "sha256": "7a2701a215742d05d167b9657dac343ce790fabb6636d94ad8a79e6de89a7fc3"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00015-of-00076.gguf",
+          "bytes": 14494789216,
+          "sha256": "b795beab3a919fe4cd1d49cdc57830538b7e58ae1ca4534c917b7278e84de1d5"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00016-of-00076.gguf",
+          "bytes": 9720754400,
+          "sha256": "3487a7491f48cb4edfa55ac25a6b5322a4252a75e83b65df921f6f18f0821c9d"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00017-of-00076.gguf",
+          "bytes": 11728654848,
+          "sha256": "fbd896df0d40b304ac29533e7fa56cc943400ca2576e7597213528474caa5f16"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00018-of-00076.gguf",
+          "bytes": 14494789216,
+          "sha256": "fd0132d5681daee413728bccbd1d7284e75fdba357dd7108655acabe847d6864"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00019-of-00076.gguf",
+          "bytes": 14489481600,
+          "sha256": "f9c60b1231b06530f287a7921584768dcaedcc98d8403ef335c3bdd8296f1c4d"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00020-of-00076.gguf",
+          "bytes": 11906194784,
+          "sha256": "cdd54b265bcf1f64ba8859d64c320e34f15bd8c4ff016a8596a1e55de92f7353"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00021-of-00076.gguf",
+          "bytes": 14489481600,
+          "sha256": "a8093b4c9ab546845457d319a282d14979cc6dbaf3a81d925539ec0e953eb419"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00022-of-00076.gguf",
+          "bytes": 14494789216,
+          "sha256": "8b0b33741fe1bd34f6e136a4ed22beb9394c98958473ab5a8502fb5c5f9248c6"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00023-of-00076.gguf",
+          "bytes": 9720754400,
+          "sha256": "89ca790923580e96c87c0608da2caffeddcc6c75823972dbe4e2ec8ae71b1406"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00024-of-00076.gguf",
+          "bytes": 11728654848,
+          "sha256": "ec62bf9e8297eafc4a6f0882bb25b225a6e3283dd02462fa42539b017427c57a"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00025-of-00076.gguf",
+          "bytes": 14494789216,
+          "sha256": "07bcacbc7c8669579d1ce5701e4b474f9680941ba1df8a9f9577ea8b1ccfbfa8"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00026-of-00076.gguf",
+          "bytes": 14489481600,
+          "sha256": "9f93efc210ba04cd0e3975ebd80b205159a75c53533f6b6ff58cd66318c54028"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00027-of-00076.gguf",
+          "bytes": 11906194784,
+          "sha256": "12bddf54163617226f007c8cd232391ec17d8044fb13c0ef93d9fcbf3c8f4514"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00028-of-00076.gguf",
+          "bytes": 14489481600,
+          "sha256": "ab4e7b54fc500a17e50ea18bc7d96d1fa3f9b7ff735cb2722280e6441f62d204"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00029-of-00076.gguf",
+          "bytes": 14494789216,
+          "sha256": "0f540948e2194f61f3b0757a5d03c9989a662202440ba5e96d27b5fbb4445760"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00030-of-00076.gguf",
+          "bytes": 9720754400,
+          "sha256": "a86c624caf11fad15287b0b0dedc9e84a5badd39344a77dbb9f6b94e88ccdfbe"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00031-of-00076.gguf",
+          "bytes": 11728654848,
+          "sha256": "57bb9a4e27ee1e1c21d112db2a973b198e6a65ebdb73c8ec4e2cdbe4c0bd317f"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00032-of-00076.gguf",
+          "bytes": 14494789216,
+          "sha256": "4b8846c6f3df5cca93b822cfa3cc1c414cac6c13af7e531d849dcec1a6da9564"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00033-of-00076.gguf",
+          "bytes": 14489481600,
+          "sha256": "451ff6adb4324d6852be99567d9427801e260cd042acbee75792494d0c21e20e"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00034-of-00076.gguf",
+          "bytes": 11906194784,
+          "sha256": "df6c364af52164b24bf8a7008053994390267599d969a3303a33f571fd37583f"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00035-of-00076.gguf",
+          "bytes": 14489481600,
+          "sha256": "323b772e811439037d300c2a767301bc13c7d7c4061775a0e86834c3e06efda1"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00036-of-00076.gguf",
+          "bytes": 14494789216,
+          "sha256": "f6d5f56e0dffbbafbd538eccf3276cac4233170bf9d3086935f7ebe82f22ab13"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00037-of-00076.gguf",
+          "bytes": 9720754400,
+          "sha256": "001e18c33b23da97db86efe8b2154680c3e0b6bb245c921901144a1d305cdee5"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00038-of-00076.gguf",
+          "bytes": 11728654848,
+          "sha256": "11176482caa7ba9ea82f87f31e36c68fea48f53ad92a824af1c2cac1b41f6466"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00039-of-00076.gguf",
+          "bytes": 14494789216,
+          "sha256": "045abdc1c1dcc6f85bdd4af31846d8eb54c89f0f5e5c1ff7535be0392c734051"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00040-of-00076.gguf",
+          "bytes": 14489481600,
+          "sha256": "6a3168c326264b2e75b2f8d7cce25c4e5d0688f224c947e757505d13948196ac"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00041-of-00076.gguf",
+          "bytes": 11906194784,
+          "sha256": "1b11be1b8f800a02fb91828c425d11a35722c6b9ad72f0fbeb95b96c4e7a96c5"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00042-of-00076.gguf",
+          "bytes": 14489481600,
+          "sha256": "77568a795b9e8f476bbb78cfeb560ed74b55b486adcad3f4ae8674b4d82ed45c"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00043-of-00076.gguf",
+          "bytes": 14494789216,
+          "sha256": "0ba9cef024f93ab4014aeb56f8f4e732698358da3d7225af35b5190674d64693"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00044-of-00076.gguf",
+          "bytes": 9720754400,
+          "sha256": "5ce7df3afffcb9e379fdda9358334f0155eaea6df71cd3c253ff9260d8f3a1a5"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00045-of-00076.gguf",
+          "bytes": 11728654848,
+          "sha256": "00bc8c137cdc4c47f3488325efa1ef1177d7e62addc2b5a54919122611f17ede"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00046-of-00076.gguf",
+          "bytes": 14494789216,
+          "sha256": "5e03c746b86bf74a64e8392391ce9cfb172b9e591d5cb4b125cd19428bb685cc"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00047-of-00076.gguf",
+          "bytes": 14489481600,
+          "sha256": "caf621518486c3fa7e928713d9c1598a4cf906839dd01dc5d57679a1aa9880a6"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00048-of-00076.gguf",
+          "bytes": 11906194784,
+          "sha256": "43a569c8bd177cf61ac6476cb467e6e18179e6fafee8320c342673e54461b810"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00049-of-00076.gguf",
+          "bytes": 14489481600,
+          "sha256": "28dcadb482483b1f8702e6d0816963500a78dc92c5cb0d0f10a6911b755615b3"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00050-of-00076.gguf",
+          "bytes": 14494789216,
+          "sha256": "8e7d07eb4b4b770306c14c6dd51bd23a659230acc15892a1509056082b7cef71"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00051-of-00076.gguf",
+          "bytes": 9720754400,
+          "sha256": "8617a814b054156bc827959fe2722c2f04d73d0f519237845d786ac36d988610"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00052-of-00076.gguf",
+          "bytes": 11728654848,
+          "sha256": "2f61bf55753454afee985c43a5723239e949161f2830ba7eea6ce6b420b032ef"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00053-of-00076.gguf",
+          "bytes": 14494789216,
+          "sha256": "8dd20038366ac615f1d3a7226d4125e88e0c7e455e782c267c044bf15fc9290d"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00054-of-00076.gguf",
+          "bytes": 14489481600,
+          "sha256": "ef050686608622214f4608d87ab3cf2aa37e959d5f958b549763b6944d540c92"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00055-of-00076.gguf",
+          "bytes": 11906194784,
+          "sha256": "1c24ae3ae5ba8c6ec6d63826ccaf7391397bbcafc231a3c88265eed36c2782f1"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00056-of-00076.gguf",
+          "bytes": 14489481600,
+          "sha256": "29fd5734283a1f2a9a2ec2baf644a44f0fd8438838dd908506e541feec6dd4cb"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00057-of-00076.gguf",
+          "bytes": 14494789216,
+          "sha256": "0ee4ceca922ef8834d799740d3a8deefd263d3237f16722cf06fa7cf57e9b2f2"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00058-of-00076.gguf",
+          "bytes": 9720754400,
+          "sha256": "a992540ca8cb53133f7f9f31fbc9ee2006b64201ac56a0af89e288c6179b2c08"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00059-of-00076.gguf",
+          "bytes": 11728654848,
+          "sha256": "1f90015d39dc90eba34ca324aa5265a3c03a639b4a3074d6f3d869b904ad781e"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00060-of-00076.gguf",
+          "bytes": 14494789216,
+          "sha256": "73c059f109cb3a9539863c1832310678a8ef5890daa1aeeab7d482437d53b59e"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00061-of-00076.gguf",
+          "bytes": 14489481600,
+          "sha256": "3e971ade28b5ef9c70a3fe8cd9c3d1900cb20af48944772ff8b3d9aaa363875e"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00062-of-00076.gguf",
+          "bytes": 11906194784,
+          "sha256": "04794fc7cbf55a47ab6d24f234ff2ebe800a48827748e3ea94de3acb73bc3baa"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00063-of-00076.gguf",
+          "bytes": 14489481600,
+          "sha256": "d6dfee664f83d474822702361e2208cd7836b577ea97429746ad4d9fc2b266a5"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00064-of-00076.gguf",
+          "bytes": 9726062048,
+          "sha256": "d69fc5d3d2df84b2702c868a16f20c86e39f0bfaf8523099371c884dec6b93e2"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00065-of-00076.gguf",
+          "bytes": 11728654848,
+          "sha256": "242d4ead15708be4a1b4157c6c18aadd2d801651b3d5f360bf9b7f23283daf58"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00066-of-00076.gguf",
+          "bytes": 11900887168,
+          "sha256": "9e8816544758dd3d5ea0406ad87e7a9a9a36c615af8fa5fcec7fa5b011bf38c9"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00067-of-00076.gguf",
+          "bytes": 9726062048,
+          "sha256": "a73cf26f0e33fdcd3ec25537ad52ba2fa15e77d7283fcad6271989288aa3d83c"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00068-of-00076.gguf",
+          "bytes": 11728654848,
+          "sha256": "187cb4bec3479646b513e129bbff3e972a2334af25e772230d1d068ed9d4a8c9"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00069-of-00076.gguf",
+          "bytes": 11900887168,
+          "sha256": "21d611bf5515513633cd6ec551dc19d0b049fd1aee7ea5d5a7d67e8bbe6000ed"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00070-of-00076.gguf",
+          "bytes": 9726062048,
+          "sha256": "1e02843057b54797cccf0027ffcf1b8f70591f319c8698c00bf2cc089bc0717c"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00071-of-00076.gguf",
+          "bytes": 11728654848,
+          "sha256": "85ab5bbe49df7b633689bc0347d4da9b7561e8e90f65c05aa222671a800bc656"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00072-of-00076.gguf",
+          "bytes": 11900887168,
+          "sha256": "968628972899299387974472f3dbf1b8dbc3777b210acafca51dfa324ee670aa"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00073-of-00076.gguf",
+          "bytes": 9726062048,
+          "sha256": "7895eaf8006f8fa37a9e73e6e1fa2aee82a435a3b44699d1cde26fb863d75d17"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00074-of-00076.gguf",
+          "bytes": 11728654848,
+          "sha256": "e3ec39e6c411ddc7558058a51242922067fcd55d0bef5bca168b28806df39352"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00075-of-00076.gguf",
+          "bytes": 11900887168,
+          "sha256": "25237b1bcd1dcae747b09d111f3c146d414280fbfd4cde5f35b5c41d7bdd7b7d"
+        },
+        {
+          "file": "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00076-of-00076.gguf",
+          "bytes": 9553164896,
+          "sha256": "b53532fc3617a29bd29ce23594f571dbb1675a7edf38a74f6cfe37f11923aac7"
         }
       ]
     }

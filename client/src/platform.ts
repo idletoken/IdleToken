@@ -14,6 +14,7 @@
 // (same philosophy as the DEV FIXTURE badge).
 import { loadSettings } from "./settings";
 import { getAuthProvider, type Session } from "./auth";
+import { platformRequest, replyJson } from "./platformHttp";
 
 const FETCH_TIMEOUT_MS = 10_000;
 
@@ -85,40 +86,36 @@ export function platformGate(): PlatformGate {
 }
 
 // ---- console API -----------------------------------------------------------
-async function req<T>(path: string, init?: RequestInit): Promise<T> {
+async function req<T>(path: string, init?: { method?: string; body?: string }): Promise<T> {
   const gate = platformGate();
   if (!gate.ok) throw new Error(`platform not connected (${gate.reason})`);
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
-  let res: Response;
+  let res;
   try {
-    res = await fetch(gate.url + path, {
-      ...init,
-      headers: {
-        authorization: `Bearer ${gate.session.token}`,
-        "content-type": "application/json",
-        ...(init?.headers ?? {}),
-      },
-      signal: ctrl.signal,
+    // Native transport in the desktop app — see platformHttp.ts. Every call in
+    // this file was CORS-blocked in the webview for the same reason sign-in
+    // was, so the whole console reported "can't reach the platform server"
+    // against a healthy gateway.
+    res = await platformRequest(gate.url + path, {
+      method: init?.method ?? "GET",
+      body: init?.body,
+      bearer: gate.session.token,
+      timeoutMs: FETCH_TIMEOUT_MS,
     });
-  } catch {
-    throw new Error("network: can't reach the platform server");
-  } finally {
-    clearTimeout(timer);
+  } catch (e) {
+    // The cause is worth carrying: "dns error" and "connection refused" send
+    // the reader to different places, and the old message named neither.
+    throw new Error(`network: can't reach the platform server (${e instanceof Error ? e.message : e})`);
   }
   if (!res.ok) {
     // Surface the server's own message when it sends one (Nest error bodies).
-    let detail = "";
-    try {
-      const body = (await res.json()) as { message?: string | string[] };
-      const m = body?.message;
-      detail = Array.isArray(m) ? m.join("; ") : m || "";
-    } catch {
-      /* non-JSON error body */
-    }
+    const body = replyJson<{ message?: string | string[] }>(res);
+    const m = body?.message;
+    const detail = Array.isArray(m) ? m.join("; ") : m || "";
     throw new Error(`HTTP ${res.status}${detail ? `: ${detail}` : ""}`);
   }
-  return (await res.json()) as T;
+  const parsed = replyJson<T>(res);
+  if (parsed === null) throw new Error(`the platform sent a non-JSON reply to ${path}`);
+  return parsed;
 }
 
 export function getMe(): Promise<PlatformMe> {
@@ -206,17 +203,13 @@ export async function fetchLeaderboard(
 ): Promise<LeaderboardPayload> {
   const base = loadSettings().platformUrl.trim().replace(/\/+$/, "");
   if (!base) throw new Error("platform not configured");
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), LEADERBOARD_TIMEOUT_MS);
-  try {
-    const res = await fetch(`${base}/leaderboard/models?window=${encodeURIComponent(window)}`, {
-      signal: ctrl.signal,
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return (await res.json()) as LeaderboardPayload;
-  } finally {
-    clearTimeout(timer);
-  }
+  const res = await platformRequest(`${base}/leaderboard/models?window=${encodeURIComponent(window)}`, {
+    timeoutMs: LEADERBOARD_TIMEOUT_MS,
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const parsed = replyJson<LeaderboardPayload>(res);
+  if (parsed === null) throw new Error("the platform sent a non-JSON leaderboard");
+  return parsed;
 }
 
 // ---- agent control (Tauri only) --------------------------------------------

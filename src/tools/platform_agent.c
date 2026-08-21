@@ -570,7 +570,7 @@ static uint8_t *http_request_json(const char *method,
     char auth[1024] = "";
     if (bearer) {
         int an = snprintf(auth, sizeof(auth), "Authorization: Bearer %s\r\n", bearer);
-        if (an < 0 || (size_t)an >= sizeof(auth)) { close(fd); return NULL; }
+        if (an < 0 || (size_t)an >= sizeof(auth)) { idletoken_close_fd(fd); return NULL; }
     }
     char head[1536];
     int hn = snprintf(head, sizeof(head),
@@ -585,29 +585,36 @@ static uint8_t *http_request_json(const char *method,
                        * both ignore which). */
                       method, path, is_unix ? "localhost" : addr, body_len, auth,
                       extra_hdr ? extra_hdr : "");
-    if (hn < 0 || (size_t)hn >= sizeof(head)) { close(fd); return NULL; }
+    if (hn < 0 || (size_t)hn >= sizeof(head)) { idletoken_close_fd(fd); return NULL; }
     if (idletoken_sendall(fd, head, (size_t)hn) < 0 ||
         (body_len && idletoken_sendall(fd, body, body_len) < 0)) {
-        close(fd); return NULL;
+        idletoken_close_fd(fd); return NULL;
     }
 
     /* Read the whole response until EOF (Connection: close). */
     size_t cap = 8192, len = 0;
     uint8_t *buf = malloc(cap);
-    if (!buf) { close(fd); return NULL; }
+    if (!buf) { idletoken_close_fd(fd); return NULL; }
     for (;;) {
         if (len + 4096 > cap) {
             size_t ncap = cap * 2;
             uint8_t *nb = realloc(buf, ncap);
-            if (!nb) { free(buf); close(fd); return NULL; }
+            if (!nb) { free(buf); idletoken_close_fd(fd); return NULL; }
             buf = nb; cap = ncap;
         }
-        ssize_t r = read(fd, buf + len, 4096);
+        /* recv, not read: on Windows the CRT's read() only understands CRT
+         * file descriptors, and a SOCKET is not one -- read() returns EBADF
+         * without touching the wire. The request had already been sent, so
+         * every reply (register, relay poll, coord answer) was thrown away
+         * and the agent called a working platform "unreachable". recv() is
+         * identical to read() for sockets on POSIX, so one spelling serves
+         * both platforms. */
+        ssize_t r = recv(fd, (char *)buf + len, 4096, 0);
         if (r > 0) { len += (size_t)r; continue; }
         if (r < 0 && errno == EINTR) continue;
         break;
     }
-    close(fd);
+    idletoken_close_fd(fd);
 
     /* Status line: "HTTP/1.x NNN ..." */
     int status = 0;
@@ -1460,7 +1467,7 @@ typedef struct {
 static void *agent_conn_thread(void *ud) {
     agent_conn *a = ud;
     handle_conn(a->fd, a->node, a->coord_addr, a->pubkey_b64);
-    close(a->fd);
+    idletoken_close_fd(a->fd);
     free(a);
     pthread_mutex_lock(&g_inflight_mu);
     g_inflight--;
@@ -1807,10 +1814,10 @@ int main(int argc, char **argv) {
             pthread_mutex_unlock(&g_inflight_mu);
         }
         handle_conn(cfd, &node, coord_addr, pubkey_b64);
-        close(cfd);
+        idletoken_close_fd(cfd);
     }
 
-    close(lfd);
+    idletoken_close_fd(lfd);
     free(provider_id);
     free(pubkey_b64);
     idletoken_secure_zero(node.sk, sizeof(node.sk));

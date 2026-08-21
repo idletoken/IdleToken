@@ -340,6 +340,86 @@ fn engine_get_json_blocking(base_url: &str, path: &str) -> Result<Value, String>
     serde_json::from_str::<Value>(payload.trim()).map_err(|e| format!("bad JSON from {path}: {e}"))
 }
 
+/// One request to the platform gateway, made from the NATIVE side.
+///
+/// Why this exists (2026-08-21): sign-in was failing on every desktop build
+/// with "cannot reach the platform server, check the address and your network",
+/// while the server was up and answering. It was CORS. The webview's origin is
+/// `tauri://localhost` (`http://tauri.localhost` on Windows), the gateway's
+/// allowlist is `CORS_ORIGINS` — the portal's domains — and a preflight from an
+/// origin that is not on it comes back 204 with no `Access-Control-Allow-Origin`
+/// header, so the browser blocks the POST before a byte leaves. `fetch` then
+/// rejects with a bare TypeError, which auth.ts can only classify as "network",
+/// which is the message the user saw. Verified against production with a
+/// positive control: the same preflight sent with `Origin: https://idletoken.ai`
+/// DOES come back with the header, and with `Origin: tauri://localhost` does
+/// not.
+///
+/// Fixing it by adding the tauri origins to `CORS_ORIGINS` would also work, and
+/// is worth doing, but it is not sufficient: it would have to be redeployed,
+/// every self-hosted gateway would hit the same wall, and the whole mechanism
+/// protects browsers from other people's pages — which is not what this is.
+/// A native request has no origin and no preflight, so the question does not
+/// arise. Same reasoning that already routes `api_capability` and `api_stats`
+/// through Rust.
+///
+/// Returns the status and body TEXT rather than parsed JSON, and treats a
+/// non-2xx as SUCCESS: the caller distinguishes 401 (wrong password) from 403
+/// (unverified email) from 409 (already exists) from a transport failure, and
+/// collapsing those into one error is exactly the bug being fixed here. `Err`
+/// means the request never completed.
+#[derive(serde::Serialize)]
+struct PlatformResponse {
+    status: u16,
+    body: String,
+}
+
+#[tauri::command]
+async fn platform_http(
+    method: String,
+    url: String,
+    body: Option<String>,
+    bearer: Option<String>,
+) -> Result<PlatformResponse, String> {
+    // Not a general-purpose fetch hole punched through the CSP: the scheme must
+    // be https, with plain http allowed only for a loopback host so a developer
+    // can point at a gateway on their own machine. The webview loads nothing but
+    // this app's own bundled assets, so the realistic threat is small — but
+    // "the frontend can ask the native side to talk to any host" is worth not
+    // being true for the sake of two lines.
+    let parsed = reqwest::Url::parse(&url).map_err(|e| format!("bad platform URL: {e}"))?;
+    let host = parsed.host_str().unwrap_or("");
+    let local = host == "localhost" || host == "127.0.0.1" || host == "::1";
+    if parsed.scheme() != "https" && !(parsed.scheme() == "http" && local) {
+        return Err(format!("refusing a non-HTTPS platform request to {host}"));
+    }
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .map_err(|e| e.to_string())?;
+        let m = reqwest::Method::from_bytes(method.as_bytes())
+            .map_err(|_| format!("bad HTTP method {method}"))?;
+        let mut req = client.request(m, parsed);
+        if let Some(t) = bearer {
+            req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        if let Some(b) = body {
+            req = req.header(reqwest::header::CONTENT_TYPE, "application/json").body(b);
+        }
+        let res = req.send().map_err(|e| e.to_string())?;
+        let status = res.status().as_u16();
+        // A body that cannot be read is not a status we can report honestly, so
+        // it is an error rather than an empty string — an empty body means the
+        // caller sees "the server sent no token", which would be a lie.
+        let body = res.text().map_err(|e| e.to_string())?;
+        Ok(PlatformResponse { status, body })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// The cluster's capability table (engine `GET /idletoken/v1/capability`).
 #[tauri::command]
 async fn api_capability(base_url: String) -> Result<Value, String> {
@@ -949,6 +1029,7 @@ fn main() {
             api_stats,
             api_capability,
             api_chat_cancel,
+            platform_http,
             ui_test_directives,
             ui_test_report,
             collect_diagnostics,

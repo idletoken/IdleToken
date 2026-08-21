@@ -38,6 +38,7 @@ static void judge(const idletoken_model_spec *m, const char *quant,
     row->mode = IDLETOKEN_MODE_REFUSE;
     row->max_ctx = 0;
     row->shortfall = 0;
+    row->need_bytes = 0;
 
     for (int pass = 0; pass < 2; pass++) {
         const idletoken_mode want = pass == 0 ? IDLETOKEN_MODE_GPU_ONLY : IDLETOKEN_MODE_HYBRID;
@@ -47,15 +48,23 @@ static void judge(const idletoken_model_spec *m, const char *quant,
             if (got == want) {
                 row->mode = want;
                 row->max_ctx = tiers[i];
+                /* The requirement AT THE TIER WE JUST ACCEPTED. Quoting it at a
+                 * fixed tier instead would contradict the row beside it: a
+                 * model whose verdict is "yes at 1M context" needs the memory
+                 * that 1M of KV costs, not the memory 8K costs. */
+                row->need_bytes = idletoken_needed_bytes_quant(m, quant, tiers[i], n_nodes);
                 return;
             }
         }
     }
 
-    /* Nothing fits — report how far off the smallest tier is. */
+    /* Nothing fits — report how far off the smallest tier is, and what that
+     * smallest tier would have cost. Same tier for both numbers so the table
+     * cannot show a "needs 40 GB" next to a shortfall measured somewhere else. */
     uint64_t missing = 0;
     idletoken_mode_decide_quant(m, quant, nodes, n_nodes, tiers[nt - 1], &missing, NULL, 0);
     row->shortfall = missing;
+    row->need_bytes = idletoken_needed_bytes_quant(m, quant, tiers[nt - 1], n_nodes);
 }
 
 int idletoken_advise(const idletoken_node_mem *nodes, int n_nodes,
@@ -195,6 +204,7 @@ int idletoken_advise_json(const idletoken_advice_row *rows, int n, int n_nodes,
         const idletoken_advice_row *r = &rows[i];
         EMIT("%s{\"id\":\"%s\",\"label\":\"%s\",\"quant\":\"%s\","
              "\"mode\":\"%s\",\"max_ctx\":%u,\"weight_bytes\":%llu,"
+             "\"need_bytes\":%llu,"
              "\"shortfall_bytes\":%llu,\"available\":%s,\"single_node\":%s}",
              i ? "," : "", r->model_id, r->label, r->quant,
              r->unavailable ? "unavailable"
@@ -202,6 +212,7 @@ int idletoken_advise_json(const idletoken_advice_row *rows, int n, int n_nodes,
                : r->mode == IDLETOKEN_MODE_HYBRID   ? "hybrid" : "no",
              r->max_ctx,
              (unsigned long long)r->weight_bytes,
+             (unsigned long long)r->need_bytes,
              (unsigned long long)r->shortfall,
              r->unavailable ? "false" : "true",
              r->single_node ? "true" : "false");

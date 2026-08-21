@@ -9,6 +9,17 @@ this is a gate and not a comment.
 
 Usage:  python3 scripts/model_manifest_check.py [path/to/model_registry_dump]
         (builds nothing; the caller compiles the dumper)
+
+⚠ REBUILD THE DUMPER FIRST. It is a binary, not a parser over model.c, so a
+stale one reports drift against whatever the registry looked like when it was
+last compiled. On 2026-08-21 an old build claimed deepseek-v4-pro, glm-5.2 and
+kimi-k2.5 were `available=false` in the registry when all three had said
+`available = 1` in the source for weeks — three phantom failures to go chasing.
+acceptance.sh gets this right (it compiles immediately before calling); anyone
+running this by hand should do the same:
+
+    cc -Wall -Wextra -std=c99 -Iinclude src/common/model.c \\
+       src/tools/model_registry_dump.c -o build/model_registry_dump
 """
 import json
 import os

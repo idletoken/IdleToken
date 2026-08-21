@@ -20,13 +20,9 @@ import type { NodeSnapshot } from "./types";
 import type { Session } from "./auth";
 import WeightsRow from "./WeightsRow";
 import StoredModels from "./StoredModels";
-import ProblemLog from "./ProblemLog";
 import { getEngineProvider } from "./provider/engine";
-import { buildDiagnosticsBundle, diagnosticsFileName, exportableSettings } from "./diagnostics";
+import { exportableSettings } from "./diagnostics";
 import PlatformPanel from "./PlatformPanel";
-import Markdown from "./Markdown";
-import { openExternal } from "./auth";
-import { GUIDE_URL, ISSUES_URL, NOTICE_URL, REPO_URL, SECURITY_URL, legalUrl } from "./links";
 
 type Theme = "dark" | "light";
 const MiB = 1024 ** 2;
@@ -36,16 +32,14 @@ const GiB = 1024 ** 3;
 type Bi = { en: string; zh: string };
 const L = (b: Bi, lang: Lang) => b[lang];
 
+// "problems" / "links" / "legal" were block types here until 2026-08-21; the
+// pages that used them (Problems & diagnostics, the About link list, the legal
+// documents) were removed, so the block types went with them rather than stay
+// as three renderer branches nothing can reach.
 type FieldType =
   | "toggle" | "select" | "text" | "password" | "number" | "slider" | "time" | "note" | "action"
   /** Full-width block: the model folder's contents, with a Delete per file. */
-  | "stored-models"
-  /** Full-width block: the local problem log + its consent switch. */
-  | "problems"
-  /** Full-width block: the outbound links (guide, repository, notices). */
-  | "links"
-  /** Full-width block: the platform's terms and privacy policy, read in place. */
-  | "legal";
+  | "stored-models";
 interface Field {
   key?: keyof AppSettings;
   type: FieldType;
@@ -60,7 +54,7 @@ interface Field {
   step?: number;
   unit?: string;
   placeholder?: string;
-  action?: "export" | "import" | "clearData" | "clearKv" | "diagnostics" | "checkUpdate";
+  action?: "export" | "import" | "clearData" | "clearKv" | "checkUpdate";
   showIf?: (s: AppSettings) => boolean;
 }
 interface Section {
@@ -242,8 +236,10 @@ const CATEGORIES: Category[] = [
         // only (loopback, coord-enforced), so a token gates nothing a local
         // caller could not already do. The AppSettings key stays for engine
         // compatibility; the UI no longer offers it.
-        { key: "apiPort", type: "number", label: { en: "Port", zh: "端口" },
-          hint: { en: "Changes apply when the cluster restarts.", zh: "修改后重启集群生效。" } },
+        // The "changes apply on restart" hint went with the rest of this page's
+        // prose on 2026-08-21 — the page is the address and the port, nothing
+        // else.
+        { key: "apiPort", type: "number", label: { en: "Port", zh: "端口" } },
       ] },
     ],
   },
@@ -286,36 +282,23 @@ const CATEGORIES: Category[] = [
   {
     id: "privacy",
     label: { en: "Privacy", zh: "隐私保护" },
-    // Cut to the one verifiable line on 2026-08-15 (the end-to-end intro note
-    // and "prompts are not written to logs" went with it): prose assurances on
-    // a privacy page read as marketing, and every claim beyond the mechanism
-    // itself is another thing the page can be wrong about. The design doc
-    // (docs/privacy-design.md) is where the full story lives.
-    // 2026-08-20 (audit A-P1-5): one line was too few. The three sentences
-    // added below are not prose assurances — each names a mechanism that is
-    // enforced in code and can be checked: the scheduler refuses to place
-    // layer 0 away from the embedding table, the RPC transport refuses to run
-    // without a PSK, and the coordinator rewrites any non-loopback API bind.
-    // They are the product's actual claim, and a privacy page that does not
-    // state them leaves the reader to take the marketing's word for it.
+    // One line, twice over: cut to the mechanism on 2026-08-15, grown back to
+    // four notes plus the legal documents on 2026-08-20 (audit A-P1-5), cut
+    // back to the mechanism on 2026-08-21 (user's call). Prose assurances on a
+    // privacy page read as marketing, and every claim beyond the mechanism
+    // itself is another thing the page can be wrong about. The full story lives
+    // in docs/privacy-design.md — layer 0 pinned to the coordinator, PSK-TLS
+    // between machines with no plaintext fallback, loopback-only API — and each
+    // of those is enforced in code whether or not this page recites it.
+    // ⚠ The terms/privacy-policy buttons (`{ type: "legal" }`) went with them.
+    // They were the only way into those documents from the app, and the
+    // marketplace charges credits — if that turns out to be a requirement
+    // rather than a preference, the LegalDocs component is still in this file.
     sections: [
       { fields: [
         { type: "note", label: {
-          en: "The machine you run the coordinator on holds the first layer of the model, because that is the layer that could otherwise be used to reconstruct your prompt. The scheduler enforces this and refuses to start rather than place it elsewhere.",
-          zh: "运行协调者的这台机器持有模型的第 0 层——因为这一层若放在别处，就足以还原出你的提示词。调度器强制这一点，宁可拒绝启动，也不会把它放到其它机器上。" } },
-        { type: "note", label: {
-          en: "Traffic between machines in a cluster is encrypted (TLS with a pre-shared key minted by the coordinator). A node that has no key refuses to start; there is no unencrypted fallback.",
-          zh: "集群内跨机流量全程加密（TLS，密钥由协调者铸造并下发）。拿不到密钥的节点会拒绝启动，没有明文回退。" } },
-        { type: "note", label: {
-          en: "The inference API listens on this machine only (127.0.0.1). It is not reachable from your network, and remote use goes through the platform relay with end-to-end encrypted prompts.",
-          zh: "推理 API 只监听本机（127.0.0.1），局域网内无法访问；远程调用走平台中继，提示词端到端加密。" } },
-        { type: "note", label: {
           en: "Encryption: X25519 + AES-256-GCM envelope encryption.",
           zh: "加密方式：X25519 + AES-256-GCM 信封加密。" } },
-        // The full documents, read in this window rather than opened as a page
-        // of raw JSON in a browser. Absent when no platform is configured —
-        // there is then nothing to link to, and a dead button is worse.
-        { type: "legal" },
         // "Share anonymous telemetry" was removed on 2026-08-13. There is no
         // telemetry client anywhere in the tree — not in the client, the engine
         // or the platform agent — so the switch never had a consumer. A privacy
@@ -371,17 +354,15 @@ const CATEGORIES: Category[] = [
         { type: "action", action: "import", label: { en: "Import settings", zh: "导入设置" } },
         { type: "action", action: "clearData", label: { en: "Clear all local data", zh: "清除全部本地数据" } },
       ] },
-      // Back on screen 2026-08-20 (audit A-P1-5). It was hidden on 2026-08-15
-      // while the machinery stayed in the tree; what that left behind was a
-      // user whose cluster would not start and no way to get at the evidence —
-      // the failures were being recorded locally and shown to nobody. The
-      // bundle is still the only thing that leaves the machine, and only when
-      // the user exports it by hand.
-      { label: { en: "Problems & diagnostics", zh: "问题与诊断" }, fields: [
-        { type: "problems" },
-        { type: "action", action: "diagnostics", label: { en: "Export diagnostics", zh: "导出诊断信息" },
-          hint: { en: "A file with this machine's hardware, settings and recent failures. Attach it when you report a problem.", zh: "包含本机硬件、设置与最近失败记录的文件。反馈问题时请附上它。" } },
-      ] },
+      // "Problems & diagnostics" (the local failure log + the export button) is
+      // gone as of 2026-08-21 (user's call). It was hidden on 2026-08-15, back
+      // on 2026-08-20 for audit A-P1-5, and off again now. The machinery is
+      // untouched — problems.ts still records failures, diagnostics.ts still
+      // assembles the bundle, and the acceptance channel still exports one —
+      // so this is a UI decision, not a capability removed. What it costs: a
+      // user whose cluster will not start has no in-app way to hand over the
+      // evidence, so a support thread starts from a description instead of a
+      // file.
       { label: { en: "About", zh: "关于" }, fields: [
         { type: "note", label: { en: `IdleToken client ${APP_VERSION}`, zh: `IdleToken 客户端 ${APP_VERSION}` } },
         // Said wrong until 2026-08-13 ("MIT-licensed"). IdleToken is
@@ -391,9 +372,11 @@ const CATEGORIES: Category[] = [
         // the attribution Apache-2.0 §4(d) actually requires, and an About box
         // that re-lists it is a second copy to keep true.
         { type: "note", label: { en: "Apache-2.0.", zh: "Apache-2.0 许可。" } },
-        // A-P1-5: until now the whole client had one outbound link. The
-        // addresses live in links.ts, not in this schema — see that file.
-        { type: "links" },
+        // The outbound link list (guide / source / issues / security / notices)
+        // was cut on 2026-08-21 with the rest of this page's extras. links.ts
+        // still holds the addresses; "request a model" now has no in-app route,
+        // which is worth remembering because the curated list is the only way
+        // to get a model and a GitHub issue is the only way into it.
       ] },
     ],
   },
@@ -417,98 +400,13 @@ function defaultKvHint(): string {
   return "~/.cache/idletoken/kv";
 }
 
-/** The About link list. One row per destination, opened in the real browser
- *  (never the app webview — see auth.openExternal). */
-function AboutLinks(props: { lang: Lang }) {
-  const items: { href: string; label: Bi }[] = [
-    { href: GUIDE_URL, label: { en: "User guide", zh: "使用指南" } },
-    { href: REPO_URL, label: { en: "Source code", zh: "源代码" } },
-    { href: ISSUES_URL, label: { en: "Report a problem or request a model", zh: "反馈问题 / 申请新模型" } },
-    { href: SECURITY_URL, label: { en: "Report a security issue", zh: "报告安全问题" } },
-    { href: NOTICE_URL, label: { en: "Third-party notices", zh: "第三方声明" } },
-  ];
-  return (
-    <div className="about-links">
-      {items.map((it) => (
-        <button key={it.href} className="linkbtn" onClick={() => void openExternal(it.href)}>
-          {L(it.label, props.lang)} ↗
-        </button>
-      ))}
-    </div>
-  );
-}
-
-/**
- * Terms and privacy policy, fetched from the platform and rendered here.
- *
- * In the app rather than in a browser tab because the endpoint answers
- * markdown inside JSON — the canonical text, but not something to hand a
- * browser. Unreachable platform = the error, never a cached or paraphrased
- * copy: a legal text the client made up would be worse than none.
- */
-function LegalDocs(props: { lang: Lang }) {
-  const [open, setOpen] = useState<null | "tos" | "privacy">(null);
-  const [body, setBody] = useState<string | null>(null);
-  const [err, setErr] = useState<string | null>(null);
-
-  const show = async (doc: "tos" | "privacy") => {
-    const url = legalUrl(doc, props.lang);
-    if (!url) return;
-    setOpen(doc);
-    setBody(null);
-    setErr(null);
-    try {
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const j = (await res.json()) as { markdown?: string };
-      if (!j.markdown) throw new Error("the platform returned no document");
-      setBody(j.markdown);
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
-    }
-  };
-
-  // No platform configured: nothing to link to, so no buttons. A control that
-  // cannot do anything is the thing this audit round keeps removing.
-  if (!legalUrl("tos", props.lang)) return null;
-
-  return (
-    <div className="about-links">
-      <button className="linkbtn" onClick={() => void show("privacy")}>
-        {L({ en: "Privacy policy", zh: "隐私政策" }, props.lang)}
-      </button>
-      <button className="linkbtn" onClick={() => void show("tos")}>
-        {L({ en: "Terms of service", zh: "服务条款" }, props.lang)}
-      </button>
-      {open ? (
-        <div className="modal-scrim" onClick={() => setOpen(null)}>
-          <div className="modal modal--legal" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
-            <div className="modal__head">
-              <h2>
-                {open === "privacy"
-                  ? L({ en: "Privacy policy", zh: "隐私政策" }, props.lang)
-                  : L({ en: "Terms of service", zh: "服务条款" }, props.lang)}
-              </h2>
-              <button className="iconbtn" onClick={() => setOpen(null)} aria-label="close">
-                ✕
-              </button>
-            </div>
-            {err ? (
-              <p className="setting-hint">
-                {L({ en: "Could not load the document: ", zh: "无法加载文档：" }, props.lang)}
-                {err}
-              </p>
-            ) : body === null ? (
-              <p className="setting-hint">{L({ en: "Loading…", zh: "加载中…" }, props.lang)}</p>
-            ) : (
-              <Markdown text={body} />
-            )}
-          </div>
-        </div>
-      ) : null}
-    </div>
-  );
-}
+// AboutLinks (guide / source / issues / security / notices) and LegalDocs (the
+// platform's terms and privacy policy, fetched and rendered in a modal) both
+// lived here until 2026-08-21, when the About and Privacy pages were cut back
+// to a version line, a licence line and the encryption line. Both are in git
+// history; links.ts still exports the addresses and the gateway still serves
+// /legal/tos and /legal/privacy, so bringing either back is a paste, not a
+// rewrite. The modal's styles are still in styles.css (.modal--legal).
 
 // ---- panel -----------------------------------------------------------------
 export default function SettingsPanel(props: {
@@ -567,7 +465,6 @@ export default function SettingsPanel(props: {
   // "Clear my cache now" feedback (philosophy 15: every action has clear
   // loading/success/failure feedback).
   const [kvClear, setKvClear] = useState<"idle" | "busy" | "ok" | "err">("idle");
-  const [diag, setDiag] = useState<"idle" | "busy" | "ok" | "err">("idle");
   // The button says "checking" while the feed is being asked; the ANSWER is
   // the dialog App opens, so there is nothing to report back here.
   const [upd, setUpd] = useState<"idle" | "busy">("idle");
@@ -633,27 +530,6 @@ export default function SettingsPanel(props: {
       link.download = "idletoken-settings.json";
       link.click();
       URL.revokeObjectURL(url);
-    } else if (a === "diagnostics") {
-      if (diag === "busy") return;
-      setDiag("busy");
-      getEngineProvider()
-        .diagnostics(props.apiBaseUrl || `http://127.0.0.1:${s.apiPort || 8000}`)
-        .then((report) => {
-          // Assembly goes through the same function in diagnostics.ts that the
-          // acceptance channel uses -- the place that decides whether a token
-          // goes out should not have two implementations.
-          const bundle = buildDiagnosticsBundle(report, s);
-          const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: "application/json" });
-          const url = URL.createObjectURL(blob);
-          const link = document.createElement("a");
-          link.href = url;
-          link.download = diagnosticsFileName();
-          link.click();
-          URL.revokeObjectURL(url);
-          setDiag("ok");
-        })
-        .catch(() => setDiag("err"))
-        .finally(() => setTimeout(() => setDiag("idle"), 2500));
     } else if (a === "checkUpdate") {
       if (upd === "busy") return;
       setUpd("busy");
@@ -717,9 +593,6 @@ export default function SettingsPanel(props: {
     if (f.type === "note") return <p key={i} className="about-line">{label}</p>;
     if (f.type === "stored-models")
       return <StoredModels key={i} modelDir={s.modelDir} onChanged={props.onWeightsChanged} />;
-    if (f.type === "problems") return <ProblemLog key={i} />;
-    if (f.type === "links") return <AboutLinks key={i} lang={lang} />;
-    if (f.type === "legal") return <LegalDocs key={i} lang={lang} />;
     if (f.type === "action") {
       let btnLabel = label;
       if (f.action === "checkUpdate" && upd === "busy") btnLabel = t("update.checking");
@@ -829,9 +702,17 @@ export default function SettingsPanel(props: {
                   }
                 >
                   <span className="model-opt__name">{brand.label}</span>
+                  {/* Singular matters now (2026-08-21): splitting the Qwen card
+                      by generation left Qwen3 and Qwen3.8 with exactly one
+                      model each, and "1 sizes" was suddenly on screen. */}
                   <span className="model-opt__params">
                     {brand.models.length}
-                    {L({ en: " sizes", zh: " 个规格" }, lang)}
+                    {L(
+                      brand.models.length === 1
+                        ? { en: " size", zh: " 个规格" }
+                        : { en: " sizes", zh: " 个规格" },
+                      lang
+                    )}
                   </span>
                   {current ? (
                     <span className="model-opt__deploy">{t("settings.model.current")}</span>
@@ -978,10 +859,12 @@ export default function SettingsPanel(props: {
         {renderField({ key: "maxTokens", type: "number", label: { en: "Max tokens per reply", zh: "单次回复最大词元数" } }, 0)}
         {/* A-P2-6: the placeholder used to suggest /tmp/idletoken-kv on every
             platform, which on Windows is a path that does not exist and on
-            macOS is one the OS empties without warning. Empty means "let the
-            engine pick"; the hint says where that is on THIS machine. */}
+            macOS is one the OS empties without warning. It now shows where the
+            engine puts the cache on THIS machine, which is also what an empty
+            field means — so the "empty = the engine's own location" hint under
+            it was saying the placeholder over again (removed 2026-08-21). */}
         {renderField({ key: "kvDir", type: "text", label: { en: "KV cache directory", zh: "KV 缓存目录" },
-                       placeholder: defaultKvHint(), hint: { en: "Empty = the engine's own location for this machine.", zh: "留空 = 由引擎按本机约定选择位置。" } }, 1)}
+                       placeholder: defaultKvHint() }, 1)}
         {renderField({ type: "action", action: "clearKv", label: { en: "Clear KV cache", zh: "清除 KV 缓存" } }, 2)}
       </div>
       {/* "What can I run?" — the summary verdict, last on purpose (see the

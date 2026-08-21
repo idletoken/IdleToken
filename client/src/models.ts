@@ -13,6 +13,7 @@ import qwen354b from "../../models/qwen3.5-4b.json";
 import qwen359b from "../../models/qwen3.5-9b.json";
 import qwen3527b from "../../models/qwen3.5-27b.json";
 import qwen3827b from "../../models/qwen3.8-27b.json";
+import qwen3824t from "../../models/qwen3.8-2.4t-a95b.json";
 import qwen3535ba3b from "../../models/qwen3.5-35b-a3b.json";
 import glm52 from "../../models/glm-5.2.json";
 import kimiK25 from "../../models/kimi-k2.5.json";
@@ -120,7 +121,7 @@ export interface ModelSpec {
 // cover this file).
 const MANIFESTS = [
   dsv4, dsv4pro,
-  qwen3508b, qwen354b, qwen38b, qwen359b, qwen3527b, qwen3827b, qwen3535ba3b,
+  qwen3508b, qwen354b, qwen38b, qwen359b, qwen3527b, qwen3827b, qwen3824t, qwen3535ba3b,
   glm52, kimiK25,
 ] as ModelManifest[];
 
@@ -190,14 +191,19 @@ export const MODELS: ModelSpec[] = MANIFESTS.map(toSpec);
 export const AVAILABLE_MODELS: ModelSpec[] = MODELS.filter((m) => m.available);
 
 /**
- * Models grouped by BRAND for the picker (2026-08-15).
+ * Models grouped into picker cards (2026-08-15; regrouped 2026-08-21).
  *
  * Flat, the catalogue is now ~10 models × up to 26 precisions — a single list
- * ran off the screen and buried the choice that actually matters first ("whose
- * model?"), then second ("how big?"), then last ("how precise?"). Brand is
- * coarser than the manifest's `family`: "qwen3" and "qwen3.5" are one vendor
- * to a reader, and splitting them into two cards would reproduce the problem
- * this grouping exists to solve.
+ * ran off the screen and buried the choice that actually matters first ("which
+ * model?"), then second ("how big?"), then last ("how precise?").
+ *
+ * The grouping key is the manifest's `family`, i.e. the GENERATION, not the
+ * vendor. Until 2026-08-21 every Qwen shared one card on the reasoning that
+ * "qwen3" and "qwen3.5" are one vendor to a reader — but a generation is not a
+ * size, and folding three of them together made the size row inside the card
+ * read as one ladder when it is really three: "0.8B, 4B, 8B, 9B, 27B, 27B,
+ * 35B-A3B" has two 27Bs in it that are different models a year apart. Three
+ * cards, one per generation, and the sizes inside each are comparable again.
  */
 /** The model's name WITHOUT its brand: "DeepSeek V4 Flash" inside the DeepSeek
  *  card is just "V4 Flash", "Qwen3.5 4B" inside Qwen is "3.5 4B". The brand is
@@ -221,22 +227,32 @@ export interface ModelBrand {
   models: ModelSpec[];
 }
 
-const BRAND_OF: { match: (family: string) => boolean; id: string; label: string }[] = [
-  { match: (f) => f.startsWith("qwen"), id: "qwen", label: "Qwen" },
-  { match: (f) => f.startsWith("deepseek"), id: "deepseek", label: "DeepSeek" },
-  { match: (f) => f.startsWith("kimi"), id: "kimi", label: "Kimi" },
-  { match: (f) => f.startsWith("glm"), id: "glm", label: "GLM" },
+// One entry per family, in the order the cards appear. Newest generation of a
+// vendor first, and the vendors ordered as the list has always shown them.
+// A family missing from this table still gets a card (see brandOf) — it just
+// sorts to the end, which is the right default for a manifest that landed
+// after this table was last edited.
+const BRAND_OF: { family: string; id: string; label: string }[] = [
+  { family: "qwen3.8", id: "qwen3.8", label: "Qwen3.8" },
+  { family: "qwen3.5", id: "qwen3.5", label: "Qwen3.5" },
+  { family: "qwen3", id: "qwen3", label: "Qwen3" },
+  { family: "deepseek", id: "deepseek", label: "DeepSeek" },
+  { family: "kimi", id: "kimi", label: "Kimi" },
+  { family: "glm", id: "glm", label: "GLM" },
 ];
 
 export function brandOf(family: string): { id: string; label: string } {
-  const hit = BRAND_OF.find((b) => b.match(family));
-  // An unknown family becomes its own brand rather than a catch-all "Other":
-  // a new vendor should appear under its own name the day its manifest lands,
-  // without anybody remembering to edit this table.
+  // Exact family match, NOT a prefix test. A prefix test is what made "qwen3"
+  // swallow "qwen3.5" and "qwen3.8"; it would do the same to any future
+  // "qwen4" vs "qwen4.5" pair, silently, the day the manifest lands.
+  const hit = BRAND_OF.find((b) => b.family === family);
+  // An unknown family becomes its own card rather than a catch-all "Other":
+  // a new generation should appear under its own name the day its manifest
+  // lands, without anybody remembering to edit this table.
   return hit ?? { id: family || "other", label: family || "Other" };
 }
 
-/** The picker's data: one card per brand, models smallest-first inside it. */
+/** The picker's data: one card per family, models smallest-first inside it. */
 export const MODEL_BRANDS: ModelBrand[] = (() => {
   const by = new Map<string, ModelBrand>();
   for (const m of AVAILABLE_MODELS) {
@@ -245,7 +261,15 @@ export const MODEL_BRANDS: ModelBrand[] = (() => {
     by.get(b.id)!.models.push(m);
   }
   for (const b of by.values()) b.models.sort((x, y) => x.approxWeightsBytes - y.approxWeightsBytes);
-  return [...by.values()];
+  // Card order follows BRAND_OF, not the order the manifests happen to be
+  // imported in — which is why the old single-Qwen card looked stable and the
+  // split one would not have: whichever generation owned the first manifest
+  // would have decided where all of Qwen sat in the list.
+  const rank = (id: string) => {
+    const i = BRAND_OF.findIndex((b) => b.id === id);
+    return i < 0 ? BRAND_OF.length : i;
+  };
+  return [...by.values()].sort((a, b) => rank(a.id) - rank(b.id));
 })();
 
 export const DEFAULT_MODEL_ID = "deepseek-v4-flash";

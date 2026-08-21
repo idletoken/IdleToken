@@ -38,6 +38,15 @@ typedef struct {
     idletoken_mode mode;       /* GPU_ONLY / HYBRID / REFUSE */
     uint32_t    max_ctx;    /* largest tier that fits in `mode`; 0 when REFUSE */
     uint64_t    weight_bytes;   /* download size at this precision */
+    /* Memory the whole cluster must have to serve this (model, precision):
+     * layer weights + per-node shared weights + per-node inference overhead,
+     * straight from idletoken_needed_bytes_quant — the planner's own number, not a
+     * second estimate. Measured at the context tier this row's verdict was
+     * reached at, and at the SMALLEST tier when the verdict is REFUSE, so it is
+     * always the counterpart of `shortfall`: need - have = shortfall.
+     * "Download size" and "memory needed" are not the same question and the
+     * table used to answer only the first (2026-08-21). */
+    uint64_t    need_bytes;
     uint64_t    shortfall;  /* bytes of memory still missing (REFUSE only) */
     int         unavailable;/* model not runnable in this build (manifest flag) */
     /* 1 = this model is single-node-only, so the verdict was computed against

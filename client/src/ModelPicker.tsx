@@ -247,8 +247,10 @@ export default function ModelPicker(props: {
                   </span>
                   <span className="modelpick__meta">
                     <span className="modelpick__params">{m.params}</span>
-                    {/* Can these machines actually run it — the advisor's verdict,
-                        same wording as the capability table. */}
+                    {/* Can these machines actually run it — the advisor's verdict.
+                        Since 2026-08-21 this chip is the ONLY place it appears:
+                        the capability table was cut to four columns and the
+                        "Can run" one went with the rest. */}
                     {mode ? <span className={`modelpick__fit ${fitClass(mode)}`}>{t(fitKey(mode))}</span> : null}
                     {/* Usage only when there IS usage: a "0 tokens" chip reads as
                         "nobody runs this", which is not what missing data means. */}

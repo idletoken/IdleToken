@@ -85,6 +85,23 @@ static const idletoken_model_variant QWEN35_9B_VARIANTS[] = {
     { .quant = "BF16", .layer_weight_bytes = 17920697312ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-9B-BF16.gguf" },
 };
 
+/* Qwen3.8 2.4T-A95B (2026-08-21). Nine precisions, 370 GiB to 4.5 TiB —
+ * cluster tier by a wide margin. Every byte count measured through the HF
+ * API; see models/qwen3.8-2.4t-a95b.json for what has and has not been
+ * verified on real hardware (short version: nothing has, because nothing
+ * we own can hold it). */
+static const idletoken_model_variant QWEN38_24T_VARIANTS[] = {
+    { .quant = "Q1_0",     .layer_weight_bytes = 397256393248ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf" },  /* 10 parts, 370 GiB */
+    { .quant = "IQ1_S",    .layer_weight_bytes = 508388672224ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ1_S/Qwen3.8-2.4T-A95B-UD-IQ1_S-00001-of-00012.gguf" },  /* 12 parts, 473 GiB */
+    { .quant = "IQ1_M",    .layer_weight_bytes = 563954811904ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ1_M/Qwen3.8-2.4T-A95B-UD-IQ1_M-00001-of-00013.gguf" },  /* 13 parts, 525 GiB */
+    { .quant = "IQ2_XXS",  .layer_weight_bytes = 656565044416ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ2_XXS/Qwen3.8-2.4T-A95B-UD-IQ2_XXS-00001-of-00015.gguf" },  /* 15 parts, 611 GiB */
+    { .quant = "IQ2_XS",   .layer_weight_bytes = 730653230336ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ2_XS/Qwen3.8-2.4T-A95B-UD-IQ2_XS-00001-of-00016.gguf" },  /* 16 parts, 680 GiB */
+    { .quant = "IQ3_XXS",  .layer_weight_bytes = 955535034144ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ3_XXS/Qwen3.8-2.4T-A95B-UD-IQ3_XXS-00001-of-00021.gguf" },  /* 21 parts, 890 GiB */
+    { .quant = "IQ4_XS",   .layer_weight_bytes = 1310876469952ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ4_XS/Qwen3.8-2.4T-A95B-UD-IQ4_XS-00001-of-00029.gguf" },  /* 29 parts, 1221 GiB */
+    { .quant = "Q8_0",     .layer_weight_bytes = 2600249563264ull, .shared_weight_bytes = 0ull, .gguf = "Q8_0/Qwen3.8-2.4T-A95B-Q8_0-00001-of-00056.gguf" },  /* 56 parts, 2422 GiB */
+    { .quant = "BF16",     .layer_weight_bytes = 4893172677568ull, .shared_weight_bytes = 0ull, .gguf = "BF16/Qwen3.8-2.4T-A95B-BF16-00001-of-00140.gguf" },  /* 140 parts, 4557 GiB */
+};
+
 static const idletoken_model_variant QWEN38_27B_VARIANTS[] = {
     { .quant = "IQ1_S", .layer_weight_bytes = 6192222208ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.8-27B-UD-IQ1_S.gguf" },
     { .quant = "IQ1_M", .layer_weight_bytes = 6729166848ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.8-27B-UD-IQ1_M.gguf" },
@@ -290,9 +307,23 @@ static const idletoken_model_variant KIMI_K25_VARIANTS[] = {
 /* DeepSeek V4 Pro: measured from unsloth/DeepSeek-V4-Pro-0813-GGUF
  * (HF API, 2026-08-15). 671B/37B-active, 61 layers — a different model
  * from Flash (43 layers), not one of its precisions. */
+/* Two repos, smallest first (2026-08-21). unsloth publishes exactly two
+ * precisions of V4 Pro and neither is below Q4, which left the largest model in
+ * the catalogue with the least room to make it fit; DevQuasar's plain-K quants
+ * add a 530 GiB floor under it.
+ * ⚠ These are NOT one quality ladder. unsloth's UD-* files are its dynamic
+ * quantization (selected tensors kept wide) and DevQuasar's are ordinary
+ * llama-quantize output, so "Q4_K_M is bigger than Q4_K_XL" here is a fact
+ * about two different quantizers, not a typo — and the ppl gate has to be run
+ * per repo. The apparent 22 GiB gap between UD-Q4_K_XL and UD-Q8_K_XL is
+ * likewise unsloth's own doing; both totals were re-measured against the HF
+ * blob sizes on 2026-08-21 and match to the byte. */
 static const idletoken_model_variant DSV4_PRO_VARIANTS[] = {
-    { .quant = "Q4_K_XL", .layer_weight_bytes = 849683927055ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00001-of-00020.gguf" },  /* 20 parts, 791 GiB */
-    { .quant = "Q8_K_XL", .layer_weight_bytes = 873445601295ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q8_K_XL/DeepSeek-V4-Pro-0813-UD-Q8_K_XL-00001-of-00020.gguf" },  /* 20 parts, 813 GiB */
+    { .quant = "Q2_K",    .layer_weight_bytes = 569417385408ull, .shared_weight_bytes = 0ull, .gguf = "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00001-of-00037.gguf" },      /* 37 parts, 530 GiB, DevQuasar */
+    { .quant = "Q3_K_M",  .layer_weight_bytes = 748403475872ull, .shared_weight_bytes = 0ull, .gguf = "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00001-of-00061.gguf" },  /* 61 parts, 697 GiB, DevQuasar */
+    { .quant = "Q4_K_XL", .layer_weight_bytes = 849683927055ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00001-of-00020.gguf" },      /* 20 parts, 791 GiB, unsloth */
+    { .quant = "Q8_K_XL", .layer_weight_bytes = 873445601295ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q8_K_XL/DeepSeek-V4-Pro-0813-UD-Q8_K_XL-00001-of-00020.gguf" },      /* 20 parts, 813 GiB, unsloth */
+    { .quant = "Q4_K_M",  .layer_weight_bytes = 950879580768ull, .shared_weight_bytes = 0ull, .gguf = "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00001-of-00076.gguf" },  /* 76 parts, 886 GiB, DevQuasar */
 };
 
 static const idletoken_model_spec MODELS[] = {
@@ -338,14 +369,14 @@ static const idletoken_model_spec MODELS[] = {
         .n_embd   = 7168,
         .hc_streams = 1,
         .n_vocab  = 129280,
-        .layer_weight_bytes  = 849683927055ull,
+        .layer_weight_bytes  = 569417385408ull, /* == variants[default_variant] = Q2_K */
         .shared_weight_bytes = 0ull,
         .ctx_max  = 1048576,
         .split_boundary_multiple = 0,
         .kv_kind  = IDLETOKEN_KV_MLA,
         .kv_bytes_per_token_layer = 0,
         .overhead_base_bytes = 3221225472ull,
-        .default_gguf = "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00001-of-00020.gguf",
+        .default_gguf = "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00001-of-00037.gguf",
         .variants = DSV4_PRO_VARIANTS,
         .n_variants = sizeof(DSV4_PRO_VARIANTS) / sizeof(DSV4_PRO_VARIANTS[0]),
         .default_variant = 0,
@@ -522,6 +553,45 @@ static const idletoken_model_spec MODELS[] = {
         .default_gguf = "Qwen3.8-27B-UD-IQ1_S.gguf",
         .variants = QWEN38_27B_VARIANTS,
         .n_variants = sizeof(QWEN38_27B_VARIANTS) / sizeof(QWEN38_27B_VARIANTS[0]),
+        .default_variant = 0,
+    },
+    {
+        /* Qwen3.8 2.4T-A95B — the other half of the Qwen3.8 family, and the
+         * largest model in the catalogue. Architecture qwen35moe, the same one
+         * qwen3.5-35b-a3b runs, so the graph is a known quantity even though
+         * this weight set is not.
+         *
+         * n_layers is 92, NOT qwen35moe.block_count (93): block 92 is the MTP
+         * (NextN) draft head. Same reading as qwen3.8-27b's 65 -> 64 above,
+         * which was used as the control for it.
+         *
+         * ⚠ Neither the ppl gate nor the testbed smoke of hard constraint #2
+         * has run on this model, and neither CAN here — the smallest precision
+         * is 370 GiB against ~150 GiB of pooled testbed memory. It is listed on
+         * the same footing as GLM-5.2 and DeepSeek V4 Pro, which are in the
+         * catalogue under the identical limitation. The manifest's notes carry
+         * the full argument. */
+        .id      = "qwen3.8-2.4t-a95b",
+        .label   = "Qwen3.8 2.4T-A95B",
+        .backend = IDLETOKEN_BACKEND_LLAMACPP,
+        .available = 1,
+        .deployment = IDLETOKEN_DEPLOY_CLUSTER,
+        .n_layers = 92,
+        .n_embd   = 8192,
+        .hc_streams = 1,
+        .n_vocab  = 248320,
+        .layer_weight_bytes  = 397256393248ull,  /* == variants[default_variant] = Q1_0 */
+        .shared_weight_bytes = 0ull,
+        .ctx_max  = 262144,
+        .split_boundary_multiple = 0,
+        .kv_kind  = IDLETOKEN_KV_HYBRID,
+        .kv_bytes_per_token_layer = 8192,   /* 4 kv heads x 256 x 2 x 4 B */
+        .state_bytes_per_layer = 8634368,   /* 128x128x128x4 + conv 3x20480x4 */
+        .full_attn_interval = 4,
+        .overhead_base_bytes = (uint64_t)(3.0 * (double)GiB),
+        .default_gguf = "UD-Q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf",
+        .variants = QWEN38_24T_VARIANTS,
+        .n_variants = sizeof(QWEN38_24T_VARIANTS) / sizeof(QWEN38_24T_VARIANTS[0]),
         .default_variant = 0,
     },
     {

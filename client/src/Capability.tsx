@@ -21,6 +21,12 @@ export interface CapabilityRow {
   mode: CapabilityMode;
   max_ctx: number;
   weight_bytes: number;
+  /** Memory the cluster needs to serve this row — weights + per-node shared
+   *  weights + per-node inference overhead, from the planner
+   *  (`idletoken_needed_bytes_quant`). Optional because a coordinator built before
+   *  2026-08-21 does not send it; absent renders as "—" rather than as a
+   *  number this file made up. */
+  need_bytes?: number;
   shortfall_bytes: number;
   available: boolean;
   // Engine-side flag (src/common/advise.c): this model is served by ONE
@@ -34,12 +40,6 @@ export interface CapabilityRow {
 export interface CapabilityReport {
   nodes: number;
   models: CapabilityRow[];
-}
-
-function ctxLabel(ctx: number): string {
-  if (!ctx) return "—";
-  if (ctx >= 1024 * 1024) return `${Math.round(ctx / (1024 * 1024))}M`;
-  return `${Math.round(ctx / 1024)}K`;
 }
 
 /**
@@ -99,16 +99,15 @@ export default function Capability(props: { apiBaseUrl?: string | null }) {
     return rank(a) - rank(b) || a.shortfall_bytes - b.shortfall_bytes;
   });
 
-  const verdict = (r: CapabilityRow) => {
-    if (r.mode === "gpu_only") return <span className="cap-yes">{t("cap.yesGpu")}</span>;
-    if (r.mode === "hybrid") return <span className="cap-hybrid">{t("cap.yesHybrid")}</span>;
-    // "unavailable" ("backend not implemented") is a relic of the self-built
-    // kernel era: with llama.cpp as the engine (2026-08-14 pivot) every model
-    // in the curated list is implemented, and the only honest reasons left are
-    // memory ones. An old engine still reporting it renders as a plain "No".
-    return <span className="cap-no">{t("cap.no")}</span>;
-  };
-
+  // Four columns as of 2026-08-21 (user's call): model, precision, download
+  // size, memory needed. "Can run" / "Max context" / "Note" and the footer
+  // about pooling a new machine's memory are gone.
+  //
+  // What survives without a column of its own: the runnable-first SORT above
+  // and the dimming below, both driven by `mode`. They are not columns and
+  // they are the difference between a table you can scan and 150 identical
+  // rows. The verdict is still readable from the numbers — the memory column
+  // is what the row needs, and the reader knows what they have.
   return (
     <section className="card cap-card">
       <header className="cap-head">
@@ -121,36 +120,24 @@ export default function Capability(props: { apiBaseUrl?: string | null }) {
             <th>{t("cap.model")}</th>
             <th>{t("cap.quant")}</th>
             <th>{t("cap.size")}</th>
-            <th>{t("cap.canRun")}</th>
-            <th>{t("cap.maxCtx")}</th>
-            <th>{t("cap.note")}</th>
+            <th>{t("cap.need")}</th>
           </tr>
         </thead>
         <tbody>
-          {rows.map((r) => {
-            return (
-              <tr key={`${r.id}:${r.quant}`} className={r.mode === "no" || r.mode === "unavailable" ? "cap-row--dim" : ""}>
-                <td>{r.label}</td>
-                <td>{r.quant || "—"}</td>
-                <td>{fmtBytes(r.weight_bytes)}</td>
-                <td>{verdict(r)}</td>
-                <td>{ctxLabel(r.max_ctx)}</td>
-                <td className="cap-note">
-                  {r.mode === "no" && r.shortfall_bytes > 0
-                    ? t(r.single_node ? "cap.needMoreSingle" : "cap.needMore")
-                        .replace("{gb}", String(Math.ceil(r.shortfall_bytes / 1024 ** 3)))
-                    : r.mode === "hybrid"
-                      ? t("cap.hybridNote")
-                      : r.single_node
-                        ? t("cap.singleNodeNote")
-                        : ""}
-                </td>
-              </tr>
-            );
-          })}
+          {rows.map((r) => (
+            <tr key={`${r.id}:${r.quant}`} className={r.mode === "no" || r.mode === "unavailable" ? "cap-row--dim" : ""}>
+              <td>{r.label}</td>
+              <td>{r.quant || "—"}</td>
+              <td>{fmtBytes(r.weight_bytes)}</td>
+              {/* An engine older than this column sends no need_bytes. Say so
+                  with a dash — a table that fills a gap with a plausible
+                  number is the failure mode this whole component was written
+                  to avoid (see the header). */}
+              <td>{r.need_bytes ? fmtBytes(r.need_bytes) : "—"}</td>
+            </tr>
+          ))}
         </tbody>
       </table>
-      <p className="cap-foot">{t("cap.footer")}</p>
     </section>
   );
 }
