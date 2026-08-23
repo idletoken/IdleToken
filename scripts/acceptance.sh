@@ -3034,27 +3034,53 @@ g_no_prompt_log() {
 }
 
 # =====================================================================
-# G_LOCAL_TOKEN — the local API is closed on a fresh install
-#      (docs/api-surface.md §3 decision 3, §5.3).
+# G_LOCAL_TOKEN — the local API's default posture
+#      (docs/api-surface.md §3 decision 3, §5.3; docs/acceptance-criteria.md).
 #
-# The engine has always accepted `--api-token` and always defaulted to open;
-# what changed is that the client now generates one for a new install. That is a
-# behaviour of `loadSettings()`, so the gate runs the real function rather than
-# grepping for it: bundle settings.ts with the vite that already builds the
-# client, then drive it against a fake localStorage.
+# ⚠ INVERTED 2026-08-21 (e78269d). This gate used to demand that a fresh install
+# MINT a 32-hex token. It no longer does, and the reason is worth keeping:
 #
-# Four claims, and the last two matter as much as the first:
+#   - The API has answered 127.0.0.1 only since 2026-08-16 (the coordinator
+#     rewrites any non-loopback --api-bind), so "anyone on the WiFi burns your
+#     balance" — the threat that justified minting — had already stopped being
+#     reachable.
+#   - Against a program on the SAME machine the token does nothing: it reads the
+#     token out of the same settings file, next to the platform JWT and the
+#     overflow key it would rather take. A lock whose key hangs on the door.
+#   - The cost was real. Every WebUI, Claude Code and Codex had to be handed a
+#     key; a fresh install was closed with the key shown nowhere; and an install
+#     predating minting could not switch sharing on at all.
 #
-#   1. a fresh install gets a token, 32 hex chars;
-#   2. two fresh installs get DIFFERENT tokens (a constant baked into the
-#      defaults object would satisfy claim 1 and be worthless — same token on
-#      every machine we ship);
-#   3. an UPGRADED install with an empty token keeps it empty. Filling one in
+# The successor is api_origin_ok(): a browser page is the one caller that can
+# reach a loopback port without being able to read your files, and it is
+# identifiable — browsers always send Origin, API clients never do. That is CSRF
+# protection, not authentication; a local program is bounded by the daily spend
+# cap instead.
+#
+# So the gate now has two halves. The settings half still drives the real
+# `loadSettings()` (bundle settings.ts with the client's own vite, fake
+# localStorage) rather than grepping source. The engine half reads the
+# coordinator's own selftests, because with minting gone the browser gate is the
+# ONLY protection still standing — and until 2026-08-23 nothing on the ladder
+# asserted it. A retirement that drops the assertion along with the mechanism
+# turns a replacement into a removal.
+#
+# Five claims:
+#
+#   1. a fresh install gets apiToken "" — open by default (INVERTED);
+#   2. an UPGRADED install with an empty token keeps it empty. Filling one in
 #      would 401 every curl, script and Claude Code config that machine already
 #      had working, with no visible cause;
-#   4. a token the user actually set is preserved.
+#   3. a token the user actually set is preserved — the setting stays for an
+#      operator who wants one, and the coordinator still enforces it;
+#   4. an ordinary API client (no Origin, including the Authorization-only shape
+#      Claude Code sends) is ALLOWED — a gate that refuses everything would
+#      "block browsers" while breaking every real client;
+#   5. a page carrying Origin is refused, and `Origin: null` (sandboxed iframe,
+#      file://) counts as a browser too — treating it as absent would leave the
+#      easiest bypass in place.
 #
-# Claims 3 and 4 are not hypothetical: while writing this gate the harness used
+# Claims 2 and 3 are not hypothetical: while writing this gate the harness used
 # the wrong storage key, every case took the fresh-install branch, and the run
 # said a user's own token had been overwritten. The check caught its own setup
 # — which is the point of asserting behaviour instead of matching source text.
@@ -3087,22 +3113,62 @@ S.saveSettings({ probe: 1 });
 const K = [...store.keys()][0];
 store.clear();
 const fail = m => { console.log('FAIL ' + m); process.exit(0); };
+// INVERTED 2026-08-21 (e78269d). This used to demand a minted 32-hex token.
+// The API has answered 127.0.0.1 only since 2026-08-16, so the threat that
+// justified minting -- anyone on the WiFi -- stopped being reachable; and
+// against a program on THIS machine a token does nothing, because that program
+// reads it out of this very file, next to the platform JWT and the overflow
+// key it would rather take. What it cost was real: every WebUI, Claude Code and
+// Codex had to be handed a key. The browser, the one caller that can reach a
+// loopback port without reading your files, is stopped directly instead --
+// asserted in the engine half below.
 const a = S.loadSettings();
-if (!/^[0-9a-f]{32}\$/.test(a.apiToken || '')) fail('a fresh install got apiToken=' + JSON.stringify(a.apiToken) + ', expected 32 hex chars');
-const b = S.loadSettings();
-if (a.apiToken === b.apiToken) fail('two fresh installs got the SAME token — it is a constant, not a secret');
+if (a.apiToken !== '') fail('a fresh install minted apiToken=' + JSON.stringify(a.apiToken) + ', expected "" — the local API is open by default since 2026-08-21 (e78269d); minting one silently 401s every WebUI and CLI on the machine');
 store.set(K, JSON.stringify({ schemaVersion: 99, apiToken: '' }));
 if (S.loadSettings().apiToken !== '') fail('an upgraded install with no token had one filled in — every existing client config on that machine starts 401ing');
 store.set(K, JSON.stringify({ schemaVersion: 99, apiToken: 'user-chose-this' }));
-if (S.loadSettings().apiToken !== 'user-chose-this') fail('a user-set token was not preserved');
+if (S.loadSettings().apiToken !== 'user-chose-this') fail('a user-set token was not preserved — the setting stays for an operator who wants it, and the coordinator still enforces it');
 console.log('OK ' + K);
 " 2>&1)
     case "$verdict" in
-        OK\ *) vlog "fresh install closed by default; upgrades and user tokens untouched (key ${verdict#OK })" ;;
+        OK\ *) vlog "fresh install open by default; upgrades and user tokens untouched (key ${verdict#OK })" ;;
         FAIL\ *) fail "$name" "${verdict#FAIL }"; rm -rf "$out"; return ;;
         *) fail "$name" "could not run the settings check: $(printf '%s' "$verdict" | head -3 | tr '\n' ' ')"; rm -rf "$out"; return ;;
     esac
     rm -rf "$out"
+
+    # --- the engine half: what actually replaced the token ------------------
+    # With minting retired, api_origin_ok() is the ONLY thing still standing
+    # between a web page and this machine's inference API, and until 2026-08-23
+    # no gate asserted it -- its selftests existed but nothing on the ladder
+    # read them. A retirement that removes the assertion along with the
+    # mechanism leaves the successor untested, which is how a replacement
+    # quietly becomes a removal.
+    #
+    # Judge by NAMED assertions and a floor on the count: grepping for "FAIL"
+    # alone would pass a binary that stopped emitting these lines entirely.
+    if [ ! -x "$REPO_ROOT/idletoken-coord" ]; then
+        fail "$name" "no ./idletoken-coord on the control machine (make coord) — cannot judge the browser gate that replaced the token"; return
+    fi
+    local st n miss lineName
+    st=$("$REPO_ROOT/idletoken-coord" --selftest 2>&1 | grep "origin gate:")
+    if printf '%s\n' "$st" | grep -q "FAIL"; then
+        fail "$name" "the coordinator's browser gate failed its own selftest: $(printf '%s\n' "$st" | grep FAIL | head -1)"; return
+    fi
+    miss=""
+    # The negatives matter as much as the positive: a gate that refuses
+    # everything would "block browsers" while breaking every API client.
+    for lineName in "a plain API client is allowed" \
+                    "an authenticated API client is allowed" \
+                    "a browser page is refused" \
+                    "Origin: null is still a browser" \
+                    "lower-case origin is caught too"; do
+        printf '%s\n' "$st" | grep -qF "origin gate: $lineName" || miss="$miss; $lineName"
+    done
+    [ -z "$miss" ] || { fail "$name" "the coordinator no longer asserts$miss — the browser gate is the only protection left after token minting was retired"; return; }
+    n=$(printf '%s\n' "$st" | grep -c "PASS")
+    [ "$n" -ge 5 ] || { fail "$name" "expected at least 5 origin-gate assertions, saw $n (did they stop running?)"; return; }
+    vlog "browser gate: API clients allowed, Origin-carrying requests refused ($n assertions)"
     pass "$name"
 }
 

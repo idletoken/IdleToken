@@ -110,9 +110,13 @@ export default function Capability(props: { apiBaseUrl?: string | null }) {
   // is what the row needs, and the reader knows what they have.
   return (
     <section className="card cap-card">
+      {/* "based on N machine(s) in this cluster" was the subtitle here until
+          2026-08-21 (removed on the user's call). ⚠ The verdicts and the
+          memory column ARE computed for that machine count — a one-machine
+          answer and a four-machine answer differ by hundreds of GB — so the
+          table no longer states the assumption it is built on. */}
       <header className="cap-head">
         <h3>{t("cap.title")}</h3>
-        <span className="cap-sub">{t("cap.forNodes").replace("{n}", String(rep.nodes))}</span>
       </header>
       <table className="cap-table">
         <thead>

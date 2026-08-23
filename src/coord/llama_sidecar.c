@@ -546,11 +546,16 @@ static int llama_spawn(idletoken_llama *lc) {
         snprintf(listen_args, sizeof(listen_args), "--host \"%s\"", lc->sock_path);
     else
         snprintf(listen_args, sizeof(listen_args), "--host 127.0.0.1 --port %s", portstr);
+    /* Must track the real argv below, including the single-vs-cluster -ngl
+     * split: this string is what the user is shown and what gets pasted into
+     * a bug report, so a preview that says 99 while the child was given `auto`
+     * sends whoever reads it looking in the wrong place. */
     int n = snprintf(cmd, sizeof(cmd),
                      "\"%s\" -m \"%s\" %s%s "
-                     "-ngl 99 --reasoning off%s%s -np %s%s%s",
+                     "-ngl %s --reasoning off%s%s -np %s%s%s",
                      lc->bin, lc->gguf, listen_args,
                      lc->shared ? " --no-slots" : "",
+                     idletoken_llama_ngl_arg(lc->cluster_args),
                      lc->ctx_size > 0 ? " -c " : "",
                      lc->ctx_size > 0 ? ctxstr : "",
                      nparstr,
@@ -680,7 +685,36 @@ static int llama_spawn(idletoken_llama *lc) {
      * (Prompts on DISK were already impossible: --slot-save-path is never
      * passed, and without it the engine refuses the save/restore action.) */
     if (lc->shared) argv[argc++] = "--no-slots";
-    argv[argc++] = "-ngl";      argv[argc++] = "99";
+    /* How many layers go on the GPU — and it is NOT the same answer for one
+     * machine and for a cluster (2026-08-21).
+     *
+     * SINGLE MACHINE: "auto", which is upstream's default (-1). The engine then
+     * runs common_fit_params, measures free device memory, and picks a layer
+     * count that fits — putting the overflow in system RAM. That is HYBRID,
+     * which hard constraint #6 says we must support.
+     *
+     * This used to be a flat "99" on both paths, and on a single machine that
+     * was a bug with a very confusing face. Pinning n_gpu_layers does not just
+     * ask for all layers on the GPU, it DISABLES the fitting procedure:
+     * fit.cpp throws `n_gpu_layers already set by user to 99, abort` at the
+     * exact point where it was about to reduce the layer count, and that throw
+     * surfaces as `failed to fit params to free device memory`. The
+     * coordinator's own guard (llama_scan_log) then refuses to serve. Net
+     * effect: we blocked the engine's remedy and then refused to start because
+     * the problem was unsolved. Measured on a 16 GiB discrete card (~13.2 GiB
+     * usable) with 64 GiB of system RAM, serving Qwen3.8-27B Q4_K_M (15.33 GiB
+     * of weights): it does not fit in VRAM, it fits comfortably in VRAM+RAM,
+     * and the user got "pick a smaller quantization" instead of a running
+     * model.
+     *
+     * CLUSTER: still 99, deliberately. Layer placement there is OURS, not the
+     * engine's — the `--device` order in cluster_args puts this machine's
+     * device first so layer 0 stays with the embedding table (hard constraint
+     * #10, the privacy invariant). An engine free to move layers around could
+     * break that, and it is not a rule we can let a memory heuristic decide.
+     * A cluster that does not fit must still fail loudly. */
+    argv[argc++] = "-ngl";
+    argv[argc++] = (char *)idletoken_llama_ngl_arg(lc->cluster_args);
     /* Reasoning off by default: thinking models (Qwen3.5 etc.) otherwise burn
      * the whole token budget inside <think> and the visible answer comes back
      * EMPTY with finish_reason "length" — measured with Qwen3.5-0.8B at
@@ -800,6 +834,19 @@ const char *idletoken_llama_placement_flag(const char *args) {
  * Contract and the reasoning about upstream's wording: the header. Kept as a
  * pure function of the text so coord --selftest can drive it with a real log
  * line AND with lines that must NOT match. */
+/* Which `-ngl` the engine is given. A pure function for the same reason
+ * idletoken_llama_log_fit_failed is one: coord --selftest can then assert BOTH
+ * arms, and both are load-bearing for different reasons.
+ *   single machine → "auto" (upstream's default): re-enables the engine's own
+ *     fitting, which is what makes HYBRID work. Pinning a number here disables
+ *     the fit and turns "runs slower" into "refuses to start".
+ *   cluster        → "99": layer placement is ours, and the --device order in
+ *     cluster_args keeps layer 0 with the embedding table (hard constraint #10).
+ * See the call site in llama_spawn for the measurement behind this. */
+const char *idletoken_llama_ngl_arg(const char *cluster_args) {
+    return (cluster_args && cluster_args[0]) ? "99" : "auto";
+}
+
 int idletoken_llama_log_fit_failed(const char *text) {
     if (!text) return 0;
     /* The sentence, not the function name: __func__ could be renamed upstream
@@ -842,6 +889,17 @@ static void llama_scan_log(idletoken_llama *lc) {
             lc->log_off = (long long)ftell(f);   /* consume the rest, stay quiet */
             break;
         }
+        /* On a cluster this is the whole story: WE place the layers, so the
+         * engine has no move left to make. On a single machine the engine
+         * fits its own layer count, so reaching here means it could not make
+         * the model fit even with the overflow in system RAM — a genuinely
+         * too-large model, not a knob we forgot to turn.
+         * ⚠ Until 2026-08-21 the single-machine path pinned n_gpu_layers to 99,
+         * which is what produced this message for models that fit perfectly
+         * well in VRAM+RAM. If this text ever shows up again with the engine
+         * log naming `n_gpu_layers already set by user`, the -ngl split above
+         * has been undone — that reason means the fitting procedure was
+         * skipped, NOT that the memory was measured and found wanting. */
         snprintf(lc->fatal, sizeof(lc->fatal),
                  "the inference engine could not fit this model into free "
                  "device memory and started anyway (its log: \"%s\"). Serving "

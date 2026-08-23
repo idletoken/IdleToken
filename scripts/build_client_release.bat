@@ -57,6 +57,22 @@ if not exist "%ROOT%\idletoken-coord.exe" (
     echo CLIENT_RELEASE_FAIL: no idletoken-coord.exe ^(run scripts\build_coord_win.bat first^)
     exit /b 1
 )
+REM The coord must carry the pinned platform verify key, or sharing can never
+REM be switched on by anyone who installs this package (overflow.c RULE 3 —
+REM every release up to 0.1.5 shipped unpinned, found 2026-08-21). String-
+REM grepping the exe is a documented dead end (Rust/C literals get merged and
+REM reordered), so ask the binary itself: an offline probe whose only network
+REM target refuses instantly. A PINNED coord prints "overflow: on" and exits on
+REM the sentinel model id; an UNPINNED one refuses before any network I/O. The
+REM check demands the positive line, so a probe that stops producing overflow
+REM output at all fails the build instead of silently passing it.
+"%ROOT%\idletoken-coord.exe" --overflow-url http://127.0.0.1:1 --overflow-key pin-probe --model pin-probe-sentinel > "%TEMP%\idletoken_pin_probe.txt" 2>&1
+findstr /c:"overflow: on" "%TEMP%\idletoken_pin_probe.txt" >nul
+if errorlevel 1 (
+    echo CLIENT_RELEASE_FAIL: idletoken-coord.exe has no pinned platform verify key ^(rebuild with scripts\build_coord_win.bat — it pins from scripts\platform-verify-key.b64^)
+    type "%TEMP%\idletoken_pin_probe.txt"
+    exit /b 1
+)
 if not exist "%ROOT%\client\src-tauri\binaries" mkdir "%ROOT%\client\src-tauri\binaries"
 copy /y "%ROOT%\idletoken-worker.exe" "%ROOT%\client\src-tauri\binaries\idletoken-worker-%TRIPLE%.exe" >nul
 copy /y "%ROOT%\idletoken-coord.exe"  "%ROOT%\client\src-tauri\binaries\idletoken-coord-%TRIPLE%.exe" >nul

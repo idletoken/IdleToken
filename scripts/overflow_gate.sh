@@ -203,28 +203,65 @@ echo " G_OVERFLOW — overflow routing"
 echo "======================================================"
 
 # ===================================================================
-# Claim 3 — no local API token, no overflow. Stands alone: it never gets
-# as far as needing an engine.
+# Claim 3 — a machine with NO local API token can still switch sharing on.
+#
+# ⚠ INVERTED 2026-08-21 (e78269d). This claim used to be the opposite: "no
+# local API token, no overflow". The token was retired because it protected
+# nothing — the API has answered 127.0.0.1 only since 2026-08-16, and a program
+# on this machine reads the token out of the same settings file as the overflow
+# key it would rather take. Refusing without one also meant every install that
+# predated token minting could not switch sharing on AT ALL.
+#
+# So the claim is now positive, matching the RULE 2 assertion in
+# src/coord/overflow.c that was inverted the same day: "no token" is a
+# SUPPORTED configuration, and a check that says so is what stops it being
+# re-forbidden by accident. Keeping the old spelling here is how the ladder
+# ended up red against a requirement that no longer existed (found 2026-08-23,
+# cutting 0.1.19 — the code and its unit test had been inverted for two days
+# while this file and G_LOCAL_TOKEN still asserted the retired contract).
+#
+# Stands alone: it never gets as far as needing an engine.
 # ===================================================================
 start_platform good || fail "the stub platform did not come up"
 VK=$(cat "$REC/verify_key.txt")
 
-out=$(IDLETOKEN_PLATFORM_VERIFY_KEY="$VK" ./idletoken-coord \
-        --overflow-url "http://127.0.0.1:$PLAT_PORT" --overflow-key sk-gate \
-        --num-workers 0 --n-predict 0 2>&1)
-rc=$?
-case "$rc:$out" in
-    2:*"local API token"*) note "claim 3: no --api-token -> refuse to start (exit 2)" ;;
-    *) fail "claim 3: overflow started without an --api-token (exit $rc): $(printf '%s' "$out" | tail -1)" ;;
-esac
-# Control: the SAME command line with a token must get past this check, or the
-# assertion above would also pass on a coordinator that refuses everything.
-out=$(IDLETOKEN_PLATFORM_VERIFY_KEY="$VK" ./idletoken-coord \
-        --overflow-url "http://127.0.0.1:$PLAT_PORT" --overflow-key sk-gate \
-        --api-token gatetok --num-workers 0 --n-predict 0 2>&1)
+# How these runs terminate. `--model <id>` with no engine flags makes the
+# coordinator configure overflow, say so, and then exit on the missing
+# --llama-server-bin/--llama-gguf — 12ms, no engine, no join wait. The old
+# spelling used `--num-workers 0` for the same purpose, but the coordinator now
+# rejects 0 during argument validation, BEFORE overflow is configured: claim 3
+# was failing on "--num-workers must be 1..16" and its control had the identical
+# bug, so neither half ever reached the logic it was written to judge. Do not
+# "fix" this by passing --num-workers 1 instead — that gets past validation and
+# then blocks for the 180s join wait, three times over.
+# This is the same probe shape scripts/build_client_release.bat uses to check
+# the pinned verify key; one idiom, already proven on three platforms.
+ovf_probe() {   # ovf_probe <extra args...>; echoes the coordinator's output
+    IDLETOKEN_PLATFORM_VERIFY_KEY="$VK" ./idletoken-coord \
+        --overflow-key sk-gate --model probe-sentinel "$@" 2>&1
+}
+
+out=$(ovf_probe --overflow-url "http://127.0.0.1:$PLAT_PORT")
 printf '%s' "$out" | grep -q "overflow: on" \
-    || fail "claim 3 control: overflow would not switch on even WITH a token, so the refusal above proves nothing"
-note "claim 3 control: with a token it switches on"
+    || fail "claim 3: overflow refused to switch on without an --api-token, but no token is a supported configuration since 2026-08-21: $(printf '%s' "$out" | tail -1)"
+printf '%s' "$out" | grep -q "local API token" \
+    && fail "claim 3: the coordinator still cites a 'local API token' as a reason — the retired requirement is back"
+note "claim 3: no --api-token -> overflow still switches on"
+
+# Control. "No refusal was seen" is worthless unless this harness can see a
+# refusal at all, so make it refuse for a reason that IS still live (an empty
+# platform URL) on an otherwise identical command line.
+out=$(ovf_probe --overflow-url "")
+printf '%s' "$out" | grep -q "platform URL" \
+    || fail "claim 3 control: an empty --overflow-url did not produce the 'platform URL' refusal, so the assertion above cannot tell 'allowed' from 'never evaluated': $(printf '%s' "$out" | tail -1)"
+note "claim 3 control: a still-live refusal (empty platform URL) is visible to this harness"
+
+# The token is not gone as a FEATURE, only as a requirement: set one and the
+# coordinator must still switch on and enforce it.
+out=$(ovf_probe --overflow-url "http://127.0.0.1:$PLAT_PORT" --api-token gatetok)
+printf '%s' "$out" | grep -q "overflow: on" \
+    || fail "claim 3: overflow would not switch on WITH a token either — an operator who sets one must still be served"
+note "claim 3: with a token it still switches on"
 
 # ===================================================================
 # Claim 5 — the four bad platform keys. Each must refuse to enable, and each

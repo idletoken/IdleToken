@@ -1657,14 +1657,25 @@ int main(int argc, char **argv) {
      * caller asked for it explicitly. A missing socket must NOT quietly become
      * a TCP connection — that is the leg this exists to close. */
     if (coord_unix && coord_unix[0]) {
-        int probe = idletoken_connect_unix(coord_unix);
-        if (probe < 0) {
-            fprintf(stderr, "platform-agent: refuse: --coord-unix %s is not "
-                            "accepting connections (%s). Not falling back to "
-                            "loopback TCP: the coordinator would then receive "
-                            "buyers' prompts over a link this machine's owner "
-                            "can capture.\n", coord_unix, strerror(errno));
-            return 3;
+        /* WAIT for the socket rather than refuse (changed 2026-08-21). The
+         * client turns sharing on independently of starting the cluster, and
+         * its panel promises the agent will wait for the coordinator — but
+         * this used to be a one-shot probe whose refusal the supervisor
+         * treats as terminal, so "sharing on, then start the cluster" left a
+         * dead agent and a switch that said on. Waiting is safe for the same
+         * reason refusing was: at no point does a missing socket become a TCP
+         * connection — that is still the leg this check exists to close. */
+        int probe, waited_s = 0;
+        while ((probe = idletoken_connect_unix(coord_unix)) < 0) {
+            if (waited_s % 30 == 0)
+                fprintf(stderr, "platform-agent: waiting for the coordinator's "
+                                "socket %s (%s). Not falling back to loopback "
+                                "TCP: the coordinator would then receive "
+                                "buyers' prompts over a link this machine's "
+                                "owner can capture.\n",
+                        coord_unix, strerror(errno));
+            sleep(2);
+            waited_s += 2;
         }
         idletoken_close_fd(probe);
         snprintf(coord_addr, sizeof(coord_addr), "unix:%s", coord_unix);

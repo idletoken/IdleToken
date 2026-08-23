@@ -40,6 +40,22 @@ echo "target triple: $TRIPLE"
 out=$(scripts/stage_sidecars.sh) || { echo "$out"; fail "sidecar staging failed"; }
 echo "$out" | sed 's/^/  /'
 
+# --- the coordinator must carry the pinned platform verify key --------------
+# Without it, nobody who installs this package can ever switch sharing on
+# (overflow.c RULE 3). Every release up to 0.1.5 shipped unpinned because
+# nothing set the variable; 0.1.19's first macOS bundle shipped unpinned even
+# though something did, because make had no reason to recompile overflow.c.
+# So ask the binary rather than the build environment. Its only network target
+# refuses instantly: a PINNED coordinator prints "overflow: on", an unpinned one
+# refuses before any network I/O. Demanding the positive line means a probe that
+# stops producing overflow output at all fails the build instead of passing it.
+if [ -x ./idletoken-coord ]; then
+    if ! ./idletoken-coord --overflow-url http://127.0.0.1:1 --overflow-key pin-probe \
+           --model pin-probe-sentinel 2>&1 | grep -q "overflow: on"; then
+        fail "idletoken-coord has no pinned platform verify key — rebuild with IDLETOKEN_PLATFORM_VERIFY_KEY_B64 set (scripts/platform-verify-key.b64 is the default)"
+    fi
+fi
+
 # --- stage licences -----------------------------------------------------------
 # The sidecars above carry vendored third-party code (ds4 = MIT, rax = BSD
 # 3-Clause), and both licences require the notice to travel with a BINARY
@@ -105,6 +121,19 @@ fi
 #   - the tooling download can time out on this network — the cache at
 #     ~/.cache/tauri survives, and TAURI_BUNDLER_TOOLS_GITHUB_MIRROR works too.
 export APPIMAGE_EXTRACT_AND_RUN=1
+# The cache surviving is not enough on its own: linuxdeploy's appimage plugin
+# re-fetches the AppImage *runtime* on every run and only reads the cached copy
+# when pointed at it. On this network that download times out often enough to
+# be the single most common release failure — it took out the 0.1.19 Linux
+# build with nothing but `failed to run linuxdeploy` to go on, while a rerun
+# with the variable set below succeeded on the same tree (2026-08-23). Point it
+# at the cached runtime whenever one is there; a first-ever build still
+# downloads, and this is silent when there is nothing to reuse.
+if [ -z "${LDAI_RUNTIME_FILE:-}" ]; then
+    for _rt in "$HOME/.cache/tauri/runtime-$(uname -m)" "$HOME/.cache/tauri/runtime-aarch64" "$HOME/.cache/tauri/runtime-x86_64"; do
+        if [ -f "$_rt" ]; then export LDAI_RUNTIME_FILE="$_rt"; echo "appimage runtime: reusing $_rt"; break; fi
+    done
+fi
 BUNDLES="${IDLETOKEN_BUNDLES:-deb,rpm,appimage}"
 # ⚠ not `| tail`: the pipe exit code is tail's, and a bundler that failed
 # AFTER producing the .deb sailed through as CLIENT_RELEASE_OK (hit 2026-08-15;

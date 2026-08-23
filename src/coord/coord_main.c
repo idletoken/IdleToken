@@ -1766,6 +1766,10 @@ static int msg_collect_cb(void *ud, const char *role, const char *content) {
     return 0;
 }
 
+/* Forward declaration: the coordinator's selftest sits above the API
+ * server whose guards it exercises. */
+static int api_origin_ok(const idletoken_http_req *req);
+
 static int coord_selftest(void) {
     int fails = 0;
 #define ST(cond, name) do { \
@@ -2238,6 +2242,58 @@ static int coord_selftest(void) {
            "fit detector: an unrelated engine line does not trip it");
         ST(idletoken_llama_log_fit_failed(NULL) == 0,
            "fit detector: no text is not a failure");
+    }
+
+    /* --- -ngl: single machine fits, a cluster is placed by us (2026-08-21) ---
+     * The detector above is the second line of defence; this is the thing that
+     * kept tripping it. Pinning n_gpu_layers on a single machine disables
+     * upstream's fitting procedure, so a model that would have run in HYBRID
+     * was refused instead. Both arms are asserted because both are
+     * load-bearing and they pull in opposite directions — see the header. */
+    {
+        ST(!strcmp(idletoken_llama_ngl_arg(NULL), "auto"),
+           "-ngl: no cluster args at all → auto (the engine fits it)");
+        ST(!strcmp(idletoken_llama_ngl_arg(""), "auto"),
+           "-ngl: empty cluster args → auto, so HYBRID is reachable");
+        ST(!strcmp(idletoken_llama_ngl_arg("--rpc 192.168.1.101:50052 --device RPC0,CUDA0"), "99"),
+           "-ngl: a real cluster keeps 99 — layer 0 placement is ours, not a heuristic's");
+    }
+
+    /* --- browser gate (2026-08-21) -------------------------------------
+     * Replaces the local API token, which every WebUI and CLI had to be handed
+     * and which protected nothing a local program could not read out of the
+     * settings file. The negatives are the point: this must let ordinary API
+     * clients through untouched, or it has traded one tax for another. */
+    {
+        idletoken_http_req r;
+        memset(&r, 0, sizeof r);
+
+        /* curl, Claude Code, Codex, any SDK: no Origin at all. */
+        snprintf(r.headers, sizeof r.headers,
+                 "Host: 127.0.0.1:8000\r\nContent-Type: application/json\r\n");
+        ST(api_origin_ok(&r) == 1, "origin gate: a plain API client is allowed");
+
+        /* Authorization present, still no Origin — the common Claude Code shape. */
+        snprintf(r.headers, sizeof r.headers,
+                 "Host: 127.0.0.1:8000\r\nAuthorization: Bearer abc\r\n");
+        ST(api_origin_ok(&r) == 1, "origin gate: an authenticated API client is allowed");
+
+        /* A page on any site, which is the whole threat. */
+        snprintf(r.headers, sizeof r.headers,
+                 "Host: 127.0.0.1:8000\r\nOrigin: https://example.com\r\n");
+        ST(api_origin_ok(&r) == 0, "origin gate: a browser page is refused");
+
+        /* "null" is what a sandboxed iframe or a file:// page sends. Still a
+         * browser, so still refused — treating it as absent would leave the
+         * easiest bypass in place. */
+        snprintf(r.headers, sizeof r.headers,
+                 "Host: 127.0.0.1:8000\r\nOrigin: null\r\n");
+        ST(api_origin_ok(&r) == 0, "origin gate: Origin: null is still a browser");
+
+        /* Case-insensitive header lookup — a browser may send `origin:`. */
+        snprintf(r.headers, sizeof r.headers,
+                 "Host: 127.0.0.1:8000\r\norigin: http://evil.test\r\n");
+        ST(api_origin_ok(&r) == 0, "origin gate: lower-case origin is caught too");
     }
 
     /* --- Automatic decision on interleaved execution (E3.4) -------------
@@ -4024,6 +4080,39 @@ static void llama_chat_route(int conn_fd, const idletoken_http_req *req,
 /* --api-token check for the inference endpoints. Returns 1 when the request
  * may proceed. /health and /idletoken/v1/cluster/status are exempt by the caller —
  * the client and pairing peers poll them before any token reaches them. */
+/* Is this request from an API client rather than from a web page?
+ *
+ * The API listens on 127.0.0.1 only, so "the network" cannot reach it. One
+ * attacker still can: a page in the browser you are already using. Its
+ * JavaScript may POST to http://127.0.0.1:8000 — the coordinator sends no CORS
+ * headers, so the page cannot READ the answer, but a blind request is enough to
+ * burn GPU time and, once sharing is on, credits.
+ *
+ * `Origin` is what separates the two. A browser sets it on every cross-origin
+ * request and cannot be talked out of it; an API client — curl, Claude Code,
+ * Codex, any SDK, our own client (which reaches the coordinator through Rust,
+ * not the webview) — never sends one. So refusing requests that carry it costs
+ * a real user exactly nothing, and it is the whole reason the local API no
+ * longer demands a token: this targets the one attacker the token actually
+ * stopped, without asking anybody to copy a key into three config files.
+ *
+ * ⚠ It is CSRF protection, not authentication. It does not pretend to stop a
+ * program running on this machine — nothing at this layer can, since such a
+ * program can read the settings file, the platform JWT and the overflow key.
+ * The daily spend cap is what bounds that case.
+ *
+ * IDLETOKEN_API_ALLOW_ORIGIN=1 turns it off for anyone genuinely building a
+ * browser UI against this API; it prints on startup, because a machine that
+ * accepts browser-driven inference should say so out loud. */
+static int api_origin_ok(const idletoken_http_req *req) {
+    char hv[512];
+    if (idletoken_http_header_get(req, "origin", hv, sizeof hv) != 0)
+        return 1;                         /* no Origin — not a browser */
+    if (!hv[0]) return 1;                 /* present but empty: same thing */
+    const char *allow = getenv("IDLETOKEN_API_ALLOW_ORIGIN");
+    return (allow && !strcmp(allow, "1")) ? 1 : 0;
+}
+
 static int api_token_ok(const idletoken_http_req *req, const char *api_token) {
     if (!api_token || !api_token[0]) return 1;   /* no token configured */
     char hv[512];
@@ -4815,7 +4904,25 @@ static void handle_http_request(int conn_fd,
         return;
     }
 
-    /* --api-token gate (client setting apiToken): inference endpoints only. */
+    /* Browser gate, same surface as the token gate below and for the same
+     * reason: these are the endpoints that spend GPU time and credits. A page
+     * that fires one of these blind is the only remote attacker a
+     * loopback-bound API has. */
+    if (!api_origin_ok(&req)) {
+        static const char noorigin[] =
+            "{\"error\":{\"type\":\"permission_error\","
+            "\"message\":\"this API does not serve browser requests (an Origin "
+            "header was present). Call it from an API client, or set "
+            "IDLETOKEN_API_ALLOW_ORIGIN=1 to allow it.\"}}";
+        idletoken_http_send_json(conn_fd, 403, noorigin, sizeof(noorigin) - 1);
+        free(req.body);
+        return;
+    }
+
+    /* --api-token gate (client setting apiToken): inference endpoints only.
+     * Nothing mints a token by default any more (2026-08-21) — this is here for
+     * an operator who sets one deliberately, and waves everything through when
+     * it is unset, exactly as before. */
     if (!api_token_ok(&req, api_token)) {
         static const char unauth[] =
             "{\"error\":{\"type\":\"authentication_error\","
@@ -5703,7 +5810,11 @@ static void *llama_pool_worker(void *ud) {
         handle_http_request(cfd, NULL, 0, NULL, 0, &g_llpool.running_pos,
                             NULL, NULL, g_llpool.ctx_size,
                             g_llpool.api_token, NULL);
-        close(cfd);
+        /* idletoken_close_fd, not close(): on Windows this fd is a SOCKET and
+         * CRT close() treats it as a CRT fd index — it leaks the socket and,
+         * when the handle value lands inside the CRT fd table, closes some
+         * unrelated open file instead. Same class as the agent's recv() fix. */
+        idletoken_close_fd(cfd);
     }
 }
 
@@ -6065,7 +6176,7 @@ static int run_llamacpp_mode(const char *llama_bin, const char *llama_gguf,
             pthread_mutex_unlock(&g_stats_mu);
             fprintf(stderr, "coord: http handoff queue full -> 429\n");
             coord_send_busy_429(cfd, (long long)svc);
-            close(cfd);
+            idletoken_close_fd(cfd);   /* SOCKET-safe on Windows (see the pool worker) */
         }
     }
     /* Wake every worker, then wait: a thread still inside handle_http_request
@@ -6076,7 +6187,7 @@ static int run_llamacpp_mode(const char *llama_bin, const char *llama_gguf,
     pthread_cond_broadcast(&g_llpool.cv);
     pthread_mutex_unlock(&g_llpool.mu);
     for (int i = 0; i < n_started; i++) pthread_join(pool[i], NULL);
-    close(lfd);
+    idletoken_close_fd(lfd);
     /* Take the socket file with us. A leftover would be removed by the next
      * bind anyway, but leaving a 0600 file named like a live endpoint lying in
      * the user's state directory invites the next reader to think it is one. */

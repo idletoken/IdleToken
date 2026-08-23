@@ -680,6 +680,7 @@ export default function Chat(props: {
       )
     );
 
+    let completed = false;
     try {
       if (inTauri()) {
         const { listen } = await import("@tauri-apps/api/event");
@@ -731,6 +732,7 @@ export default function Chat(props: {
                   return out;
                 }, convoId);
               }
+              completed = true;
               resolve();
             }
             if (p.kind === "error") {
@@ -810,6 +812,10 @@ export default function Chat(props: {
         },
       });
     } finally {
+      // A local completion may have used platform overflow. Refreshing the
+      // ephemeral balance is harmless for local-only work and avoids teaching
+      // the webview any provider/routing detail.
+      if (completed) window.dispatchEvent(new CustomEvent("idletoken:platform-request-complete"));
       // MUST be `finally`. This used to be straight-line code after the
       // try/catch, so anything that threw on the way out — including inside the
       // catch block itself — skipped it and left the guard stuck at "running".

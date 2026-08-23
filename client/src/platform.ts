@@ -1,9 +1,7 @@
 // Platform (marketplace) client — integration plan 3.1/3.2. Two halves:
 //
-//  1. Console API: real HTTP calls to the platform gateway with the cloud
-//     session's JWT (balance /me, ledger /me/ledger, my providers /providers,
-//     API keys /me/api-keys). No mock data: every function either returns the
-//     server's answer or throws with the real failure (philosophy 15).
+//  1. Minimal account API: the in-memory balance pill, provider identity needed
+//     to start the local agent, and the agent's overflow credential.
 //  2. Agent control: local RPC to the Rust supervisor (engine.rs) that runs
 //     `idletoken-platform-agent --relay ...` as a sidecar. Relay mode dials OUT
 //     to the platform, so the home side opens no inbound port; the agent
@@ -36,15 +34,6 @@ export interface PlatformMe {
   emailVerified?: boolean;
 }
 
-export interface LedgerEntry {
-  id: string;
-  type: string; // GRANT | SPEND | EARN | ...
-  deltaMilli: number;
-  reason: string | null;
-  ref: string | null;
-  createdAt: string;
-}
-
 export interface ProviderInfo {
   id: string;
   name: string;
@@ -52,13 +41,6 @@ export interface ProviderInfo {
   status: string; // ONLINE | OFFLINE | SUSPENDED
   listed: boolean; // whether it is listed on the marketplace (off by default; only then can others call it and earn credits)
   lastBeat: string | null;
-  createdAt: string;
-}
-
-export interface ApiKeyInfo {
-  id: string;
-  prefix: string;
-  revoked: boolean;
   createdAt: string;
 }
 
@@ -106,6 +88,15 @@ async function req<T>(path: string, init?: { method?: string; body?: string }): 
     // the reader to different places, and the old message named neither.
     throw new Error(`network: can't reach the platform server (${e instanceof Error ? e.message : e})`);
   }
+  if (res.status === 401) {
+    // The gateway rejected the session token (expired or revoked). Keeping the
+    // dead session makes every panel show `HTTP 401: invalid token` forever
+    // with no way back (field report 2026-08-22) — drop it and tell the shell,
+    // which reverts to the signed-out state and opens the login screen.
+    getAuthProvider().signOut();
+    window.dispatchEvent(new CustomEvent("idletoken:session-expired"));
+    throw new Error("session expired — sign in again");
+  }
   if (!res.ok) {
     // Surface the server's own message when it sends one (Nest error bodies).
     const body = replyJson<{ message?: string | string[] }>(res);
@@ -122,24 +113,8 @@ export function getMe(): Promise<PlatformMe> {
   return req<PlatformMe>("/me");
 }
 
-export function getLedger(): Promise<LedgerEntry[]> {
-  return req<LedgerEntry[]>("/me/ledger");
-}
-
 export function getProviders(): Promise<ProviderInfo[]> {
   return req<ProviderInfo[]>("/providers");
-}
-
-/** List or unlist on the marketplace (the sharing switch). Only with listed=true can others call it and earn credits. */
-export function setProviderListing(id: string, listed: boolean): Promise<{ id: string; listed: boolean }> {
-  return req<{ id: string; listed: boolean }>(`/providers/${encodeURIComponent(id)}/listing`, {
-    method: "POST",
-    body: JSON.stringify({ listed }),
-  });
-}
-
-export function listApiKeys(): Promise<ApiKeyInfo[]> {
-  return req<ApiKeyInfo[]>("/me/api-keys");
 }
 
 export function createApiKey(opts?: { label?: string; dailyCapMilli?: number }): Promise<CreatedApiKey> {
@@ -148,21 +123,6 @@ export function createApiKey(opts?: { label?: string; dailyCapMilli?: number }):
   // shows a list of prefixes and no way to tell which is which.
   const body = opts && (opts.label || opts.dailyCapMilli) ? JSON.stringify(opts) : undefined;
   return req<CreatedApiKey>("/me/api-keys", { method: "POST", ...(body ? { body } : {}) });
-}
-
-export function revokeApiKey(id: string): Promise<{ ok: boolean }> {
-  return req<{ ok: boolean }>(`/me/api-keys/${encodeURIComponent(id)}`, { method: "DELETE" });
-}
-
-/** The rendezvous pairing token (for the engine's account mode `--account-token`; see gateway 4.7). */
-export interface RendezvousToken {
-  token: string;
-  expiresInSec: number;
-}
-
-/** Fetch a 30-day scope=rendezvous token: the engine speaks over a plaintext link and should hold nothing but this restricted token. */
-export function createRendezvousToken(): Promise<RendezvousToken> {
-  return req<RendezvousToken>("/auth/rendezvous-token", { method: "POST" });
 }
 
 // ---- model usage leaderboard (public, no session) --------------------------
@@ -244,6 +204,12 @@ export async function agentStart(opts: {
   coordApiPort: number;
   /** settings.apiToken — the coordinator 401s dispatched jobs without it. */
   coordToken: string;
+  /** settings.modelId — what this machine serves. Without it the agent
+   *  registers under its own default ("dsv4-flash", a DSv4 relic) and the
+   *  marketplace routes this machine's real model around it. */
+  modelId: string;
+  /** settings.quant — precision-aware routing (may be ""). */
+  quant: string;
 }): Promise<void> {
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("platform_agent_start", {
@@ -252,12 +218,52 @@ export async function agentStart(opts: {
     name: opts.name,
     coordApiPort: opts.coordApiPort,
     coordToken: opts.coordToken,
+    modelId: opts.modelId,
+    quant: opts.quant,
   });
 }
 
 export async function agentStop(): Promise<void> {
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("platform_agent_stop");
+}
+
+/** Resume lending on launch. The sharing switch is a STANDING choice: the
+ *  user made it once, and every later launch on this machine keeps sharing
+ *  without being asked again — until 0.1.10 a restarted client showed the
+ *  switch on while no agent ran, so the machine silently stopped earning.
+ *  Called from App's mount effect (Tauri only).
+ *
+ *  Deliberately quiet about the cases it cannot act on: signed out or no
+ *  platform URL means the agent CANNOT register (it needs the JWT), and the
+ *  sharing panel already explains both states to the user. An agent that is
+ *  already running or restarting is left alone — this resumes, it never
+ *  restarts. */
+export async function resumeSharingAgent(): Promise<string> {
+  if (!inTauri()) return "skipped: not the desktop app";
+  const s = loadSettings();
+  if (!s.sharingEnabled) return "skipped: sharing is off";
+  const gate = platformGate();
+  if (!gate.ok) return `skipped: ${gate.reason}`;
+  const st = await agentStatus();
+  if (st.state === "running" || st.state === "starting" || st.state === "restarting")
+    return "skipped: agent already up";
+  // The EXACT name this machine registered under (see ShareToggleButton):
+  // the gateway dedupes by (account, name), so resuming under a different
+  // spelling would register a second provider row for the same machine. No
+  // name yet = sharing was never toggled on this identity scheme; the next
+  // manual toggle mints one, and resuming under a guess would be worse.
+  if (!s.providerName) return "skipped: no provider identity yet";
+  await agentStart({
+    platformUrl: gate.url,
+    jwt: gate.session.token,
+    name: s.providerName,
+    coordApiPort: s.apiPort || 8000,
+    coordToken: s.apiToken,
+    modelId: s.modelId,
+    quant: s.quant,
+  });
+  return "started";
 }
 
 export async function agentStatus(): Promise<AgentStatus> {

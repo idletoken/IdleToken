@@ -144,6 +144,31 @@ void idletoken_llama_fatal_reason(idletoken_llama *lc, char *out, size_t cap);
  * this catches the cases the budget's estimates get wrong. */
 int idletoken_llama_log_fit_failed(const char *text);
 
+/* The `-ngl` value the engine is spawned with, from the cluster-args string
+ * (NULL/"" = single machine). Returns a static string.
+ *
+ * Both arms are load-bearing, for unrelated reasons, which is why this is a
+ * named function with a test rather than a ternary in the middle of spawn:
+ *
+ *   single machine → "auto" — upstream's default, which leaves
+ *     common_fit_params free to pick a layer count that fits and put the
+ *     remainder in system RAM. That is HYBRID (hard constraint #6). Pinning a
+ *     NUMBER here does not merely ask for more GPU: it makes fit.cpp throw
+ *     `n_gpu_layers already set by user to N, abort`, which surfaces as
+ *     `failed to fit params to free device memory` and trips
+ *     idletoken_llama_log_fit_failed above — so we would block the engine's own
+ *     remedy and then refuse to start because the problem was unsolved. That
+ *     was the bug on 2026-08-21: Qwen3.8-27B Q4_K_M (15.33 GiB) on a 16 GiB
+ *     card with 64 GiB of RAM was refused outright; with "auto" it loads in
+ *     15.5 s and serves at 4.38 tok/s with 14.1 GiB resident on the GPU.
+ *
+ *   cluster → "99" — placement there is OURS. The `--device` order in the
+ *     cluster args keeps layer 0 on this machine with the embedding table
+ *     (hard constraint #10, the privacy invariant), and a memory heuristic
+ *     must not be allowed to move it. A cluster that does not fit still fails
+ *     loudly. */
+const char *idletoken_llama_ngl_arg(const char *cluster_args);
+
 /* Does this IDLETOKEN_LLAMA_ARGS string set a flag that decides WHERE tensors
  * live? Returns the offending flag (a static string) or NULL.
  *

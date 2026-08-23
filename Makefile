@@ -98,6 +98,9 @@ IDLETOKEN_PLATFORM_VERIFY_KEY_B64 ?=
 ifneq ($(IDLETOKEN_PLATFORM_VERIFY_KEY_B64),)
   CFLAGS_COORD += -DIDLETOKEN_PLATFORM_VERIFY_KEY_B64='"$(IDLETOKEN_PLATFORM_VERIFY_KEY_B64)"'
 endif
+# ⚠ The pin is a compile-time input make cannot see; the stamp below
+# (COORD_PIN_STAMP, defined once COORD_BUILD exists) makes it a real
+# prerequisite. Without that, setting the pin on a warm tree changes nothing.
 
 # Objective-C for the Metal sources. -fobjc-arc matches vendor/ds4's Makefile;
 # mixing ARC and non-ARC translation units in one binary is legal but the
@@ -118,6 +121,25 @@ METAL_LDLIBS := -lm -pthread -framework Foundation -framework Metal
 
 WORKER_BUILD := build/worker
 COORD_BUILD  := build/coord
+
+# The platform verify-key pin (CFLAGS_COORD, above) is a compile-time input
+# that make cannot see. Set it on a tree whose build/coord is already warm and
+# every object is still "up to date", so the link quietly reuses an overflow.o
+# compiled WITHOUT it — and the result is a coordinator that refuses to enable
+# sharing, which is precisely the bug the pin was added to fix. That is how the
+# 0.1.19 macOS bundle shipped an unpinned coordinator while the Linux one,
+# built in a colder tree, came out pinned (2026-08-23).
+#
+# The stamp turns the VALUE into a real prerequisite. Its recipe runs on every
+# invocation but only replaces the file when the content differs, so warm
+# builds stay warm and a changed pin rebuilds exactly what depends on it.
+COORD_PIN_STAMP := $(COORD_BUILD)/.verify-key-pin
+$(COORD_PIN_STAMP): FORCE | $(COORD_BUILD)
+	@printf '%s' '$(IDLETOKEN_PLATFORM_VERIFY_KEY_B64)' > $@.new
+	@cmp -s $@.new $@ 2>/dev/null || mv -f $@.new $@
+	@rm -f $@.new
+FORCE:
+.PHONY: FORCE
 
 # vendor objects. ds4_cuda.o / ds4_metal.o are the two implementations of the
 # same ds4_gpu.h; exactly one is linked.
@@ -391,7 +413,7 @@ $(WORKER_BUILD)/ds4x/ds4x_cuda.o: src/ds4x/ds4x_cuda.cu include/idletoken_ds4x_c
 $(WORKER_BUILD)/%.o: src/worker/%.c include/idletoken_proto.h include/idletoken_net.h | $(WORKER_BUILD)
 	$(CC) $(CFLAGS_WORKER) -c -o $@ $<
 
-$(COORD_BUILD)/%.o: src/coord/%.c include/idletoken_proto.h include/idletoken_net.h | $(COORD_BUILD)
+$(COORD_BUILD)/%.o: src/coord/%.c include/idletoken_proto.h include/idletoken_net.h $(COORD_PIN_STAMP) | $(COORD_BUILD)
 	$(CC) $(CFLAGS_COORD) -c -o $@ $<
 
 # --- dirs ------------------------------------------------------------------

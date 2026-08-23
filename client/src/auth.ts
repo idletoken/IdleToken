@@ -148,13 +148,35 @@ function writeUsers(t: UserTable) {
   localStorage.setItem(USERS_KEY, JSON.stringify(t));
 }
 
+/**
+ * A cloud session carries a gateway JWT with an absolute expiry. Reading is the
+ * one moment every consumer (gate, console, share toggle) passes through, so an
+ * expired token is dropped right here — otherwise the UI keeps a dead
+ * "signed in" state whose every platform call fails with `HTTP 401: invalid
+ * token` and no path back to the login screen (field report 2026-08-22).
+ * Not a JWT / unreadable → keep the session and let the server be the judge.
+ */
+function jwtExpired(token: string): boolean {
+  try {
+    const payload = JSON.parse(atob(token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
+    return typeof payload.exp === "number" && payload.exp * 1000 <= Date.now();
+  } catch {
+    return false;
+  }
+}
+
 export const localAuthProvider: AuthProvider = {
   kind: "local",
 
   currentSession(): Session | null {
     try {
       const raw = getSecret(SESSION_KEY);
-      return raw ? (JSON.parse(raw) as Session) : null;
+      const s = raw ? (JSON.parse(raw) as Session) : null;
+      if (s?.provider === "cloud" && jwtExpired(s.token)) {
+        clearSecret(SESSION_KEY);
+        return null;
+      }
+      return s;
     } catch {
       return null;
     }
@@ -243,9 +265,13 @@ class CloudAuthProvider implements AuthProvider {
       // CORS check killed it before it left the machine: the catch below then
       // reported "cannot reach the platform" about a server that was answering
       // fine. Nothing about the status handling changes; only the transport.
+      // remember:true → the gateway issues a 30-day token instead of 24 hours
+      // (auth.controller.ts). A desktop client is a personal device; the 24 h
+      // default meant every install silently lost its session a day later and
+      // showed `401 invalid token` on the sharing console (2026-08-22).
       res = await platformRequest(this.baseUrl.replace(/\/+$/, "") + path, {
         method: "POST",
-        body: JSON.stringify({ email, password }),
+        body: JSON.stringify({ email, password, remember: true }),
         timeoutMs: FETCH_TIMEOUT_MS,
       });
     } catch {

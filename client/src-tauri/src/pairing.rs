@@ -768,8 +768,11 @@ fn overflow_args(tuning: &Tuning) -> Vec<String> {
     if tuning.overflow_url.is_empty() || tuning.overflow_key.is_empty() {
         return Vec::new();
     }
+    // The coordinator has no TLS client and refuses https:// at startup —
+    // which, on this launch path, is a crash loop the user reads as "the
+    // engine keeps dying" (2026-08-21). Hand it the plaintext spelling.
     let mut v = vec![
-        "--overflow-url".into(), tuning.overflow_url.clone(),
+        "--overflow-url".into(), crate::engine::engine_platform_url(&tuning.overflow_url),
         "--overflow-wait-s".into(), tuning.overflow_wait_s.to_string(),
     ];
     // 0 means "use the coordinator's own default", which is a real ceiling --
@@ -869,6 +872,34 @@ fn materialize_engine(app: &AppHandle) {
             "--ctx-size".into(), tuning.ctx_size.to_string(),
             "--max-decode".into(), tuning.max_decode.to_string(),
         ];
+        // Shared mode's second door — the SAME one llamacpp_serve opens, and
+        // missing here until 2026-08-21. The comment above says this engine is
+        // hardened "always, not only once someone presses share compute", and
+        // lists "unix-socket link" among the flags that do it; that flag was
+        // simply never passed. The result was a cluster-path engine that looked
+        // hardened and had no socket, so switching sharing on produced
+        //   platform-agent: refuse: --coord-unix ...\coord-api.sock is not
+        //   accepting connections
+        // and the agent stopped — correctly, since it will not put a buyer's
+        // prompt on loopback TCP where this machine's owner can read it. The
+        // agent was right; the door was missing.
+        //
+        // Taken from engine.rs rather than rebuilt here: the coordinator and
+        // the agent must agree on this path, and a second derivation is the
+        // kind of copy that drifts silently.
+        if let Some(sock) = crate::engine::coord_api_socket() {
+            coord_args.push("--api-unix".into());
+            coord_args.push(sock);
+        }
+        // The user's "Resource usage" caps, which reached the WORKER (line
+        // ~925) and not the coordinator until 2026-08-21. On a single machine
+        // the coordinator budgets from its own probe rather than from a
+        // worker's HELLO — that is the "SINGLE: N GiB needed ... fits the
+        // coordinator's M GiB usable" decision in its log — so an uncapped
+        // coordinator plans against the whole machine no matter where the
+        // sliders are set. Same flags, same contract, same helper as the
+        // worker: one source, so the two cannot drift apart again.
+        coord_args.extend(usage_cap_args(&tuning));
         if remote_workers > 0 {
             coord_args.push("--num-workers".into());
             coord_args.push(remote_workers.to_string());
@@ -2274,6 +2305,23 @@ mod pairing_settings_tests {
             t.overflow_key = "sk".into();
         });
         assert!(!overflow_args(&no_cap).contains(&"--overflow-daily-cap".to_string()));
+    }
+
+    /// The bug that shipped as 0.1.4 (2026-08-21): the client handed the
+    /// coordinator its own https:// platform URL, and the coordinator — which
+    /// has no TLS client and rightly refuses to downgrade — exited with
+    /// "refuse: overflow cannot be enabled" on every start. To the user that
+    /// was a crash-looping engine and a machine that never joined the cluster.
+    /// The argv the coordinator receives must never spell https.
+    #[test]
+    fn overflow_url_reaches_the_coordinator_as_plaintext() {
+        let t = tuning(|t| {
+            t.overflow_url = "https://api.idletoken.ai".into();
+            t.overflow_key = "sk".into();
+        });
+        let argv = overflow_args(&t).join(" ");
+        assert!(argv.contains("--overflow-url http://api.idletoken.ai:8080"), "{argv}");
+        assert!(!argv.contains("https://"), "{argv}");
     }
 
     /// The client sends camelCase; a rename on either side must fail loudly

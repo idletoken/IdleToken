@@ -59,7 +59,12 @@ export interface AppSettings {
   apiPort: number;
   apiOpenAI: boolean;
   apiAnthropic: boolean;
-  apiToken: string; // empty = no auth (LAN default)
+  // Empty = no auth, and that is the shipped default: the API serves loopback
+  // only (2026-08-15) and browser-origin requests are refused by the
+  // coordinator's Origin check, so a token guards nothing a local program
+  // could not read from this same store. An operator who sets one still gets
+  // it enforced.
+  apiToken: string;
   // ---- sharing: lend when idle, borrow when busy (one switch) ----
   //
   // One setting, because it is one deal: this machine takes other people's work
@@ -68,16 +73,28 @@ export interface AppSettings {
   // if they were separate products; they are the two halves of the same
   // exchange, and the pricing only works if most machines do both.
   sharingEnabled: boolean;
-  /** Ceiling on what borrowing may cost in one UTC day, in milli-credits.
-   *  Adjustable, never zero-able: an automatic spender with no ceiling empties
-   *  a balance overnight and the owner finds out afterwards. Shown next to the
-   *  switch rather than in an advanced pane -- it is the only guard rail
-   *  against a switch that can both earn and spend. */
+  /** What borrowing may cost in one UTC day, in milli-credits. NOT a user
+   *  setting any more (owner's call, 2026-08-21): borrowing may spend the
+   *  whole balance, and the balance itself is the ceiling — the platform
+   *  refuses past zero. The field stays because the coordinator's flag needs
+   *  a positive number (it reads 0 as "use my own default"); it is pinned to
+   *  OVERFLOW_UNCAPPED_MILLI by the v6 migration and no UI edits it. */
   overflowDailyCapMilli: number;
   /** Only borrow once this machine's estimated wait reaches this many seconds.
    *  0 = borrow as soon as it is full. Advanced: the useful default is 0 and
    *  the setting only matters to someone who would rather queue than pay. */
   overflowWaitS: number;
+  /** The provider name this machine registered on the platform, written by
+   *  the sharing toggle: `<clusterName>-<N>`, N = the smallest free number
+   *  among the account's providers. Per-machine because the gateway dedupes
+   *  providers by (account, name) — two machines sharing the bare cluster
+   *  name upserted into ONE row and fought over its pubkey (found
+   *  2026-08-21: an account's second machine never appeared in the portal).
+   *  The suffix is a NUMBER, not the hostname: this name shows on the public
+   *  marketplace, and hostnames carry real names and machine identities
+   *  (owner's call, same night). Chosen once, then reused verbatim by resume
+   *  and delist. Not rendered. */
+  providerName: string;
   /** The platform API key borrowing is billed to. Minted on first use and kept
    *  so the switch does not create a new key every time it is flipped -- an
    *  account slowly filling with abandoned keys is worse than one key the user
@@ -223,12 +240,14 @@ export interface AppSettings {
 const BUILT_IN_PLATFORM_URL: string =
   (typeof import.meta !== "undefined" && (import.meta as any).env?.VITE_PLATFORM_URL) || "";
 
-/** Mirror of the coordinator's IDLETOKEN_OVF_DEFAULT_DAILY_CAP_MILLI
- * (include/idletoken_overflow.h). It lives here as a named constant because
- * the number used to be spelled out in three places — the defaults below, the
- * launch-argument fallback, and the panel's initial field value — and there is
- * no reason for those to be able to drift apart. */
-export const OVERFLOW_DEFAULT_DAILY_CAP_MILLI = 50000;
+/** The daily borrow cap as shipped: effectively NONE (owner's call,
+ * 2026-08-21) — borrowing may spend the whole account balance, and the real
+ * ceiling is the balance itself (the platform refuses past zero). The value is
+ * not 0 because the coordinator reads 0 as "use my own 50-credit default" and
+ * has no spelling for "no ceiling" at all; and it stays under 2^31 because the
+ * flag is parsed with atol(), which is 32-bit on Windows. 2e9 milli = 2M
+ * credits, orders of magnitude past any real balance. */
+export const OVERFLOW_UNCAPPED_MILLI = 2_000_000_000;
 
 export const DEFAULT_SETTINGS: AppSettings = {
   modelId: DEFAULT_MODEL_ID,
@@ -258,9 +277,10 @@ export const DEFAULT_SETTINGS: AppSettings = {
   // the feature looked broken to anyone who switched it on. 50 is still a
   // guardrail — a default that surprises someone by refusing is recoverable in
   // a way that one which surprises them by spending is not.
-  overflowDailyCapMilli: OVERFLOW_DEFAULT_DAILY_CAP_MILLI,
+  overflowDailyCapMilli: OVERFLOW_UNCAPPED_MILLI,
   overflowWaitS: 0,
   overflowKey: "",
+  providerName: "",
   temperature: 0.7,
   topP: 0.95,
   topK: 40,
@@ -277,7 +297,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   maxTokens: 0,
   // Literal, not SCHEMA_VERSION: that const is declared further down and this
   // object is built at module init. Keep the two in step by hand.
-  schemaVersion: 4,
+  schemaVersion: 7,
   kvOffload: false,
   kvDir: "",
   kvMaxMb: 1024,
@@ -360,13 +380,13 @@ export const DEFAULT_SETTINGS: AppSettings = {
 // which package.json mirrors — keep this literal in step with it. (Not read
 // from the Tauri API because it renders synchronously in the About note and
 // must also work in the browser dev build, where there is no shell to ask.)
-export const APP_VERSION = "0.1.1";
+export const APP_VERSION = "0.1.19";
 
 const KEY = "idletoken.settings";
 
 // Bump when a stored value must be discarded rather than merged. Absent in
 // blobs written before versioning existed, which reads as 0.
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 7;
 
 // ---- UI scale --------------------------------------------------------------
 // The fixed factors the panel offers. `0` means auto; anything else must be one
@@ -437,12 +457,21 @@ export function generateApiToken(): string {
 export function loadSettings(): AppSettings {
   try {
     const raw = localStorage.getItem(KEY);
-    // Fresh install: give the local API a token instead of leaving it open on
-    // the LAN (docs/api-surface.md §3 decision 3). Generated here rather than
-    // in DEFAULT_SETTINGS because that object is a shared constant — one token
-    // baked into it would be the same token on every machine, which is worse
-    // than none.
-    if (!raw) return { ...DEFAULT_SETTINGS, apiToken: generateApiToken() };
+    // A fresh install gets NO token (2026-08-21). It used to mint one here
+    // "instead of leaving it open on the LAN" — but the API has not been
+    // reachable from the LAN since 2026-08-16, when the coordinator started
+    // rewriting any non-loopback bind to 127.0.0.1. What the token was left
+    // guarding was a program on this machine, which it cannot guard against:
+    // that program can read this very file. The cost was real — a new user
+    // pointing Claude Code, Codex or a WebUI at their own machine got 401 and
+    // had to go find a key — so the local API is now open on its port, the way
+    // every other local inference server works.
+    // The browser, the one caller that can reach a loopback port without being
+    // able to read this file, is handled where it can be: api_origin_ok() in
+    // the coordinator refuses requests that carry an Origin header.
+    // `apiToken` stays a setting: an operator who wants one sets it (or
+    // IDLETOKEN_API_TOKEN) and the coordinator still enforces it.
+    if (!raw) return { ...DEFAULT_SETTINGS };
     const parsed = JSON.parse(raw) as Partial<AppSettings>;
     const merged = { ...DEFAULT_SETTINGS, ...parsed };
     // v0 → v1: maxTokens was a hollow setting — the engine's ceiling was a
@@ -489,6 +518,37 @@ export function loadSettings(): AppSettings {
         if (cut > 0) merged.modelDir = legacy.ggufPath.slice(0, cut);
       }
     }
+    // v4 → v5: adopt the built-in platform address when the stored one is
+    // empty. The "never overwrite a saved setting" rule above assumed the user
+    // could have cleared it deliberately — but there has never been a
+    // platformUrl field anywhere in the UI, so an empty stored value is a
+    // pre-feature default, not a choice (the same reasoning as maxTokens in
+    // v0 → v1). The cost of honouring it was total: on every upgraded install
+    // the sign-in silently used the LOCAL identity backend (valid platform
+    // credentials answered "wrong email or password") and the whole
+    // sharing/earnings section was hidden (found on a test machine,
+    // 2026-08-21).
+    // A NON-empty stored URL is still kept: someone running a self-hosted
+    // gateway put it there by hand-editing storage or importing settings, and
+    // that IS deliberate.
+    if ((parsed.schemaVersion ?? 0) < 5 && !merged.platformUrl.trim()) {
+      merged.platformUrl = DEFAULT_SETTINGS.platformUrl;
+    }
+    // v5 → v6: the daily borrow cap stopped being a setting (owner's call,
+    // 2026-08-21 — borrowing may spend the whole balance; the balance is the
+    // ceiling). Stored values came from a cap field that no longer exists
+    // anywhere in the UI, so they are stale mechanics, not choices — same
+    // reasoning as maxTokens in v0 → v1. Overwrite unconditionally.
+    if ((parsed.schemaVersion ?? 0) < 6) {
+      merged.overflowDailyCapMilli = OVERFLOW_UNCAPPED_MILLI;
+    }
+    // v6 → v7: the one build that derived providerName from the HOSTNAME
+    // (0.1.16, test machines only) put that hostname on the public
+    // marketplace. Clear it so the next toggle regenerates a random-suffix
+    // identity; the machine re-registers under the new name.
+    if ((parsed.schemaVersion ?? 0) < 7 && merged.providerName) {
+      merged.providerName = "";
+    }
     // No migration for the cluster-name default rename ("home" →
     // "IdleToken-Home", 2026-08-15): a stored "home" MAY be a deliberate
     // choice, and rewriting a name the user could have typed is worse than
@@ -513,15 +573,18 @@ export function loadSettings(): AppSettings {
     // keeps it empty. Filling one in on upgrade would 401 every curl, script
     // and Claude Code config that machine already had working, and the user
     // would have no idea why — the app they left running overnight simply
-    // stopped answering. New installs are closed by default (above); old ones
-    // get closed the moment it actually matters, when overflow routing is
-    // switched on and the box can spend Sparks (docs/api-surface.md §5.3).
+    // stopped answering. Nor are new installs any different: since 2026-08-21
+    // nothing mints a token at all (see the block above), so this is not a
+    // migration exception, it is the same open-by-default posture reached from
+    // the other direction. What guards the port is api_origin_ok() in the
+    // coordinator; what bounds a local program is the daily spend cap
+    // (docs/api-surface.md §5.3).
     merged.schemaVersion = SCHEMA_VERSION;
     return merged;
   } catch {
-    // Unreadable storage is a fresh start in every way that matters, so it gets
-    // a token too — otherwise a corrupt file silently reopens the API.
-    return { ...DEFAULT_SETTINGS, apiToken: generateApiToken() };
+    // Unreadable storage is a fresh start in every way that matters, and a
+    // fresh start no longer means a token — see the branch above.
+    return { ...DEFAULT_SETTINGS };
   }
 }
 
@@ -652,12 +715,19 @@ export function engineTuning(
     // a key has been minted for it. Anything less and the URL is left empty,
     // which is how the coordinator is told "do not enable this" -- there is no
     // separate off flag to fall out of step with the credentials.
+    //
+    // This stays the URL as the user configured it (usually https://). The
+    // coordinator has no TLS client, so the spawn layer translates it to the
+    // gateway's plaintext spelling (engine_platform_url in engine.rs) — the
+    // translation lives in Rust because both launch paths (coord overflow and
+    // the platform agent) pass through there, and a second copy here would be
+    // the kind that drifts.
     overflowUrl: s.sharingEnabled && s.overflowKey ? s.platformUrl.trim().replace(/\/+$/, "") : "",
     overflowKey: s.sharingEnabled ? s.overflowKey : "",
     overflowWaitS: Math.max(0, s.overflowWaitS || 0),
     // Never 0: 0 means "the coordinator's own default", not "no ceiling", and
     // the coordinator has no way to express "no ceiling" at all.
-    overflowDailyCapMilli: Math.max(1, s.overflowDailyCapMilli || OVERFLOW_DEFAULT_DAILY_CAP_MILLI),
+    overflowDailyCapMilli: Math.max(1, s.overflowDailyCapMilli || OVERFLOW_UNCAPPED_MILLI),
   };
 }
 

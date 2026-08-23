@@ -34,6 +34,18 @@ REM loud IDLETOKEN_PLATFORM_VERIFY_KEY escape hatch.
 REM Injected via a generated header, NOT -D on the command line: cmd's quote
 REM handling shreds a -DX="..." into a bare " that gcc reads as a linker input
 REM (seen 2026-08-20: ': linker input file not found').
+REM
+REM When the environment does not set one, the checked-in PUBLIC verify key is
+REM the default (scripts\platform-verify-key.b64 -- the ed25519 verify half the
+REM platform signs its encryption key with; not a secret). Every release up to
+REM 0.1.5 shipped an UNPINNED coord because nothing ever set the variable, and
+REM an unpinned coord refuses to enable sharing on every user machine
+REM (overflow.c RULE 3, found 2026-08-21). The environment still wins so a dev
+REM gateway's ephemeral key can be pinned deliberately.
+if not defined IDLETOKEN_PLATFORM_VERIFY_KEY_B64 if exist scripts\platform-verify-key.b64 (
+    set /p IDLETOKEN_PLATFORM_VERIFY_KEY_B64=<scripts\platform-verify-key.b64
+    echo pinning the platform verify key from scripts\platform-verify-key.b64
+)
 if defined IDLETOKEN_PLATFORM_VERIFY_KEY_B64 (
     echo #define IDLETOKEN_PLATFORM_VERIFY_KEY_B64 "%IDLETOKEN_PLATFORM_VERIFY_KEY_B64%"> vk_pin.h
     set CF=%CF% -include vk_pin.h

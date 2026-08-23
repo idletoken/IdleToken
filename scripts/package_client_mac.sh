@@ -32,8 +32,29 @@ TRIPLE=$(rustc -vV | awk '/^host:/{print $2}')
 echo "target triple: $TRIPLE"
 
 # --- engine binaries (idempotent: make decides what to rebuild) -------------
+# Pin the platform verify key by default (scripts/platform-verify-key.b64, the
+# PUBLIC ed25519 verify half). An unpinned coord refuses to enable sharing on
+# every user machine (overflow.c RULE 3, found 2026-08-21); the environment
+# still wins for dev-gateway builds.
+if [ -z "${IDLETOKEN_PLATFORM_VERIFY_KEY_B64:-}" ] && [ -f scripts/platform-verify-key.b64 ]; then
+    IDLETOKEN_PLATFORM_VERIFY_KEY_B64=$(cat scripts/platform-verify-key.b64)
+fi
+IDLETOKEN_PLATFORM_VERIFY_KEY_B64="${IDLETOKEN_PLATFORM_VERIFY_KEY_B64:-}" \
 make coord worker >/dev/null || fail "make coord worker failed"
 make -f Makefile.platform >/dev/null || fail "make -f Makefile.platform failed"
+# Ask the binary whether the pin actually took. Passing the variable is not the
+# same as it reaching the object file — the first 0.1.19 macOS bundle set it and
+# still shipped an unpinned coordinator, because make saw no reason to recompile
+# overflow.c (fixed by COORD_PIN_STAMP in the Makefile; this is the check that
+# would have caught it). Grepping the exe for the key is a documented dead end,
+# so use the same offline probe the Windows lane uses: its only network target
+# refuses instantly, a PINNED build prints "overflow: on", an unpinned one
+# refuses before any network I/O. Demand the positive line, so a probe that
+# stops producing overflow output at all fails the build.
+if ! ./idletoken-coord --overflow-url http://127.0.0.1:1 --overflow-key pin-probe \
+       --model pin-probe-sentinel 2>&1 | grep -q "overflow: on"; then
+    fail "idletoken-coord has no pinned platform verify key — sharing could never be switched on by anyone who installs this build (expected the pin from scripts/platform-verify-key.b64)"
+fi
 # The pinned llama.cpp is a separate, expensive build; stage_sidecars.sh below
 # hard-fails with the right instructions if it is missing. Do not build it here.
 

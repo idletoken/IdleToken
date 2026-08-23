@@ -262,16 +262,30 @@ int idletoken_overflow_configure(const idletoken_overflow_cfg *cfg,
     if (err && err_cap) err[0] = '\0';
     if (!cfg) OVF_FAIL("no overflow configuration");
 
-    /* RULE 2 — fail closed. api_token_ok() waves everything through when no
-     * token is set, which is a fine default for a machine that can only spend
-     * its OWN hardware. The moment it can spend credits instead, that same
-     * default means anyone on the WiFi can empty the balance and the owner
-     * finds out from the ledger (api-surface §5.3). A warning would not do:
-     * the whole point is that the dangerous configuration must not run. */
-    if (!cfg->api_token_set)
-        OVF_FAIL("overflow needs a local API token first — generate one in the "
-                 "client's settings (without it anyone on this network could "
-                 "spend your credits)");
+    /* RULE 2 is GONE (2026-08-21). It refused to configure overflow without an
+     * --api-token, reasoning that "anyone on the WiFi could spend your
+     * credits". That threat had already stopped existing five days earlier: the
+     * user-facing API is rewritten to 127.0.0.1 and is not reachable from the
+     * network at all. What the token actually stood between was a program on
+     * THIS machine and the balance — and it cannot do that, because it lives in
+     * the same settings file that program can read, next to the platform JWT
+     * and the overflow key it would rather steal anyway. A lock whose key hangs
+     * on the same door.
+     *
+     * The cost was not theoretical: every WebUI, Claude Code or Codex pointed
+     * at this machine had to be handed a key, and an install upgraded from
+     * before token minting could not switch sharing on at all.
+     *
+     * What guards the balance now: the daily cap below (a real ceiling, not a
+     * door), and — for the one attacker the token DID stop, a web page in your
+     * browser firing blind requests at localhost — the coordinator's Origin
+     * check, which costs the user nothing because no API client sends that
+     * header. See api_origin_ok() in coord_main.c.
+     *
+     * `api_token_set` stays in the struct and is still reported: an operator
+     * who sets --api-token deliberately should see it reflected, and removing
+     * a field to celebrate deleting a rule is how the next person loses the
+     * ability to tell whether a token is in force. */
     if (!cfg->url || !cfg->url[0])
         OVF_FAIL("overflow needs the platform URL");
     if (!cfg->api_key || !cfg->api_key[0])
@@ -919,13 +933,18 @@ int idletoken_overflow_selftest(void) {
          * is exercised without a DNS lookup or a timeout in a unit test. */
         idletoken_overflow_cfg cfg = { "http://127.0.0.1:1", "sk-test",
                                        0, 0, /*api_token_set=*/0 };
-        OST(idletoken_overflow_configure(&cfg, err, sizeof err) == -1 &&
-            strstr(err, "local API token") != NULL,
-            "overflow: without a local API token, overflow refuses to switch on");
-        OST(!idletoken_overflow_enabled(),
-            "overflow: a refused configure leaves it OFF, not half on");
+        /* The old RULE 2 assertion lived here: "without a local API token,
+         * overflow refuses to switch on". Inverted on 2026-08-21 — a machine
+         * with no token must now be able to switch sharing on, because that is
+         * the state every install that predates token minting is in, and the
+         * token never protected the balance from anything that could read the
+         * settings file anyway. Kept as a positive assertion rather than
+         * deleted: "no token" is a supported configuration now, and a test that
+         * says so is what stops it being re-forbidden by accident. */
+        OST(idletoken_overflow_configure(&cfg, err, sizeof err) != -1 ||
+                strstr(err, "local API token") == NULL,
+            "overflow: no local API token is no longer a reason to refuse");
 
-        cfg.api_token_set = 1;
         cfg.url = "";
         OST(idletoken_overflow_configure(&cfg, err, sizeof err) == -1 &&
             strstr(err, "platform URL") != NULL,

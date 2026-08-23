@@ -736,7 +736,7 @@ pub fn engine_logs(state: State<'_, Engine>, max_lines: Option<usize>) -> Vec<Lo
 /// Why a socket at all: on loopback TCP that leg carries the prompt in the
 /// clear, and one `tcpdump -i lo` reads it. Measured on a real node
 /// 2026-08-16 (results/shared-mode-realmachine-20260816.md).
-fn coord_api_socket() -> Option<String> {
+pub(crate) fn coord_api_socket() -> Option<String> {
     let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok()?;
     if home.is_empty() {
         return None;
@@ -744,6 +744,39 @@ fn coord_api_socket() -> Option<String> {
     let dir = std::path::PathBuf::from(home).join(".idletoken");
     let _ = std::fs::create_dir_all(&dir);
     Some(dir.join("coord-api.sock").to_string_lossy().into_owned())
+}
+
+/// The platform base URL as the ENGINE-side processes can dial it.
+///
+/// The coordinator (`--overflow-url`) and the platform agent (`--platform`)
+/// are plain-HTTP/1.1 clients — neither links a TLS library, and both refuse
+/// https:// outright rather than speak in the clear to port 443
+/// (src/coord/overflow.c, src/tools/platform_agent.c). The client's
+/// `platformUrl` is the https:// gateway the web side talks to, so handing it
+/// over verbatim turned the sharing switch into a coordinator crash loop
+/// ("refuse: overflow cannot be enabled …", 2026-08-21).
+///
+/// The dialable spelling is the gateway's own plaintext port: every deployment
+/// serves :8080 in the clear (platform/docker-compose.yml), the resident
+/// headless agents already ride it in production, and nginx's :80 vhost
+/// whitelists only the rendezvous path — every other path there is a 301 the
+/// engine will not follow. What crosses it stays protected by the layer that
+/// was designed for an untrusted wire: the sealed envelope, not TLS.
+///
+/// http:// URLs pass through untouched — a LAN or self-hosted gateway is
+/// already dialable as written. Anything else (including a malformed https://
+/// with no host) is also passed through, so the engine refuses it loudly
+/// instead of this function quietly inventing an address.
+pub(crate) fn engine_platform_url(url: &str) -> String {
+    let trimmed = url.trim();
+    if let Some(rest) = trimmed.strip_prefix("https://") {
+        let host: &str = rest.split(|c| c == '/' || c == ':').next().unwrap_or("");
+        if !host.is_empty() {
+            return format!("http://{host}:8080");
+        }
+        return trimmed.to_string();
+    }
+    trimmed.trim_end_matches('/').to_string()
 }
 
 #[tauri::command]
@@ -754,11 +787,15 @@ pub fn platform_agent_start(
     name: String,
     coord_api_port: u16,
     coord_token: String,
+    model_id: String,
+    quant: String,
 ) -> Result<(), String> {
     let platform_url = platform_url.trim().to_string();
     if platform_url.is_empty() {
         return Err("[PLATFORM_URL_EMPTY] platform URL is empty — set it in Settings first".into());
     }
+    // The agent has no TLS client; give it the gateway's plaintext spelling.
+    let platform_url = engine_platform_url(&platform_url);
     if jwt.trim().is_empty() {
         return Err("[PLATFORM_NO_SESSION] not signed in to the platform (no session token)".into());
     }
@@ -775,6 +812,21 @@ pub fn platform_agent_start(
         "--coord".into(),
         format!("http://127.0.0.1:{coord_api_port}"),
     ];
+    // What this machine actually serves. The agent's own default is
+    // "dsv4-flash" (DSv4's platform billing id, a relic), and registration
+    // happens once at startup — so an agent started without this registered
+    // every machine as a DSv4 provider no matter what the engine loaded, and
+    // the marketplace routed qwen requests around it while offering it DSv4
+    // work it cannot do (found on a test machine, 2026-08-21: provider
+    // online, listed, and unroutable for its real model).
+    if !model_id.trim().is_empty() {
+        args.push("--model".into());
+        args.push(model_id.trim().to_string());
+    }
+    if !quant.trim().is_empty() {
+        args.push("--quant".into());
+        args.push(quant.trim().to_string());
+    }
     // The coordinator's own API token. It has always been allowed to require
     // one; since overflow routing it MUST when borrowing is on, and the sharing
     // switch turns lending and borrowing on together. Without this the
@@ -1071,6 +1123,42 @@ pub async fn clear_kv_cache(app: AppHandle, kv_dir: Option<String>) -> Result<()
         ));
     }
     Ok(())
+}
+
+/// What the engine processes can and cannot dial is a hard fact of their
+/// binaries (no TLS client), so the mapping is pinned literally: the exact
+/// production URL, the pass-throughs, and the shapes that must NOT be touched.
+#[cfg(test)]
+mod engine_platform_url_tests {
+    use super::engine_platform_url;
+
+    #[test]
+    fn https_becomes_the_gateways_plaintext_port() {
+        assert_eq!(engine_platform_url("https://api.idletoken.ai"),
+                   "http://api.idletoken.ai:8080");
+        // Trailing slash and an explicit https port both fold into the same
+        // dialable spelling — the engine's url_to_addr keeps host:port only.
+        assert_eq!(engine_platform_url("https://api.idletoken.ai/"),
+                   "http://api.idletoken.ai:8080");
+        assert_eq!(engine_platform_url("https://api.idletoken.ai:443"),
+                   "http://api.idletoken.ai:8080");
+    }
+
+    #[test]
+    fn http_and_lan_urls_pass_through() {
+        assert_eq!(engine_platform_url("http://192.168.1.164:8080"),
+                   "http://192.168.1.164:8080");
+        assert_eq!(engine_platform_url("http://localhost:8080/"),
+                   "http://localhost:8080");
+    }
+
+    #[test]
+    fn garbage_is_left_for_the_engine_to_refuse_loudly() {
+        // Inventing an address out of a malformed URL would move the failure
+        // from a clear engine refusal to a silent dial of the wrong host.
+        assert_eq!(engine_platform_url("https://"), "https://");
+        assert_eq!(engine_platform_url(""), "");
+    }
 }
 
 /// The refusal latch is the client's whole understanding of "the engine said

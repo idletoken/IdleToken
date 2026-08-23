@@ -11,19 +11,20 @@ import { loadSettings, saveSettings, settingsWerePersisted, effectiveCaps, engin
 import { buildDiagnosticsBundle } from "./diagnostics";
 import { getAuthProvider, type Session } from "./auth";
 import SettingsPanel from "./SettingsPanel";
+import { ShareToggleButton } from "./PlatformPanel";
+import SparkBalancePill from "./SparkBalancePill";
 import AuthScreen from "./AuthScreen";
 import PairingPanel from "./PairingPanel";
 import Chat from "./Chat";
 import ModelPicker from "./ModelPicker";
 import WeightsRow, { type WeightsInfo } from "./WeightsRow";
-import { inTauri, platformGate, getMe } from "./platform";
+import { inTauri, platformGate, getMe, resumeSharingAgent } from "./platform";
 import { identityFrom, type UserIdentity } from "./Avatar";
 import { accountPairSecret, getPairingProvider, type PairingSnapshot, type ClusterApi, type PeerNode } from "./pairing";
 import { recordProblem } from "./problems";
 import { useClusterStats, servedModelOf, type ClusterStats } from "./clusterStats";
 import { fmtGiB, pct } from "./format";
 import UpdateDialog, { type UpdateResult } from "./UpdateDialog";
-import Capability from "./Capability";
 import PopularModels from "./Popularity";
 import { getUpdateProvider } from "./provider/update";
 import { quitApp, setAutostart, syncTray, syncWindowPrefs, windowState } from "./system";
@@ -111,8 +112,7 @@ type View = "cluster" | "chat" | "settings";
 // The marketplace used to be a fourth place (2026-08-10: removed). Browsing
 // other people's compute is a browser job — the portal already does it, and
 // duplicating it here meant two IAs to keep in sync. What genuinely needs THIS
-// machine — listing this cluster, the credit balance, API keys — is a settings
-// category now (Settings → Sharing & earnings).
+// machine remains in the client; commercial controls live in the signed-in portal.
 const NAV: Array<{ id: View; icon: string }> = [
   // Simple geometric glyphs drawn inline — consistent 18px stroke icons.
   { id: "chat", icon: "M4 5h16v11H9l-5 4z" },
@@ -158,10 +158,17 @@ function TopBar(props: {
         ))}
       </nav>
       <span className="topbar__spacer" />
+      {/* The sharing control, whole and entire (owner's call, 2026-08-21): one
+          button beside the serving pill, only while something is serving —
+          an idle machine has nothing to lend. */}
+      {props.cluster === "ready" ? <ShareToggleButton onNeedLogin={props.onSignIn} /> : null}
       <button className={`pill pill--${props.cluster}`} onClick={props.onGoCluster} title={t("nav.cluster")}>
         <span className="pill__dot" />
         {t(clusterKey)}
       </button>
+      {/* Account balance is global chrome, not cluster-page content. The
+          component hides itself when signed out and never persists its value. */}
+      <SparkBalancePill />
       <button className="iconbtn iconbtn--lang" onClick={props.onToggleLang} aria-label={t("lang.switch")}>
         {t("lang.switch")}
       </button>
@@ -647,27 +654,26 @@ function ClusterCard(props: {
               {t("cluster.create")}
             </button>
           </div>
-          {/* A-P1-3: the reason, next to the button it is about. This sentence
-              existed — `pairing.singleNodeModel` — but only ever rendered
-              inside the pairing panel, which is precisely the place this
-              disabled button prevents you from reaching. */}
-          {!clusterable ? (
-            <span className="wrow">
-              <span className="wrow__msg">{t("pairing.singleNodeModel")}</span>
-            </span>
-          ) : null}
+          {/* The "this model runs on one machine, so there is no join code"
+              sentence was here (A-P1-3, next to the button it explains) until
+              2026-08-21. Removed on the user's call. The button is still
+              disabled for a single-node model — what is gone is the sentence
+              saying why, so a user who cannot click "Create a cluster" now has
+              to work that out from the model they picked. `pairing.singleNodeModel`
+              is still rendered inside the pairing panel. */}
         </div>
 
-        {/* A-P1-3: the two questions a new user has before anything else —
-            "which model do people use" and "what can this machine run" — used
-            to live inside a popover and at the bottom of Settings → Models.
-            Same components, rendered where the questions are asked. */}
+        {/* The capability table was here too (A-P1-3, "what can this machine
+            run?" answered where the question is asked). Removed 2026-08-21:
+            Settings → Models already carries it, and two copies of a table
+            that talks to the engine on every render is one copy too many.
+            PopularModels stays — "which model do people use" has no other
+            home. */}
         <div className="cluster-empty__capability">
           <PopularModels
             selectedId={props.settingModelId}
             onPick={(id) => props.onSwitchModel(id, defaultQuant(id))}
           />
-          <Capability apiBaseUrl={snap?.api?.status === "online" ? snap.api.baseUrl : null} />
         </div>
       </section>
     );
@@ -1169,6 +1175,18 @@ export default function App() {
     return () => { live = false; };
   }, [session]);
   const [showAuth, setShowAuth] = useState(false);
+  // platform.ts drops the stored session when the gateway answers 401 (token
+  // expired). React state does not follow localStorage on its own — without
+  // this listener the top bar keeps showing a signed-in account whose every
+  // request fails, which is exactly the trap the 401 handling exists to break.
+  useEffect(() => {
+    const onExpired = () => {
+      setSession(null);
+      setShowAuth(true);
+    };
+    window.addEventListener("idletoken:session-expired", onExpired);
+    return () => window.removeEventListener("idletoken:session-expired", onExpired);
+  }, []);
   const [showPairing, setShowPairing] = useState(false);
   const [pairingView, setPairingView] = useState<"choose" | "join">("choose");
   // Single source of truth for cluster state: one subscription here feeds the
@@ -1204,6 +1222,17 @@ export default function App() {
       live = false;
       un();
     };
+  }, []);
+
+  // The sharing switch is a STANDING choice: turned on once, it holds across
+  // launches. Until 0.1.10 nothing restarted the agent after a client restart,
+  // so the panel showed "on" over a machine that had quietly stopped earning.
+  // Errors go to the console only: the resume has no owner watching it, and
+  // the sharing panel's own status line is where a broken agent is explained.
+  useEffect(() => {
+    resumeSharingAgent()
+      .then((r) => { if (r === "started") console.info("sharing agent resumed"); })
+      .catch((e) => console.error("sharing agent resume:", e));
   }, []);
 
   // --- Getting the weights in place (B1/B2) --------------------------------
@@ -1549,11 +1578,18 @@ export default function App() {
     if (!snap) return false;
     try {
       const path = await ensureWeights(over);
+      // Tuning comes from STORAGE, not from the `settings` React state: the
+      // sharing card saves through saveSettings() without going through this
+      // component's state, so the state can be minutes stale by the time the
+      // engine starts. Read at spawn time, or "turn sharing on, then start
+      // the cluster" launches a coordinator with no overflow flags — seen
+      // live on a Windows compute node (2026-08-21): the panel promised the borrow settings
+      // would apply on the next engine start, and the next start ignored them.
       await getPairingProvider().create({
         hostname: snap.hostname,
         gpu: snap.gpu_name,
         modelPath: path,
-        tuning: engineTuning(over ? { ...settings, ...over } : settings, caps),
+        tuning: engineTuning(over ? { ...loadSettings(), ...over } : loadSettings(), caps),
       });
       // allowSolo: this IS the one-machine flow. Without it the engine's
       // 2-machine pairing floor rejects the start and the button dies after
@@ -1622,7 +1658,8 @@ export default function App() {
           hostname: snap.hostname,
           gpu: snap.gpu_name,
           modelPath: path,
-          tuning: engineTuning({ ...settings, modelId, quant }, caps),
+          // From storage, not state — same staleness as serveStandalone above.
+          tuning: engineTuning({ ...loadSettings(), modelId, quant }, caps),
         };
         // Account mode has no typed code: the secret is derived from the
         // account, so every machine re-derives the same one and finds us again.
@@ -2567,7 +2604,8 @@ export default function App() {
             hostname: snap.hostname,
             gpu: snap.gpu_name,
             modelPath: weightsPath,
-            tuning: engineTuning(settings, caps),
+            // From storage, not state — same staleness as serveStandalone.
+            tuning: engineTuning(loadSettings(), caps),
           }}
           session={session}
           modelId={settings.modelId}

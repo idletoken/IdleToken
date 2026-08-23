@@ -279,11 +279,23 @@ int idletoken_listen_tcp(const char *bind_addr) {
 }
 
 int idletoken_accept_tcp(int listener) {
-    struct sockaddr_in peer;
+    /* sockaddr_storage, NOT sockaddr_in: the header promises this accept is
+     * address-family agnostic, and the coordinator points it at an AF_UNIX
+     * listener (--api-unix) whose peer address is a sockaddr_un of up to
+     * ~110 bytes. With a 16-byte sockaddr_in here, Windows' afunix provider
+     * wrote the peer path over the stack — return address included — and the
+     * coordinator died with a wild jump (BEX64/c0000005) on the FIRST request
+     * some machines' curl sent through the socket, while the same binary on
+     * another user's path length served fine (two test machines whose
+     * accounts differ only in name length, 2026-08-21).
+     * A crash that depends on the USERNAME length is what an undersized
+     * accept buffer looks like. */
+    struct sockaddr_storage peer;
     socklen_t plen = sizeof(peer);
     int fd = accept(listener, (struct sockaddr *)&peer, &plen);
     if (fd < 0) return -1;
     int one = 1;
+    /* Harmlessly fails on non-TCP families; the return is ignored on purpose. */
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
     return fd;
 }

@@ -11,7 +11,6 @@ import {
   DEFAULT_SETTINGS,
   TIERS,
   effectiveCaps,
-  loadSettings,
   saveSettings,
   type AppSettings,
   type ResourcePreset,
@@ -22,7 +21,6 @@ import WeightsRow from "./WeightsRow";
 import StoredModels from "./StoredModels";
 import { getEngineProvider } from "./provider/engine";
 import { exportableSettings } from "./diagnostics";
-import PlatformPanel from "./PlatformPanel";
 
 type Theme = "dark" | "light";
 const MiB = 1024 ** 2;
@@ -65,7 +63,7 @@ interface Category {
   id: string;
   label: Bi;
   note?: Bi;
-  bespoke?: "quick" | "platform" | "endpoints" | "resources";
+  bespoke?: "quick" | "endpoints" | "resources";
   /** Only render this category when the predicate holds (the platform console
    *  needs a build that has a platform to talk to). */
   visible?: () => boolean;
@@ -182,13 +180,6 @@ function ModelWeightsCell(props: {
 // feel, and a settings page must not show controls that do nothing
 // (principle 15).
 //
-// "Sharing & earnings" is BACK (2026-08-20, audit A-P1-2). It was removed on
-// the same reasoning while the marketplace was not live. The marketplace IS
-// live now — balance, ledger, providers and the lend/borrow switch are all real
-// platform calls — and the client was the only place with no way in: you could
-// not see your balance, list this cluster, or turn sharing on from the app that
-// runs the cluster. The category renders `PlatformPanel`, which has been intact
-// and unreachable the whole time.
 const CATEGORIES: Category[] = [
   // The model page: download manager, capability table, storage, plus the
   // model-adjacent runtime knobs (context tier, resource caps). Language and
@@ -243,16 +234,6 @@ const CATEGORIES: Category[] = [
       ] },
     ],
   },
-  // A-P1-2: the marketplace console. Hidden when this build has no platform
-  // configured — an empty console is worse than no entry — but present the
-  // moment there is one, signed in or not (the panel's own Guide explains what
-  // to do next, which is what an entry that leads somewhere is for).
-  {
-    id: "platform",
-    bespoke: "platform",
-    label: { en: "Sharing & earnings", zh: "共享与收益" },
-    visible: () => !!loadSettings().platformUrl.trim(),
-  },
   {
     id: "network",
     label: { en: "Networking", zh: "联机组网" },
@@ -269,7 +250,10 @@ const CATEGORIES: Category[] = [
       // returns, the fix is auto-detecting overlay adapters, not re-adding the
       // field. Settings import still applies both keys for hand-edited files.
       { label: { en: "Pairing & discovery", zh: "组网与发现" }, fields: [
-        { key: "clusterName", type: "text", label: { en: "Cluster name", zh: "集群名" } },
+        // No cluster-name field (owner's call, 2026-08-21): the provider's
+        // public identity comes from the account username + a number now, and
+        // account-mode pairing derives its secret from the fixed default. The
+        // settings key stays for stored-value compatibility; nothing edits it.
         { key: "mdns", type: "toggle", label: { en: "LAN auto-discovery", zh: "局域网自动发现" } },
         { key: "discoveryPort", type: "number", label: { en: "Discovery port", zh: "发现端口" } },
         { key: "manualPeers", type: "text", label: { en: "Manual peer IPs", zh: "手动节点 IP" }, placeholder: "192.168.1.50, 192.168.1.51" },
@@ -349,8 +333,12 @@ const CATEGORIES: Category[] = [
       // machine's app-data directory (Tauri decides it) and in localStorage,
       // and no code ever read the box. Typing a path did not move anything.
       { label: { en: "Data & backup", zh: "数据与备份" }, fields: [
-        { type: "action", action: "export", label: { en: "Export settings", zh: "导出设置" },
-          hint: { en: "Keys and tokens are left out of the file.", zh: "导出文件不包含密钥与令牌。" } },
+        // The "keys and tokens are left out of the file" hint was here until
+        // 2026-08-21 (removed on the user's call). The BEHAVIOUR is unchanged —
+        // exportableSettings() still runs the same allowlist the diagnostics
+        // bundle uses, which is what keeps apiToken and overflowKey out of a
+        // file someone mails on (audit A-P2-1). Only the sentence is gone.
+        { type: "action", action: "export", label: { en: "Export settings", zh: "导出设置" } },
         { type: "action", action: "import", label: { en: "Import settings", zh: "导入设置" } },
         { type: "action", action: "clearData", label: { en: "Clear all local data", zh: "清除全部本地数据" } },
       ] },
@@ -418,7 +406,6 @@ export default function SettingsPanel(props: {
   lang: Lang;
   onLang: (l: Lang) => void;
   onClose: () => void;
-  // Sharing & earnings needs the cloud session (and a way to get one).
   session?: Session | null;
   onSignIn?: () => void;
   // Deep link: "share this cluster →" must land on the sharing category, not
@@ -940,15 +927,6 @@ export default function SettingsPanel(props: {
               {cat.bespoke === "quick" ? renderQuick() : null}
               {cat.bespoke === "resources" ? renderResources() : null}
               {cat.bespoke === "endpoints" ? <EndpointsPanel settings={s} /> : null}
-              {/* A-P1-2: the marketplace console, reachable again. */}
-              {cat.bespoke === "platform" ? (
-                <PlatformPanel
-                  settings={s}
-                  session={props.session ?? null}
-                  onOpenSettings={() => setActive("connect")}
-                  onSignIn={() => props.onSignIn?.()}
-                />
-              ) : null}
               {/* Language and theme live with the rest of Appearance (moved
                   from the model page 2026-08-15). They are not AppSettings
                   fields — the app shell owns them — so they render here rather
