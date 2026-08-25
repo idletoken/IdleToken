@@ -251,6 +251,9 @@ static void usage(FILE *out) {
 "  --bind H:P          worker-facing TCP (default: 0.0.0.0:14100)\n"
 "  --num-workers N     wait for N workers, then plan (default: 1)\n"
 "  --ctx-size N        context window in ASSIGN_PLAN (default: 8192)\n"
+"  --ctx-fit           treat --ctx-size as a ceiling: grant the largest\n"
+"                      window this machine's memory affords (floor 16384)\n"
+"                      instead of refusing when the ceiling does not fit\n"
 "  --model-id ID       model to serve, from the model registry\n"
 "                      (default: deepseek-v4-flash; other registered models\n"
 "                      need their backend implemented first)\n"
@@ -3273,8 +3276,34 @@ static int llama_prompt_token_count(const char *oai_body, size_t len,
     size_t plen;
     if (status != 200 ||
         json_raw_str_span(resp, rlen, "prompt", &pspan, &plen) != 0) {
-        *bad_request = (status >= 400 && status < 500);
-        snprintf(err, err_cap, "chat template failed (engine HTTP %d)", status);
+        /* llama.cpp wraps chat-template exceptions (a Jinja raise, a parse
+         * failure) in HTTP 500 "server_error" even though the fault is the
+         * request's shape. An ANSWERED failure here means the engine is alive
+         * and rejected THIS body — the client must see 400, never "node not
+         * ready": one such 500-turned-503 cascaded into every provider of the
+         * model being cooled down (2026-08-24). Only an engine 503 keeps its
+         * meaning — that really is the loading/restarting state. */
+        *bad_request = (status >= 400 && status < 600 && status != 503);
+        /* Carry the engine's own words (bounded, unescape-lite: escapes and
+         * quotes collapse to spaces, so the one-liner embeds safely in our
+         * error JSON). "chat template failed" alone is not actionable. */
+        char detail[120];
+        size_t o = 0;
+        const char *emsg;
+        size_t eml;
+        if (json_raw_str_span(resp, rlen, "message", &emsg, &eml) == 0) {
+            for (size_t k = 0; k < eml && o + 1 < sizeof detail; k++) {
+                char ch = emsg[k];
+                if (ch == '\\') {
+                    k += (k + 1 < eml && emsg[k + 1] == 'u') ? 5 : 1;
+                    ch = ' ';
+                }
+                detail[o++] = ((unsigned char)ch < 0x20 || ch == '"') ? ' ' : ch;
+            }
+        }
+        detail[o] = '\0';
+        snprintf(err, err_cap, "chat template failed (engine HTTP %d)%s%s",
+                 status, o ? ": " : "", detail);
         free(resp);
         return -1;
     }
@@ -3979,13 +4008,31 @@ static void llama_chat_route(int conn_fd, const idletoken_http_req *req,
     const int tools_oneshot = want_stream &&
         idletoken_body_has_tools((const char *)req->body, req->body_len);
     size_t uplen = 0;
-    char *up = is_anthropic
-        ? idletoken_anthropic_to_openai((const char *)req->body, req->body_len,
+    char *up;
+    if (is_anthropic) {
+        up = idletoken_anthropic_to_openai((const char *)req->body, req->body_len,
+                                           want_stream && !tools_oneshot,
+                                           g_max_decode, &uplen);
+    } else {
+        /* Same demotion rule the Anthropic translation applies: templates
+         * accept a system/developer role only in position 0 and RAISE on any
+         * later one, which the engine wraps in HTTP 500 — so one such request
+         * used to read as a broken node all the way up to the platform
+         * (2026-08-24: a phone client's connection test cooled down every
+         * provider of the model). */
+        size_t dlen = 0;
+        char *demoted = idletoken_openai_demote_system((const char *)req->body,
+                                                       req->body_len, &dlen);
+        if (demoted)
+            fprintf(stderr, "coord: chat: demoted non-leading system/developer "
+                            "role(s) to user (OpenAI face)\n");
+        up = llama_openai_upstream_body(demoted ? demoted
+                                                : (const char *)req->body,
+                                        demoted ? dlen : req->body_len,
                                         want_stream && !tools_oneshot,
-                                        g_max_decode, &uplen)
-        : llama_openai_upstream_body((const char *)req->body, req->body_len,
-                                     want_stream && !tools_oneshot,
-                                     tools_oneshot, &uplen);
+                                        tools_oneshot, &uplen);
+        free(demoted);
+    }
     if (!up) {
         idletoken_http_send_error(conn_fd, 400,
                                   is_anthropic ? "missing or empty 'messages'/'content'"
@@ -6874,6 +6921,7 @@ int main(int argc, char **argv) {
     int http_serve         = 0;
     int tokenizer_only     = 0;
     uint32_t ctx_size      = 0;   /* 0 = defaulted per mode below */
+    int ctx_fit            = 0;   /* --ctx-fit: ctx_size is a ceiling, size to memory */
     /* Pairing / discovery: when a code (or account) is given, advertise this
      * coordinator over the LAN so workers self-assemble by code — no manual
      * --coordinator on the worker side. */
@@ -6917,6 +6965,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--api-token")   && i + 1 < argc) api_token   = argv[++i];
         else if (!strcmp(a, "--num-workers") && i + 1 < argc) { num_workers = atoi(argv[++i]); num_workers_set = 1; }
         else if (!strcmp(a, "--ctx-size")    && i + 1 < argc) ctx_size    = (uint32_t)atoi(argv[++i]);
+        else if (!strcmp(a, "--ctx-fit"))                     ctx_fit     = 1;
         else if (!strcmp(a, "--model-id")    && i + 1 < argc) model_id    = argv[++i];
         else if (!strcmp(a, "--model-path")  && i + 1 < argc) model_path  = argv[++i];
         else if (!strcmp(a, "--gguf-dir")    && i + 1 < argc) gguf_dir    = argv[++i];
@@ -7147,6 +7196,32 @@ int main(int argc, char **argv) {
              * run had to reverse-engineer from a byte count. */
             fprintf(stderr, "coord: budget from: %s\n", budget_src);
 
+            /* A quantized KV cache (IDLETOKEN_KV_CACHE_TYPE/_V) genuinely fits
+             * more context, so the planner must price KV at the dtype the
+             * sidecar will actually spawn with — a plan at f16 prices would
+             * refuse windows the engine can serve. Same resolver as the spawn;
+             * an invalid value refuses HERE, before any memory maths runs on
+             * a dtype the engine would reject anyway. */
+            {
+                char kvk[12], kvv[12], kverr[128];
+                if (idletoken_llama_kv_types(kvk, kvv, kverr, sizeof kverr) != 0) {
+                    fprintf(stderr, "idletoken-coord: %s\n", kverr);
+                    return 2;
+                }
+                const double kvs = idletoken_llama_kv_scale(kvk, kvv);
+                if (kvs != 1.0) {
+                    msize.kv_bytes_per_token =
+                        (uint64_t)((double)msize.kv_bytes_per_token * kvs + 0.5);
+                    fprintf(stderr,
+                            "coord: KV cache K=%s V=%s -> %.0f%% of f16 "
+                            "(%.1f KiB/token for planning)\n",
+                            kvk[0] ? kvk : "f16",
+                            kvv[0] ? kvv : (kvk[0] ? kvk : "f16"),
+                            kvs * 100.0,
+                            (double)msize.kv_bytes_per_token / 1024.0);
+                }
+            }
+
             idletoken_node_mem me;
             memset(&me, 0, sizeof(me));
             const char *fake_usable = getenv("IDLETOKEN_TEST_USABLE_BYTES");
@@ -7203,7 +7278,15 @@ int main(int argc, char **argv) {
              * Cluster ctx sizing stays simple (default ask, model clamp);
              * the planner's needed() accounts for the KV bytes. */
             if (num_workers_set && num_workers >= 1) {
-                uint32_t cctx = ctx_size ? ctx_size : 32768;
+                /* --ctx-fit has no per-node fitting here (the pool is not one
+                 * machine's memory); it falls back to the conservative default
+                 * ask rather than honoring a ceiling nobody sized. */
+                if (ctx_fit && ctx_size)
+                    fprintf(stderr, "coord: --ctx-fit: cluster mode sizes the "
+                                    "context conservatively (ask %u); pass an "
+                                    "explicit --ctx-size tier to override\n",
+                            (unsigned)32768);
+                uint32_t cctx = (ctx_size && !ctx_fit) ? ctx_size : 32768;
                 if (cctx > g_model->ctx_max) {
                     fprintf(stderr, "idletoken-coord: ctx-size %u clamped to %s "
                                     "max %u\n", cctx, g_model->id, g_model->ctx_max);
@@ -7234,7 +7317,7 @@ int main(int argc, char **argv) {
                         ctx_capped, g_model->id, g_model->ctx_max);
                 ctx_capped = g_model->ctx_max;
             }
-            if (ctx_size == 0) {
+            if (ctx_size == 0 || ctx_fit) {
                 const uint32_t granted =
                     idletoken_llama_fit_ctx(usable, &msize, ctx_capped, 16384);
                 if (granted == 0) {

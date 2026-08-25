@@ -2,7 +2,7 @@
 // Split into a Simple set (what a home user needs) and an Advanced set (precise
 // control). Persisted to localStorage and restored on launch. Theme + language
 // live separately (pure UI state) but are surfaced in the Simple tab.
-import { DEFAULT_MODEL_ID, defaultQuant, isAvailable, quantOptions } from "./models";
+import { DEFAULT_MODEL_ID, defaultQuant, getManifest, getVariant, isAvailable, quantOptions } from "./models";
 
 const MiB = 1024 ** 2;
 
@@ -18,6 +18,114 @@ export const TIERS: Tier[] = [
   { id: 4, ctx: 524288 },
   { id: 5, ctx: 1048576 },
 ];
+
+// ---- context bounded by the model -----------------------------------------
+// `tier: 0` = "model default": ask for the model's own trained window and let
+// the coordinator size DOWN to what this machine's memory affords (--ctx-fit).
+// Tiers above the model's trained window are refused in the picker: the model
+// cannot attend past it, so a longer window only buys degraded output.
+export const MODEL_DEFAULT_TIER = 0;
+
+/** The selected model's trained context window (manifest `context_max`). */
+export function modelCtxMax(modelId: string): number {
+  try {
+    return getManifest(modelId || DEFAULT_MODEL_ID).context_max || 8192;
+  } catch {
+    return 8192;
+  }
+}
+
+/** The context the engine is actually asked for: the tier's window bounded by
+ *  the model's trained one (tier 0 = the trained window itself). The same
+ *  clamp exists in the coordinator; this copy keeps every client-side
+ *  estimate (capacity cards, KV recommendation) honest about what will run. */
+export function effectiveCtx(s: Pick<AppSettings, "tier" | "modelId">): number {
+  const cap = modelCtxMax(s.modelId);
+  return s.tier === MODEL_DEFAULT_TIER ? cap : Math.min(tierCtx(s.tier), cap);
+}
+
+// ---- KV cache precision ----------------------------------------------------
+// The engine's own KV cache dtypes (vendor/llama.cpp kv_cache_types; mirror of
+// the coordinator's allow-list in src/coord/llama_sidecar.c — the two must
+// agree or a stored choice refuses to launch). `blockBytes` is the storage
+// cost of one 32-element quant block; f16's is 64, so scale = blockBytes/64.
+export const KV_CACHE_TYPES = [
+  { type: "f16", blockBytes: 64 },
+  { type: "bf16", blockBytes: 64 },
+  { type: "q8_0", blockBytes: 34 },
+  { type: "q5_1", blockBytes: 24 },
+  { type: "q5_0", blockBytes: 22 },
+  { type: "iq4_nl", blockBytes: 18 },
+  { type: "q4_1", blockBytes: 20 },
+  { type: "q4_0", blockBytes: 18 },
+] as const;
+export type KvCacheType = (typeof KV_CACHE_TYPES)[number]["type"] | "";
+
+export function kvScale(type: string): number {
+  const t = KV_CACHE_TYPES.find((k) => k.type === type);
+  return t ? t.blockBytes / 64 : 1;
+}
+
+/** f16 KV bytes per token for the WHOLE model, from the manifest. Hybrid
+ *  models only pay attention KV on every `full_attention_interval`-th layer;
+ *  their per-layer recurrent state is context-independent and therefore not
+ *  part of this number. Estimate parity: src/common/model.c. */
+export function kvBytesPerTokenF16(modelId: string): number {
+  const m = getManifest(modelId || DEFAULT_MODEL_ID);
+  const kv = m.kv as { bytes_per_token_per_layer: number; full_attention_interval?: number };
+  const layers = kv.full_attention_interval
+    ? Math.max(1, Math.round(m.n_layers / kv.full_attention_interval))
+    : m.n_layers;
+  return kv.bytes_per_token_per_layer * layers;
+}
+
+export interface KvRecommendation {
+  /** The dtype "auto" resolves to. */
+  type: (typeof KV_CACHE_TYPES)[number]["type"];
+  /** Why, in numbers the user can check: KV need at the effective context vs
+   *  the memory left after weights. Rendered verbatim in the panel. */
+  kvNeedBytes: number;
+  budgetBytes: number;
+  ctx: number;
+  /** True when even the smallest dtype does not fit — the pick is then "least
+   *  bad", and the panel must say so instead of implying it fits. */
+  tight: boolean;
+}
+
+/**
+ * Recommend a KV cache dtype from the model's size, this machine's memory and
+ * the effective context (the user's ask: the default should come from model ×
+ * resources, not from a fixed constant).
+ *
+ * Ladder deliberately stops at q4_0 and skips the exotic middle steps for the
+ * recommendation itself (they all stay selectable): f16 when it fits with the
+ * weights, else the highest of q8_0/q5_1/q4_0 that does. Below q4_0 there is
+ * nothing, so a machine where even that overflows still gets q4_0 — flagged
+ * `tight` so the UI says "will size the context down" rather than "fits".
+ */
+export function recommendKvCache(
+  s: Pick<AppSettings, "tier" | "modelId" | "quant">,
+  mem: { vramBytes: number; ramBytes: number; unified: boolean }
+): KvRecommendation {
+  const ctx = effectiveCtx(s);
+  const m = getManifest(s.modelId || DEFAULT_MODEL_ID);
+  const v = getVariant(s.modelId, s.quant || undefined);
+  const weights = (v ? v.layer_weight_bytes + v.shared_weight_bytes
+                     : m.layer_weight_bytes + m.shared_weight_bytes) || 0;
+  // Unified memory is one physical pool — count it once (plan.c rule).
+  const have = mem.unified ? Math.max(mem.vramBytes, mem.ramBytes) : mem.vramBytes + mem.ramBytes;
+  // Engine parity: per-node overhead = 768 MiB + weights/64 (calibrated
+  // 2026-08-15, results/resource-calibration-20260815.md).
+  const overhead = 768 * MiB + weights / 64;
+  const budget = Math.max(0, have - weights - overhead);
+  const perTok = kvBytesPerTokenF16(s.modelId);
+  const ladder = ["f16", "q8_0", "q5_1", "q4_0"] as const;
+  for (const t of ladder) {
+    if (perTok * kvScale(t) * ctx <= budget)
+      return { type: t, kvNeedBytes: perTok * kvScale(t) * ctx, budgetBytes: budget, ctx, tight: false };
+  }
+  return { type: "q4_0", kvNeedBytes: perTok * kvScale("q4_0") * ctx, budgetBytes: budget, ctx, tight: true };
+}
 
 export type ResourcePreset = "conservative" | "balanced" | "max" | "custom";
 // Fraction of a machine's total the preset lets IdleToken use (max = no cap).
@@ -41,7 +149,10 @@ export interface AppSettings {
   // customHfFile, removed 2026-08-15 with the open model intake): the curated
   // registry is the whole selectable set, and a stored "local-gguf" selection
   // migrates back to the default model below.
-  tier: Tier["id"];
+  /** 0 = "model default": the model's trained window, sized down to memory by
+   *  the coordinator (--ctx-fit). 1-5 = the fixed tier ladder, bounded by the
+   *  model's trained window in the picker. */
+  tier: Tier["id"] | 0;
   resourcePreset: ResourcePreset;
   // ---- advanced: resources (precise; used when resourcePreset === "custom") ----
   maxVramMb: number; // 0 = no cap
@@ -117,6 +228,14 @@ export interface AppSettings {
   // engine grows them. Do not fake flags for them (design philosophy 15).
   kvOffload: boolean; // reserved — engine has no live KV offload
   kvDir: string; // real: passed to `--kv-clear --kv-dir` (empty = platform dir)
+  // ---- KV cache precision (real: engine -ctk/-ctv via the coordinator) ----
+  /** K cache dtype. "" = auto: the client resolves recommendKvCache() at
+   *  launch and passes the concrete dtype. Any other value must be in
+   *  KV_CACHE_TYPES (the coordinator refuses unknown ones loudly). */
+  kvCacheK: string;
+  /** V (activation) cache dtype. "" = auto: follows the K choice. A quantized
+   *  V cache needs flash attention; the coordinator adds `-fa on` itself. */
+  kvCacheV: string;
   kvMaxMb: number; // reserved — engine enforces no size bound yet
   kvTtlDays: number; // reserved — engine has no TTL eviction yet
   kvEviction: KvEviction; // reserved — engine has no eviction policy yet
@@ -252,7 +371,11 @@ export const OVERFLOW_UNCAPPED_MILLI = 2_000_000_000;
 export const DEFAULT_SETTINGS: AppSettings = {
   modelId: DEFAULT_MODEL_ID,
   quant: defaultQuant(DEFAULT_MODEL_ID),
-  tier: 2,
+  // Model default (2026-08-24, was tier 2/32K): the model's own trained window
+  // sized down to memory. A fixed 32K default silently under-served models
+  // trained for 256K, and a real client with a large toolset (Nimbalyst's
+  // opencode: 48.5K tokens of tool schemas) overflowed it on first contact.
+  tier: MODEL_DEFAULT_TIER,
   // Full power by default (2026-08-15, was "balanced"): the product's whole
   // promise is using this machine's idle capacity, and a fresh install that
   // silently keeps 25% back both underuses the hardware and misreports what
@@ -300,6 +423,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   schemaVersion: 7,
   kvOffload: false,
   kvDir: "",
+  kvCacheK: "",
+  kvCacheV: "",
   kvMaxMb: 1024,
   kvTtlDays: 3,
   kvEviction: "lru",
@@ -380,7 +505,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
 // which package.json mirrors — keep this literal in step with it. (Not read
 // from the Tauri API because it renders synchronously in the About note and
 // must also work in the browser dev build, where there is no shell to ask.)
-export const APP_VERSION = "0.1.19";
+export const APP_VERSION = "0.1.24";
 
 const KEY = "idletoken.settings";
 
@@ -625,6 +750,15 @@ export interface EngineTuning {
   modelId: string;
   quant: string;
   ctxSize: number;
+  /** Tier 0 ("model default"): `ctxSize` is a CEILING and the coordinator
+   *  sizes down to memory (--ctx-fit) instead of refusing when it does not
+   *  fit. Explicit tiers keep today's refuse-loudly contract. */
+  ctxFit: boolean;
+  /** KV cache dtypes → coord env IDLETOKEN_KV_CACHE_TYPE / _V ("" = engine
+   *  default f16). "auto" is resolved to a concrete dtype HERE, at launch,
+   *  because the recommendation depends on the machine the engine starts on. */
+  kvCacheK: string;
+  kvCacheV: string;
   /** Per-request generation ceiling → coord `--max-decode`. 0 = context-bound. */
   maxDecode: number;
   /** This machine's usage caps (MiB, 0 = no cap) → worker `--max-vram-mb` /
@@ -666,7 +800,7 @@ export interface EngineTuning {
   overflowDailyCapMilli: number;
 }
 
-export function tierCtx(tier: Tier["id"]): number {
+export function tierCtx(tier: Tier["id"] | 0): number {
   return TIERS.find((t) => t.id === tier)?.ctx ?? 8192;
 }
 
@@ -683,8 +817,13 @@ export function tierCtx(tier: Tier["id"]): number {
  */
 export function engineTuning(
   s: AppSettings,
-  caps: { maxVramMb: number; maxRamMb: number }
+  caps: { maxVramMb: number; maxRamMb: number },
+  /** This machine's memory, for resolving kvCache "auto" into a concrete
+   *  dtype. Optional so a caller without a probe still launches — "auto" then
+   *  degrades to the engine's own default (f16), never to a guess. */
+  mem?: { vramBytes: number; ramBytes: number; unified: boolean }
 ): EngineTuning {
+  const autoKv = mem ? recommendKvCache(s, mem).type : "";
   return {
     maxVramMb: caps.maxVramMb,
     maxRamMb: caps.maxRamMb,
@@ -706,7 +845,14 @@ export function engineTuning(
     discoveryPort: s.discoveryPort || 14099,
     modelId: s.modelId || DEFAULT_MODEL_ID,
     quant: s.quant ?? "",
-    ctxSize: tierCtx(s.tier),
+    // Bounded by the model's trained window in both cases — the coordinator
+    // clamps too, but the number the client quotes should be the one in force.
+    ctxSize: effectiveCtx(s),
+    ctxFit: s.tier === MODEL_DEFAULT_TIER,
+    kvCacheK: s.kvCacheK || autoKv,
+    // V follows K when only K is set (or recommended): mixed K/V dtypes are a
+    // deliberate choice, not a default.
+    kvCacheV: s.kvCacheV || s.kvCacheK || autoKv,
     // The engine's per-request ceiling comes from the same setting the chat
     // sends, so the number the user typed is the number that governs — for
     // third-party API clients too, not just our own chat.

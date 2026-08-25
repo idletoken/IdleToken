@@ -20,8 +20,9 @@ import { inTauri } from "./platform";
 export interface DownloadTarget {
   repo: string;
   file: string;
-  /** Byte count declared by the manifest (layers + shared). 0 = not stated, in
-   *  which case the server's value wins. */
+  /** Declared bytes of `file` ITSELF — for a split model that is the first
+   *  part only; the other files carry their own `bytes` in `parts`. 0 = not
+   *  stated, in which case the server's value wins. */
   expectBytes: number;
   /** SHA-256 pinned by the manifest. "" = not pinned (curation gap): the
    *  integrity gate then has nothing to check — it never invents a hash. */
@@ -62,10 +63,21 @@ export function resolveDownload(man: ModelManifest, quant?: string): DownloadTar
   const sha256 = (v ? v.sha256 : man.sha256) ?? "";
   const revision = (v ? v.revision : man.revision) ?? "";
   const parts = (v ? v.parts : man.parts) ?? [];
-  // The declared size must cover the WHOLE model, parts included — otherwise a
-  // 434 GB download would report "done" at part one's 36 GB.
+  // `layer_weight_bytes + shared_weight_bytes` cover the WHOLE model — every
+  // split file — because the planner sizes memory off them. `expectBytes`
+  // however describes ONE file (`file`, the first part): the Rust side checks
+  // each part against its own `bytes` and sums everything back up for the
+  // progress denominator. So the first part's size is the whole minus the
+  // declared parts — exact, since the manifest generator records file bytes on
+  // both sides. Adding partBytes ON TOP of the whole (the code until
+  // 2026-08-25) double-counted every split model: DSv4 IQ2_XXS advertised
+  // 182 GB of a 91 GB model, and completeness compared part one's 5 MB file
+  // against the whole-model figure, so a fully-downloaded split model stayed
+  // "not downloaded" forever.
   const partBytes = parts.reduce((n: number, p: SplitPart) => n + (p.bytes ?? 0), 0);
-  return { repo, file, expectBytes: layer + shared + partBytes, sha256, revision, parts };
+  const whole = layer + shared;
+  const expectBytes = partBytes > 0 ? Math.max(0, whole - partBytes) : whole;
+  return { repo, file, expectBytes, sha256, revision, parts };
 }
 
 export interface WeightsState {
@@ -263,12 +275,21 @@ export async function resolveLocalWeights(args: {
   const target = resolveDownload(args.manifest, args.quant);
   if (!target) return { path: "", needsDownload: false, target: null, haveBytes: 0, needsVerify: false };
   const dir = args.modelDir || (await defaultModelDir());
+  // Every file of a split model must be present — llama.cpp opens part 1 and
+  // finds the rest by name in the same directory, so "part 1 exists" alone
+  // says nothing. Checked file by file because that is the granularity the
+  // engine side works at: each part has its own bytes, hash, and marker.
   const st = await weightsState(dir, target.file, target.expectBytes, target.sha256);
+  const states = [st];
+  for (const p of target.parts) {
+    states.push(await weightsState(dir, p.file, p.bytes ?? 0, p.sha256 ?? ""));
+  }
+  const complete = states.every((s) => s.complete);
   return {
-    path: st.complete ? st.path : "",
-    needsDownload: !st.complete,
+    path: complete ? st.path : "",
+    needsDownload: !complete,
     target,
-    haveBytes: st.complete ? 0 : st.have_bytes,
-    needsVerify: st.complete && !st.verified,
+    haveBytes: complete ? 0 : states.reduce((n, s) => n + s.have_bytes, 0),
+    needsVerify: complete && states.some((s) => !s.verified),
   };
 }

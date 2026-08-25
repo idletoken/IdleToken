@@ -139,6 +139,60 @@ int main(void) {
            "no usable message -> NULL");
     }
 
+    /* ---- openai face: non-leading system demotion ---------------------- */
+    printf("== idletoken_openai_demote_system ==\n");
+    {
+        const char *body = "{\"model\":\"m\",\"messages\":["
+                           "{\"role\":\"user\",\"content\":\"a\"},"
+                           "{\"role\":\"system\",\"content\":\"reminder\"}],"
+                           "\"temperature\":0.7}";
+        size_t ol = 0;
+        char *r = idletoken_openai_demote_system(body, strlen(body), &ol);
+        ok(r && ol == strlen(r), "demote: returns consistent length");
+        ok(r && strstr(r, "{\"role\":\"user\",\"content\":\"reminder\"}") != NULL,
+           "demote: non-leading system -> user");
+        ok(r && strstr(r, "\"temperature\":0.7") != NULL &&
+               strstr(r, "\"model\":\"m\"") != NULL,
+           "demote: every other byte survives");
+        free(r);
+    }
+    {
+        const char *body = "{\"messages\":["
+                           "{\"role\":\"system\",\"content\":\"s\"},"
+                           "{\"role\":\"user\",\"content\":\"u\"},"
+                           "{\"role\":\"developer\",\"content\":\"d\"},"
+                           "{\"role\":\"system\",\"content\":\"s2\"}]}";
+        size_t ol = 0;
+        char *r = idletoken_openai_demote_system(body, strlen(body), &ol);
+        ok(r && strstr(r, "{\"role\":\"system\",\"content\":\"s\"}") != NULL,
+           "demote: leading system is kept");
+        ok(r && strstr(r, "{\"role\":\"user\",\"content\":\"d\"}") != NULL,
+           "demote: non-leading developer -> user");
+        ok(r && strstr(r, "{\"role\":\"user\",\"content\":\"s2\"}") != NULL,
+           "demote: every later system rewritten");
+        free(r);
+    }
+    {
+        const char *body = "{\"messages\":["
+                           "{\"role\":\"system\",\"content\":\"s\"},"
+                           "{\"role\":\"user\",\"content\":\"u\"}]}";
+        ok(idletoken_openai_demote_system(body, strlen(body), NULL) == NULL,
+           "demote: nothing to rewrite -> NULL (caller keeps original)");
+    }
+    {
+        const char *body = "{\"messages\":["
+                           "{\"role\":\"user\",\"content\":\"say role:\\\"system\\\"\"},"
+                           "{\"role\":\"user\",\"content\":\"b\"}]}";
+        ok(idletoken_openai_demote_system(body, strlen(body), NULL) == NULL,
+           "demote: 'system' inside content text is not a role");
+    }
+    {
+        ok(idletoken_openai_demote_system("{\"prompt\":\"x\"}", 14, NULL) == NULL,
+           "demote: no messages array -> NULL");
+        ok(idletoken_openai_demote_system(NULL, 0, NULL) == NULL,
+           "demote: NULL body -> NULL");
+    }
+
     /* ---- anthropic -> openai: sampling passthrough --------------------- */
     printf("== idletoken_anthropic_to_openai: sampling ==\n");
     {

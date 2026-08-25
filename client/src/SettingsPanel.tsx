@@ -9,8 +9,12 @@ import { fmtBytes } from "./format";
 import {
   APP_VERSION,
   DEFAULT_SETTINGS,
+  KV_CACHE_TYPES,
+  MODEL_DEFAULT_TIER,
   TIERS,
   effectiveCaps,
+  modelCtxMax,
+  recommendKvCache,
   saveSettings,
   type AppSettings,
   type ResourcePreset,
@@ -781,16 +785,44 @@ export default function SettingsPanel(props: {
           changes its "max context" column — so it reads best at the bottom. */}
       <div className="setting-group">
         <div className="setting-group__label">{t("settings.tier")}</div>
+        {/* Bounded by the selected model (2026-08-24): a window past the
+            trained one is not "more context", it is attention positions the
+            model never saw — output degrades, so those tiers are disabled,
+            not merely discouraged. Tier 0 asks for the trained window itself
+            and lets the coordinator size DOWN to memory (--ctx-fit). */}
         <div className="tier-list">
-          {TIERS.map((tier) => {
-            const ctxLabel = tier.ctx >= 1048576 ? "1M" : `${tier.ctx / 1024}K`;
+          {(() => {
+            const cap = modelCtxMax(s.modelId);
+            const capLabel = cap >= 1048576 ? `${Math.round(cap / 1048576)}M` : `${Math.round(cap / 1024)}K`;
             return (
-              <button key={tier.id} className={`tier-opt${s.tier === tier.id ? " is-on" : ""}`} onClick={() => set("tier", tier.id)}>
-                <span className="tier-opt__name">{t(`tier.${tier.id}.name` as const)}</span>
-                <span className="tier-opt__ctx">{ctxLabel}</span>
-              </button>
+              <>
+                <button
+                  key={MODEL_DEFAULT_TIER}
+                  className={`tier-opt${s.tier === MODEL_DEFAULT_TIER ? " is-on" : ""}`}
+                  onClick={() => set("tier", MODEL_DEFAULT_TIER)}
+                >
+                  <span className="tier-opt__name">{L({ en: "Model default", zh: "模型默认" }, lang)}</span>
+                  <span className="tier-opt__ctx">{capLabel}</span>
+                </button>
+                {TIERS.map((tier) => {
+                  const ctxLabel = tier.ctx >= 1048576 ? "1M" : `${tier.ctx / 1024}K`;
+                  const over = tier.ctx > cap;
+                  return (
+                    <button
+                      key={tier.id}
+                      className={`tier-opt${s.tier === tier.id ? " is-on" : ""}${over ? " is-disabled" : ""}`}
+                      disabled={over}
+                      title={over ? L({ en: `Beyond this model's trained window (${capLabel})`, zh: `超出该模型的训练上下文上限(${capLabel})` }, lang) : undefined}
+                      onClick={() => !over && set("tier", tier.id)}
+                    >
+                      <span className="tier-opt__name">{t(`tier.${tier.id}.name` as const)}</span>
+                      <span className="tier-opt__ctx">{ctxLabel}</span>
+                    </button>
+                  );
+                })}
+              </>
             );
-          })}
+          })()}
         </div>
       </div>
       {/* Storage: the folder the download manager writes into, and what it
@@ -844,6 +876,56 @@ export default function SettingsPanel(props: {
       <div className="setting-group">
         <div className="setting-group__label">{L({ en: "Inference & cache", zh: "推理与缓存" }, lang)}</div>
         {renderField({ key: "maxTokens", type: "number", label: { en: "Max tokens per reply", zh: "单次回复最大词元数" } }, 0)}
+        {/* KV cache precision (2026-08-24). Every dtype the pinned engine
+            supports is selectable; "auto" resolves to the recommendation at
+            launch. The recommendation is recomputed per render from model ×
+            memory × effective context, so it tracks the pickers above. */}
+        {(() => {
+          const rec = recommendKvCache(s, {
+            vramBytes: props.snap.vram_total,
+            ramBytes: props.snap.ram_total,
+            unified: props.snap.unified_memory,
+          });
+          const kvOptions = (auto: Bi) => [
+            { value: "", label: auto },
+            ...KV_CACHE_TYPES.map((k) => ({
+              value: k.type,
+              label: {
+                en: `${k.type} — ${Math.round((k.blockBytes / 64) * 100)}% of f16`,
+                zh: `${k.type} — f16 的 ${Math.round((k.blockBytes / 64) * 100)}%`,
+              },
+            })),
+          ];
+          const gib = (b: number) => (b / 1024 ** 3).toFixed(1);
+          const ctxLabel = rec.ctx >= 1048576 ? `${Math.round(rec.ctx / 1048576)}M` : `${Math.round(rec.ctx / 1024)}K`;
+          return (
+            <>
+              {renderField({
+                key: "kvCacheK", type: "select",
+                label: { en: "KV cache precision (K)", zh: "KV 缓存精度(K)" },
+                options: kvOptions({ en: `Auto — recommended: ${rec.type}`, zh: `自动 — 推荐 ${rec.type}` }),
+              }, 3)}
+              {renderField({
+                key: "kvCacheV", type: "select",
+                label: { en: "Value cache precision (V, activations)", zh: "值缓存精度(V,激活)" },
+                options: kvOptions({ en: "Auto — follow K", zh: "自动 — 跟随 K" }),
+              }, 4)}
+              <div className="setting-row">
+                <span className="setting-row__hint">
+                  {rec.tight
+                    ? L({
+                        en: `Recommended ${rec.type}: even the smallest KV cache (${gib(rec.kvNeedBytes)} GiB at ${ctxLabel} context) overflows the ${gib(rec.budgetBytes)} GiB left after the weights — the engine will size the context down at launch.`,
+                        zh: `推荐 ${rec.type}:即使最小的 KV 缓存(${ctxLabel} 上下文需 ${gib(rec.kvNeedBytes)} GiB)也超出权重之外剩余的 ${gib(rec.budgetBytes)} GiB,引擎启动时会自动缩小上下文。`,
+                      }, lang)
+                    : L({
+                        en: `Recommended ${rec.type}: at ${ctxLabel} context the KV cache needs ${gib(rec.kvNeedBytes)} GiB of the ${gib(rec.budgetBytes)} GiB left after the weights on this machine.`,
+                        zh: `推荐 ${rec.type}:${ctxLabel} 上下文下 KV 缓存需 ${gib(rec.kvNeedBytes)} GiB,本机权重之外剩余 ${gib(rec.budgetBytes)} GiB。`,
+                      }, lang)}
+                </span>
+              </div>
+            </>
+          );
+        })()}
         {/* A-P2-6: the placeholder used to suggest /tmp/idletoken-kv on every
             platform, which on Windows is a path that does not exist and on
             macOS is one the OS empties without warning. It now shows where the

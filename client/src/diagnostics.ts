@@ -14,7 +14,7 @@ import { readProblems } from "./problems";
 // a denylist is a leak, a missed entry in an allowlist is just a blank field --
 // the same trade-off as the public mirror.
 export const DIAG_SETTING_KEYS = [
-  "modelId", "quant", "tier", "kvDir",
+  "modelId", "quant", "tier", "kvDir", "kvCacheK", "kvCacheV",
   "apiHost", "apiPort", "interStagePort", "discoveryPort",
   "resourcePreset", "maxVramMb", "maxRamMb", "computeMode",
   "clusterName", "preferCoordinator", "sameSubnetOnly", "bindNic",

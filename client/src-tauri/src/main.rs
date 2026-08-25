@@ -925,6 +925,16 @@ async fn http_get_json(url: &str) -> Result<Value, String> {
 }
 
 fn main() {
+    // NVIDIA Linux (DGX, and any GTX/RTX desktop): WebKitGTK's DMA-BUF
+    // renderer produces a fully blank window — no error, no log, just white.
+    // Documented workaround is this env var; setting it here means installing
+    // the deb is enough, instead of every user rediscovering the flag (it
+    // bit the DGX on 0.1.19 and again on 0.1.23 before this line existed).
+    // Respect an explicit user override; harmless on non-NVIDIA stacks.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
     tauri::Builder::default()
         // Registered FIRST, before anything else can spin up state. A second
         // launch focuses the existing window and exits — two live instances

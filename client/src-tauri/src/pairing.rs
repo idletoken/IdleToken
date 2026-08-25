@@ -82,6 +82,19 @@ pub struct Tuning {
     /// Context window (settings.tier → ctx) → coord `--ctx-size`. Feeds the
     /// engine's mode decision + per-node overhead in the layer split.
     ctx_size: u32,
+    /// Tier 0 ("model default"): ctx_size is a CEILING → coord `--ctx-fit`
+    /// sizes the window down to memory instead of refusing to start. Explicit
+    /// tiers keep the refuse-loudly contract and do not set this.
+    #[serde(default)]
+    ctx_fit: bool,
+    /// KV cache dtypes (settings "KV cache precision") → the coordinator's
+    /// IDLETOKEN_KV_CACHE_TYPE / _V environment variables. Empty = engine
+    /// default (f16). Env, not argv, to match the coordinator's existing knob;
+    /// the value set is validated there against the engine's own allow-list.
+    #[serde(default)]
+    kv_cache_k: String,
+    #[serde(default)]
+    kv_cache_v: String,
     /// Per-request generation ceiling (settings.maxTokens) → coord
     /// `--max-decode`. Configuration, not a compiled-in constant: 4096 used to
     /// be hardcoded in the engine, so "Max tokens per reply" could not raise it.
@@ -170,6 +183,9 @@ impl Default for Tuning {
             model_id: "deepseek-v4-flash".into(),
             quant: String::new(),
             ctx_size: 8192,
+            ctx_fit: false,
+            kv_cache_k: String::new(),
+            kv_cache_v: String::new(),
             max_decode: default_max_decode(),
             max_vram_mb: 0,
             max_ram_mb: 0,
@@ -807,6 +823,15 @@ fn secret_env(tuning: &Tuning) -> Vec<(String, String)> {
     if !tuning.overflow_url.is_empty() && !tuning.overflow_key.is_empty() {
         env.push(("IDLETOKEN_OVERFLOW_KEY".into(), tuning.overflow_key.clone()));
     }
+    // Not secrets — they ride here because this is the one env channel every
+    // coordinator spawn already passes through, and a second channel would be
+    // the kind that one launch path forgets.
+    if !tuning.kv_cache_k.is_empty() {
+        env.push(("IDLETOKEN_KV_CACHE_TYPE".into(), tuning.kv_cache_k.clone()));
+    }
+    if !tuning.kv_cache_v.is_empty() {
+        env.push(("IDLETOKEN_KV_CACHE_TYPE_V".into(), tuning.kv_cache_v.clone()));
+    }
     env
 }
 
@@ -872,6 +897,12 @@ fn materialize_engine(app: &AppHandle) {
             "--ctx-size".into(), tuning.ctx_size.to_string(),
             "--max-decode".into(), tuning.max_decode.to_string(),
         ];
+        if tuning.ctx_fit {
+            // "Model default" context: the size above is a ceiling, the
+            // coordinator grants the largest window this machine's memory
+            // affords (floor 16K) instead of refusing to start.
+            coord_args.push("--ctx-fit".into());
+        }
         // Shared mode's second door — the SAME one llamacpp_serve opens, and
         // missing here until 2026-08-21. The comment above says this engine is
         // hardened "always, not only once someone presses share compute", and

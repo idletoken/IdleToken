@@ -853,6 +853,19 @@ pub fn platform_agent_start(
         args.push("--coord-unix".into());
         args.push(sock);
     }
+    // A STABLE machine identity. Without --key-file the agent generates an
+    // EPHEMERAL keypair per start (platform_agent.c load_or_make_key(NULL)),
+    // and the platform now keys provider identity by that pubkey — so every
+    // agent restart minted a brand-new provider row (measured 2026-08-24:
+    // cluster-2 and cluster-3 within nine seconds, both orphans on the next
+    // restart). The key lives beside the coord socket in ~/.idletoken.
+    if let Some(sock) = coord_api_socket() {
+        let dir = std::path::Path::new(&sock).parent().map(|d| d.to_path_buf());
+        if let Some(dir) = dir {
+            args.push("--key-file".into());
+            args.push(dir.join("agent.key").to_string_lossy().into_owned());
+        }
+    }
     let args = args;
     start_engine(&app, ROLE_PLATFORM_AGENT.into(), args, env)
 }

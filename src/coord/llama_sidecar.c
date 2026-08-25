@@ -65,6 +65,8 @@ struct idletoken_llama {
     char log_path[512];
     char cluster_args[1024];  /* WS-C cluster flags (--rpc/--device/--tensor-split) */
     char extra_args[1024];    /* IDLETOKEN_LLAMA_ARGS copy, split at spawn */
+    char kv_type[12];         /* IDLETOKEN_KV_CACHE_TYPE (validated); "" = f16 default */
+    char kv_type_v[12];       /* IDLETOKEN_KV_CACHE_TYPE_V; "" = follow kv_type */
     int  shared;              /* serving OTHER people's requests — see below */
     char sock_path[256];      /* AF_UNIX path, or "" for TCP loopback */
     char endpoint[300];       /* "127.0.0.1:<port>" | "unix:<sock_path>" */
@@ -492,6 +494,104 @@ static void llama_scrub_env(void) {
 
 /* Spawn the child. Called with the mutex held (fork+exec does not block).
  * Returns 0 and fills lc->pid / lc->spawned_ms, or -1 with lc->fail set. */
+/* ---- KV cache dtype resolution --------------------------------------------
+ * IDLETOKEN_KV_CACHE_TYPE (K, with a ~/.idletoken/kv-cache-type file fallback)
+ * and IDLETOKEN_KV_CACHE_TYPE_V (V/activations, env only — the file fallback
+ * exists for `setx`-over-ssh sessions where the K knob was first needed, and a
+ * second file would just be a second thing to leave stale). This is the one
+ * engine knob that survives shared mode: a CLOSED set that picks the KV cache
+ * dtype for -ctk/-ctv and nothing else, so it cannot weaken the shared-mode
+ * hardening — it only trades KV precision for context headroom. Values are
+ * the engine's own kv_cache_types list (vendor/llama.cpp common/arg.cpp).
+ * An unknown value refuses loudly instead of silently running unquantized:
+ * whoever set it meant something, and "ignored" reads as "the engine is
+ * broken" three debugging hours later.
+ *
+ * Shared between spawn (llama_spawn -ctk/-ctv) and planning (coord_main
+ * scales kv_bytes_per_token by idletoken_llama_kv_scale) so the memory plan
+ * and the engine's actual cache can never disagree. */
+
+/* One quant block covers 32 elements; f16 stores it in 64 bytes. */
+static const struct { const char *name; int block_bytes; } kv_dtypes[] = {
+    { "f16", 64 }, { "bf16", 64 }, { "q8_0", 34 }, { "q5_1", 24 },
+    { "q5_0", 22 }, { "iq4_nl", 18 }, { "q4_1", 20 }, { "q4_0", 18 },
+};
+
+static int kv_type_valid(const char *t) {
+    for (size_t i = 0; i < sizeof(kv_dtypes) / sizeof(kv_dtypes[0]); i++)
+        if (strcmp(t, kv_dtypes[i].name) == 0) return 1;
+    return 0;
+}
+
+int idletoken_llama_kv_types(char k[12], char v[12], char *err, size_t err_cap) {
+    k[0] = v[0] = '\0';
+    const char *kt = getenv("IDLETOKEN_KV_CACHE_TYPE");
+    char kv_file_buf[16];
+    if (!kt || !kt[0]) {
+        /* File fallback: a `setx` issued inside an ssh session broadcasts
+         * WM_SETTINGCHANGE only within THAT session, so the console desktop's
+         * Explorer — and every GUI-launched client under it — keeps the old
+         * environment until logoff (measured: two relaunch rounds, variable
+         * present in HKCU, absent in the engine argv). A one-line file has no
+         * propagation semantics to get wrong. */
+        const char *home = getenv("USERPROFILE");
+        if (!home) home = getenv("HOME");
+        if (home) {
+            char p[512];
+            snprintf(p, sizeof p, "%s/.idletoken/kv-cache-type", home);
+            FILE *f = fopen(p, "rb");
+            if (f) {
+                kv_file_buf[0] = '\0';
+                if (fgets(kv_file_buf, sizeof kv_file_buf, f)) {
+                    size_t L = strlen(kv_file_buf);
+                    while (L && (kv_file_buf[L - 1] == '\n' || kv_file_buf[L - 1] == '\r' ||
+                                 kv_file_buf[L - 1] == ' '  || kv_file_buf[L - 1] == '\t'))
+                        kv_file_buf[--L] = '\0';
+                    if (L) kt = kv_file_buf;
+                }
+                fclose(f);
+            }
+        }
+    }
+    const char *vt = getenv("IDLETOKEN_KV_CACHE_TYPE_V");
+    if (kt && kt[0]) {
+        if (!kv_type_valid(kt)) {
+            if (err && err_cap)
+                snprintf(err, err_cap, "refusing IDLETOKEN_KV_CACHE_TYPE='%s': "
+                         "not a KV cache type this engine pin supports "
+                         "(f16, bf16, q8_0, q5_1, q5_0, iq4_nl, q4_1, q4_0)", kt);
+            return -1;
+        }
+        snprintf(k, 12, "%s", kt);
+    }
+    if (vt && vt[0]) {
+        if (!kv_type_valid(vt)) {
+            if (err && err_cap)
+                snprintf(err, err_cap, "refusing IDLETOKEN_KV_CACHE_TYPE_V='%s': "
+                         "not a KV cache type this engine pin supports "
+                         "(f16, bf16, q8_0, q5_1, q5_0, iq4_nl, q4_1, q4_0)", vt);
+            return -1;
+        }
+        snprintf(v, 12, "%s", vt);
+    }
+    return 0;
+}
+
+double idletoken_llama_kv_scale(const char *ktype, const char *vtype) {
+    /* Per-token KV is half K, half V; each half scales by its dtype's block
+     * cost relative to f16 (64 bytes per 32 elements). "" = f16, and V
+     * follows K when unset — the same resolution the spawn applies. */
+    double sk = 1.0, sv;
+    for (size_t i = 0; i < sizeof(kv_dtypes) / sizeof(kv_dtypes[0]); i++)
+        if (ktype && ktype[0] && strcmp(ktype, kv_dtypes[i].name) == 0)
+            sk = kv_dtypes[i].block_bytes / 64.0;
+    sv = sk;
+    for (size_t i = 0; i < sizeof(kv_dtypes) / sizeof(kv_dtypes[0]); i++)
+        if (vtype && vtype[0] && strcmp(vtype, kv_dtypes[i].name) == 0)
+            sv = kv_dtypes[i].block_bytes / 64.0;
+    return (sk + sv) / 2.0;
+}
+
 static int llama_spawn(idletoken_llama *lc) {
     {
         const char *plain = getenv("GGML_RPC_ALLOW_PLAINTEXT");
@@ -550,15 +650,23 @@ static int llama_spawn(idletoken_llama *lc) {
      * split: this string is what the user is shown and what gets pasted into
      * a bug report, so a preview that says 99 while the child was given `auto`
      * sends whoever reads it looking in the wrong place. */
+    /* K set, V unset → V follows K (mixed dtypes are a deliberate choice, not
+     * a default). V set alone keeps K at f16. */
+    const char *ctk = lc->kv_type[0] ? lc->kv_type : "f16";
+    const char *ctv = lc->kv_type_v[0] ? lc->kv_type_v : ctk;
+    char kv_frag[64];
+    kv_frag[0] = '\0';
+    if (lc->kv_type[0] || lc->kv_type_v[0])
+        snprintf(kv_frag, sizeof(kv_frag), " -ctk %s -ctv %s -fa on", ctk, ctv);
     int n = snprintf(cmd, sizeof(cmd),
                      "\"%s\" -m \"%s\" %s%s "
-                     "-ngl %s --reasoning off%s%s -np %s%s%s",
+                     "-ngl %s --reasoning off%s%s -np %s%s%s%s",
                      lc->bin, lc->gguf, listen_args,
                      lc->shared ? " --no-slots" : "",
                      idletoken_llama_ngl_arg(lc->cluster_args),
                      lc->ctx_size > 0 ? " -c " : "",
                      lc->ctx_size > 0 ? ctxstr : "",
-                     nparstr,
+                     nparstr, kv_frag,
                      lc->cluster_args[0] ? " " : "", lc->cluster_args);
     if (n < 0 || (size_t)n >= sizeof(cmd)) {
         snprintf(lc->fail, sizeof(lc->fail), "idletoken-server command line is too long");
@@ -726,6 +834,17 @@ static int llama_spawn(idletoken_llama *lc) {
     /* Continuous batching is already the upstream default, so `-np` alone is
      * enough to get overlapping prefill/decode across slots. */
     argv[argc++] = "-np";       argv[argc++] = nparstr;
+    if (lc->kv_type[0] || lc->kv_type_v[0]) {
+        /* Validated at config time (closed allow-list). -fa rides along:
+         * a quantized V cache requires flash attention. Same K-then-V
+         * resolution as the Windows command string above — the two spawn
+         * paths must not diverge. */
+        const char *ctk = lc->kv_type[0] ? lc->kv_type : "f16";
+        const char *ctv = lc->kv_type_v[0] ? lc->kv_type_v : ctk;
+        argv[argc++] = "-ctk"; argv[argc++] = (char *)ctk;
+        argv[argc++] = "-ctv"; argv[argc++] = (char *)ctv;
+        argv[argc++] = "-fa";  argv[argc++] = "on";
+    }
     /* No extra log flags on purpose: the default level logs request metadata
      * but no prompt text. Never add -v or --log-prompts-dir here. */
 
@@ -1173,6 +1292,26 @@ idletoken_llama *idletoken_llama_start(const char *bin, const char *gguf,
             return NULL;
         }
         snprintf(lc->extra_args, sizeof(lc->extra_args), "%s", extra);
+    }
+    /* IDLETOKEN_KV_CACHE_TYPE(_V): the one engine knob that survives shared
+     * mode — see idletoken_llama_kv_types() for the whole contract. Resolved
+     * through the shared function so the planner (coord_main) and this spawn
+     * can never disagree about which dtypes are in force. */
+    {
+        char kverr[128];
+        if (idletoken_llama_kv_types(lc->kv_type, lc->kv_type_v,
+                                     kverr, sizeof kverr) != 0) {
+            fprintf(stderr, "coord: %s\n", kverr);
+            if (err && err_cap) snprintf(err, err_cap, "%s", kverr);
+            free(lc);
+            return NULL;
+        }
+        if (lc->kv_type[0] || lc->kv_type_v[0])
+            fprintf(stderr, "coord: KV cache type K=%s V=%s "
+                            "(-ctk/-ctv, flash attention on)\n",
+                    lc->kv_type[0] ? lc->kv_type : "f16",
+                    lc->kv_type_v[0] ? lc->kv_type_v
+                                     : (lc->kv_type[0] ? lc->kv_type : "f16"));
     }
     if (lc->shared) {
         fprintf(stderr, "coord: shared mode: engine args locked, "

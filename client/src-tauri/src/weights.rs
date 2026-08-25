@@ -846,6 +846,16 @@ fn fetch_inner(
         have = 0;
     }
 
+    // Split-GGUF variants live in a SUBDIRECTORY of the model folder (the
+    // manifest's file is e.g. "BF16/Qwen3.8-27B-BF16-00001-of-00002.gguf"),
+    // and File::create does not create parents — so the one variant stored
+    // under a subdir failed on every machine with "cannot create the download
+    // file (os error 2)" while every flat-named quant downloaded fine
+    // (measured 2026-08-24, BF16 on the DGX).
+    if let Some(parent) = part_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create the download directory {}: {e}", parent.display()))?;
+    }
     let mut f = if have > 0 {
         fs::OpenOptions::new()
             .append(true)

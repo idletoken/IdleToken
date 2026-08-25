@@ -7,7 +7,7 @@ import type { NodeSnapshot, ClusterState } from "./types";
 import { HW_NO_GPU, HW_CC_TOO_LOW, HW_DRIVER_TOO_OLD, HW_VRAM_TOO_SMALL, HW_GPU_UNSUPPORTED, HW_MACOS_SEALED } from "./types";
 import { getModel, getManifest, defaultQuant, estimateClusterCapacity, poolMemory, isSingleNode, pickBestFittingModel, type ModelSpec } from "./models";
 import { resolveLocalWeights, fetchWeights, onFetchProgress, defaultModelDir, cancelFetch, resolveDownload, weightsState, verifyWeights, isWeightsCancelled, type DownloadTarget } from "./weights";
-import { loadSettings, saveSettings, settingsWerePersisted, effectiveCaps, engineTuning, autoUiScale, TIERS, type AppSettings } from "./settings";
+import { loadSettings, saveSettings, settingsWerePersisted, effectiveCaps, effectiveCtx, engineTuning, autoUiScale, type AppSettings, type Tier } from "./settings";
 import { buildDiagnosticsBundle } from "./diagnostics";
 import { getAuthProvider, type Session } from "./auth";
 import SettingsPanel from "./SettingsPanel";
@@ -25,7 +25,6 @@ import { recordProblem } from "./problems";
 import { useClusterStats, servedModelOf, type ClusterStats } from "./clusterStats";
 import { fmtGiB, pct } from "./format";
 import UpdateDialog, { type UpdateResult } from "./UpdateDialog";
-import PopularModels from "./Popularity";
 import { getUpdateProvider } from "./provider/update";
 import { quitApp, setAutostart, syncTray, syncWindowPrefs, windowState } from "./system";
 
@@ -663,18 +662,10 @@ function ClusterCard(props: {
               is still rendered inside the pairing panel. */}
         </div>
 
-        {/* The capability table was here too (A-P1-3, "what can this machine
-            run?" answered where the question is asked). Removed 2026-08-21:
-            Settings → Models already carries it, and two copies of a table
-            that talks to the engine on every render is one copy too many.
-            PopularModels stays — "which model do people use" has no other
-            home. */}
-        <div className="cluster-empty__capability">
-          <PopularModels
-            selectedId={props.settingModelId}
-            onPick={(id) => props.onSwitchModel(id, defaultQuant(id))}
-          />
-        </div>
+        {/* The capability table (A-P1-3) was here until 2026-08-21 (Settings →
+            Models already carries it), and the platform usage ranking
+            (PopularModels) until 2026-08-25 — removed on the user's call: the
+            ranking lives on the portal home page, not in the client. */}
       </section>
     );
   }
@@ -1461,6 +1452,12 @@ export default function App() {
     () => effectiveCaps(settings, totals),
     [settings.resourcePreset, settings.maxVramMb, settings.maxRamMb, totals]
   );
+  // The machine's memory shape, for resolving the KV-cache "auto" dtype at
+  // launch (engineTuning's third argument). Absent before the first probe, in
+  // which case "auto" degrades to the engine's own default (f16), never a guess.
+  const mem = snap
+    ? { vramBytes: snap.vram_total, ramBytes: snap.ram_total, unified: snap.unified_memory }
+    : undefined;
 
   /**
    * The weights the cluster flows are allowed to use — resolve, never fetch.
@@ -1494,7 +1491,15 @@ export default function App() {
     if (r.needsVerify && r.target) {
       try {
         const dir = settings.modelDir || (await defaultModelDir());
-        await verifyWeights({ id: r.target.file, destDir: dir, file: r.target.file, sha256: r.target.sha256 });
+        // A split model verifies file by file: each part carries its own hash
+        // and marker, and a part already verified is a fast marker hit.
+        const files = [
+          { file: r.target.file, sha256: r.target.sha256 },
+          ...r.target.parts.map((p) => ({ file: p.file, sha256: p.sha256 ?? "" })),
+        ];
+        for (const f of files) {
+          await verifyWeights({ id: f.file, destDir: dir, file: f.file, sha256: f.sha256 });
+        }
       } catch (e) {
         bumpWeights();
         throw e;
@@ -1589,7 +1594,7 @@ export default function App() {
         hostname: snap.hostname,
         gpu: snap.gpu_name,
         modelPath: path,
-        tuning: engineTuning(over ? { ...loadSettings(), ...over } : loadSettings(), caps),
+        tuning: engineTuning(over ? { ...loadSettings(), ...over } : loadSettings(), caps, mem),
       });
       // allowSolo: this IS the one-machine flow. Without it the engine's
       // 2-machine pairing floor rejects the start and the button dies after
@@ -1659,7 +1664,7 @@ export default function App() {
           gpu: snap.gpu_name,
           modelPath: path,
           // From storage, not state — same staleness as serveStandalone above.
-          tuning: engineTuning({ ...loadSettings(), modelId, quant }, caps),
+          tuning: engineTuning({ ...loadSettings(), modelId, quant }, caps, mem),
         };
         // Account mode has no typed code: the secret is derived from the
         // account, so every machine re-derives the same one and finds us again.
@@ -1724,7 +1729,7 @@ export default function App() {
         if (pm) {
           const [, op, code, as, apiPort, apiToken, model] = pm;
           const tuning = {
-            ...engineTuning(settings, caps),
+            ...engineTuning(settings, caps, mem),
             ...(apiPort ? { apiPort: Number(apiPort) } : {}),
             ...(apiToken ? { apiToken } : {}),
           };
@@ -1773,7 +1778,7 @@ export default function App() {
                 hostname: as || window.location.hostname || "test-node",
                 gpu: "test",
                 modelPath: "",
-                tuning: engineTuning(settings, caps),
+                tuning: engineTuning(settings, caps, mem),
                 account: true,
               });
               reportTest("pairing-account", { ok: true, op, email: gate.session.email });
@@ -2286,7 +2291,7 @@ export default function App() {
         // themselves must not be overwritten.
         if (firstRun.current && !settingsWerePersisted()) {
           firstRun.current = false;
-          const ctx = (TIERS.find((x) => x.id === settings.tier) ?? TIERS[1]).ctx;
+          const ctx = effectiveCtx(settings);
           const pick = pickBestFittingModel(s, ctx);
           if (pick.modelId !== settings.modelId || pick.quant !== settings.quant) {
             const next = { ...settings, modelId: pick.modelId, quant: pick.quant };
@@ -2554,7 +2559,7 @@ export default function App() {
                 snap={snap}
                 model={model}
                 quant={settings.quant}
-                tier={TIERS.find((x) => x.id === settings.tier) ?? TIERS[1]}
+                tier={{ id: settings.tier || 2, ctx: effectiveCtx(settings) } as Tier}
                 pair={pairSnap}
                 localEngine={localEngine}
                 localApi={localApi}
@@ -2605,7 +2610,7 @@ export default function App() {
             gpu: snap.gpu_name,
             modelPath: weightsPath,
             // From storage, not state — same staleness as serveStandalone.
-            tuning: engineTuning(loadSettings(), caps),
+            tuning: engineTuning(loadSettings(), caps, mem),
           }}
           session={session}
           modelId={settings.modelId}

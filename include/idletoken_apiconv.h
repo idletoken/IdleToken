@@ -60,6 +60,20 @@ char *idletoken_anthropic_to_openai(const char *body, size_t len,
  * relay uses this to pick the tool-aware path.) */
 int idletoken_body_has_tools(const char *body, size_t len);
 
+/* ---- request: OpenAI body passed through --------------------------------- */
+
+/* Demote every non-leading {"role":"system"} / {"role":"developer"} in the
+ * body's top-level "messages" array to "user". Chat templates accept a
+ * system-ish message only in position 0 and raise on any later one (Qwen3.5
+ * measured a 400; Qwen3.8 raises a Jinja exception the engine wraps in HTTP
+ * 500) — the Anthropic face already demotes inside the translation above,
+ * and this applies the same rule to the OpenAI face, whose body is otherwise
+ * passed through untouched. Only the role VALUES are rewritten; every other
+ * byte survives verbatim. Returns a malloc'd body (caller frees), or NULL
+ * when nothing needed demoting — the caller then keeps the original buffer. */
+char *idletoken_openai_demote_system(const char *body, size_t len,
+                                     size_t *out_len);
+
 /* ---- response: OpenAI chat.completion -> Anthropic message --------------- */
 
 /* Span of choices[0].message inside an OpenAI chat.completion body. 0 / -1. */

@@ -601,6 +601,43 @@ char *idletoken_anthropic_to_openai(const char *body, size_t len,
     return b.p;
 }
 
+/* ---- OpenAI face: non-leading system demotion ----------------------------- */
+
+char *idletoken_openai_demote_system(const char *body, size_t len,
+                                     size_t *out_len) {
+    if (!body || len == 0) return NULL;
+    const char *end = body + len;
+    const char *mv = idletoken_json_obj_get(body, len, "messages");
+    if (!mv || *mv != '[') return NULL;
+    sb_t b = {0};
+    const char *src = body;
+    size_t it = 0;
+    const char *el;
+    long el_len;
+    int idx = 0, demoted = 0;
+    while (arr_next(mv, end, &it, &el, &el_len)) {
+        if (*el == '{' && idx > 0) {
+            const char *role;
+            size_t rl;
+            if (idletoken_json_obj_str(el, (size_t)el_len, "role",
+                                       &role, &rl) == 0 &&
+                ((rl == 6 && memcmp(role, "system", 6) == 0) ||
+                 (rl == 9 && memcmp(role, "developer", 9) == 0))) {
+                sb_put(&b, src, (size_t)(role - src));
+                sb_cstr(&b, "user");
+                src = role + rl;
+                demoted++;
+            }
+        }
+        idx++;
+    }
+    if (!demoted || b.oom) { free(b.p); return NULL; }
+    sb_put(&b, src, (size_t)(end - src));
+    if (b.oom) { free(b.p); return NULL; }
+    if (out_len) *out_len = b.len;
+    return b.p;
+}
+
 /* ---- response translation ------------------------------------------------- */
 
 int idletoken_oai_resp_message(const char *resp, size_t len,

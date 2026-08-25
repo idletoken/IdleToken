@@ -90,7 +90,7 @@ COPYFILE_DISABLE=1 tar czf "$TAR" \
     vendor/tweetnacl vendor/blake2 \
     client \
     LICENSE NOTICE Makefile \
-    build_worker_win.bat build_coord_win.bat \
+    build_worker_win.bat build_coord_win.bat build_agent_win.bat \
     -C "$PROVENANCE_DIR" provenance.json
 
 echo "shipping $(du -h "$TAR" | cut -f1) to $NODE:$WHOME"

@@ -43,6 +43,9 @@
 
 #include <errno.h>
 #include <signal.h>
+#ifdef __linux__
+  #include <sys/prctl.h>
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,6 +63,14 @@
   #include <sys/select.h>
   #include <sys/socket.h>
   #include <unistd.h>
+#endif
+
+/* Thread-local storage across our three toolchains: MSVC spells it
+ * __declspec(thread); MinGW and the Unix compilers take C11 _Thread_local. */
+#if defined(_MSC_VER)
+  #define IDLETOKEN_TLS __declspec(thread)
+#else
+  #define IDLETOKEN_TLS _Thread_local
 #endif
 
 /* ======================================================================
@@ -683,22 +694,35 @@ static void json_escape_into(char *dst, size_t cap, const char *src) {
 static char *platform_register(const char *platform_addr, const char *jwt,
                                const char *name, const char *pubkey_b64,
                                const char *endpoint, int relay,
-                               const char *model, const char *quant) {
+                               const char *model, const char *quant,
+                               int ctx_per_slot) {
     char name_esc[256], ep_esc[512], model_esc[128], quant_esc[64];
     json_escape_into(name_esc, sizeof(name_esc), name);
     json_escape_into(model_esc, sizeof(model_esc), model);
     json_escape_into(quant_esc, sizeof(quant_esc), quant ? quant : "");
-    /* Precision-aware capability (small-model-design §6.3): when a quant is
-     * loaded, advertise capacity.models:[{model,quant}] so the platform only
-     * routes matching-precision requests here; else keep the single-model form
-     * the router treats as "any precision". */
-    char cap[256];
+    /* Precision-aware capability (small-model-design §6.3): a loaded quant is
+     * advertised so the platform only routes matching-precision requests here;
+     * an entry without quant means "any precision".
+     *
+     * `ctx` is the per-slot context and the third element of the SERVICE
+     * identity (model + quant + per-slot context): the platform lists one
+     * service per declared triple, and a relaunch with a different triple is a
+     * new listing while the same triple resumes the old one. Omitted when the
+     * coordinator's ctx_size could not be read -- the platform must record
+     * "undeclared", not a guess. */
+    char ctx_part[48];
+    ctx_part[0] = '\0';
+    if (ctx_per_slot > 0)
+        snprintf(ctx_part, sizeof(ctx_part), ",\"ctx\":%d", ctx_per_slot);
+    char cap[320];
     if (quant && quant[0])
         snprintf(cap, sizeof(cap),
-                 "\"capacity\":{\"models\":[{\"model\":\"%s\",\"quant\":\"%s\"}],\"tiers\":[1]}",
-                 model_esc, quant_esc);
+                 "\"capacity\":{\"models\":[{\"model\":\"%s\",\"quant\":\"%s\"%s}],\"tiers\":[1]}",
+                 model_esc, quant_esc, ctx_part);
     else
-        snprintf(cap, sizeof(cap), "\"capacity\":{\"model\":\"%s\",\"tiers\":[1]}", model_esc);
+        snprintf(cap, sizeof(cap),
+                 "\"capacity\":{\"models\":[{\"model\":\"%s\"%s}],\"tiers\":[1]}",
+                 model_esc, ctx_part);
     char body[1024];
     int bl;
     if (relay) {
@@ -836,7 +860,7 @@ static int coord_ctx_size(const char *coord_addr) {
  * not established, which is its own kind of dishonesty -- but silence is not an
  * option either, so the operator gets told the check did not happen.
  */
-static int assert_listable_ctx(const char *coord_addr) {
+static int assert_listable_ctx(const char *coord_addr, int *ctx_out) {
     int ctx = -1;
     for (int attempt = 0; attempt < 5; attempt++) {
         ctx = coord_ctx_size(coord_addr);
@@ -873,6 +897,7 @@ static int assert_listable_ctx(const char *coord_addr) {
                 ctx, AGENT_MIN_LIST_CTX, AGENT_MIN_LIST_CTX, AGENT_MIN_LIST_CTX);
         return 4;
     }
+    if (ctx_out) *ctx_out = ctx; /* only a VERIFIED per-slot context is reported */
     return 0;
 }
 
@@ -1191,9 +1216,12 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
     }
 
     /* -- translate InferenceRequest → OpenAI chat request ----------------- *
-     * {model, messages, maxTokens?} → {model, messages, max_tokens?}.
-     * The messages array is re-embedded verbatim (raw token), so nested
-     * content survives untouched. */
+     * {model, messages, maxTokens?, tools?} → {model, messages, max_tokens?,
+     * tools?}. The messages and tools arrays are re-embedded verbatim (raw
+     * tokens), so nested content — including tool_calls / tool_call_id on
+     * individual messages — survives untouched. tool_choice is deliberately
+     * not forwarded: the engine defaults to "auto" whenever tools are present,
+     * and that is the only mode the platform offers today. */
     const char *model_tok = "dsv4-flash"; size_t model_len = 10;
     json_str_token((const char *)plain, plain_len, "model", &model_tok, &model_len);
     const char *msgs_tok; size_t msgs_len;
@@ -1204,6 +1232,9 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
         FAIL(400, "opened request has no messages array");
     }
     int max_tokens = json_int_field((const char *)plain, plain_len, "maxTokens", -1);
+    const char *tools_tok = NULL; size_t tools_len = 0;
+    int have_req_tools = json_array_token((const char *)plain, plain_len, "tools",
+                                          &tools_tok, &tools_len) == 0 && tools_len > 2;
 
     /* Contract hashes for the KV prefix: they must be computed into a staging
      * buffer while `plain` still exists (it is wiped moments from now), and are
@@ -1212,7 +1243,7 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
     static char staged[PFX_MAX_BLOCKS][65];
     int staged_n = prefix_hash_messages(msgs_tok, msgs_len, staged, PFX_MAX_BLOCKS);
 
-    size_t creq_cap = msgs_len + model_len + 96;
+    size_t creq_cap = msgs_len + model_len + tools_len + 128;
     char *creq = malloc(creq_cap);
     if (!creq) {
         idletoken_secure_zero(plain, plain_cap);
@@ -1221,13 +1252,14 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
         FAIL(500, "oom");
     }
     idletoken_mlock(creq, creq_cap);    /* also plaintext */
-    int cl;
+    char mt_frag[40];
+    mt_frag[0] = '\0';
     if (max_tokens > 0)
-        cl = snprintf(creq, creq_cap, "{\"model\":\"%.*s\",\"messages\":%.*s,\"max_tokens\":%d}",
-                      (int)model_len, model_tok, (int)msgs_len, msgs_tok, max_tokens);
-    else
-        cl = snprintf(creq, creq_cap, "{\"model\":\"%.*s\",\"messages\":%.*s}",
-                      (int)model_len, model_tok, (int)msgs_len, msgs_tok);
+        snprintf(mt_frag, sizeof mt_frag, ",\"max_tokens\":%d", max_tokens);
+    int cl = snprintf(creq, creq_cap, "{\"model\":\"%.*s\",\"messages\":%.*s%s%s%.*s}",
+                      (int)model_len, model_tok, (int)msgs_len, msgs_tok, mt_frag,
+                      have_req_tools ? ",\"tools\":" : "",
+                      (int)tools_len, have_req_tools ? tools_tok : "");
 
     /* -- forward plaintext to coord over loopback ------------------------- *
      * Deliberately NO "stream":true here: the sealed envelope is a one-shot
@@ -1250,6 +1282,30 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
     idletoken_munlock(plain, plain_cap); free(plain);
 
     if (!cresp || cstatus != 200) {
+        int coord_answered = cresp != NULL;
+        /* Salvage the coord's own words before the body is wiped: an engine
+         * 400 carries a one-line reason ("request (48549 tokens) exceeds the
+         * available context size (32768 tokens)") that is the whole diagnosis
+         * — the status code alone cost an afternoon of packet captures
+         * (2026-08-24). Engine/coord error messages are generated text plus
+         * numbers, never an echo of the prompt, so relaying them breaks no
+         * privacy invariant; bounded and control-stripped all the same. */
+        static IDLETOKEN_TLS char coord_msg[192];
+        coord_msg[0] = '\0';
+        if (cresp && cstatus != 429) {
+            const char *needle = "\"message\":\"";
+            const char *at = strstr((const char *)cresp, needle);
+            if (at) {
+                at += strlen(needle);
+                size_t o = 0;
+                while (*at && *at != '"' && o + 1 < sizeof coord_msg) {
+                    char c = *at++;
+                    if (c == '\\' && *at) { at++; c = ' '; } /* collapse escapes */
+                    coord_msg[o++] = ((unsigned char)c < 0x20) ? ' ' : c;
+                }
+                coord_msg[o] = '\0';
+            }
+        }
         if (cresp) wipe_free(cresp, cresp_len);
         free(reply_to);
         /* "Busy" is not "broken", and the difference must survive this hop.
@@ -1269,15 +1325,72 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
          * Every other non-200 stays 502: those really are "this machine cannot
          * serve you", and pretending otherwise would suppress real faults. */
         if (cstatus == 429) FAIL(429, "coordinator busy: no free sequence slot");
-        FAIL(502, "upstream coord unreachable or errored");
+        /* Everything else used to collapse into one flattened string
+         * ("upstream coord unreachable or errored"), which made an engine
+         * still loading (503), a request the coord rejected (400/500) and a
+         * dead loopback socket indistinguishable in the platform log — the
+         * only place a relay provider's fault can be diagnosed from. The
+         * coord's actual status must survive this hop. The buffer is
+         * thread-local because process_sealed also runs on per-connection
+         * threads, and *err_msg is read after this function returns. */
+        if (!coord_answered)
+            FAIL(502, "upstream coord unreachable (no response on loopback)");
+        if (cstatus >= 400 && cstatus < 500) {
+            /* The coord REJECTED this request (malformed body, template
+             * refusal, context overflow). Relay the 4xx untouched: the
+             * platform classifies it as "this one request, not this machine"
+             * (reliability.ts CAPACITY, no strike) — flattening it into 502
+             * once let a single malformed consumer request cool down every
+             * provider of the model (2026-08-24). */
+            static IDLETOKEN_TLS char coord_rej[256];
+            snprintf(coord_rej, sizeof coord_rej,
+                     "upstream coord rejected the request (HTTP %d)%s%s",
+                     cstatus, coord_msg[0] ? ": " : "", coord_msg);
+            *err_status = cstatus;
+            *err_msg = coord_rej;
+            return -1;
+        }
+        if (cstatus == 503) {
+            /* The coord's own words matter here: 503 covers the engine's real
+             * not-serving states (loading, restarting, failed), and asserting
+             * "loading" without evidence once sent a whole debugging session
+             * the wrong way (2026-08-24). */
+            static IDLETOKEN_TLS char coord_unavail[256];
+            snprintf(coord_unavail, sizeof coord_unavail,
+                     "upstream coord answered 503%s%s",
+                     coord_msg[0] ? ": " : " (engine not serving; no detail)",
+                     coord_msg);
+            FAIL(503, coord_unavail);
+        }
+        {
+            static IDLETOKEN_TLS char coord_err[256];
+            if (coord_msg[0])
+                snprintf(coord_err, sizeof coord_err,
+                         "upstream coord returned HTTP %d: %s", cstatus, coord_msg);
+            else
+                snprintf(coord_err, sizeof coord_err,
+                         "upstream coord returned HTTP %d", cstatus);
+            *err_status = 502; *err_msg = coord_err;
+            return -1;
+        }
     }
 
-    /* -- pick choices[0].message.content and wrap as {"text": "..."} ------ *
-     * The raw string token (escapes intact) is re-embedded verbatim, so no
-     * decode/re-encode round trip is needed. */
-    const char *content_tok; size_t content_len;
-    if (json_str_token((const char *)cresp, cresp_len, "content",
-                       &content_tok, &content_len) != 0) {
+    /* -- pick choices[0].message.{content,tool_calls} for the sealed reply -- *
+     * The raw tokens (escapes intact) are re-embedded verbatim, so no
+     * decode/re-encode round trip is needed.
+     *
+     * A tool-calling turn has `content: null` and the payload in `tool_calls`
+     * (OpenAI shape, produced by the engine). Requiring `content` here used to
+     * turn every such turn into "coord response has no content" — a 502 for a
+     * response that was perfectly fine. Text and tool_calls are each optional;
+     * a response carrying NEITHER is still a real fault. */
+    const char *content_tok = NULL; size_t content_len = 0;
+    int have_content = json_str_token((const char *)cresp, cresp_len, "content",
+                                      &content_tok, &content_len) == 0;
+    const char *tc_tok = NULL; size_t tc_len = 0;
+    int have_tools = json_array_token((const char *)cresp, cresp_len, "tool_calls",
+                                      &tc_tok, &tc_len) == 0;
+    if (!have_content && !have_tools) {
         wipe_free(cresp, cresp_len);
         free(reply_to);
         FAIL(502, "coord response has no content");
@@ -1325,14 +1438,27 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
                  ",\"usage\":{\"in\":%d,\"out\":%d}", in_tok, out_tok);
     }
 
-    size_t reply_cap = content_len + 96 + sizeof usage_frag;
+    /* finish_reason travels so the platform can hand the consumer the real
+     * one ("tool_calls" vs "stop" vs "length"); absent on older coords, and
+     * the platform then falls back to its historical hard-coded "stop". */
+    const char *fr_tok = NULL; size_t fr_len = 0;
+    int have_fr = json_str_token((const char *)cresp, cresp_len, "finish_reason",
+                                 &fr_tok, &fr_len) == 0 && fr_len < 32;
+
+    size_t reply_cap = content_len + tc_len + 192 + sizeof usage_frag;
     char *reply = malloc(reply_cap);
     if (!reply) { wipe_free(cresp, cresp_len); free(reply_to); FAIL(500, "oom"); }
     idletoken_mlock(reply, reply_cap);
+    char tc_frag_head[24];
+    snprintf(tc_frag_head, sizeof tc_frag_head, "%s", have_tools ? ",\"tool_calls\":" : "");
     int rl = snprintf(reply, reply_cap,
-                      "{\"text\":\"%.*s\",\"cache_hit\":%s,\"cached_tokens\":%d%s}",
-                      (int)content_len, content_tok,
-                      cache_hit ? "true" : "false", cached_tokens, usage_frag);
+                      "{\"text\":\"%.*s\",\"cache_hit\":%s,\"cached_tokens\":%d%s%s%.*s%s%.*s%s}",
+                      (int)content_len, have_content ? content_tok : "",
+                      cache_hit ? "true" : "false", cached_tokens, usage_frag,
+                      tc_frag_head, (int)tc_len, have_tools ? tc_tok : "",
+                      have_fr ? ",\"finish_reason\":\"" : "",
+                      (int)fr_len, have_fr ? fr_tok : "",
+                      have_fr ? "\"" : "");
     wipe_free(cresp, cresp_len);
     if (rl < 0 || (size_t)rl >= reply_cap) {
         idletoken_secure_zero(reply, reply_cap);
@@ -1573,6 +1699,20 @@ static void usage(FILE *o) {
 }
 
 int main(int argc, char **argv) {
+#ifdef __linux__
+    /* Opt-in (set by the client supervisor): die with the launching client.
+     * Same block as coord_main.c/worker_main.c — the agent was the ONE
+     * sidecar that never had it, so on Windows a closed client left
+     * idletoken-platform-agent.exe running and the installer could not
+     * overwrite it until the user killed it by hand (measured 2026-08-24,
+     * every upgrade on every machine). */
+    if (getenv("IDLETOKEN_DIE_WITH_PARENT")) {
+        prctl(PR_SET_PDEATHSIG, SIGKILL);
+        if (getppid() == 1) _exit(0);
+    }
+#elif defined(_WIN32)
+    idletoken_die_with_parent();
+#endif
     int         port           = 9700;
     const char *coord_url      = "http://127.0.0.1:8000"; /* idletoken-coord --api-bind default */
     const char *coord_unix     = NULL;   /* --coord-unix: socket path, shared mode */
@@ -1717,12 +1857,13 @@ int main(int argc, char **argv) {
          * platform_url because without it this agent is not listing anything.
          * Escape hatch on purpose absent -- see §A3 in the cleanup plan; the
          * decision is that such a machine is not a provider. */
-        int floor_rc = assert_listable_ctx(coord_addr);
+        int list_ctx = 0; /* stays 0 (= undeclared) when the floor check could not read it */
+        int floor_rc = assert_listable_ctx(coord_addr, &list_ctx);
         if (floor_rc != 0) { free(pubkey_b64); return floor_rc; }
         if (provider_id_in) {
             provider_id = strdup(provider_id_in);
         } else {
-            provider_id = platform_register(platform_addr, jwt, name, pubkey_b64, endpoint, relay, model, quant);
+            provider_id = platform_register(platform_addr, jwt, name, pubkey_b64, endpoint, relay, model, quant, list_ctx);
             if (!provider_id) {
                 fprintf(stderr, "platform-agent: registration failed; refusing to start\n");
                 return 1;

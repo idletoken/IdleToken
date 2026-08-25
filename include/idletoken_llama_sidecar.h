@@ -97,6 +97,21 @@ idletoken_llama *idletoken_llama_start(const char *bin, const char *gguf,
                                        const char *log_path, int shared,
                                        char *err, size_t err_cap);
 
+/* Resolve the KV cache dtypes in force: IDLETOKEN_KV_CACHE_TYPE (K; with the
+ * ~/.idletoken/kv-cache-type file fallback) and IDLETOKEN_KV_CACHE_TYPE_V
+ * (V/activations; env only). Outputs are "" when unset ("" = engine default
+ * f16; V follows K at spawn). Returns 0, or -1 with `err` filled when a value
+ * is not in the engine pin's closed dtype set — the caller must refuse, not
+ * ignore. Shared by the spawn (-ctk/-ctv) and the memory planner (scaled
+ * kv_bytes_per_token) so the two can never disagree. */
+int idletoken_llama_kv_types(char k[12], char v[12], char *err, size_t err_cap);
+
+/* Per-token KV cost multiplier vs f16 for the resolved dtypes (1.0 when both
+ * are ""/f16; q8_0 both ≈ 0.53). Feed it to the planner: a quantized cache
+ * genuinely fits more context, and a plan at f16 prices would refuse windows
+ * the engine can serve. */
+double idletoken_llama_kv_scale(const char *ktype, const char *vtype);
+
 /* Stop the monitor thread and terminate the child (SIGTERM, then SIGKILL).
  * Frees the handle. */
 void idletoken_llama_shutdown(idletoken_llama *lc);
