@@ -12,9 +12,11 @@
  * crypto and policy. */
 
 #include "idletoken_overflow.h"
+#include "idletoken_admission.h"
 #include "idletoken_b64.h"
 #include "idletoken_http.h"
 #include "idletoken_privacy.h"
+#include "idletoken_sha256.h"
 #include "idletoken_sodium_seal.h"
 /* The coordinator's existing HTTP/1.1 client. It is named after the engine it
  * was written for, but it speaks plain HTTP to a "host:port" and nothing about
@@ -347,6 +349,28 @@ int idletoken_overflow_configure(const idletoken_overflow_cfg *cfg,
     fprintf(stderr, "coord: overflow: on — platform %s, verify key %s, "
                     "forward when the wait is >= %lldms, at most %lld "
                     "milli-credits a day\n", cfg->url, src, wait, cap);
+    /* Said out loud, once, at the moment the setting takes effect. The envelope
+     * hides a borrowed prompt from the NETWORK; it does not hide it from the
+     * endpoint that opens it or from the provider that endpoint picks, and both
+     * of those read it in the clear (threat register PRIV-01/PRIV-02). When the
+     * URL is not the IdleToken platform, "still inside IdleToken's envelope" is
+     * simply not true of it (PRIV-08) — and the only place that can be stated
+     * against the value really dialled is here. */
+    fprintf(stderr, "coord: overflow: disclosure — a borrowed request is "
+                    "decrypted in the clear by %s and by whichever provider it "
+                    "selects. Requests this machine answers itself never leave "
+                    "it. At most %d further machine(s) may see one prompt.\n",
+            cfg->url, IDLETOKEN_OVF_MAX_HOPS);
+    return 0;
+}
+
+int idletoken_overflow_endpoint(char *out, size_t cap) {
+    if (!out || cap == 0) return -1;
+    pthread_mutex_lock(&g_ovf_mu);
+    /* "" when off, rather than the last URL configured: a disclosure that keeps
+     * naming an endpoint after borrowing was switched off is worse than none. */
+    snprintf(out, cap, "%s", g_ovf.on ? g_ovf.url : "");
+    pthread_mutex_unlock(&g_ovf_mu);
     return 0;
 }
 
@@ -373,31 +397,96 @@ void idletoken_overflow_note_spend(long long milli) {
     pthread_mutex_unlock(&g_ovf_mu);
 }
 
-int idletoken_overflow_should_forward(int from_platform, int want_stream,
-                                      long long est_wait_ms, const char **why) {
+/* --- origin policy --------------------------------------------------------
+ *
+ * Stored next to the spend counters and under the same lock: the policy and the
+ * budget are read together on every decision, and two locks around one decision
+ * is how the next person introduces a race that only shows up under load. */
+static idletoken_ovf_policy g_ovf_policy = IDLETOKEN_OVF_ORIGIN_CAPABILITY;
+
+const char *idletoken_origin_name(idletoken_origin o) {
+    switch (o) {
+    case IDLETOKEN_ORIGIN_LOCAL:             return "local";
+    case IDLETOKEN_ORIGIN_PLATFORM_PROVEN:   return "platform";
+    case IDLETOKEN_ORIGIN_PLATFORM_CLAIMED:  return "platform-claimed";
+    case IDLETOKEN_ORIGIN_UNATTRIBUTED:      return "unattributed";
+    }
+    return "unknown";
+}
+
+const char *idletoken_overflow_policy_name(idletoken_ovf_policy p) {
+    switch (p) {
+    case IDLETOKEN_OVF_ORIGIN_LEGACY:     return "legacy";
+    case IDLETOKEN_OVF_ORIGIN_CAPABILITY: return "capability";
+    case IDLETOKEN_OVF_ORIGIN_STRICT:     return "strict";
+    }
+    return "unknown";
+}
+
+void idletoken_overflow_set_policy(idletoken_ovf_policy p) {
+    pthread_mutex_lock(&g_ovf_mu);
+    g_ovf_policy = p;
+    pthread_mutex_unlock(&g_ovf_mu);
+}
+
+idletoken_ovf_policy idletoken_overflow_policy(void) {
+    idletoken_ovf_policy p;
+    pthread_mutex_lock(&g_ovf_mu);
+    p = g_ovf_policy;
+    pthread_mutex_unlock(&g_ovf_mu);
+    return p;
+}
+
+int idletoken_overflow_should_forward(idletoken_origin origin, int want_stream,
+                                      long long est_wait_ms, int hops_in,
+                                      const char **why) {
+    (void)want_stream; /* both stream and non-stream are safe to borrow: the
+                        * coordinator opens SSE only after a complete reply */
     const char *reason = "off";
     int yes = 0;
+    idletoken_ovf_policy policy;
 
-    /* RULE 1, and it is checked FIRST so that no setting, threshold or budget
-     * can be read as an exception to it: a job the platform dispatched ends
-     * here or is refused here, and is never handed on. That one rule removes
-     * every loop — provider ping-pong, and a request finding its way back to
-     * the cluster it came from — without a hop counter to get wrong.
+    pthread_mutex_lock(&g_ovf_mu);
+    policy = g_ovf_policy;
+    pthread_mutex_unlock(&g_ovf_mu);
+
+    /* RULE 1, checked FIRST so that no setting, threshold or budget can be read
+     * as an exception to it: a job the platform dispatched ends here or is
+     * refused here, and is never handed on. That one rule removes the loop that
+     * goes out through the platform and comes back.
      *
-     * The sense of the test is the subtle half. "No marker means local" is what
-     * makes the feature work at all: the curl and the Claude Code on this LAN
-     * have no reason to send our private header, so treating unknown origins as
-     * un-forwardable would forward nothing, ever, and look like a feature that
-     * was never switched on. Which puts the entire weight of this rule on the
-     * agent really setting the header — hence the gate that asserts against the
-     * real agent binary rather than against this function (design §3). */
-    if (from_platform) {
+     * What changed on 2026-08-30 is the SENSE of the test, and it is the whole
+     * point of the change. It used to be "no marker means local", which is true
+     * of a curl on this LAN and equally true of a platform agent that deleted
+     * one line of itself (threat register PROV-28) — and the second reading is
+     * the one that forwards somebody else's prompt to a third machine and bills
+     * for it twice. So "no marker" is now its own answer, UNATTRIBUTED, and
+     * whether it may be forwarded is a policy decision made once, out loud,
+     * rather than an accident of how the predicate was spelled.
+     *
+     * The old behaviour still exists, under LEGACY, and is not reachable by
+     * accident: the gate uses it to demonstrate the attack on the same binary
+     * that stops it, which is the only kind of attack oracle anybody re-runs. */
+    if (origin == IDLETOKEN_ORIGIN_PLATFORM_PROVEN) {
         reason = "platform work is never forwarded";
-    } else if (want_stream) {
-        /* §5.4: refuse a stream honestly rather than relay one we cannot
-         * finish. "The upstream died and the caller already has half an answer"
-         * has no agreed meaning yet, and half an answer is worse than a 429. */
-        reason = "stream:true is refused locally, not forwarded";
+    } else if (origin == IDLETOKEN_ORIGIN_PLATFORM_CLAIMED) {
+        /* Believed, because believing a claim in the SAFE direction costs
+         * nothing: the worst an attacker gets by falsely claiming platform
+         * origin is that their own request is not forwarded. */
+        reason = "platform work is never forwarded (claimed origin)";
+    } else if (origin == IDLETOKEN_ORIGIN_UNATTRIBUTED &&
+               policy == IDLETOKEN_OVF_ORIGIN_STRICT) {
+        reason = "unattributed request on a machine that serves the platform";
+    } else if (idletoken_admission_platform_busy((long long)time(NULL)) > 0 &&
+               policy != IDLETOKEN_OVF_ORIGIN_LEGACY) {
+        /* A machine in the middle of somebody else's paid job does not get to
+         * pay a third machine at the same time. This one needs no honesty from
+         * anybody: the count comes from capabilities this coordinator minted
+         * and spent itself. */
+        reason = "a platform-dispatched job is in flight on this machine";
+    } else if (hops_in >= IDLETOKEN_OVF_MAX_HOPS &&
+               policy != IDLETOKEN_OVF_ORIGIN_LEGACY) {
+        reason = "the request has already been forwarded once";
     } else {
         pthread_mutex_lock(&g_ovf_mu);
         if (!g_ovf.on) {
@@ -565,8 +654,38 @@ void idletoken_overflow_reply_free(idletoken_overflow_reply *r) {
     r->text_escaped = NULL;
 }
 
+/* A stable pseudonym for this installation. Derived from the local-origin
+ * marker, which persists across restarts, so the platform can recognise "this
+ * is the same coordinator that forwarded the last one" without being told
+ * anything about the machine. Empty when admission was never armed — an absent
+ * field is honest; a made-up one would let two installations collide and have
+ * the platform refuse a legitimate request as a loop. */
+int idletoken_overflow_origin_id(char *out, size_t cap) {
+    char marker[IDLETOKEN_ADM_KEYHEX_CAP];
+    uint8_t d[32];
+    char hex[65];
+    if (!out || cap < 17) return -1;
+    out[0] = '\0';
+    if (idletoken_admission_local_marker(marker, sizeof marker) != 0) return -1;
+    /* Hashed with its own domain string rather than used directly: the marker
+     * is a live credential on this machine, and shipping it to the platform
+     * would turn "identify the installation" into "hand out the thing that
+     * attributes a request as local". */
+    {
+        char msg[128];
+        int n = snprintf(msg, sizeof msg, "idletoken-overflow-origin-id-v1\n%s", marker);
+        if (n < 0) return -1;
+        if ((size_t)n >= sizeof msg) n = (int)sizeof msg - 1;
+        idletoken_sha256(msg, (size_t)n, d);
+    }
+    idletoken_admission_hex(d, 8, hex, sizeof hex);   /* 16 hex chars is plenty */
+    snprintf(out, cap, "%s", hex);
+    return 0;
+}
+
 int idletoken_overflow_exchange(const char *messages_json,
                                 const char *model, int max_tokens,
+                                int hops_in,
                                 idletoken_overflow_reply *out,
                                 char *err, size_t err_cap) {
     if (err && err_cap) err[0] = '\0';
@@ -610,10 +729,23 @@ int idletoken_overflow_exchange(const char *messages_json,
         snprintf(nonce_hex + i * 2, 3, "%02x", nonce_raw[i]);
     long long issued_at = (long long)time(NULL);
 
+    /* Provenance, INSIDE the seal for the same reason the nonce is: outside it
+     * would be the network's to rewrite, and a hop counter an attacker can
+     * reset is not a hop counter. See the exchange comment in
+     * include/idletoken_overflow.h for what the platform is asked to do with
+     * these; the coordinator's obligation is to state them truthfully whether or
+     * not anybody is reading yet. */
+    char origin_id[24] = "";
+    idletoken_overflow_origin_id(origin_id, sizeof origin_id);
+    char prov[160];
+    snprintf(prov, sizeof prov,
+             ",\"hops\":%d,\"max_hops\":%d,\"origin_id\":\"%s\"",
+             (hops_in < 0 ? 0 : hops_in) + 1, IDLETOKEN_OVF_MAX_HOPS, origin_id);
+
     /* The plaintext, and the only place it exists outside this machine's own
      * memory is nowhere: it is sealed before the socket is opened. */
     size_t inner_cap = strlen(messages_json) + strlen(api_key) +
-                       (model ? strlen(model) : 0) + 256;
+                       (model ? strlen(model) : 0) + sizeof prov + 256;
     char *inner = malloc(inner_cap);
     if (!inner) OVF_FAIL("out of memory");
     int inner_len;
@@ -621,15 +753,15 @@ int idletoken_overflow_exchange(const char *messages_json,
         inner_len = snprintf(inner, inner_cap,
                              "{\"api_key\":\"%s\",\"model\":\"%s\","
                              "\"messages\":%s,\"max_tokens\":%d,"
-                             "\"nonce\":\"%s\",\"issued_at\":%lld}",
+                             "\"nonce\":\"%s\",\"issued_at\":%lld%s}",
                              api_key, model ? model : "", messages_json, max_tokens,
-                             nonce_hex, issued_at);
+                             nonce_hex, issued_at, prov);
     else
         inner_len = snprintf(inner, inner_cap,
                              "{\"api_key\":\"%s\",\"model\":\"%s\",\"messages\":%s,"
-                             "\"nonce\":\"%s\",\"issued_at\":%lld}",
+                             "\"nonce\":\"%s\",\"issued_at\":%lld%s}",
                              api_key, model ? model : "", messages_json,
-                             nonce_hex, issued_at);
+                             nonce_hex, issued_at, prov);
     if (inner_len < 0 || (size_t)inner_len >= inner_cap) {
         free(inner);
         OVF_FAIL("request too large to seal");
@@ -982,57 +1114,126 @@ int idletoken_overflow_selftest(void) {
      * the policy is tested on both kinds of build. */
     {
         const char *why = NULL;
+        const idletoken_origin LOCAL   = IDLETOKEN_ORIGIN_LOCAL;
+        const idletoken_origin PROVEN  = IDLETOKEN_ORIGIN_PLATFORM_PROVEN;
+        const idletoken_origin CLAIMED = IDLETOKEN_ORIGIN_PLATFORM_CLAIMED;
+        const idletoken_origin UNATTR  = IDLETOKEN_ORIGIN_UNATTRIBUTED;
         g_ovf.on = 1;
         g_ovf.wait_ms = 0;
         g_ovf.daily_cap_milli = 1000;
         g_ovf.spent_milli = 0;
         g_ovf.day = ovf_today();
+        g_ovf_policy = IDLETOKEN_OVF_ORIGIN_CAPABILITY;
 
         /* Positive control first: without it every "refused" below would also
          * hold on a predicate that returns 0 unconditionally — which is what a
          * silently disabled feature looks like. */
-        OST(idletoken_overflow_should_forward(0, 0, 0, &why) == 1,
+        OST(idletoken_overflow_should_forward(LOCAL, 0, 0, 0, &why) == 1,
             "overflow: a local non-streaming request on a full machine forwards");
 
-        /* RULE 1, the one that costs the most if it inverts. */
-        OST(idletoken_overflow_should_forward(1, 0, 0, &why) == 0 &&
+        /* RULE 1, the one that costs the most if it inverts. Both spellings of
+         * "platform", because the proven one is what the official agent now
+         * sends and the claimed one is what every agent older than 2026-08-30
+         * sends — a version of this rule that only covered the new shape would
+         * start forwarding other people's work the moment an old agent
+         * connected. */
+        OST(idletoken_overflow_should_forward(PROVEN, 0, 0, 0, &why) == 0 &&
             strstr(why, "platform work") != NULL,
             "overflow: platform-dispatched work is never forwarded");
+        OST(idletoken_overflow_should_forward(CLAIMED, 0, 0, 0, &why) == 0 &&
+            strstr(why, "claimed") != NULL,
+            "overflow: a legacy agent's claimed platform origin is still believed");
         g_ovf.wait_ms = 60000;
-        OST(idletoken_overflow_should_forward(1, 0, 999999, &why) == 0,
+        OST(idletoken_overflow_should_forward(PROVEN, 0, 999999, 0, &why) == 0,
             "overflow: no threshold or estimate makes platform work forwardable");
         g_ovf.wait_ms = 0;
 
-        OST(idletoken_overflow_should_forward(0, 1, 0, &why) == 0 &&
-            strstr(why, "stream") != NULL,
-            "overflow: a streaming request is refused here, not relayed");
+        /* PROV-28 / CHAIN-05: the state a stripped header produces.
+         *
+         * Under CAPABILITY it is still forwardable — that is the borrow-only
+         * machine, where nothing else could have sent it. Under STRICT it is
+         * not, and the two assertions have to sit next to each other, because a
+         * strict result that also held under capability would prove only that
+         * the predicate had stopped forwarding altogether. */
+        OST(idletoken_overflow_should_forward(UNATTR, 0, 0, 0, &why) == 1,
+            "overflow: capability policy still forwards an unattributed request");
+        g_ovf_policy = IDLETOKEN_OVF_ORIGIN_STRICT;
+        OST(idletoken_overflow_should_forward(UNATTR, 0, 0, 0, &why) == 0 &&
+            strstr(why, "unattributed") != NULL,
+            "overflow: strict policy refuses to forward an unattributed request");
+        OST(idletoken_overflow_should_forward(LOCAL, 0, 0, 0, &why) == 1,
+            "overflow: ...and an ATTRIBUTED local request still forwards under "
+            "strict (the refusal above is the origin check, not a dead feature)");
+        g_ovf_policy = IDLETOKEN_OVF_ORIGIN_LEGACY;
+        OST(idletoken_overflow_should_forward(UNATTR, 0, 0, 0, &why) == 1,
+            "overflow: legacy policy reproduces the old behaviour the gate "
+            "attacks (no marker = forwardable)");
+        g_ovf_policy = IDLETOKEN_OVF_ORIGIN_CAPABILITY;
+
+        /* The hop budget. Independent of anyone's honesty about origin: it is a
+         * counter that travels with the request, and one hop is all the feature
+         * was ever specified to need. */
+        OST(idletoken_overflow_should_forward(LOCAL, 0, 0, IDLETOKEN_OVF_MAX_HOPS, &why) == 0 &&
+            strstr(why, "already been forwarded") != NULL,
+            "overflow: a request that has already been forwarded is not forwarded again");
+        OST(idletoken_overflow_should_forward(LOCAL, 0, 0, IDLETOKEN_OVF_MAX_HOPS - 1, &why) == 1,
+            "overflow: one hop below the budget still forwards");
+
+        /* The fee-expansion interlock (CHAIN-05, second half). Driven through
+         * the real admission module: a consumed capability is what marks a
+         * platform job in flight, so this asserts the two modules agree rather
+         * than asserting a flag this file set for itself. */
+        {
+            char adm_err[160], ticket[IDLETOKEN_ADM_TICKET_CAP];
+            uint8_t bh[32];
+            idletoken_admission_init(NULL, NULL, adm_err, sizeof adm_err);
+            idletoken_admission_body_hash("{}", 2, bh);
+            if (idletoken_admission_mint("selftest-job", bh, (long long)time(NULL),
+                                         ticket, sizeof ticket,
+                                         adm_err, sizeof adm_err) == 0 &&
+                idletoken_admission_consume(ticket, bh, (long long)time(NULL),
+                                            NULL, 0) == IDLETOKEN_ADM_OK) {
+                OST(idletoken_overflow_should_forward(LOCAL, 0, 0, 0, &why) == 0 &&
+                    strstr(why, "in flight") != NULL,
+                    "overflow: nothing is borrowed while a platform job is in flight here");
+                idletoken_admission_request_end();
+                OST(idletoken_overflow_should_forward(LOCAL, 0, 0, 0, &why) == 1,
+                    "overflow: ...and borrowing resumes once that job finishes");
+            } else {
+                OST(0, "overflow: the in-flight interlock fixture could not mint/spend");
+            }
+        }
+
+        OST(idletoken_overflow_should_forward(LOCAL, 1, 0, 0, &why) == 1,
+            "overflow: a local streaming request on a full machine forwards");
 
         /* The threshold: "only bother paying if I would have waited a while". */
         g_ovf.wait_ms = 5000;
-        OST(idletoken_overflow_should_forward(0, 0, 4999, &why) == 0 &&
+        OST(idletoken_overflow_should_forward(LOCAL, 0, 4999, 0, &why) == 0 &&
             strstr(why, "threshold") != NULL,
             "overflow: an estimated wait under the threshold stays local");
-        OST(idletoken_overflow_should_forward(0, 0, 5000, &why) == 1,
+        OST(idletoken_overflow_should_forward(LOCAL, 0, 5000, 0, &why) == 1,
             "overflow: at the threshold it forwards");
         g_ovf.wait_ms = 0;
 
         /* The daily ceiling, and that it is a ceiling on the DAY. */
         idletoken_overflow_note_spend(999);
-        OST(idletoken_overflow_should_forward(0, 0, 0, &why) == 1,
+        OST(idletoken_overflow_should_forward(LOCAL, 0, 0, 0, &why) == 1,
             "overflow: under the daily cap it still forwards");
         idletoken_overflow_note_spend(1);
-        OST(idletoken_overflow_should_forward(0, 0, 0, &why) == 0 &&
+        OST(idletoken_overflow_should_forward(LOCAL, 0, 0, 0, &why) == 0 &&
             strstr(why, "daily spend cap") != NULL,
             "overflow: at the daily cap it stops forwarding");
         g_ovf.day -= 1;          /* pretend the UTC day turned over */
-        OST(idletoken_overflow_should_forward(0, 0, 0, &why) == 1,
+        OST(idletoken_overflow_should_forward(LOCAL, 0, 0, 0, &why) == 1,
             "overflow: the cap resets when the UTC day turns over");
 
         g_ovf.on = 0;
-        OST(idletoken_overflow_should_forward(0, 0, 999999, &why) == 0 &&
+        OST(idletoken_overflow_should_forward(LOCAL, 0, 999999, 0, &why) == 0 &&
             strstr(why, "off") != NULL,
             "overflow: switched off, nothing forwards");
         memset(&g_ovf, 0, sizeof g_ovf);
+        g_ovf_policy = IDLETOKEN_OVF_ORIGIN_CAPABILITY;
     }
 
     free(good); free(swapped); free(tampered); free(expired); free(nodomain);

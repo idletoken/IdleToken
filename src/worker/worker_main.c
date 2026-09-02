@@ -43,6 +43,7 @@ void ds4_gpu_set_moe_cache(uint64_t bytes, uint32_t n_layers);
 #ifdef _WIN32
   #include <winsock2.h>      /* before windows.h */
   #include <windows.h>
+  #include <winioctl.h>      /* StorageDeviceSeekPenaltyProperty */
   #include <bcrypt.h>        /* BCryptGenRandom — link -lbcrypt */
   #include <process.h>       /* _getpid */
   /* Every fd closed in this file is a network socket. */
@@ -74,6 +75,13 @@ void ds4_gpu_set_moe_cache(uint64_t bytes, uint32_t n_layers);
 #endif
 
 #define IDLETOKEN_WORKER_VERSION "idletoken-worker v0.1.0-pre"
+
+/* How long this worker will wait for a coordinator to say ANYTHING during the
+ * join (2026-08-30, CLUS-04/CLUS-05). Generous — the coordinator may be
+ * admitting another machine ahead of us, and its own per-step deadline is 15 s
+ * — but finite, because a beacon can be answered by anything on the LAN and a
+ * silent "coordinator" must cost us one window, not the whole session. */
+#define IDLETOKEN_WORKER_JOIN_TIMEOUT_MS 90000
 
 /* The model this worker was assigned (from ASSIGN_PLAN's model_id, resolved
  * against the registry). All tensor dimensions (n_embd/hc_streams/n_vocab)
@@ -242,7 +250,8 @@ static int idletoken_kv_clear(const char *dir) {
 static void usage(FILE *out) {
     fprintf(out,
 "idletoken-worker  DSv4-Flash inference shard (v0.1)\n"
-"Usage: idletoken-worker (--coordinator <host:port> | --pair-code CODE) [--model <path>]\n"
+"Usage: idletoken-worker --rpc-supervisor\n"
+"       (--coordinator <host:port> | --pair-code CODE) [--model <path>]\n"
 "       idletoken-worker --probe-only [--gguf-dir <dir>]\n"
 "\n"
 "Required (run mode) — one of:\n"
@@ -267,14 +276,14 @@ static void usage(FILE *out) {
 "  --advise-peers L    judge this machine PLUS peers; L = vramGiB:ramGiB:unified,...\n"
 "  --gguf-dir DIR      directory to statvfs() for disk-avail (default: ./)\n"
 "  --max-vram-mb N     cap usable VRAM at N MiB (client setting; 0 = no cap)\n"
-"  --max-ram-mb N      cap usable RAM at N MiB (client setting; 0 = no cap)\n"
+"  --max-ram-mb N      retired compatibility option; serving ignores RAM\n"
 "  --kv-clear          wipe the on-disk KV warm cache and exit\n"
 "  --kv-dir DIR        KV cache directory (default: platform cache dir)\n"
 "  -h, --help          show this help\n"
 "\n"
 "llama.cpp rpc-supervisor mode (v2 WS-C1; pairs, then supervises a local\n"
 "idletoken-rpc-server the coordinator's idletoken-server computes through):\n"
-"  --rpc-supervisor    join as an rpc worker instead of the legacy INFER loop.\n"
+"  --rpc-supervisor    join as a llama.cpp RPC worker (required for network join).\n"
 "                      Requires pairing (--pair-code / account mode): the\n"
 "                      cluster TLS PSK arrives through the pairing channel.\n"
 "  --engine-dir DIR    llama.cpp build bin dir holding idletoken-rpc-server and\n"
@@ -284,8 +293,9 @@ static void usage(FILE *out) {
 "                      addresses (100.64/10) are refused — tensor traffic\n"
 "                      must stay on the real LAN)  (env IDLETOKEN_RPC_HOST)\n"
 "  --rpc-port N        rpc-server port (default 50052; env IDLETOKEN_RPC_PORT)\n"
-"  --rpc-device D      ggml device for the rpc-server (-d), default CUDA0 on\n"
-"                      Windows/Linux, MTL0 on macOS (env IDLETOKEN_RPC_DEVICE)\n"
+"  --rpc-device D      GPU device for the rpc-server (-d), default\n"
+"                      CUDA0 on Windows/Linux, MTL0 on macOS; CPU is refused\n"
+"                      (env IDLETOKEN_RPC_DEVICE)\n"
 "\n"
 "v0.1 only runs PP (segment_id always 0). v0.2 will add SP=2.\n");
 }
@@ -557,6 +567,161 @@ static void worker_rpc_psk_path(char *out, size_t cap) {
 #endif
 }
 
+/* Keep the rpc-server log out of the process working directory on Windows.
+ * Scheduled tasks and desktop auto-start launchers commonly inherit
+ * C:\Windows\System32, which a normal user cannot write. The worker used to
+ * fail before RPC_READY in that case even though pairing had succeeded. */
+static int worker_rpc_log_path(char *out, size_t cap, int port) {
+    const char *env = getenv("IDLETOKEN_RPC_LOG");
+    if (env && env[0]) {
+        int n = snprintf(out, cap, "%s", env);
+        return n >= 0 && (size_t)n < cap ? 0 : -1;
+    }
+#ifdef _WIN32
+    char temp[MAX_PATH + 1] = "";
+    const char *base = getenv("LOCALAPPDATA");
+    if (!base || !base[0]) {
+        DWORD n = GetTempPathA((DWORD)sizeof(temp), temp);
+        if (n == 0 || n >= sizeof(temp)) {
+            fprintf(stderr, "idletoken-worker: cannot resolve a writable rpc log directory "
+                            "(winerr %lu)\n", (unsigned long)GetLastError());
+            return -1;
+        }
+        base = temp;
+    }
+    char dir[1024];
+    int dn = snprintf(dir, sizeof(dir), "%s%sIdleToken", base,
+                      base[strlen(base) - 1] == '\\' ? "" : "\\");
+    if (dn < 0 || (size_t)dn >= sizeof(dir)) {
+        fprintf(stderr, "idletoken-worker: rpc log directory path is too long\n");
+        return -1;
+    }
+    if (!CreateDirectoryA(dir, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        fprintf(stderr, "idletoken-worker: cannot create rpc log directory %s "
+                        "(winerr %lu)\n", dir, (unsigned long)GetLastError());
+        return -1;
+    }
+    int n = snprintf(out, cap, "%s\\idletoken-rpc-server-%d.log", dir, port);
+#else
+    int n = snprintf(out, cap, "idletoken-rpc-server-%d.log", port);
+#endif
+    if (n < 0 || (size_t)n >= cap) {
+        fprintf(stderr, "idletoken-worker: rpc log path is too long\n");
+        return -1;
+    }
+    return 0;
+}
+
+/* Keep the pre-seeded tensors beside the configured model directory so a
+ * machine with a small system drive can put its shard cache on the large model
+ * disk. ggml-rpc-server appends "rpc" to LLAMA_CACHE itself. */
+#ifdef _WIN32
+static int win_drive_is_nonrotational(char drive, int *known) {
+    char device[] = "\\\\.\\C:";
+    device[4] = drive;
+    *known = 0;
+    HANDLE h = CreateFileA(device, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    STORAGE_PROPERTY_QUERY q;
+    DEVICE_SEEK_PENALTY_DESCRIPTOR d;
+    DWORD returned = 0;
+    ZeroMemory(&q, sizeof(q));
+    ZeroMemory(&d, sizeof(d));
+    q.PropertyId = StorageDeviceSeekPenaltyProperty;
+    q.QueryType = PropertyStandardQuery;
+    BOOL ok = DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY,
+                              &q, sizeof(q), &d, sizeof(d),
+                              &returned, NULL);
+    CloseHandle(h);
+    if (!ok || returned < sizeof(d)) return 0;
+    *known = 1;
+    return d.IncursSeekPenalty ? 0 : 1;
+}
+#endif
+
+static int worker_rpc_cache_paths(const char *gguf_dir,
+                                  char *root, size_t root_cap,
+                                  char *rpc, size_t rpc_cap) {
+    const char *env = getenv("IDLETOKEN_RPC_CACHE_ROOT");
+    const char *base = (gguf_dir && gguf_dir[0]) ? gguf_dir : ".";
+    int n = -1;
+    if (env && env[0]) {
+        n = snprintf(root, root_cap, "%s", env);
+    }
+#ifdef _WIN32
+    else if (!strcmp(base, ".") || !strcmp(base, "./") || !strcmp(base, ".\\")) {
+        /* A bundled desktop sidecar normally has no configured GGUF directory.
+         * Windows often puts only a few GiB free on C: while a data drive has
+         * hundreds. Select the fixed drive with the most free bytes, then keep
+         * the choice stable at <drive>:\\IdleToken\\model-shards. */
+        DWORD mask = GetLogicalDrives();
+        ULONGLONG best_any = 0, best_fast = 0;
+        char best_any_drive = 0, best_fast_drive = 0;
+        for (char d = 'C'; d <= 'Z'; d++) {
+            if (!(mask & (1u << (d - 'A')))) continue;
+            char dr[4] = { d, ':', '\\', '\0' };
+            if (GetDriveTypeA(dr) != DRIVE_FIXED) continue;
+            ULARGE_INTEGER avail, total, freeb;
+            if (!GetDiskFreeSpaceExA(dr, &avail, &total, &freeb)) continue;
+            if (avail.QuadPart > best_any) {
+                best_any = avail.QuadPart;
+                best_any_drive = d;
+            }
+            int media_known = 0;
+            if (win_drive_is_nonrotational(d, &media_known) && media_known &&
+                avail.QuadPart > best_fast) {
+                best_fast = avail.QuadPart;
+                best_fast_drive = d;
+            }
+        }
+        const char best_drive = best_fast_drive ? best_fast_drive : best_any_drive;
+        const ULONGLONG best = best_fast_drive ? best_fast : best_any;
+        if (best_drive) {
+            char parent[32];
+            snprintf(parent, sizeof(parent), "%c:\\IdleToken", best_drive);
+            CreateDirectoryA(parent, NULL);
+            n = snprintf(root, root_cap, "%s\\model-shards", parent);
+            fprintf(stderr, "idletoken-worker: selected %c: for model shards "
+                            "(%.1f GiB free%s)\n", best_drive,
+                    (double)best / 1073741824.0,
+                    best_fast_drive ? ", non-rotational" : "");
+        }
+    }
+#endif
+    if (n < 0) {
+        n = snprintf(root, root_cap, "%s%s.idletoken-llama-cache", base,
+                     (base[strlen(base) - 1] == '/' ||
+                      base[strlen(base) - 1] == '\\') ? "" : "/");
+    }
+    if (n < 0 || (size_t)n >= root_cap) return -1;
+#ifdef _WIN32
+    if (!CreateDirectoryA(root, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        fprintf(stderr, "idletoken-worker: cannot create RPC cache root %s "
+                        "(winerr %lu)\n", root,
+                (unsigned long)GetLastError());
+        return -1;
+    }
+#else
+    if (mkdir(root, 0700) != 0 && errno != EEXIST) {
+        fprintf(stderr, "idletoken-worker: cannot create RPC cache root %s: %s\n",
+                root, strerror(errno));
+        return -1;
+    }
+#endif
+    n = snprintf(rpc, rpc_cap, "%s%srpc", root,
+                 (root[strlen(root) - 1] == '/' ||
+                  root[strlen(root) - 1] == '\\') ? "" : "/");
+    if (n < 0 || (size_t)n >= rpc_cap) return -1;
+#ifdef _WIN32
+    if (!CreateDirectoryA(rpc, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
+        return -1;
+#else
+    if (mkdir(rpc, 0700) != 0 && errno != EEXIST) return -1;
+#endif
+    return 0;
+}
+
 /* The rpc-server child's pid, mirrored for signal-time cleanup: a SIGTERM'd
  * worker must not orphan its child. Linux children carry pdeathsig, but macOS
  * has no equivalent — killing the worker there left idletoken-rpc-server holding
@@ -596,6 +761,63 @@ static int rpc_coord_readable(int fd, int timeout_ms) {
     int pr = poll(&pfd, 1, timeout_ms);
     return pr > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR));
 #endif
+}
+
+typedef struct {
+    int fd;
+    uint64_t request_id;
+    uint64_t last_sent;
+} rpc_cache_progress_ctx;
+
+static void rpc_cache_progress(uint64_t done, uint64_t total, void *opaque) {
+    rpc_cache_progress_ctx *ctx = (rpc_cache_progress_ctx *)opaque;
+    if (!ctx || ctx->fd < 0) return;
+    /* A DSv4 shard has over a thousand tensors. Report coarse progress rather
+     * than turn every small tensor into control-plane chatter. */
+    if (done != total && done - ctx->last_sent < (256ull << 20)) return;
+    uint8_t pay[16];
+    idletoken_buf b;
+    idletoken_buf_init(&b, pay, sizeof(pay));
+    idletoken_buf_put_u64(&b, done);
+    idletoken_buf_put_u64(&b, total);
+    idletoken_msg_header h = {
+        .magic = IDLETOKEN_PROTO_MAGIC,
+        .version = IDLETOKEN_PROTO_VERSION,
+        .msg_type = IDLETOKEN_MSG_RPC_CACHE_PROGRESS,
+        .payload_bytes = b.pos,
+        .request_id = ctx->request_id,
+        .stage_id = 0,
+        .segment_id = IDLETOKEN_SEGMENT_NONE,
+    };
+    if (!b.err && idletoken_send_msg(ctx->fd, &h, pay, b.pos) == 0)
+        ctx->last_sent = done;
+}
+
+static int rpc_send_cache_ready(int fd, uint64_t request_id, int ok,
+                                unsigned lo, unsigned hi,
+                                uint64_t bytes, unsigned tensors,
+                                const char *detail) {
+    uint8_t pay[512];
+    idletoken_buf b;
+    idletoken_buf_init(&b, pay, sizeof(pay));
+    idletoken_buf_put_u8(&b, ok ? 1 : 0);
+    uint8_t z3[3] = {0};
+    idletoken_buf_put_bytes(&b, z3, 3);
+    idletoken_buf_put_u16(&b, (uint16_t)lo);
+    idletoken_buf_put_u16(&b, (uint16_t)hi);
+    idletoken_buf_put_u64(&b, bytes);
+    idletoken_buf_put_u32(&b, tensors);
+    idletoken_buf_put_str(&b, detail ? detail : "");
+    idletoken_msg_header h = {
+        .magic = IDLETOKEN_PROTO_MAGIC,
+        .version = IDLETOKEN_PROTO_VERSION,
+        .msg_type = IDLETOKEN_MSG_RPC_CACHE_READY,
+        .payload_bytes = b.pos,
+        .request_id = request_id,
+        .stage_id = 0,
+        .segment_id = IDLETOKEN_SEGMENT_NONE,
+    };
+    return b.err ? -1 : idletoken_send_msg(fd, &h, pay, b.pos);
 }
 
 /* Spawn idletoken-rpc-server. GGML_RPC_PSK comes from the persisted credential
@@ -645,7 +867,7 @@ static int rpc_spawn(const char *rpc_bin, const char *host, int port,
     snprintf(portstr, sizeof(portstr), "%d", port);
 #ifdef _WIN32
     char cmd[3072];
-    int cn = snprintf(cmd, sizeof(cmd), "\"%s\" -H %s -p %s -d %s",
+    int cn = snprintf(cmd, sizeof(cmd), "\"%s\" -H %s -p %s -d %s -c",
                       rpc_bin, host, portstr, device);
     if (cn < 0 || (size_t)cn >= sizeof(cmd)) {
         fprintf(stderr, "idletoken-worker: rpc-server command line is too long\n");
@@ -720,12 +942,13 @@ static int rpc_spawn(const char *rpc_bin, const char *host, int port,
             dup2(lg, 2);
             if (lg > 2) close(lg);
         }
-        char *cargv[10];
+        char *cargv[11];
         int ca = 0;
         cargv[ca++] = (char *)rpc_bin;
         cargv[ca++] = "-H"; cargv[ca++] = (char *)host;
         cargv[ca++] = "-p"; cargv[ca++] = portstr;
         cargv[ca++] = "-d"; cargv[ca++] = (char *)device;
+        cargv[ca++] = "-c";
         cargv[ca] = NULL;
         execv(rpc_bin, cargv);
         dprintf(2, "idletoken-worker: execv %s: %s\n", rpc_bin, strerror(errno));
@@ -743,7 +966,8 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
                               const char *pair_acct, const char *acct_token,
                               const char *rendezvous, int disc_port,
                               uint64_t max_vram_bytes, uint64_t max_ram_bytes,
-                              const char *gguf_dir) {
+                              const char *gguf_dir, const char *model_path,
+                              const char *shard_repo_override) {
     if (!engine_dir || !engine_dir[0]) {
         fprintf(stderr, "idletoken-worker: --rpc-supervisor needs --engine-dir "
                         "(or IDLETOKEN_ENGINE_DIR) pointing at the llama.cpp "
@@ -776,6 +1000,15 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
                         "engine first (scripts/build_llamacpp.sh)\n", engine_dir);
         return 2;
     }
+
+    char rpc_cache_root[1024], rpc_cache_dir[1088];
+    if (worker_rpc_cache_paths(gguf_dir, rpc_cache_root, sizeof(rpc_cache_root),
+                               rpc_cache_dir, sizeof(rpc_cache_dir)) != 0) {
+        fprintf(stderr, "idletoken-worker: cannot prepare the local RPC tensor cache\n");
+        return 2;
+    }
+    setenv("LLAMA_CACHE", rpc_cache_root, 1);
+    fprintf(stderr, "idletoken-worker: RPC tensor cache: %s\n", rpc_cache_dir);
 
 #ifndef _WIN32
     signal(SIGTERM, rpc_supervisor_on_signal);
@@ -924,6 +1157,14 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
         fprintf(stderr, "idletoken-worker: connect: %s\n", strerror(errno));
         return 1;
     }
+    /* Bounded join, same rule as the coordinator's side (CLUS-04/CLUS-05).
+     * Anything on the LAN can answer a beacon; a "coordinator" that accepts the
+     * connection and then never speaks used to leave this worker parked in
+     * recv() with no timer and no way back to the discovery loop, which the
+     * user experiences as a join that never finishes and never fails.
+     * Lifted again once this machine is admitted — the supervisor loop that
+     * follows has its own, much longer, liveness rules. */
+    idletoken_set_recv_timeout(fd, IDLETOKEN_WORKER_JOIN_TIMEOUT_MS);
     if (idletoken_pair_client_auth(fd, &pair_id, g_session_key) != 0) {
         fprintf(stderr, "idletoken-worker: pairing auth failed (%s) — wrong code?\n",
                 strerror(errno));
@@ -942,12 +1183,19 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
      * appended as the optional trailing field the coordinator checks) ------ */
     uint8_t uuid[16];
     fill_uuid(uuid);
+    char worker_version[64];
+    /* Keep capability tokens inside the coordinator's 64-byte version field.
+     * The older verbose "rpc-supervisor+..." spelling pushed rpc-cache-v1
+     * past the boundary and made a new worker look incapable after truncation. */
+    snprintf(worker_version, sizeof(worker_version), "%s (rpc-cache-v1)",
+             IDLETOKEN_WORKER_VERSION);
+
     uint8_t hello_payload[1024];
     idletoken_buf b;
     idletoken_buf_init(&b, hello_payload, sizeof(hello_payload));
     idletoken_buf_put_bytes(&b, uuid, 16);
     idletoken_buf_put_str(&b, rr.hostname);
-    idletoken_buf_put_str(&b, IDLETOKEN_WORKER_VERSION " (rpc-supervisor)");
+    idletoken_buf_put_str(&b, worker_version);
     idletoken_buf_put_str(&b, endpoint);
     idletoken_buf_put_u8(&b, (uint8_t)IDLETOKEN_OS_FAMILY_SELF);
     uint8_t pad3[3] = {0};
@@ -1006,6 +1254,16 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
                 idletoken_buf_get_u32(&ab, &hb);
                 idletoken_buf_get_str(&ab, coord_ver, sizeof(coord_ver));
                 idletoken_buf_get_str(&ab, reject, sizeof(reject));
+                /* This string is chosen by whatever answered the beacon, and it
+                 * is about to be printed on a stream the client scrapes for the
+                 * refusal marker and shows to the user (engine.rs
+                 * refusal_reason). A newline in it forges a second log line and
+                 * can put attacker text in the client's UI, which is a phishing
+                 * primitive, not a cosmetic bug (CLUS-04/CLUS-18). */
+                if (reject[0] && !idletoken_peer_label_ok(reject, sizeof(reject)))
+                    snprintf(reject, sizeof(reject),
+                             "(the coordinator's stated reason was not printable "
+                             "text and was discarded)");
                 fprintf(stderr, "idletoken-worker: " IDLETOKEN_JOIN_REFUSED_MARK
                                 "the coordinator refused this node%s%s\n",
                         reject[0] ? ": " : " (no reason given)", reject);
@@ -1139,19 +1397,21 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
                         "(psk=%s) and persisted to %s\n", fp, psk_path);
     }
 
+    /* Admitted. The join deadline comes off here: from this point the socket
+     * carries the supervisor's own protocol, whose silences (a shard fetch, an
+     * idle cluster between heartbeats) are legitimately long and are already
+     * bounded by rpc_coord_readable() and the heartbeat deadline below. */
+    idletoken_set_recv_timeout(fd, 0);
+
     /* --- spawn + supervise idletoken-rpc-server --------------------------------
      * Same state machine as the coordinator's idletoken-server sidecar
      * (src/coord/llama_sidecar.c): backoff 2/4/8/16/30s, 5 consecutive quick
      * crashes latch FAILED. Readiness = the endpoint accepts TCP (rpc-server
      * has no /health; it serves the ggml-RPC protocol directly). */
-    char log_path[512];
-    {
-        const char *log_env = getenv("IDLETOKEN_RPC_LOG");
-        if (log_env && log_env[0])
-            snprintf(log_path, sizeof(log_path), "%s", log_env);
-        else
-            snprintf(log_path, sizeof(log_path), "idletoken-rpc-server-%d.log",
-                     rpc_port);
+    char log_path[1024];
+    if (worker_rpc_log_path(log_path, sizeof(log_path), rpc_port) != 0) {
+        close(fd);
+        return 1;
     }
 
     long long pid = 0;
@@ -1184,8 +1444,85 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
                                 "stopping the rpc-server\n");
                 break;
             }
-            /* HEARTBEAT and anything else: liveness, nothing else to do. */
             last_coord_ms = (long long)(now_monotonic_s() * 1000.0);
+            if (mh.msg_type == IDLETOKEN_MSG_RPC_CACHE_PLAN) {
+                idletoken_buf cb;
+                idletoken_buf_init(&cb, mp, mh.payload_bytes);
+                uint8_t ver = 0, rsv8 = 0;
+                uint16_t lo = 0, hi = 0, rsv16 = 0;
+                char repo[384] = "";
+                idletoken_buf_get_u8(&cb, &ver);
+                idletoken_buf_get_u8(&cb, &rsv8);
+                idletoken_buf_get_u16(&cb, &lo);
+                idletoken_buf_get_u16(&cb, &hi);
+                idletoken_buf_get_u16(&cb, &rsv16);
+                /* _strict: this string is a URL this worker is about to fetch
+                 * from. A truncated URL is a different URL, and the truncation
+                 * point is chosen by the sender — so silently keeping the first
+                 * 383 bytes hands the peer a redirect primitive (CLUS-14). */
+                idletoken_buf_get_str_strict(&cb, repo, sizeof(repo));
+                if (cb.err || ver != 1 || hi < lo || !repo[0]) {
+                    fprintf(stderr, "idletoken-worker: malformed RPC_CACHE_PLAN\n");
+                    rpc_send_cache_ready(fd, mh.request_id, 0, lo, hi, 0, 0,
+                                         "malformed cache plan");
+                    continue;
+                }
+                /* Printable, and plain HTTP(S) — the fetcher speaks nothing
+                 * else, so anything with a control byte or another scheme is
+                 * either a bug or someone probing what this parser will do
+                 * with it. Refuse it by name rather than hand it to the URL
+                 * parser to find out. */
+                if (!idletoken_peer_label_ok(repo, sizeof(repo)) ||
+                    (strncmp(repo, "http://", 7) != 0 &&
+                     strncmp(repo, "https://", 8) != 0)) {
+                    fprintf(stderr, "idletoken-worker: RPC_CACHE_PLAN named a "
+                                    "weight source that is not a printable "
+                                    "http(s) URL — refusing it\n");
+                    rpc_send_cache_ready(fd, mh.request_id, 0, lo, hi, 0, 0,
+                                         "weight source is not an http(s) URL");
+                    continue;
+                }
+                const char *fetch_repo =
+                    shard_repo_override && shard_repo_override[0]
+                        ? shard_repo_override : repo;
+                fprintf(stderr, "idletoken-worker: assigned llama.cpp tensor "
+                                "layers [%u,%u); fetching locally from %s\n",
+                        (unsigned)lo, (unsigned)hi, fetch_repo);
+                rpc_cache_progress_ctx pc = {
+                    .fd = fd,
+                    .request_id = mh.request_id,
+                    .last_sent = 0,
+                };
+                uint64_t cached_bytes = 0;
+                unsigned cached_tensors = 0;
+                const int crc = idletoken_rpc_cache_fetch(
+                    fetch_repo, lo, hi, model_path, rpc_cache_dir,
+                    rpc_cache_progress, &pc,
+                    &cached_bytes, &cached_tensors);
+                char detail[192];
+                if (crc == 0) {
+                    snprintf(detail, sizeof(detail),
+                             "local shard ready: layers [%u,%u), %u tensors, %.2f GiB",
+                             (unsigned)lo, (unsigned)hi, cached_tensors,
+                             (double)cached_bytes / 1073741824.0);
+                    fprintf(stderr, "idletoken-worker: %s\n", detail);
+                } else {
+                    snprintf(detail, sizeof(detail),
+                             "local shard fetch failed for layers [%u,%u) from %.96s",
+                             (unsigned)lo, (unsigned)hi, fetch_repo);
+                    fprintf(stderr, "idletoken-worker: %s\n", detail);
+                }
+                if (rpc_send_cache_ready(fd, mh.request_id, crc == 0,
+                                         lo, hi, cached_bytes, cached_tensors,
+                                         detail) != 0) {
+                    fprintf(stderr, "idletoken-worker: send RPC_CACHE_READY: %s\n",
+                            strerror(errno));
+                    break;
+                }
+                /* A first seed can take minutes. It is active coordinator work,
+                 * not silence, so restart the heartbeat deadline now. */
+                last_coord_ms = (long long)(now_monotonic_s() * 1000.0);
+            }
         }
 
         long long now = (long long)(now_monotonic_s() * 1000.0);
@@ -1387,6 +1724,7 @@ int main(int argc, char **argv) {
         if (getppid() == 1) _exit(0); /* parent already gone before prctl */
     }
 #elif defined(_WIN32)
+    if (idletoken_win_require_utf8_paths() != 0) return 2;
     /* Windows side of parent-death: watch the client's process handle. */
     idletoken_die_with_parent();
     /* Unbuffered stderr: a hard crash in the CUDA DLL (access violation /
@@ -1487,8 +1825,6 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(stdout); return 0; }
         else { fprintf(stderr, "idletoken-worker: unknown argument: %s\n\n", a); usage(stderr); return 2; }
     }
-    if (!model_path) model_path = "./ds4flash.gguf";
-
     if (kv_clear) {
         char defdir[1024];
         if (!kv_dir) {
@@ -1498,9 +1834,9 @@ int main(int argc, char **argv) {
         return idletoken_kv_clear(kv_dir);
     }
 
-    /* llama.cpp rpc-supervisor mode (v2 WS-C1): pair, receive the TLS PSK,
-     * supervise a idletoken-rpc-server. No legacy INFER loop, no model load here —
-     * the coordinator's idletoken-server pushes tensors over authenticated RPC. */
+    /* llama.cpp rpc-supervisor mode: pair, receive the TLS PSK, seed this
+     * machine's assigned GGUF tensors into the local content-addressed cache,
+     * then supervise idletoken-rpc-server. There is no legacy INFER loop. */
     if (rpc_supervisor) {
         if (rpc_port < 1 || rpc_port > 65535) {
             fprintf(stderr, "idletoken-worker: --rpc-port must be 1..65535\n");
@@ -1514,12 +1850,24 @@ int main(int argc, char **argv) {
             rpc_device = "CUDA0";
 #endif
         }
+        if (strstr(rpc_device, "CPU") != NULL || strstr(rpc_device, "cpu") != NULL) {
+            fprintf(stderr, "idletoken-worker: CPU RPC devices are not supported; "
+                            "use a GPU device such as CUDA0 or MTL0\n");
+            return 2;
+        }
         return run_rpc_supervisor(engine_dir, rpc_host, rpc_port, rpc_device,
                                   coord_addr, pair_code, pair_acct, acct_token,
                                   rendezvous, disc_port,
                                   max_vram_mb * 1024ull * 1024ull,
-                                  max_ram_mb  * 1024ull * 1024ull, gguf_dir);
+                                  0, gguf_dir,
+                                  model_path,
+                                  shard_repo);
     }
+
+    // Legacy non-RPC modes keep their historical default. RPC supervisor mode
+    // deliberately receives NULL when an older caller did not provide a local
+    // full GGUF, so it can retain the repository-fetch compatibility path.
+    if (!model_path) model_path = "./ds4flash.gguf";
 
     /* Weight repo server mode: generate the .idx if missing, then serve the
      * GGUF's directory over HTTP byte-range (blocks). The coordinator runs this
@@ -1649,6 +1997,16 @@ int main(int argc, char **argv) {
         }
         return 0;
     }
+
+    /* The product network path is llama.cpp RPC supervision. The old INFER_*
+     * protocol is retired: keeping its implementation below is historical and
+     * does not make it an alternate join mode. Fail before firewall changes,
+     * discovery, pairing, HELLO, or any coordinator-chosen input is consumed.
+     * This also makes a future client call-site regression loud instead of
+     * silently reactivating a stale protocol with different security gates. */
+    fprintf(stderr, "idletoken-worker: " IDLETOKEN_JOIN_REFUSED_MARK
+                    "legacy INFER join mode is retired; use --rpc-supervisor\n");
+    return IDLETOKEN_EXIT_JOIN_REFUSED;
 
 #ifdef _WIN32
     /* Self-provision inbound firewall rules (architecture §9, productization).

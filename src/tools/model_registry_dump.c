@@ -51,13 +51,29 @@ int main(void) {
         jnum("n_embd", m->n_embd, 0);
         jnum("hc_streams", m->hc_streams, 0);
         jnum("n_vocab", m->n_vocab, 0);
+        jnum("n_expert", m->n_expert, 0);
+        jnum("n_expert_used", m->n_expert_used, 0);
         jnum("layer_weight_bytes", m->layer_weight_bytes, 0);
         jnum("shared_weight_bytes", m->shared_weight_bytes, 0);
         jnum("context_max", m->ctx_max, 0);
+        jnum("context_yarn_max", m->ctx_yarn_max, 0);
+        jstr("kv_kind",
+             m->kv_kind == IDLETOKEN_KV_DSV4 ? "dsv4" :
+             m->kv_kind == IDLETOKEN_KV_MLA ? "mla" :
+             m->kv_kind == IDLETOKEN_KV_GQA ? "gqa" :
+             m->kv_kind == IDLETOKEN_KV_HYBRID ? "hybrid" : "", 0);
         jnum("kv_bytes_per_token_per_layer", m->kv_bytes_per_token_layer, 0);
         jnum("state_bytes_per_layer", m->state_bytes_per_layer, 0);
         jnum("full_attention_interval", m->full_attn_interval, 0);
+        jnum("dsv4_raw_bytes_per_cell", m->dsv4_raw_bytes_per_cell, 0);
+        jnum("dsv4_csa_bytes_per_cell", m->dsv4_csa_bytes_per_cell, 0);
+        jnum("dsv4_hca_bytes_per_cell", m->dsv4_hca_bytes_per_cell, 0);
+        jnum("dsv4_fixed_bytes_per_seq", m->dsv4_fixed_bytes_per_seq, 0);
         jnum("overhead_base_bytes", m->overhead_base_bytes, 0);
+        jnum("compute_bytes_256k_cuda", m->compute_bytes_256k_cuda, 0);
+        jnum("compute_bytes_1m_cuda", m->compute_bytes_1m_cuda, 0);
+        jnum("compute_bytes_256k_metal", m->compute_bytes_256k_metal, 0);
+        jnum("compute_bytes_1m_metal", m->compute_bytes_1m_metal, 0);
         jstr("default_gguf", m->default_gguf, 0);
         printf("    \"variants\": [");
         for (uint8_t v = 0; v < m->n_variants; v++)

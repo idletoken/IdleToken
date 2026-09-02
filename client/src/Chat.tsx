@@ -65,16 +65,11 @@ const STORE_KEY = "idletoken.chat.v2";
 const LEGACY_KEY = "idletoken.chat.v1"; // single rolling transcript
 const MAX_STORED = 50; // messages kept per conversation
 const MAX_CONVOS = 40;
-/** How many conversations may generate at once.
- *
- *  Not a setting (and not derived from the cluster): the coordinator serves
- *  requests serially in single-machine llama.cpp mode today, so past a small
- *  number the extra turns are pure queue — a ceiling that let a user open ten
- *  would be a ceiling that lies about what the machine can do. Three is enough
- *  to work in one thread while two others think, and small enough that the
- *  queue behind it stays comprehensible. Raise it when the engine grows real
- *  sequence slots (see the engine-multislot-cachehit plan), not before.
- */
+/** Local inference is deliberately one request wide. The other two lanes are
+ * allowed through the UI so a busy coordinator can hand them to platform
+ * overflow instead of the client pre-emptively saying "wait". This is only a
+ * browser-side safety ceiling; the coordinator remains authoritative and may
+ * return 429 when borrowing is off or unavailable. */
 const CLIENT_MAX_INFLIGHT = 3;
 /** How long changes may sit unwritten before history hits localStorage. The
  *  whole table is serialized on every write, so with three streams appending
@@ -368,6 +363,10 @@ function Bubble(props: {
 }
 
 export default function Chat(props: {
+  /** The top-level page currently shown. Chat deliberately stays mounted while
+   *  hidden so its native stream listener and per-conversation request ids
+   *  survive navigation to Cluster or Settings. */
+  visible: boolean;
   api: ClusterApi | null;
   /** Where `api` comes from, so the browser dev-sim can answer "what is loaded"
    *  the way a coordinator would. Defaults to the real engine. */
@@ -396,8 +395,10 @@ export default function Chat(props: {
   // Until 2026-08-18 this was a single global `busy` flag: one reply at a time,
   // and on a LAN cluster a reply is minutes — so the sidebar full of
   // conversations could be read but never used. Conversations are now
-  // independent, up to CLIENT_MAX_INFLIGHT of them; within one conversation a
-  // second send is still refused (the two turns would race the same transcript).
+  // independent, up to CLIENT_MAX_INFLIGHT. The local engine itself stays
+  // single-request; extra conversations are eligible for platform overflow.
+  // Within one conversation a second send is still refused (the two turns
+  // would race the same transcript).
   const [liveMap, setLiveMap] = useState<Map<string, LiveGen>>(() => new Map());
   // The AUTHORITATIVE record of what is running; `liveMap` above only drives
   // rendering. The guard in generate() used to read React state, i.e. whatever
@@ -448,6 +449,13 @@ export default function Chat(props: {
   // setting the local value names a model nothing is running. Older engines do
   // not report one at all — then "selected" is all we can honestly say.
   const shownModel = served ?? { id: props.modelId, label: props.modelLabel, quant: props.quant };
+  // Precision fallback (2026-08-25, user request): older coordinators (and any
+  // GGUF whose file name is not in the variant table) report quant as "", and
+  // the chip silently dropped it. When the served id IS the model this client
+  // launched, the launch precision is a fact we hold first-hand — the client
+  // resolved the GGUF from it — so showing it is honest. A served id that
+  // differs from the setting keeps "", never a guess.
+  if (!shownModel.quant && shownModel.id === props.modelId) shownModel.quant = props.quant;
   // No mismatch warning on the chip any more (2026-08-15): selecting a model
   // IS the switch, everywhere — the setting and the served model can only
   // disagree for the moments a rebuild is in flight.
@@ -543,6 +551,25 @@ export default function Chat(props: {
     // conversation you are not reading changes nothing about this scroller, and
     // re-pinning on it would fight the reader for no reason.
   }, [msgs, liveHere]);
+
+  // The scroller has zero layout size while the page is hidden. Returning to
+  // Chat therefore needs one post-layout pin even when the stream finished on
+  // another page and no further message update will fire the effect above.
+  // Keeping the component mounted is what preserves the stream; this effect is
+  // what makes the completed/continuing reply immediately visible on return.
+  const wasVisibleRef = useRef(props.visible);
+  useEffect(() => {
+    const returned = props.visible && !wasVisibleRef.current;
+    wasVisibleRef.current = props.visible;
+    if (!returned) return;
+    stickRef.current = true;
+    setAtBottom(true);
+    const raf = requestAnimationFrame(() => {
+      const el = scrollRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [props.visible]);
 
   /** Re-arm following and go there. */
   const jumpToLatest = () => {
@@ -896,7 +923,11 @@ export default function Chat(props: {
   // send. The old behaviour replaced the whole view with "go start a cluster",
   // which read as "your conversations are gone".
   return (
-    <main className="main chat chat--withbar">
+    <main
+      className="main chat chat--withbar"
+      hidden={!props.visible}
+      aria-hidden={!props.visible}
+    >
       <aside className="chatbar">
         {/* Switching and starting conversations stay live during a generation.
             They used to be disabled by `busy`, which on a LAN cluster meant the

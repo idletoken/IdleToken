@@ -24,15 +24,15 @@ This tool has three modes:
       + shared + those layers). This is exactly what the C fetcher pulls over
       HTTP range requests; kept here so the logic has one source of truth.
 
-The quant block geometry table is copied verbatim from ds4.c gguf_types[] so the
-byte sizes are byte-exact.
+The quant block geometry table follows the pinned llama.cpp ggml_type enum so
+the byte sizes are byte-exact.
 """
 import json
 import os
 import struct
 import sys
 
-# (block_elems, block_bytes) per GGUF tensor type id — verbatim from ds4.c.
+# (block_elems, block_bytes) per GGUF tensor type id — pinned llama.cpp.
 GGUF_TYPES = {
     0: (1, 4), 1: (1, 2), 2: (32, 18), 3: (32, 20), 6: (32, 22), 7: (32, 24),
     8: (32, 34), 9: (32, 40), 10: (256, 84), 11: (256, 110), 12: (256, 144),
@@ -40,6 +40,8 @@ GGUF_TYPES = {
     18: (256, 98), 19: (256, 110), 20: (256, 50), 21: (256, 110), 22: (256, 82),
     23: (256, 136), 24: (1, 1), 25: (1, 2), 26: (1, 4), 27: (1, 8), 28: (1, 8),
     29: (256, 56), 30: (1, 2),
+    34: (256, 54), 35: (256, 66),
+    39: (32, 17), 40: (64, 36), 41: (128, 18), 42: (64, 18),
 }
 
 # GGUF metadata value types.
@@ -244,15 +246,17 @@ def cmd_ranges(argv):
 
 def cmd_idx(argv):
     """C-friendly line-based manifest for the worker's fetcher (no JSON parse in
-    C). Line 1: `file_size tensor_data_pos n_tensors`. Then one line per tensor:
-    `layer offset bytes` (layer -1 = shared/global)."""
+    C). Line 1: `file_size tensor_data_pos n_tensors version`. Then one line per
+    tensor: `layer offset bytes name` (layer -1 = shared/global). Version 2 adds
+    the name so ggml-RPC can resolve a pre-seeded local tensor without reading
+    its bytes on the coordinator."""
     man = parse_gguf(argv[0])
     out = None
     if len(argv) >= 3 and argv[1] == "-o":
         out = argv[2]
-    lines = [f"{man['file_size']} {man['tensor_data_pos']} {man['n_tensors']}"]
+    lines = [f"{man['file_size']} {man['tensor_data_pos']} {man['n_tensors']} 2"]
     for t in man["tensors"]:
-        lines.append(f"{t['layer']} {t['offset']} {t['bytes']}")
+        lines.append(f"{t['layer']} {t['offset']} {t['bytes']} {t['name']}")
     text = "\n".join(lines) + "\n"
     if out:
         with open(out, "w") as f:

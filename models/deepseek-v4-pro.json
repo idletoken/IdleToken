@@ -11,7 +11,7 @@
   "release": "0813",
   "n_layers": 61,
   "n_embd": 7168,
-  "hc_streams": 1,
+  "hc_streams": 4,
   "n_vocab": 129280,
   "layer_weight_bytes": 569417385408,
   "shared_weight_bytes": 0,
@@ -21,9 +21,21 @@
   },
   "kv": {
     "kind": "dsv4",
-    "bytes_per_token_per_layer": 0
+    "bytes_per_token_per_layer": 0,
+    "raw_bytes_per_cell": 62464,
+    "csa_bytes_per_cell": 38400,
+    "hca_bytes_per_cell": 31744,
+    "fixed_bytes_per_sequence": 18710528
+  },
+  "moe": {
+    "n_expert": 384,
+    "n_expert_used": 6
   },
   "overhead_base_bytes": 3221225472,
+  "compute_bytes_256k_cuda": 719679652,
+  "compute_bytes_1m_cuda": 1948610724,
+  "compute_bytes_256k_metal": 1131245732,
+  "compute_bytes_1m_metal": 2948165796,
   "default_gguf": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00001-of-00037.gguf",
   "chat_template": "ds4",
   "sources": [
@@ -50,7 +62,7 @@
   ],
   "default_quant": "Q2_K",
   "notes": [
-    "Cluster-tier model: the smallest published quant is ~791 GiB, so it needs a sizable cluster. 671B/37B-active, 61 layers, arch deepseek4 — a different model from Flash, read by the pinned llama.cpp.",
+    "Cluster-tier model: the smallest published quant is Q2_K at ~530 GiB (791 GiB is only the smallest unsloth dynamic quant), so it needs a sizable cluster. 671B/37B-active, 61 layers, arch deepseek4 — a different model from Flash, read by the pinned llama.cpp.",
     "Every number above is measured metadata: byte counts, sha256 digests and the revision come from the HF API and from HTTP Range reads of the GGUF headers (unsloth/DeepSeek-V4-Pro-0813-GGUF).",
     "Geometry is read from the model's own config.json and GGUF header: 671B total / 37B active, 61 decode layers, n_embd 7168, MLA KV. This is a DIFFERENT model from DeepSeek-V4-Flash (304B, 43 layers), not another precision of it.",
     "The notes that used to sit here were copied wholesale from deepseek-v4-flash.json and described that model instead -- its 43 blocks, its compress_ratios, and a DSpark draft module that belongs to Flash and targets layers 40/41/42 of a 43-layer stack. The `speculative` block carrying those same Flash values was removed for the same reason: it was never measured against this model, and it has no consumer outside the frozen ds4 tree. `release` said 0731 (Flash's date); the Pro build is 0813, as the GGUF filenames say."

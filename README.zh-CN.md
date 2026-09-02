@@ -48,8 +48,8 @@ OpenAI 兼容接口使用同一地址。请求运行在他人分享的集群上�
 
 IdleToken 是一个桌面客户端，日常使用不需要命令行。Windows、Linux 和 macOS 安装包见 [Releases](https://github.com/idletoken/IdleToken/releases) 页面。
 
-1. **选一个模型**——从内置列表中选择。客户端会根据本机可用显存和内存判断能否运行。
-2. **启动服务**——缺少的权重自动下载。API 监听 `127.0.0.1:8000`，仅本机可达；客户端会显示地址和生成的 API key。
+1. **选择模型和上下文**——从内置列表中选择。上下文默认精确为 256K；支持长上下文的模型可显式勾选 1M。客户端只用可用显存估算所选服务。
+2. **启动服务**——缺少的权重自动下载。API 监听 `127.0.0.1:8000`，仅本机可达；客户端会显示这个地址。它不需要密钥：只绑 loopback 的端口本来就没有外部可达性，而存在本机上的密钥挡不住已经跑在本机上的程序。（带 `Origin` 头的请求会被拒绝，浏览器里的网页因此打不了这个端口；确实想要密钥就给协调器设 `--api-token`。）
 
 权重从 Hugging Face 获取。若 `huggingface.co` 连不上，客户端不会直接失败，而是改从镜像 `hf-mirror.com` 重试同一个文件——如果你在意字节来自哪里，这条兜底值得知道。两种来源下，下载完成的文件都会先与 manifest 里记录的 SHA-256 比对，对不上就丢弃。
 
@@ -57,7 +57,7 @@ Claude Code 接入：
 
 ```sh
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8000
-export ANTHROPIC_API_KEY='<IdleToken 中显示的 key>'
+export ANTHROPIC_API_KEY=idletoken   # 填任意值即可，本机 API 不校验
 claude
 ```
 
@@ -65,12 +65,14 @@ claude
 
 ```sh
 curl http://127.0.0.1:8000/v1/chat/completions \
-  -H 'authorization: Bearer <IdleToken 中显示的 key>' \
   -H 'content-type: application/json' \
   -d '{"model":"qwen3-8b","messages":[{"role":"user","content":"你好"}]}'
 ```
 
-单机装不下的模型，可由同一局域网内的多台机器共同运行。在一台机器上创建集群，其余机器用六位验证码或同一账号加入；IdleToken 会探测各机可用内存并切分模型。Windows、Linux、macOS 节点可混合组网，所有节点须运行相同版本的 IdleToken。工作节点经加密连接从 API 所在机器获取模型分片，prompt 不会以明文跨节点传输。
+`GET /v1/models` 会报出本机此刻正在服务的那一个模型——它的 id 就是各类客户端配置里
+要填的模型名。
+
+同一局域网内的多台机器可共同运行模型。联机部署是默认选择，用户仍可显式强制仅在本机运行。IdleToken 会用各节点可用显存校验精确的模型、精度与 256K/1M 上下文；完整服务放不下就拒绝启动，不使用 CPU/内存卸载，也不会自动缩短上下文。Windows、Linux、macOS 节点可混合组网，所有节点须运行相同版本的 IdleToken。工作节点经加密连接从 API 所在机器获取模型分片，prompt 不会以明文跨节点传输。
 
 集群闲置时可打开共享赚取火花；共享默认关闭。
 

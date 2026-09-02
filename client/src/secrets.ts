@@ -26,6 +26,23 @@ function inTauri(): boolean {
  *  the migration below can find what previous versions wrote. */
 export const SESSION_KEY = "idletoken.auth.session";
 
+/**
+ * The platform agent's own, scope-restricted token (2026-08-30, threat register
+ * HOST-03/HOST-04/CHAIN-01).
+ *
+ * Until now the agent was handed the FULL console JWT, which can move credits,
+ * mint API keys and issue cluster-join credentials. It only ever calls
+ * `/providers*`, so it now gets a `scope=agent` token instead — same store, same
+ * 0600 file, but stealing it is worth far less. Kept separate from the session
+ * so signing out clears both and neither can be mistaken for the other.
+ */
+export const AGENT_TOKEN_KEY = "idletoken.platform.agentToken";
+
+/** Everything this module keeps. `clearAllSecrets` and the dev-build read path
+ *  both iterate it, so a new credential cannot be added and then forgotten by
+ *  one of them. */
+const ALL_KEYS = [SESSION_KEY, AGENT_TOKEN_KEY];
+
 let cache: Record<string, string> = {};
 let hydrated = false;
 
@@ -48,7 +65,7 @@ export async function hydrateSecrets(): Promise<void> {
   hydrated = true;
   if (!inTauri()) {
     // Browser dev build: localStorage is the store, read it as-is.
-    for (const k of [SESSION_KEY]) {
+    for (const k of ALL_KEYS) {
       const v = localStorage.getItem(k);
       if (v) cache[k] = v;
     }
@@ -59,7 +76,7 @@ export async function hydrateSecrets(): Promise<void> {
   } catch {
     cache = {};
   }
-  for (const k of [SESSION_KEY]) {
+  for (const k of ALL_KEYS) {
     const legacy = localStorage.getItem(k);
     if (!legacy) continue;
     if (!cache[k]) {
@@ -95,4 +112,31 @@ export function setSecret(key: string, value: string): void {
 
 export function clearSecret(key: string): void {
   setSecret(key, "");
+}
+
+/**
+ * Remove every credential this module keeps, on the host and in localStorage.
+ *
+ * Signing out used to drop only the session, leaving the agent token (and, in
+ * upgraded installs, whatever a previous version had written to localStorage)
+ * on disk. "Signed out" has to mean the machine no longer holds anything that
+ * speaks for the account — otherwise the reassuring UI state and the bytes on
+ * disk disagree, which is precisely the gap threat register HOST-02/HOST-04
+ * describes.
+ *
+ * The host call is awaited-but-not-required: the in-memory cache and
+ * localStorage are cleared first, so a failed IPC leaves a stale file rather
+ * than a live in-process credential.
+ */
+export function clearAllSecrets(): void {
+  cache = {};
+  for (const k of ALL_KEYS) {
+    try {
+      localStorage.removeItem(k);
+    } catch {
+      /* private mode / no storage: nothing to remove */
+    }
+  }
+  if (!inTauri()) return;
+  void invoke("secrets_clear").catch(() => {});
 }

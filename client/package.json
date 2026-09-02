@@ -1,13 +1,13 @@
 {
   "name": "idletoken-client",
-  "version": "0.1.24",
+  "version": "0.1.35",
   "private": true,
   "description": "IdleToken desktop/mobile client — Tauri v2 shell over a decoupled web frontend that drives the native inference engine as a sidecar.",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "build:release": "tsc && vite build --mode release",
+    "build:release": "tsc && vite build --mode release && node scripts/write_frontend_provenance.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },

@@ -155,12 +155,37 @@ textarea {
 
 /* ---- top bar ------------------------------------------------------------- */
 .topbar {
-  display: flex;
-  align-items: center;
-  gap: 16px;
+  container-type: inline-size;
   padding: 18px clamp(18px, 4vw, 40px);
   border-bottom: 1px solid var(--line);
   flex: none; /* chrome keeps its height; the content pane absorbs the rest */
+}
+
+.topbar__layout {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+/* Keep the brand/navigation and global actions as two explicit layout units.
+   Previously the brand itself was the first flex item allowed to shrink. Its
+   box became narrower during a resize while the wordmark kept painting at its
+   natural width, so it visibly crossed into the Chat button. */
+.topbar__primary,
+.topbar__actions {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-width: 0;
+}
+
+.topbar__primary {
+  flex: none;
+}
+
+.topbar__actions {
+  flex: none;
+  margin-left: auto;
 }
 
 .brand {
@@ -168,7 +193,7 @@ textarea {
   align-items: center;
   gap: 12px;
   margin-right: auto;
-  min-width: 0;
+  flex: none;
 }
 
 .brand__mark {
@@ -225,11 +250,40 @@ textarea {
   border-color: var(--amber);
 }
 
+.pill:disabled {
+  opacity: 0.48;
+  cursor: default;
+}
+
+.topbar__market-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+.pill--market {
+  /* Both marketplace controls keep the same footprint through label and
+     state changes; otherwise the longer overflow label flexes by itself as
+     the window is resized. */
+  width: 128px;
+  min-width: 128px;
+  flex: 0 0 128px;
+}
+
 .pill__dot {
   width: 8px;
   height: 8px;
+  flex: none;
   border-radius: 50%;
   background: var(--ink-faint);
+}
+
+.pill__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .pill--standalone .pill__dot {
@@ -1003,11 +1057,9 @@ textarea {
   white-space: nowrap;
 }
 
-/* Weight status. Rendered inside two different flex rows — the model option in
-   Settings and the "run on this machine" row on Cluster — so it claims a full
-   line of its own in both (each host row already has content pushed to the
-   right that it must not fight with). This is where the old floating banner's
-   content went. */
+/* Weight status belongs to a model row and claims one full line below that
+   model's identity. Deployment choices consume readiness; they do not repeat
+   this control. */
 .wrow {
   flex-basis: 100%;
   display: flex;
@@ -2015,6 +2067,8 @@ textarea {
      shrink and truncate rather than push the buttons off-screen */
   .topbar {
     padding: 16px 14px;
+  }
+  .topbar__layout {
     gap: 9px;
   }
   .pill {
@@ -2022,6 +2076,15 @@ textarea {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .topbar__market-actions {
+    gap: 6px;
+  }
+  .topbar__market-actions .pill {
+    width: 112px;
+    min-width: 112px;
+    flex-basis: 112px;
+    max-width: 112px;
   }
   .brand {
     min-width: 0;
@@ -2686,10 +2749,24 @@ textarea {
   margin-top: 14px;
 }
 
-/* this-machine strip: one dense row of probe facts */
-/* Two rows, two columns (2026-08-15): GPU over CPU threads on the left, the
-   VRAM bar over the RAM bar on the right — the two memory bars stack so their
-   scales read together. */
+.cluster-start-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.cluster-start-actions--modal {
+  margin-top: 4px;
+}
+
+.cluster-start-actions .cluster-start {
+  min-height: 46px;
+  margin-top: 0;
+}
+
+/* This-machine strip: serving capacity is GPU-only, so the card shows only the
+   accelerator identity and its available VRAM. */
 .node-strip {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);
@@ -2879,6 +2956,36 @@ textarea {
   margin-left: auto;
 }
 
+/* The checkbox and the Change link BOTH take an auto margin, so the free space
+   splits evenly and the checkbox lands between the model name and the link
+   rather than crowding the link. (It was adjacent to Change for one revision;
+   that read as the two belonging together, which they do not — one is a
+   setting, the other is a navigation affordance.) */
+.cluster-model__longctx {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  color: var(--ink);
+  cursor: pointer;
+}
+
+/* Secondary to the model name (15px) it sits beside: this is one optional knob,
+   not the headline of the row. At the inherited 16px it read as the loudest
+   text on the card. */
+.cluster-model__longctx > span {
+  font-size: 13px;
+}
+
+.cluster-model__longctx input {
+  margin: 0;
+}
+
+.cluster-model__longctx.is-disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 /* ---- model picker popover -------------------------------------------------
    Anchored under whatever displays the current model (the chat header chip, the
    cluster card's model row), so the choice is made where the fact is shown. */
@@ -2905,7 +3012,7 @@ textarea {
 
 .modelpick__item {
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: 1fr;
   gap: 2px 10px;
   width: 100%;
   padding: 8px 10px;
@@ -2934,8 +3041,7 @@ textarea {
   color: var(--ink);
 }
 
-.modelpick__params,
-.modelpick__deploy {
+.modelpick__params {
   font-size: 11.5px;
   color: var(--ink-dim);
 }
@@ -2986,12 +3092,6 @@ textarea {
   padding: 0 10px;
   font-size: 11px;
   color: var(--ink-dim);
-}
-
-.modelpick__deploy {
-  grid-column: 2;
-  grid-row: 1;
-  text-align: right;
 }
 
 .modelpick__quant {
@@ -3301,6 +3401,14 @@ textarea {
   min-height: 0;
   padding-bottom: 24px;
   max-width: 860px; /* conventional readable thread column, not full width */
+}
+
+/* Navigation hides Chat without unmounting it: live native event listeners
+   must keep receiving tokens while Cluster or Settings is on screen. Keep this
+   explicit even though browsers normally map the hidden attribute to none —
+   .chat's author-level display:flex must never win that cascade. */
+.chat[hidden] {
+  display: none !important;
 }
 
 /* With the conversation sidebar the page owns the full width; the thread keeps
@@ -3962,8 +4070,7 @@ textarea {
 }
 
 /* ---- top-nav (2026-07-25: sidebar → topbar, matches portal pv-topnav) ---- */
-.brand { margin-right: 8px; }         /* override the old margin-right:auto; spacer now pushes controls right */
-.topbar__spacer { flex: 1 1 auto; }
+.brand { margin-right: 8px; }
 .topnav {
   display: flex;
   align-items: center;
@@ -3997,10 +4104,93 @@ textarea {
 .topnav__item:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
 .topnav__icon { width: 18px; height: 18px; flex: none; }
 
-/* Narrow windows: icon-only nav keeps the places one tap away. */
-@media (max-width: 760px) {
-  .topnav__label { display: none; }
-  .topnav__item { padding: 8px 9px; min-width: 0; } /* no label left to reserve for */
+/* Compact before any fixed-width chrome can press into its neighbour. Text is
+   visually hidden rather than removed so every icon-only control keeps its
+   accessible name. The breakpoint also covers the 1.1x auto-scale band: CSS
+   zoom consumes layout room while media queries still see the window width. */
+@container (max-width: 1500px) {
+  .topnav__label,
+  .pill__label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .topnav__item {
+    min-width: 36px;
+    width: 36px;
+    padding: 8px 9px;
+  }
+
+  .pill,
+  .pill--market,
+  .topbar__market-actions .pill {
+    width: 36px;
+    min-width: 36px;
+    max-width: 36px;
+    flex: 0 0 36px;
+    padding-inline: 8px;
+  }
+
+  .acct__btn {
+    max-width: 160px;
+  }
+
+  .spark-balance-pill {
+    max-width: 128px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+}
+
+@container (max-width: 900px) {
+  .brand__name {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .brand__mark {
+    gap: 0;
+  }
+
+  .acct__btn {
+    max-width: 104px;
+  }
+}
+
+/* At phone width there is no honest one-row arrangement for six global
+   actions. Give the action group its own line and let that line wrap instead
+   of allowing flex overflow to stack controls on top of one another. */
+@container (max-width: 700px) {
+  .topbar__layout {
+    flex-wrap: wrap;
+    row-gap: 8px;
+  }
+
+  .topbar__primary,
+  .topbar__actions {
+    width: 100%;
+    gap: 9px;
+  }
+
+  .topbar__actions {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    margin-left: 0;
+  }
 }
 
 /* Hardware floor notice (engine `idletoken_hw_check`). Deliberately loud: a

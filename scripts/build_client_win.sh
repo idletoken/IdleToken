@@ -60,10 +60,19 @@ WHOME="$(testbed_repo_home "$NODE")"
 
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=10"
 WIN="${WHOME//\//\\}"                       # C:/Users/x/IdleToken -> C:\Users\x\IdleToken
-TRIPLE=$($SSH "$NODE" 'rustc -vV' 2>/dev/null | tr -d '\r' | awk '/^host:/{print $2}')
+RUST_TOOLCHAIN=
+if $SSH "$NODE" 'where link.exe >NUL 2>&1' >/dev/null 2>&1; then
+    TRIPLE=$($SSH "$NODE" 'rustc -vV' 2>/dev/null | tr -d '\r' | awk '/^host:/{print $2}')
+else
+    TRIPLE=$($SSH "$NODE" 'rustup run stable-x86_64-pc-windows-gnu rustc -vV' 2>/dev/null | tr -d '\r' | awk '/^host:/{print $2}')
+    RUST_TOOLCHAIN=+stable-x86_64-pc-windows-gnu
+fi
 [ -n "$TRIPLE" ] || fail "could not read the rustc host triple on $NODE (is Rust installed?)"
 
 echo "== [1/4] build the web assets locally ($MODE mode) =="
+resource_out=$(scripts/resource_estimate_gate.sh 2>&1) \
+    || fail "native/client resource estimates disagree: $(echo "$resource_out" | tail -2 | tr '\n' ' ')"
+echo "   $(echo "$resource_out" | tail -1)"
 # Clean first for the same reason the remote one is deleted: hashed filenames
 # accumulate, and a stale bundle in dist/ ends up inside the installer.
 rm -rf client/dist
@@ -138,6 +147,51 @@ stage_win "$LLAMA_DIR\\ggml-rpc-server.exe"    idletoken-rpc-server
 $SSH "$NODE" "del /q \"$BIN\\ggml-rpc-server-$TRIPLE.exe\" \"$BIN\\llama-server-$TRIPLE.exe\" 2>NUL" >/dev/null 2>&1
 $SSH "$NODE" "dir \"$BIN\\*.exe\"" 2>/dev/null | tr -d '\r' | grep -E '\.exe' | sed 's/^/   /'
 
+# The pinned Windows llama.cpp build links the CUDA 12 runtime dynamically.
+# A display driver does not install these DLLs, so stage the exact runtime next
+# to the debug sidecars as part of the same standard build. The release path
+# consumes this same runtime/windows directory through tauri.windows.conf.json.
+RUNTIME="$WIN\\client\\src-tauri\\runtime\\windows"
+$SSH "$NODE" "if not exist \"$RUNTIME\" mkdir \"$RUNTIME\"" >/dev/null 2>&1
+# externalBin bundles the executable but not a sibling digest. Stage hashes as
+# explicit Windows resources under the FINAL installed names so shared mode can
+# verify the engines after a real install, not only in the build directory.
+for engine in idletoken-server idletoken-rpc-server; do
+    $SSH "$NODE" "powershell -NoProfile -Command \"\$h=(Get-FileHash '$BIN\\$engine-$TRIPLE.exe' -Algorithm SHA256).Hash.ToLower(); Set-Content -Encoding ascii '$RUNTIME\\$engine.exe.sha256' (\$h + '  $engine.exe')\"" >/dev/null 2>&1 \
+        || fail "could not record the $engine.exe digest on $NODE"
+done
+$SSH "$NODE" "del /q \"$RUNTIME\\ds4cuda.dll\" \"$RUNTIME\\ds4xcuda.dll\" 2>NUL" >/dev/null 2>&1
+CUDA_RUNTIME_DIR=
+for d in '%IDLETOKEN_CUDA_RUNTIME_DIR%' '%CUDA_PATH%\bin' '%LOCALAPPDATA%\IdleToken'; do
+    if $SSH "$NODE" "if exist \"$d\\cudart64_12.dll\" (exit 0) else (exit 1)" >/dev/null 2>&1; then
+        CUDA_RUNTIME_DIR=$d
+        break
+    fi
+done
+[ -n "$CUDA_RUNTIME_DIR" ] || fail "no CUDA 12 runtime on $NODE (set IDLETOKEN_CUDA_RUNTIME_DIR there)"
+for dll in cudart64_12.dll cublas64_12.dll cublasLt64_12.dll; do
+    $SSH "$NODE" "copy /Y \"$CUDA_RUNTIME_DIR\\$dll\" \"$RUNTIME\\$dll\"" >/dev/null 2>&1 \
+        || fail "could not stage $dll from $CUDA_RUNTIME_DIR on $NODE"
+done
+$SSH "$NODE" "copy /Y \"%SystemRoot%\\System32\\vcomp140.dll\" \"$RUNTIME\\vcomp140.dll\"" >/dev/null 2>&1 \
+    || fail "could not stage vcomp140.dll from System32 on $NODE"
+
+# webview2-com-sys 0.38.2 is the version locked in Cargo.lock. Its GNU build
+# links WebView2Loader dynamically; Tauri validates configured resource paths
+# before cargo can produce any target output, so source it from the locked
+# crate's own x64 payload and stage it before the build.
+WEBVIEW2_LOADER=$($SSH "$NODE" 'for /d %D in ("%USERPROFILE%\.cargo\registry\src\*") do @if exist "%~fD\webview2-com-sys-0.38.2\x64\WebView2Loader.dll" @echo %~fD\webview2-com-sys-0.38.2\x64\WebView2Loader.dll' 2>/dev/null | tr -d '\r' | tail -1)
+[ -n "$WEBVIEW2_LOADER" ] || fail "no webview2-com-sys 0.38.2 x64 WebView2Loader.dll in the Cargo registry on $NODE (must match Cargo.lock)"
+$SSH "$NODE" "copy /Y \"$WEBVIEW2_LOADER\" \"$RUNTIME\\WebView2Loader.dll\"" >/dev/null 2>&1 \
+    || fail "could not stage WebView2Loader.dll from the locked Cargo crate on $NODE"
+
+echo "== Windows Unicode path gate (native socket/model/cache/key paths) =="
+unicode_out=$($SSH "$NODE" "cd /d $WIN && powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\windows_unicode_path_gate.ps1 -RepoRoot \"$WIN\"" 2>&1 | tr -d '\r')
+case "$unicode_out" in
+    *WINDOWS_UNICODE_PATH_OK*) echo "   WINDOWS_UNICODE_PATH_OK" ;;
+    *) echo "$unicode_out" | tail -12 | sed 's/^/   /'; fail "Windows Unicode path gate failed on $NODE" ;;
+esac
+
 if [ "$MODE" = debug ]; then
     echo "== [4/4] cargo build (debug shell for the product gates) =="
     # Plain cargo build, not `tauri build`: no bundling, and nothing runs
@@ -148,7 +202,7 @@ if [ "$MODE" = debug ]; then
     # a dead localhost address, the front end never starts, and every UI-test
     # directive silently produces nothing. That is what `tauri dev` turns on for
     # you and what a plain `cargo build` does not.
-    out=$($SSH "$NODE" "cd /d $WIN\\client\\src-tauri && cargo build --features custom-protocol" 2>&1 | tr -d '\r')
+    out=$($SSH "$NODE" "cd /d $WIN\\client\\src-tauri && cargo $RUST_TOOLCHAIN build --features custom-protocol" 2>&1 | tr -d '\r')
     echo "$out" | tail -4 | sed 's/^/   /'
     EXE="$WHOME/client/src-tauri/target/debug/idletoken-client.exe"
     size=$($SSH "$NODE" "for %I in (\"${EXE//\//\\}\") do @echo %~zI" 2>/dev/null | tr -d '\r' | tail -1)
@@ -163,17 +217,11 @@ if [ "$MODE" = debug ]; then
         *"os error 5"*) fail "cargo could not replace the binary — a client is still running on $NODE (taskkill /IM idletoken-client.exe /F)" ;;
         *) fail "cargo build did not finish on $NODE (see the tail above)" ;;
     esac
-    # The existence of the file proves nothing: a running client holds a lock on
-    # it, cargo fails with "Access is denied (os error 5)", and the OLD binary
-    # is still sitting there at its old size. This gate then certifies a build
-    # that predates the change under test — the exact failure this repo has
-    # already had once with a three-week-old exe. Cargo says "Finished" only
-    # when it really linked, so that is what is checked.
-    case "$out" in
-        *Finished*) ;;
-        *"os error 5"*) fail "cargo could not replace the binary — a client is still running on $NODE (taskkill /IM idletoken-client.exe /F)" ;;
-        *) fail "cargo build did not finish on $NODE (see the tail above)" ;;
-    esac
+    # cargo copies externalBin sidecars beside the debug shell. Put their DLL
+    # dependencies and integrity digests there too, then delete stale artifacts.
+    TARGET="$WIN\\client\\src-tauri\\target\\debug"
+    $SSH "$NODE" "copy /Y \"$RUNTIME\\*.dll\" \"$TARGET\\\" >NUL && copy /Y \"$RUNTIME\\*.sha256\" \"$TARGET\\\" >NUL && del /q \"$TARGET\\ds4cuda.dll\" \"$TARGET\\ds4xcuda.dll\" \"$TARGET\\llama-server.exe\" \"$TARGET\\ggml-rpc-server.exe\" 2>NUL" >/dev/null 2>&1 \
+        || fail "could not stage the Windows runtime beside the debug client"
     echo "CLIENT_WIN_DEBUG_OK $NODE:$EXE ($size bytes)"
     exit 0
 fi
@@ -219,11 +267,11 @@ SIGN_ENV="set \"TAURI_SIGNING_PRIVATE_KEY=$KEY_MATERIAL\" && set \"TAURI_SIGNING
 # The override lives on the machine only for the duration of the build.
 printf '{"build":{"beforeBuildCommand":""}}' > /tmp/idletoken-nobuild.json
 scp -q /tmp/idletoken-nobuild.json "$NODE:$WHOME/client/src-tauri/nobuild.conf.json" || fail "could not ship the config override"
-out=$($SSH "$NODE" "cd /d $WIN\\client && ${SIGN_ENV}cargo tauri build --bundles nsis --config src-tauri\\nobuild.conf.json" 2>&1 | tr -d '\r')
+out=$($SSH "$NODE" "cd /d $WIN\\client && ${SIGN_ENV}cargo $RUST_TOOLCHAIN tauri build --bundles nsis --config src-tauri\\nobuild.conf.json" 2>&1 | tr -d '\r')
 echo "$out" | tail -4 | sed 's/^/   /'
 $SSH "$NODE" "del /q \"$WIN\\client\\src-tauri\\nobuild.conf.json\"" >/dev/null 2>&1
 
-SETUP="$WHOME/client/src-tauri/target/release/bundle/nsis/IdleToken_0.1.0_x64-setup.exe"
+SETUP=$($SSH "$NODE" "powershell -NoProfile -Command \"Get-ChildItem '$WHOME/client/src-tauri/target/release/bundle/nsis' -Filter '*-setup.exe' | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName\"" 2>/dev/null | tr -d '\r' | tail -1)
 size=$($SSH "$NODE" "for %I in (\"${SETUP//\//\\}\") do @echo %~zI" 2>/dev/null | tr -d '\r' | tail -1)
 case "$size" in ''|*[!0-9]*) fail "no installer produced (see the tail above)" ;; esac
 

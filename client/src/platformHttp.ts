@@ -1,3 +1,5 @@
+import { version as OFFICIAL_CLIENT_VERSION } from "../package.json";
+
 // One way out to the platform gateway, for every caller in the client.
 //
 // Why not just `fetch` (2026-08-21): the webview's origin is `tauri://localhost`
@@ -37,6 +39,13 @@ export interface PlatformReply {
 export class PlatformNetworkError extends Error {}
 
 export const PLATFORM_TIMEOUT_MS = 20_000;
+export const IDLETOKEN_VERSION_HEADER = "X-IdleToken-Version";
+
+// Compatibility metadata, not an authenticator.  package.json is the existing
+// browser-build version source; the release gate already requires it to agree
+// with Cargo and Tauri metadata.  A modified client can copy this value, so the
+// gateway must never use it to grant authority or trust.
+export const PLATFORM_CLIENT_VERSION = OFFICIAL_CLIENT_VERSION;
 
 export async function platformRequest(
   url: string,
@@ -68,6 +77,7 @@ export async function platformRequest(
     const res = await fetch(url, {
       method,
       headers: {
+        [IDLETOKEN_VERSION_HEADER]: PLATFORM_CLIENT_VERSION,
         ...(init?.body ? { "content-type": "application/json" } : {}),
         ...(init?.bearer ? { authorization: `Bearer ${init.bearer}` } : {}),
       },

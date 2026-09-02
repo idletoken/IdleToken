@@ -1,0 +1,112 @@
+diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
+index ed572da..df9bcc6 100644
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -615,6 +615,56 @@ struct llama_mmap::impl {
+ 
+     void * addr;
+     size_t size;
++
++    void prefetch_fragment(size_t first, size_t last) {
++        first = std::min(first, size);
++        last  = std::min(last,  size);
++        if (first >= last) {
++            return;
++        }
++
++#if defined(_WIN32) && _WIN32_WINNT >= 0x602
++        BOOL (WINAPI *pPrefetchVirtualMemory) (HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
++        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
++        pPrefetchVirtualMemory = (decltype(pPrefetchVirtualMemory))(void *)
++            GetProcAddress(hKernel32, "PrefetchVirtualMemory");
++        if (pPrefetchVirtualMemory) {
++            WIN32_MEMORY_RANGE_ENTRY range;
++            range.VirtualAddress = (uint8_t *) addr + first;
++            range.NumberOfBytes  = (SIZE_T) (last - first);
++            if (!pPrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0)) {
++                LLAMA_LOG_WARN("warning: sparse PrefetchVirtualMemory failed: %s\n",
++                        llama_format_win_err(GetLastError()).c_str());
++            }
++        }
++#elif defined(_POSIX_MAPPED_FILES)
++        if (posix_madvise((uint8_t *) addr + first, last - first, POSIX_MADV_WILLNEED)) {
++            LLAMA_LOG_WARN("warning: sparse posix_madvise(.., POSIX_MADV_WILLNEED) failed: %s\n",
++                    strerror(errno));
++        }
++#endif
++
++        // The platform prefetch calls are advisory. Touch one byte per page so
++        // READY is not published until every local mmap page is resident. The
++        // volatile accesses are deliberate and must not be optimized away.
++#if defined(_WIN32)
++        SYSTEM_INFO si;
++        GetSystemInfo(&si);
++        const size_t page_size = si.dwPageSize;
++#elif defined(_SC_PAGESIZE)
++        const long page_size_raw = sysconf(_SC_PAGESIZE);
++        const size_t page_size = page_size_raw > 0 ? (size_t) page_size_raw : 4096;
++#else
++        const size_t page_size = 4096;
++#endif
++        const volatile uint8_t * data = (const volatile uint8_t *) addr;
++        volatile uint8_t sink = 0;
++        for (size_t off = first; off < last; off += page_size) {
++            sink ^= data[off];
++        }
++        sink ^= data[last - 1];
++        GGML_UNUSED(sink);
++    }
+ };
+ 
+ llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa) : pimpl(std::make_unique<impl>(file, prefetch, numa)) {}
+@@ -623,6 +673,7 @@ llama_mmap::~llama_mmap() = default;
+ size_t llama_mmap::size() const { return pimpl->size; }
+ void * llama_mmap::addr() const { return pimpl->addr; }
+ 
++void llama_mmap::prefetch_fragment(size_t first, size_t last) { pimpl->prefetch_fragment(first, last); }
+ void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
+ 
+ #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
+diff --git a/src/llama-mmap.h b/src/llama-mmap.h
+index b7d5c61..d445bb1 100644
+--- a/src/llama-mmap.h
++++ b/src/llama-mmap.h
+@@ -48,6 +48,10 @@ struct llama_mmap {
+     size_t size() const;
+     void * addr() const;
+ 
++    // Make one retained part of a sparse mapping resident before inference.
++    // Unlike the constructor's prefetch argument, this never touches model
++    // ranges assigned to another RPC node.
++    void prefetch_fragment(size_t first, size_t last);
+     void unmap_fragment(size_t first, size_t last);
+ 
+     static const bool SUPPORTED;
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 9b22cb0..a150181 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1538,6 +1538,9 @@ bool llama_model_loader::load_all_data(
+             ggml_backend_name(upload_backend));
+     }
+ 
++    const char * require_rpc_cache = std::getenv("GGML_RPC_REQUIRE_MODEL_CACHE");
++    const bool prefetch_sparse_local = use_mmap && require_rpc_cache != nullptr && strcmp(require_rpc_cache, "0") != 0;
++
+     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
+         const auto * weight = get_weight(ggml_get_name(cur));
+         if (weight == nullptr) {
+@@ -1570,6 +1573,13 @@ bool llama_model_loader::load_all_data(
+             GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
+             if (buf_mmap && cur->data == nullptr) {
+                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
++                // Whole-file prefetch is disabled for an IdleToken cluster so
++                // the coordinator does not read tensors owned by RPC workers.
++                // Local CPU tensors must still be resident before READY or the
++                // first request turns into demand paging from disk.
++                if (prefetch_sparse_local) {
++                    mapping->prefetch_fragment(weight->offs, weight->offs + n_size);
++                }
+                 if (lmlocks) {
+                     const auto & lmlock = lmlocks->at(weight->idx);
+                     lmlock->grow_to(weight->offs + n_size);

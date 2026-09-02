@@ -13,6 +13,7 @@
 import { loadSettings } from "./settings";
 import { getAuthProvider, type Session } from "./auth";
 import { platformRequest, replyJson } from "./platformHttp";
+import { AGENT_TOKEN_KEY, getSecret, setSecret } from "./secrets";
 
 const FETCH_TIMEOUT_MS = 10_000;
 
@@ -197,8 +198,71 @@ export function inTauri(): boolean {
 // The supervisor's shared ring buffer tags every line with its role.
 const AGENT_LOG_TAG = "[platform-agent]";
 
+/**
+ * The credential the platform agent actually runs with (2026-08-30, threat
+ * register HOST-03/HOST-04/CHAIN-01).
+ *
+ * The agent used to be handed the full console JWT. That token sits in the
+ * process arguments and memory of a machine that is powered on unattended for
+ * weeks, and it can transfer this account's credits, mint API keys, and issue a
+ * cluster-join credential — so stealing it is a complete account takeover. The
+ * agent itself only ever calls `/providers*` (register, heartbeat, relay poll
+ * and result, cache-state), so it gets a `scope=agent` token whose server-side
+ * route allowlist refuses everything else.
+ *
+ * Cached in the 0600 credential store and reused until it is close to expiry:
+ * minting one per launch would fill the account's session list with a row per
+ * restart, and the list is the thing the user is supposed to be able to read.
+ *
+ * A gateway too old to know the endpoint answers 404. That case falls back to
+ * the console JWT with a loud warning rather than refusing to share — a client
+ * that silently stops earning against an older self-hosted gateway is a worse
+ * failure, and the fallback is exactly the status quo it replaces.
+ */
+const AGENT_TOKEN_RENEW_BEFORE_MS = 24 * 3600 * 1000;
+
+function storedAgentToken(): string | null {
+  const raw = getSecret(AGENT_TOKEN_KEY);
+  if (!raw) return null;
+  try {
+    const payload = JSON.parse(atob(raw.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
+    if (typeof payload.exp !== "number") return null;
+    // Renew a day early: a token that expires while the agent is mid-shift takes
+    // the machine off the market until someone notices.
+    if (payload.exp * 1000 - Date.now() < AGENT_TOKEN_RENEW_BEFORE_MS) return null;
+    return raw;
+  } catch {
+    return null;
+  }
+}
+
+export async function agentCredential(fallbackJwt: string): Promise<string> {
+  const cached = storedAgentToken();
+  if (cached) return cached;
+  try {
+    const issued = await req<{ token?: string; scope?: string }>("/auth/agent-token", {
+      method: "POST",
+      body: JSON.stringify({ label: "sharing agent" }),
+    });
+    if (issued?.token && issued.scope === "agent") {
+      setSecret(AGENT_TOKEN_KEY, issued.token);
+      return issued.token;
+    }
+    console.warn("platform: /auth/agent-token returned an unexpected body; falling back to the console session token");
+  } catch (e) {
+    console.warn(
+      `platform: could not obtain a scope-restricted agent token (${e instanceof Error ? e.message : e}). ` +
+        "Falling back to the console session token — the agent will run with more authority than it needs. " +
+        "Upgrade the platform gateway to close this."
+    );
+  }
+  return fallbackJwt;
+}
+
 export async function agentStart(opts: {
   platformUrl: string;
+  /** Console session token. Used only to MINT the agent's scoped token, and as
+   *  the fallback when the gateway is too old to issue one. */
   jwt: string;
   name: string;
   coordApiPort: number;
@@ -212,9 +276,14 @@ export async function agentStart(opts: {
   quant: string;
 }): Promise<void> {
   const { invoke } = await import("@tauri-apps/api/core");
+  // Swap the console session for the scope-restricted agent token HERE rather
+  // than at each call site: both callers (the sharing toggle and the launch-time
+  // resume) pass `gate.session.token`, and a rule that has to be remembered
+  // twice is a rule that will be followed once.
+  const jwt = await agentCredential(opts.jwt);
   await invoke("platform_agent_start", {
     platformUrl: opts.platformUrl,
-    jwt: opts.jwt,
+    jwt,
     name: opts.name,
     coordApiPort: opts.coordApiPort,
     coordToken: opts.coordToken,
@@ -228,7 +297,7 @@ export async function agentStop(): Promise<void> {
   await invoke("platform_agent_stop");
 }
 
-/** Resume lending on launch. The sharing switch is a STANDING choice: the
+/** Resume lending on launch. The provider switch is a STANDING choice: the
  *  user made it once, and every later launch on this machine keeps sharing
  *  without being asked again — until 0.1.10 a restarted client showed the
  *  switch on while no agent ran, so the machine silently stopped earning.
@@ -242,7 +311,7 @@ export async function agentStop(): Promise<void> {
 export async function resumeSharingAgent(): Promise<string> {
   if (!inTauri()) return "skipped: not the desktop app";
   const s = loadSettings();
-  if (!s.sharingEnabled) return "skipped: sharing is off";
+  if (!s.providerEnabled) return "skipped: sharing is off";
   const gate = platformGate();
   if (!gate.ok) return `skipped: ${gate.reason}`;
   const st = await agentStatus();

@@ -7,7 +7,9 @@
 # "stream did not contain valid UTF-8", which is a confusing way to learn about
 # resource forks.
 #
-# Usage:  scripts/sync-to-win.sh <ssh-alias>
+# Usage:  scripts/sync-to-win.sh <ssh-alias> [--with-client-dist]
+#         IDLETOKEN_SSH_HOSTNAME=<ip-or-dns> may override only the transport
+#         address while retaining the alias's user, key and testbed mapping.
 #         The alias comes from your own ~/.ssh/config; there is no default (see below).
 set -eu
 
@@ -15,9 +17,15 @@ set -eu
 # could only ever be one maintainer's own box.
 NODE="${1:-}"
 if [ -z "$NODE" ]; then
-    echo "usage: scripts/sync-to-win.sh <ssh-alias>   # e.g. scripts/sync-to-win.sh my-win-box" >&2
+    echo "usage: scripts/sync-to-win.sh <ssh-alias> [--with-client-dist]" >&2
     exit 2
 fi
+WITH_CLIENT_DIST=0
+case "${2:-}" in
+    "") ;;
+    --with-client-dist) WITH_CLIENT_DIST=1 ;;
+    *) echo "sync-to-win.sh: unknown option: $2" >&2; exit 2 ;;
+esac
 # Per-machine user directories come from scripts/testbed.env (not committed, see
 # testbed.env.example). This used to be a third hardcoded copy -- the same fact
 # spread across three scripts, which both drifts and pins the account name of
@@ -26,6 +34,12 @@ fi
 . "$(dirname "$0")/testbed-lib.sh"
 WHOME="$(testbed_repo_home "$NODE")"
 [ -n "$WHOME" ] || { echo "sync-to-win.sh:" >&2; testbed_hint "$NODE"; exit 2; }
+
+SSH=(ssh)
+if [ -n "${IDLETOKEN_SSH_HOSTNAME:-}" ]; then
+    SSH+=(-o "HostName=$IDLETOKEN_SSH_HOSTNAME" -o "HostKeyAlias=$NODE")
+fi
+SSH+=("$NODE")
 
 cd "$(dirname "$0")/.."
 TAR=/tmp/idletoken-win-sync.tar.gz
@@ -63,9 +77,12 @@ scripts/sync-provenance.sh "$NODE:$WHOME" > "$PROVENANCE_DIR/provenance.json"
 # source tarballs are still lying around there). Hand copies drift,
 # and after the rename the staged sidecar on the build machine still had the old
 # name, so a rebuilt package carried **both** engines. `client/dist` is
-# **deliberately excluded**: it is a build artifact, and which one you carry
-# matters (a release-mode dist points at the production platform address) -- so
-# whoever needs it pushes it explicitly rather than having it tag along.
+# **excluded by default**: it is a build artifact, and which one you carry
+# matters (a release-mode dist points at the production platform address).
+# Release packaging must use `--with-client-dist`; that mode first verifies the
+# release provenance stamp and mirrors dist exactly. This explicit flag prevents
+# an ordinary source sync from silently turning a development frontend into a
+# release, while also preventing the Windows packager from reusing an old dist.
 # Pricing calibration runs ON this machine (bench.py over loopback; from the
 # control machine we would be pricing LAN latency). Only the wrapper, the
 # workload and the rate card go -- the rest of platform/ is the commercial
@@ -77,17 +94,23 @@ if [ -f platform/scripts/pricing-calibrate.py ] && [ -f platform/scripts/pricing
     PRICING_SRCS=(platform/pricing platform/scripts/pricing-calibrate.py
                   platform/scripts/pricing-generate.py)
 fi
+DIST_EXCLUDES=(--exclude='client/dist')
+if [ "$WITH_CLIENT_DIST" -eq 1 ]; then
+    (cd client && node scripts/write_frontend_provenance.mjs --verify)
+    DIST_EXCLUDES=()
+fi
 COPYFILE_DISABLE=1 tar czf "$TAR" \
     --exclude='._*' --exclude='.DS_Store' --exclude='*.o' --exclude='*.gguf' \
-    --exclude='client/node_modules' --exclude='client/src-tauri/target' \
+    --exclude='client/node_modules' --exclude='packages/shared-ui/node_modules' \
+    --exclude='client/src-tauri/target' \
     --exclude='client/src-tauri/gen' --exclude='client/src-tauri/binaries' \
-    --exclude='client/dist' \
+    ${DIST_EXCLUDES[@]+"${DIST_EXCLUDES[@]}"} \
     --exclude='platform/pricing/calibrations' \
     src include models scripts vendor/ds4/ds4.c vendor/ds4/ds4.h vendor/ds4/ds4_gpu.h \
     ${PRICING_SRCS[@]+"${PRICING_SRCS[@]}"} \
     vendor/ds4/ds4_cuda.cu \
     vendor/ds4/rax.c vendor/ds4/rax.h vendor/ds4/rax_malloc.h \
-    vendor/tweetnacl vendor/blake2 \
+    vendor/tweetnacl vendor/blake2 packages/shared-ui \
     client \
     LICENSE NOTICE Makefile \
     build_worker_win.bat build_coord_win.bat build_agent_win.bat \
@@ -104,7 +127,7 @@ echo "shipping $(du -h "$TAR" | cut -f1) to $NODE:$WHOME"
 # archive). No archive file, no comparison, no flake. cmd.exe hosts the
 # extraction because PowerShell mangles binary stdin.
 win_stage_path="${WHOME//\//\\}\\idletoken-sync-stage"
-ssh "$NODE" "cmd /c \"rmdir /s /q $win_stage_path 2>nul & mkdir $win_stage_path && tar xzf - -C $win_stage_path\"" < "$TAR"
+"${SSH[@]}" "cmd /c \"rmdir /s /q $win_stage_path 2>nul & mkdir $win_stage_path && tar xzf - -C $win_stage_path\"" < "$TAR"
 tar_rc=$?
 if [ "$tar_rc" -ne 0 ]; then
     echo "sync-to-win.sh: streamed extraction failed on $NODE (exit $tar_rc)" >&2
@@ -124,18 +147,34 @@ fi
 # died with "FATAL: patch 0002-rpc-memset-tensor.patch does not apply" from a
 # file no longer in the repo. A leftover here is not the machine owner's
 # preference, it silently changes which engine gets built.
+dist_merge=""
+if [ "$WITH_CLIENT_DIST" -eq 1 ]; then
+    dist_merge="& robocopy \"\$stage\\client\\src\" 'client\\src' /MIR /IS /IT /NFL /NDL /NJH /NJS /NP; \
+\$frontendSrcRc=\$LASTEXITCODE; \
+if (\$frontendSrcRc -ge 8) { exit \$frontendSrcRc }; \
+& robocopy \"\$stage\\client\\public\" 'client\\public' /MIR /IS /IT /NFL /NDL /NJH /NJS /NP; \
+\$frontendPublicRc=\$LASTEXITCODE; \
+if (\$frontendPublicRc -ge 8) { exit \$frontendPublicRc }; \
+& robocopy \"\$stage\\packages\\shared-ui\\src\" 'packages\\shared-ui\\src' /MIR /IS /IT /NFL /NDL /NJH /NJS /NP; \
+\$sharedUiRc=\$LASTEXITCODE; \
+if (\$sharedUiRc -ge 8) { exit \$sharedUiRc }; \
+& robocopy \"\$stage\\client\\dist\" 'client\\dist' /MIR /IS /IT /NFL /NDL /NJH /NJS /NP; \
+\$distRc=\$LASTEXITCODE; \
+if (\$distRc -ge 8) { exit \$distRc };"
+fi
 remote_ps="\$ErrorActionPreference='Stop'; \
 Set-Location '$WHOME'; \
 \$stage='idletoken-sync-stage'; \
 & robocopy \$stage . /E /IS /IT /NFL /NDL /NJH /NJS /NP; \
 \$copyRc=\$LASTEXITCODE; \
 if (\$copyRc -ge 8) { exit \$copyRc }; \
+$dist_merge \
 & robocopy \"\$stage\\scripts\\llamacpp-patches\" 'scripts\\llamacpp-patches' /E /PURGE /NFL /NDL /NJH /NJS /NP; \
 \$purgeRc=\$LASTEXITCODE; \
 if (\$purgeRc -ge 8) { exit \$purgeRc }; \
 Remove-Item -Recurse -Force \$stage; \
 Write-Output 'SYNC_OK'"
-if sync_out=$(ssh "$NODE" "powershell -NoProfile -Command \"$remote_ps\"" 2>&1); then
+if sync_out=$("${SSH[@]}" "powershell -NoProfile -Command \"$remote_ps\"" 2>&1); then
     sync_rc=0
 else
     sync_rc=$?
@@ -149,6 +188,16 @@ if [ "$sync_rc" -ne 0 ] || ! printf '%s\n' "$sync_out" | tr -d '\r' | grep -qx '
 fi
 rm -f "$TAR"
 
+if [ "$WITH_CLIENT_DIST" -eq 1 ]; then
+    local_dist_hash=$(shasum -a 256 client/dist/frontend-provenance.json | cut -d' ' -f1)
+    remote_dist_hash=$("${SSH[@]}" "powershell -NoProfile -Command \"(Get-FileHash '$WHOME/client/dist/frontend-provenance.json' -Algorithm SHA256).Hash\"" | tr -d '\r ' | tr 'A-F' 'a-f')
+    if [ "$local_dist_hash" != "$remote_dist_hash" ]; then
+        echo "sync-to-win.sh: client/dist provenance differs after sync" >&2
+        exit 1
+    fi
+    echo "frontend release dist verified byte-identical on $NODE"
+fi
+
 if grep -q '"dirty": true' "$PROVENANCE_DIR/provenance.json"; then
     echo "note: this sync carried UNCOMMITTED changes; pricing calibration on $NODE will refuse it"
 fi
@@ -160,7 +209,7 @@ fi
 # shelved kernels and needs a CUDA Toolkit -- i.e. not the worker this repo
 # builds anywhere else. Report them; deleting files on someone's machine is not
 # this script's call.
-stale=$(ssh "$NODE" "cd /d ${WHOME//\//\\} && for %f in (build_ds4x.bat build_ds4x_win.bat runworker-ds4x-win.bat) do @if exist %f echo %f" 2>/dev/null | tr -d '\r')
+stale=$("${SSH[@]}" "cd /d ${WHOME//\//\\} && for %f in (build_ds4x.bat build_ds4x_win.bat runworker-ds4x-win.bat) do @if exist %f echo %f" 2>/dev/null | tr -d '\r')
 if [ -n "$stale" ]; then
     echo "note: shelved ds4x build scripts still on $NODE (no longer synced; use build_worker_win.bat):"
     printf '      %s\n' $stale
@@ -184,7 +233,7 @@ verify_engine_sources() {
     for f in vendor/ds4/ds4.c vendor/ds4/ds4.h vendor/ds4/ds4_cuda.cu \
              src/common/ds4_stub.c src/worker/worker_main.c; do
         rl=$(shasum -a 256 "$f" 2>/dev/null | cut -c1-16)
-        rr=$(ssh "$NODE" "powershell -NoProfile -Command \"(Get-FileHash '${WHOME}/${f}' -Algorithm SHA256).Hash.Substring(0,16)\"" 2>/dev/null | tr -d '\r ' | tr 'A-F' 'a-f')
+        rr=$("${SSH[@]}" "powershell -NoProfile -Command \"(Get-FileHash '${WHOME}/${f}' -Algorithm SHA256).Hash.Substring(0,16)\"" 2>/dev/null | tr -d '\r ' | tr 'A-F' 'a-f')
         if [ -z "$rr" ]; then
             echo "WARN: cannot read $f on $NODE" >&2; bad=1
         elif [ "$rl" != "$rr" ]; then

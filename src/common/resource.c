@@ -1,8 +1,10 @@
 /* IdleToken Cluster — resource probe (Linux NVML + Windows runtime nvml.dll
  * + macOS Metal/mach).
  *
- * Numbers report what's *actually free for our worker*, after deducting
- * what the system and other processes already use, plus safety margins. */
+ * Numbers report what's *actually free for our worker*, after deducting what
+ * the system and other processes already use. VRAM carries no margin on top of
+ * that measurement (retired 2026-09-01 — idletoken_resource.h says why); RAM
+ * still does, because it backs the OS itself. */
 
 /* _GNU_SOURCE comes via Makefile. */
 
@@ -94,7 +96,11 @@ typedef nvmlReturn_t (*fn_nvmlGetDriver)(char *, unsigned int);
 static HMODULE nvml_load(void) {
     /* Test hook: pretend the driver is absent, so the "no driver" path can be
      * exercised on a machine that does have one (G-HW gate). */
-    if (getenv("IDLETOKEN_FORCE_NO_NVML")) return NULL;
+    if (getenv("IDLETOKEN_FORCE_NO_NVML")) {
+        fprintf(stderr, "idletoken-probe: *** TEST OVERRIDE ACTIVE *** "
+                        "NVML unavailable (forced by IDLETOKEN_FORCE_NO_NVML)\n");
+        return NULL;
+    }
     HMODULE h = LoadLibraryA("nvml.dll");   /* default search hits System32 */
     if (!h) h = LoadLibraryA(
         "C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvml.dll"); /* legacy */
@@ -187,11 +193,14 @@ static int probe_gpu(idletoken_resource_report *r) {
         /* At probe time our worker has not allocated yet, so NVML's "used" is
          * exactly what *other* processes (compositor, browser, ...) hold. */
         r->vram_used_other = mem.used;
-        uint64_t reserved = IDLETOKEN_VRAM_SAFETY_BYTES + IDLETOKEN_VRAM_WORKSPACE_BYTES;
-        if (r->vram_total > r->vram_used_other + reserved)
-            r->vram_usable = r->vram_total - r->vram_used_other - reserved;
-        else
-            r->vram_usable = 0;
+        /* NVML's own `free`, NOT `total - used` (2026-09-01). MEASURED on
+         * a 16 GB discrete GPU the same instant: total 16311, used 0,
+         * free 16050 MiB. Those
+         * do not reconcile — 261 MiB is held by the driver/display and shows
+         * up in neither — so reconstructing `free` by subtraction overstates
+         * what a process can actually get. This is the "have" side and the
+         * rule is that it reports what is really remaining, nothing else. */
+        r->vram_usable = mem.free;
     } else {
         fprintf(stderr, "idletoken-probe: nvmlDeviceGetMemoryInfo: %s\n", ESTR(st));
     }
@@ -257,13 +266,15 @@ static int probe_gpu(idletoken_resource_report *r) {
      * use memory the host probe has already ruled out (other processes, the
      * 4 GiB safety floor, the 70% proportional ceiling). Take the smaller.
      *
-     * Only the Metal workspace reserve is subtracted, not
-     * IDLETOKEN_VRAM_SAFETY_BYTES: that 1 GiB stands for the CUDA context,
-     * which has no Metal counterpart. The reserve itself is CALIBRATED
-     * (2026-08-15, this machine): the llamacpp engine's whole non-weight
-     * footprint is ~133 MiB and the width-scaled part is charged by the
-     * scheduler — the earlier 1.5 GiB CUDA-derived guess stacked with that
-     * into a ~2.3 GiB double reservation on a 16 GiB Mac. */
+     * The Metal workspace reserve is the ONE reserve left in this file, and it
+     * is not the CUDA-style discount that was retired on 2026-09-01 (see
+     * idletoken_resource.h): `recommendedMaxWorkingSetSize` is ADVISORY, so
+     * this hedges an API that can be wrong, rather than re-charging an
+     * inference cost the scheduler already bills. CALIBRATED 2026-08-15 on this
+     * machine — the llamacpp engine's whole non-weight footprint is ~133 MiB
+     * and the width-scaled part is charged by the scheduler, so 512 MiB keeps
+     * a 3.7x margin without stacking into the ~2.3 GiB double reservation the
+     * earlier CUDA-derived 1.5 GiB guess produced on a 16 GiB Mac. */
     uint64_t budget = g.recommended_working_set;
     if (r->ram_usable < budget) budget = r->ram_usable;
     r->vram_usable = budget > IDLETOKEN_METAL_WORKSPACE_BYTES
@@ -368,12 +379,9 @@ static int probe_gpu(idletoken_resource_report *r) {
         }
         r->vram_used_other = used_others;
 
-        uint64_t reserved = IDLETOKEN_VRAM_SAFETY_BYTES + IDLETOKEN_VRAM_WORKSPACE_BYTES;
-        if (r->vram_total > r->vram_used_other + reserved) {
-            r->vram_usable = r->vram_total - r->vram_used_other - reserved;
-        } else {
-            r->vram_usable = 0;
-        }
+        /* Same as the Windows branch above (2026-09-01): report NVML's own
+         * `free`, and charge every inference cost once, on the need side. */
+        r->vram_usable = mem.free;
     } else {
         fprintf(stderr, "idletoken-probe: nvmlDeviceGetMemoryInfo_v2: %s\n", nvmlErrorString(st));
     }

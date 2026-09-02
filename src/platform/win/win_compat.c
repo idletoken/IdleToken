@@ -14,6 +14,25 @@
 #include "sys/file.h"
 #include "win_compat.h"
 
+int idletoken_win_require_utf8_paths(void) {
+    const UINT acp = GetACP();
+    if (acp != CP_UTF8) {
+        fprintf(stderr,
+                "idletoken/win: refuse: this executable is running with Windows "
+                "code page %u, not UTF-8 (65001). Its UTF-8 application manifest "
+                "is missing or unsupported, so model, cache, key, and socket paths "
+                "containing non-ASCII characters would be corrupted. Reinstall the "
+                "current IdleToken package on Windows 10 1903 or newer.\n",
+                (unsigned)acp);
+        return -1;
+    }
+    /* Console code pages do not control file APIs, but setting them makes the
+     * same UTF-8 paths readable in redirected/manual diagnostic output. */
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+    return 0;
+}
+
 /* --- parent-death: die with the launching client ------------------------- *
  * Windows analogue of Linux PR_SET_PDEATHSIG. The client supervisor spawns us
  * with IDLETOKEN_DIE_WITH_PARENT=1 and IDLETOKEN_PARENT_PID=<client pid>; we open a

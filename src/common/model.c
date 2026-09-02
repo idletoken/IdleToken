@@ -85,22 +85,6 @@ static const idletoken_model_variant QWEN35_9B_VARIANTS[] = {
     { .quant = "BF16", .layer_weight_bytes = 17920697312ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-9B-BF16.gguf" },
 };
 
-/* Qwen3.8 2.4T-A95B (2026-08-21). Nine precisions, 370 GiB to 4.5 TiB —
- * cluster tier by a wide margin. Every byte count measured through the HF
- * API; see models/qwen3.8-2.4t-a95b.json for what has and has not been
- * verified on real hardware (short version: nothing has, because nothing
- * we own can hold it). */
-static const idletoken_model_variant QWEN38_24T_VARIANTS[] = {
-    { .quant = "Q1_0",     .layer_weight_bytes = 397256393248ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf" },  /* 10 parts, 370 GiB */
-    { .quant = "IQ1_S",    .layer_weight_bytes = 508388672224ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ1_S/Qwen3.8-2.4T-A95B-UD-IQ1_S-00001-of-00012.gguf" },  /* 12 parts, 473 GiB */
-    { .quant = "IQ1_M",    .layer_weight_bytes = 563954811904ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ1_M/Qwen3.8-2.4T-A95B-UD-IQ1_M-00001-of-00013.gguf" },  /* 13 parts, 525 GiB */
-    { .quant = "IQ2_XXS",  .layer_weight_bytes = 656565044416ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ2_XXS/Qwen3.8-2.4T-A95B-UD-IQ2_XXS-00001-of-00015.gguf" },  /* 15 parts, 611 GiB */
-    { .quant = "IQ2_XS",   .layer_weight_bytes = 730653230336ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ2_XS/Qwen3.8-2.4T-A95B-UD-IQ2_XS-00001-of-00016.gguf" },  /* 16 parts, 680 GiB */
-    { .quant = "IQ3_XXS",  .layer_weight_bytes = 955535034144ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ3_XXS/Qwen3.8-2.4T-A95B-UD-IQ3_XXS-00001-of-00021.gguf" },  /* 21 parts, 890 GiB */
-    { .quant = "IQ4_XS",   .layer_weight_bytes = 1310876469952ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ4_XS/Qwen3.8-2.4T-A95B-UD-IQ4_XS-00001-of-00029.gguf" },  /* 29 parts, 1221 GiB */
-    { .quant = "Q8_0",     .layer_weight_bytes = 2600249563264ull, .shared_weight_bytes = 0ull, .gguf = "Q8_0/Qwen3.8-2.4T-A95B-Q8_0-00001-of-00056.gguf" },  /* 56 parts, 2422 GiB */
-    { .quant = "BF16",     .layer_weight_bytes = 4893172677568ull, .shared_weight_bytes = 0ull, .gguf = "BF16/Qwen3.8-2.4T-A95B-BF16-00001-of-00140.gguf" },  /* 140 parts, 4557 GiB */
-};
 
 static const idletoken_model_variant QWEN38_27B_VARIANTS[] = {
     { .quant = "IQ1_S", .layer_weight_bytes = 6192222208ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.8-27B-UD-IQ1_S.gguf" },
@@ -338,17 +322,31 @@ static const idletoken_model_spec MODELS[] = {
         .n_embd   = 4096,
         .hc_streams = 4,           /* mHC 4-stream hyper-connections */
         .n_vocab  = 129280,
+        .n_expert = 256,
+        .n_expert_used = 6,
         .layer_weight_bytes  = 82539237024ull, /* == IQ2_XXS+Q2_K variant (measured) */
         .shared_weight_bytes = 0ull,  /* token_embd + output + norms */
         .ctx_max  = 1048576,
         .split_boundary_multiple = 0,
         .kv_kind  = IDLETOKEN_KV_DSV4,          /* per-tier table in overhead() */
+        .kv_bytes_per_token_layer = 0, /* exact padded DSV4 fields below */
+        /* GGUF compress_ratios: 21 CSA + 20 HCA over 43 raw-K layers.
+         * Whole-model f16 bytes per cache cell, including the CSA lightning
+         * indexer; fixed is the pinned engine's f32 compressor state. */
+        .dsv4_raw_bytes_per_cell = 44032,
+        .dsv4_csa_bytes_per_cell = 26880,
+        .dsv4_hca_bytes_per_cell = 20480,
+        .dsv4_fixed_bytes_per_seq = 12206080,
         /* The filename antirez actually publishes. "ds4flash.gguf" was a
          * local nickname: every gate passed --model-path explicitly, so the
          * drift stayed invisible until something (the topology matrix, the
          * weight fetcher) tried to RESOLVE the default name. The -0731 suffix
          * is the official release; the unsuffixed files are the superseded
          * preview and must not be resolved by default any more. */
+        .compute_bytes_256k_cuda = 585986212ull,
+        .compute_bytes_1m_cuda = 1800237220ull,
+        .compute_bytes_256k_metal = 804090020ull,
+        .compute_bytes_1m_metal = 2688643236ull,
         .default_gguf = "UD-IQ1_S/DeepSeek-V4-Flash-UD-IQ1_S-00001-of-00003.gguf",
         .variants = DSV4_FLASH_VARIANTS,
         .n_variants = sizeof(DSV4_FLASH_VARIANTS) / sizeof(DSV4_FLASH_VARIANTS[0]),
@@ -357,9 +355,10 @@ static const idletoken_model_spec MODELS[] = {
     {
         /* DeepSeek V4 Pro (2026-08-13 release). 671B/37B-active, 61 layers —
          * a different model from Flash, not one of its precisions. Cluster-tier:
-         * ~791 GiB at the smallest published quant, so it needs a sizable
-         * cluster. Architecture deepseek4 is read by the pinned llama.cpp; the
-         * numbers below are measured from the GGUF headers (HF API). */
+         * the smallest published quant is Q2_K at 530 GiB (791 GiB is the
+         * smallest unsloth dynamic quant, not the catalogue minimum).
+         * Architecture deepseek4 is read by the pinned llama.cpp; the numbers
+         * below are measured from the GGUF headers (HF API). */
         .id      = "deepseek-v4-pro",
         .label   = "DeepSeek V4 Pro",
         .backend = IDLETOKEN_BACKEND_LLAMACPP,
@@ -367,15 +366,26 @@ static const idletoken_model_spec MODELS[] = {
         .deployment = IDLETOKEN_DEPLOY_CLUSTER,
         .n_layers = 61,
         .n_embd   = 7168,
-        .hc_streams = 1,
+        .hc_streams = 4,
         .n_vocab  = 129280,
+        .n_expert = 384,
+        .n_expert_used = 6,
         .layer_weight_bytes  = 569417385408ull, /* == variants[default_variant] = Q2_K */
         .shared_weight_bytes = 0ull,
         .ctx_max  = 1048576,
         .split_boundary_multiple = 0,
-        .kv_kind  = IDLETOKEN_KV_MLA,
+        .kv_kind  = IDLETOKEN_KV_DSV4,
         .kv_bytes_per_token_layer = 0,
+        /* GGUF compress_ratios: 30 CSA + 31 HCA over 61 raw-K layers. */
+        .dsv4_raw_bytes_per_cell = 62464,
+        .dsv4_csa_bytes_per_cell = 38400,
+        .dsv4_hca_bytes_per_cell = 31744,
+        .dsv4_fixed_bytes_per_seq = 18710528,
         .overhead_base_bytes = 3221225472ull,
+        .compute_bytes_256k_cuda = 719679652ull,
+        .compute_bytes_1m_cuda = 1948610724ull,
+        .compute_bytes_256k_metal = 1131245732ull,
+        .compute_bytes_1m_metal = 2948165796ull,
         .default_gguf = "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00001-of-00037.gguf",
         .variants = DSV4_PRO_VARIANTS,
         .n_variants = sizeof(DSV4_PRO_VARIANTS) / sizeof(DSV4_PRO_VARIANTS[0]),
@@ -393,7 +403,7 @@ static const idletoken_model_spec MODELS[] = {
                                     * Qwen3.5-0.8B Q4_K_M GGUF (DGX): output
                                     * matches llama.cpp token-for-token on
                                     * greedy prompts (design doc §4d) */
-        .deployment = IDLETOKEN_DEPLOY_SINGLE_NODE,
+        .deployment = IDLETOKEN_DEPLOY_CLUSTER,
         .n_layers = 24,
         .n_embd   = 1024,
         .hc_streams = 1,
@@ -401,15 +411,29 @@ static const idletoken_model_spec MODELS[] = {
         .layer_weight_bytes  = 338227456ull,   /* == variants[default_variant] = IQ2_XXS */
         .shared_weight_bytes = 0ull,
         .ctx_max  = 262144,
+        .ctx_yarn_max = 1048576,   /* Qwen ships YaRN configs for 4x */
         .split_boundary_multiple = 0,
         .kv_kind  = IDLETOKEN_KV_HYBRID,
-        /* full layers: 2 kv heads × 256 head_dim × 2 (K+V) × 4 B = 4096 B/token */
-        .kv_bytes_per_token_layer = 4096,
+        /* full layers: 2 KV heads × (256 K + 256 V) × 2 B/f16 */
+        .kv_bytes_per_token_layer = 2048,
         /* linear layers: 16 heads × 128 × 128 state + conv window (3×6144),
          * fp32 → 1 MiB + 72 KiB, ctx-INDEPENDENT */
         .state_bytes_per_layer = 1122304,
         .full_attn_interval = 4,
         .overhead_base_bytes = (uint64_t)(0.8 * (double)GiB),
+        /* MEASURED 2026-09-01 with llama.cpp's no_alloc dry-run on the pinned
+         * engine (scripts/measure_model_memory.sh, -ngl 99 -np 1).
+         * 256K: 512753664 B (489.00 MiB) — byte-identical on Mac/Metal,
+         *       CUDA-unified and CUDA-discrete alike, and identical across
+         *       Q4_K_M..BF16.
+         * 1M:   Metal 1115915551 B vs CUDA 1115852636 B; the larger is taken,
+         *       because a manifest that understates is the failure mode this
+         *       whole change exists to remove.
+         * results/memory-need-measured-20260901.md */
+        .compute_bytes_256k_cuda = 512753664ull,
+        .compute_bytes_1m_cuda = 1115852636ull,
+        .compute_bytes_256k_metal = 512753664ull,
+        .compute_bytes_1m_metal = 1115915551ull,
         .default_gguf = "Qwen3.5-0.8B-UD-IQ2_XXS.gguf",
         .variants = QWEN35_08B_VARIANTS,
         .n_variants = sizeof(QWEN35_08B_VARIANTS) / sizeof(QWEN35_08B_VARIANTS[0]),
@@ -428,7 +452,7 @@ static const idletoken_model_spec MODELS[] = {
                                     * CUDA agree token-for-token, and the
                                     * cpu/gpu recurrence check stays at 6e-08
                                     * over 168 chunks (design doc §4j) */
-        .deployment = IDLETOKEN_DEPLOY_SINGLE_NODE,
+        .deployment = IDLETOKEN_DEPLOY_CLUSTER,
         .n_layers = 32,
         .n_embd   = 2560,
         .hc_streams = 1,
@@ -436,15 +460,20 @@ static const idletoken_model_spec MODELS[] = {
         .layer_weight_bytes  = 1520217248ull,  /* == variants[default_variant] = IQ2_XXS */
         .shared_weight_bytes = 0ull,
         .ctx_max  = 262144,
+        .ctx_yarn_max = 1048576,   /* Qwen ships YaRN configs for 4x */
         .split_boundary_multiple = 0,
         .kv_kind  = IDLETOKEN_KV_HYBRID,
-        /* full layers: 4 kv heads × 256 head_dim × 2 (K+V) × 4 B = 8192 B/token */
-        .kv_bytes_per_token_layer = 8192,
+        /* full layers: 4 KV heads × (256 K + 256 V) × 2 B/f16 */
+        .kv_bytes_per_token_layer = 4096,
         /* linear layers: 32 heads × 128 × 128 state + conv window (3×8192),
          * fp32 → 2 MiB + 96 KiB, ctx-INDEPENDENT */
         .state_bytes_per_layer = 2195456,
         .full_attn_interval = 4,
         .overhead_base_bytes = (uint64_t)(1.2 * (double)GiB),
+        .compute_bytes_256k_cuda = 519045120ull,
+        .compute_bytes_1m_cuda = 1140871660ull,
+        .compute_bytes_256k_metal = 519045120ull,
+        .compute_bytes_1m_metal = 1157743247ull,
         .default_gguf = "Qwen3.5-4B-UD-IQ2_XXS.gguf",
         .variants = QWEN35_4B_VARIANTS,
         .n_variants = sizeof(QWEN35_4B_VARIANTS) / sizeof(QWEN35_4B_VARIANTS[0]),
@@ -461,7 +490,7 @@ static const idletoken_model_spec MODELS[] = {
         .available = 1,            /* validated 2026-07-28 on the real
                                     * Qwen3.5-9B Q4_K_M GGUF (DGX): greedy
                                     * output matches llama.cpp word for word */
-        .deployment = IDLETOKEN_DEPLOY_SINGLE_NODE,
+        .deployment = IDLETOKEN_DEPLOY_CLUSTER,
         .n_layers = 32,
         .n_embd   = 4096,
         .hc_streams = 1,
@@ -469,12 +498,17 @@ static const idletoken_model_spec MODELS[] = {
         .layer_weight_bytes  = 3190613216ull,  /* == variants[default_variant] = IQ2_XXS */
         .shared_weight_bytes = 0ull,
         .ctx_max  = 262144,
+        .ctx_yarn_max = 1048576,   /* Qwen ships YaRN configs for 4x */
         .split_boundary_multiple = 0,
         .kv_kind  = IDLETOKEN_KV_HYBRID,
-        .kv_bytes_per_token_layer = 8192,
+        .kv_bytes_per_token_layer = 4096,
         .state_bytes_per_layer = 2195456,
         .full_attn_interval = 4,
         .overhead_base_bytes = (uint64_t)(1.5 * (double)GiB),
+        .compute_bytes_256k_cuda = 525336576ull,
+        .compute_bytes_1m_cuda = 1166037484ull,
+        .compute_bytes_256k_metal = 525336576ull,
+        .compute_bytes_1m_metal = 1174520463ull,
         .default_gguf = "Qwen3.5-9B-UD-IQ2_XXS.gguf",
         .variants = QWEN35_9B_VARIANTS,
         .n_variants = sizeof(QWEN35_9B_VARIANTS) / sizeof(QWEN35_9B_VARIANTS[0]),
@@ -493,7 +527,7 @@ static const idletoken_model_spec MODELS[] = {
                                     * counting prompt matches llama.cpp word
                                     * for word; layer-0 attn_output/final_output
                                     * agree to <0.1% (design doc §4j) */
-        .deployment = IDLETOKEN_DEPLOY_SINGLE_NODE,
+        .deployment = IDLETOKEN_DEPLOY_CLUSTER,
         .n_layers = 64,
         .n_embd   = 5120,
         .hc_streams = 1,
@@ -501,12 +535,17 @@ static const idletoken_model_spec MODELS[] = {
         .layer_weight_bytes  = 8573593504ull,  /* == variants[default_variant] = IQ2_XXS */
         .shared_weight_bytes = 0ull,
         .ctx_max  = 262144,
+        .ctx_yarn_max = 1048576,   /* Qwen ships YaRN configs for 4x */
         .split_boundary_multiple = 0,
         .kv_kind  = IDLETOKEN_KV_HYBRID,
-        .kv_bytes_per_token_layer = 8192,   /* 4 kv heads × 256 × 2 × 4 B */
+        .kv_bytes_per_token_layer = 4096,   /* 4 × (256 K + 256 V) × 2 B/f16 */
         .state_bytes_per_layer = 3268608,   /* 48×128×128×4 + conv 3×10240×4 */
         .full_attn_interval = 4,
         .overhead_base_bytes = (uint64_t)(2.0 * (double)GiB),
+        .compute_bytes_256k_cuda = 529530880ull,
+        .compute_bytes_1m_cuda = 1201689068ull,
+        .compute_bytes_256k_metal = 797987308ull,
+        .compute_bytes_1m_metal = 1224873083ull,
         .default_gguf = "Qwen3.5-27B-UD-IQ2_XXS.gguf",
         .variants = QWEN35_27B_VARIANTS,
         .n_variants = sizeof(QWEN35_27B_VARIANTS) / sizeof(QWEN35_27B_VARIANTS[0]),
@@ -532,11 +571,10 @@ static const idletoken_model_spec MODELS[] = {
                                     * 0.05305, identical across 3 runs, and the
                                     * testbed smoke served it through coord.
                                     * Evidence: results/t14-engine-bump-phaseb-20260820.md */
-        /* single-node, not cluster: the draft manifest guessed cluster because
-         * the other llamacpp-backed models are clustered, but those are
-         * clustered for being 200-850 GB. This one's default is 6.2 GB. Rule
-         * #8 -- if it fits, do not go over the network. */
-        .deployment = IDLETOKEN_DEPLOY_SINGLE_NODE,
+        /* Cluster-capable even though the default precision is only 6.2 GB:
+         * higher precisions can need several machines, and deployment is the
+         * user's choice after model + precision, not a model-wide verdict. */
+        .deployment = IDLETOKEN_DEPLOY_CLUSTER,
         .n_layers = 64,
         .n_embd   = 5120,
         .hc_streams = 1,
@@ -544,54 +582,20 @@ static const idletoken_model_spec MODELS[] = {
         .layer_weight_bytes  = 6192222208ull,  /* == variants[default_variant] = IQ1_S */
         .shared_weight_bytes = 0ull,
         .ctx_max  = 262144,
+        .ctx_yarn_max = 1048576,   /* Qwen ships YaRN configs for 4x */
         .split_boundary_multiple = 0,
         .kv_kind  = IDLETOKEN_KV_HYBRID,
-        .kv_bytes_per_token_layer = 8192,   /* 4 kv heads x 256 x 2 x 4 B */
+        .kv_bytes_per_token_layer = 4096,   /* 4 x (256 K + 256 V) x 2 B/f16 */
         .state_bytes_per_layer = 3268608,   /* 48x128x128x4 + conv 3x10240x4 */
         .full_attn_interval = 4,
         .overhead_base_bytes = (uint64_t)(2.0 * (double)GiB),
+        .compute_bytes_256k_cuda = 529530880ull,
+        .compute_bytes_1m_cuda = 1201689068ull,
+        .compute_bytes_256k_metal = 797987308ull,
+        .compute_bytes_1m_metal = 1224873083ull,
         .default_gguf = "Qwen3.8-27B-UD-IQ1_S.gguf",
         .variants = QWEN38_27B_VARIANTS,
         .n_variants = sizeof(QWEN38_27B_VARIANTS) / sizeof(QWEN38_27B_VARIANTS[0]),
-        .default_variant = 0,
-    },
-    {
-        /* Qwen3.8 2.4T-A95B — the other half of the Qwen3.8 family, and the
-         * largest model in the catalogue. Architecture qwen35moe, the same one
-         * qwen3.5-35b-a3b runs, so the graph is a known quantity even though
-         * this weight set is not.
-         *
-         * n_layers is 92, NOT qwen35moe.block_count (93): block 92 is the MTP
-         * (NextN) draft head. Same reading as qwen3.8-27b's 65 -> 64 above,
-         * which was used as the control for it.
-         *
-         * ⚠ Neither the ppl gate nor the testbed smoke of hard constraint #2
-         * has run on this model, and neither CAN here — the smallest precision
-         * is 370 GiB against ~150 GiB of pooled testbed memory. It is listed on
-         * the same footing as GLM-5.2 and DeepSeek V4 Pro, which are in the
-         * catalogue under the identical limitation. The manifest's notes carry
-         * the full argument. */
-        .id      = "qwen3.8-2.4t-a95b",
-        .label   = "Qwen3.8 2.4T-A95B",
-        .backend = IDLETOKEN_BACKEND_LLAMACPP,
-        .available = 1,
-        .deployment = IDLETOKEN_DEPLOY_CLUSTER,
-        .n_layers = 92,
-        .n_embd   = 8192,
-        .hc_streams = 1,
-        .n_vocab  = 248320,
-        .layer_weight_bytes  = 397256393248ull,  /* == variants[default_variant] = Q1_0 */
-        .shared_weight_bytes = 0ull,
-        .ctx_max  = 262144,
-        .split_boundary_multiple = 0,
-        .kv_kind  = IDLETOKEN_KV_HYBRID,
-        .kv_bytes_per_token_layer = 8192,   /* 4 kv heads x 256 x 2 x 4 B */
-        .state_bytes_per_layer = 8634368,   /* 128x128x128x4 + conv 3x20480x4 */
-        .full_attn_interval = 4,
-        .overhead_base_bytes = (uint64_t)(3.0 * (double)GiB),
-        .default_gguf = "UD-Q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf",
-        .variants = QWEN38_24T_VARIANTS,
-        .n_variants = sizeof(QWEN38_24T_VARIANTS) / sizeof(QWEN38_24T_VARIANTS[0]),
         .default_variant = 0,
     },
     {
@@ -607,20 +611,27 @@ static const idletoken_model_spec MODELS[] = {
                                     * Qwen3.5-35B-A3B Q4_K_M GGUF (DGX): the
                                     * counting prompt matches llama.cpp word
                                     * for word and layer-0 agrees (§4n) */
-        .deployment = IDLETOKEN_DEPLOY_SINGLE_NODE,
+        .deployment = IDLETOKEN_DEPLOY_CLUSTER,
         .n_layers = 40,
         .n_embd   = 2048,
         .hc_streams = 1,
         .n_vocab  = 248320,
+        .n_expert = 256,
+        .n_expert_used = 8,
         .layer_weight_bytes  = 10656955008ull,  /* == variants[default_variant] = IQ2_XXS */
         .shared_weight_bytes = 0ull,
         .ctx_max  = 262144,
+        .ctx_yarn_max = 1048576,   /* Qwen ships YaRN configs for 4x */
         .split_boundary_multiple = 0,
         .kv_kind  = IDLETOKEN_KV_HYBRID,
-        .kv_bytes_per_token_layer = 4096,   /* 2 kv heads × 256 × 2 × 4 B */
+        .kv_bytes_per_token_layer = 2048,   /* 2 × (256 K + 256 V) × 2 B/f16 */
         .state_bytes_per_layer = 2195456,   /* 32×128×128×4 + conv 3×8192×4 */
         .full_attn_interval = 4,
         .overhead_base_bytes = (uint64_t)(1.5 * (double)GiB),
+        .compute_bytes_256k_cuda = 516947968ull,
+        .compute_bytes_1m_cuda = 1145065964ull,
+        .compute_bytes_256k_metal = 516947968ull,
+        .compute_bytes_1m_metal = 1146135511ull,
         .default_gguf = "Qwen3.5-35B-A3B-UD-IQ2_XXS.gguf",
         .variants = QWEN35_35B_A3B_VARIANTS,
         .n_variants = sizeof(QWEN35_35B_A3B_VARIANTS) / sizeof(QWEN35_35B_A3B_VARIANTS[0]),
@@ -633,7 +644,7 @@ static const idletoken_model_spec MODELS[] = {
         .available = 1,            /* validated 2026-07-27 on real Qwen3-8B
                                     * Q4_K_M GGUF (DGX): coherent output, and
                                     * the CUDA path matches CPU token-for-token */
-        .deployment = IDLETOKEN_DEPLOY_SINGLE_NODE,
+        .deployment = IDLETOKEN_DEPLOY_CLUSTER,
         .n_layers = 36,
         .n_embd   = 4096,
         .hc_streams = 1,           /* plain residual */
@@ -641,10 +652,15 @@ static const idletoken_model_spec MODELS[] = {
         .layer_weight_bytes  = 5027783488ull,  /* == Q4_K_M variant (measured) */
         .shared_weight_bytes = 0ull,
         .ctx_max  = 40960,
+        .ctx_yarn_max = 163840,   /* Qwen ships YaRN configs for 4x */
         .split_boundary_multiple = 0,
         .kv_kind  = IDLETOKEN_KV_GQA,
         .kv_bytes_per_token_layer = 4096,
         .overhead_base_bytes = (uint64_t)(1.5 * (double)GiB), /* n_embd 4096 + CUDA */
+        .compute_bytes_256k_cuda = 319553536ull,
+        .compute_bytes_1m_cuda = 0ull,
+        .compute_bytes_256k_metal = 327942144ull,
+        .compute_bytes_1m_metal = 0ull,
         .default_gguf = "Qwen3-8B-Q4_K_M.gguf",
         .variants = QWEN3_8B_VARIANTS,
         .n_variants = sizeof(QWEN3_8B_VARIANTS) / sizeof(QWEN3_8B_VARIANTS[0]),
@@ -665,6 +681,8 @@ static const idletoken_model_spec MODELS[] = {
         .n_embd   = 6144,
         .hc_streams = 1,           /* plain residual */
         .n_vocab  = 154880,
+        .n_expert = 256,
+        .n_expert_used = 8,
         .layer_weight_bytes  = 216715360960ull,
         .shared_weight_bytes = 0ull,
         .ctx_max  = 1048576,
@@ -672,6 +690,10 @@ static const idletoken_model_spec MODELS[] = {
         .kv_kind  = IDLETOKEN_KV_MLA,
         .kv_bytes_per_token_layer = 1152,
         .overhead_base_bytes = 3ull * GiB,  /* activations at n_embd 6144 + CUDA */
+        .compute_bytes_256k_cuda = 1614880440ull,
+        .compute_bytes_1m_cuda = 4836105912ull,
+        .compute_bytes_256k_metal = 35706707640ull,
+        .compute_bytes_1m_metal = 141201841848ull,
         .default_gguf = "UD-IQ1_S/GLM-5.2-UD-IQ1_S-00001-of-00006.gguf",
         .variants = GLM52_VARIANTS,
         .n_variants = sizeof(GLM52_VARIANTS) / sizeof(GLM52_VARIANTS[0]),
@@ -691,13 +713,20 @@ static const idletoken_model_spec MODELS[] = {
         .n_embd   = 7168,
         .hc_streams = 1,
         .n_vocab  = 163840,
+        .n_expert = 384,
+        .n_expert_used = 8,
         .layer_weight_bytes  = 210299214240ull,
         .shared_weight_bytes = 0ull,
         .ctx_max  = 262144,
+        .ctx_yarn_max = 1048576,   /* x4 — owner-approved extension */
         .split_boundary_multiple = 0,
         .kv_kind  = IDLETOKEN_KV_MLA,
         .kv_bytes_per_token_layer = 1152,
         .overhead_base_bytes = 3ull * GiB,
+        .compute_bytes_256k_cuda = 532687094ull,
+        .compute_bytes_1m_cuda = 1337993462ull,
+        .compute_bytes_256k_metal = 679435305ull,
+        .compute_bytes_1m_metal = 1485528105ull,
         .default_gguf = "moonshotai_Kimi-K2.5-IQ1_S/moonshotai_Kimi-K2.5-IQ1_S-00001-of-00006.gguf",
         .variants = KIMI_K25_VARIANTS,
         .n_variants = sizeof(KIMI_K25_VARIANTS) / sizeof(KIMI_K25_VARIANTS[0]),
@@ -709,6 +738,17 @@ const idletoken_model_spec *idletoken_model_get(const char *id) {
     if (!id || !id[0]) return NULL;
     for (size_t i = 0; i < sizeof(MODELS) / sizeof(MODELS[0]); i++)
         if (strcmp(MODELS[i].id, id) == 0) return &MODELS[i];
+    /* Compatibility for settings, scripts and API clients saved while long
+     * context was exposed as a duplicate `<model>-1m` SKU. The alias resolves
+     * to the base spec, so every outward-facing id is the one real model. */
+    const size_t len = strlen(id);
+    if (len > 3 && strcmp(id + len - 3, "-1m") == 0 && len - 3 < 128) {
+        char base[128];
+        memcpy(base, id, len - 3);
+        base[len - 3] = '\0';
+        for (size_t i = 0; i < sizeof(MODELS) / sizeof(MODELS[0]); i++)
+            if (strcmp(MODELS[i].id, base) == 0) return &MODELS[i];
+    }
     return NULL;
 }
 

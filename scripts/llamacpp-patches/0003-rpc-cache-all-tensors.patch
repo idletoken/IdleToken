@@ -1,0 +1,258 @@
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 9d48022..36b9c71 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -17,6 +17,14 @@
+ #include <fstream>
+ #include <filesystem>
+ #include <algorithm>
++#include <chrono>
++#include <fcntl.h>
++
++#ifdef _WIN32
++#include <io.h>
++#else
++#include <unistd.h>
++#endif
+ 
+ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
+ 
+@@ -77,8 +85,10 @@ enum rpc_cmd {
+ 
+ static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
+ 
+-// Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
+-const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
++// IdleToken pre-seeds each worker's tensor cache from its assigned GGUF layer
++// ranges. Route every tensor through the cache command so a cold cluster start
++// sends no model payload over RPC; required caches resolve weights by name.
++const size_t HASH_THRESHOLD = 0;
+ 
+ struct rpc_msg_hello_req {
+     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
+@@ -483,14 +493,35 @@ static void ggml_backend_rpc_buffer_memset_tensor(
+     RPC_STATUS_ASSERT(status);
+ }
+ 
++static bool rpc_is_model_tensor_name(const char * name) {
++    if (name == nullptr || name[0] == '\0') {
++        return false;
++    }
++    return strncmp(name, "blk.", 4) == 0 ||
++           strncmp(name, "token_embd.", 11) == 0 ||
++           strncmp(name, "output.", 7) == 0 ||
++           strncmp(name, "output_norm.", 12) == 0 ||
++           strstr(name, ".weight") != nullptr;
++}
++
+ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+     rpc_tensor rpc_tensor = serialize_tensor(tensor);
+     if (size > HASH_THRESHOLD) {
++        const char * require_cache = std::getenv("GGML_RPC_REQUIRE_MODEL_CACHE");
++        const bool required_model_cache =
++            require_cache != nullptr && strcmp(require_cache, "0") != 0 &&
++            rpc_is_model_tensor_name(rpc_tensor.name);
+         rpc_msg_set_tensor_hash_req request;
+         request.tensor = rpc_tensor;
+         request.offset = offset;
+-        request.hash = fnv_hash((const uint8_t*)data, size);
++        /* A required model cache is keyed by the tensor name on the worker.
++         * Hashing the coordinator's sparse GGUF would pointlessly page through
++         * every remote tensor before asking for that name. The hash remains
++         * authoritative for all other cache traffic. */
++        request.hash = required_model_cache
++            ? 0
++            : fnv_hash((const uint8_t*)data, size);
+         rpc_msg_set_tensor_hash_rsp response;
+         bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
+         RPC_STATUS_ASSERT(status);
+@@ -498,6 +529,10 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
+             // the server has the same data, no need to send it
+             return;
+         }
++        if (required_model_cache) {
++            GGML_ABORT("required RPC model cache miss for tensor '%s' (%zu bytes)",
++                       rpc_tensor.name, size);
++        }
+     }
+     // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
+     size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
+@@ -875,6 +910,7 @@ public:
+ 
+ private:
+     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
++    bool get_cached_tensor_name(const rpc_tensor & tensor, std::vector<uint8_t> & data);
+     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
+     ggml_tensor * create_node(uint64_t id,
+                               struct ggml_context * ctx,
+@@ -1164,33 +1200,93 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
+     return true;
+ }
+ 
++static bool read_cached_file(const fs::path & cache_file, std::vector<uint8_t> & data) {
++    std::error_code ec;
++    const uintmax_t raw_size = fs::file_size(cache_file, ec);
++    if (ec || raw_size > SIZE_MAX) {
++        return false;
++    }
++
++    const size_t size = (size_t) raw_size;
++    data.resize(size);
++#ifdef _WIN32
++    // MSVC's std::ifstream path degenerates into 4 KiB paging reads for these
++    // 500-700 MiB tensor files.  On an otherwise healthy NVMe that measured
++    // only ~18 MiB/s and dominated a DSv4 cluster start.  _O_SEQUENTIAL plus
++    // explicit multi-MiB reads reaches the storage stack as sequential I/O.
++    const int fd = _wopen(cache_file.c_str(), _O_RDONLY | _O_BINARY | _O_SEQUENTIAL);
++#else
++    const int fd = open(cache_file.c_str(), O_RDONLY);
++#endif
++    if (fd < 0) {
++        data.clear();
++        return false;
++    }
++
++    size_t done = 0;
++    while (done < size) {
++        const size_t left = size - done;
++        const unsigned chunk = (unsigned) std::min<size_t>(left, 8U << 20);
++#ifdef _WIN32
++        const int n = _read(fd, data.data() + done, chunk);
++#else
++        const ssize_t n = read(fd, data.data() + done, chunk);
++#endif
++        if (n <= 0) {
++            break;
++        }
++        done += (size_t) n;
++    }
++#ifdef _WIN32
++    _close(fd);
++#else
++    close(fd);
++#endif
++    if (done != size) {
++        data.clear();
++        return false;
++    }
++    return true;
++}
++
+ bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
+     if (!cache_dir) {
+         return false;
+     }
+     char hash_str[17];
+     snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
+-    fs::path cache_file = fs::path(cache_dir) / hash_str;
+-    std::error_code ec;
+-    if (!fs::exists(cache_file, ec)) {
++    return read_cached_file(fs::path(cache_dir) / hash_str, data);
++}
++
++bool rpc_server::get_cached_tensor_name(const rpc_tensor & tensor, std::vector<uint8_t> & data) {
++    if (!cache_dir || tensor.name[0] == '\0') {
+         return false;
+     }
+-    std::ifstream ifs(cache_file, std::ios::binary);
+-    ifs.seekg(0, std::ios::end);
+-    size_t size = ifs.tellg();
+-    ifs.seekg(0, std::ios::beg);
+-    data.resize(size);
+-    ifs.read((char *)data.data(), size);
+-    return true;
++    size_t name_len = 0;
++    while (name_len < GGML_MAX_NAME && tensor.name[name_len] != '\0') {
++        name_len++;
++    }
++    const uint64_t name_hash = fnv_hash((const uint8_t *) tensor.name, name_len);
++    char name_hash_str[19];
++    snprintf(name_hash_str, sizeof(name_hash_str), "n-%016" PRIx64, name_hash);
++    return read_cached_file(fs::path(cache_dir) / name_hash_str, data);
+ }
+ 
+ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response)
+ {
++    const auto cache_read_start = std::chrono::steady_clock::now();
+     std::vector<uint8_t> cached_file;
+-    if (!get_cached_file(request.hash, cached_file)) {
++    // A zero hash is the explicit required-cache/name-lookup sentinel. Keep
++    // the content hash authoritative for ordinary RPC cache requests, or a
++    // warm cache from another model with the same tensor name could silently
++    // substitute different bytes.
++    const bool by_name = request.hash == 0 &&
++                         get_cached_tensor_name(request.tensor, cached_file);
++    if (!by_name && !get_cached_file(request.hash, cached_file)) {
+         response.result = 0;
+         return true;
+     }
++    const auto cache_read_end = std::chrono::steady_clock::now();
+     size_t size = cached_file.size();
+     struct ggml_init_params params {
+         /*.mem_size   =*/ ggml_tensor_overhead(),
+@@ -1205,6 +1301,17 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
+         GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+         return false;
+     }
++    /* Name links are seeded from the worker's assigned GGUF ranges. Only use
++     * one for a complete tensor write; transient graph inputs may reuse a
++     * human-readable name but never get to impersonate a model weight. */
++    if (by_name && (request.offset != 0 || size != ggml_nbytes(tensor))) {
++        response.result = 0;
++        return true;
++    }
++    if (by_name) {
++        LOG_DBG("[%s] local name cache hit: %s (%zu bytes)\n",
++                __func__, request.tensor.name, size);
++    }
+     LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %zu, hash: %" PRIx64 "\n",
+             __func__, (void*)tensor->buffer, tensor->data, request.offset, size, request.hash);
+ 
+@@ -1221,7 +1328,17 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
+             return false;
+         }
+     }
++    const auto backend_set_start = std::chrono::steady_clock::now();
+     ggml_backend_tensor_set(tensor, cached_file.data(), request.offset, size);
++    const auto backend_set_end = std::chrono::steady_clock::now();
++    if (by_name) {
++        const double read_ms = std::chrono::duration<double, std::milli>(
++            cache_read_end - cache_read_start).count();
++        const double set_ms = std::chrono::duration<double, std::milli>(
++            backend_set_end - backend_set_start).count();
++        LOG_DBG("[%s] local cache timings: read=%.1f ms, backend_set=%.1f ms, size=%zu\n",
++                __func__, read_ms, set_ms, size);
++    }
+     response.result = 1;
+     return true;
+ }
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 0d74a21..4173bb0 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1565,7 +1565,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         }
+     }
+ 
+-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
++    /* IdleToken cluster workers already hold the exact assigned model tensors
++     * in their local RPC caches. On Windows, prefetching a sparse coordinator
++     * GGUF asks PrefetchVirtualMemory() to page in the full logical file before
++     * placement, defeating sharding and making startup appear hung. Keep mmap,
++     * but let only the tensors actually used by this process fault in. */
++    const char * require_rpc_cache = std::getenv("GGML_RPC_REQUIRE_MODEL_CACHE");
++    const bool prefetch_model = require_rpc_cache == nullptr || strcmp(require_rpc_cache, "0") == 0;
++    ml.init_mappings(prefetch_model, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+     pimpl->mappings.reserve(ml.mappings.size());
+ 
+     // create the backend buffers
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 1609fec..ed8f716 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -614,4 +614,3 @@ const char * llama_print_system_info(void) {
+ 
+     return s.c_str();
+ }
+-

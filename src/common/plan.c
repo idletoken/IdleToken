@@ -3,15 +3,22 @@
  * Model-shaped numbers all come from the idletoken_model_spec (multi-model
  * design §3.3) — this file must stay free of per-model constants. */
 #include "idletoken_plan.h"
+#include "idletoken_modelsize.h"
 
 #include <stdio.h>
-#include <stdlib.h>   /* getenv — the over-subscription override */
 #include <string.h>
 
 #define GiB (1024ull * 1024 * 1024)
 
-/* HYBRID floor: CUDA context + workspace + at least one GPU layer. */
-#define IDLETOKEN_HYBRID_MIN_VRAM      (4ull * GiB)
+uint32_t idletoken_llama_product_ctx_ceiling(
+        const idletoken_model_spec *model) {
+    if (!model) return 0;
+    uint32_t ceiling = model->ctx_yarn_max > model->ctx_max
+        ? model->ctx_yarn_max : model->ctx_max;
+    if (ceiling > IDLETOKEN_PRODUCT_CONTEXT_CAP)
+        ceiling = IDLETOKEN_PRODUCT_CONTEXT_CAP;
+    return ceiling;
+}
 
 /* Average layers per node — the overhead estimate used before the actual
  * split exists (needed_bytes, capacity caps). Ceil so we err conservative. */
@@ -22,20 +29,31 @@ static int avg_layers_per_node(const idletoken_model_spec *m, int n_nodes) {
 
 uint64_t idletoken_needed_bytes_quant(const idletoken_model_spec *model,
                                    const char *quant,
-                                   uint32_t ctx_size, int n_nodes) {
+                                   uint32_t ctx_size, int n_nodes,
+                                   uint8_t backend) {
     if (n_nodes < 1) n_nodes = 1;
-    uint64_t layer_bytes = model->layer_weight_bytes;
-    uint64_t shared_bytes = model->shared_weight_bytes;
-    idletoken_model_weight_bytes(model, quant, &layer_bytes, &shared_bytes);
-    const uint64_t per_node = shared_bytes +
-        idletoken_model_overhead(model, ctx_size, avg_layers_per_node(model, n_nodes));
-    return layer_bytes + (uint64_t)n_nodes * per_node;
+    idletoken_llm_model_size size;
+    if (!model || idletoken_model_size_resolve(model, quant, NULL, &size,
+                                                NULL, 0) != 0)
+        return UINT64_MAX;
+    /* The shipped automatic KV tier is a function of selected weight
+     * precision. This is the same closed mapping coord_main applies before it
+     * asks the llama.cpp planner; using f16 here for an IQ2 row was a second,
+     * hidden source of capability-table inflation. >=5/unknown remains f16
+     * first because downgrade then depends on the particular machine. */
+    const int bits = idletoken_quant_weight_bits(quant);
+    if (bits >= 1 && bits <= 2)
+        idletoken_llama_model_kv_scale(&size, 18.0 / 64.0);
+    else if (bits >= 3 && bits <= 4)
+        idletoken_llama_model_kv_scale(&size, 34.0 / 64.0);
+    return size.total_bytes +
+           idletoken_llama_hard_need(&size, ctx_size, n_nodes, backend);
 }
 
 uint64_t idletoken_needed_bytes(const idletoken_model_spec *model,
-                             uint32_t ctx_size, int n_nodes) {
+                             uint32_t ctx_size, int n_nodes, uint8_t backend) {
     /* The model's own default precision — one code path, no drift. */
-    return idletoken_needed_bytes_quant(model, NULL, ctx_size, n_nodes);
+    return idletoken_needed_bytes_quant(model, NULL, ctx_size, n_nodes, backend);
 }
 
 idletoken_mode idletoken_mode_decide_quant(const idletoken_model_spec *model,
@@ -55,27 +73,13 @@ idletoken_mode idletoken_mode_decide_quant(const idletoken_model_spec *model,
         return IDLETOKEN_MODE_REFUSE;
     }
 
-    const uint64_t needed = idletoken_needed_bytes_quant(model, quant, ctx_size, n);
+    const uint64_t needed = idletoken_needed_bytes_quant(
+        model, quant, ctx_size, n, idletoken_llama_roster_backend(nodes, n));
     if (shortfall_out) *shortfall_out = 0;
-    uint64_t sum_vram = 0, sum_all = 0;
-    uint64_t min_vram = UINT64_MAX;
-    int min_vram_at = 0;               /* which node holds that minimum */
+    uint64_t sum_vram = 0;
     for (int i = 0; i < n; i++) {
-        const uint64_t v = nodes[i].vram_usable;
-        const uint64_t r = nodes[i].ram_usable;
-        sum_vram += v;
-        /* Unified hosts: one physical pool — count it once, not twice. */
-        sum_all  += nodes[i].unified ? (v > r ? v : r) : (v + r);
-        if (v < min_vram) { min_vram = v; min_vram_at = i; }
+        sum_vram += nodes[i].vram_usable;
     }
-    /* Name the machine, or say which index it was. A refusal the user cannot
-     * act on is only marginally better than no refusal at all. */
-    char who[80];
-    if (nodes[min_vram_at].label && nodes[min_vram_at].label[0])
-        snprintf(who, sizeof who, "%s", nodes[min_vram_at].label);
-    else
-        snprintf(who, sizeof who, "node #%d", min_vram_at + 1);
-
     if (sum_vram >= needed) {
         if (why) snprintf(why, whylen,
                           "GPU_ONLY: %.1f GiB VRAM >= %.1f GiB needed (%s)",
@@ -83,38 +87,15 @@ idletoken_mode idletoken_mode_decide_quant(const idletoken_model_spec *model,
                           (double)needed   / (double)GiB, model->id);
         return IDLETOKEN_MODE_GPU_ONLY;
     }
-    if (sum_all >= needed) {
-        if (min_vram < IDLETOKEN_HYBRID_MIN_VRAM) {
-            if (why) snprintf(why, whylen,
-                              "refuse: HYBRID possible by memory (%.1f GiB) but "
-                              "%s reports only %.1f GiB usable VRAM (< 4 GiB floor). "
-                              "Check that machine: close what is using its GPU, "
-                              "raise its VRAM limit in Settings, or leave it out "
-                              "of the cluster.",
-                              (double)sum_all  / (double)GiB, who,
-                              (double)min_vram / (double)GiB);
-            return IDLETOKEN_MODE_REFUSE;
-        }
-        if (why) snprintf(why, whylen,
-                          "HYBRID: VRAM %.1f GiB short of %.1f GiB, VRAM+RAM "
-                          "%.1f GiB covers it (%s)",
-                          (double)sum_vram / (double)GiB,
-                          (double)needed   / (double)GiB,
-                          (double)sum_all  / (double)GiB, model->id);
-        return IDLETOKEN_MODE_HYBRID;
-    }
     if (why) snprintf(why, whylen,
-                      "refuse: %s needs %.1f GiB for ctx=%u on %d node(s); have "
-                      "%.1f GiB VRAM / %.1f GiB VRAM+RAM. Add nodes, free "
-                      "memory, or lower the context tier.",
+                      "[RESOURCE_INSUFFICIENT] %s needs %.1f GiB of GPU memory "
+                      "for ctx=%u on %d node(s); only %.1f GiB is available. "
+                      "Free GPU memory, choose a smaller quantization, or add "
+                      "nodes.",
                       model->id,
                       (double)needed   / (double)GiB, ctx_size, n,
-                      (double)sum_vram / (double)GiB,
-                      (double)sum_all  / (double)GiB);
-    /* How much more memory would make it fit — the number the capability
-     * advisor turns into "37 GB short". Reported against VRAM+RAM because that
-     * is the boundary between REFUSE and HYBRID. */
-    if (shortfall_out) *shortfall_out = needed - sum_all;
+                      (double)sum_vram / (double)GiB);
+    if (shortfall_out) *shortfall_out = needed - sum_vram;
     return IDLETOKEN_MODE_REFUSE;
 }
 
@@ -125,34 +106,10 @@ idletoken_mode idletoken_mode_decide(const idletoken_model_spec *model,
                                     why, whylen);
 }
 
-/* Per-node weight used to size its layer share.
- * - GPU_ONLY: usable VRAM only — keep every layer in fast device memory.
- * - HYBRID:   total usable capacity (VRAM + RAM for a discrete card; the single
- *             unified pool for a unified host) — a node with modest VRAM but
- *             ample RAM can then hold MORE layers, spilling the overflow to RAM
- *             (the worker auto-offloads via cudaHostAlloc). This is what makes
- *             the cluster use every machine's RAM, not just its VRAM. */
+/* Per-node layer weight. Serving is GPU-only. */
 static uint64_t node_split_weight(const idletoken_node_mem *m, idletoken_mode mode) {
-    uint64_t w;
-    if (mode == IDLETOKEN_MODE_HYBRID) {
-        /* The host-side share is bounded by the **pinned-memory ceiling**, not
-         * by ram_usable: every spilled layer goes through cudaHostAlloc, and
-         * that ceiling sits well below physical RAM and cannot be derived
-         * (measured 73.0% vs 48.2% of physical RAM on the same GPU model, each
-         * reproducible across runs). Exceeding it shows up mid-load as
-         * `cudaHostAlloc failed: out of memory`, a failure the capacity model
-         * did not account for at all. 0 = not measured, so fall back to the old
-         * behaviour (no constraint) rather than shrinking a node because a
-         * probe failed. Unified-memory hosts skip this path entirely: they have
-         * no separate VRAM pool to spill from. */
-        uint64_t host = m->ram_usable;
-        if (!m->unified && m->ram_pinnable > 0 && host > m->ram_pinnable)
-            host = m->ram_pinnable;
-        w = m->unified ? (m->vram_usable > m->ram_usable ? m->vram_usable : m->ram_usable)
-                       : (m->vram_usable + host);
-    } else {
-        w = m->vram_usable > 0 ? m->vram_usable : m->ram_usable;
-    }
+    (void)mode;
+    uint64_t w = m->vram_usable;
     return w == 0 ? 1 : w;   /* probe-failure guard: avoid div by zero */
 }
 
@@ -270,63 +227,131 @@ int idletoken_plan_layers(const idletoken_model_spec *model,
 /* ===== llama.cpp-engine scheduling (v2 rebuild WS-B2) ======================
  * Contracts + the usable-memory formula: include/idletoken_plan.h. */
 
-/* Per-node engine overhead beyond weights + KV. CALIBRATED 2026-08-15 on all
- * three backends (Qwen3.5-0.8B Q4_K_M, ctx 4096, llama-server -lv 5 buffer
- * report + nvidia-smi / RSS; results/resource-calibration-20260815.md):
- *   - CUDA context on a discrete card:      ~550 MiB (RTX 5060 Ti:
- *     1171 GPU-MiB used − 497 weights − 122 engine buffers)
- *   - engine buffers (RS+compute+output):   ~133 MiB on every backend at 0.8B,
- *     and they scale with model width — so a fixed constant alone is wrong in
- *     both directions (overcharges a phone-sized model, undercharges DSv4).
- *   - Metal has no CUDA-context analogue (~0): the fixed term is conservative
- *     there, which is the safe direction on a 16 GiB unified Mac.
- * Formula: 768 MiB fixed (CUDA context + small-model buffers, ~15% margin
- * over the worst measurement) + weights/64 (~1.6%, covers the width-scaled
- * compute buffers; 80 GiB DSv4 → ~2 GiB/node total).
- * Deliberately shared between the fit check and the ctx sizing so the two
- * cannot disagree about what "fits" means.
+/* Per-node engine overhead beyond weights + KV + workspace.
  *
- * RECHECKED 2026-08-19 at the top end, which 08-15 could only extrapolate
- * (results/resource-calibration-20260819.md; 5.29 / 15.59 / 80.76 GiB of
- * weights). Two results:
+ * RETIRED 2026-09-01: `768 MiB + weights/64`. It was calibrated on ONE small
+ * model at ctx 4096 and then extrapolated, and it had no context term at all.
+ * Measured against the engine's own dry-run at 256K
+ * (results/memory-need-measured-20260901.md) it was 59% high on Qwen3.5-0.8B
+ * and 9.6x LOW on DeepSeek-V2-Lite — 1013 MiB charged against 9764 MiB real.
+ * The workspace's growth rate is set by the model's ARCHITECTURE (DS-V2-Lite
+ * grows linearly with context, Qwen3.5 is flat), so the failure was not a bad
+ * constant; it was the belief that a constant existed. The workspace is now a
+ * measured per-model input (`compute_bytes_*`), and what remains here is only
+ * what genuinely is per-NODE.
  *
- *  - The slope is SAFE where it was unmeasured: DeepSeek-V4-Flash at 80.76 GiB
- *    wants ~321 MiB of non-weight buffers against the ~2060 MiB budgeted here,
- *    a 6.4x margin. Nothing to raise. The constants are therefore unchanged.
+ * CUDA context: the driver's own allocation when a process initializes CUDA.
+ * MEASURED 2026-09-01 on an RTX 5060 Ti (driver-current): NVML reported
+ * 16050 MiB free from outside the process, the engine reported 15172 MiB free
+ * from inside it, i.e. **878 MiB**. Metal has no analogue (~0), so charging
+ * the CUDA figure everywhere is conservative in the safe direction on a Mac.
  *
- *  - But the real driver is NOT model size, it is SLOT COUNT, and this formula
- *    has no slot term. The engine's per-sequence state buffer scales exactly
- *    with -np (measured 4.000x from -np 1 to -np 4 on both Qwen3.5 sizes), and
- *    on the hybrid-linear-attention Qwen3.5 family it dominates: ~9.65 MiB per
- *    GiB of weights PER SLOT, i.e. ~38.6 MiB/GiB at the cap of 4, against the
- *    16 MiB/GiB this formula charges. Crossover is around 29 GiB of weights.
- *    The largest curated Qwen3.5 (35b-a3b, 20.5 GiB) still fits with a 1.22x
- *    margin, so nothing shipped is mis-budgeted and nothing is changed here.
+ * ⚠ This is per-node because each machine runs its own engine process and so
+ * pays its own context. Weights, KV and workspace are NOT per-node: the
+ * tensor split divides them.
  *
- *    ⚠ If that margin is ever spent — a bigger hybrid-attention model, or a
- *    slot cap above 4 — this needs a slot term, not a bigger constant. Note
- *    that making it slot-aware closes a loop: idletoken_llama_seq_slots() calls
- *    this to decide the slot count. That is a design decision, not a
- *    recalibration; take it deliberately. */
-#define IDLETOKEN_LLAMA_NODE_OVERHEAD_FIXED (768ull * 1024 * 1024)
+ * The 100 MiB is the ONLY margin in the whole budget, and it is deliberately
+ * small: the standing rule (2026-09-01) is no reserves anywhere, and 100 MB is
+ * the stated ceiling for the one exception. It covers allocator fragmentation,
+ * not a category of cost we failed to enumerate — if a real shortfall appears,
+ * measure it and give it its own term rather than growing this one. */
+#define IDLETOKEN_LLAMA_CUDA_CONTEXT_BYTES (878ull * 1024 * 1024)
+#define IDLETOKEN_LLAMA_NODE_MARGIN_BYTES  (100ull * 1024 * 1024)
 #define idletoken_llama_node_overhead(model_bytes) \
-    (IDLETOKEN_LLAMA_NODE_OVERHEAD_FIXED + (model_bytes) / 64)
+    ((void)(model_bytes), \
+     IDLETOKEN_LLAMA_CUDA_CONTEXT_BYTES + IDLETOKEN_LLAMA_NODE_MARGIN_BYTES)
+
+uint64_t idletoken_llama_compute_bytes(const idletoken_llm_model_size *model,
+                                       uint32_t ctx_size, uint8_t backend) {
+    if (!model) return 0;
+    /* Two product tiers, two measurements (hard constraint #13). Anything above
+     * the 256K tier is the 1M tier; there is nothing in between to interpolate
+     * and interpolating is what this change exists to stop. */
+    const int one_m = ctx_size > 262144u;
+    const uint64_t cuda  = one_m ? model->compute_bytes_1m_cuda
+                                 : model->compute_bytes_256k_cuda;
+    const uint64_t metal = one_m ? model->compute_bytes_1m_metal
+                                 : model->compute_bytes_256k_metal;
+    switch (backend) {
+        case IDLETOKEN_NODE_BACKEND_CUDA:  return cuda;
+        case IDLETOKEN_NODE_BACKEND_METAL: return metal;
+        default: break;
+    }
+    /* Unknown backend: charge the larger. Picking one would be a guess about
+     * the machine, and on GLM-5.2 that guess is wrong by 22x in the direction
+     * that OOMs. If EITHER measurement is missing the answer is 0, which the
+     * planner turns into a refusal — an unmeasured model must not become a
+     * cheap one. */
+    if (cuda == 0 || metal == 0) return 0;
+    return cuda > metal ? cuda : metal;
+}
+
+uint8_t idletoken_llama_roster_backend(const idletoken_node_mem *nodes, int n) {
+    if (!nodes || n <= 0) return IDLETOKEN_NODE_BACKEND_UNKNOWN;
+    const uint8_t first = nodes[0].backend;
+    if (first == IDLETOKEN_NODE_BACKEND_UNKNOWN)
+        return IDLETOKEN_NODE_BACKEND_UNKNOWN;
+    for (int i = 1; i < n; i++)
+        if (nodes[i].backend != first) return IDLETOKEN_NODE_BACKEND_UNKNOWN;
+    return first;
+}
 
 uint64_t idletoken_llama_node_usable(const idletoken_node_mem *node) {
-    if (!node) return 0;
-    if (node->unified)   /* one physical pool — count it once */
-        return node->vram_usable > node->ram_usable ? node->vram_usable
-                                                    : node->ram_usable;
-    return node->vram_usable + node->ram_usable;
+    return node ? node->vram_usable : 0;
 }
 
 uint64_t idletoken_llama_kv_pool(const idletoken_node_mem *node) {
     if (!node) return 0;
-    /* Unified: one physical pool, so where the KV lives and what the model can
-     * be laid out across are the same number. Discrete: the KV is allocated on
-     * the device (-ngl 99), and host RAM does not back it. */
-    if (node->unified) return idletoken_llama_node_usable(node);
     return node->vram_usable;
+}
+
+static uint64_t sat_add_u64(uint64_t a, uint64_t b) {
+    return UINT64_MAX - a < b ? UINT64_MAX : a + b;
+}
+
+static uint64_t sat_mul_u64(uint64_t a, uint64_t b) {
+    return a && b > UINT64_MAX / a ? UINT64_MAX : a * b;
+}
+
+static uint64_t round_cells_256(uint64_t cells) {
+    if (cells > UINT64_MAX - 255) return UINT64_MAX;
+    return (cells + 255) / 256 * 256;
+}
+
+uint64_t idletoken_llama_kv_bytes(const idletoken_llm_model_size *model,
+                                  uint32_t ctx_size) {
+    if (!model) return 0;
+    uint64_t bytes = model->kv_fixed_bytes_per_seq;
+    if (model->dsv4_raw_bytes_per_cell != 0) {
+        /* Mirrors llama-kv-cache-dsv4.cpp exactly: raw has one cell per
+         * context token; CSA/HCA use compressed cell counts, each padded to a
+         * 256-cell allocation boundary. csa_bytes_per_cell already includes
+         * the lightning-indexer cache attached to CSA layers. */
+        const uint64_t raw_cells = ctx_size;
+        const uint64_t csa_cells = round_cells_256(((uint64_t)ctx_size + 3) / 4);
+        const uint64_t hca_cells = round_cells_256(((uint64_t)ctx_size + 127) / 128);
+        bytes = sat_add_u64(bytes,
+            sat_mul_u64(model->dsv4_raw_bytes_per_cell, raw_cells));
+        bytes = sat_add_u64(bytes,
+            sat_mul_u64(model->dsv4_csa_bytes_per_cell, csa_cells));
+        bytes = sat_add_u64(bytes,
+            sat_mul_u64(model->dsv4_hca_bytes_per_cell, hca_cells));
+        return bytes;
+    }
+    return sat_add_u64(bytes,
+        sat_mul_u64(model->kv_bytes_per_token, (uint64_t)ctx_size));
+}
+
+void idletoken_llama_model_kv_scale(idletoken_llm_model_size *model,
+                                    double scale) {
+    if (!model || !(scale > 0.0)) return;
+#define SCALE_FIELD(field_) \
+    model->field_ = (uint64_t)((double)model->field_ * scale + 0.5)
+    SCALE_FIELD(kv_bytes_per_token);
+    SCALE_FIELD(dsv4_raw_bytes_per_cell);
+    SCALE_FIELD(dsv4_csa_bytes_per_cell);
+    SCALE_FIELD(dsv4_hca_bytes_per_cell);
+#undef SCALE_FIELD
 }
 
 /* Bytes this model needs on `n_nodes` machines at `ctx_size`:
@@ -338,60 +363,146 @@ uint64_t idletoken_llama_kv_pool(const idletoken_node_mem *node) {
  * still the right number for "will this run WELL", which is what ctx sizing
  * and the single-node fast path ask. */
 static uint64_t llplan_needed(const idletoken_llm_model_size *model,
-                              uint32_t ctx_size, int n_nodes) {
+                              uint32_t ctx_size, int n_nodes, uint8_t backend) {
     if (n_nodes < 1) n_nodes = 1;
-    return model->total_bytes +
-           model->kv_bytes_per_token * (uint64_t)ctx_size +
-           (uint64_t)n_nodes * idletoken_llama_node_overhead(model->total_bytes);
+    uint64_t need = sat_add_u64(model->total_bytes,
+                                idletoken_llama_kv_bytes(model, ctx_size));
+    /* The graph workspace is charged ONCE for the whole cluster, like weights
+     * and KV: the tensor split divides the graph, so each node reserves its
+     * slice rather than a private copy. Only the CUDA context and the margin
+     * are per-node — every machine runs its own engine process. */
+    need = sat_add_u64(need,
+        idletoken_llama_compute_bytes(model, ctx_size, backend));
+    return sat_add_u64(need,
+        sat_mul_u64((uint64_t)n_nodes,
+                    idletoken_llama_node_overhead(model->total_bytes)));
 }
 
 uint64_t idletoken_llama_hard_need(const idletoken_llm_model_size *model,
-                                   uint32_t ctx_size, int n_nodes) {
+                                   uint32_t ctx_size, int n_nodes,
+                                   uint8_t backend) {
     if (!model) return 0;
     if (n_nodes < 1) n_nodes = 1;
-    return model->kv_bytes_per_token * (uint64_t)ctx_size +
-           (uint64_t)n_nodes * idletoken_llama_node_overhead(model->total_bytes);
+    /* The workspace is resident like the KV cache is: it is allocated, not
+     * mmap'd, so it belongs on this side of the line even though the weights
+     * do not. */
+    uint64_t need = sat_add_u64(idletoken_llama_kv_bytes(model, ctx_size),
+        idletoken_llama_compute_bytes(model, ctx_size, backend));
+    return sat_add_u64(need,
+        sat_mul_u64((uint64_t)n_nodes,
+                    idletoken_llama_node_overhead(model->total_bytes)));
 }
 
 uint64_t idletoken_llama_working_set(const idletoken_llm_model_size *model) {
     if (!model) return 0;
-    /* Dense (or an MoE we cannot characterise): every byte is touched. Falling
-     * back to the whole file is the SAFE direction — it can only make the
-     * verdict more conservative, never promise a speed the machine cannot
-     * deliver. */
-    if (model->n_expert < 2 || model->n_expert_used == 0 ||
-        model->n_expert_used >= model->n_expert)
-        return model->total_bytes;
-    /* MoE. The expert FFN dominates the file, but attention/norms/shared
-     * experts are touched by EVERY token, and no field here separates them —
-     * so charge a floor of 1/8 of the file for the always-resident part on top
-     * of the consulted experts' share. Deliberately crude and deliberately
-     * high: over-charging costs a "slow" label on a model that would have been
-     * fast, while under-charging promises a speed the disk cannot deliver.
-     * (GLM-5.2 256/8: 12.5% floor + 3.1% experts ≈ 35 GiB of a 222 GiB file;
-     * measured working set from the 08-16 run is ~12 GiB, so this is ~3x
-     * conservative. Tighten it when a GGUF-side split of expert vs shared
-     * tensor bytes exists — see the doc's closed-loop item.) */
-    const uint64_t experts = model->total_bytes / (uint64_t)model->n_expert *
-                             (uint64_t)model->n_expert_used;
-    return model->total_bytes / 8 + experts;
+    /* The GGUF manifests currently expose the total file size and MoE routing
+     * counts, but not the byte-exact split between always-hot tensors and each
+     * expert's tensors. A ratio derived from expert counts would therefore be
+     * a guess. Use the whole mapped file until the tensor-directory parser can
+     * provide those exact byte buckets. This is deliberately conservative: it
+     * may label a runnable MoE configuration "slow", but it never promises a
+     * full-speed working set that was not measured. */
+    return model->total_bytes;
 }
 
 uint32_t idletoken_llama_fit_ctx(uint64_t usable_bytes,
                                  const idletoken_llm_model_size *model,
-                                 uint32_t ctx_want, uint32_t ctx_floor) {
+                                 uint32_t ctx_want, uint32_t ctx_floor,
+                                 uint8_t backend) {
     if (!model || ctx_want == 0) return 0;
-    if (model->kv_bytes_per_token == 0) return ctx_want;  /* unknown ≠ free; the
-                                                           * engine still fails
-                                                           * loudly if wrong */
+    if (model->kv_bytes_per_token == 0 &&
+        model->dsv4_raw_bytes_per_cell == 0) return ctx_want; /* unknown ≠ free */
     const uint64_t fixed = model->total_bytes +
                            idletoken_llama_node_overhead(model->total_bytes);
     if (usable_bytes <= fixed) return 0;
-    uint64_t tokens = (usable_bytes - fixed) / model->kv_bytes_per_token;
-    if (tokens > ctx_want) tokens = ctx_want;
-    tokens -= tokens % 1024;             /* engine-friendly granularity */
-    if (tokens < ctx_floor) return 0;
-    return (uint32_t)tokens;
+    uint32_t lo = 0, hi = ctx_want / 1024;
+    while (lo < hi) {
+        const uint32_t mid = lo + (hi - lo + 1) / 2;
+        /* The workspace is a function of the context being tried, so it has to
+         * move inside the search — hoisting it into `fixed` would size the
+         * window against a different window's workspace. */
+        const uint64_t need = sat_add_u64(fixed,
+            sat_add_u64(idletoken_llama_kv_bytes(model, mid * 1024u),
+                        idletoken_llama_compute_bytes(model, mid * 1024u,
+                                                      backend)));
+        if (need <= usable_bytes) lo = mid; else hi = mid - 1;
+    }
+    const uint32_t tokens = lo * 1024u;
+    return tokens < ctx_floor ? 0 : tokens;
+}
+
+int idletoken_quant_bits_from_path(const char *path) {
+    /* The client launches the coordinator with only a GGUF path (no
+     * --model-id/--quant), so the weight-quant tier must read the file NAME:
+     * curated downloads all carry the variant token ("...-UD-IQ2_XXS.gguf",
+     * "...-Q4_K_M.gguf"). Scan for the LAST token shaped like a quant name —
+     * (I)Q<digits>, BF16/F16, or MXFP4/FP4 at a word boundary — and return
+     * its bits.
+     * No match -> 0 (conservative tier), same never-guess-low rule. */
+    if (!path || !path[0]) return 0;
+    const char *base = path;
+    for (const char *p = path; *p; p++)
+        if (*p == '/' || *p == '\\') base = p + 1;
+    int bits = 0;
+    for (const char *p = base; *p; p++) {
+        const int at_boundary =
+            (p == base) || !((p[-1] >= 'A' && p[-1] <= 'Z') ||
+                             (p[-1] >= 'a' && p[-1] <= 'z') ||
+                             (p[-1] >= '0' && p[-1] <= '9'));
+        if (!at_boundary) continue;
+        const char *q = p;
+        if ((q[0] == 'M' || q[0] == 'm') &&
+            (q[1] == 'X' || q[1] == 'x') &&
+            (q[2] == 'F' || q[2] == 'f') &&
+            (q[3] == 'P' || q[3] == 'p')) q += 4;
+        else if ((q[0] == 'F' || q[0] == 'f') &&
+                 (q[1] == 'P' || q[1] == 'p')) q += 2;
+        else if ((q[0] == 'B' || q[0] == 'b') &&
+                 (q[1] == 'F' || q[1] == 'f')) q += 2;
+        else {
+            if (q[0] == 'I' || q[0] == 'i') q++;
+            if (q[0] == 'Q' || q[0] == 'q') q++;
+            else if (q[0] == 'F' || q[0] == 'f') q++;
+            else continue;
+        }
+        if (!(*q >= '0' && *q <= '9')) continue;
+        int b = 0;
+        while (*q >= '0' && *q <= '9') b = b * 10 + (*q++ - '0');
+        /* Must END the token here: "Qwen3" (Q + 3 + 'w'-less but followed by
+         * '.') is a real trap only when letters follow; digits already
+         * consumed, so reject a trailing letter that would make this a word. */
+        if ((*q >= 'A' && *q <= 'Z' && *q != '_') || (*q >= 'a' && *q <= 'z'))
+            continue;
+        if (b >= 1 && b <= 32) bits = b;   /* keep scanning: LAST match wins */
+    }
+    return bits;
+}
+
+int idletoken_quant_weight_bits(const char *quant) {
+    /* Use the same token parser as a GGUF filename. "first digit wins" read
+     * the 3 in Qwen3.5 from the MXFP4 variant label and happened to choose the
+     * same tier for the wrong reason. */
+    return idletoken_quant_bits_from_path(quant);
+}
+
+const char *idletoken_llama_kv_type_for_weight(int weight_bits) {
+    if (weight_bits >= 1 && weight_bits <= 2) return "q4_0";
+    if (weight_bits >= 3 && weight_bits <= 4) return "q8_0";
+    return NULL;
+}
+
+/* Display rounding is retained for diagnostics. Product starts use the exact
+ * selected 256K or 1M context and never call this as an automatic ladder. */
+uint32_t idletoken_llama_ctx_display_tier(uint32_t max_ctx) {
+    static const uint32_t tiers[] = {
+        16384, 32768, 65536, 131072, 262144, 524288, 1048576,
+    };
+    uint32_t best = 0;
+    for (size_t i = 0; i < sizeof(tiers) / sizeof(tiers[0]); i++) {
+        if (tiers[i] > max_ctx) break;
+        best = tiers[i];
+    }
+    return best;
 }
 
 int idletoken_llama_seq_slots(const idletoken_node_mem *node,
@@ -409,18 +520,21 @@ int idletoken_llama_seq_slots(const idletoken_node_mem *node,
     const uint64_t pool = idletoken_llama_kv_pool(node);
 
     const uint64_t weights = (uint64_t)((double)model->total_bytes * layer_share);
-    /* The overhead term is per-NODE and does not scale with the share: a CUDA
-     * context costs the same on a machine holding three layers as on one
-     * holding all of them (results/resource-calibration-20260815.md). */
-    const uint64_t fixed = weights + idletoken_llama_node_overhead(model->total_bytes);
+    /* The workspace is split with the graph, so it takes the share; the CUDA
+     * context does not — it costs the same on a machine holding three layers
+     * as on one holding all of them. */
+    const uint64_t workspace = (uint64_t)(
+        (double)idletoken_llama_compute_bytes(model, ctx_size, node->backend) *
+        layer_share);
+    const uint64_t fixed = weights + workspace +
+                           idletoken_llama_node_overhead(model->total_bytes);
     /* Also the slow-tier rule: weights that do not fit the KV pool are weights
      * spilling to host RAM, and a machine already paying PCIe per token must
      * not also be asked to hold a second context in the memory it ran out of. */
     if (pool <= fixed) return 1;
 
     const uint64_t kv_per_seq =
-        (uint64_t)((double)model->kv_bytes_per_token * layer_share) *
-        (uint64_t)ctx_size;
+        (uint64_t)((double)idletoken_llama_kv_bytes(model, ctx_size) * layer_share);
     if (kv_per_seq == 0) return 1;
 
     uint64_t slots = (pool - fixed) / kv_per_seq;
@@ -432,7 +546,7 @@ int idletoken_llama_seq_slots(const idletoken_node_mem *node,
 int idletoken_plan_llamacpp(const idletoken_llm_model_size *model,
                             const idletoken_node_mem *nodes, int n,
                             int coordinator, uint32_t ctx_size,
-                            int allow_small_cluster,
+                            int force_cluster,
                             idletoken_llama_plan *out) {
     if (!model || !nodes || !out || n <= 0 || n > IDLETOKEN_LLPLAN_MAX_NODES ||
         coordinator < 0 || coordinator >= n || model->total_bytes == 0)
@@ -441,7 +555,30 @@ int idletoken_plan_llamacpp(const idletoken_llm_model_size *model,
     out->single_node = -1;
     out->layer0_node = -1;
 
-    const uint64_t need1 = llplan_needed(model, ctx_size, 1);
+    /* No measurement, no admission (2026-09-01). A zero workspace is the ONE
+     * value that must never be taken at face value: charging 0 means the
+     * budget silently omits a term that measured 9764 MiB on a 15.7 GiB model
+     * at 256K, so the plan would say "fits", the user would wait through a
+     * full load, and the engine would OOM. Refusing is the honest answer and
+     * the fix is mechanical — run the dry-run and record it.
+     *
+     * Deliberately BEFORE the invariant checks below: "we never measured this"
+     * is a fact about the build, not about the user's machines, and a machine
+     * report cannot make it true or false. */
+    const uint8_t backend = idletoken_llama_roster_backend(nodes, n);
+    if (idletoken_llama_compute_bytes(model, ctx_size, backend) == 0) {
+        out->kind = IDLETOKEN_LLPLAN_REFUSE;
+        snprintf(out->why, sizeof(out->why),
+                 "[RESOURCE_INSUFFICIENT] this model has no measured GPU "
+                 "workspace for a %u-token context, so its memory requirement "
+                 "is unknown. Measure it against the pinned engine "
+                 "(scripts/measure_model_memory.sh <gguf> %u) and record the "
+                 "result in the model manifest; this build will not guess.",
+                 ctx_size, ctx_size);
+        return 0;
+    }
+
+    const uint64_t need1 = llplan_needed(model, ctx_size, 1, backend);
     const uint64_t coord_usable = idletoken_llama_node_usable(&nodes[coordinator]);
 
     /* ---- hard invariant #1 first: layer 0 + the embedding lookup stay with
@@ -461,11 +598,12 @@ int idletoken_plan_llamacpp(const idletoken_llm_model_size *model,
         return 0;
     }
 
-    /* ---- hard invariant #5: fits the coordinator alone → don't cluster.
+    /* ---- default: fits the coordinator alone → select SINGLE.
      * "The best single node" is the coordinator by construction: a lone
      * worker could hold the bytes, but layer 0 may not move there (above),
-     * so the only machine that can legally run single IS the coordinator. */
-    if (coord_usable >= need1 && !(allow_small_cluster && n > 1)) {
+     * so the only machine that can legally run single IS the coordinator.
+     * This is a default, not a veto: an explicit multi-machine choice wins. */
+    if (coord_usable >= need1 && !(force_cluster && n > 1)) {
         out->kind = IDLETOKEN_LLPLAN_SINGLE;
         out->single_node = coordinator;
         out->layer0_node = coordinator;
@@ -479,125 +617,42 @@ int idletoken_plan_llamacpp(const idletoken_llm_model_size *model,
         return 0;
     }
 
-    /* ---- one machine, weights beyond its memory --------------------------
-     * Not automatically a refusal any more (2026-08-16). The weights are
-     * mmap'd, so what must be RESIDENT is only KV + engine overhead; the rest
-     * streams from disk. This exact case was measured: GLM-5.2 (222 GiB) on a
-     * 119 GiB DGX loaded in 3m11s and generated at 0.91 tok/s, while the old
-     * rule here called it "119.35 GiB short". Same ceiling as the cluster
-     * path — past 2x the cache it is honest to refuse. */
+    /* A forced single-machine launch is allowed to reach the planner, but it
+     * is not allowed to spill weights or cache to host RAM. Refuse the exact
+     * selected window here; never silently shrink it. */
     if (n == 1) {
-        const uint64_t hard1 = idletoken_llama_hard_need(model, ctx_size, 1);
-        const uint64_t wset1 = idletoken_llama_working_set(model);
-        out->hard_need_bytes   = hard1;
-        out->working_set_bytes = wset1;
-        out->working_set_fits  = (coord_usable >= hard1 + wset1);
-
-        if (coord_usable < hard1) {
-            out->kind = IDLETOKEN_LLPLAN_REFUSE;
-            snprintf(out->why, sizeof(out->why),
-                     "refuse: this model needs %.2f GiB resident at ctx %u (KV "
-                     "cache + engine overhead; the %.2f GiB of weights stream "
-                     "from disk and do not have to fit) but this machine has "
-                     "%.2f GiB usable — %.2f GiB short. Free memory, lower the "
-                     "context size, or add machines.",
-                     (double)hard1 / (double)GiB, ctx_size,
-                     (double)model->total_bytes / (double)GiB,
-                     (double)coord_usable / (double)GiB,
-                     (double)(hard1 - coord_usable) / (double)GiB);
-            return 0;
-        }
-        const uint64_t cache1 = coord_usable - hard1;
-        if (!out->working_set_fits && (cache1 == 0 || wset1 > 2 * cache1) &&
-            !getenv("IDLETOKEN_ALLOW_SLOW_OVERSUBSCRIBE")) {
-            out->kind = IDLETOKEN_LLPLAN_REFUSE;
-            snprintf(out->why, sizeof(out->why),
-                     "refuse: it would start, but unusably slowly. This machine "
-                     "has %.2f GiB usable and %.2f GiB of that can cache weights, "
-                     "against a %.2f GiB working set at ctx %u — %.1fx over, so "
-                     "every token would re-read most of the model from disk. Pick "
-                     "a smaller quantization or add machines. Set "
-                     "IDLETOKEN_ALLOW_SLOW_OVERSUBSCRIBE=1 to run it anyway.",
-                     (double)coord_usable / (double)GiB,
-                     (double)cache1 / (double)GiB,
-                     (double)wset1 / (double)GiB, ctx_size,
-                     cache1 ? (double)wset1 / (double)cache1 : 0.0);
-            return 0;
-        }
-        /* Runs on this one machine, streaming part of the weights. */
-        out->kind = IDLETOKEN_LLPLAN_SINGLE;
-        out->single_node = coordinator;
-        out->layer0_node = coordinator;
+        out->kind = IDLETOKEN_LLPLAN_REFUSE;
         snprintf(out->why, sizeof(out->why),
-                 "SINGLE (slow): %.2f GiB resident fits this machine's %.2f GiB "
-                 "usable, but the %.2f GiB working set does not — weights stream "
-                 "from disk each token. Measured ~1 token/s at this ratio; a "
-                 "smaller quantization or another machine removes it.",
-                 (double)hard1 / (double)GiB, (double)coord_usable / (double)GiB,
-                 (double)wset1 / (double)GiB);
+                 "[RESOURCE_INSUFFICIENT] this model needs %.2f GiB of GPU "
+                 "memory at ctx %u (weights + KV + engine overhead), but this "
+                 "machine has %.2f GiB available — %.2f GiB short. Free GPU "
+                 "memory, choose a smaller quantization, or add cluster nodes.",
+                 (double)need1 / (double)GiB, ctx_size,
+                 (double)coord_usable / (double)GiB,
+                 (double)(need1 - coord_usable) / (double)GiB);
         return 0;
     }
 
     uint64_t total_usable = 0;
     for (int i = 0; i < n; i++) total_usable += idletoken_llama_node_usable(&nodes[i]);
-    const uint64_t need_n = llplan_needed(model, ctx_size, n);
-    (void)need_n;   /* full-speed figure; the CLUSTER wording below quotes need1 */
-
-    /* Feasibility is decided by what must be RESIDENT — KV + per-node engine
-     * overhead — not by the weight bytes (2026-08-16). llama.cpp mmaps the
-     * weights, so they are reclaimable page cache: a 222 GiB model served from
-     * a 119 GiB machine at 0.91 tok/s is the measurement that retired the old
-     * rule, which had refused the same model on THREE machines. */
-    const uint64_t hard = idletoken_llama_hard_need(model, ctx_size, n);
+    const uint64_t need_n = llplan_needed(model, ctx_size, n, backend);
+    const uint64_t hard = idletoken_llama_hard_need(model, ctx_size, n, backend);
     const uint64_t wset = idletoken_llama_working_set(model);
     out->hard_need_bytes   = hard;
     out->working_set_bytes = wset;
-    /* Full speed needs the working set cached NEXT TO the resident part. */
-    out->working_set_fits  = (total_usable >= hard + wset);
+    out->working_set_fits  = (total_usable >= need_n);
 
-    if (total_usable < hard) {
+    if (total_usable < need_n) {
         out->kind = IDLETOKEN_LLPLAN_REFUSE;
         snprintf(out->why, sizeof(out->why),
-                 "refuse: this model needs %.2f GiB resident at ctx %u (KV cache "
-                 "+ per-node engine overhead; the %.2f GiB of weights stream from "
-                 "disk and do not have to fit) but the %d machine(s) have %.2f GiB "
-                 "usable in total — %.2f GiB short. Add machines, free memory, or "
-                 "lower the context size.",
-                 (double)hard / (double)GiB, ctx_size,
-                 (double)model->total_bytes / (double)GiB,
+                 "[RESOURCE_INSUFFICIENT] this model needs %.2f GiB of GPU "
+                 "memory at ctx %u (weights + KV + per-node engine overhead), "
+                 "but the %d machine(s) have %.2f GiB available — %.2f GiB "
+                 "short. Free GPU memory, choose a smaller quantization, or "
+                 "add cluster nodes.",
+                 (double)need_n / (double)GiB, ctx_size,
                  n, (double)total_usable / (double)GiB,
-                 (double)(hard - total_usable) / (double)GiB);
-        return 0;
-    }
-
-    /* Over-subscription ceiling. "It runs" stops being a useful promise well
-     * before it stops being true: every token re-reads the part of the working
-     * set that did not stay cached, so the rate collapses toward
-     * disk_bandwidth / uncached_bytes.
-     *
-     * The bound is anchored to the ONE ratio actually measured (2026-08-16):
-     * GLM-5.2, working set ~1.9x the machine, 0.91 tok/s — slow but usable.
-     * Past 2x we would be extrapolating from a single point, and the wrong
-     * direction to extrapolate is the one that tells a user "sure, go ahead"
-     * before a 40 s/token experience. Beyond it we refuse and say why, with an
-     * override for whoever wants to measure the next point. */
-    const uint64_t cache_avail = total_usable - hard;
-    if (!out->working_set_fits && cache_avail > 0 &&
-        wset > 2 * cache_avail && !getenv("IDLETOKEN_ALLOW_SLOW_OVERSUBSCRIBE")) {
-        out->kind = IDLETOKEN_LLPLAN_REFUSE;
-        snprintf(out->why, sizeof(out->why),
-                 "refuse: it would start, but unusably slowly. The %d machine(s) "
-                 "have %.2f GiB usable and %.2f GiB of that can cache weights, "
-                 "against a %.2f GiB working set at ctx %u — %.1fx over, so every "
-                 "token would re-read most of the model from disk (measured: %.2f GiB "
-                 "short of the cache it wants). Add machines, free memory, or pick a "
-                 "smaller quantization. Set IDLETOKEN_ALLOW_SLOW_OVERSUBSCRIBE=1 to "
-                 "run it anyway.",
-                 n, (double)total_usable / (double)GiB,
-                 (double)cache_avail / (double)GiB,
-                 (double)wset / (double)GiB, ctx_size,
-                 (double)wset / (double)cache_avail,
-                 (double)(wset - cache_avail) / (double)GiB);
+                 (double)(need_n - total_usable) / (double)GiB);
         return 0;
     }
 
@@ -642,8 +697,12 @@ int idletoken_plan_llamacpp(const idletoken_llm_model_size *model,
      * paged VRAM out to system memory and the rpc-server died mid-decode. The
      * same split was produced for a 0.5 GiB model and an 80.76 GiB one, which
      * is the tell: it never looked at the bytes it was handing out. */
-    const uint64_t kv_total = model->kv_bytes_per_token * (uint64_t)ctx_size;
-    const uint64_t slice_all = model->total_bytes + kv_total;  /* what gets split */
+    const uint64_t kv_total = idletoken_llama_kv_bytes(model, ctx_size);
+    /* What gets split: weights, KV and the graph workspace all divide with the
+     * layers. The CUDA context does not — it is charged per node below. */
+    const uint64_t slice_all = model->total_bytes + kv_total +
+                               idletoken_llama_compute_bytes(model, ctx_size,
+                                                            backend);
     const uint64_t per_node_oh = idletoken_llama_node_overhead(model->total_bytes);
 
     /* cap[i] = the largest layer fraction node i can actually hold.
@@ -660,14 +719,10 @@ int idletoken_plan_llamacpp(const idletoken_llm_model_size *model,
     for (int i = 0; i < n; i++) {
         const idletoken_node_mem *nd = &nodes[out->order[i]];
         pool_of[i] = idletoken_llama_kv_pool(nd);
-        if (nd->unified) {
-            cap[i] = 1.0;
-        } else {
-            const uint64_t room = pool_of[i] > per_node_oh
-                                      ? pool_of[i] - per_node_oh : 0;
-            cap[i] = slice_all ? (double)room / (double)slice_all : 1.0;
-            if (cap[i] > 1.0) cap[i] = 1.0;
-        }
+        const uint64_t room = pool_of[i] > per_node_oh
+                                  ? pool_of[i] - per_node_oh : 0;
+        cap[i] = slice_all ? (double)room / (double)slice_all : 1.0;
+        if (cap[i] > 1.0) cap[i] = 1.0;
         cap_total += cap[i];
         if (cap[i] < cap[tightest]) tightest = i;
     }
@@ -681,13 +736,12 @@ int idletoken_plan_llamacpp(const idletoken_llm_model_size *model,
     if (cap[0] < min_frac) {
         out->kind = IDLETOKEN_LLPLAN_REFUSE;
         snprintf(out->why, sizeof(out->why),
-                 "refuse: the coordinator can only hold %.2f GiB in the memory "
+                 "[RESOURCE_INSUFFICIENT] the coordinator can only hold %.2f GiB in the memory "
                  "its GPU can address (%.2f GiB of video memory, minus %.2f GiB "
                  "of engine overhead), which is less than the %.2f GiB one layer "
                  "of this model needs at ctx %u — and layer 0 must stay on the "
                  "coordinator (privacy invariant). Free video memory on this "
-                 "machine, pick a smaller quantization, or lower the context "
-                 "size.",
+                 "machine, choose a smaller quantization, or add cluster nodes.",
                  cap[0] * (double)slice_all / (double)GiB,
                  (double)pool_of[0] / (double)GiB,
                  (double)per_node_oh / (double)GiB,
@@ -700,20 +754,16 @@ int idletoken_plan_llamacpp(const idletoken_llm_model_size *model,
      * of — the useful sentence is "this node's card is too small", not "the
      * cluster is short". */
     if (cap_total < 1.0) {
-        const idletoken_node_mem *t = &nodes[out->order[tightest]];
         out->kind = IDLETOKEN_LLPLAN_REFUSE;
         snprintf(out->why, sizeof(out->why),
-                 "refuse: %.2f GiB of weights + KV at ctx %u must be split "
+                 "[RESOURCE_INSUFFICIENT] %.2f GiB of weights + KV at ctx %u must be split "
                  "across %d machines, but a machine can only be handed layers "
                  "in memory its GPU can address. Node %d has %.2f GiB of video "
-                 "memory (its %.2f GiB of system RAM cannot hold layers: its "
-                 "engine is started on the GPU device), and cluster-wide only "
+                 "memory, and cluster-wide only "
                  "%.2f GiB is reachable — %.2f GiB short. Add a machine with "
-                 "more video memory, pick a smaller quantization, or lower the "
-                 "context size.",
+                 "more video memory or choose a smaller quantization.",
                  (double)slice_all / (double)GiB, ctx_size, n,
                  out->order[tightest], (double)pool_of[tightest] / (double)GiB,
-                 (double)t->ram_usable / (double)GiB,
                  cap_total * (double)slice_all / (double)GiB,
                  (1.0 - cap_total) * (double)slice_all / (double)GiB);
         return 0;
@@ -727,7 +777,7 @@ int idletoken_plan_llamacpp(const idletoken_llm_model_size *model,
     if (sum <= 0.0) {   /* cap_total >= 1.0 rules this out; belt and braces */
         out->kind = IDLETOKEN_LLPLAN_REFUSE;
         snprintf(out->why, sizeof(out->why),
-                 "refuse: no machine in this cluster reports memory its engine "
+                 "[RESOURCE_INSUFFICIENT] no machine in this cluster reports GPU memory its engine "
                  "can allocate in. Check that each machine has a supported GPU "
                  "with free video memory.");
         return 0;
@@ -779,11 +829,10 @@ int idletoken_plan_llamacpp(const idletoken_llm_model_size *model,
     if (placed < 0.999) {
         out->kind = IDLETOKEN_LLPLAN_REFUSE;
         snprintf(out->why, sizeof(out->why),
-                 "refuse: only %.1f%% of this model's layers could be placed in "
+                 "[RESOURCE_INSUFFICIENT] only %.1f%% of this model's layers could be placed in "
                  "memory the machines' GPUs can address (node %d holds at most "
                  "%.2f GiB of the %.2f GiB total at ctx %u). Add a machine with "
-                 "more video memory, pick a smaller quantization, or lower the "
-                 "context size.",
+                 "more video memory or choose a smaller quantization.",
                  placed * 100.0, out->order[tightest],
                  cap[tightest] * (double)slice_all / (double)GiB,
                  (double)slice_all / (double)GiB, ctx_size);
@@ -791,39 +840,71 @@ int idletoken_plan_llamacpp(const idletoken_llm_model_size *model,
     }
 
     if (coord_usable >= need1) {
-        /* Only reachable through the small-cluster override: the model fits
-         * the coordinator, so say that — the generic wording below would
-         * claim need > usable with the numbers contradicting it. */
+        /* The user explicitly selected a cluster even though the model fits
+         * the coordinator. Say that without pretending capacity required it. */
         snprintf(out->why, sizeof(out->why),
-                 "CLUSTER (forced): %.2f GiB needed FITS the coordinator's "
-                 "%.2f GiB usable — clustering anyway because "
-                 "IDLETOKEN_ALLOW_SMALL_CLUSTER=1 (acceptance override); "
+                 "CLUSTER (selected): %.2f GiB needed FITS the coordinator's "
+                 "%.2f GiB usable — using the user's multi-machine choice; "
                  "splitting across %d nodes (%.2f GiB total), layer 0 pinned "
                  "to the coordinator (node %d).",
                  (double)need1 / (double)GiB, (double)coord_usable / (double)GiB,
                  n, (double)total_usable / (double)GiB, coordinator);
-    } else if (out->working_set_fits) {
+    } else {
         snprintf(out->why, sizeof(out->why),
                  "CLUSTER: %.2f GiB needed exceeds the coordinator's %.2f GiB "
                  "usable; splitting across %d nodes (%.2f GiB total), layer 0 "
                  "pinned to the coordinator (node %d).",
                  (double)need1 / (double)GiB, (double)coord_usable / (double)GiB,
                  n, (double)total_usable / (double)GiB, coordinator);
+    }
+    return 0;
+}
+
+int idletoken_llama_device_layer_range(
+        unsigned n_layers, int n_gpu_layers,
+        const double *shares, int n_devices,
+        int dev_lo, int dev_hi,
+        unsigned *layer_lo, unsigned *layer_hi) {
+    if (!shares || n_devices < 1 ||
+        n_devices > IDLETOKEN_LLPLAN_MAX_DEVICES ||
+        dev_lo < 0 || dev_hi > n_devices || dev_lo >= dev_hi ||
+        !layer_lo || !layer_hi) {
+        return -1;
+    }
+
+    double sum = 0.0;
+    double cumulative[IDLETOKEN_LLPLAN_MAX_DEVICES];
+    for (int d = 0; d < n_devices; d++) {
+        if (shares[d] < 0.0) return -1;
+        sum += shares[d];
+        cumulative[d] = sum;
+    }
+    if (sum <= 0.0) return -1;
+    for (int d = 0; d < n_devices; d++) cumulative[d] /= sum;
+
+    const int n_all = (int)n_layers;
+    const int start = n_all + 1 - n_gpu_layers > 0
+                          ? n_all + 1 - n_gpu_layers : 0;
+    const int active = n_gpu_layers < n_all + 1
+                           ? n_gpu_layers : n_all + 1;
+    int first = -1, last = -1;
+    for (int il = 0; il < n_all; il++) {
+        if (il < start || il - start >= active) continue;
+        const double pos = (double)(il - start) / (double)active;
+        int owner = 0;
+        while (owner < n_devices && pos >= cumulative[owner]) owner++;
+        if (owner >= n_devices) owner = n_devices - 1;
+        if (owner >= dev_lo && owner < dev_hi) {
+            if (first < 0) first = il;
+            last = il;
+        }
+    }
+    if (first < 0) {
+        *layer_lo = n_layers;
+        *layer_hi = n_layers;
     } else {
-        /* Runs, but the weights do not all stay cached — pages stream from
-         * disk. Said out loud with the numbers, because "it works" and "it
-         * works at a usable speed" are different promises and the user is
-         * about to wait on the difference. */
-        snprintf(out->why, sizeof(out->why),
-                 "CLUSTER (slow): splitting across %d nodes (%.2f GiB usable), "
-                 "layer 0 pinned to the coordinator (node %d). %.2f GiB must stay "
-                 "resident and does; but the %.2f GiB working set does not fit, so "
-                 "weights stream from disk each token — expect roughly 1 token/s, "
-                 "not interactive speed. A smaller quantization or another machine "
-                 "removes this.",
-                 n, (double)total_usable / (double)GiB, coordinator,
-                 (double)out->hard_need_bytes / (double)GiB,
-                 (double)out->working_set_bytes / (double)GiB);
+        *layer_lo = (unsigned)first;
+        *layer_hi = (unsigned)(last + 1);
     }
     return 0;
 }

@@ -91,6 +91,17 @@ if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
 fi
 export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}"
 
+# --- release preflight ------------------------------------------------------
+# The check above proves a key FILE exists. This one proves it is the RIGHT
+# key, by signing a nonce and verifying it against the pubkey compiled into the
+# client — signing with a valid-but-wrong key succeeds at every step and is
+# only discovered by users whose updater rejects the release. It also refuses a
+# dirty tree, so the provenance record below cannot name a commit that is not
+# what was built.
+# shellcheck disable=SC1091
+. "$ROOT/scripts/release-provenance-lib.sh"
+rp_preflight "macos" || fail "release preflight refused this build (see above)"
+
 # --- build ------------------------------------------------------------------
 cd client || fail "no client/ directory"
 pnpm install >/tmp/client-mac-install.log 2>&1 || fail "pnpm install failed (see /tmp/client-mac-install.log)"
@@ -170,6 +181,14 @@ echo "--- artifacts ---"
 for f in "$DMG" "$APPTAR" "$SIG"; do
     printf '%s  %s  %s\n' "$(shasum -a 256 "$f" | cut -c1-16)" "$(du -h "$f" | cut -f1)" "$ROOT/client/$f"
 done
+
+# --- provenance -------------------------------------------------------------
+# See build_client_release.sh for the reasoning; non-fatal for the same reason
+# (the artifacts are already built and signed, so a hard stop here would leave
+# a half-published release with no way to retry the record).
+rp_emit "$(python3 -c "import json;print(json.load(open('$ROOT/client/src-tauri/tauri.conf.json'))['version'])")" \
+        "darwin-$(uname -m)" "$ROOT/client/$DMG" "$ROOT/client/$APPTAR" \
+    || echo "  !! PROVENANCE NOT WRITTEN — do not publish these artifacts until it is"
 
 # --- restore the non-release client/dist ------------------------------------
 # `tauri build` ran beforeBuildCommand = `pnpm build:release`, which leaves a

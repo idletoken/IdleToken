@@ -853,13 +853,38 @@ static void auth_tag(const idletoken_pair_id *id, const char *label,
  * skip the penalty, and (more importantly) the refusal must look identical
  * either way, or the timing itself answers "was that code correct?".
  * One success clears the source's record entirely. */
-#define THROTTLE_SLOTS       32
+/* 256, not 32 (2026-08-30, CLUS-02): the table is keyed by source address and
+ * evicts the least recently active entry when it is full, so with 32 slots an
+ * attacker holding 33 addresses — trivial on a LAN, and free for anyone who can
+ * spoof or who owns a /24 of DHCP leases — pushed every penalty out of the
+ * table before it could bite. Each slot is 40 bytes; 256 of them is 10 KB, and
+ * a home LAN has nowhere near that many distinct sources. */
+#define THROTTLE_SLOTS       256
 #define THROTTLE_FREE_TRIES  5
 #define THROTTLE_BASE_MS     1000
 #define THROTTLE_MAX_MS      30000
 /* No failure for this long ⇒ forget the source (a shared NAT/DHCP address
  * must not inherit yesterday's attacker's penalty). */
 #define THROTTLE_FORGET_MS   600000
+
+/* Cluster-wide guessing meter (CLUS-02, distributed-source residual).
+ *
+ * The per-source curve above is the right shape for one attacker at one
+ * address, and the wrong shape for the same attacker at a hundred: every
+ * address gets its own free allowance, so N sources buy N × THROTTLE_FREE_TRIES
+ * free guesses per forget-window. This second meter counts failures across ALL
+ * sources and, past a threshold no honest cluster can reach, refuses new
+ * attempts for a short window and says so in one loud, attributable line.
+ *
+ * Deliberately generous and deliberately short: a home cluster forming for the
+ * first time might produce a handful of failures from typos across a few
+ * machines; 120 in one minute is not that. And the block lasts seconds, not
+ * minutes, because locking the owner out of their own cluster is a worse
+ * outcome than making a brute-forcer wait — the point is to cap the RATE
+ * (roughly 120/min ⇒ ~2^30 needs over a decade), not to punish. */
+#define GLOBAL_WINDOW_MS     60000
+#define GLOBAL_MAX_FAILS     120
+#define GLOBAL_BLOCK_MS      5000
 
 typedef struct {
     uint8_t  addr[16];        /* peer address, v4-mapped into 16 bytes */
@@ -870,6 +895,12 @@ typedef struct {
 } throttle_slot;
 
 static throttle_slot g_throttle[THROTTLE_SLOTS];
+
+/* Cluster-wide meter (see GLOBAL_* above). Guarded by the same lock. */
+static long long g_global_window_start_ms;
+static int       g_global_fails;
+static long long g_global_blocked_until_ms;
+static int       g_global_announced;
 
 #if defined(_WIN32)
 static CRITICAL_SECTION g_throttle_lock;
@@ -927,40 +958,112 @@ static void peer_key(int fd, uint8_t out[16]) {
     }
 }
 
-/* Find the slot for `key`, or claim one (free slot, or the least recently
- * active). Caller holds the lock. */
+/* Find the slot for `key`, or claim one. Caller holds the lock.
+ *
+ * Eviction order (2026-08-30): a free slot, else the least recently active slot
+ * that is NOT currently serving a penalty, else the least recently active slot
+ * of all. The "not currently blocked" clause is the fix that makes the table
+ * worth having — plain LRU let a source that had just earned a 30-second
+ * penalty be evicted by the attacker's next fresh address, so the penalty was
+ * erased by the very behaviour it was meant to price. Only when every slot is
+ * blocked (i.e. the cluster is under a broad attack, which the global meter
+ * below also sees) does a blocked entry get reused. */
 static throttle_slot *throttle_slot_for(const uint8_t key[16], long long now) {
-    throttle_slot *oldest = &g_throttle[0];
+    throttle_slot *free_slot = NULL, *oldest_idle = NULL, *oldest_any = NULL;
     for (int i = 0; i < THROTTLE_SLOTS; i++) {
         throttle_slot *s = &g_throttle[i];
         if (s->used && memcmp(s->addr, key, 16) == 0) {
             if (now - s->last_ms > THROTTLE_FORGET_MS) { s->fails = 0; s->blocked_until_ms = 0; }
             return s;
         }
-        if (!s->used) { oldest = s; break; }
-        if (s->last_ms < oldest->last_ms) oldest = s;
+        if (!s->used) { if (!free_slot) free_slot = s; continue; }
+        if (!oldest_any || s->last_ms < oldest_any->last_ms) oldest_any = s;
+        if (s->blocked_until_ms <= now &&
+            (!oldest_idle || s->last_ms < oldest_idle->last_ms)) oldest_idle = s;
     }
-    memcpy(oldest->addr, key, 16);
-    oldest->used = 1;
-    oldest->fails = 0;
-    oldest->blocked_until_ms = 0;
-    oldest->last_ms = now;
-    return oldest;
+    throttle_slot *victim = free_slot ? free_slot
+                          : (oldest_idle ? oldest_idle : oldest_any);
+    if (!victim) victim = &g_throttle[0];   /* unreachable; keeps the NULL out */
+    memcpy(victim->addr, key, 16);
+    victim->used = 1;
+    victim->fails = 0;
+    victim->blocked_until_ms = 0;
+    victim->last_ms = now;
+    return victim;
 }
 
-/* Milliseconds this peer must still wait; 0 = may attempt now. */
-static long long throttle_check(int fd) {
-    uint8_t key[16]; peer_key(fd, key);
+/* Cluster-wide meter. Caller holds the lock. Returns ms still to wait. */
+static long long global_check_locked(long long now) {
+    if (now - g_global_window_start_ms > GLOBAL_WINDOW_MS) {
+        g_global_window_start_ms = now;
+        g_global_fails = 0;
+        g_global_announced = 0;
+    }
+    return g_global_blocked_until_ms > now ? g_global_blocked_until_ms - now : 0;
+}
+
+/* The threshold as a pure predicate, and a snapshot of the live meter. Both
+ * exist for the unit test: reaching this threshold for real needs the hundred
+ * distinct source addresses that a single loopback host cannot supply, so
+ * without a seam the only available "test" would be one that passes whether or
+ * not the meter works. Same reasoning as idletoken_pair_backoff_ms. */
+int idletoken_pair_global_would_block(int fails) {
+    return fails >= GLOBAL_MAX_FAILS ? 1 : 0;
+}
+
+void idletoken_pair_global_state(int *fails, long long *blocked_ms) {
+    long long now = throttle_now_ms();
+    throttle_lock();
+    long long wait = global_check_locked(now);   /* rolls an expired window */
+    if (fails) *fails = g_global_fails;
+    if (blocked_ms) *blocked_ms = wait;
+    throttle_unlock();
+}
+
+static void global_record_fail_locked(long long now) {
+    (void)global_check_locked(now);           /* roll the window first */
+    if (g_global_fails < 1000000) g_global_fails++;
+    if (!idletoken_pair_global_would_block(g_global_fails)) return;
+    g_global_blocked_until_ms = now + GLOBAL_BLOCK_MS;
+    if (!g_global_announced) {
+        g_global_announced = 1;
+        fprintf(stderr,
+                "[pair] %d failed join attempts cluster-wide in under %d s — this is "
+                "not typing mistakes, it is a machine walking the join-code space "
+                "from more than one address. All new join attempts are refused for "
+                "%d s at a time until it stops. If you did not expect this, take the "
+                "cluster off this network and form it again with a fresh code.\n",
+                g_global_fails, GLOBAL_WINDOW_MS / 1000, GLOBAL_BLOCK_MS / 1000);
+        fflush(stderr);
+    }
+}
+
+/* ---- the policy, addressed by key ---------------------------------------
+ *
+ * The fd-taking wrappers below add nothing but getpeername(). Keeping the
+ * policy in one place is what lets the unit test drive it with synthetic
+ * addresses and still be testing the code the live path runs: if these two
+ * bodies were copies, a test could stay green while the thing it claims to
+ * cover drifted underneath it. */
+
+/* Milliseconds this source must still wait; 0 = may attempt now. */
+static long long throttle_check_key(const uint8_t key[16], int quiet) {
+    (void)quiet;
     long long now = throttle_now_ms(), wait = 0;
     throttle_lock();
     throttle_slot *s = throttle_slot_for(key, now);
+    /* Touch it even on a refused attempt. Without this, a source being actively
+     * refused looks IDLE to the eviction scan (last_ms only moved on recorded
+     * failures), so hammering was the way to get your own penalty forgotten. */
+    s->last_ms = now;
     if (s->blocked_until_ms > now) wait = s->blocked_until_ms - now;
+    long long gwait = global_check_locked(now);
+    if (gwait > wait) wait = gwait;
     throttle_unlock();
     return wait;
 }
 
-static void throttle_record(int fd, int success) {
-    uint8_t key[16]; peer_key(fd, key);
+static void throttle_record_key(const uint8_t key[16], int success, int quiet) {
     long long now = throttle_now_ms();
     throttle_lock();
     throttle_slot *s = throttle_slot_for(key, now);
@@ -969,10 +1072,11 @@ static void throttle_record(int fd, int success) {
         s->fails = 0;
         s->blocked_until_ms = 0;
     } else {
+        global_record_fail_locked(now);
         if (s->fails < 1000000) s->fails++;
         long long back = idletoken_pair_backoff_ms(s->fails);
         s->blocked_until_ms = back > 0 ? now + back : 0;
-        if (back > 0) {
+        if (back > 0 && !quiet) {
             /* Loud on purpose: a machine being walked through the code space is
              * something the owner should be able to see in the log. */
             fprintf(stderr, "[pair] refused join #%d from this peer; "
@@ -984,16 +1088,74 @@ static void throttle_record(int fd, int success) {
     throttle_unlock();
 }
 
+static long long throttle_check(int fd) {
+    uint8_t key[16]; peer_key(fd, key);
+    return throttle_check_key(key, 0);
+}
+
+static void throttle_record(int fd, int success) {
+    uint8_t key[16]; peer_key(fd, key);
+    throttle_record_key(key, success, 0);
+}
+
+/* Test seams. `quiet` only suppresses the per-refusal log line — a test that
+ * walks 300 synthetic sources would otherwise bury its own output. Every
+ * decision above it is untouched. */
+void idletoken_pair_throttle_test_record(const uint8_t addr16[16], int fail) {
+    throttle_record_key(addr16, fail ? 0 : 1, 1);
+}
+
+long long idletoken_pair_throttle_test_check(const uint8_t addr16[16]) {
+    return throttle_check_key(addr16, 1);
+}
+
 /* Test hook: forget every recorded source. Not part of the public header —
  * the unit test declares it. */
 void idletoken_pair_throttle_reset(void) {
     throttle_lock();
     memset(g_throttle, 0, sizeof(g_throttle));
+    g_global_window_start_ms = throttle_now_ms();
+    g_global_fails = 0;
+    g_global_blocked_until_ms = 0;
+    g_global_announced = 0;
     throttle_unlock();
+}
+
+/* How long either side of the pairing preamble will wait for the other to
+ * speak. The exchange is two small messages on a LAN: 15 s is three orders of
+ * magnitude of slack and still bounds the "connect, then say nothing" attack
+ * (CLUS-05) that used to pin the coordinator's serial join loop forever.
+ *
+ * Applied inside the handshake rather than left to callers on purpose — this is
+ * the one function every join path in the tree goes through, and a timeout that
+ * each caller has to remember to set is a timeout that a new caller will not
+ * have. */
+#define PAIR_HANDSHAKE_TIMEOUT_MS 15000
+
+/* Impose the handshake deadline, remembering what the caller had. Paired with
+ * pair_deadline_restore on EVERY exit — including the failure exits, which is
+ * where a forgotten restore would do its damage, since the socket usually
+ * survives a refusal long enough to be read again. */
+static int pair_deadline_enter(int fd) {
+    int prev = 0;
+    if (idletoken_get_recv_timeout(fd, &prev) != 0) prev = 0;
+    idletoken_set_recv_timeout(fd, PAIR_HANDSHAKE_TIMEOUT_MS);
+    return prev;
+}
+
+static void pair_deadline_restore(int fd, int prev_ms) {
+    idletoken_set_recv_timeout(fd, prev_ms);
 }
 
 int idletoken_pair_client_auth(int fd, const idletoken_pair_id *id,
                             uint8_t session_key[IDLETOKEN_SESSION_KEY_BYTES]) {
+    /* The worker needs this as much as the coordinator does, for the mirror
+     * image of the same reason: a fake beacon that accepts the TCP connection
+     * and then never speaks used to park the joiner in recv() forever, so it
+     * never moved on to the next candidate address and the user saw a join
+     * that simply never finished (CLUS-04/CLUS-05). */
+    const int prev_to = pair_deadline_enter(fd);
+    #define PAIR_C_RET(v) do { pair_deadline_restore(fd, prev_to); return (v); } while (0)
     uint8_t wnonce[IDLETOKEN_PAIR_NONCE_BYTES];
     idletoken_disc_random_bytes(wnonce, sizeof(wnonce));
     uint8_t wtag[IDLETOKEN_PAIR_TAG_BYTES];
@@ -1008,50 +1170,70 @@ int idletoken_pair_client_auth(int fd, const idletoken_pair_id *id,
     idletoken_msg_header h; memset(&h, 0, sizeof(h));
     h.magic = IDLETOKEN_PROTO_MAGIC; h.version = IDLETOKEN_PROTO_VERSION;
     h.msg_type = IDLETOKEN_MSG_PAIR_HELLO; h.payload_bytes = b.pos;
-    if (idletoken_send_msg(fd, &h, pay, b.pos) != 0) return -1;
+    if (idletoken_send_msg(fd, &h, pay, b.pos) != 0) PAIR_C_RET(-1);
 
     uint8_t rp[128]; idletoken_msg_header rh;
-    if (idletoken_recv_msg(fd, &rh, rp, sizeof(rp)) != 0) return -1;
-    if (rh.msg_type != IDLETOKEN_MSG_PAIR_ACCEPT) { errno = EACCES; return -1; }
+    if (idletoken_recv_msg(fd, &rh, rp, sizeof(rp)) != 0) PAIR_C_RET(-1);
+    if (rh.msg_type != IDLETOKEN_MSG_PAIR_ACCEPT) { errno = EACCES; PAIR_C_RET(-1); }
     idletoken_buf rb; idletoken_buf_init(&rb, rp, rh.payload_bytes);
     uint8_t accepted, z3[3], cnonce[IDLETOKEN_PAIR_NONCE_BYTES], ctag[IDLETOKEN_PAIR_TAG_BYTES];
     idletoken_buf_get_u8(&rb, &accepted);
     idletoken_buf_get_bytes(&rb, z3, 3);
     idletoken_buf_get_bytes(&rb, cnonce, sizeof(cnonce));
     idletoken_buf_get_bytes(&rb, ctag, sizeof(ctag));
-    if (rb.err || !accepted) { errno = EACCES; return -1; }
+    if (rb.err || !accepted) { errno = EACCES; PAIR_C_RET(-1); }
 
     uint8_t expect[IDLETOKEN_PAIR_TAG_BYTES];
     auth_tag(id, "pair-c", wnonce, cnonce, expect);
-    if (!ct_equal(expect, ctag, IDLETOKEN_PAIR_TAG_BYTES)) { errno = EACCES; return -1; }
+    if (!ct_equal(expect, ctag, IDLETOKEN_PAIR_TAG_BYTES)) { errno = EACCES; PAIR_C_RET(-1); }
 
     if (session_key) derive_session(id, wnonce, cnonce, session_key);
-    return 0;
+    PAIR_C_RET(0);
+    #undef PAIR_C_RET
 }
 
 int idletoken_pair_server_auth(int fd, const idletoken_pair_id *id,
                             uint8_t session_key[IDLETOKEN_SESSION_KEY_BYTES]) {
-    uint8_t rp[128]; idletoken_msg_header rh;
-    if (idletoken_recv_msg(fd, &rh, rp, sizeof(rp)) != 0) return -1;
-    if (rh.msg_type != IDLETOKEN_MSG_PAIR_HELLO) { errno = EPROTO; return -1; }
-    idletoken_buf rb; idletoken_buf_init(&rb, rp, rh.payload_bytes);
-    uint8_t gid[IDLETOKEN_GROUP_ID_BYTES], wnonce[IDLETOKEN_PAIR_NONCE_BYTES], wtag[IDLETOKEN_PAIR_TAG_BYTES];
-    idletoken_buf_get_bytes(&rb, gid, sizeof(gid));
-    idletoken_buf_get_bytes(&rb, wnonce, sizeof(wnonce));
-    idletoken_buf_get_bytes(&rb, wtag, sizeof(wtag));
-
-    /* Throttled sources are refused without looking at the proof at all (see
-     * the throttle block above): same reply, same timing, no free guesses. */
+    /* Order matters (2026-08-30, CLUS-05). The throttle used to be consulted
+     * AFTER the blocking read, so a source already serving a penalty still got
+     * to hold this thread — and on the coordinator's serial join loop, holding
+     * the thread IS the denial of service. Ask first, and a refused source
+     * costs one syscall instead of a read window.
+     *
+     * Refusing before reading does reveal "you are currently blocked" through
+     * timing. That is already public — the source just got refused — and it is
+     * not the secret this handshake protects: whether the CODE was right is
+     * decided below, on the same path, with the same reply either way. */
+    const int prev_to = pair_deadline_enter(fd);
+    #define PAIR_S_RET(v) do { pair_deadline_restore(fd, prev_to); return (v); } while (0)
     long long wait_ms = throttle_check(fd);
-    int ok = 0;
+    uint8_t wnonce[IDLETOKEN_PAIR_NONCE_BYTES];
+    memset(wnonce, 0, sizeof(wnonce));
+    int ok = 0, read_ok = 0;
+
     if (wait_ms == 0) {
-        ok = !rb.err && ct_equal(gid, id->group_id, IDLETOKEN_GROUP_ID_BYTES);
-        if (ok) {
-            uint8_t expect[IDLETOKEN_PAIR_TAG_BYTES];
-            auth_tag(id, "pair-w", wnonce, NULL, expect);
-            ok = ct_equal(expect, wtag, IDLETOKEN_PAIR_TAG_BYTES);
+        uint8_t rp[128]; idletoken_msg_header rh;
+        if (idletoken_recv_msg(fd, &rh, rp, sizeof(rp)) == 0 &&
+            rh.msg_type == IDLETOKEN_MSG_PAIR_HELLO) {
+            idletoken_buf rb; idletoken_buf_init(&rb, rp, rh.payload_bytes);
+            uint8_t gid[IDLETOKEN_GROUP_ID_BYTES], wtag[IDLETOKEN_PAIR_TAG_BYTES];
+            idletoken_buf_get_bytes(&rb, gid, sizeof(gid));
+            idletoken_buf_get_bytes(&rb, wnonce, sizeof(wnonce));
+            idletoken_buf_get_bytes(&rb, wtag, sizeof(wtag));
+            read_ok = 1;
+            ok = !rb.err && ct_equal(gid, id->group_id, IDLETOKEN_GROUP_ID_BYTES);
+            if (ok) {
+                uint8_t expect[IDLETOKEN_PAIR_TAG_BYTES];
+                auth_tag(id, "pair-w", wnonce, NULL, expect);
+                ok = ct_equal(expect, wtag, IDLETOKEN_PAIR_TAG_BYTES);
+            }
         }
+        /* A connection that opens and then says nothing (or speaks nonsense) is
+         * not a neutral event on a serial accept loop — it is the attack. It
+         * counts against the source exactly like a wrong code, so a machine
+         * doing it in a loop earns the same growing backoff. */
         throttle_record(fd, ok);
+        if (!read_ok) { errno = EPROTO; PAIR_S_RET(-1); }
     }
 
     uint8_t cnonce[IDLETOKEN_PAIR_NONCE_BYTES];
@@ -1071,9 +1253,10 @@ int idletoken_pair_server_auth(int fd, const idletoken_pair_id *id,
     h.msg_type = IDLETOKEN_MSG_PAIR_ACCEPT; h.payload_bytes = b.pos;
     idletoken_send_msg(fd, &h, pay, b.pos);
 
-    if (!ok) { errno = EACCES; return -1; }
+    if (!ok) { errno = EACCES; PAIR_S_RET(-1); }
     if (session_key) derive_session(id, wnonce, cnonce, session_key);
-    return 0;
+    PAIR_S_RET(0);
+    #undef PAIR_S_RET
 }
 
 /* ============================================================================

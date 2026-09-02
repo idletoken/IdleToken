@@ -118,6 +118,15 @@ int idletoken_http_sse_event(int conn_fd, const char *event,
 #define IDLETOKEN_PATH_PRIV_PUBKEY IDLETOKEN_NS "/privacy/pubkey"
 #define IDLETOKEN_PATH_PRIV_MSG    IDLETOKEN_NS "/privacy/messages"
 #define IDLETOKEN_PATH_PRIV_CHAT   IDLETOKEN_NS "/privacy/chat/completions"
+/* Where the platform agent asks the coordinator to mint a single-use admission
+ * capability for one dispatched job (include/idletoken_admission.h). Named here
+ * with the rest because it, too, crosses binaries: the coordinator serves it
+ * and the agent calls it. */
+#define IDLETOKEN_PATH_ADMIT       IDLETOKEN_NS "/platform/admit"
+/* What this coordinator will and will not do with a prompt, as ENFORCED rather
+ * than as displayed. Read by the client so a disclosure panel quotes the
+ * engine instead of quoting itself (threat register HOST-06). */
+#define IDLETOKEN_PATH_PRIVACY     IDLETOKEN_NS "/privacy/posture"
 /* Vendor-compatible routes (unchanged; listed so the split is visible in one
  * place and nobody "tidies" them into the namespace above). */
 #define IDLETOKEN_PATH_OPENAI      "/v1/chat/completions"

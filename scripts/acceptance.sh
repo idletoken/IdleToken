@@ -69,7 +69,10 @@ read -r -a WORKER_NODES <<< "${IDLETOKEN_WORKER_NODES:-}"
 # purely local and hardware-free -- exited 2 without a testbed.env. CI could not
 # run it, a stranger cloning the repo could not run it, and that README sentence
 # was false. Requiring something presupposes actually using it.
-LOCAL_ONLY_GATES=" G_MODEL G_SCHED G_VERSION G_MAC_SMOKE G_PRIV7 G_PPL G_INTEGRITY "
+# The 2026-08-30 hardening gates are local too (files, lockfiles, and a
+# coordinator that exits in argument validation). Omitting them would make
+# `--gate G_ADMISSION` exit 2 without a testbed.env — the same bug as above.
+LOCAL_ONLY_GATES=" G_MODEL G_SCHED G_TEST_ISOLATION G_PLATFORM_HARDENING G_REDIS_SECURITY G_WORKER_JOIN G_VERSION G_MAC_SMOKE G_PRIV7 G_PPL G_INTEGRITY G_RELEASE_ID G_DEP_AUDIT G_ADMISSION G_ACCEPTANCE_CONTRACT "
 needs_nodes=1
 if [ -n "$ONLY_GATE" ] && [[ "$LOCAL_ONLY_GATES" == *" $ONLY_GATE "* ]]; then needs_nodes=0; fi
 if [ "$needs_nodes" = 1 ] && { [ -z "$COORD_NODE" ] || [ ${#WORKER_NODES[@]} -eq 0 ]; }; then
@@ -214,14 +217,35 @@ fail() { RESULTS+=("FAIL $1"); printf '  \033[31m[FAIL]\033[0m %s — %s\n' "$1"
 skip() { RESULTS+=("SKIP $1"); printf '  \033[33m[SKIP]\033[0m %s (%s)\n' "$1" "${2:-blocked by $FRONTIER}"; }
 vlog() { [ "$VERBOSE" = 1 ] && printf '      | %s\n' "$1"; }
 
+# --gate <name>: an EXACT name, once served, suppresses later prefix matches.
+#
+# The prefix half exists so `--gate G4` finds `G4_single_infer`, and it was
+# unambiguous while no gate name extended another with `_` — true of all 44
+# registrations before 2026-08-30 (G_PRIV/G_PRIV7 and G_MACSEAL/G_MAC_SMOKE
+# deliberately avoid the underscore; nothing is named G4, G_API or G_MAC).
+# `G_RELEASE_ID` is the first name that does extend one. Without this rule
+# `--gate G_RELEASE` would run both gates and the single-gate summary below
+# keeps the LAST match — so asking for the Windows packaging gate would report
+# the release-identity gate's verdict under the name G_RELEASE. Same class of
+# false report as the 2026-08-15 "SKIP printed as PASS".
+#
+# Nothing registered before this date changes: there was no exact/prefix pair
+# to change, and this needs no hand-maintained list of names.
+ONLY_GATE_SERVED=""
+only_gate_wants() {  # only_gate_wants <gate-name>
+    case "$1" in
+        "$ONLY_GATE")   ONLY_GATE_SERVED=1; return 0 ;;
+        "$ONLY_GATE"_*) [ -z "$ONLY_GATE_SERVED" ] && return 0 ;;
+    esac
+    return 1
+}
+
 # Run a gate only if no earlier gate has failed; else auto-SKIP.
 # With --gate G<n>, run exactly that gate (prefix match) and nothing else.
 gate() {  # gate <name> <function>
     local name="$1" fn="$2"
     if [ -n "$ONLY_GATE" ]; then
-        case "$name" in
-            "$ONLY_GATE"|"$ONLY_GATE"_*) "$fn" "$name" ;;
-        esac
+        if only_gate_wants "$name"; then "$fn" "$name"; fi
         return
     fi
     if [ -n "$FRONTIER" ]; then skip "$name"; return; fi
@@ -245,9 +269,7 @@ gate() {  # gate <name> <function>
 gate_local() {  # gate_local <name> <function>
     local name="$1" fn="$2"
     if [ -n "$ONLY_GATE" ]; then
-        case "$name" in
-            "$ONLY_GATE"|"$ONLY_GATE"_*) "$fn" "$name" ;;
-        esac
+        if only_gate_wants "$name"; then "$fn" "$name"; fi
         return
     fi
     local saved="$FRONTIER"
@@ -267,9 +289,7 @@ gate_local() {  # gate_local <name> <function>
 gate_always() {  # gate_always <name> <function>
     local name="$1" fn="$2"
     if [ -n "$ONLY_GATE" ]; then
-        case "$name" in
-            "$ONLY_GATE"|"$ONLY_GATE"_*) "$fn" "$name" ;;
-        esac
+        if only_gate_wants "$name"; then "$fn" "$name"; fi
         return
     fi
     "$fn" "$name"
@@ -687,7 +707,7 @@ try: d=json.load(sys.stdin)
 except Exception as e: print("bad-json"); raise SystemExit
 ms=d.get("models") or []
 if not ms: print("empty-models"); raise SystemExit
-allowed={"gpu_only","hybrid","no","unavailable"}
+allowed={"gpu_only","no","unavailable"}
 bad=[m for m in ms if m.get("mode") not in allowed]
 print("ok" if not bad else "bad-mode:"+str(bad[:1]))' 2>/dev/null)
         [ "$jv" = "ok" ] || bad="$bad $n(json:${jv:-none})"
@@ -874,7 +894,17 @@ g_release() {
 
     # The build node has no node/pnpm, so the frontend has to arrive prebuilt.
     # Release mode = the platform address real users get.
-    if ! ( cd "$REPO_ROOT/client" && ./node_modules/.bin/tsc && "$vite" build --mode release ) >/dev/null 2>&1; then
+    #
+    # write_frontend_provenance.mjs is NOT optional and NOT decoration: the
+    # Windows build refuses a dist whose provenance file is missing or does not
+    # match the synced sources ("client\dist is stale or does not match the
+    # synced frontend sources"). This step used to be omitted here because
+    # `pnpm build:release` runs it and this gate calls vite directly to avoid
+    # needing pnpm — so the gate would fail on a tree that builds fine through
+    # pnpm. Keep the three commands in step with client/package.json's
+    # build:release.
+    if ! ( cd "$REPO_ROOT/client" && ./node_modules/.bin/tsc && "$vite" build --mode release \
+             && node scripts/write_frontend_provenance.mjs ) >/dev/null 2>&1; then
         fail "$name" "frontend release build failed (client/ on the control machine)"; return
     fi
     local tgz=/tmp/idletoken-dist-sync.tar.gz
@@ -933,11 +963,14 @@ g_release() {
     # client a cluster mode it cannot actually join.
     for f in idletoken-client.exe idletoken-coord.exe idletoken-worker.exe \
              idletoken-server.exe idletoken-rpc-server.exe \
-             LICENSE.txt NOTICE.txt ds4-MIT.txt rax-BSD-3-Clause.txt llamacpp-MIT.txt; do
+             idletoken-server.exe.sha256 idletoken-rpc-server.exe.sha256 \
+             cudart64_12.dll cublas64_12.dll cublasLt64_12.dll \
+             WebView2Loader.dll vcomp140.dll \
+             LICENSE.txt NOTICE.txt ds4-MIT.txt llamacpp-MIT.txt; do
         printf '%s\n' "$listing" | grep -qF "$f" || missing="$missing $f"
     done
     [ -z "$missing" ] || { fail "$name" "the installer $bn just built is missing:$missing"; return; }
-    vlog "installer carries both engine binaries and every licence text"
+    vlog "installer carries both engine binaries, their integrity digests, and every licence text"
 
     sign_tmp=$(mktemp -d "${TMPDIR:-/tmp}/idletoken-updater-sign.XXXXXX") || {
         fail "$name" "could not create a local updater signing directory"; return;
@@ -1377,6 +1410,15 @@ g_model() {
     echo "$mc" | grep -q "MODEL_MANIFEST_CHECK_OK" || { fail "$name" "model manifest/registry mismatch ($mc)"; return; }
     vlog "models/*.json agree with the compiled registry"
 
+    # 1c. The UI's displayed need must be the compiled planner's need, down to
+    # one byte. This enumerates every model/precision, four context tiers and
+    # 1/2/4 nodes; it caught both the old hybrid-KV layer multiplier and the
+    # duplicated client-only overhead formula.
+    local rc
+    rc=$(cd "$repo" && scripts/resource_estimate_gate.sh 2>&1 | tail -1)
+    echo "$rc" | grep -q "RESOURCE_ESTIMATE_CHECK_OK" || { fail "$name" "native/client resource estimate mismatch ($rc)"; return; }
+    vlog "native/client resource estimates match in every enumerated case"
+
     # 2. ds4x config + forward (generates fixtures, incl. a tiny real GGUF)
     #
     # PARKED (2026-08-14, llama.cpp pivot — docs/v2-rebuild-plan-2026-08.md §1.1
@@ -1639,6 +1681,28 @@ client_run() {
 p1_client() {
     local name="$1"
     ensure_client_display
+    # A live chat request belongs to the app session, not to the currently
+    # visible page. Keep this structural guard beside the product gate: the
+    # previous conditional render unmounted Chat on Cluster/Settings while its
+    # native stream kept consuming an engine slot. Returning then showed no
+    # deltas and repeated sends eventually received "no free slot".
+    if ! python3 - "$REPO_ROOT/client/src/App.tsx" "$REPO_ROOT/client/src/Chat.tsx" <<'PY'
+import pathlib, re, sys
+app = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+chat = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+if len(re.findall(r"<Chat\b", app)) != 1:
+    raise SystemExit("App must own exactly one persistent Chat instance")
+if 'visible={!error && !!snap && view === "chat"}' not in app:
+    raise SystemExit("App does not hide/show its persistent Chat by view")
+if 'hidden={!props.visible}' not in chat:
+    raise SystemExit("Chat does not preserve its mounted stream while hidden")
+if app.index("<Chat") > app.index("{error ? ("):
+    raise SystemExit("Chat is still inside the page-switch conditional")
+PY
+    then
+        fail "$name" "chat is unmounted by page navigation, which orphans live streams"
+        return
+    fi
     # The shell itself must come from the current Rust sources too. The first
     # WS-F full-suite run only compared the staged worker with the root worker;
     # it therefore called the sidecars FRESH while running an Aug-08 client
@@ -1947,7 +2011,11 @@ p4_orchestration() {
     # XRCHES, not ORCHES: join codes use the no-O/0/I/1 alphabet and the v2
     # engine VALIDATES it — 'O' was never noticed while the mock era stopped
     # short of the engine (`invalid join code 'ORCHES'`, measured round 5).
-    local rep; rep=$(pairing_pair_report XRCHES p4 ":model=$gguf_abs" "" 150000 40 3)
+    # Every compute node now has to prove the exact model ready before Start.
+    # Both UI instances run on this same testbed node, so give the joiner the
+    # same already-verified file instead of turning this orchestration gate into
+    # an unrelated network-download gate.
+    local rep; rep=$(pairing_pair_report XRCHES p4 ":model=$gguf_abs" ":model=$gguf_abs" 150000 40 3)
     client_cleanup
     [ -n "$rep" ] || { fail "$name" "no pairing-phases report (see /tmp/idletoken-p4-{a,b}.log on $COORD_NODE)"; return; }
     vlog "pairing-phases: $rep"
@@ -1986,7 +2054,7 @@ print('ok' if not bad else 'failed: '+','.join(bad)+' | '+json.dumps(r))" 2>/dev
 #          spec tokens into it (same style as the existing `:model=` token).
 #      Until that pipeline lands this gate honestly fails (it IS the oracle
 #      for it). The fuller P5 items in the md (model select via the pluggable
-#      interface, VRAM/RAM caps into the split, KV-cache policy, i18n/theme
+#      interface, the VRAM cap into the split, exact 256K/1M, i18n/theme
 #      persistence) remain PASS requirements at the md level; extending this
 #      oracle to them is tracked in the md §P5 note.
 # =====================================================================
@@ -1999,7 +2067,7 @@ p5_settings() {
     # settings pipeline is proven against the same engine users run.
     local gguf_abs
     gguf_abs=$(coord_small_gguf) || { fail "$name" "no small smoke GGUF on $COORD_NODE (searched IDLETOKEN_GGUF_DIRS_${COORD_NODE})"; return; }
-    local rep; rep=$(pairing_pair_report P5SETT p5 "$tune:model=$gguf_abs" "$tune" 150000 40 3)
+    local rep; rep=$(pairing_pair_report P5SETT p5 "$tune:model=$gguf_abs" "$tune:model=$gguf_abs" 150000 40 3)
     if [ -z "$rep" ]; then
         client_cleanup
         fail "$name" "cluster with custom apiPort/apiToken never reached ready — settings→engine pipeline missing? (integration-plan 1.2; see /tmp/idletoken-p5-{a,b}.log on $COORD_NODE)"
@@ -3325,131 +3393,50 @@ g_api_models() {
 }
 
 # =====================================================================
-# G_SIZE — large models cluster, small models do not. The coordinator must
-#      REFUSE to serve a single-node model on more than one machine (CLAUDE.md
-#      hard constraint, 2026-08-12), and must still serve a cluster model
-#      across many.
+# G_SIZE — deployment choice (2026-08-28).
 #
-# Runs on the control machine with no cluster and no weights: every assertion
-# is about a startup decision the coordinator makes before it opens a socket,
-# so `--num-workers 2` never has to be satisfied.
-#
-# BOTH halves are checked, for the same reason G_HOMO checks both: a build that
-# refused every multi-node start would pass the negative half on its own. And
-# the escape hatch is checked too — the cross-machine gates depend on it, so a
-# silent change to its name would disable them without turning anything red.
+# Capacity chooses only the DEFAULT after model + precision: a fitting row
+# defaults to one machine, a non-fitting row defaults to several. An explicit
+# cluster choice must survive all the way to the planner even when the same
+# quant also fits locally. The old model-wide single-node veto is gone.
 # =====================================================================
 g_size() {
     local name="$1" repo; repo=$(cd "$(dirname "$0")/.." && pwd)
-    # One port per step. Reusing one made step 3 fail with "Address already in
-    # use" from step 2's just-killed listener, which reads exactly like the
-    # policy check refusing the model -- a red for the wrong reason.
-    local base="${IDLETOKEN_SIZE_PORT:-14321}"
-    local port_a=$base port_b=$((base + 1)) port_c=$((base + 2)) port_d=$((base + 3))
     command -v cc >/dev/null 2>&1 || { skip "$name" "no C compiler on the control machine"; return; }
-    (cd "$repo" && make coord >/dev/null 2>&1) || { fail "$name" "make coord failed on the control machine"; return; }
-
-    # Pick the models from the manifests rather than naming them here: the
-    # registry decides which are small, and a hardcoded id here would keep
-    # passing after that model was retired.
-    local small large
-    small=$(python3 - <<'PY'
-import glob, json
-for f in sorted(glob.glob("models/*.json")):
-    m = json.load(open(f))
-    if m.get("available") and m.get("deployment") == "single-node":
-        print(m["id"]); break
-PY
-)
-    large=$(python3 - <<'PY'
-import glob, json
-for f in sorted(glob.glob("models/*.json")):
-    m = json.load(open(f))
-    if m.get("available") and m.get("deployment") == "cluster":
-        print(m["id"]); break
-PY
-)
-    [ -n "$small" ] && [ -n "$large" ] || {
-        fail "$name" "need one available single-node and one available cluster model in models/*.json (got '$small' / '$large')"
-        return
+    (cd "$repo" && make plantest >/dev/null 2>&1) || {
+        fail "$name" "planner tests failed (auto SINGLE / explicit CLUSTER contract)"; return;
+    }
+    (cd "$repo" && make weightstest >/dev/null 2>&1) || {
+        fail "$name" "dynamic local model view failed (cold build / heterogeneous re-plan reuse)"; return;
     }
 
-    # 1. small model + 2 nodes => refused, with a reason the client can show.
-    #
-    # Backgrounded with a log rather than `out=$(...)`: a coordinator that does
-    # NOT refuse goes on to wait for workers forever, and the command
-    # substitution would block on its stdout — the gate would HANG instead of
-    # failing. A check that cannot report the very thing it is looking for is
-    # not a check. (Found by running this gate with the override exported.)
-    local log; log=$(mktemp)
-    (cd "$repo" && exec ./idletoken-coord --model-id "$small" --num-workers 2 --n-predict 0 \
-        --bind "127.0.0.1:$port_a" >"$log" 2>&1) &
-    local pid=$!
-    local i=0
-    while [ $i -lt 100 ] && ! grep -qE "JOIN_REFUSED: |waiting for worker" "$log"; do sleep 0.1; i=$((i + 1)); done
-    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
-    if grep -q "waiting for worker" "$log"; then
-        fail "$name" "coordinator accepted a 2-node start for the single-node model $small (see $log)"
-        rm -f "$log"; return
-    fi
-    if ! grep -q "JOIN_REFUSED: " "$log"; then
-        fail "$name" "$small was refused without the JOIN_REFUSED marker — the client cannot show a reason (see $log)"
-        rm -f "$log"; return
-    fi
-    vlog "$small refused on 2 nodes: $(grep -o 'JOIN_REFUSED: .*' "$log" | head -1 | cut -c1-90)"
-    rm -f "$log"
+    # Every currently selectable model is technically splittable. A future
+    # unsplittable backend may reintroduce single-node, but model SIZE or its
+    # default quant must never do so.
+    (cd "$repo" && python3 - <<'PY'
+import glob, json, sys
+bad = []
+for path in sorted(glob.glob("models/*.json")):
+    model = json.load(open(path, encoding="utf-8"))
+    if model.get("available") and model.get("deployment") != "cluster":
+        bad.append(f"{model.get('id')}: {model.get('deployment')}")
+if bad:
+    print("available models not cluster-capable: " + ", ".join(bad))
+    sys.exit(1)
+PY
+    ) || { fail "$name" "an available model still has a model-wide single-node veto"; return; }
 
-    # 2. ...but one node is fine. Reaching the "waiting for worker" line means
-    #    the deployment check let it through; we kill it there rather than
-    #    supply a worker, because a worker would need real weights.
-    log=$(mktemp)
-    (cd "$repo" && exec ./idletoken-coord --model-id "$small" --num-workers 1 --n-predict 0 \
-        --bind "127.0.0.1:$port_b" >"$log" 2>&1) &
-    pid=$!
-    i=0
-    while [ $i -lt 60 ] && ! grep -q "waiting for worker" "$log"; do sleep 0.1; i=$((i + 1)); done
-    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
-    if ! grep -q "waiting for worker" "$log"; then
-        fail "$name" "$small was blocked on ONE machine too — the check refuses everything (see $log)"
-        rm -f "$log"; return
-    fi
-    rm -f "$log"
-    vlog "$small starts fine on one machine"
+    (cd "$repo" && make coord >/dev/null 2>&1) || {
+        fail "$name" "make coord failed on the control machine"; return;
+    }
+    (cd "$repo" && ./idletoken-coord --help 2>&1 | grep -q -- "--force-cluster") || {
+        fail "$name" "coordinator does not expose the explicit cluster choice"; return;
+    }
+    grep -q 'coord_args.push("--force-cluster".into())' "$repo/client/src-tauri/src/pairing.rs" || {
+        fail "$name" "desktop cluster flow does not pass the explicit choice to the coordinator"; return;
+    }
 
-    # 3. a cluster model on 2 nodes must NOT be refused by this check.
-    log=$(mktemp)
-    (cd "$repo" && exec ./idletoken-coord --model-id "$large" --num-workers 2 --n-predict 0 \
-        --bind "127.0.0.1:$port_c" >"$log" 2>&1) &
-    pid=$!
-    i=0
-    while [ $i -lt 60 ] && ! grep -q "waiting for worker" "$log"; do sleep 0.1; i=$((i + 1)); done
-    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
-    if grep -q "JOIN_REFUSED" "$log"; then
-        fail "$name" "the cluster model $large was refused a 2-node start (see $log)"; rm -f "$log"; return
-    fi
-    if ! grep -q "waiting for worker" "$log"; then
-        fail "$name" "$large never reached the worker wait on 2 nodes (see $log)"; rm -f "$log"; return
-    fi
-    rm -f "$log"
-    vlog "$large accepted on 2 nodes"
-
-    # 4. the escape hatch the cross-machine gates rely on still opens. Same
-    #    background-and-kill shape as above rather than `timeout`, which the
-    #    control machine may not have (macOS ships none).
-    log=$(mktemp)
-    (cd "$repo" && export IDLETOKEN_ALLOW_SMALL_CLUSTER=1 && exec ./idletoken-coord \
-        --model-id "$small" --num-workers 2 --n-predict 0 \
-        --bind "127.0.0.1:$port_d" >"$log" 2>&1) &
-    pid=$!
-    i=0
-    while [ $i -lt 60 ] && ! grep -q "waiting for worker" "$log"; do sleep 0.1; i=$((i + 1)); done
-    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
-    if ! grep -q "IDLETOKEN_ALLOW_SMALL_CLUSTER=1" "$log" || ! grep -q "waiting for worker" "$log"; then
-        fail "$name" "IDLETOKEN_ALLOW_SMALL_CLUSTER=1 did not let $small start on 2 nodes — the cross-machine gates have lost their vehicle (see $log)"
-        rm -f "$log"; return
-    fi
-    rm -f "$log"
-    vlog "override still works, and says so"
+    vlog "capacity supplies the default; explicit multi-machine selection reaches the planner"
 
     pass "$name"
 }
@@ -3756,6 +3743,409 @@ g_sched() {
     esac
 }
 
+# G_TEST_ISOLATION — the gateway test suite must not share a mutable SQLite
+# file or fixed listening port across Jest workers/sessions. This is a local
+# platform-quality gate: the public mirror intentionally has no platform tree,
+# so a missing tree/dependency is an explicit SKIP rather than a false failure.
+# The contract suite contains the known-bad datasource and port controls; this
+# wrapper additionally proves that running it leaves prisma/test.db byte- and
+# metadata-identical.
+g_test_isolation() {
+    local name="$1" gateway="$REPO_ROOT/platform/packages/gateway"
+    local jest="$REPO_ROOT/platform/packages/gateway/node_modules/.bin/jest"
+    if [ ! -d "$gateway" ]; then
+        skip "$name" "platform gateway is not present in this checkout (not shipped publicly)"
+        return
+    fi
+    if [ ! -x "$jest" ]; then
+        skip "$name" "platform gateway dependencies are not installed (missing node_modules/.bin/jest)"
+        return
+    fi
+    command -v python3 >/dev/null 2>&1 || {
+        skip "$name" "python3 is required to fingerprint the shared database and read Jest's verdict"; return; }
+
+    local db="$gateway/prisma/test.db" before after log json timed=0 verdict
+    _test_isolation_fingerprint() {
+        python3 - "$1" <<'PY'
+import hashlib, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+if not p.exists():
+    print("absent")
+else:
+    st = p.stat()
+    print(f"{hashlib.sha256(p.read_bytes()).hexdigest()}:{st.st_mtime_ns}:{st.st_size}")
+PY
+    }
+    before=$(_test_isolation_fingerprint "$db") || {
+        fail "$name" "could not fingerprint prisma/test.db before the isolation contract"; return; }
+    log=$(mktemp "${TMPDIR:-/tmp}/idletoken-test-isolation.XXXXXX") || {
+        fail "$name" "could not create an isolation-contract transcript"; return; }
+    json=$(mktemp "${TMPDIR:-/tmp}/idletoken-test-isolation-json.XXXXXX") || {
+        rm -f "$log"; fail "$name" "could not create an isolation-contract verdict file"; return; }
+
+    run_deadline "${IDLETOKEN_TEST_ISOLATION_TIMEOUT:-300}" "$log" \
+        bash -c 'cd "$1" && exec "$2" --runTestsByPath test/test-isolation.spec.ts --detectOpenHandles --json --outputFile="$3"' \
+        _ "$gateway" "$jest" "$json" || timed=1
+    after=$(_test_isolation_fingerprint "$db") || {
+        fail "$name" "could not fingerprint prisma/test.db after the isolation contract (transcript: $log)"; return; }
+    if [ "$before" != "$after" ]; then
+        fail "$name" "the isolation contract changed prisma/test.db ($before -> $after; transcript: $log)"
+        return
+    fi
+    if [ "$timed" = 1 ]; then
+        fail "$name" "the isolation contract exceeded ${IDLETOKEN_TEST_ISOLATION_TIMEOUT:-300}s (transcript: $log)"
+        return
+    fi
+    if [ ! -s "$json" ]; then
+        fail "$name" "Jest produced no machine-readable isolation verdict (transcript: $log)"
+        return
+    fi
+    verdict=$(python3 - "$json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+print("OK" if (
+    d.get("success") is True
+    and d.get("numTotalTestSuites") == 1
+    and d.get("numPassedTestSuites") == 1
+    and d.get("numFailedTestSuites") == 0
+    and d.get("numTotalTests") == 35
+    and d.get("numPassedTests") == 35
+    and d.get("numFailedTests") == 0
+    and d.get("numPendingTests") == 0
+    and not d.get("wasInterrupted", False)
+) else "BAD:" + ",".join(f"{k}={d.get(k)!r}" for k in (
+    "success", "numTotalTestSuites", "numPassedTestSuites", "numFailedTestSuites",
+    "numTotalTests", "numPassedTests", "numFailedTests", "numPendingTests", "wasInterrupted")))
+PY
+    ) || verdict="BROKEN"
+    case "$verdict" in
+        OK)
+            vlog "isolation contract: 1/1 suite, 35/35 tests; datasource and fixed-port controls fired; shared DB unchanged"
+            rm -f "$log" "$json"
+            pass "$name" ;;
+        *)
+            fail "$name" "isolation contract did not reach its exact 35/35 verdict ($verdict; transcript: $log; JSON: $json)" ;;
+    esac
+}
+
+# G_WORKER_JOIN — the shipped client uses the single hardened RPC-supervisor
+# join path, while invoking the retired network path directly fails before any
+# discovery/pairing/HELLO side effect. The C contract mutates both the shipped
+# argv and externalBin declaration in memory and requires each mutation to turn
+# the oracle red before its verdict is trusted. Public-source builds compile the
+# real worker from source against a loud, fail-closed legacy-backend refusal ABI;
+# missing public build inputs are failures, never a reason to skip execution.
+g_worker_join() {
+    local name="$1" repo="$REPO_ROOT" log
+    command -v cc >/dev/null 2>&1 || { skip "$name" "no C compiler on the control machine"; return; }
+    log=$(mktemp "${TMPDIR:-/tmp}/idletoken-worker-join.XXXXXX") || {
+        fail "$name" "could not create a worker-join transcript"; return; }
+    run_deadline "${IDLETOKEN_WORKER_JOIN_TIMEOUT:-300}" "$log" \
+        bash -c 'cd "$1" && exec make workerjointest' _ "$repo" || {
+        fail "$name" "make workerjointest exceeded ${IDLETOKEN_WORKER_JOIN_TIMEOUT:-300}s (transcript: $log)"; return; }
+    if ! grep -qx 'WORKER_JOIN_CONTRACT_TEST_OK' "$log" ||
+       ! grep -qx 'worker join contract: 8 checks, 0 failures' "$log" ||
+       ! grep -q 'control: removing the shipped --rpc-supervisor argument makes the oracle red' "$log" ||
+       ! grep -q 'control: removing the bundled worker entry makes the oracle red' "$log"; then
+        fail "$name" "worker join did not reach its exact 8-check, two-control verdict (transcript: $log)"
+        return
+    fi
+    vlog "worker join: 8/8; shipped argv + bundle mutations red; retired path refused before network"
+    rm -f "$log"
+    pass "$name"
+}
+
+# G_PLATFORM_HARDENING — stable, isolated integration for the private gateway.
+# It deliberately does NOT run a destructive/full suite and does NOT claim a
+# live Redis or PostgreSQL result.  The two pending Jest cases are the opt-in
+# live-Redis tiers; G_REDIS_SECURITY owns their real verdict separately.
+g_platform_hardening() {
+    local name="$1" gateway="$REPO_ROOT/platform/packages/gateway"
+    local jest="$gateway/node_modules/.bin/jest" db="$gateway/prisma/test.db"
+    if [ ! -d "$gateway" ]; then
+        skip "$name" "platform gateway is not present in this checkout (not shipped publicly)"
+        return
+    fi
+    if [ ! -x "$jest" ]; then
+        skip "$name" "platform gateway dependencies are not installed (missing node_modules/.bin/jest)"
+        return
+    fi
+    command -v python3 >/dev/null 2>&1 || {
+        skip "$name" "python3 is required for migration and machine-readable Jest verdicts"; return; }
+
+    _platform_hardening_fingerprint() {
+        python3 - "$1" <<'PY'
+import hashlib, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+if not p.exists(): print("absent")
+else:
+    s = p.stat()
+    print(f"{hashlib.sha256(p.read_bytes()).hexdigest()}:{s.st_mtime_ns}:{s.st_size}")
+PY
+    }
+    local before after mlog vlogf jlog json verdict
+    before=$(_platform_hardening_fingerprint "$db") || {
+        fail "$name" "could not fingerprint prisma/test.db before platform hardening"; return; }
+
+    mlog=$(mktemp "${TMPDIR:-/tmp}/idletoken-prisma-contract.XXXXXX") || {
+        fail "$name" "could not create a Prisma contract transcript"; return; }
+    run_deadline "${IDLETOKEN_PRISMA_CONTRACT_TIMEOUT:-600}" "$mlog" \
+        bash "$gateway/tools/prisma-migration-contract.sh" || {
+        fail "$name" "SQLite migration contract timed out (transcript: $mlog)"; return; }
+    if ! grep -q '^PRISMA_MIGRATION_CONTRACT_OK:' "$mlog"; then
+        fail "$name" "SQLite migration contract did not reach its positive-controlled verdict (transcript: $mlog)"
+        return
+    fi
+
+    vlogf=$(mktemp "${TMPDIR:-/tmp}/idletoken-platform-version.XXXXXX") || {
+        fail "$name" "could not create a platform-version transcript"; return; }
+    run_deadline "${IDLETOKEN_PLATFORM_VERSION_TIMEOUT:-600}" "$vlogf" \
+        bash -c 'cd "$1" && exec make platformversiontest' _ "$REPO_ROOT" || {
+        fail "$name" "platform version contract timed out (transcript: $vlogf)"; return; }
+    if ! grep -q '^PLATFORM_VERSION_CONTRACT_OK ' "$vlogf" ||
+       ! grep -q '^PLATFORM_VERSION_SNAPSHOT_OK ' "$vlogf" ||
+       ! grep -qx 'PLATFORM_VERSION_BINARY_OK' "$vlogf"; then
+        fail "$name" "platform version/R11 contract did not reach all source, snapshot and binary markers (transcript: $vlogf)"
+        return
+    fi
+
+    jlog=$(mktemp "${TMPDIR:-/tmp}/idletoken-platform-hardening.XXXXXX") || {
+        fail "$name" "could not create a platform-hardening transcript"; return; }
+    json=$(mktemp "${TMPDIR:-/tmp}/idletoken-platform-hardening-json.XXXXXX") || {
+        fail "$name" "could not create a platform-hardening JSON verdict"; return; }
+    run_deadline "${IDLETOKEN_PLATFORM_HARDENING_TIMEOUT:-300}" "$jlog" \
+        bash -c 'cd "$1" && exec env -u REDIS_URL -u TEST_REDIS_URL "$2" --runInBand --detectOpenHandles \
+          --globalSetup ./test/no-db-global-setup.ts --json --outputFile="$3" --runTestsByPath \
+          src/shared/safe-fetch.spec.ts src/shared/endpoint-toctou.spec.ts \
+          src/shared/provider-text.spec.ts src/routing/failure-detail.spec.ts \
+          src/inference/provider-text-wiring.spec.ts src/shared/throttle-concurrency-rollback.spec.ts \
+          src/shared/rate-limit-redis.spec.ts src/audit/security-audit.spec.ts \
+          src/audit/security-audit-redis.spec.ts src/audit/security-audit-wiring.spec.ts' \
+          _ "$gateway" "$jest" "$json" || {
+        fail "$name" "focused shared-hardening slice timed out (transcript: $jlog)"; return; }
+    if grep -Eqi 'Jest did not exit|open handle potentially keeping Jest from exiting' "$jlog"; then
+        fail "$name" "focused shared-hardening slice emitted an open-handle warning (transcript: $jlog)"
+        return
+    fi
+    verdict=$(python3 - "$json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+ok = (d.get("success") is True and d.get("numTotalTestSuites") == 10
+      and d.get("numPassedTestSuites") == 10 and d.get("numFailedTestSuites") == 0
+      and d.get("numTotalTests") == 87 and d.get("numPassedTests") == 85
+      and d.get("numFailedTests") == 0 and d.get("numPendingTests") == 2
+      and not d.get("wasInterrupted", False))
+print("OK" if ok else "BAD:" + ",".join(f"{k}={d.get(k)!r}" for k in (
+    "success", "numTotalTestSuites", "numPassedTestSuites", "numFailedTestSuites",
+    "numTotalTests", "numPassedTests", "numFailedTests", "numPendingTests", "wasInterrupted")))
+PY
+    ) || verdict=BROKEN
+    if [ "$verdict" != OK ]; then
+        fail "$name" "focused shared-hardening slice missed exact 10-suite/85-pass/2-live-skip verdict ($verdict; transcript: $jlog; JSON: $json)"
+        return
+    fi
+    after=$(_platform_hardening_fingerprint "$db") || {
+        fail "$name" "could not fingerprint prisma/test.db after platform hardening"; return; }
+    if [ "$before" != "$after" ]; then
+        fail "$name" "platform hardening changed prisma/test.db ($before -> $after)"
+        return
+    fi
+    vlog "SQLite migration: fresh/adopted/repeat + 3 controls; version: source/snapshot/binary + controls"
+    vlog "shared hardening: 10/10 suites, 85 passed, exactly 2 live-Redis cases skipped; DB unchanged"
+    rm -f "$mlog" "$vlogf" "$jlog" "$json"
+    pass "$name"
+}
+
+redis_security_verdict() { # <exit-code> <transcript> -> OK|SKIP|FAIL|BROKEN
+    local rc="$1" file="$2" last=""
+    local ok_marker='REDIS_SECURITY_GATE_OK canary=live relay=live audit=live rate-limit=live replay=live quota=live open_handles=clean'
+    [ -f "$file" ] && last=$(grep -E '^REDIS_SECURITY_GATE_(OK|SKIPPED|FAILED)([^A-Za-z0-9_]|$)' "$file" | tail -1)
+    case "$last" in
+        "$ok_marker")                [ "$rc" = 0 ] && echo OK || echo BROKEN ;;
+        REDIS_SECURITY_GATE_OK*)      echo BROKEN ;;
+        REDIS_SECURITY_GATE_SKIPPED*) [ "$rc" = 3 ] && echo SKIP || echo BROKEN ;;
+        REDIS_SECURITY_GATE_FAILED*)  if [ "$rc" != 0 ] && [ "$rc" != 3 ]; then echo FAIL; else echo BROKEN; fi ;;
+        *) echo BROKEN ;;
+    esac
+}
+
+redis_security_reader_selfcheck() {
+    local t got bad=""
+    t=$(mktemp "${TMPDIR:-/tmp}/idletoken-redis-reader.XXXXXX") || { echo no-mktemp; return; }
+    _redis_reader_case() {
+        local want="$1" rc="$2" marker="$3"
+        printf '%s\n' "$marker" >"$t"
+        got=$(redis_security_verdict "$rc" "$t")
+        [ "$got" = "$want" ] || bad="$bad got=$got/want=$want"
+    }
+    _redis_reader_case OK 0 'REDIS_SECURITY_GATE_OK canary=live relay=live audit=live rate-limit=live replay=live quota=live open_handles=clean'
+    _redis_reader_case SKIP 3 'REDIS_SECURITY_GATE_SKIPPED reason=no-safe-runtime'
+    _redis_reader_case FAIL 1 'REDIS_SECURITY_GATE_FAILED status=1 scratch=/tmp/example'
+    _redis_reader_case BROKEN 0 'REDIS_SECURITY_GATE_SKIPPED reason=no-safe-runtime'
+    _redis_reader_case BROKEN 3 'REDIS_SECURITY_GATE_OK canary=live relay=live audit=live rate-limit=live replay=live quota=live open_handles=clean'
+    _redis_reader_case BROKEN 0 'REDIS_SECURITY_GATE_OK canary=live relay=live audit=live replay=live quota=live open_handles=clean'
+    _redis_reader_case BROKEN 0 'REDIS_SECURITY_GATE_OK canary=live relay=live audit=live rate-limit=skipped replay=live quota=live open_handles=clean'
+    _redis_reader_case BROKEN 0 'REDIS_SECURITY_GATE_OKAY near-miss'
+    rm -f "$t"
+    unset -f _redis_reader_case
+    printf '%s' "$bad"
+}
+
+# G_REDIS_SECURITY needs its own strict deadline runner.  The older shared
+# run_deadline() intentionally normalizes every natural child exit to zero, so
+# it cannot distinguish this gate's live OK=0, deployment SKIP=3 and failure
+# exits.  This runner returns the exact natural code and owns a new process
+# group; timeout is 124 after TERM, a short grace, then KILL.
+redis_security_run_deadline() { # <seconds> <term-grace> <transcript> <command...>
+    local seconds="$1" grace="$2" transcript="$3" rc; shift 3
+    case "$seconds" in *[!0-9]*|'') return 2 ;; esac
+    [ "$seconds" -gt 0 ] || return 2
+    case "$grace" in *[!0-9]*|'') return 2 ;; esac
+    [ "$grace" -gt 0 ] || return 2
+    python3 - "$seconds" "$grace" "$transcript" "$@" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+import time
+
+deadline = int(sys.argv[1])
+grace = int(sys.argv[2])
+transcript = sys.argv[3]
+command = sys.argv[4:]
+
+def alive(pgid):
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+def stop(pgid):
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    until = time.monotonic() + grace
+    while alive(pgid) and time.monotonic() < until:
+        time.sleep(0.05)
+    if alive(pgid):
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    until = time.monotonic() + 2
+    while alive(pgid) and time.monotonic() < until:
+        time.sleep(0.05)
+
+with open(transcript, "wb") as output:
+    try:
+        child = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT,
+                                 start_new_session=True)
+    except Exception as exc:
+        output.write((f"REDIS_ACCEPTANCE_SPAWN_FAILED {exc}\n").encode())
+        sys.exit(125)
+    pgid = child.pid
+    try:
+        rc = child.wait(timeout=deadline)
+    except subprocess.TimeoutExpired:
+        output.write((f"REDIS_ACCEPTANCE_DEADLINE_EXCEEDED seconds={deadline} pgid={pgid}\n").encode())
+        output.flush()
+        stop(pgid)
+        child.poll()
+        sys.exit(124)
+    if alive(pgid):
+        output.write((f"REDIS_ACCEPTANCE_LEAKED_GROUP pgid={pgid}\n").encode())
+        output.flush()
+        stop(pgid)
+        sys.exit(125)
+    sys.exit(rc if rc >= 0 else 128 + (-rc))
+PY
+    rc=$?
+    return "$rc"
+}
+
+redis_security_deadline_selfcheck() {
+    local d rc bad="" survivor="" pid=""
+    d=$(mktemp -d "${TMPDIR:-/tmp}/idletoken-redis-deadline.XXXXXX") || {
+        printf 'no-mktemp'; return; }
+    redis_security_run_deadline 5 1 "$d/zero.log" bash -c 'exit 0'; rc=$?
+    [ "$rc" = 0 ] || bad="$bad zero=$rc"
+    redis_security_run_deadline 5 1 "$d/skip.log" bash -c 'exit 3'; rc=$?
+    [ "$rc" = 3 ] || bad="$bad skip=$rc"
+    redis_security_run_deadline 5 1 "$d/fail.log" bash -c 'exit 9'; rc=$?
+    [ "$rc" = 9 ] || bad="$bad fail=$rc"
+    survivor="$d/survivor.pid"
+    redis_security_run_deadline 1 1 "$d/hang.log" \
+        bash -c 'trap "" TERM; sleep 30 & p=$!; printf "%s\n" "$p" >"$1"; wait "$p"' _ "$survivor"
+    rc=$?
+    [ "$rc" = 124 ] || bad="$bad timeout=$rc"
+    grep -q '^REDIS_ACCEPTANCE_DEADLINE_EXCEEDED ' "$d/hang.log" || bad="$bad no-timeout-marker"
+    [ -s "$survivor" ] && pid=$(cat "$survivor")
+    case "$pid" in
+        ''|*[!0-9]*) bad="$bad no-survivor-pid" ;;
+        *) kill -0 "$pid" 2>/dev/null && bad="$bad survivor-alive=$pid" ;;
+    esac
+    rm -rf "$d"
+    printf '%s' "$bad"
+}
+
+# G_REDIS_SECURITY — real, fresh loopback Redis for Canary/Relay/Audit/rate-limit/provider-observation.
+# A host without an approved runtime exits 3 and is a real SKIP, never a fake pass.
+g_redis_security() {
+    local name="$1" gate="$REPO_ROOT/scripts/redis_security_gate.sh"
+    local self out rc broke reason deadline_broke
+    # Keep the literal basename in the guard: sync-public.sh proves optional
+    # private-script references are guarded by inspecting the public mirror.
+    if [ ! -f "$REPO_ROOT/scripts/redis_security_gate.sh" ] ||
+       [ ! -d "$REPO_ROOT/platform/packages/gateway" ]; then
+        skip "$name" "private platform/Redis security gate is not present in this checkout"
+        return
+    fi
+    broke=$(redis_security_reader_selfcheck)
+    if [ -n "$broke" ]; then
+        fail "$name" "Redis verdict reader does not distinguish OK/SKIP/FAIL/bad-exit/near-miss ($broke)"
+        return
+    fi
+    deadline_broke=$(redis_security_deadline_selfcheck)
+    if [ -n "$deadline_broke" ]; then
+        fail "$name" "Redis total-deadline runner does not preserve exits or reap a hanging group ($deadline_broke)"
+        return
+    fi
+    self=$(mktemp "${TMPDIR:-/tmp}/idletoken-redis-selftest.XXXXXX") || {
+        fail "$name" "could not create Redis self-test transcript"; return; }
+    redis_security_run_deadline "${IDLETOKEN_REDIS_SELFTEST_TIMEOUT:-15}" 4 "$self" \
+        bash "$gate" --self-test
+    rc=$?
+    if [ "$rc" != 0 ] || ! grep -qx 'REDIS_SECURITY_GATE_SELFTEST_OK suites=canary,relay,audit,rate-limit,provider-observation omission_is_not_pass=true skip_is_not_pass=true force_exit=forbidden signals=nonzero deadlines=process-group' "$self"; then
+        fail "$name" "Redis gate self-test did not prove suite registration, skip refusal, signal failure and process-group deadlines (exit $rc; transcript: $self)"
+        return
+    fi
+    out=$(mktemp "${TMPDIR:-/tmp}/idletoken-redis-live.XXXXXX") || {
+        fail "$name" "could not create Redis live transcript"; return; }
+    # The outer grace exceeds the inner suite grace plus owned Redis teardown,
+    # so a total timeout cannot kill the gate halfway through reaping a suite's
+    # deliberately separate process group.
+    redis_security_run_deadline "${IDLETOKEN_REDIS_SECURITY_TIMEOUT:-960}" 8 "$out" bash "$gate"
+    rc=$?
+    if [ "$rc" = 124 ]; then
+        fail "$name" "real Redis tier exceeded ${IDLETOKEN_REDIS_SECURITY_TIMEOUT:-960}s total deadline (transcript: $out)"
+        return
+    fi
+    case "$(redis_security_verdict "$rc" "$out")" in
+        OK)
+            vlog "$(grep '^REDIS_SECURITY_GATE_OK' "$out" | tail -1)"
+            rm -f "$self" "$out"; pass "$name" ;;
+        SKIP)
+            reason=$(grep '^REDIS_SECURITY_GATE_SKIPPED' "$out" | tail -1 | sed 's/^REDIS_SECURITY_GATE_SKIPPED[[:space:]]*//')
+            rm -f "$self" "$out"; skip "$name" "${reason:-no approved live Redis runtime}" ;;
+        FAIL)
+            fail "$name" "real Redis tier failed (exit $rc; transcript: $out)" ;;
+        *)
+            fail "$name" "Redis gate exited $rc without a matching strict OK/SKIPPED/FAILED verdict (transcript: $out)" ;;
+    esac
+}
+
 g_plat() {
     local name="$1"
     local out
@@ -3933,6 +4323,197 @@ g_ppl() {
 }
 
 # =====================================================================
+# Verdict reader for the fail-closed hardening gate SCRIPTS (2026-08-30).
+#
+# scripts/release_identity_gate.sh, scripts/dependency_audit.sh and
+# scripts/admission_origin_gate.sh share one contract: the LAST line is one of
+#     <PREFIX>_OK[: detail]   <PREFIX>_SKIP: <why>   <PREFIX>_FAIL: <why>
+# and the exit code is 0 for OK, **0 for SKIP as well**, and 1 for FAIL.
+#
+# So the exit code alone cannot separate "passed" from "never ran": both are 0.
+# This ladder has shipped that confusion once already — the --gate summary
+# printed PASS for a gate that had SKIPped for want of its inputs (2026-08-15,
+# G_PPL). The verdict therefore comes from the MARKER, and the exit code has to
+# AGREE with it; any disagreement, or no marker at all, is BROKEN and fails.
+#
+# script_gate_selfcheck proves on EVERY run that the reader tells those cases
+# apart before any of its answers is believed. A checker never observed to
+# discriminate is the OPS-08 failure mode, and this repo has twice shipped a
+# check that could not fail (a pattern that never matched; `grep -P` on BSD
+# grep counting nothing and passing silently).
+# =====================================================================
+script_gate_verdict() {  # <marker-prefix> <exit-code> <output-file> -> OK|SKIP|FAIL|BROKEN
+    local prefix="$1" rc="$2" file="$3" last=""
+    if [ -f "$file" ]; then
+        last=$(grep -E "^${prefix}_(OK|FAIL|SKIP)([^A-Za-z0-9_]|$)" "$file" | tail -1)
+    fi
+    case "$last" in
+        "${prefix}_OK"*)   if [ "$rc" = 0 ]; then echo OK;   else echo BROKEN; fi ;;
+        "${prefix}_SKIP"*) if [ "$rc" = 0 ]; then echo SKIP; else echo BROKEN; fi ;;
+        "${prefix}_FAIL"*) if [ "$rc" = 1 ]; then echo FAIL; else echo BROKEN; fi ;;
+        *) echo BROKEN ;;
+    esac
+}
+
+# Prints nothing when the reader discriminates; otherwise what it got wrong.
+script_gate_selfcheck() {
+    local t bad="" got
+    t=$(mktemp "${TMPDIR:-/tmp}/idletoken-gateread.XXXXXX") || { printf 'no mktemp'; return; }
+    _gate_case() {  # _gate_case <expected> <exit-code> <label> <marker line>
+        local want="$1" rc="$2" label="$3"; shift 3
+        printf 'a preamble line the reader must ignore\n%s\n' "$*" > "$t"
+        got=$(script_gate_verdict SELFCHECK "$rc" "$t")
+        [ "$got" = "$want" ] || bad="$bad ${label}[got=$got,want=$want]"
+    }
+    _gate_case OK     0 ok               'SELFCHECK_OK: everything held'
+    _gate_case SKIP   0 skip-is-not-pass 'SELFCHECK_SKIP: no toolchain on this machine'
+    _gate_case FAIL   1 fail             'SELFCHECK_FAIL: a control did not fire'
+    _gate_case BROKEN 1 ok-with-exit-1   'SELFCHECK_OK: everything held'
+    _gate_case BROKEN 0 fail-with-exit-0 'SELFCHECK_FAIL: a control did not fire'
+    _gate_case BROKEN 0 silence          'the script died before concluding anything'
+    _gate_case BROKEN 0 near-miss-name   'SELFCHECK_OKAY: a name that only looks like the marker'
+    # The contract says the verdict is the LAST such line, so a script that
+    # recovers after printing an earlier one must not be read by its first word.
+    printf 'preamble\nSELFCHECK_FAIL: an earlier line\nSELFCHECK_OK: the real verdict\n' > "$t"
+    got=$(script_gate_verdict SELFCHECK 0 "$t")
+    [ "$got" = OK ] || bad="$bad last-line-wins[got=$got]"
+    rm -f "$t"
+    unset -f _gate_case
+    printf '%s' "$bad"
+}
+
+script_gate_run() {  # script_gate_run <gate-name> <marker-prefix> <script-path>
+    local name="$1" prefix="$2" rel="$3"
+    local repo; repo=$(cd "$(dirname "$0")/.." && pwd)
+    if [ ! -f "$repo/$rel" ]; then
+        skip "$name" "$rel is not in this checkout"
+        return
+    fi
+    local broke; broke=$(script_gate_selfcheck)
+    if [ -n "$broke" ]; then
+        fail "$name" "this gate's own verdict reader does not discriminate ($broke) — refusing to report a result it cannot read"
+        return
+    fi
+    vlog "verdict-reader control: OK / SKIP / FAIL / silence / near-miss / bad-exit all read differently"
+    local out rc reason
+    out=$(mktemp "${TMPDIR:-/tmp}/idletoken-${prefix}.XXXXXX") || {
+        fail "$name" "could not create a transcript file for $rel"; return; }
+    # Deliberately NOT piped: `$?` after a pipeline is the last command's, and
+    # taking an exit code through a pipe has cost this project a green run
+    # before (AGENTS.md, known traps).
+    ( cd "$repo" && bash "$rel" ) >"$out" 2>&1
+    rc=$?
+    reason=$(grep -E "^${prefix}_(FAIL|SKIP)([^A-Za-z0-9_]|$)" "$out" | tail -1 \
+             | sed -E "s/^${prefix}_(FAIL|SKIP):?[[:space:]]*//")
+    case "$(script_gate_verdict "$prefix" "$rc" "$out")" in
+        OK)
+            vlog "$(grep -E "^${prefix}_OK" "$out" | tail -1 | cut -c1-220)"
+            rm -f "$out"; pass "$name" ;;
+        SKIP)
+            rm -f "$out"; skip "$name" "${reason:-the script skipped without saying why}" ;;
+        FAIL)
+            fail "$name" "${reason:-no reason given} (full transcript: $out)" ;;
+        *)
+            fail "$name" "$rel exited $rc without a single ${prefix}_(OK|FAIL|SKIP) verdict line — see $out" ;;
+    esac
+}
+
+# =====================================================================
+# G_RELEASE_ID — release identity and supply chain (DIST-05/06/08/09/10,
+#      OPS-02/03/04/09/12, CHAIN-07; docs/release-identity-supply-chain-2026-08.md).
+#      The question users cannot answer for themselves: can this tree still
+#      produce a release whose identity somebody outside the project can check?
+#      Local: no cluster node, no GPU, no weights, no network.
+#      IDLETOKEN_RELEASE_ID_SKIP_CARGO=1 parks only R4's release-profile cargo
+#      test, and is deliberately NOT set here — it turns the whole gate into a
+#      SKIP, and a SKIP is not a pass.
+# =====================================================================
+g_release_id() {
+    local name="$1"
+    command -v python3 >/dev/null 2>&1 || {
+        skip "$name" "python3 is this gate's own oracle (key ids, feed metadata, Ed25519 vectors)"; return; }
+    script_gate_run "$name" G_RELEASE_ID scripts/release_identity_gate.sh
+}
+
+# =====================================================================
+# G_DEP_AUDIT — dependency and engine-pin integrity (DIST-10, mechanical half
+#      of OPS-09): the vendored llama.cpp is the commit UPSTREAM claims, the
+#      patch series matches its recorded digests, the Rust/JS lockfiles carry
+#      no known advisories, the human review is inside its window. The patch
+#      digests have no other owner — a patch is a diff applied to third-party
+#      source at build time and no lockfile covers it.
+# =====================================================================
+g_dep_audit() {
+    local name="$1"
+    command -v python3 >/dev/null 2>&1 || {
+        skip "$name" "python3 is needed for the dependency review-window check"; return; }
+    script_gate_run "$name" DEP_AUDIT scripts/dependency_audit.sh
+}
+
+# =====================================================================
+# G_ADMISSION — request provenance (PROV-28, PRIV-05, PRIV-09, CHAIN-05): a job
+#      the PLATFORM dispatched is finished here or refused here, never
+#      forwarded back out. Two engine-free halves — `make admissiontest` (the
+#      pure-C mint/verify/spend target the coordinator's --selftest also calls,
+#      judged without a GGUF) and the gate script, where the REAL platform-agent
+#      binary mints a capability bound to its posted bytes by the SYSTEM's
+#      sha256 and the coordinator's own verifier spends it exactly once.
+#      Distinct from G_OVERFLOW, which judges the forwarding DECISION and needs
+#      a live engine; this judges the machinery, which does not.
+# =====================================================================
+g_admission() {
+    local name="$1" repo; repo=$(cd "$(dirname "$0")/.." && pwd)
+    command -v cc >/dev/null 2>&1 || { skip "$name" "no C compiler on the control machine"; return; }
+    local ulog urc
+    ulog=$(mktemp "${TMPDIR:-/tmp}/idletoken-admissiontest.XXXXXX") || {
+        fail "$name" "could not create a transcript file for make admissiontest"; return; }
+    ( cd "$repo" && make admissiontest ) >"$ulog" 2>&1
+    urc=$?
+    if [ "$urc" != 0 ] || ! grep -q '^ADMISSION_TEST_OK' "$ulog"; then
+        fail "$name" "make admissiontest did not reach ADMISSION_TEST_OK (exit $urc; see $ulog)"
+        return
+    fi
+    vlog "make admissiontest: $(grep -c 'selftest PASS admission' "$ulog") assertions, ADMISSION_TEST_OK"
+    rm -f "$ulog"
+    script_gate_run "$name" ADMISSION_GATE scripts/admission_origin_gate.sh
+}
+
+# G_ACCEPTANCE_CONTRACT — active acceptance wording and its explicit history
+# boundaries. Local and independent of G_FINAL: this proves only that the truth
+# source states the current contract consistently, never that an implementation
+# or a real-machine gate passed. The Python lint carries copied known-bad
+# controls for every retired contradiction and for malformed archive markers.
+g_acceptance_contract() {
+    local name="$1" repo out rc verdict reason broke
+    repo=$(cd "$(dirname "$0")/.." && pwd)
+    command -v python3 >/dev/null 2>&1 || {
+        fail "$name" "python3 is required for the fail-closed contract lint"; return; }
+    [ -f "$repo/scripts/acceptance_contract_lint.py" ] || {
+        fail "$name" "scripts/acceptance_contract_lint.py is missing"; return; }
+    broke=$(script_gate_selfcheck)
+    if [ -n "$broke" ]; then
+        fail "$name" "the verdict reader does not discriminate ($broke)"
+        return
+    fi
+    out=$(mktemp "${TMPDIR:-/tmp}/idletoken-acceptance-contract.XXXXXX") || {
+        fail "$name" "could not create a lint transcript"; return; }
+    ( cd "$repo" && python3 scripts/acceptance_contract_lint.py ) >"$out" 2>&1
+    rc=$?
+    verdict=$(script_gate_verdict ACCEPTANCE_CONTRACT_LINT "$rc" "$out")
+    reason=$(grep -E '^ACCEPTANCE_CONTRACT_LINT_FAIL([^A-Za-z0-9_]|$)' "$out" | tail -1 \
+             | sed -E 's/^ACCEPTANCE_CONTRACT_LINT_FAIL:?[[:space:]]*//')
+    case "$verdict" in
+        OK)
+            vlog "$(grep '^ACCEPTANCE_CONTRACT_LINT_OK' "$out" | tail -1)"
+            rm -f "$out"; pass "$name" ;;
+        FAIL)
+            fail "$name" "${reason:-contract lint failed without a reason} (full transcript: $out)" ;;
+        *)
+            fail "$name" "contract lint exited $rc without a matching OK/FAIL verdict (full transcript: $out)" ;;
+    esac
+}
+
+# =====================================================================
 echo "======================================================"
 echo " IdleToken acceptance ladder   $(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo)"
 echo "======================================================"
@@ -4047,7 +4628,29 @@ gate_always G_FIT_FAIL  g_fit_fail
 # machine gets asked for KV it does not have, and no cluster node is needed to
 # check it.
 gate_always G_BUDGET_SRC g_budget_source
+# --- 2026-08-30, modified-client threat-register hardening wave -------------
+# Three fail-closed scripts came out of that wave with nothing running them, so
+# none of them could regress anything. All three are local and carry their own
+# positive controls. Registered BEFORE G_FINAL: after it, a failure would set
+# the FRONTIER too late to stop `PASS G_FINAL` exiting 0 (see gate_always).
+#
+# gate_always for the same reason as G_INTEGRITY / G_SHARED — "the installer
+# users are told to trust is still verifiable from outside", "this tree would
+# build an engine nobody decided to ship" (hard constraint #1), and "a job the
+# platform sent here is never forwarded on" are product promises, not platform
+# niceties, and an offline laptop must not be able to hide them.
+#
+# KNOWN RESIDUAL, coordinator/Release owner (this session does not own
+# scripts/dependency_audit.sh): its D3 treats a `cargo audit` failure as a
+# finding, so a machine with no network AND no cached advisory database goes
+# RED there rather than SKIP. Its other four checks are offline-deterministic.
+gate_always G_RELEASE_ID g_release_id
+gate_always G_DEP_AUDIT  g_dep_audit
+gate_always G_ADMISSION  g_admission
 gate G_FINAL           g_final
+# Contract wording is audited independently after G_FINAL so this textual gate
+# cannot silently widen the product implementation composition (P1-P6 + G6).
+gate_local G_ACCEPTANCE_CONTRACT g_acceptance_contract
 # Both of these run AFTER G_FINAL and are independent of it: G_PLAT is the
 # platform business layer (spec decision 11), G_DSPARK is an optional
 # accelerator. Neither may set the FRONTIER for the product ladder.
@@ -4056,6 +4659,15 @@ gate G_PLAT            g_plat
 # G_SCHED needs only the gateway dependencies on the control machine and touches
 # no cluster node -> gate_local (see above).
 gate_local G_SCHED     g_sched
+# Test isolation is also platform-local and independent of G_FINAL. It runs the
+# shipped anti-vacuous contract, not a second shell reimplementation of it.
+gate_local G_TEST_ISOLATION g_test_isolation
+# Private gateway integration is deliberately after G_FINAL. Missing platform
+# is an explicit SKIP, and neither it nor the real-Redis deployment tier can
+# change the public cluster product's exit result.
+gate_local G_WORKER_JOIN g_worker_join
+gate_local G_PLATFORM_HARDENING g_platform_hardening
+gate_local G_REDIS_SECURITY g_redis_security
 # G_OVERFLOW is the platform track's (plan §2 O5) and touches no cluster node —
 # its fixtures are a stub engine and a stub platform on this machine — so
 # gate_local, alongside G_SCHED. Registered after G_PLAT for the same reason

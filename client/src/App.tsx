@@ -4,14 +4,14 @@ import { getResourceProvider } from "./provider";
 import { getEngineProvider, type EngineLogLine, type EngineRole, type EngineStatus } from "./provider/engine";
 import { uiTestDirectives } from "./testHooks";
 import type { NodeSnapshot, ClusterState } from "./types";
-import { HW_NO_GPU, HW_CC_TOO_LOW, HW_DRIVER_TOO_OLD, HW_VRAM_TOO_SMALL, HW_GPU_UNSUPPORTED, HW_MACOS_SEALED } from "./types";
-import { getModel, getManifest, defaultQuant, estimateClusterCapacity, poolMemory, isSingleNode, pickBestFittingModel, type ModelSpec } from "./models";
+import { HW_OK, HW_NO_GPU, HW_CC_TOO_LOW, HW_DRIVER_TOO_OLD, HW_VRAM_TOO_SMALL, HW_GPU_UNSUPPORTED, HW_MACOS_SEALED } from "./types";
+import { getModel, getManifest, defaultQuant, estimateClusterCapacity, poolVram, pickBestFittingModel, backendOfOs, type ModelSpec } from "./models";
 import { resolveLocalWeights, fetchWeights, onFetchProgress, defaultModelDir, cancelFetch, resolveDownload, weightsState, verifyWeights, isWeightsCancelled, type DownloadTarget } from "./weights";
-import { loadSettings, saveSettings, settingsWerePersisted, effectiveCaps, effectiveCtx, engineTuning, autoUiScale, type AppSettings, type Tier } from "./settings";
+import { loadSettings, saveSettings, settingsWerePersisted, effectiveCaps, effectiveCtx, engineTuning, overflowTuning, autoUiScale, modelSupportsLongContext, type AppSettings, type Tier } from "./settings";
 import { buildDiagnosticsBundle } from "./diagnostics";
 import { getAuthProvider, type Session } from "./auth";
 import SettingsPanel from "./SettingsPanel";
-import { ShareToggleButton } from "./PlatformPanel";
+import { OverflowToggleButton, ShareToggleButton } from "./PlatformPanel";
 import SparkBalancePill from "./SparkBalancePill";
 import AuthScreen from "./AuthScreen";
 import PairingPanel from "./PairingPanel";
@@ -23,7 +23,7 @@ import { identityFrom, type UserIdentity } from "./Avatar";
 import { accountPairSecret, getPairingProvider, type PairingSnapshot, type ClusterApi, type PeerNode } from "./pairing";
 import { recordProblem } from "./problems";
 import { useClusterStats, servedModelOf, type ClusterStats } from "./clusterStats";
-import { fmtGiB, pct } from "./format";
+import { floorGiB1, fmtGiB, pct } from "./format";
 import UpdateDialog, { type UpdateResult } from "./UpdateDialog";
 import { getUpdateProvider } from "./provider/update";
 import { quitApp, setAutostart, syncTray, syncWindowPrefs, windowState } from "./system";
@@ -132,54 +132,62 @@ function TopBar(props: {
   onSignOut: () => void;
 }) {
   const { t } = useI18n();
-  // "pill.serving", not "cluster.ready": in single-machine mode there is no
-  // cluster, and the pill's claim is about the service, not the topology.
+  // Same "cluster.ready" wording as the cluster page's phase label, so the two
+  // surfaces never disagree about whether the machine is ready to answer.
   const clusterKey =
-    props.cluster === "ready" ? "pill.serving" : props.cluster === "joining" ? "cluster.joining" : "cluster.standalone";
+    props.cluster === "ready" ? "cluster.ready" : props.cluster === "joining" ? "cluster.joining" : "cluster.standalone";
   return (
     <header className="topbar">
-      <div className="brand">
-        <span className="brand__mark">IdleToken</span>
-      </div>
-      <nav className="topnav" aria-label="primary">
-        {NAV.map((item) => (
-          <button
-            key={item.id}
-            className={`topnav__item${props.view === item.id ? " is-on" : ""}`}
-            aria-current={props.view === item.id ? "page" : undefined}
-            onClick={() => props.onView(item.id)}
-          >
-            <svg viewBox="0 0 24 24" className="topnav__icon" aria-hidden="true">
-              <path d={item.icon} fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round" strokeLinecap="round" />
-            </svg>
-            <span className="topnav__label">{t(`nav.${item.id}` as const)}</span>
+      <div className="topbar__layout">
+        <div className="topbar__primary">
+          <div className="brand">
+            <span className="brand__mark"><span className="brand__name">IdleToken</span></span>
+          </div>
+          <nav className="topnav" aria-label="primary">
+            {NAV.map((item) => (
+              <button
+                key={item.id}
+                className={`topnav__item${props.view === item.id ? " is-on" : ""}`}
+                aria-current={props.view === item.id ? "page" : undefined}
+                onClick={() => props.onView(item.id)}
+              >
+                <svg viewBox="0 0 24 24" className="topnav__icon" aria-hidden="true">
+                  <path d={item.icon} fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round" strokeLinecap="round" />
+                </svg>
+                <span className="topnav__label">{t(`nav.${item.id}` as const)}</span>
+              </button>
+            ))}
+          </nav>
+        </div>
+        <div className="topbar__actions">
+          {/* The two marketplace directions are independent global controls. They
+              stay together in the top-right chrome instead of being mixed into a
+              model or deployment decision. */}
+          <div className="topbar__market-actions">
+            <ShareToggleButton serviceReady={props.cluster === "ready"} onNeedLogin={props.onSignIn} />
+            <OverflowToggleButton serviceReady={props.cluster === "ready"} onNeedLogin={props.onSignIn} />
+          </div>
+          <button className={`pill pill--${props.cluster}`} onClick={props.onGoCluster} title={t("nav.cluster")}>
+            <span className="pill__dot" />
+            <span className="pill__label">{t(clusterKey)}</span>
           </button>
-        ))}
-      </nav>
-      <span className="topbar__spacer" />
-      {/* The sharing control, whole and entire (owner's call, 2026-08-21): one
-          button beside the serving pill, only while something is serving —
-          an idle machine has nothing to lend. */}
-      {props.cluster === "ready" ? <ShareToggleButton onNeedLogin={props.onSignIn} /> : null}
-      <button className={`pill pill--${props.cluster}`} onClick={props.onGoCluster} title={t("nav.cluster")}>
-        <span className="pill__dot" />
-        {t(clusterKey)}
-      </button>
-      {/* Account balance is global chrome, not cluster-page content. The
-          component hides itself when signed out and never persists its value. */}
-      <SparkBalancePill />
-      <button className="iconbtn iconbtn--lang" onClick={props.onToggleLang} aria-label={t("lang.switch")}>
-        {t("lang.switch")}
-      </button>
-      <button
-        className="iconbtn"
-        onClick={props.onToggleTheme}
-        aria-label={props.theme === "dark" ? t("theme.toLight") : t("theme.toDark")}
-        title={props.theme === "dark" ? t("theme.toLight") : t("theme.toDark")}
-      >
-        {props.theme === "dark" ? "☾" : "☀"}
-      </button>
-      <AccountMenu session={props.session} onSignIn={props.onSignIn} onSignOut={props.onSignOut} />
+          {/* Account balance is global chrome, not cluster-page content. The
+              component hides itself when signed out and never persists its value. */}
+          <SparkBalancePill />
+          <button className="iconbtn iconbtn--lang" onClick={props.onToggleLang} aria-label={t("lang.switch")}>
+            {t("lang.switch")}
+          </button>
+          <button
+            className="iconbtn"
+            onClick={props.onToggleTheme}
+            aria-label={props.theme === "dark" ? t("theme.toLight") : t("theme.toDark")}
+            title={props.theme === "dark" ? t("theme.toLight") : t("theme.toDark")}
+          >
+            {props.theme === "dark" ? "☾" : "☀"}
+          </button>
+          <AccountMenu session={props.session} onSignIn={props.onSignIn} onSignOut={props.onSignOut} />
+        </div>
+      </div>
     </header>
   );
 }
@@ -194,34 +202,31 @@ function NodeCapacityCard(props: {
   model: ModelSpec;
   quant: string; // selected precision → sizes the weight bytes in the estimate
   tier: { id: number; ctx: number };
-  nNodes: number; // known cluster size when paired; nominal estimate otherwise
+  nNodes: number; // actual roster size when paired; one real machine otherwise
   /** The paired machines, each carrying the memory IT measured (roster). More
    *  than one = the verdict is about the pool, not just this machine. */
   peers?: PeerNode[];
 }) {
   const { t } = useI18n();
   const s = props.snap;
-  // Sized against what the machine actually has FREE (total − other
-  // processes), not the engine's reserved budget (2026-08-15, user's call):
-  // this card answers "does it fit on my hardware", and quoting a number the
-  // user cannot find in any system monitor made the answer unverifiable. The
-  // engine's own scheduler still applies its reserves when it decides how to
-  // place layers — that verdict is the one that must not overpromise.
-  const selfFreeVram = Math.max(0, s.vram_total - s.vram_used_other);
-  const selfFreeRam = Math.max(0, s.ram_total - s.ram_used_other);
-  const freeMem = {
-    vram_usable: selfFreeVram,
-    ram_usable: selfFreeRam,
-    unified_memory: s.unified_memory,
-  };
+  // Availability and the UI estimate use the uncapped memory the GPU reports
+  // as free. A user-selected runtime usage cap answers a different question
+  // ("how much may IdleToken consume?") and must not make a 15.7 GiB-free card
+  // claim that only 13.1 GiB is available.
+  const freeMem = { vram_usable: s.vram_usable };
   // Paired: total what every machine reported and answer for the CLUSTER
   // (2026-08-15). Each machine measures its own memory and sends it with its
   // join, so this question was always answerable before pressing Start — until
   // now the only answer came from the coordinator refusing afterwards.
   const peers = props.peers ?? [];
-  const pool = useMemo(() => poolMemory(peers), [peers]);
+  const pool = useMemo(() => poolVram(peers), [peers]);
   const clustered = peers.length > 1;
-  const cap = estimateClusterCapacity(props.model, freeMem, props.tier.ctx, props.nNodes, props.quant);
+  // Backend matters: GLM-5.2's measured workspace is 1.50 GiB on CUDA and
+  // 33.25 GiB on Metal. Passing the machine's own OS keeps this card and the
+  // deploy buttons reading the same number.
+  const cap = estimateClusterCapacity(props.model, freeMem, props.tier.ctx,
+                                      props.nNodes, props.quant,
+                                      backendOfOs(s.os));
   // The pooled verdict reuses the same needBytes (it already accounts for the
   // node count) against the summed memory.
   const haveBytes = clustered ? pool.bytes : cap.haveBytes;
@@ -231,36 +236,21 @@ function NodeCapacityCard(props: {
   // (a total that already covers the model cannot be talked down by adding
   // more memory to it).
   const unknown = clustered && !pool.complete && short;
-  const GB = (b: number) => Math.round(b / 1024 ** 3);
-  // What the machine actually has free (total − other processes), NOT the
-  // engine's scheduling budget (2026-08-15): `vram_usable`/`ram_usable` also
-  // subtract runtime reserves (CUDA context, inference workspace), which made
-  // an idle 16 GB card read "13.2 GB" — a number that looks like a lie next to
-  // any GPU monitor. Reserves still count where they matter: the fits/doesn't
-  // verdict (estimateClusterCapacity above and the engine's scheduler) keeps
-  // using the reserved budget.
-  const vFree = fmtGiB(Math.max(0, s.vram_total - s.vram_used_other));
+  // Never round available memory upward or required memory downward: doing so
+  // can print equal-looking figures beside a real shortfall at the boundary.
+  // `floorGiB1` is shared with the hardware strip's readout so the two cannot
+  // print different numbers for the same bytes.
+  const GBHave = floorGiB1;
+  const GBNeed = (b: number) => Math.ceil((b / 1024 ** 3) * 10) / 10;
+  // ONE source for "what is left". This used to recompute
+  // `vram_total - vram_used_other` while the capacity line below read
+  // `vram_usable`; the two happen to be equal on the machines tested, but they
+  // are two expressions for one quantity and nothing kept them equal. The probe
+  // now reports remaining memory directly (NVML's own `free`), so read that.
+  const vFree = fmtGiB(s.vram_usable);
   const vTotal = fmtGiB(s.vram_total);
-  const ram = fmtGiB(Math.max(0, s.ram_total - s.ram_used_other));
-  const ramTotal = fmtGiB(s.ram_total);
   const total = props.model.totalLayers;
   const ticks = useMemo(() => Array.from({ length: total }), [total]);
-  // CPU model, same billing as the GPU's (the engine probe only counts
-  // threads; the shell reads the brand string — see cpu_name in main.rs).
-  const [cpuName, setCpuName] = useState("");
-  useEffect(() => {
-    if (!inTauri()) return;
-    let live = true;
-    void import("@tauri-apps/api/core")
-      .then(({ invoke }) => invoke<string>("cpu_name"))
-      .then((n) => {
-        if (live) setCpuName(n);
-      })
-      .catch(() => {});
-    return () => {
-      live = false;
-    };
-  }, []);
   // Hardware floor: the engine decided, the UI only renders the verdict. A
   // blocked machine must SAY SO up front — otherwise the card looks healthy and
   // the failure surfaces much later as a mock fallback or garbage tokens.
@@ -302,25 +292,6 @@ function NodeCapacityCard(props: {
             <span className="track__used" style={{ width: `${pct(s.vram_used_other, s.vram_total)}%` }} />
           </div>
         </div>
-        <div className="nstat nstat--gpu">
-          <span className="nstat__k">{t("node.cpu")}</span>
-          <span className="nstat__v">{cpuName || "—"}</span>
-          <span className="nstat__sub">{t("node.threads", { n: s.cpu_count })}</span>
-        </div>
-        {/* Same treatment as VRAM (2026-08-15), and directly under it: the two
-            memory bars stack so their scales read together. RAM is the other
-            half of what HYBRID mode can use. */}
-        <div className="nstat nstat--bar">
-          <span className="nstat__k">{t("node.ram")}</span>
-          <span className="nstat__v">
-            {ram.value}
-            <span className="unit">/ {ramTotal.value} {ramTotal.unit}</span>
-          </span>
-          <div className="track track--mini">
-            <span className="track__usable" style={{ width: `${pct(s.ram_total - s.ram_used_other, s.ram_total)}%` }} />
-            <span className="track__used" style={{ width: `${pct(s.ram_used_other, s.ram_total)}%` }} />
-          </div>
-        </div>
       </div>
 
       {/* Two facts and a bar (2026-08-15; the explanatory sentences are gone —
@@ -331,7 +302,7 @@ function NodeCapacityCard(props: {
       <div className="capacity">
         <div className="capacity__head">
           <span className={`capacity__need${short ? " capacity__gap" : ""}`}>
-            {t("capacity.ratio", { have: GB(haveBytes), need: GB(cap.needBytes) })}
+            {t("capacity.ratio", { have: GBHave(haveBytes), need: GBNeed(cap.needBytes) })}
           </span>
         </div>
         <div className="spine" role="img" aria-label={t(short ? "spine.no" : "spine.fits")}>
@@ -339,17 +310,20 @@ function NodeCapacityCard(props: {
             <span key={i} className={`tick${i < cap.hostableLayers ? " tick--on" : ""}`} />
           ))}
         </div>
-        {/* Two outcomes, one line — three once machines are pooled, because
-            "the machines that reported add up to less than the model" is a
-            different claim from "this machine cannot hold it". The bar is the
-            only thing on this card a glance can read, and unlabelled it is
-            decoration; the earlier paragraphs said more than the moment needs. */}
+        {/* The bar is the only thing on this card a glance can read, and
+            unlabelled it is decoration — so one short line names the outcome.
+            The shortfall side no longer distinguishes one machine from a pool
+            (2026-09-01): the head line above already quotes have/need for the
+            selected context, and the caveats it used to carry (estimate vs
+            runtime admission) said more than the moment needs. */}
         <p className={`capacity__verdict${short ? " capacity__verdict--no" : ""}`}>
           {unknown
             ? t("spine.unknown")
-            : clustered
-              ? t(short ? "spine.clusterNo" : "spine.clusterFits", { n: peers.length })
-              : t(short ? "spine.no" : "spine.fits")}
+            : short
+              ? t("spine.no")
+              : clustered
+                ? t("spine.clusterFits", { n: peers.length })
+                : t("spine.fits")}
         </p>
       </div>
     </section>
@@ -484,6 +458,30 @@ function ActivityRow(props: { stats: ClusterStats | null }) {
           {t("stats.cache")} <b>{stats.cached_tokens!.toLocaleString()}</b> tok
         </span>
       ) : null}
+      {/* The granted window + KV dtype, straight from the engine: context and
+          KV precision are automatic (ctx-kv-simplification), so this readback
+          is where the user sees what the machine decided. KV shown only when
+          quantized — "f16" is the wordless default. */}
+      {(stats.ctx_size ?? 0) > 0 ? (
+        <span className="activity__item" title={t("stats.ctxTitle")}>
+          {t("stats.ctx")}{" "}
+          <b>
+            {stats.ctx_size! >= 1048576
+              ? `${Math.round(stats.ctx_size! / 1048576)}M`
+              : `${Math.round(stats.ctx_size! / 1024)}K`}
+          </b>
+          {(() => {
+            // Disclose BOTH halves when an explicit measurement override makes
+            // them differ. Automatic tiers keep K/V uniform, but the readback
+            // must still describe what actually runs rather than assume that.
+            const k = stats.kv_cache_k;
+            const v = stats.kv_cache_v || k;
+            const quantized = (x?: string) => !!x && x !== "f16" && x !== "bf16";
+            if (!quantized(k) && !quantized(v)) return "";
+            return k === v ? ` · KV ${k}` : ` · KV ${k}/${v}`;
+          })()}
+        </span>
+      ) : null}
       <span className="activity__item">
         {t("stats.uptime")} <b>{uptimeLabel}</b>
       </span>
@@ -501,42 +499,48 @@ function ActivityRow(props: { stats: ClusterStats | null }) {
 // with the pairing panel as the management surface.
 function ClusterCard(props: {
   pair: PairingSnapshot | null;
-  // Does the selected model+precision fit THIS machine alone? The local row
-  // stays on screen either way and says why it's unavailable — "the option is
-  // missing" and "the option is unavailable to you, here's why" look identical
-  // to a user, and only one of them is true.
-  //
-  // Deliberately no byte figure here: NodeCapacityCard sits beside this card
-  // quoting the shortfall for an N-machine cluster (≈61 GB), while this row's
-  // question is N=1 (≈54.5 GiB). Both are right, they answer different
-  // questions, and two nearly-equal numbers side by side just read as a bug.
-  // The card owns the quantities; this row owns the choice.
+  /** Does the selected model+precision fit THIS machine alone, by the MEASURED
+   *  budget? Drives which deployment gets the primary button — nothing else.
+   *  Both entries stay on screen and both stay clickable either way; only the
+   *  visual weight follows the fact.
+   *
+   *  This was pinned to "cluster" from 2026-09-01 to 2026-09-02, because the
+   *  local-fit verdict was then a closed-form ESTIMATE that measured 8.2x low
+   *  on GLM-5.2 — not something to steer a user with. The need side is measured
+   *  now (results/memory-need-measured-20260901.md), so the verdict is worth
+   *  following. Undefined = unknown = leave cluster primary. */
   fitsStandalone?: boolean;
+  // A hardware/backend fact, not a capacity estimate. Unsupported compute
+  // hardware remains a hard gate; an estimated memory shortfall does not.
+  canServeStandalone?: boolean;
   onServeStandalone?: () => void;
-  // "Run it here" downloads the weights first when they are missing — 4.7 GB
-  // for an 8B, 80 GB for DSv4. Without this the button looked broken: it really
-  // had started a multi-GB download, and the only place that said so was a
-  // different page. Whatever a button sets in motion has to report back next to
-  // that button.
+  // Weight presence and download state belong to the selected model, above the
+  // two deployment choices. Rendering this inside each choice made one transfer
+  // look like two independent jobs.
   weights?: WeightsInfo;
   onCreate: () => void;
+  onNeedLogin: () => void;
   onManage: () => void;
+  onLeave: () => Promise<void>;
   // The LOCAL setting, used only to detect disagreement with what the cluster
   // reports it is serving. Never used as the displayed value.
   settingModelId: string;
   settingModelLabel: string;
   settingQuant: string;
-  onOpenModelSetting: () => void;
-  // Save a pick and rebuild whatever is running around it (App.switchModel).
+  longContext: boolean;
+  longContextAvailable: boolean;
+  onLongContextChange: (enabled: boolean) => void;
+  // Save a pick before any cluster is running.
   onSwitchModel: (modelId: string, quant: string) => void;
 }) {
   const { t, tErr } = useI18n();
   const [copiedApi, setCopiedApi] = useState(false);
   const [copiedCode, setCopiedCode] = useState(false);
   const [pickOpen, setPickOpen] = useState(false);
-  // A refused start ("need at least 2 machines", …) used to be an unhandled
-  // rejection: the button did nothing on screen. Rendered under the button.
-  const [startErr, setStartErr] = useState<string | null>(null);
+  // Start/leave failures used to be unhandled rejections: the button did
+  // nothing on screen. One operation strip keeps both actions honest.
+  const [opErr, setOpErr] = useState<string | null>(null);
+  const [leaving, setLeaving] = useState(false);
   const snap = props.pair;
   // Before the early return below: hooks cannot be conditional.
   const stats = useClusterStats(snap?.api ?? null, snap?.source ?? "engine", {
@@ -550,15 +554,23 @@ function ClusterCard(props: {
   // Reported by the coordinator. Absent on an older engine -> show nothing;
   // substituting the local setting would answer a different question.
   const served = servedModelOf(stats);
+  // `phase=ready` is stronger and fresher than a previously polled stats
+  // snapshot: the native pairing layer only publishes it after
+  // /cluster/status itself reports engine_state=ready. A stats request can be
+  // delayed behind a long generation (the coordinator deliberately serves a
+  // bounded number of requests), so retaining its earlier "starting" value
+  // here used to leave a loading warning on a cluster that was already
+  // answering chat. Never let the weaker observation contradict the stronger
+  // one.
+  const engineState = snap?.phase === "ready" ? "ready" : stats?.engine_state;
   const anyError = active && snap.peers.some((p) => p.stage === "error");
-  const fits = !!props.fitsStandalone;
-  // The selected model decides whether "across several machines" is even a
-  // path. Offering it for a single-node model would walk the user through
-  // pairing, downloading and starting, only for the coordinator to refuse the
-  // second worker — so the option stays visible (it explains itself) but its
-  // buttons do not.
-  const clusterable = !isSingleNode(props.settingModelId);
-
+  const canServe = props.canServeStandalone !== false;
+  // Single machine leads when it can actually hold the model: it is faster (no
+  // RPC hop), simpler, and strictly better for privacy since nothing leaves the
+  // machine. Hard constraint #1 says single-machine users are the majority and
+  // should not pay the clustering tax; making them press the secondary button
+  // to get the simpler path was exactly that tax.
+  const localLeads = props.fitsStandalone === true && canServe;
   if (!active) {
     return (
       // No pitch here (2026-08-10): whoever is looking at this screen already
@@ -578,6 +590,23 @@ function ClusterCard(props: {
           <span className="cluster-model__label">{t("model.selected")}</span>
           <span className="cluster-model__name">{props.settingModelLabel}</span>
           {props.settingQuant ? <span className="cluster-model__quant">{props.settingQuant}</span> : null}
+          {/* Both knobs that define what will be served — the window and the
+              model — sit together at the right end of the row. The checkbox was
+              on its own bordered line below, which read as a third setting
+              unrelated to the model above it. The disabled reason moves to the
+              tooltip so this stays one line. */}
+          <label
+            className={`cluster-model__longctx${props.longContextAvailable ? "" : " is-disabled"}`}
+            title={props.longContextAvailable ? undefined : t("model.longContextUnavailable")}
+          >
+            <input
+              type="checkbox"
+              checked={props.longContext}
+              disabled={!props.longContextAvailable}
+              onChange={(e) => props.onLongContextChange(e.target.checked)}
+            />
+            <span>{t("model.longContext")}</span>
+          </label>
           {/* Nothing is running yet, so this pick is free: it writes the
               setting and the two options below re-read it. */}
           <button className="linkbtn cluster-model__change" onClick={() => setPickOpen((v) => !v)}>
@@ -588,10 +617,15 @@ function ClusterCard(props: {
               modelId={props.settingModelId}
               quant={props.settingQuant}
               running={null}
-              apiBaseUrl={snap?.api?.status === "online" ? snap.api.baseUrl : null}
               onPick={props.onSwitchModel}
               onClose={() => setPickOpen(false)}
             />
+          ) : null}
+          {/* Downloading is a property of the selected model+precision, not of
+              either deployment path. Keep one control and one progress bar
+              here so local and cluster never narrate the same transfer twice. */}
+          {props.weights && (props.weights.needs || props.weights.dl) ? (
+            <WeightsRow w={props.weights} idle="show" />
           ) : null}
         </div>
 
@@ -605,36 +639,21 @@ function ClusterCard(props: {
             <h3 className="deploy-opt__title">{t("deploy.local")}</h3>
           </div>
           <button
-            className={fits ? "btn-primary" : "btn-secondary"}
-            // Serving needs the weights already here: downloading belongs to
-            // Settings (2026-08-15 split), so the button waits rather than
-            // fetching gigabytes as a side effect.
-            disabled={!fits || !!props.weights?.dl || !!props.weights?.needs}
+            className={localLeads ? "btn-primary" : "btn-secondary"}
+            // Serving needs the weights already here. The selected-model row
+            // above owns downloading, so this button waits rather than
+            // duplicating that action or its progress. Capacity is deliberately
+            // NOT a client-side disable condition: the coordinator performs the
+            // authoritative GPU admission for the exact selected context.
+            disabled={!canServe || !!props.weights?.dl || !!props.weights?.needs}
             onClick={props.onServeStandalone}
           >
-            {props.weights?.dl ? t("weights.downloading") : t("cluster.serveLocal")}
+            {t("cluster.serveLocal")}
           </button>
-          {/* A download already running (started from Settings) shows its
-              progress here; weights simply not present point at the place
-              that downloads them. */}
-          {props.weights?.dl ? (
-            <WeightsRow w={props.weights} idle="hide" />
-          ) : props.weights?.needs ? (
-            <span className="wrow">
-              <span className="wrow__msg">{t("weights.needed")}</span>
-              <button className="linkbtn" onClick={props.onOpenModelSetting}>
-                {t("weights.goSettings")}
-              </button>
-            </span>
-          ) : !fits ? (
-            // A-P1-3: the button is grey and the weights ARE here, so the only
-            // remaining reason is that the model does not fit on this machine —
-            // which used to be said nowhere on this card. A disabled control
-            // with no reason beside it reads as a broken app.
-            <span className="wrow">
-              <span className="wrow__msg">{t("deploy.local.tooBig")}</span>
-            </span>
-          ) : null}
+          {/* No shortfall sentence here (2026-09-01): the capacity card beside
+              this one already says whether the VRAM is short, and runtime
+              admission is the authoritative answer either way. Repeating it
+              under the button only made the choice look forbidden. */}
         </div>
 
         <div className="deploy-opt">
@@ -646,20 +665,17 @@ function ClusterCard(props: {
                 already offers joining with a code — a second button for the
                 same dialog's other tab was noise (removed 2026-08-15). */}
             <button
-              className={fits || !clusterable ? "btn-secondary" : "btn-primary"}
-              disabled={!clusterable}
+              className={localLeads ? "btn-secondary" : "btn-primary"}
               onClick={props.onCreate}
             >
               {t("cluster.create")}
             </button>
           </div>
-          {/* The "this model runs on one machine, so there is no join code"
-              sentence was here (A-P1-3, next to the button it explains) until
-              2026-08-21. Removed on the user's call. The button is still
-              disabled for a single-node model — what is gone is the sentence
-              saying why, so a user who cannot click "Create a cluster" now has
-              to work that out from the model they picked. `pairing.singleNodeModel`
-              is still rendered inside the pairing panel. */}
+          {/* Still no "recommended" badge and no explanatory copy: the emphasis
+              swap is the whole signal. Both paths remain one click away, and
+              the coordinator's runtime admission is still the authority — this
+              only stops the UI from pointing at the slower path when the
+              measured budget says the simpler one works. */}
         </div>
 
         {/* The capability table (A-P1-3) was here until 2026-08-21 (Settings →
@@ -705,9 +721,25 @@ function ClusterCard(props: {
           {t(phaseKey)}
         </span>
         <span className="cluster-head__count">{t("cluster.machines", { n: snap.peers.length })}</span>
-        <button className="linkbtn cluster-head__manage" onClick={props.onManage}>
-          {t("cluster.manage")}
-        </button>
+        {snap.peers.length === 1 ? (
+          <button
+            className="linkbtn cluster-head__manage"
+            disabled={leaving}
+            onClick={() => {
+              setOpErr(null);
+              setLeaving(true);
+              void props.onLeave()
+                .catch((e) => setOpErr(tErr(String(e))))
+                .finally(() => setLeaving(false));
+            }}
+          >
+            {t("pairing.leave")}
+          </button>
+        ) : (
+          <button className="linkbtn cluster-head__manage" onClick={props.onManage}>
+            {t("cluster.manage")}
+          </button>
+        )}
       </div>
 
       {snap.phase === "idle" && snap.code ? (
@@ -727,38 +759,31 @@ function ClusterCard(props: {
         <div className="cluster-model">
           <span className="cluster-model__label">{t("cluster.serving")}</span>
           <span className="cluster-model__name">{served.label}</span>
-          {served.quant ? <span className="cluster-model__quant">{served.quant}</span> : null}
-          {/* Switching from here is a cluster operation — it stops what is
-              running and builds it again — so the row is still read-only until
-              you ask, and the picker spells out the cost before it acts. */}
-          <button className="linkbtn cluster-model__change" onClick={() => setPickOpen((v) => !v)}>
-            {t("model.change")}
-          </button>
-          {pickOpen ? (
-            <ModelPicker
-              modelId={props.settingModelId}
-              quant={props.settingQuant}
-              running={{ modelId: served.id, quant: served.quant, machines: snap.peers.length }}
-              apiBaseUrl={snap.api?.status === "online" ? snap.api.baseUrl : null}
-              onPick={props.onSwitchModel}
-              onClose={() => setPickOpen(false)}
-            />
+          {/* Engine-reported precision first; when it is blank (older
+              coordinator, or a file name outside the variant table) fall back
+              to the precision THIS client launched with — first-hand
+              knowledge, but only while the served id matches the setting. */}
+          {(served.quant || (served.id === props.settingModelId ? props.settingQuant : "")) ? (
+            <span className="cluster-model__quant">{served.quant || props.settingQuant}</span>
           ) : null}
+          {/* Running deployments are read-only. Changing model requires an
+              explicit cluster exit followed by a fresh start, so no restart
+              shortcut is offered here. */}
         </div>
       ) : null}
       {/* Inference-engine health (v2, llamacpp mode): mirrored from the
           coordinator's /health via stats. Chat answers 503 until "ready", so a
           quiet panel over a 503ing API would be a lie; absent on the legacy
           path, where per-peer stages carry the same news. */}
-      {stats?.engine_state && stats.engine_state !== "ready" ? (
+      {engineState && engineState !== "ready" ? (
         <p
           className={`cluster-hint ${
-            stats.engine_state === "failed" ? "cluster-hint--bad" : "cluster-hint--warn"
+            engineState === "failed" ? "cluster-hint--bad" : "cluster-hint--warn"
           }`}
         >
-          {t(`cluster.engine.${stats.engine_state}` as const)}
-          {(stats.engine_restarts ?? 0) > 0
-            ? ` · ${t("cluster.engine.restarts", { n: stats.engine_restarts! })}`
+          {t(`cluster.engine.${engineState}` as const)}
+          {(stats?.engine_restarts ?? 0) > 0
+            ? ` · ${t("cluster.engine.restarts", { n: stats?.engine_restarts ?? 0 })}`
             : ""}
         </p>
       ) : null}
@@ -781,11 +806,21 @@ function ClusterCard(props: {
             <span className="cpeer__meta">
               {p.layerLo !== undefined && p.layerHi !== undefined
                 ? t("pairing.layers", { lo: p.layerLo, hi: p.layerHi - 1 })
-                : t(`pairing.stage.${p.stage}` as const)}
+                : p.modelReady === false
+                  ? t("pairing.model.preparing")
+                  : t(`pairing.stage.${p.stage}` as const)}
             </span>
           </div>
         ))}
       </div>
+
+      {/* On a joining machine, preparing the creator-selected full GGUF is an
+          automatic background step, but it is not invisible. The same row
+          shows progress, a concrete failure, and a retry; once complete the
+          native roster publishes modelReady and the creator unlocks Start. */}
+      {snap.phase === "idle" && snap.peers.some((p) => p.self && p.modelReady === false) && props.weights ? (
+        <WeightsRow w={props.weights} idle={props.weights.needs ? "show" : "hide"} />
+      ) : null}
 
       {/* Joiner side: the CREATOR stopped answering. Every row is grayed by
           the same event, so the member-offline hint below would only repeat
@@ -806,20 +841,28 @@ function ClusterCard(props: {
 
       {snap.phase === "loading" ? <p className="cluster-hint">{t("cluster.loadingHint")}</p> : null}
 
-      {snap.canStart ? (
-        <button
-          className="btn-primary btn-block cluster-start"
-          onClick={() => {
-            setStartErr(null);
-            getPairingProvider()
-              .start()
-              .catch((e) => setStartErr(tErr(String(e))));
-          }}
-        >
-          {t("pairing.startCluster", { n: snap.peers.length })} →
-        </button>
+      {snap.phase === "idle" && snap.peers.some((p) => p.modelReady === false) ? (
+        <p className="cluster-hint">{t("pairing.model.waiting")}</p>
       ) : null}
-      {startErr ? <p className="cluster-hint cluster-hint--bad">{startErr}</p> : null}
+
+      {snap.canStart ? (
+        <div className="cluster-start-actions">
+          <button
+            className="btn-primary btn-block cluster-start"
+            onClick={() => {
+              setOpErr(null);
+              getPairingProvider()
+                // The roster may have been created before the adjacent switch
+                // changed. Refresh only overflow at the moment of launch.
+                .start(false, props.weights?.path, overflowTuning(loadSettings()))
+                .catch((e) => setOpErr(tErr(String(e))));
+            }}
+          >
+            {t("pairing.startCluster", { n: snap.peers.length })} →
+          </button>
+        </div>
+      ) : null}
+      {opErr ? <p className="cluster-hint cluster-hint--bad">{opErr}</p> : null}
 
       {snap.api ? (
         <div className="cluster-api">
@@ -951,6 +994,13 @@ function LocalEngineCard(props: {
         {/* The engine's own id once it has read the GGUF header; the picked
             file name until then. */}
         <span className="cluster-model__name">{stats?.model_label || stats?.model || props.label}</span>
+        {/* Same precision rule as the cluster card's serving row: engine-
+            reported first, launch setting as the fallback only when the ids
+            agree — this card can serve an arbitrary local GGUF, where the
+            setting's precision would be a guess about someone else's file. */}
+        {(stats?.quant || (stats?.model === props.settingModelId ? props.settingQuant : "")) ? (
+          <span className="cluster-model__quant">{stats?.quant || props.settingQuant}</span>
+        ) : null}
         <button className="linkbtn cluster-model__change" onClick={() => setPickOpen((v) => !v)}>
           {t("model.change")}
         </button>
@@ -959,7 +1009,6 @@ function LocalEngineCard(props: {
             modelId={props.settingModelId}
             quant={props.settingQuant}
             running={{ modelId: props.settingModelId, quant: "", machines: 1 }}
-            apiBaseUrl={props.api?.status === "online" ? props.api.baseUrl : null}
             onPick={props.onSwitchModel}
             onClose={() => setPickOpen(false)}
           />
@@ -1035,6 +1084,8 @@ function Dashboard(props: {
   model: ModelSpec;
   quant: string;
   tier: { id: number; ctx: number };
+  longContext: boolean;
+  onLongContextChange: (enabled: boolean) => void;
   pair: PairingSnapshot | null;
   /** Local llama.cpp engine (open-GGUF serving) — replaces the cluster card
    *  while it runs; this machine IS the whole deployment. */
@@ -1045,22 +1096,29 @@ function Dashboard(props: {
   onStopLocal: () => void;
   onServeStandalone: () => void;
   onCreateCluster: () => void;
+  onNeedLogin: () => void;
   onJoinCluster: () => void;
   onManageCluster: () => void;
+  onLeaveCluster: () => Promise<void>;
   /** Jump to the full model section in Settings (the cluster card's picker
    *  covers the common case; Settings still owns weights paths and the rest). */
-  onOpenModelSetting: () => void;
   onSwitchModel: (modelId: string, quant: string) => void;
   weights?: WeightsInfo;
 }) {
   const { t, tErr } = useI18n();
   const s = props.snap;
-  const nNodes = props.pair && props.pair.peers.length > 0 ? props.pair.peers.length : 3;
-  // Single-node-first: does the selected model+precision fit THIS machine alone
-  // (N=1)? If so the empty-state leads with "serve locally" instead of pairing.
-  // The shortfall goes down with it — the local row reports how far off it is
-  // rather than just going quiet.
-  const standalone = estimateClusterCapacity(props.model, s, props.tier.ctx, 1, props.quant);
+  // No hypothetical cluster: before pairing this card compares this machine
+  // with a one-node requirement. Once paired, use the real roster count. The
+  // old fallback of three added two imaginary engine-overhead allocations and
+  // made a 256K estimate look larger without any machines to justify it.
+  const nNodes = props.pair && props.pair.peers.length > 0 ? props.pair.peers.length : 1;
+  // Does the model fit THIS machine alone (N=1)? Only the primary-button
+  // emphasis reads it; both deployment entries stay clickable regardless, and
+  // the coordinator still performs the authoritative admission. Same function,
+  // same backend and same measured workspace the capacity card renders, so the
+  // card cannot say "fits" while the buttons point the other way.
+  const standalone = estimateClusterCapacity(props.model, s, props.tier.ctx, 1,
+                                             props.quant, backendOfOs(s.os));
   // The generic refusal surface (D2): whatever sentence the engine sent
   // through the JOIN_REFUSED / exit-3 channel, verbatim, where the user is
   // looking. WS-C's "upgrade machine X" (version mismatch) arrives through
@@ -1094,14 +1152,19 @@ function Dashboard(props: {
           <ClusterCard
             pair={props.pair}
             fitsStandalone={standalone.gapBytes === 0}
+            canServeStandalone={(s.hw_status ?? HW_OK) === HW_OK}
             onServeStandalone={props.onServeStandalone}
             weights={props.weights}
             onCreate={props.onCreateCluster}
+            onNeedLogin={props.onNeedLogin}
             onManage={props.onManageCluster}
+            onLeave={props.onLeaveCluster}
             settingModelId={props.model.id}
             settingModelLabel={props.model.label}
             settingQuant={props.quant}
-            onOpenModelSetting={props.onOpenModelSetting}
+            longContext={props.longContext}
+            longContextAvailable={modelSupportsLongContext(props.model.id)}
+            onLongContextChange={props.onLongContextChange}
             onSwitchModel={props.onSwitchModel}
           />
           )}
@@ -1142,14 +1205,9 @@ export default function App() {
   // machines behind it are supporting detail. Before there is a cluster the
   // chat view is a one-click ramp into Cluster, so first run still lands right.
   const [view, setView] = usePersisted<View>("idletoken.view", "chat");
-  // Deep link into a settings category ("share this cluster →" must land ON
-  // the sharing page, not on whatever category was open last). null = keep
-  // whatever the panel had; consumed by SettingsPanel on mount.
-  const [settingsCategory, setSettingsCategory] = useState<string | null>(null);
-  const openSettings = (category: string) => {
-    setSettingsCategory(category);
-    setView("settings");
-  };
+  // (The settings deep-link state left with its last caller, 2026-08-26 —
+  // the "download in Settings" hand-off is gone; SettingsPanel still accepts
+  // initialCategory for any future deep link.)
   const [session, setSession] = useState<Session | null>(() => getAuthProvider().currentSession());
   // The signed-in person's public identity (display name + avatar colour), so
   // the chat can show the user as the account they configured on the platform
@@ -1215,7 +1273,7 @@ export default function App() {
     };
   }, []);
 
-  // The sharing switch is a STANDING choice: turned on once, it holds across
+  // The provider switch is a STANDING choice: turned on once, it holds across
   // launches. Until 0.1.10 nothing restarted the agent after a client restart,
   // so the panel showed "on" over a machine that had quietly stopped earning.
   // Errors go to the console only: the resume has no owner watching it, and
@@ -1257,10 +1315,6 @@ export default function App() {
    * was (without the weights), and the next attempt resumes from the .part.
    */
   const [dlErrors, setDlErrors] = useState<Record<string, string>>({});
-  /** Bumped when any download reaches a final state (or weights are deleted),
-   *  so every row re-probes what is actually on disk. */
-  const [weightsVersion, setWeightsVersion] = useState(0);
-
   const refreshWeights = useCallback(async () => {
     try {
       const r = await resolveLocalWeights({
@@ -1294,11 +1348,16 @@ export default function App() {
   /** Files with a fetch currently in flight — the double-click guard readable
    *  from callbacks (state would be stale there). */
   const activeFetches = useRef<Set<string>>(new Set());
+  // Every caller awaiting the same file shares one promise. A joiner's
+  // automatic cluster preparation can begin while the user-visible download
+  // row is already fetching that file; returning false to the second caller
+  // used to make it report a failure even though the transfer was healthy.
+  const fetchTasks = useRef<Map<string, Promise<boolean>>>(new Map());
 
-  /** Everything on disk may have changed: re-probe the selected model and tell
-   *  every Settings row to re-probe too. */
+  /** Everything on disk may have changed: re-probe the selected model.
+   *  (The per-row Settings re-probe went with the download manager,
+   *  2026-08-26 — the cluster card is the one weights surface now.) */
   const bumpWeights = useCallback(() => {
-    setWeightsVersion((v) => v + 1);
     void refreshWeights();
   }, [refreshWeights]);
 
@@ -1309,41 +1368,48 @@ export default function App() {
    * so callers do not each invent their own reporting.
    */
   const startDownload = useCallback(
-    async (file: string, target: DownloadTarget): Promise<boolean> => {
-      if (!file || activeFetches.current.has(file)) return false;
-      activeFetches.current.add(file);
-      const dir = settings.modelDir || (await defaultModelDir());
-      setDlErrors((m) => {
-        if (!(file in m)) return m;
-        const n = { ...m };
-        delete n[file];
-        return n;
-      });
-      setDls((m) => ({ ...m, [file]: { have: 0, total: target.expectBytes } }));
-      try {
-        await fetchWeights({ id: file, target, destDir: dir });
-        return true;
-      } catch (e) {
-        if (!isWeightsCancelled(e)) {
-          const msg = String(e);
-          setDlErrors((m) => ({ ...m, [file]: msg }));
-          recordProblem({
-            at: new Date().toISOString(),
-            kind: "download",
-            message: msg,
-            detail: { file },
-          });
-        }
-        return false;
-      } finally {
-        activeFetches.current.delete(file);
-        setDls((m) => {
+    (file: string, target: DownloadTarget): Promise<boolean> => {
+      if (!file) return Promise.resolve(false);
+      const existing = fetchTasks.current.get(file);
+      if (existing) return existing;
+      const task = (async () => {
+        activeFetches.current.add(file);
+        const dir = settings.modelDir || (await defaultModelDir());
+        setDlErrors((m) => {
+          if (!(file in m)) return m;
           const n = { ...m };
           delete n[file];
           return n;
         });
-        bumpWeights();
-      }
+        setDls((m) => ({ ...m, [file]: { have: 0, total: target.expectBytes } }));
+        try {
+          await fetchWeights({ id: file, target, destDir: dir });
+          return true;
+        } catch (e) {
+          if (!isWeightsCancelled(e)) {
+            const msg = String(e);
+            setDlErrors((m) => ({ ...m, [file]: msg }));
+            recordProblem({
+              at: new Date().toISOString(),
+              kind: "download",
+              message: msg,
+              detail: { file },
+            });
+          }
+          return false;
+        } finally {
+          activeFetches.current.delete(file);
+          fetchTasks.current.delete(file);
+          setDls((m) => {
+            const n = { ...m };
+            delete n[file];
+            return n;
+          });
+          bumpWeights();
+        }
+      })();
+      fetchTasks.current.set(file, task);
+      return task;
     },
     [settings.modelDir, bumpWeights]
   );
@@ -1450,35 +1516,37 @@ export default function App() {
   // ever reach the probe.
   const caps = useMemo(
     () => effectiveCaps(settings, totals),
-    [settings.resourcePreset, settings.maxVramMb, settings.maxRamMb, totals]
+    [settings.resourcePreset, settings.maxVramMb, totals]
   );
-  // The machine's memory shape, for resolving the KV-cache "auto" dtype at
-  // launch (engineTuning's third argument). Absent before the first probe, in
-  // which case "auto" degrades to the engine's own default (f16), never a guess.
-  const mem = snap
-    ? { vramBytes: snap.vram_total, ramBytes: snap.ram_total, unified: snap.unified_memory }
-    : undefined;
+  // (The memory-shape argument engineTuning used for resolving the KV "auto"
+  // dtype left with the KV selector, 2026-08-25: the coordinator decides the
+  // dtype where the memory plan is made — see ctx-kv-simplification.)
 
-  /**
-   * The weights the cluster flows are allowed to use — resolve, never fetch.
-   *
-   * Downloading belongs to Settings (the download manager) since the
-   * 2026-08-15 split: the cluster starts and switches models, and when the
-   * weights are not here yet it says so and points at Settings, instead of
-   * kicking off a multi-gigabyte download as a side effect of a start button.
-   *
-   * `over` overrides the model/precision for THIS call. switchModel needs it:
-   * it saves the new selection and immediately acts on it, and `settings` in
-   * this closure is still the old value until React re-renders.
-   */
-  const ensureWeights = useCallback(async (over?: { modelId: string; quant: string }): Promise<string> => {
+  /** Resolve and integrity-check one exact curated model. Joining a cluster
+   * may additionally fetch it: the creator chose the identity, so the joiner
+   * prepares that same full GGUF automatically before it can report ready. */
+  const prepareWeights = useCallback(async (
+    over?: { modelId: string; quant: string },
+    fetchMissing = false,
+  ): Promise<string> => {
     const modelId = over?.modelId ?? settings.modelId;
     const quant = over?.quant ?? settings.quant;
-    const r = await resolveLocalWeights({
+    const manifest = getManifest(modelId);
+    let r = await resolveLocalWeights({
       modelDir: settings.modelDir,
-      manifest: getManifest(modelId),
+      manifest,
       quant,
     });
+    if ((r.needsDownload || !r.path) && fetchMissing) {
+      const target = r.target ?? resolveDownload(manifest, quant);
+      if (!target || !(await startDownload(target.file, target))) {
+        throw new Error(`[WEIGHTS_NOT_DOWNLOADED] ${modelId}${quant ? ` ${quant}` : ""}`);
+      }
+      // The download command verifies every part before returning. Resolve
+      // again instead of manufacturing a path so split GGUF completeness and
+      // the marker files remain one source of truth.
+      r = await resolveLocalWeights({ modelDir: settings.modelDir, manifest, quant });
+    }
     if (r.needsDownload || !r.path) {
       // "[CODE] detail" — localized by tErr (ERROR_KEYS in i18n.ts).
       throw new Error(`[WEIGHTS_NOT_DOWNLOADED] ${modelId}${quant ? ` ${quant}` : ""}`);
@@ -1506,7 +1574,52 @@ export default function App() {
       }
     }
     return r.path;
-  }, [settings.modelDir, settings.modelId, settings.quant, bumpWeights]);
+  }, [settings.modelDir, settings.modelId, settings.quant, bumpWeights, startDownload]);
+
+  /** Creator/standalone preflight: creation never starts a surprise transfer.
+   * The cluster card owns the explicit download control and progress. */
+  const ensureWeights = useCallback(
+    (over?: { modelId: string; quant: string }) => prepareWeights(over, false),
+    [prepareWeights]
+  );
+
+  /** Joiner preparation: exact creator-selected model, automatic download. */
+  const ensureClusterWeights = useCallback(
+    (over: { modelId: string; quant: string }) => prepareWeights(over, true),
+    [prepareWeights]
+  );
+
+  /**
+   * Fetch the exact model a cluster demanded when it refused this machine, and
+   * hand back everything the retrying join needs to describe itself.
+   *
+   * This replaces the effect that used to do the same work AFTER joining
+   * (removed 2026-09-01, when admission started requiring the weights). That
+   * effect can no longer fire — a machine without the weights never reaches the
+   * roster, so `peers.find(p => p.self).modelReady` is true for every member
+   * there is — and leaving it in would be a dormant path that starts a
+   * multi-gigabyte transfer nobody asked for if a member ever appeared unready
+   * again.
+   *
+   * The cluster's identity overwrites this machine's own selection: the two
+   * disagreeing is precisely what earned the refusal, and the settings have to
+   * be saved before the join so every other surface names the same model.
+   *
+   * `tuning` is built from `next`, not from React state, because the join goes
+   * out in the same turn: state has not committed, and a stale tuning would
+   * send the OLD model id and earn a second refusal for the model we just
+   * finished downloading.
+   */
+  const prepareClusterModel = useCallback(
+    async (modelId: string, quant: string) => {
+      const next = { ...loadSettings(), modelId, quant };
+      setSettings(next);
+      saveSettings(next);
+      const modelPath = await ensureClusterWeights({ modelId, quant });
+      return { modelPath, tuning: engineTuning(next, caps) };
+    },
+    [ensureClusterWeights, caps]
+  );
 
   const stopLocalEngine = useCallback(async () => {
     try {
@@ -1538,14 +1651,9 @@ export default function App() {
     return chained;
   }, []);
 
-  // One object, two renderers: the model row in Settings → Quick, and the
-  // "run on this machine" row on Cluster. Both start the same download, so
-  // both must show the same progress — building it once is what keeps them
-  // from drifting into two half-truths.
-  // The SELECTED model's weight situation, for the cluster surfaces. Since the
-  // 2026-08-15 split those surfaces only DISPLAY it (progress if a download is
-  // running, "not here yet" otherwise) — the download button lives in Settings,
-  // so onDownload sends the user there rather than starting anything.
+  // The selected model's one weight state. The Cluster page renders it once,
+  // directly under the model choice; deployment buttons consume readiness but
+  // do not each grow their own copy of the download control.
   const weightsInfo = useMemo<WeightsInfo>(
     () => ({
       needs: needsWeights,
@@ -1553,10 +1661,13 @@ export default function App() {
       dl: dls[selFile] ?? null,
       partialBytes,
       lastError: dlErrors[selFile] ?? null,
-      onDownload: () => openSettings("quick"),
+      onDownload: () => {
+        const target = resolveDownload(getManifest(settings.modelId), settings.quant);
+        if (target) void startDownload(target.file, target);
+      },
       onCancel: () => cancelDownloadFor(selFile),
     }),
-    [needsWeights, weightsPath, dls, dlErrors, selFile, partialBytes, cancelDownloadFor, openSettings]
+    [needsWeights, weightsPath, dls, dlErrors, selFile, partialBytes, cancelDownloadFor, startDownload, settings.modelId, settings.quant]
   );
 
   /**
@@ -1584,9 +1695,9 @@ export default function App() {
     try {
       const path = await ensureWeights(over);
       // Tuning comes from STORAGE, not from the `settings` React state: the
-      // sharing card saves through saveSettings() without going through this
+      // The top-right Request help button saves through saveSettings() without going through this
       // component's state, so the state can be minutes stale by the time the
-      // engine starts. Read at spawn time, or "turn sharing on, then start
+      // engine starts. Read at spawn time, or "turn Request help on, then start
       // the cluster" launches a coordinator with no overflow flags — seen
       // live on a Windows compute node (2026-08-21): the panel promised the borrow settings
       // would apply on the next engine start, and the next start ignored them.
@@ -1594,12 +1705,12 @@ export default function App() {
         hostname: snap.hostname,
         gpu: snap.gpu_name,
         modelPath: path,
-        tuning: engineTuning(over ? { ...loadSettings(), ...over } : loadSettings(), caps, mem),
+        tuning: engineTuning(over ? { ...loadSettings(), ...over } : loadSettings(), caps),
       });
       // allowSolo: this IS the one-machine flow. Without it the engine's
       // 2-machine pairing floor rejects the start and the button dies after
       // downloading the weights.
-      await getPairingProvider().start(true);
+      await getPairingProvider().start(true, path, overflowTuning(loadSettings()));
       return true;
     } catch (e) {
       // Cancelling the weights download cancels serving too — that is the same
@@ -1610,78 +1721,33 @@ export default function App() {
     }
   }, [snap, ensureWeights, settings, caps, reportWeightsError]);
 
-  /**
-   * Switch the model from wherever it is displayed (chat header, cluster card).
-   *
-   * The engine has no hot swap — a model is fixed when the coordinator loads it
-   * — so this is "save the choice, and rebuild whatever is running around it":
-   *
-   *   nothing running  save only. The next start picks it up.
-   *   one machine      leave (stops the engine) -> serveStandalone with the new
-   *                    selection, downloading its weights first if needed.
-   *   several machines leave, then re-create the roster **under the same join
-   *                    code** and stop there. The other machines rejoin (their
-   *                    client re-registers when it finds itself missing from
-   *                    the roster) and the user presses Start — the same
-   *                    forming flow as any other cluster, so nothing new has to
-   *                    be explained. Minting a fresh code here would strand
-   *                    every machine still holding the old one.
-   *
-   * It also jumps to the Cluster page whenever it restarts something: the
-   * download bar, the per-machine stages and the failure messages all live
-   * there, and a switch started from chat would otherwise be a page that goes
-   * quiet for however long an 80 GB model takes.
-   */
+  /** Save a model choice only when no pairing roster is active. A running or
+   * forming cluster is deliberately immutable: the user exits it first, then
+   * chooses a model and starts a fresh deployment. `localEngine` is the
+   * dormant open-GGUF path rather than a pairing cluster, so it keeps its own
+   * explicit stop/restart behaviour until that legacy surface is retired. */
   const switchModel = useCallback(
     async (modelId: string, quant: string) => {
+      if (pairSnap && pairSnap.peers.length > 0) return;
       // The setting is written immediately — the radio/picker must reflect the
       // choice now, not after whatever rebuild is currently winding down.
-      updateSettings({ ...settings, modelId, quant });
+      updateSettings({
+        ...settings,
+        modelId,
+        quant,
+        longContext: settings.longContext && modelSupportsLongContext(modelId),
+      });
       return queueRebuild(async () => {
-      // Switching AWAY from a running local llama.cpp engine: stop it, then
-      // serve the curated pick the single-machine way (same restart promise
-      // the picker made — nothing keeps running under the old model).
-      if (localEngine) {
-        await stopLocalEngine();
-        if (snap) await serveStandalone({ modelId, quant });
-        return;
-      }
-      const running = pairSnap && pairSnap.peers.length > 0;
-      if (!running || !snap) return;
-      const machines = pairSnap.peers.length;
-      const code = pairSnap.code;
-      const account = !!pairSnap.accountMode;
-      setView("cluster");
-      try {
-        await getPairingProvider().leave();
-        if (machines <= 1) {
+        // Switching away from a running local llama.cpp engine: stop it, then
+        // serve the curated pick the single-machine way. Pairing clusters never
+        // reach this branch because of the guard above.
+        if (localEngine) {
+          await stopLocalEngine();
           await serveStandalone({ modelId, quant });
-          return;
         }
-        const path = await ensureWeights({ modelId, quant });
-        const self = {
-          hostname: snap.hostname,
-          gpu: snap.gpu_name,
-          modelPath: path,
-          // From storage, not state — same staleness as serveStandalone above.
-          tuning: engineTuning({ ...loadSettings(), modelId, quant }, caps, mem),
-        };
-        // Account mode has no typed code: the secret is derived from the
-        // account, so every machine re-derives the same one and finds us again.
-        if (account) {
-          const g = platformGate();
-          const secret = g.ok && g.session.userId ? await accountPairSecret(g.session.userId, g.url, settings.clusterName.trim() || "IdleToken-Home") : null;
-          if (secret) await getPairingProvider().createAccount(self, secret);
-        } else {
-          await getPairingProvider().create(self, code ?? undefined);
-        }
-      } catch (e) {
-        if (!isWeightsCancelled(e)) console.error("switch-model:", e);
-        reportWeightsError(e, "cluster");
-      }
       });
     },
-    [settings, pairSnap, snap, localEngine, stopLocalEngine, serveStandalone, ensureWeights, caps, reportWeightsError, queueRebuild]
+    [settings, pairSnap, localEngine, stopLocalEngine, serveStandalone, queueRebuild]
   );
 
   // The UI-test effect runs once on mount, so it captures the FIRST render's
@@ -1729,7 +1795,7 @@ export default function App() {
         if (pm) {
           const [, op, code, as, apiPort, apiToken, model] = pm;
           const tuning = {
-            ...engineTuning(settings, caps, mem),
+            ...engineTuning(settings, caps),
             ...(apiPort ? { apiPort: Number(apiPort) } : {}),
             ...(apiToken ? { apiToken } : {}),
           };
@@ -1768,8 +1834,7 @@ export default function App() {
             }
             const secret = await accountPairSecret(
               gate.session.userId,
-              gate.url,
-              loadSettings().clusterName || "IdleToken-Home"
+              gate.url
             );
             const { invoke } = await import("@tauri-apps/api/core");
             try {
@@ -1778,7 +1843,7 @@ export default function App() {
                 hostname: as || window.location.hostname || "test-node",
                 gpu: "test",
                 modelPath: "",
-                tuning: engineTuning(settings, caps, mem),
+                tuning: engineTuning(settings, caps),
                 account: true,
               });
               reportTest("pairing-account", { ok: true, op, email: gate.session.email });
@@ -1801,7 +1866,7 @@ export default function App() {
             signedIn: sess !== null,
             sessionProvider: sess?.provider ?? null,
             gate: gate.ok ? "ok" : gate.reason,
-            agentName: s.clusterName || "IdleToken-Home",
+            agentName: s.providerName || null,
             coordApiPort: s.apiPort || 8000,
             tauri: inTauri(),
           });
@@ -2250,20 +2315,23 @@ export default function App() {
     (document.body.style as { zoom?: string }).zoom = String(settings.uiScale || autoScale);
   }, [settings.uiScale, autoScale]);
 
-  // Re-probe whenever the effective caps change so the dashboard reflects the
-  // new limit immediately (the setting visibly takes effect). We keep the old
-  // snapshot visible during a re-probe so only the first load shows a spinner.
+  // The dashboard probe is deliberately uncapped: "available VRAM" means the
+  // GPU's real current free memory, not the user's IdleToken usage limit. The
+  // limit is still passed to every engine launch through engineTuning(); it
+  // simply no longer falsifies the hardware reading or the reference estimate.
+  // We keep the old snapshot visible during a manual re-probe so only the first
+  // load shows a spinner.
   useEffect(() => {
     let live = true;
     setError(null);
     getResourceProvider()
-      .probe({ maxVramMb: caps.maxVramMb, maxRamMb: caps.maxRamMb })
+      .probe()
       .then((s) => {
         if (!live) return;
         setSnap(s);
         setTotals({ vram_total: s.vram_total, ram_total: s.ram_total });
-        // Hand this machine's free memory to the pairing layer, which sends it
-        // with every join (2026-08-15). Each machine measures its own, so the
+        // Hand this machine's real free GPU memory to the pairing layer, which
+        // sends it with every join. Each machine measures its own, so the
         // roster can total the pool and answer "does the model fit on all of
         // us" BEFORE anyone presses Start — that used to be answerable only by
         // the coordinator refusing after the fact. Reported in every mode: the
@@ -2272,8 +2340,8 @@ export default function App() {
           void import("@tauri-apps/api/core")
             .then(({ invoke }) =>
               invoke("pairing_report_memory", {
-                vramFree: Math.max(0, s.vram_total - s.vram_used_other),
-                ramFree: Math.max(0, s.ram_total - s.ram_used_other),
+                vramFree: s.vram_usable,
+                ramFree: 0,
                 unifiedMemory: s.unified_memory,
               })
             )
@@ -2305,7 +2373,7 @@ export default function App() {
     return () => {
       live = false;
     };
-  }, [nonce, caps.maxVramMb, caps.maxRamMb]);
+  }, [nonce]);
 
   const updateSettings = (s: AppSettings) => {
     setSettings(s);
@@ -2505,6 +2573,23 @@ export default function App() {
         />
         <div className="app__body app__body--topnav">
           <div className="app__content">
+            {/* Chat owns live stream listeners and request ids. It must remain
+                mounted while the user visits Cluster or Settings; conditionally
+                rendering it orphaned the visible transcript while the native
+                request kept its engine slot and GPU work alive. */}
+            <Chat
+              visible={!error && !!snap && view === "chat"}
+              api={pairSnap?.api ?? localApi}
+              source={pairSnap?.source ?? "engine"}
+              apiToken={settings.apiToken}
+              modelId={settings.modelId}
+              modelLabel={model.label}
+              quant={settings.quant}
+              maxTokens={settings.maxTokens}
+              identity={identity}
+              onGoCluster={() => setView("cluster")}
+              machines={pairSnap?.peers.length ?? (localEngine ? 1 : 0)}
+            />
             {error ? (
               <div className="center-state">
                 <div className="msg">{t2("state.errorTitle", lang)}</div>
@@ -2518,19 +2603,6 @@ export default function App() {
                 <div className="spinner" />
                 <div className="msg">{t2("state.loading", lang)}</div>
               </div>
-            ) : view === "chat" ? (
-              <Chat
-                api={pairSnap?.api ?? localApi}
-                source={pairSnap?.source ?? "engine"}
-                apiToken={settings.apiToken}
-                modelId={settings.modelId}
-                modelLabel={model.label}
-                quant={settings.quant}
-                maxTokens={settings.maxTokens}
-                identity={identity}
-                onGoCluster={() => setView("cluster")}
-                machines={pairSnap?.peers.length ?? (localEngine ? 1 : 0)}
-              />
             ) : view === "settings" ? (
               <SettingsPanel
                 asPage
@@ -2544,22 +2616,18 @@ export default function App() {
                 onLang={setLang}
                 session={session}
                 onSignIn={() => setShowAuth(true)}
-                initialCategory={settingsCategory}
-                downloads={dls}
-                downloadErrors={dlErrors}
-                weightsVersion={weightsVersion}
-                onStartDownload={(file, target) => void startDownload(file, target)}
-                onCancelDownload={cancelDownloadFor}
                 onWeightsChanged={bumpWeights}
                 onCheckUpdate={() => checkUpdate("always")}
                 onClose={() => setView("cluster")}
               />
-            ) : (
+            ) : view === "cluster" ? (
               <Dashboard
                 snap={snap}
                 model={model}
                 quant={settings.quant}
                 tier={{ id: settings.tier || 2, ctx: effectiveCtx(settings) } as Tier}
+                longContext={settings.longContext}
+                onLongContextChange={(enabled) => updateSettings({ ...settings, longContext: enabled })}
                 pair={pairSnap}
                 localEngine={localEngine}
                 localApi={localApi}
@@ -2574,6 +2642,7 @@ export default function App() {
                   setPairingView("choose");
                   setShowPairing(true);
                 }}
+                onNeedLogin={() => setShowAuth(true)}
                 onJoinCluster={() => {
                   setPairingView("join");
                   setShowPairing(true);
@@ -2582,18 +2651,16 @@ export default function App() {
                   setPairingView("choose");
                   setShowPairing(true);
                 }}
-                onOpenModelSetting={() => openSettings("quick")}
+                onLeaveCluster={() => getPairingProvider().leave()}
                 onSwitchModel={(id, q) => void switchModel(id, q)}
                 weights={weightsInfo}
               />
-            )}
+            ) : null}
           </div>
         </div>
       </div>
-      {/* No floating download bar at all (2026-08-10). Every weight state —
-          missing, downloading, failed, ready — is rendered on the model row it
-          belongs to, in Settings → Quick. A box that covers the page to narrate
-          a file transfer the user already asked for is pure interruption. */}
+      {/* No floating download bar. The selected model row owns its download;
+          deployment choices only consume the resulting ready state. */}
       {showAuth ? (
         <AuthScreen
           onAuthed={(s) => {
@@ -2610,11 +2677,12 @@ export default function App() {
             gpu: snap.gpu_name,
             modelPath: weightsPath,
             // From storage, not state — same staleness as serveStandalone.
-            tuning: engineTuning(loadSettings(), caps, mem),
+            tuning: engineTuning(loadSettings(), caps),
           }}
           session={session}
-          modelId={settings.modelId}
           initialView={pairingView}
+          prepareSelectedModel={() => ensureWeights()}
+          prepareClusterModel={prepareClusterModel}
           onSignIn={() => {
             setShowPairing(false);
             setShowAuth(true);

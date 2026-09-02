@@ -1073,6 +1073,29 @@ mod delete_tests {
     fn list_of_a_missing_folder_is_empty_not_a_crash() {
         assert!(weights_list("/nonexistent/idletoken/models".into()).is_empty());
     }
+
+    #[test]
+    fn chinese_model_and_cache_paths_round_trip_without_replacement() {
+        let d = tmpdir().join("模型缓存");
+        fs::create_dir_all(&d).unwrap();
+        write(&d, "中文模型.gguf", 13);
+        let dir = d.to_str().expect("the CJK fixture must be Unicode").to_owned();
+
+        let listed = weights_list(dir.clone());
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].file, "中文模型.gguf");
+        assert_eq!(listed[0].bytes, 13);
+
+        let state = weights_state(
+            dir.clone(), "中文模型.gguf".into(), 13, String::new());
+        assert!(state.complete && state.verified);
+        assert!(state.path.contains("模型缓存"));
+        assert!(state.path.ends_with("中文模型.gguf"));
+
+        assert_eq!(weights_delete(
+            dir, "中文模型.gguf".into()).unwrap(), 13);
+        assert!(!d.join("中文模型.gguf").exists());
+    }
 }
 
 /// Tests for the SHA-256 integrity gate.

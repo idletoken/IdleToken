@@ -39,13 +39,27 @@ SCALARS = [
     ("layer_weight_bytes", "layer_weight_bytes"),
     ("shared_weight_bytes", "shared_weight_bytes"),
     ("context_max", "context_max"),
+    ("context_yarn_max", "context_yarn_max"),
     ("overhead_base_bytes", "overhead_base_bytes"),
+    # The measured graph workspace. Compared here because it is the number that
+    # decides whether a configuration is admitted or OOMs, and the two copies
+    # (models/*.json for the client, the C registry for the engine) have no
+    # other thing keeping them equal.
+    ("compute_bytes_256k_cuda", "compute_bytes_256k_cuda"),
+    ("compute_bytes_1m_cuda", "compute_bytes_1m_cuda"),
+    ("compute_bytes_256k_metal", "compute_bytes_256k_metal"),
+    ("compute_bytes_1m_metal", "compute_bytes_1m_metal"),
     ("default_gguf", "default_gguf"),
 ]
 KV = [
+    ("kind", "kv_kind"),
     ("bytes_per_token_per_layer", "kv_bytes_per_token_per_layer"),
     ("state_bytes_per_layer", "state_bytes_per_layer"),
     ("full_attention_interval", "full_attention_interval"),
+    ("raw_bytes_per_cell", "dsv4_raw_bytes_per_cell"),
+    ("csa_bytes_per_cell", "dsv4_csa_bytes_per_cell"),
+    ("hca_bytes_per_cell", "dsv4_hca_bytes_per_cell"),
+    ("fixed_bytes_per_sequence", "dsv4_fixed_bytes_per_seq"),
 ]
 
 
@@ -78,16 +92,22 @@ def main(argv):
             if mk in man.get("kv", {}) and man["kv"][mk] != r[rk]:
                 problems.append("%s: kv.%s manifest=%r registry=%r"
                                 % (mid, mk, man["kv"][mk], r[rk]))
+        moe = man.get("moe") or {}
+        for mk, rk in (("n_expert", "n_expert"),
+                       ("n_expert_used", "n_expert_used")):
+            if int(moe.get(mk, 0)) != int(r.get(rk, 0)):
+                problems.append("%s: moe.%s manifest=%r registry=%r"
+                                % (mid, mk, moe.get(mk, 0), r.get(rk, 0)))
         # `available` gates whether the planner will serve the model at all —
         # a manifest claiming ready while the engine says not (or vice versa)
         # is the difference between "offered to users" and "actually works".
         if bool(man.get("available")) != bool(r["available"]):
             problems.append("%s: available manifest=%r registry=%r"
                             % (mid, man.get("available"), bool(r["available"])))
-        # `deployment` decides whether the coordinator will let this model span
-        # more than one machine. Both copies must say the same thing, and BOTH
-        # must say something: a model added without it is refused at runtime,
-        # which is a fine failure mode but a terrible way to discover the typo.
+        # `deployment` is technical capability, not a size recommendation.
+        # "cluster" means the model may use either path; "single-node" is
+        # reserved for a backend that genuinely cannot be split. Both copies
+        # must agree, and an omitted value still fails closed at runtime.
         md, rd = man.get("deployment"), r.get("deployment")
         if md not in ("single-node", "cluster"):
             problems.append("%s: manifest deployment=%r (want 'single-node' or 'cluster')" % (mid, md))

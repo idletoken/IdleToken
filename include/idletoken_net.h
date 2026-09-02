@@ -51,6 +51,29 @@ int idletoken_recv_msg(int fd, idletoken_msg_header *out_h,
 int idletoken_listen_tcp(const char *bind_addr);   /* returns listener fd, -1 on error */
 int idletoken_accept_tcp(int listener);            /* returns conn fd, -1 on error */
 
+/* Bound how long a blocking recv() on `fd` may wait (SO_RCVTIMEO).
+ * `timeout_ms <= 0` removes the bound (blocking forever again).
+ *
+ * Why this is a security primitive and not a convenience (CLUS-05): the
+ * coordinator's join loop is serial — accept, pair-auth, HELLO, one worker at a
+ * time. Every one of those steps used to be an unbounded blocking read, so a
+ * single TCP connection from ANY device on the LAN that connects and then says
+ * nothing pinned the coordinator in recv() forever. No join code, no
+ * credential, no packet after the SYN: cluster formation simply never
+ * completed, and the bounded IDLETOKEN_JOIN_WAIT_S deadline could not fire
+ * because the thread was inside recv(), not inside accept().
+ *
+ * A timeout makes that connection cost the attacker a re-dial per window and
+ * turns the failure into an attributable, logged refusal. Returns 0 / -1. */
+int idletoken_set_recv_timeout(int fd, int timeout_ms);
+
+/* Read back the current SO_RCVTIMEO in milliseconds (0 = unbounded). Exists so
+ * a helper can impose a deadline for the duration of one handshake and put the
+ * caller's own setting back afterwards — a shared function that silently leaves
+ * its deadline behind would make the NEXT read on that socket fail for a reason
+ * its author never wrote down. Returns 0 / -1. */
+int idletoken_get_recv_timeout(int fd, int *out_ms);
+
 /* accept() bounded by a deadline. Returns the conn fd, -2 on timeout (a state
  * the caller must be able to tell from an error), -1 on a real failure.
  * Exists because a plain accept() waits forever: a cluster whose second
@@ -134,6 +157,43 @@ int idletoken_ip_is_overlay(const char *ip);
  * — the cluster RPC PSK format both the coord and the worker persist). */
 int idletoken_hex64_valid(const char *h);
 
+/* ---- peer-supplied string gates (CLUS-14, CHAIN-08 LAN side) -------------
+ *
+ * TLS and the pairing handshake decide WHO may speak. They say nothing about
+ * WHAT the peer says. Every string in a HELLO — hostname, engine version, rpc
+ * endpoint, GPU name — is chosen by the machine on the other end, and the
+ * coordinator then splices it into log lines and into the
+ * `/idletoken/v1/cluster/status` JSON body with a plain `%s`. An authorized but
+ * modified worker could therefore emit `a","role":"coordinator","x":"` as its
+ * hostname and rewrite the document the client parses, or embed a newline and
+ * forge a log line. Neither needs a parser bug: it is straight string splicing.
+ *
+ * These are ingress gates. Egress still escapes (belt and braces) — a gate that
+ * is the ONLY defence becomes the single point of failure the next refactor
+ * removes.
+ *
+ * `idletoken_peer_label_ok`: a human-readable label (GPU name, version banner).
+ * Accepts printable ASCII 0x20..0x7E except `"` and `\`; rejects empty, longer
+ * than `max_len`, control bytes, and anything non-ASCII. Non-ASCII is refused
+ * on purpose — a 64-byte field truncated mid-UTF-8 produces invalid JSON, and
+ * homoglyph hostnames are a display-spoofing surface we get nothing back for.
+ *
+ * `idletoken_peer_host_ok`: an identity-bearing address/name (hostname, rpc
+ * endpoint). Stricter still: `[A-Za-z0-9]`, `.`, `-`, `_`, `:` only.
+ *
+ * Both return 1 = acceptable, 0 = refuse. NULL is refused. */
+int idletoken_peer_label_ok(const char *s, size_t max_len);
+int idletoken_peer_host_ok(const char *s, size_t max_len);
+
+/* JSON-escape `src` (`n` bytes) into `dst` (capacity `cap`, always
+ * NUL-terminated). Returns the number of bytes written, excluding the
+ * terminator; output is truncated rather than overflowed, and never truncated
+ * inside an escape sequence. Escapes `"`, `\` and every byte < 0x20; passes the
+ * rest through. Bytes >= 0x80 pass through unchanged, so the caller is
+ * responsible for UTF-8 validity — which is why the ingress gates above refuse
+ * non-ASCII on the peer path. */
+size_t idletoken_json_escape(char *dst, size_t cap, const char *src, size_t n);
+
 /* ---- Payload (de)serialization helpers --------------------------------
  *
  * `idletoken_buf` is a fixed-capacity bump cursor over a caller-owned buffer.
@@ -166,5 +226,17 @@ int idletoken_buf_get_bytes(idletoken_buf *b, void *dst, size_t n);
  * If the wire string exceeds max-1, the extra bytes are still consumed but
  * `out` is truncated and `b->err` is left clear. Returns 0 / -1. */
 int idletoken_buf_get_str(idletoken_buf *b, char *out, size_t max);
+
+/* Same wire format, but an over-long string is an ERROR (`b->err` set, `out`
+ * emptied) instead of a silent truncation.
+ *
+ * Use this for every field whose VALUE decides something (CLUS-06, CLUS-14):
+ *   - an identity — two peers whose 200-char hostnames differ only after byte
+ *     63 truncate to the same 64-byte name, and a name that collides is a name
+ *     that can be impersonated wherever the code compares names;
+ *   - a URL or path the receiver then dials or opens — a truncated URL is a
+ *     DIFFERENT URL, and the caller has no way to notice.
+ * `idletoken_buf_get_str` remains correct for genuinely cosmetic fields. */
+int idletoken_buf_get_str_strict(idletoken_buf *b, char *out, size_t max);
 
 #endif /* IDLETOKEN_NET_H */

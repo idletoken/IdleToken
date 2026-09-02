@@ -5,7 +5,7 @@
   "backend": "ds4x",
   "arch": "qwen3",
   "available": true,
-  "deployment": "single-node",
+  "deployment": "cluster",
   "license": "Apache-2.0",
   "params_summary": "8.2B dense · 36 layers · GQA",
   "n_layers": 36,
@@ -13,6 +13,7 @@
   "hc_streams": 1,
   "n_vocab": 151936,
   "context_max": 40960,
+  "context_yarn_max": 163840,
   "attn": {
     "kind": "gqa",
     "n_head": 32,
@@ -29,6 +30,10 @@
     "boundary_multiple": 0
   },
   "overhead_base_bytes": 1610612736,
+  "compute_bytes_256k_cuda": 319553536,
+  "compute_bytes_1m_cuda": 0,
+  "compute_bytes_256k_metal": 327942144,
+  "compute_bytes_1m_metal": 0,
   "chat_template": "gguf",
   "layer_weight_bytes": 5027783488,
   "shared_weight_bytes": 0,

@@ -7,14 +7,14 @@ export type Lang = "en" | "zh";
 
 export const STRINGS = {
   en: {
-    // Topbar pill states. "standalone" = nothing serving on this machine (not
-    // merely "no cluster" — a local engine counts as serving), so the pill
-    // reads as a service status: Offline / Preparing / Serving.
+    // Topbar pill states: Offline / Preparing… / Cluster ready. "standalone" =
+    // nothing serving on this machine (not merely "no cluster" — a local engine
+    // counts as serving); the ready state reuses "cluster.ready" below.
     "cluster.standalone": "Offline",
-    "pill.serving": "Serving",
     "share.off": "Share compute",
     "share.on": "Sharing",
     "share.needLogin": "Sign in first to share compute",
+    "share.needService": "Start a model before turning on sharing.",
     "weights.needed": "Not in the model folder yet",
     "weights.downloading": "Downloading weights",
     "weights.download": "Download weights",
@@ -98,17 +98,15 @@ export const STRINGS = {
     "cap.model": "Model",
     "cap.quant": "Precision",
     "cap.size": "Download",
-    "cap.need": "VRAM / RAM needed",
+    "cap.need": "VRAM needed",
     // The three verdict words. No longer a capability-table column
     // (2026-08-21) but still the ModelPicker's fit chip, which is the
     // only place a verdict is shown at all now.
-    "cap.yesGpu": "Yes — fast",
-    "cap.yesHybrid": "Yes — slower",
-    "cap.no": "No",
+    "cap.yesGpu": "Runs locally at full speed",
+    "cap.no": "Cannot run locally",
     "spine.fits": "This machine can hold the whole model.",
-    "spine.no": "Too big for this machine.",
+    "spine.no": "Available VRAM may fall short.",
     "spine.clusterFits": "These {n} machines can hold the whole model.",
-    "spine.clusterNo": "Too big for these {n} machines together.",
     // A member that does not report its memory makes the total a lower bound;
     // only a shortfall can be wrong that way, so only a shortfall says this.
     "spine.unknown": "Cannot tell yet — a machine has not reported its memory.",
@@ -152,12 +150,14 @@ export const STRINGS = {
     "pairing.accountCreateHint": "No code needed — this machine hosts; account machines auto-join.",
     "pairing.accountJoin": "Auto-join this account's cluster",
     "pairing.accountJoinHint": "Scan this LAN for a cluster created under {email}.",
-    "pairing.accountLanHint":
-      "Same LAN only for now: machines must be signed in to the same platform account with the same cluster name (“{name}”, in Settings). Cross-network discovery arrives with the cloud rendezvous.",
     "pairing.accountNeedLogin": "Sign in (top right) to let same-account machines pair with no code. Code mode above works fully offline.",
     "pairing.accountCluster": "Account cluster — machines signed in to {email} on this LAN join without a code.",
     "pairing.enterCode": "Enter join code",
     "pairing.join": "Join",
+    // Named on purpose: the user is agreeing to one specific multi-gigabyte
+    // download, not to "whatever this cluster happens to want".
+    "pairing.fetchModel": "Download {model} ({quant}) and join",
+    "pairing.fetchingModel": "Downloading…",
     "pairing.invalidCode": "Codes are 6 letters and numbers.",
     // Join failures (pairing.rs lastError codes). A failed join used to reset
     // silently to idle — indistinguishable from the button doing nothing.
@@ -173,6 +173,13 @@ export const STRINGS = {
       "The hosting machine is running an older version of IdleToken. Update it, then create the cluster again.",
     "pairing.err.subnet":
       "The cluster refused this machine: it is on a different subnet, and that cluster is restricted to one subnet.",
+    // 2026-09-01: admission requires the weights to be on disk already. The
+    // refusal names the model because a refused machine never reaches the
+    // roster that used to be how it learned what to fetch. Not to be confused
+    // with `pairing.err.modelNotReady` below, which is the START-time
+    // complaint about an admitted member; this one is why a join was refused.
+    "pairing.err.joinNeedsModel":
+      "This cluster runs {model} at {quant}, and this machine does not have those weights yet. Download them to join.",
     "pairing.err.rejected": "The cluster refused this machine: {detail}",
     "pairing.err.portBusy":
       "Could not create the cluster: port {port} on this machine is already in use, so other machines cannot register. Close the program using it (often an earlier IdleToken that is still running), or create the cluster on another machine.",
@@ -182,9 +189,11 @@ export const STRINGS = {
     "pairing.err.needTwo": "The cluster needs at least 2 machines before it can start.",
     "pairing.err.started": "The cluster has already started.",
     "pairing.err.noMember": "That machine is no longer in the cluster.",
+    "pairing.err.modelMismatch": "This machine prepared a different model than the cluster ({detail}).",
+    "pairing.err.modelNotReady": "A cluster member has not finished preparing the selected model ({detail}).",
+    "pairing.createNeedsModel": "Download and verify the selected model on this machine before creating a cluster.",
     "pairing.yourCode": "Share this code to add machines:",
     "pairing.addMachine": "Add another machine…",
-    "pairing.singleNodeModel": "This model is served by one machine, so there is no join code to share. Switch to a cluster model in Settings to pool machines.",
     "pairing.copy": "Copy",
     "pairing.copied": "Copied",
     "pairing.members": "Cluster · {n} machine(s)",
@@ -193,6 +202,8 @@ export const STRINGS = {
     "pairing.worker": "Worker",
     "pairing.makeCoord": "Make coordinator",
     "pairing.waiting": "Waiting for machines to join…",
+    "pairing.model.preparing": "Preparing selected model…",
+    "pairing.model.waiting": "Waiting for every machine to download and verify this model. Start becomes available when all are ready.",
     "pairing.startCluster": "Start the cluster ({n} machines)",
     "pairing.leave": "Leave cluster",
     "pairing.back": "Back",
@@ -234,6 +245,8 @@ export const STRINGS = {
       "The idletoken-server engine binary is missing ({detail}). Build it with scripts/build_llamacpp.sh, then stage it with scripts/stage_sidecars.sh.",
     "engine.err.refusedSilent":
       "The engine refused to start and gave no reason — open the engine log below.",
+    "engine.err.resourceInsufficient":
+      "Insufficient GPU memory; unable to start. Free GPU memory, choose a smaller precision, or add cluster nodes.",
     "fixture.badge": "DEV FIXTURE",
     "fixture.title": "Placeholder data",
     "fixture.body": "The client is running outside the engine, so these numbers are a development placeholder — not a real probe.",
@@ -247,8 +260,6 @@ export const STRINGS = {
     "settings.searchLabel": "Search settings",
     "a11y.close": "Close",
     "settings.model": "Model downloads",
-    "settings.model.singleNode": "one machine",
-    "settings.model.cluster": "needs a cluster",
     "settings.precision": "Precision",
     "settings.maxVram": "Max VRAM",
     "settings.maxRam": "Max RAM",
@@ -295,32 +306,35 @@ export const STRINGS = {
     "platform.provider.offline": "Offline",
     "platform.provider.suspended": "Suspended",
     "platform.provider.lastBeat": "heartbeat {t}",
-    // One switch, because it is one arrangement (T5, 2026-08-19): idle time goes
-    // out, overflow comes back. Two switches would present "earn only" and
-    // "spend only" as products; they are the two halves of one exchange.
     "platform.share": "Sharing",
     "platform.share.explain":
-      "Lend this machine while it is idle, and borrow another when it is full. It dials out to the platform; no inbound port is opened, and prompts are encrypted end to end in both directions.",
+      "Let this machine complete other users' requests while it has capacity and earn Sparks. It dials out to the platform; no inbound port is opened, and prompts are encrypted end to end.",
     "platform.share.start": "Turn on",
     "platform.share.stop": "Turn off",
     "platform.share.on": "On",
     "platform.share.off": "Off",
     "platform.share.working": "Working…",
+    "platform.overflow.name": "Request help",
+    "platform.overflow.optionHint": "When the local inference slot is occupied, immediately ask another user to complete the request (spends Sparks).",
+    "platform.overflow.off": "Request help when busy",
+    "platform.overflow.on": "Help active",
+    "platform.overflow.needLogin": "Sign in to route unfinished local requests to another user's machine.",
+    "platform.overflow.needService": "Start a model before turning on Request help.",
+    "platform.overflow.hint":
+      "When the local inference slot is occupied, another IdleToken provider immediately completes the request using this account's Sparks. Changes apply the next time the model starts.",
     "platform.share.notReady": "This machine's cluster isn't ready yet. You can still turn sharing on — the agent waits for the coordinator on port {port}.",
     "platform.share.browser": "Sharing needs the desktop app; this is the browser dev build.",
     // The engine reads the borrowing settings once, at start. Same words as a
     // model switch, because it is the same event.
-    "platform.share.restart": "Borrowing takes effect when the engine next starts. Restart the cluster to apply it now.",
+    "platform.share.restart": "Request help takes effect when the engine next starts. Restart the cluster to apply it now.",
     "platform.share.failed": "Could not turn sharing on: {msg}. Nothing was changed.",
     "platform.share.offFailed": "Could not turn sharing off cleanly: {msg}.",
-    // The one guard rail on a switch that can both earn and spend — so it is
-    // shown next to the switch, not filed under advanced.
     "platform.share.cap": "Daily borrowing limit",
     "platform.share.capUnit": "Sparks per day",
-    "platform.share.capHint": "The most borrowing may cost in one day (UTC). It cannot be removed — sharing spends without asking, and an unlimited spender empties a balance overnight. The platform's own record is the one that counts.",
+    "platform.share.capHint": "The most Request help may cost in one day (UTC). The platform's own record is the one that counts.",
     "platform.share.wait": "Borrow only after waiting",
     "platform.share.waitUnit": "seconds",
-    "platform.share.waitHint": "0 = borrow as soon as this machine is full. Higher means queue here first and pay only for longer waits.",
+    "platform.share.waitHint": "Request help is immediate when the local inference slot is occupied; the client does not queue locally.",
     "platform.share.advanced": "Advanced",
     "platform.agent.log": "Recent agent log",
     "platform.keys": "API keys",
@@ -334,12 +348,11 @@ export const STRINGS = {
     "platform.rdv.hint": "For account pairing from the CLI (passed as --account-token). Scope is limited to exchanging cluster addresses.",
     "platform.rdv.new": "Get token",
     "platform.rdv.warn": "Every machine in a cluster must use the same token. Valid for {days} days.",
-    "cluster.emptyTitle": "How do you want to run it?",
+    "cluster.emptyTitle": "Start your model",
     "cluster.create": "Create a cluster",
     "cluster.serveLocal": "Run it here",
     "deploy.local": "On this machine only",
     // Said next to the disabled button, not on a page you reach by pressing it.
-    "deploy.local.tooBig": "The selected model does not fit on this machine. Pick a smaller one, or run it across several machines.",
     "deploy.cluster": "Across several machines",
     "cluster.title": "Cluster",
     "cluster.machines": "{n} machines",
@@ -348,9 +361,11 @@ export const STRINGS = {
     "cluster.serving": "Serving",
     "cluster.waiting": "Waiting for machines to join",
     "cluster.loadingHint": "First start downloads this machine's model shard — allow a few minutes on a fast network.",
-    "capacity.ratio": "{have} GB available / {need} GB needed (est.)",
+    "capacity.ratio": "{have} GB VRAM available / {need} GB needed (est.)",
     "stats.requests": "requests served",
     "stats.tokens": "tokens",
+    "stats.ctx": "context",
+    "stats.ctxTitle": "the exact window selected for this service; KV cache precision follows automatically",
     "stats.cache": "KV reuse saved",
     "stats.cacheTitle": "prefill tokens skipped via KV prefix cache reuse",
     "stats.uptime": "online",
@@ -401,7 +416,7 @@ export const STRINGS = {
     // picked up (the coordinator serves one request at a time).
     "chat.queued": "Sent — waiting for the cluster to start on it",
     "chat.queuedBehind": "Queued — the cluster is finishing another conversation's reply first",
-    "chat.limit": "{n} replies are already generating, which is this app's limit. Wait for one to finish.",
+    "chat.limit": "{n} replies are already being handled locally or by shared compute. Wait for one to finish.",
     "chat.toLatest": "Latest",
     "chat.toLive": "Follow the reply",
     // Which model is in play. Two deliberately different claims: "Answering
@@ -410,6 +425,8 @@ export const STRINGS = {
     // on an older engine that does not report one).
     "model.serving": "Answering with",
     "model.selected": "Selected",
+    "model.longContext": "1M context",
+    "model.longContextUnavailable": "This model does not support a 1M context.",
     "model.change": "Change",
     "chat.model.servingTitle": "Reported by the coordinator that loaded it — this is what answers you.",
     "chat.model.selectedTitle": "Your choice in Settings. The cluster has not reported which model it loaded, so this is what requests are sent for.",
@@ -425,7 +442,7 @@ export const STRINGS = {
     // Curated registry only (the open intake was removed 2026-08-15): every
     // listed model is one we have verified on real hardware. Missing one is a
     // request, not a file box.
-    "model.request.hint": "Every listed model is verified on real hardware. Missing one you need?",
+    "model.request.hint": "Missing a model you need?",
     "model.request.link": "Request it on GitHub",
     // Usage ordering (platform leaderboard). The label is the SIGNAL that the
     // order came from real usage: no platform, no label, no numbers — never a
@@ -495,10 +512,10 @@ export const STRINGS = {
   },
   zh: {
     "cluster.standalone": "未在线",
-    "pill.serving": "服务中",
     "share.off": "开启共享",
     "share.on": "共享中",
     "share.needLogin": "登录后才能共享算力，点击前往登录",
+    "share.needService": "启动模型后才能开启共享",
     "weights.needed": "当前模型目录下没有",
     "weights.downloading": "正在下载权重",
     "weights.download": "下载权重",
@@ -559,15 +576,13 @@ export const STRINGS = {
     "cap.model": "模型",
     "cap.quant": "精度",
     "cap.size": "下载体积",
-    "cap.need": "预估显/内存需求",
-    "cap.yesGpu": "可运行 · 快",
-    "cap.yesHybrid": "可运行 · 较慢",
-    "cap.no": "无法运行",
+    "cap.need": "预估显存需求",
+    "cap.yesGpu": "本机全速运行",
+    "cap.no": "本机无法运行",
     "spine.fits": "本机能放下全部。",
-    "spine.no": "本机放不下。",
+    "spine.no": "可用显存可能不足。",
     "spine.clusterFits": "这 {n} 台机器能放下全部。",
-    "spine.clusterNo": "这 {n} 台机器加起来也放不下。",
-    "spine.unknown": "暂时无法判断——有机器还没上报可用内存。",
+    "spine.unknown": "暂时无法判断——有机器还没上报可用显存。",
     "auth.title": "登录 IdleToken",
     "auth.subtitle": "用邮箱把你的机器组成一个集群。",
     "auth.tabSignIn": "登录",
@@ -608,12 +623,12 @@ export const STRINGS = {
     "pairing.accountCreateHint": "无需组网码——本机作主机，同账号机器自动加入。",
     "pairing.accountJoin": "自动加入同账号集群",
     "pairing.accountJoinHint": "在本局域网内查找 {email} 创建的集群。",
-    "pairing.accountLanHint":
-      "目前仅限同一局域网：各机器需登录同一平台账号且集群名称一致（“{name}”，见设置）。跨网发现将随云端中继上线。",
     "pairing.accountNeedLogin": "登录（右上角）后，同账号机器可免码互相发现；上方组网码模式离线即可用。",
     "pairing.accountCluster": "账号集群——本局域网内登录 {email} 的机器免码加入。",
     "pairing.enterCode": "输入组网码",
     "pairing.join": "加入",
+    "pairing.fetchModel": "下载 {model}（{quant}）并加入",
+    "pairing.fetchingModel": "正在下载…",
     "pairing.invalidCode": "组网码为 6 位字母和数字。",
     "pairing.err.notFound":
       "没有找到使用这个组网码的集群。请核对组网码、确认两台机器在同一局域网，并在两台机器的防火墙上放行 UDP {port} 与 TCP 14098 端口。",
@@ -622,6 +637,8 @@ export const STRINGS = {
     "pairing.err.badCode": "组网码未被接受。请到主机上核对后重试。",
     "pairing.err.oldCreator": "主机上的 IdleToken 版本过旧。请先更新那台机器，然后重新创建集群。",
     "pairing.err.subnet": "集群拒绝了本机：本机与集群不在同一子网，而该集群限制了「仅限同子网」。",
+    "pairing.err.joinNeedsModel":
+      "该集群运行 {model} 的 {quant} 精度，本机还没有这份权重。下载完成后即可加入。",
     "pairing.err.rejected": "集群拒绝了本机：{detail}",
     "pairing.err.portBusy":
       "无法创建集群：本机端口 {port} 已被占用，其它机器将无法注册。请关闭占用该端口的程序（通常是尚未退出的旧 IdleToken），或换一台机器创建集群。",
@@ -631,9 +648,11 @@ export const STRINGS = {
     "pairing.err.needTwo": "至少要有 2 台机器才能启动集群。",
     "pairing.err.started": "集群已经启动。",
     "pairing.err.noMember": "这台机器已不在集群成员名单里。",
+    "pairing.err.modelMismatch": "本机准备的模型与集群不一致（{detail}）。",
+    "pairing.err.modelNotReady": "还有集群成员未完成所选模型的准备（{detail}）。",
+    "pairing.createNeedsModel": "请先在本机下载并校验所选模型，就绪后才能创建集群。",
     "pairing.yourCode": "分享此组网码以添加机器：",
     "pairing.addMachine": "添加机器…",
-    "pairing.singleNodeModel": "该模型只在单台机器上运行，因此没有可分享的组网码。要合并多台机器，请在「设置」里换一个支持集群的模型。",
     "pairing.copy": "复制",
     "pairing.copied": "已复制",
     "pairing.members": "集群 · {n} 台机器",
@@ -642,6 +661,8 @@ export const STRINGS = {
     "pairing.worker": "工作节点",
     "pairing.makeCoord": "设为协调者",
     "pairing.waiting": "等待其他机器加入…",
+    "pairing.model.preparing": "正在准备所选模型…",
+    "pairing.model.waiting": "正在等待每台机器下载并校验该模型；全部就绪后才能启动。",
     "pairing.startCluster": "启动集群（{n} 台机器）",
     "pairing.leave": "退出集群",
     "pairing.back": "返回",
@@ -674,6 +695,7 @@ export const STRINGS = {
     "engine.err.binMissingDev":
       "缺少 idletoken-server 引擎二进制（{detail}）。请先用 scripts/build_llamacpp.sh 构建，再用 scripts/stage_sidecars.sh 放置。",
     "engine.err.refusedSilent": "引擎拒绝启动，且没有给出原因——请查看下方引擎日志。",
+    "engine.err.resourceInsufficient": "显存资源不足，无法启动。请释放显存、降低精度或增加集群节点。",
     "fixture.badge": "开发占位",
     "fixture.title": "占位数据",
     "fixture.body": "客户端未连接引擎，这些数字只是开发占位——不是真实探测结果。",
@@ -687,8 +709,6 @@ export const STRINGS = {
     "settings.searchLabel": "搜索设置",
     "a11y.close": "关闭",
     "settings.model": "模型下载管理",
-    "settings.model.singleNode": "单机",
-    "settings.model.cluster": "需要集群",
     "settings.precision": "精度",
     "settings.maxVram": "最大显存",
     "settings.maxRam": "最大内存",
@@ -735,23 +755,31 @@ export const STRINGS = {
     "platform.provider.suspended": "已停用",
     "platform.provider.lastBeat": "心跳 {t}",
     "platform.share": "共享",
-    "platform.share.explain": "空闲时把本机借给他人，繁忙时向他人借用。本机只建立出站连接，不开放入站端口；两个方向的提示词均端到端加密。",
+    "platform.share.explain": "本机有余力时接收并完成其他用户的请求，赚取火花。本机只建立出站连接，不开放入站端口；提示词端到端加密。",
     "platform.share.start": "开启",
     "platform.share.stop": "关闭",
     "platform.share.on": "已开启",
     "platform.share.off": "已关闭",
     "platform.share.working": "处理中…",
+    "platform.overflow.name": "请求外援",
+    "platform.overflow.optionHint": "本地推理槽被占用时，立即交给其他用户完成（消耗火花）。",
+    "platform.overflow.off": "繁忙时请求外援",
+    "platform.overflow.on": "外援中",
+    "platform.overflow.needLogin": "登录后才能把本地来不及完成的请求路由给其他用户。",
+    "platform.overflow.needService": "启动模型后才能开启外援",
+    "platform.overflow.hint":
+      "本地推理槽被占用时，立即由其他 IdleToken 用户使用本账号的火花完成请求；更改在模型下次启动时生效。",
     "platform.share.notReady": "本机集群尚未就绪。仍可开启——代理会等待端口 {port} 上的协调者。",
     "platform.share.browser": "共享功能需要桌面应用；当前是浏览器开发环境。",
-    "platform.share.restart": "借用设置在引擎下次启动时生效。如需立即生效，请重启集群。",
+    "platform.share.restart": "请求外援在引擎下次启动时生效。如需立即生效，请重启集群。",
     "platform.share.failed": "开启共享失败：{msg}。未做任何更改。",
     "platform.share.offFailed": "关闭共享未能完全完成：{msg}。",
     "platform.share.cap": "每日借用上限",
     "platform.share.capUnit": "火花／天",
-    "platform.share.capHint": "一个自然日（UTC）内借用最多可花费的火花。该上限不可取消——共享会在无人确认的情况下消费，没有上限时一夜之间即可花光余额。以平台流水为准。",
+    "platform.share.capHint": "一个自然日（UTC）内请求外援最多可花费的火花，以平台流水为准。",
     "platform.share.wait": "等待超过此时长才借用",
     "platform.share.waitUnit": "秒",
-    "platform.share.waitHint": "0 = 本机一满即借用。数值越大，越倾向于先在本机排队，只在等待较久时才付费借用。",
+    "platform.share.waitHint": "本地推理槽被占用时立即请求外援；客户端不在本地排队。",
     "platform.share.advanced": "高级",
     "platform.agent.log": "最近代理日志",
     "platform.keys": "API 密钥",
@@ -765,11 +793,10 @@ export const STRINGS = {
     "platform.rdv.hint": "用于命令行方式的账号组网（作为 --account-token 传入）。权限仅限交换集群地址。",
     "platform.rdv.new": "获取令牌",
     "platform.rdv.warn": "同一集群的所有机器须使用同一份令牌。有效期 {days} 天。",
-    "cluster.emptyTitle": "选择运行方式",
+    "cluster.emptyTitle": "启动你的模型",
     "cluster.create": "创建集群",
     "cluster.serveLocal": "仅在本机运行",
     "deploy.local": "仅用本机",
-    "deploy.local.tooBig": "所选模型在本机放不下。请改选更小的模型，或用多台机器一起运行。",
     "deploy.cluster": "多台机器一起",
     "cluster.title": "集群",
     "cluster.machines": "{n} 台机器",
@@ -778,9 +805,11 @@ export const STRINGS = {
     "cluster.serving": "正在服务",
     "cluster.waiting": "等待机器加入",
     "cluster.loadingHint": "首次启动需下载本机的模型分片——视网速可能需要几分钟。",
-    "capacity.ratio": "可用 {have} GB / 需求 {need} GB（预估）",
+    "capacity.ratio": "可用显存 {have} GB / 需求 {need} GB（预估）",
     "stats.requests": "次请求",
     "stats.tokens": "词元",
+    "stats.ctx": "上下文",
+    "stats.ctxTitle": "该服务所选的精确上下文窗口；KV 缓存精度自动决定",
     "stats.cache": "KV 复用省",
     "stats.cacheTitle": "前缀缓存复用省下的预填充词元数",
     "stats.uptime": "在线",
@@ -818,11 +847,13 @@ export const STRINGS = {
     "chat.generating": "这个对话正在生成回复",
     "chat.queued": "已发送——正在等待集群开始处理",
     "chat.queuedBehind": "排队中——集群正在先完成另一个对话的回复",
-    "chat.limit": "已有 {n} 条回复正在生成，这是本应用的上限。等其中一条结束后再发。",
+    "chat.limit": "已有 {n} 条回复正在由本机或共享算力处理。等其中一条结束后再发。",
     "chat.toLatest": "回到最新",
     "chat.toLive": "跟随生成",
     "model.serving": "正在回答",
     "model.selected": "已选模型",
+    "model.longContext": "1M上下文",
+    "model.longContextUnavailable": "该模型不支持 1M 上下文。",
     "model.change": "更换",
     "chat.model.servingTitle": "由加载它的协调者上报——回答你的就是这个模型。",
     "chat.model.selectedTitle": "这是你在「设置」里选的模型。集群还没上报它加载的是哪个，请求就按这个发。",
@@ -833,7 +864,7 @@ export const STRINGS = {
     "model.switch.cancel": "保持不变",
     "model.pick.apply": "确定",
     "model.switch.go": "切换并重启",
-    "model.request.hint": "列表中的每个模型都经过真机验证。需要其他模型？",
+    "model.request.hint": "需要其他模型？",
     "model.request.link": "去 GitHub 提交需求",
     "model.rank.byUsage": "按平台近 7 天调用量排序",
     "model.rank.tokens": "近 7 天 {n} 词元",
@@ -914,12 +945,15 @@ const ERROR_KEYS: Record<string, StringKey> = {
   // error message. Their fix is to reinstall; the developer's is to build.
   ENGINE_BIN_MISSING: IS_DEV_BUILD ? "engine.err.binMissingDev" : "engine.err.binMissing",
   ENGINE_REFUSED_SILENT: "engine.err.refusedSilent",
+  RESOURCE_INSUFFICIENT: "engine.err.resourceInsufficient",
   PLATFORM_URL_EMPTY: "platform.err.noUrl",
   PLATFORM_NO_SESSION: "platform.err.noSession",
   PAIR_NOT_CREATOR: "pairing.err.notCreator",
   PAIR_NEED_TWO: "pairing.err.needTwo",
   PAIR_ALREADY_STARTED: "pairing.err.started",
   PAIR_NO_MEMBER: "pairing.err.noMember",
+  PAIR_MODEL_MISMATCH: "pairing.err.modelMismatch",
+  PAIR_MODEL_NOT_READY: "pairing.err.modelNotReady",
 };
 
 export const LangContext = createContext<{

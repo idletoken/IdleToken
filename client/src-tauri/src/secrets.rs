@@ -40,6 +40,19 @@ fn store_path() -> Option<PathBuf> {
     }
     let dir = PathBuf::from(home).join(".idletoken");
     std::fs::create_dir_all(&dir).ok()?;
+    // The file is 0600, but the directory it lives in was whatever the umask
+    // said — typically 0755. That does not expose the bytes, and it does expose
+    // the listing: another user on the machine could see which credential files
+    // exist and when they were last written, and could not be stopped from
+    // creating files alongside them. 0700 costs nothing and closes both.
+    // Windows has no equivalent one-liner here; the profile directory's
+    // inherited ACL is the boundary there, which is the same boundary the RPC
+    // PSK file already relies on.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
     Some(dir.join("client-secrets.json"))
 }
 

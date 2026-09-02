@@ -1,13 +1,6 @@
-// Weight presence + download control, rendered next to whatever the user just
-// pressed. Shared by the model list (Settings → Quick) and the "run on this
-// machine" row (Cluster), because BOTH of them start a download.
-//
-// This used to be one floating bar for the whole app. Removing it fixed the
-// interruption but created a worse bug: pressing "Run it here" on the Cluster
-// page kicked off a 4.7 GB download whose progress — and whose failures — only
-// rendered on a different page. The button looked dead. Feedback has to live
-// where the action is, so this component goes to both places rather than back
-// into a bar that covers everything.
+// Weight presence + download control for one exact model+precision. The host
+// renders it with the selected model, never once per deployment choice: a
+// single GGUF transfer must look like one job.
 import { useI18n } from "./i18n";
 import { fmtBytes } from "./format";
 
@@ -39,17 +32,17 @@ export interface WeightsInfo {
  * last failure rides along as a quiet note, so a download that keeps dying is
  * still diagnosable.
  *
- * `idle` hides the resting "not downloaded yet" case — the Cluster row passes
- * it, because there the download is implied by the button next to it and the
- * standing fact would just be noise.
+ * `idle="hide"` suppresses the plain resting "not downloaded yet" case when a
+ * host only needs live progress, while still surfacing a partial copy or the
+ * reason the last attempt stopped.
  */
 export default function WeightsRow(props: { w: WeightsInfo; idle?: "hide" | "show" }) {
   // tErr: notes and failure reasons from the Rust download path carry a
   // "[CODE] detail" prefix and render localized; anything else passes through.
   const { t, tErr } = useI18n();
   const d = props.w.dl;
-  // In Settings this sits inside a <label> that owns a radio; without this,
-  // clicking Download would also re-select the model.
+  // Some hosts put this inside a clickable model row. Do not let Download or
+  // Cancel also trigger the row's selection action.
   const stop = (e: React.MouseEvent) => e.preventDefault();
 
   if (d) {
@@ -66,9 +59,9 @@ export default function WeightsRow(props: { w: WeightsInfo; idle?: "hide" | "sho
     );
   }
   if (props.w.needs) {
-    // The Cluster row hides the resting state — but not when there is something
-    // to say about it. A part-downloaded model and a failed attempt are both
-    // things the button next to it does NOT imply.
+    // A host may hide the resting state — but not when there is something to
+    // say about it. A partial copy and a failed attempt both need a visible way
+    // to continue.
     const partial = props.w.partialBytes > 0;
     if (props.idle === "hide" && !partial && !props.w.lastError) return null;
     return (

@@ -48,8 +48,8 @@ The OpenAI-compatible endpoint works at the same base URL. Requests run on clust
 
 IdleToken is a desktop app; normal use needs no command line. Installers for Windows, Linux and macOS are on the [Releases](https://github.com/idletoken/IdleToken/releases) page.
 
-1. **Pick a model** — from the built-in list. The app checks it against this machine's available VRAM and RAM.
-2. **Start serving** — missing weights download automatically. The API listens on `127.0.0.1:8000`, this machine only; the app shows the address and the generated API key.
+1. **Pick a model and context** — from the built-in list. Context is exactly 256K by default; models that support it offer an explicit 1M checkbox. The app estimates the selected service against GPU memory only.
+2. **Start serving** — missing weights download automatically. The API listens on `127.0.0.1:8000`, this machine only; the app shows the address. It needs no key: a loopback-only port cannot be reached from anywhere else, and a key stored on the machine would not stop a program already running on it. (Requests carrying an `Origin` header are refused, which keeps a web page in your browser from firing at the port; set `--api-token` on the coordinator if you want a key anyway.)
 
 Weights are fetched from Hugging Face. If `huggingface.co` cannot be reached, the client retries the same file from the `hf-mirror.com` mirror rather than failing — a fallback worth knowing about if your network policy cares where bytes come from. Either way the finished file is checked against the SHA-256 recorded in the model manifest before it is used, and a file that does not match is discarded.
 
@@ -57,7 +57,7 @@ Connect Claude Code:
 
 ```sh
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8000
-export ANTHROPIC_API_KEY='<key shown in IdleToken>'
+export ANTHROPIC_API_KEY=idletoken   # any value; the local API does not check it
 claude
 ```
 
@@ -65,12 +65,14 @@ Or use the OpenAI-compatible endpoint:
 
 ```sh
 curl http://127.0.0.1:8000/v1/chat/completions \
-  -H 'authorization: Bearer <key shown in IdleToken>' \
   -H 'content-type: application/json' \
   -d '{"model":"qwen3-8b","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-When a model is too large for one machine, machines on the same LAN can serve it together. Create a cluster on one machine and join the others with a six-character code or the same account; IdleToken measures each machine's usable memory and splits the model accordingly. Windows, Linux and macOS nodes can mix in one cluster; every node must run the same IdleToken version. Workers receive their model shards from the API machine over an encrypted connection, and prompts do not cross the cluster in plain text.
+`GET /v1/models` reports the one model this machine currently serves — the id to
+put in any client's configuration.
+
+Machines on the same LAN can serve a model together. Cluster deployment is the default choice; local-only deployment remains available explicitly. IdleToken compares the exact selected model, precision and 256K/1M context with usable GPU memory and refuses startup if the complete service does not fit—there is no CPU/RAM offload or automatic context reduction. Windows, Linux and macOS nodes can mix in one cluster; every node must run the same IdleToken version. Workers receive their model shards from the API machine over an encrypted connection, and prompts do not cross the cluster in plain text.
 
 To earn Sparks, turn on sharing while your cluster is idle — it is off by default.
 
@@ -107,7 +109,7 @@ These apply to machines that run inference; using the platform requires no GPU a
 - Operating systems can mix in one cluster; the IdleToken version must match on every node.
 - Cluster machines need a direct LAN route to each other; tensor traffic does not go through VPN or overlay networks such as Tailscale. Wired gigabit or faster is recommended.
 - CPU-only machines, AMD GPUs, Intel Macs and phones cannot compute, but can run the client to sign in, chat and control a cluster.
-- The API machine stores the complete GGUF; a worker only needs memory for its assigned shard.
+- Every compute node stores the complete selected GGUF on disk. At startup a worker copies and loads only its assigned tensors, so RAM/VRAM usage follows the assigned slice rather than the full file.
 
 ## Building from source
 

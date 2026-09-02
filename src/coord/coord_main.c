@@ -29,9 +29,11 @@
 #include "idletoken_llama_sidecar.h"   /* llamacpp single-machine mode (WS-B1) */
 #include "idletoken_model_auto.h"   /* open model intake: GGUF -> spec (WS-B4) */
 #include "idletoken_modelsize.h"    /* where the memory budget's bytes come from */
+#include "idletoken_weights.h"      /* layer-range repo + ggml-RPC cache seeding */
 #include "idletoken_enginever.h"   /* engine version invariant (WS-C3) */
 #include "idletoken_apiconv.h"   /* Anthropic <-> OpenAI body translation */
 #include "idletoken_overflow.h"   /* overflow routing: borrow when this box is full */
+#include "idletoken_admission.h"  /* who a loopback request really came from (PROV-28) */
 #include "ds4.h"
 
 #include <errno.h>
@@ -75,6 +77,29 @@
 
 #define IDLETOKEN_MAX_WORKERS 16
 
+/* Read deadlines on the worker-facing socket (2026-08-30, CLUS-05/CLUS-13).
+ *
+ * The join loop is serial: one machine is admitted at a time, and every step is
+ * a blocking read. Before these existed, ANY device on the LAN could stop a
+ * home cluster from ever forming by opening TCP to the join port and then
+ * sending nothing — no join code, no packet after the SYN, no way for the
+ * IDLETOKEN_JOIN_WAIT_S deadline to notice, because that deadline is measured
+ * around accept() and the stall happens after accept() returns.
+ *
+ * Each value is sized to the slowest honest case for that step and no larger:
+ *   JOIN_STEP  pairing preamble + HELLO + RESOURCE_REPORT — small messages on a
+ *              LAN, so seconds of slack, not minutes.
+ *   RPC_READY  the worker has to start a real rpc-server (load a backend, bind
+ *              a port). Cold Windows machines have been measured in the tens of
+ *              seconds.
+ *   CACHE      the worker is fetching its layer shard, which is legitimately
+ *              minutes — but it reports progress every 256 MiB, so total
+ *              SILENCE for this long means the worker is gone or is stalling us
+ *              on purpose. */
+#define IDLETOKEN_JOIN_STEP_TIMEOUT_MS  15000
+#define IDLETOKEN_RPC_READY_TIMEOUT_MS  120000
+#define IDLETOKEN_CACHE_SILENCE_TIMEOUT_MS 600000
+
 /* The model this cluster run serves (--model-id, default DSv4-Flash). Set in
  * main() before any worker/HTTP traffic; the fallback keeps early error paths
  * safe. All layer counts / weight sizes come from here — never hard-coded
@@ -90,6 +115,11 @@ static const idletoken_model_spec *g_model;
 static uint8_t g_cluster_salt[IDLETOKEN_CLUSTER_SALT_BYTES];
 static uint8_t g_cluster_key[IDLETOKEN_SESSION_KEY_BYTES];
 static int     g_cluster_key_ok;
+
+/* The prompt-excerpt logging decision lives with the origin classifier that
+ * gates it (prompt_excerpt_log_on(), further down): the two are one rule, and
+ * an earlier draft of this change declared the flag here as well, which the
+ * compiler caught only because both spellings initialised it. */
 static const idletoken_model_spec *coord_model(void) {
     return g_model ? g_model : idletoken_model_default();
 }
@@ -135,10 +165,52 @@ static char g_api_unix[320] = "";
 static char g_engine_unverified[240] = "";
 
 static idletoken_llama *g_llama;
-/* Sequence slots the engine was started with (`-np`), derived from this
- * machine's memory by idletoken_llama_seq_slots(). 1 = today's serial
- * behaviour. Written once before the engine spawns, read-only after. */
+
+/* A cluster is not effectively READY merely because llama-server has finished
+ * constructing its CUDA/RPC tensors. The post-load worker keeps public state
+ * at "starting" until the GPU-only placement is actually ready for traffic. */
+typedef struct {
+    pthread_mutex_t mu;
+    int state;                    /* 0 = disabled/done, 1 = pending, -1 = failed */
+    char base_url[1600];
+    char gguf[1280];
+    unsigned layer_hi;
+    char error[192];
+} coord_postload_prefetch;
+
+static coord_postload_prefetch g_postload_prefetch = {
+    .mu = PTHREAD_MUTEX_INITIALIZER,
+};
+
+static int coord_postload_prefetch_state(void) {
+    int state;
+    pthread_mutex_lock(&g_postload_prefetch.mu);
+    state = g_postload_prefetch.state;
+    pthread_mutex_unlock(&g_postload_prefetch.mu);
+    return state;
+}
+
+static const char *coord_llama_state_name(void) {
+    idletoken_llama_state state = idletoken_llama_get_state(g_llama);
+    if (state == IDLETOKEN_LLAMA_READY) {
+        const int warm = coord_postload_prefetch_state();
+        if (warm > 0) return "starting";
+        if (warm < 0) return "failed";
+    }
+    return idletoken_llama_state_name(state);
+}
+/* Sequence slots the engine was started with (`-np`). Product policy is one
+ * local sequence: spend the KV budget on that conversation's context and let
+ * platform overflow absorb simultaneous local work. The resource-derived
+ * value is still computed/logged for diagnostics, and the measurement-only
+ * IDLETOKEN_LLAMA_SLOTS escape hatch can override it. */
 static int g_llama_slots = 1;
+/* Exact selected context, reported unchanged in stats and service identity.
+ * It is 256K by default or 1M after explicit opt-in and never grows or shrinks
+ * at runtime. g_llama_gpu_only carries the sole supported mode into the
+ * sidecar so --poll 0 is applied. */
+static uint32_t g_ctx_display;
+static int      g_llama_gpu_only;
 
 /* llama.cpp cluster membership exposed to the client status endpoint. Unlike
  * the legacy pipeline these nodes own tensor shares, not contiguous layer
@@ -155,6 +227,15 @@ typedef struct {
 } idletoken_rpc_peer;
 static idletoken_rpc_peer g_rpc_peers[IDLETOKEN_LLPLAN_MAX_NODES];
 static int g_n_rpc_peers = 0;
+
+/* Resource rows behind GET /idletoken/v1/capability in llama.cpp mode. The
+ * HTTP pool has no legacy `worker_info` roster, so passing NULL,0 used to make
+ * that route advise over one uninitialized stack row. Besides inventing
+ * capacity numbers, its garbage label pointer crashed the coordinator when a
+ * user opened Cluster or Settings during a chat. This value-owned snapshot is
+ * immutable after the HTTP workers start. */
+static idletoken_node_mem g_capability_nodes[IDLETOKEN_LLPLAN_MAX_NODES];
+static int g_n_capability_nodes = 0;
 
 /* The precision this run serves (--quant, default = model's default variant).
  * Empty string for models with no variant menu. Carried in ASSIGN_PLAN so the
@@ -250,10 +331,10 @@ static void usage(FILE *out) {
 "Optional:\n"
 "  --bind H:P          worker-facing TCP (default: 0.0.0.0:14100)\n"
 "  --num-workers N     wait for N workers, then plan (default: 1)\n"
-"  --ctx-size N        context window in ASSIGN_PLAN (default: 8192)\n"
-"  --ctx-fit           treat --ctx-size as a ceiling: grant the largest\n"
-"                      window this machine's memory affords (floor 16384)\n"
-"                      instead of refusing when the ceiling does not fit\n"
+"  --force-cluster     honor an explicit multi-machine choice even when the\n"
+"                      selected model and precision also fit locally\n"
+"  --ctx-size N        exact context window (product default: 262144; the\n"
+"                      client passes 1048576 after explicit 1M opt-in)\n"
 "  --model-id ID       model to serve, from the model registry\n"
 "                      (default: deepseek-v4-flash; other registered models\n"
 "                      need their backend implemented first)\n"
@@ -412,12 +493,41 @@ static int do_hello(int fd, idletoken_worker_info *w, uint64_t *out_request_id) 
     idletoken_buf_init(&b, hp, h.payload_bytes);
     uint8_t pad3[3];
     idletoken_buf_get_bytes(&b, w->uuid, 16);
-    idletoken_buf_get_str  (&b, w->hostname,  sizeof(w->hostname));
-    idletoken_buf_get_str  (&b, w->version,   sizeof(w->version));
-    idletoken_buf_get_str  (&b, w->bind_addr, sizeof(w->bind_addr));
+    /* _strict, not the truncating read (CLUS-06/CLUS-14). These three fields
+     * are an identity, a dialable address and a version compared for equality;
+     * a value that did not fit is a DIFFERENT value, and silently keeping its
+     * first 63 bytes is how two machines end up sharing one name. */
+    idletoken_buf_get_str_strict(&b, w->hostname,  sizeof(w->hostname));
+    idletoken_buf_get_str_strict(&b, w->version,   sizeof(w->version));
+    idletoken_buf_get_str_strict(&b, w->bind_addr, sizeof(w->bind_addr));
     idletoken_buf_get_u8   (&b, &w->os_family);
     idletoken_buf_get_bytes(&b, pad3, 3);
     if (b.err) { fprintf(stderr, "coord: HELLO payload malformed\n"); return -1; }
+
+    /* Passing the pairing handshake proves the peer holds the join code. It
+     * proves nothing about the BYTES it then sends (CLUS-14). These strings go
+     * straight into log lines and into the /idletoken/v1/cluster/status JSON
+     * body, so a quote or a newline here is a document-rewriting or
+     * log-forging primitive available to any authorized-but-modified worker.
+     * Refuse at ingress; the status writer escapes as well. */
+    /* bind_addr is the strict one: this coordinator dials it and hands it to
+     * llama-server as an `--rpc` argument, so it must look like an address and
+     * nothing else. hostname and version are labels — they are printed and
+     * shown, never used to decide who may do what — so they only have to be
+     * safe to print, and a machine whose name contains a parenthesis should
+     * not be locked out of its owner's own cluster over a charset. */
+    if (!idletoken_peer_host_ok(w->bind_addr, sizeof(w->bind_addr))) {
+        fprintf(stderr, "coord: HELLO rejected — the rpc endpoint is empty, "
+                        "over-long, or is not an address\n");
+        return -1;
+    }
+    if (!idletoken_peer_label_ok(w->hostname, sizeof(w->hostname)) ||
+        !idletoken_peer_label_ok(w->version, sizeof(w->version))) {
+        fprintf(stderr, "coord: HELLO rejected — the machine name or version "
+                        "string is empty, over-long, or carries control "
+                        "characters, quotes or non-ASCII bytes\n");
+        return -1;
+    }
     /* Optional trailing field (WS-C3): the worker's llama.cpp build version.
      * Read only when bytes remain, so a pre-C3 worker's HELLO still parses;
      * a failed optional read must not poison the verdict above. */
@@ -425,7 +535,11 @@ static int do_hello(int fd, idletoken_worker_info *w, uint64_t *out_request_id) 
     if (b.pos + 2 <= h.payload_bytes) {
         idletoken_buf ev = b;   /* copy: keep b's err state pristine */
         char ver[IDLETOKEN_ENGINE_VERSION_MAX] = "";
-        if (idletoken_buf_get_str(&ev, ver, sizeof(ver)) == 0 && !ev.err)
+        /* Strict: this string is compared for EQUALITY against ours to enforce
+         * the one cluster invariant. A truncated engine version that happens to
+         * match our first 63 bytes would pass a gate it should have failed. */
+        if (idletoken_buf_get_str_strict(&ev, ver, sizeof(ver)) == 0 && !ev.err &&
+            idletoken_peer_label_ok(ver, sizeof(ver)))
             snprintf(w->engine_version, sizeof(w->engine_version), "%s", ver);
     }
     *out_request_id = h.request_id;
@@ -518,7 +632,14 @@ static int recv_resource_report(int fd, idletoken_worker_info *w) {
     idletoken_buf_get_bytes(&b, pad7, 7);
     if (b.err) { fprintf(stderr, "coord: RESOURCE_REPORT payload malformed\n"); return -1; }
 
-    w->score = w->vram_usable * 1000ull + w->ram_usable;
+    /* The GPU name is a peer-chosen string that reaches the cluster/status JSON
+     * and the log (CLUS-14). An unprintable one is replaced rather than
+     * refused: unlike the endpoint, nothing is decided from it, so losing a
+     * machine over a vendor's odd device string would be the worse failure. */
+    if (!idletoken_peer_label_ok(w->gpu_name, sizeof(w->gpu_name)))
+        snprintf(w->gpu_name, sizeof(w->gpu_name), "(unnamed GPU)");
+
+    w->score = w->vram_usable;
     return 0;
 }
 
@@ -532,20 +653,20 @@ static int cmp_worker_desc(const void *pa, const void *pb) {
 
 /* Resource-proportional split + mode decision live in src/common/plan.c as
  * pure unit-tested functions (src/tools/plan_test.c). This wrapper adapts
- * idletoken_worker_info (callers pass it sorted strongest-first) and stamps
- * stage ids / contiguous layer ranges. In HYBRID the split sizes by VRAM+RAM
- * so weak-VRAM/ample-RAM nodes get more layers and offload the overflow. */
+ * idletoken_worker_info (callers pass it sorted by usable VRAM) and stamps
+ * stage ids / contiguous layer ranges. */
 static void plan_layers(idletoken_worker_info *ws, int n, idletoken_mode mode,
                         uint32_t ctx_size) {
     if (n <= 0) return;
 
-    idletoken_node_mem nodes[IDLETOKEN_MAX_WORKERS];
+    idletoken_node_mem nodes[IDLETOKEN_MAX_WORKERS] = {0};
     for (int i = 0; i < n && i < IDLETOKEN_MAX_WORKERS; i++) {
         nodes[i].vram_usable = ws[i].vram_usable;
         nodes[i].ram_usable  = ws[i].ram_usable;
         nodes[i].ram_pinnable= ws[i].ram_pinnable;
         nodes[i].unified     = ws[i].unified;
-        nodes[i].label       = ws[i].hostname;
+        nodes[i].backend     = IDLETOKEN_BACKEND_OF_OS(ws[i].os_family);
+        snprintf(nodes[i].label, sizeof nodes[i].label, "%s", ws[i].hostname);
     }
 
     int counts[IDLETOKEN_MAX_WORKERS];
@@ -554,9 +675,8 @@ static void plan_layers(idletoken_worker_info *ws, int n, idletoken_mode mode,
 
     /* Test/override hook: IDLETOKEN_FORCE_LAYERS="c0,c1,..." pins each stage's
      * layer count (strongest-first order), bypassing the proportional split.
-     * Used to deliberately assign a discrete card MORE layers than fit in its
-     * VRAM to exercise HYBRID (managed-memory VRAM+RAM). Counts must sum to
-     * the model's layer count. */
+     * Counts must sum to the model's layer count. It is a diagnostic override,
+     * never a way to bypass runtime GPU admission. */
     const char *force = getenv("IDLETOKEN_FORCE_LAYERS");
     if (force && force[0]) {
         int sum = 0, k = 0;
@@ -614,7 +734,7 @@ static int send_assign_plan(const idletoken_worker_info *w, int cluster_size,
     idletoken_buf_put_u8(&b, (uint8_t)cluster_size);
     idletoken_buf_put_u8(&b, w->stage_id);
     idletoken_buf_put_u8(&b, 0);                  /* segment_id, v0.1 */
-    idletoken_buf_put_u8(&b, mode);               /* idletoken_mode: 1=GPU_ONLY, 2=HYBRID */
+    idletoken_buf_put_u8(&b, mode);               /* idletoken_mode: 1=GPU_ONLY */
     idletoken_buf_put_u16(&b, w->layer_lo);
     idletoken_buf_put_u16(&b, w->layer_hi);
     idletoken_buf_put_u16(&b, coord_model()->n_layers);
@@ -1087,13 +1207,11 @@ static void coord_send_busy_429(int cfd, long long est_ms) {
 
 /* --- llamacpp-mode inference admission (P2) --------------------------------
  *
- * The engine serves `slots` sequences at once (`-np`, sized by
- * idletoken_llama_seq_slots). This gate is the coordinator's half of that
- * number: at most `slots` relays touch the engine concurrently, at most `qcap`
- * more wait for a free one, and request number slots+qcap+1 is told to go
- * somewhere else INSTEAD of joining an unbounded line — the same discipline as
- * the cluster path's intake queue, and the same one as "cluster formation must
- * not wait forever" (CLAUDE.md #12).
+ * The engine normally serves one local sequence (`-np 1`). This gate is the
+ * coordinator's half of that number: at most `slots` relays touch the engine
+ * concurrently. The normal queue is intentionally zero-deep, so a simultaneous
+ * local request reaches overflow immediately instead of sitting silently behind
+ * a long generation. When borrowing is off or fails, it gets an honest 429.
  *
  * Non-inference routes (/health, stats, tokenize) never take the gate, which is
  * what keeps the dashboard answering while every slot is mid-generation. */
@@ -1111,7 +1229,7 @@ static void infer_gate_init(int slots) {
     if (slots < 1) slots = 1;
     memset(&g_infer, 0, sizeof(g_infer));
     g_infer.slots = slots;
-    g_infer.qcap  = slots;   /* plan §9: queue as deep as the machine is wide */
+    g_infer.qcap  = 0;       /* concurrency belongs to overflow, not local KV */
     pthread_mutex_init(&g_infer.mu, NULL);
     pthread_cond_init(&g_infer.cv, NULL);
 }
@@ -1382,8 +1500,8 @@ static uint64_t coord_kv_bytes_per_seq(const idletoken_model_spec *m,
  *   and workspace usage, which kv_per_seq does not cover. Better to run one
  *   sequence fewer than to have sequence N hit OOM halfway through.
  *
- * On HYBRID deployments (unified memory, or VRAM already full) the computation
- * uses RAM headroom -- which is exactly where such machines keep their KV.
+ * Only the GPU working-set budget is eligible. Unified-memory probes report
+ * that one budget through vram_usable; host RAM is never a second pool.
  */
 #define KV_SHARE_NUM 1
 #define KV_SHARE_DEN 2
@@ -1399,10 +1517,6 @@ static int coord_auto_seq_slots(const idletoken_model_spec *mi,
         if (kv_per_seq == 0) return 1;   /* no marginal KV for this model: stick to one slot */
         uint64_t usable = ws[i].vram_usable;
         uint64_t used   = ws[i].vram_used_after;
-        if (ws[i].unified || used > usable) {   /* unified memory, or VRAM is full: KV lands in host RAM */
-            usable = ws[i].ram_usable;
-            used   = ws[i].ram_used_after;
-        }
         uint64_t freeb = usable > used ? usable - used : 0;
         int slots = (int)((freeb / KV_SHARE_DEN * KV_SHARE_NUM) / kv_per_seq);
         if (slots < best) best = slots;
@@ -1755,6 +1869,139 @@ static int request_from_platform(const idletoken_http_req *req) {
     return strcmp(origin, IDLETOKEN_ORIGIN_PLATFORM) == 0;
 }
 
+/* Non-zero once this coordinator is also a provider, i.e. once "no marker"
+ * stops having exactly one possible meaning. Set by --shared, and also the
+ * first time an agent successfully spends a capability here: a machine serving
+ * platform work is a provider whether or not the flag was typed. */
+static int g_is_provider = 0;
+
+/* May a prompt EXCERPT be written to the log? (threat register PRIV-09/HOST-05.)
+ *
+ * It lives here, next to g_is_provider, because it is the SAME rule as the one
+ * below it: whether this machine serves other people decides both what "no
+ * marker" means and whether a prompt may be quoted at all.
+ *
+ * `IDLETOKEN_LOG_PROMPTS` quotes the first 40 characters of a request. The old
+ * test was "the operator asked for it AND this request is not platform work",
+ * and the second half was a header the SENDER chose to send (PROV-28) — an
+ * agent that stripped it got the coordinator to print a buyer's prompt into its
+ * owner's log. Two changes, and the call sites need both:
+ *
+ *   - a machine that shares gets no excerpts at all, whatever the environment
+ *     says, and it announces the refusal at STARTUP rather than leaving its
+ *     operator to notice that lines are missing;
+ *   - the call sites additionally require a POSITIVELY attributed local origin,
+ *     so an unattributed request is never quoted even on a machine that only
+ *     borrows.
+ *
+ * Counts are unaffected: a token count is not content, and it is what operating
+ * the thing needs.
+ *
+ * Resolved once. main() calls this after argv is parsed so the announcement
+ * happens at startup; the memo makes the later call sites free. */
+static int g_prompt_excerpt_log_resolved = 0;
+static int g_prompt_excerpt_log = 0;
+
+static int prompt_excerpt_log_on(void) {
+    if (!g_prompt_excerpt_log_resolved) {
+        const char *env = getenv("IDLETOKEN_LOG_PROMPTS");
+        g_prompt_excerpt_log_resolved = 1;
+        g_prompt_excerpt_log = (env && env[0]) ? 1 : 0;
+        if (g_prompt_excerpt_log && (g_shared_mode || g_is_provider)) {
+            g_prompt_excerpt_log = 0;
+            fprintf(stderr, "coord: IDLETOKEN_LOG_PROMPTS is set and is being "
+                            "IGNORED: this machine serves other people's work, "
+                            "and a request carrying no origin marker cannot be "
+                            "shown to be yours (PRIV-09/PROV-28)\n");
+        }
+    }
+    return g_prompt_excerpt_log;
+}
+
+/* Where did this request REALLY come from?
+ *
+ * The four-state answer that replaced a boolean on 2026-08-30 (threat register
+ * PROV-28). The order below is the order of trust, and it is the whole design:
+ *
+ *   1. a capability this coordinator minted and has not yet spent -> PROVEN.
+ *      The only answer that cannot be produced by editing the sender.
+ *   2. a capability that was presented and did NOT verify -> nothing. The
+ *      caller gets a 403 and the request dies; `*out_refuse` says which check
+ *      failed. This is the load-bearing half: if a bad capability quietly
+ *      demoted to "local", corrupting one byte of a ticket would be an easier
+ *      way to strip it than deleting the header, and the whole mechanism would
+ *      be theatre.
+ *   3. the legacy X-IdleToken-Origin header -> CLAIMED. Believed, because it is
+ *      only ever believed in the direction that REFUSES to forward, and because
+ *      every agent older than this change sends nothing else.
+ *   4. the local-origin marker -> LOCAL, positively attributed.
+ *   5. nothing at all -> LOCAL on a machine that only borrows, UNATTRIBUTED on
+ *      one that also lends. Same bytes on the wire, different meaning, and the
+ *      difference is decided by a fact about THIS machine rather than by
+ *      anything the sender said.
+ *
+ * Consuming happens here, once, on the parsed request — not in the routes —
+ * because a capability checked in one place and spent in another is a
+ * capability that eventually gets checked twice and spent none. */
+static idletoken_origin request_origin(const idletoken_http_req *req,
+                                       idletoken_adm_rc *out_refuse) {
+    char cap[IDLETOKEN_ADM_TICKET_CAP] = "";
+    char marker[IDLETOKEN_ADM_KEYHEX_CAP] = "";
+    if (out_refuse) *out_refuse = IDLETOKEN_ADM_OK;
+
+    if (idletoken_http_header_get(req, IDLETOKEN_HDR_ADMISSION, cap, sizeof cap) == 0 &&
+        cap[0]) {
+        uint8_t bh[32];
+        char job[IDLETOKEN_ADM_JOB_CAP] = "";
+        idletoken_adm_rc rc;
+        idletoken_admission_body_hash(req->body, req->body ? req->body_len : 0, bh);
+        rc = idletoken_admission_consume(cap, bh, (long long)time(NULL), job, sizeof job);
+        if (rc == IDLETOKEN_ADM_OK) {
+            g_is_provider = 1;
+            fprintf(stderr, "coord: origin: platform job %s admitted (capability spent)\n", job);
+            return IDLETOKEN_ORIGIN_PLATFORM_PROVEN;
+        }
+        fprintf(stderr, "coord: origin: REFUSING a request whose admission "
+                        "capability %s\n", idletoken_admission_rc_str(rc));
+        if (out_refuse) *out_refuse = rc;
+        return IDLETOKEN_ORIGIN_UNATTRIBUTED;   /* the caller turns this into a 403 */
+    }
+
+    if (request_from_platform(req)) {
+        g_is_provider = 1;
+        return IDLETOKEN_ORIGIN_PLATFORM_CLAIMED;
+    }
+
+    if (idletoken_http_header_get(req, IDLETOKEN_HDR_LOCAL_ORIGIN, marker, sizeof marker) == 0 &&
+        marker[0] && idletoken_admission_local_ok(marker))
+        return IDLETOKEN_ORIGIN_LOCAL;
+
+    return (g_shared_mode || g_is_provider) ? IDLETOKEN_ORIGIN_UNATTRIBUTED
+                                            : IDLETOKEN_ORIGIN_LOCAL;
+}
+
+/* How many times this request has already been handed on. Absent, negative or
+ * unparsable all read as 0 — a missing counter must not be able to BLOCK a
+ * first hop, only a header that says a hop already happened may. */
+static int request_hops(const idletoken_http_req *req) {
+    char hv[16] = "";
+    long v;
+    char *end = NULL;
+    if (idletoken_http_header_get(req, IDLETOKEN_HDR_HOPS, hv, sizeof hv) != 0 || !hv[0])
+        return 0;
+    v = strtol(hv, &end, 10);
+    if (!end || *end != '\0' || v < 0) return 0;
+    if (v > IDLETOKEN_OVF_MAX_HOPS) v = IDLETOKEN_OVF_MAX_HOPS;
+    return (int)v;
+}
+
+/* Is a platform-origin answer, in either of its two spellings? Overflow asks
+ * the enum; the engine-integrity refusal and the prompt log ask this. */
+static int origin_is_platform(idletoken_origin o) {
+    return o == IDLETOKEN_ORIGIN_PLATFORM_PROVEN ||
+           o == IDLETOKEN_ORIGIN_PLATFORM_CLAIMED;
+}
+
 /* Defined further down with the engine startup it belongs to; --selftest
  * exercises it here, which is the only place it can be judged on a machine the
  * scheduler refuses to run an engine on. */
@@ -1772,6 +2019,85 @@ static int msg_collect_cb(void *ud, const char *role, const char *content) {
 /* Forward declaration: the coordinator's selftest sits above the API
  * server whose guards it exercises. */
 static int api_origin_ok(const idletoken_http_req *req);
+static size_t esc_chunk_len(const char *esc, size_t len, size_t max);
+
+#ifdef _WIN32
+/* Real Windows-path probe used by the release gate. The caller supplies a
+ * directory whose NAME contains non-ASCII characters through the environment,
+ * which exercises all three vulnerable boundaries at once: getenv(), narrow
+ * CRT filesystem calls, and Winsock AF_UNIX's char sun_path. A unit test that
+ * only manipulates an in-memory UTF-8 string would miss the original failure. */
+static int windows_utf8_path_selftest(void) {
+    const char *dir = getenv("IDLETOKEN_UTF8_TEST_DIR");
+    if (!dir || !dir[0]) return 0; /* opt-in: ordinary --selftest stays portable */
+
+    char first[512], second[512], sock[512], size_why[256];
+    /* Chinese leaf names matter as well as a Chinese profile directory: the
+     * former covers model/cache names selected by the user, while the latter
+     * is where the original coord-api.sock failure occurred. These UTF-8 byte
+     * strings are test data, intentionally not translated. */
+    if (snprintf(first, sizeof first, "%s\\\xe6\xa8\xa1\xe5\x9e\x8b-\xe7\xbc\x93\xe5\xad\x98.gguf", dir) >= (int)sizeof first ||
+        snprintf(second, sizeof second, "%s\\\xe5\xb7\xb2\xe9\xaa\x8c\xe8\xaf\x81-\xe6\xa8\xa1\xe5\x9e\x8b.gguf", dir) >= (int)sizeof second ||
+        snprintf(sock, sizeof sock, "%s\\coord-api.sock", dir) >= (int)sizeof sock) {
+        fprintf(stderr, "selftest FAIL Windows UTF-8 path: test path is too long\n");
+        return 1;
+    }
+
+    FILE *f = fopen(first, "wb");
+    int file_ok = f != NULL;
+    if (f) {
+        file_ok = fwrite("utf8", 1, 4, f) == 4;
+        if (fclose(f) != 0) file_ok = 0;
+    }
+    if (!file_ok) {
+        fprintf(stderr, "selftest FAIL Windows UTF-8 path: cannot create %s: %s\n",
+                first, strerror(errno));
+        return 1;
+    }
+    struct stat st;
+    size_why[0] = '\0';
+    const uint64_t gguf_bytes =
+        idletoken_gguf_bytes_on_disk(first, size_why, sizeof size_why);
+    if (stat(first, &st) != 0 || st.st_size != 4 || gguf_bytes != 4 ||
+        rename(first, second) != 0) {
+        fprintf(stderr, "selftest FAIL Windows UTF-8 path: model stat/size/rename "
+                "under %s (%s): %s\n",
+                dir, size_why, strerror(errno));
+        unlink(first);
+        return 1;
+    }
+
+    int listener = idletoken_listen_unix(sock);
+    if (listener < 0) {
+        fprintf(stderr, "selftest FAIL Windows UTF-8 path: cannot listen on %s: %s\n",
+                sock, strerror(errno));
+        unlink(second);
+        return 1;
+    }
+    int client = idletoken_connect_unix(sock);
+    int peer = client >= 0 ? idletoken_accept_tcp(listener) : -1;
+    if (client < 0 || peer < 0) {
+        fprintf(stderr, "selftest FAIL Windows UTF-8 path: AF_UNIX connect/accept on %s: %s\n",
+                sock, strerror(errno));
+        if (client >= 0) idletoken_close_fd(client);
+        idletoken_close_fd(listener);
+        unlink(sock);
+        unlink(second);
+        return 1;
+    }
+    idletoken_close_fd(peer);
+    idletoken_close_fd(client);
+    idletoken_close_fd(listener);
+    const int cleanup_ok = unlink(sock) == 0 && unlink(second) == 0;
+    if (!cleanup_ok) {
+        fprintf(stderr, "selftest FAIL Windows UTF-8 path: cleanup under %s: %s\n",
+                dir, strerror(errno));
+        return 1;
+    }
+    fprintf(stderr, "selftest PASS Windows UTF-8 file + AF_UNIX path: %s\n", dir);
+    return 0;
+}
+#endif
 
 static int coord_selftest(void) {
     int fails = 0;
@@ -1801,6 +2127,9 @@ static int coord_selftest(void) {
             { "-ts 0,1",                    1, "split short alias" },
             { "--device=RPC0",              1, "equals form" },
             { "--tensor_split 0,1",         1, "underscore normalisation" },
+            { "-ngl auto",                  1, "GPU-layer override" },
+            { "--n-gpu-layers 4",          1, "GPU-layer long form" },
+            { "--fit on",                   1, "CPU-offload fitter" },
             { "-c 4096 --device RPC0 -np 2", 1, "mid-string" },
             { "--spec-type f16",            0, "T14's real use must keep working" },
             { "--devices-note x",           0, "contains --device but is not it" },
@@ -1993,11 +2322,12 @@ static int coord_selftest(void) {
         for (int i = 0; i < 2; i++) { tw[i].layer_lo = 0; tw[i].layer_hi = 10; }
         tw[0].vram_usable = per_seq * 2; tw[1].vram_usable = per_seq * 2;
         ST(coord_auto_seq_slots(&gqa, tw, 2, ctx) == 1, "auto-slots: only spends half the free memory");
-        /* Unified memory (DGX/Spark) reads the RAM budget. */
+        /* Unified memory reports its one GPU working-set budget as VRAM. */
         memset(tw, 0, sizeof(tw));
         tw[0].layer_lo = 0; tw[0].layer_hi = 10;
-        tw[0].unified = 1; tw[0].ram_usable = per_seq * 8;
-        ST(coord_auto_seq_slots(&gqa, tw, 1, ctx) == 2, "auto-slots: unified memory reads the RAM budget");
+        tw[0].unified = 1; tw[0].vram_usable = per_seq * 8;
+        ST(coord_auto_seq_slots(&gqa, tw, 1, ctx) == 2,
+           "auto-slots: unified memory reads the reported GPU budget");
 
         /* DSv4's calibrated table has no separable marginal KV -> fall back to a
          * single slot, never guess. */
@@ -2010,7 +2340,7 @@ static int coord_selftest(void) {
            "auto-slots: DSv4 calibrated table has no marginal KV -> stay at 1");
         ST(coord_kv_bytes_per_seq(&dsv4, ctx, 10) == 0, "auto-slots: DSv4 marginal KV is undefined");
 
-        /* HYBRID: only 1 layer in `interval` is full attention and grows with
+        /* Hybrid attention architecture: only 1 layer in `interval` is full attention and grows with
          * ctx; the linear layers hold a fixed-size state. */
         idletoken_model_spec hyb;
         memset(&hyb, 0, sizeof(hyb));
@@ -2020,9 +2350,9 @@ static int coord_selftest(void) {
         hyb.full_attn_interval = 4;
         /* 8 layers -> 2 full-attention layers (rounded up) + 6 linear layers. */
         ST(coord_kv_bytes_per_seq(&hyb, ctx, 8) == (uint64_t)4096 * ctx * 2 + 1000ull * 6,
-           "auto-slots: hybrid charges ctx only to the full-attention layers");
+           "auto-slots: hybrid attention charges ctx only to the full-attention layers");
         ST(coord_kv_bytes_per_seq(&hyb, ctx, 8) < coord_kv_bytes_per_seq(&gqa, ctx, 8),
-           "auto-slots: hybrid is cheaper than pure GQA at the same layer count");
+           "auto-slots: hybrid attention is cheaper than pure GQA at the same layer count");
     }
 
     /* v4 multi-sequence slot selection (E2): two interleaved sessions each keep
@@ -2151,6 +2481,151 @@ static int coord_selftest(void) {
         ST(request_from_platform(&r) == 0, "origin: an explicit local marker stays local");
     }
 
+    /* --- request_origin(): the four-state answer that replaced the boolean ---
+     *
+     * The boolean above is still the LEGACY input; what routing now reads is
+     * this. The attack it exists to stop (threat register PROV-28) is a
+     * platform agent that deletes its own marker so that its dispatched job is
+     * read as local work and forwarded on. So the assertions come in pairs:
+     * the honest shape must produce the honest answer, AND the stripped shape
+     * must not produce "local" on a machine that serves the platform. A test
+     * that only asserted the refusals would pass for a classifier that answered
+     * UNATTRIBUTED to everything, which would switch the feature off entirely
+     * for the user who paid for it.
+     *
+     * g_shared_mode / g_is_provider are saved and restored: these are process
+     * globals and the blocks after this one must not inherit a provider. */
+    {
+        idletoken_http_req r;
+        const int saved_shared = g_shared_mode, saved_prov = g_is_provider;
+        char aerr[160], marker[IDLETOKEN_ADM_KEYHEX_CAP] = "";
+        char ticket[IDLETOKEN_ADM_TICKET_CAP] = "";
+        uint8_t bh[32];
+        idletoken_adm_rc refuse = IDLETOKEN_ADM_OK;
+        static const char BODY[] = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+
+        idletoken_admission_init(NULL, NULL, aerr, sizeof aerr);
+        idletoken_admission_local_marker(marker, sizeof marker);
+        idletoken_admission_body_hash(BODY, sizeof(BODY) - 1, bh);
+
+#define ORG_REQ(hdrs) do {                                                    \
+            memset(&r, 0, sizeof(r));                                         \
+            r.body = (uint8_t *)(char *)BODY;                                 \
+            r.body_len = sizeof(BODY) - 1;                                    \
+            snprintf(r.headers, sizeof(r.headers), "%s", (hdrs));             \
+        } while (0)
+
+        /* 1. A machine that only borrows. "No marker" has exactly one possible
+         *    meaning here, and reading it as anything else would break plain
+         *    curl and Claude Code for no security gain. */
+        g_shared_mode = 0; g_is_provider = 0;
+        ORG_REQ("Content-Type: application/json\r\n");
+        ST(request_origin(&r, &refuse) == IDLETOKEN_ORIGIN_LOCAL &&
+           refuse == IDLETOKEN_ADM_OK,
+           "origin: on a machine that does not share, an unmarked request is local");
+
+        /* 2. The same bytes on a machine that DOES share. This is the PROV-28
+         *    shape — a stripped platform job is indistinguishable from a LAN
+         *    client here — so it gets its own answer rather than "local". */
+        g_shared_mode = 1;
+        ORG_REQ("Content-Type: application/json\r\n");
+        ST(request_origin(&r, &refuse) == IDLETOKEN_ORIGIN_UNATTRIBUTED,
+           "origin: on a sharing machine, an unmarked request is UNATTRIBUTED, not local");
+
+        /* 3. ...and the honest local client is still recognised there, by the
+         *    marker the coordinator published. Without this the fix above would
+         *    be indistinguishable from switching the feature off. */
+        {
+            char h[300];
+            snprintf(h, sizeof h, IDLETOKEN_HDR_LOCAL_ORIGIN ": %s\r\n", marker);
+            ORG_REQ(h);
+            ST(request_origin(&r, &refuse) == IDLETOKEN_ORIGIN_LOCAL,
+               "origin: the local-origin marker attributes a request even on a "
+               "sharing machine");
+        }
+        /* A marker we did not mint is not a marker. */
+        ORG_REQ(IDLETOKEN_HDR_LOCAL_ORIGIN ": deadbeef\r\n");
+        ST(request_origin(&r, &refuse) == IDLETOKEN_ORIGIN_UNATTRIBUTED,
+           "origin: a forged local-origin marker attributes nothing");
+
+        /* 4. The legacy header is still believed — in the direction that
+         *    refuses to forward, which is the only direction it is believed in. */
+        ORG_REQ(IDLETOKEN_HDR_ORIGIN ": " IDLETOKEN_ORIGIN_PLATFORM "\r\n");
+        ST(request_origin(&r, &refuse) == IDLETOKEN_ORIGIN_PLATFORM_CLAIMED,
+           "origin: a legacy agent's header still reads as platform work");
+
+        /* 5. A real capability: minted for THIS body, spent once, and the
+         *    second attempt is a refusal rather than a demotion to "local". */
+        g_shared_mode = 0; g_is_provider = 0;
+        ST(idletoken_admission_mint("selftest-job", bh, (long long)time(NULL),
+                                    ticket, sizeof ticket, aerr, sizeof aerr) == 0,
+           "origin: the coordinator mints a capability for a job");
+        {
+            char h[512];
+            snprintf(h, sizeof h, IDLETOKEN_HDR_ADMISSION ": %s\r\n", ticket);
+            ORG_REQ(h);
+            ST(request_origin(&r, &refuse) == IDLETOKEN_ORIGIN_PLATFORM_PROVEN &&
+               refuse == IDLETOKEN_ADM_OK,
+               "origin: a spent capability proves platform work");
+            ST(g_is_provider == 1,
+               "origin: spending a capability marks this machine a provider");
+            idletoken_admission_request_end();
+
+            /* Replay. The answer must be a REFUSAL carried out to the caller,
+             * never UNATTRIBUTED-with-no-reason: a request whose capability
+             * fails is a 403, because otherwise corrupting one byte of a ticket
+             * would be an easier way to strip it than deleting the header. */
+            ORG_REQ(h);
+            ST(request_origin(&r, &refuse) == IDLETOKEN_ORIGIN_UNATTRIBUTED &&
+               refuse == IDLETOKEN_ADM_REPLAYED,
+               "origin: a replayed capability is refused as replayed");
+
+            /* Same capability, different body. */
+            ST(idletoken_admission_mint("selftest-job2", bh, (long long)time(NULL),
+                                        ticket, sizeof ticket, aerr, sizeof aerr) == 0,
+               "origin: a second capability mints");
+            snprintf(h, sizeof h, IDLETOKEN_HDR_ADMISSION ": %s\r\n", ticket);
+            ORG_REQ(h);
+            r.body = (uint8_t *)(char *)"{\"messages\":[]}";
+            r.body_len = 15;
+            ST(request_origin(&r, &refuse) == IDLETOKEN_ORIGIN_UNATTRIBUTED &&
+               refuse == IDLETOKEN_ADM_BODY_MISMATCH,
+               "origin: a capability minted for another body is refused as such");
+
+            /* ...and the SAME capability still admits its own body, so the
+             * refusal above is the body check and not a dead verifier. */
+            ORG_REQ(h);
+            ST(request_origin(&r, &refuse) == IDLETOKEN_ORIGIN_PLATFORM_PROVEN,
+               "origin: ...and it still admits the body it was minted for");
+            idletoken_admission_request_end();
+        }
+
+        /* 6. Garbage in the capability header is a refusal, not a fallthrough. */
+        ORG_REQ(IDLETOKEN_HDR_ADMISSION ": not-a-capability\r\n");
+        ST(request_origin(&r, &refuse) == IDLETOKEN_ORIGIN_UNATTRIBUTED &&
+           refuse == IDLETOKEN_ADM_MALFORMED,
+           "origin: a malformed capability is refused, not demoted to local");
+
+        /* 7. The hop counter. Absent/negative/garbage must read as 0 — a
+         *    missing counter may not BLOCK a first hop — while a real count
+         *    must survive, because that is the only thing that ends a chain
+         *    RULE 1 cannot see from any single machine's side (CHAIN-05). */
+        ORG_REQ("Content-Type: application/json\r\n");
+        ST(request_hops(&r) == 0, "hops: no header means zero hops so far");
+        ORG_REQ(IDLETOKEN_HDR_HOPS ": 1\r\n");
+        ST(request_hops(&r) == 1, "hops: a declared hop is carried into the decision");
+        ORG_REQ(IDLETOKEN_HDR_HOPS ": -3\r\n");
+        ST(request_hops(&r) == 0, "hops: a negative count cannot buy a hop back");
+        ORG_REQ(IDLETOKEN_HDR_HOPS ": banana\r\n");
+        ST(request_hops(&r) == 0, "hops: an unparsable count reads as zero");
+        ORG_REQ(IDLETOKEN_HDR_HOPS ": 999\r\n");
+        ST(request_hops(&r) == IDLETOKEN_OVF_MAX_HOPS,
+           "hops: an over-large count clamps to the budget rather than wrapping");
+#undef ORG_REQ
+        g_shared_mode = saved_shared;
+        g_is_provider = saved_prov;
+    }
+
     /* --- Engine binary integrity (P0-3) ---------------------------------
      * The verdict is judged against a PUBLISHED digest — the FIPS 180-4 test
      * vector for "abc" — not against what our own hasher just produced. A
@@ -2247,19 +2722,20 @@ static int coord_selftest(void) {
            "fit detector: no text is not a failure");
     }
 
-    /* --- -ngl: single machine fits, a cluster is placed by us (2026-08-21) ---
-     * The detector above is the second line of defence; this is the thing that
-     * kept tripping it. Pinning n_gpu_layers on a single machine disables
-     * upstream's fitting procedure, so a model that would have run in HYBRID
-     * was refused instead. Both arms are asserted because both are
-     * load-bearing and they pull in opposite directions — see the header. */
+    /* --- -ngl: all product paths are GPU-only ---------------------------- */
     {
-        ST(!strcmp(idletoken_llama_ngl_arg(NULL), "auto"),
-           "-ngl: no cluster args at all → auto (the engine fits it)");
-        ST(!strcmp(idletoken_llama_ngl_arg(""), "auto"),
-           "-ngl: empty cluster args → auto, so HYBRID is reachable");
-        ST(!strcmp(idletoken_llama_ngl_arg("--rpc 192.168.1.101:50052 --device RPC0,CUDA0"), "99"),
-           "-ngl: a real cluster keeps 99 — layer 0 placement is ours, not a heuristic's");
+        ST(!strcmp(idletoken_llama_ngl_arg(NULL), "99"),
+           "-ngl: single machine keeps all layers on GPU");
+        ST(!strcmp(idletoken_llama_ngl_arg(""), "99"),
+           "-ngl: empty cluster args still keep all layers on GPU");
+        ST(!strcmp(idletoken_llama_ngl_arg(
+               "--rpc 192.168.1.101:50052 --device CUDA0,RPC0 "
+               "--tensor-split 0.5,0.5"), "99"),
+           "-ngl: an explicit GPU-only cluster split keeps 99");
+        ST(!strcmp(idletoken_llama_ngl_arg(
+               "--rpc 192.168.1.101:50052 --device CUDA0,RPC0,RPC1 "
+               "--fit-target 4096"), "99"),
+           "-ngl: no cluster string can re-enable CPU offload");
     }
 
     /* --- browser gate (2026-08-21) -------------------------------------
@@ -2544,22 +3020,29 @@ static int coord_selftest(void) {
      * planner is linked into it, and a coordinator that ships with a different
      * plan.c than the one plan_test built is exactly the drift worth catching.
      *
-     * allow_small_cluster = 1 because that is how the cell ran: the model fits
-     * the DGX alone, so without the override this returns SINGLE. */
+     * force_cluster = 1 because this is a cluster-placement fixture: the model
+     * also fits the DGX alone, so the default plan would otherwise be SINGLE. */
     {
         idletoken_llm_model_size dsv4 = {
             .total_bytes = (uint64_t)(80.76 * 1073741824.0),
             .n_layers = 43, .kv_bytes_per_token = 65536,
+            .compute_bytes_256k_cuda = 1ull << 30,
+            .compute_bytes_1m_cuda   = 2ull << 30,
+            .compute_bytes_256k_metal = 1ull << 30,
+            .compute_bytes_1m_metal   = 2ull << 30,
         };
         idletoken_node_mem cell[2] = {
             { .vram_usable = (uint64_t)(107.61 * 1073741824.0),
-              .ram_usable  = (uint64_t)(107.61 * 1073741824.0), .unified = 1 },
+              .ram_usable  = (uint64_t)(107.61 * 1073741824.0),
+              .backend = IDLETOKEN_NODE_BACKEND_CUDA, .unified = 1 },
             { .vram_usable = (uint64_t)(13.2 * 1073741824.0),
-              .ram_usable  = (uint64_t)(37.3 * 1073741824.0), .unified = 0 },
+              .ram_usable  = (uint64_t)(37.3 * 1073741824.0),
+              .backend = IDLETOKEN_NODE_BACKEND_CUDA, .unified = 0 },
         };
         idletoken_llama_plan lp;
         const double slice = (double)dsv4.total_bytes +
-                             (double)dsv4.kv_bytes_per_token * 32768.0;
+                             (double)dsv4.kv_bytes_per_token * 32768.0 +
+                             (double)dsv4.compute_bytes_256k_cuda;
         const int planned = idletoken_plan_llamacpp(&dsv4, cell, 2, 0, 32768,
                                                     1, &lp);
         ST(planned == 0 && lp.kind == IDLETOKEN_LLPLAN_CLUSTER,
@@ -2568,6 +3051,26 @@ static int coord_selftest(void) {
                lp.tensor_split[1] * slice <= (double)cell[1].vram_usable,
            "cluster split: the worker's share fits its VRAM, not its VRAM+RAM");
     }
+
+    /* Overflow opens SSE only after it owns the whole escaped answer, then
+     * chunks it. A boundary through either JSON escaping or UTF-8 would turn a
+     * successful cloud reply into malformed local events. */
+    {
+        char span[2060];
+        memset(span, 'a', 2047);
+        span[2047] = '\\'; span[2048] = 'u';
+        memcpy(span + 2049, "4e2d", 4);
+        ST(esc_chunk_len(span, 2053, 2048) == 2047,
+           "overflow SSE chunks do not split a JSON unicode escape");
+        span[2047] = (char)0xe4; span[2048] = (char)0xb8;
+        span[2049] = (char)0xad; span[2050] = 'b';
+        ST(esc_chunk_len(span, 2051, 2048) == 2047,
+           "overflow SSE chunks do not split a UTF-8 code point");
+    }
+
+#ifdef _WIN32
+    fails += windows_utf8_path_selftest();
+#endif
 
 #undef ST
     /* Node-crypto framing (docs/inter-node-encryption.md N1). Lives with the
@@ -2707,6 +3210,14 @@ static size_t json_escape_text(char *dst, size_t cap,
  * the way in; the array is what the platform's ChatMessage[] expects. */
 typedef struct { char *buf; size_t len, cap; int n, oom; } coord_ovf_msgs;
 
+/* Implemented next to the SSE emitters below. Overflow waits for the complete
+ * sealed cloud reply before opening the client's stream, then emits that whole
+ * answer as a legal OpenAI/Anthropic SSE sequence. Therefore an upstream
+ * failure still becomes an ordinary 429; no half-stream ambiguity is created. */
+static void coord_overflow_stream_reply(int conn_fd, int is_anthropic,
+                                        uint64_t req_id, const char *text_escaped,
+                                        int n_input, int n_output);
+
 static int coord_ovf_msg_cb(void *ud, const char *role, const char *content) {
     coord_ovf_msgs *m = (coord_ovf_msgs *)ud;
     if (m->oom) return 0;
@@ -2732,8 +3243,14 @@ static int coord_ovf_msg_cb(void *ud, const char *role, const char *content) {
     return 0;
 }
 
+/* `hops_in` is how many machines this request has already been handed through
+ * before it reached us. It is not re-decided here — should_forward() has
+ * already refused anything over budget — it is carried so the envelope can
+ * declare hops+1 to the platform, which is the only party positioned to see a
+ * loop that no single coordinator can (PRIV-04 / CHAIN-05). */
 static int coord_overflow_relay(int conn_fd, const idletoken_http_req *req,
-                                int is_anthropic, uint64_t req_id) {
+                                int is_anthropic, int want_stream,
+                                uint64_t req_id, int hops_in) {
     coord_ovf_msgs m = { NULL, 0, 0, 0, 0 };
     /* Anthropic keeps the system prompt out of `messages`; the platform's
      * intake has one list, so it goes in first. Dropping it would send a
@@ -2772,7 +3289,7 @@ static int coord_overflow_relay(int conn_fd, const idletoken_http_req *req,
     idletoken_overflow_reply rep;
     char err[256];
     int rc = idletoken_overflow_exchange(m.buf, coord_model()->id, max_tokens,
-                                         &rep, err, sizeof err);
+                                         hops_in, &rep, err, sizeof err);
     idletoken_secure_zero(m.buf, m.len);   /* the prompt, in the clear, in our heap */
     free(m.buf);
     if (rc != 0) {
@@ -2783,7 +3300,16 @@ static int coord_overflow_relay(int conn_fd, const idletoken_http_req *req,
         return -1;
     }
 
-    /* Same two response shapes as every other answer this coordinator gives,
+    if (want_stream) {
+        coord_overflow_stream_reply(conn_fd, is_anthropic, req_id,
+                                    rep.text_escaped,
+                                    rep.in_tokens, rep.out_tokens);
+        idletoken_overflow_reply_free(&rep);
+        return 0;
+    }
+
+    /* Same two non-stream response shapes as every other answer this
+     * coordinator gives,
      * with the model id it would have served locally: from the caller's side
      * this was one ordinary request that happened to take a little longer.
      * rep.text_escaped is already JSON-escaped and is spliced in as-is. */
@@ -3229,19 +3755,31 @@ static void llama_error_json(int conn_fd, int status, const char *type,
  * invariant #4: no silent fallback; a broken engine stays loudly broken). */
 static int llama_gate_ready(int conn_fd) {
     idletoken_llama_state st = idletoken_llama_get_state(g_llama);
-    if (st == IDLETOKEN_LLAMA_READY) return 0;
+    const int warm = coord_postload_prefetch_state();
+    if (st == IDLETOKEN_LLAMA_READY && warm == 0) return 0;
     char msg[560];
-    if (st == IDLETOKEN_LLAMA_FAILED) {
+    if (warm < 0) {
+        pthread_mutex_lock(&g_postload_prefetch.mu);
+        snprintf(msg, sizeof(msg), "inference engine state is 'failed': %s",
+                 g_postload_prefetch.error[0]
+                     ? g_postload_prefetch.error
+                     : "local CPU layer residency failed");
+        pthread_mutex_unlock(&g_postload_prefetch.mu);
+    } else if (st == IDLETOKEN_LLAMA_FAILED) {
         char why[256];
         idletoken_llama_fail_reason(g_llama, why, sizeof(why));
         snprintf(msg, sizeof(msg), "inference engine state is 'failed': %s", why);
+    } else if (st == IDLETOKEN_LLAMA_READY && warm > 0) {
+        snprintf(msg, sizeof(msg),
+                 "inference engine state is 'starting' (local CPU layers are "
+                 "being made memory-resident); retry shortly");
     } else {
         snprintf(msg, sizeof(msg),
                  "inference engine state is '%s' (idletoken-server is not serving yet); retry shortly",
                  idletoken_llama_state_name(st));
     }
     fprintf(stderr, "coord: llama-relay: refusing request — engine state %s\n",
-            idletoken_llama_state_name(st));
+            coord_llama_state_name());
     llama_error_json(conn_fd, 503, "api_error", msg);
     return -1;
 }
@@ -3793,19 +4331,49 @@ stream_end:
     llama_account(n_in, n_out, tps, t0, cached);
 }
 
-/* One escape-safe chunk of an already-escaped span: never cuts inside a
- * \x or \uXXXX escape sequence (sse_emitf frames cap at 4 KiB, so long
- * texts must go out in pieces). */
+/* One JSON-escape- and UTF-8-safe chunk of an already-escaped span: never cuts
+ * inside a \x / \uXXXX escape sequence or a multibyte code point (sse_emitf
+ * frames cap at 4 KiB, so long texts must go out in pieces). */
 static size_t esc_chunk_len(const char *esc, size_t len, size_t max) {
     size_t j = 0;
     while (j < len) {
         size_t unit = 1;
-        if (esc[j] == '\\' && j + 1 < len)
+        const unsigned char c = (unsigned char)esc[j];
+        if (esc[j] == '\\' && j + 1 < len) {
             unit = (esc[j + 1] == 'u' && j + 5 < len) ? 6 : 2;
+        } else if ((c & 0xe0) == 0xc0 && j + 1 < len) {
+            unit = 2;
+        } else if ((c & 0xf0) == 0xe0 && j + 2 < len) {
+            unit = 3;
+        } else if ((c & 0xf8) == 0xf0 && j + 3 < len) {
+            unit = 4;
+        }
         if (j + unit > max) break;
         j += unit;
     }
     return j ? j : (len < max ? len : max);
+}
+
+static void coord_overflow_stream_reply(int conn_fd, int is_anthropic,
+                                        uint64_t req_id, const char *text_escaped,
+                                        int n_input, int n_output) {
+    idletoken_sse s = {
+        .fd = conn_fd,
+        .anthropic = is_anthropic,
+        .created = (long long)time(NULL),
+    };
+    snprintf(s.id, sizeof(s.id), "%llu", (unsigned long long)req_id);
+    sse_begin(&s, n_input);
+    const size_t len = text_escaped ? strlen(text_escaped) : 0;
+    for (size_t i = 0; i < len && !s.failed; ) {
+        const size_t n = esc_chunk_len(text_escaped + i, len - i, 2048);
+        char frame[2049];
+        memcpy(frame, text_escaped + i, n);
+        frame[n] = '\0';
+        sse_delta(&s, frame);
+        i += n;
+    }
+    sse_finish(&s, n_input, n_output, 1, 0);
 }
 
 /* Streaming chat WITH tools declared. Streaming idletoken-server's OpenAI
@@ -3996,12 +4564,17 @@ static void llama_chat_stream_tools(int conn_fd, int is_anthropic,
 
 /* The chat entry point for llamacpp mode (both faces, both stream modes).
  *
- * `from_platform` is carried in for the admission point below: it is the only
- * place on this path where the request has been parsed and its origin can still
- * be read, and it decides whether a full machine may borrow another one. */
+ * `origin` and `hops_in` are carried in for the admission point below: this is
+ * the only place on this path where the request has been parsed and where its
+ * provenance can still be read, and together they decide whether a full machine
+ * may borrow another one. They are passed rather than re-derived because the
+ * capability that produced `origin` has already been SPENT upstream — deriving
+ * it a second time here would either fail (it is single-use) or require a
+ * second, un-spent check, which is how a capability ends up being verified
+ * twice and consumed never. */
 static void llama_chat_route(int conn_fd, const idletoken_http_req *req,
                              int is_anthropic, int want_stream,
-                             int from_platform) {
+                             idletoken_origin origin, int hops_in) {
     if (llama_gate_ready(conn_fd) != 0) return;
     /* Tools + stream => the one-shot path above; the upstream body must then
      * be built WITHOUT "stream":true. */
@@ -4051,11 +4624,14 @@ static void llama_chat_route(int conn_fd, const idletoken_http_req *req,
         free(up);
         return;
     }
-    if (getenv("IDLETOKEN_LOG_PROMPTS") && !from_platform) {
-        /* Opt-in debugging excerpt, LOCAL requests only — the same rule as the
-         * cluster path (see the block above ds4's tokenize log): whatever the
-         * operator sets, a platform-dispatched prompt is never quoted, because
-         * that content is not theirs to read. `up` is our own serialization,
+    if (prompt_excerpt_log_on() && origin == IDLETOKEN_ORIGIN_LOCAL) {
+        /* Opt-in debugging excerpt, ATTRIBUTED-LOCAL requests only. The test
+         * used to be `!from_platform`, i.e. "the sender did not say it was the
+         * platform" — which an agent that stripped its header could defeat,
+         * printing a stranger's prompt into this machine's log. It now takes
+         * the positive answer only: unattributed and platform-claimed requests
+         * are both excluded, and --shared switches the whole thing off at
+         * startup (see g_prompt_excerpt_log). `up` is our own serialization,
          * so the first "content" really is the first message's text. */
         char ex[41];
         size_t k = 0;
@@ -4078,9 +4654,14 @@ static void llama_chat_route(int conn_fd, const idletoken_http_req *req,
         pthread_mutex_lock(&g_stats_mu);
         double svc = g_stats.service_ms_ewma > 0 ? g_stats.service_ms_ewma : 1000.0;
         pthread_mutex_unlock(&g_stats_mu);
-        int qcap = 1;
-        infer_gate_snapshot(NULL, NULL, NULL, &qcap);
-        long long est = (long long)(svc * (double)qcap);
+        int active = 1, waiting = 0;
+        infer_gate_snapshot(&active, &waiting, NULL, NULL);
+        /* What this request would wait if it stayed local: the active work and
+         * anyone already ahead of it, not the configured queue capacity. With
+         * a zero-deep queue this is still one service time, never zero. */
+        int ahead = active + waiting;
+        if (ahead < 1) ahead = 1;
+        long long est = (long long)(svc * (double)ahead);
         fprintf(stderr, "coord: llama-relay: all %d slot(s) busy and the queue "
                         "is full -> 429\n", g_llama_slots);
         /* Overflow's one usable trigger point on this path (api-surface §5.1).
@@ -4094,8 +4675,9 @@ static void llama_chat_route(int conn_fd, const idletoken_http_req *req,
          * request was about to be refused anyway: overflow never diverts work a
          * machine could have done itself. */
         const char *why = "off";
-        if (idletoken_overflow_should_forward(from_platform, want_stream, est, &why)) {
-            if (coord_overflow_relay(conn_fd, req, is_anthropic, coord_next_req_id()) == 0) {
+        if (idletoken_overflow_should_forward(origin, want_stream, est, hops_in, &why)) {
+            if (coord_overflow_relay(conn_fd, req, is_anthropic, want_stream,
+                                     coord_next_req_id(), hops_in) == 0) {
                 free(up);
                 return;
             }
@@ -4712,9 +5294,28 @@ static void handle_http_request(int conn_fd,
         idletoken_http_send_error(conn_fd, 400, "bad request");
         return;
     }
-    const int from_platform = request_from_platform(&req);
-    fprintf(stderr, "coord: http: %s %s  body=%zuB  origin=%s\n",
-            req.method, req.path, req.body_len, from_platform ? "platform" : "local");
+    idletoken_adm_rc adm_refuse = IDLETOKEN_ADM_OK;
+    const idletoken_origin origin = request_origin(&req, &adm_refuse);
+    const int from_platform = origin_is_platform(origin);
+    const int hops_in = request_hops(&req);
+    fprintf(stderr, "coord: http: %s %s  body=%zuB  origin=%s hops=%d\n",
+            req.method, req.path, req.body_len, idletoken_origin_name(origin), hops_in);
+
+    /* A capability was presented and did not verify. There is no route below
+     * that may run: not the chat routes, not /health, nothing. Demoting the
+     * request to an ordinary one would make CORRUPTING a ticket a cheaper way to
+     * strip it than deleting it, which is the exact hole this mechanism exists
+     * to close (threat register PROV-28). */
+    if (adm_refuse != IDLETOKEN_ADM_OK) {
+        char body[320];
+        int bl = snprintf(body, sizeof(body),
+                          "{\"error\":{\"type\":\"permission_error\",\"message\":"
+                          "\"admission capability rejected: %s\"}}",
+                          idletoken_admission_rc_str(adm_refuse));
+        idletoken_http_send_json(conn_fd, 403, body, (size_t)bl);
+        free(req.body);
+        return;
+    }
 
     /* GET /health — quick liveness probe. In llamacpp mode two extra fields
      * name the engine and its state; the original fields are untouched so
@@ -4724,7 +5325,7 @@ static void handle_http_request(int conn_fd,
         if (g_llama)
             snprintf(engine_extra, sizeof(engine_extra),
                      ",\"engine\":\"llamacpp\",\"engine_state\":\"%s\"",
-                     idletoken_llama_state_name(idletoken_llama_get_state(g_llama)));
+                     coord_llama_state_name());
         /* cluster_size = number of workers (legacy semantics). In llamacpp
          * mode the legacy roster `n` is always 0 — count the RPC peers, or
          * /health claims a 2-machine cluster is running solo. */
@@ -4733,6 +5334,146 @@ static void handle_http_request(int conn_fd,
                           "{\"status\":\"ok\",\"cluster_size\":%d,\"pos\":%u%s}",
                           g_llama ? g_n_rpc_peers : n, *running_pos,
                           engine_extra);
+        idletoken_http_send_json(conn_fd, 200, body, (size_t)bl);
+        free(req.body);
+        return;
+    }
+
+    /* POST /idletoken/v1/platform/admit — mint one single-use capability.
+     *
+     * The agent presents the channel key the coordinator published to a 0600
+     * file beside it, and names the job and the exact body it is about to post.
+     * What comes back admits THAT body ONCE (include/idletoken_admission.h).
+     *
+     * Authenticated by the channel key and by nothing else: --api-token is a
+     * different credential with a different lifetime, and the Origin gate is
+     * applied on top so that a page in a browser cannot mint even if it somehow
+     * learned the key. Every refusal names its own cause — an agent that cannot
+     * mint has to be able to tell "wrong key" from "bad job id", or the failure
+     * reads as "the platform stopped sending me work". */
+    if (!strcmp(req.method, "POST") && !strcmp(req.path, IDLETOKEN_PATH_ADMIT)) {
+        char bearer[512] = "", job[IDLETOKEN_ADM_JOB_CAP] = "", hash[80] = "";
+        char ticket[IDLETOKEN_ADM_TICKET_CAP], aerr[200], body[512];
+        uint8_t bh[32];
+        const char *key = NULL;
+        int bl;
+
+        if (!api_origin_ok(&req)) {
+            static const char nob[] =
+                "{\"error\":{\"type\":\"permission_error\",\"message\":"
+                "\"admission capabilities are not minted for browser requests\"}}";
+            idletoken_http_send_json(conn_fd, 403, nob, sizeof(nob) - 1);
+            free(req.body);
+            return;
+        }
+        if (idletoken_http_header_get(&req, "authorization", bearer, sizeof bearer) == 0) {
+            key = bearer;
+            if (!strncmp(bearer, "Bearer ", 7) || !strncmp(bearer, "bearer ", 7))
+                key = bearer + 7;
+        }
+        if (!idletoken_admission_channel_ok(key)) {
+            static const char unauth[] =
+                "{\"error\":{\"type\":\"authentication_error\",\"message\":"
+                "\"the coordinator's admission channel key is required\"}}";
+            fprintf(stderr, "coord: admit: refused — wrong or missing channel key\n");
+            idletoken_http_send_json(conn_fd, 401, unauth, sizeof(unauth) - 1);
+            free(req.body);
+            return;
+        }
+        idletoken_http_json_extract_str((const char *)req.body, req.body_len,
+                                        "job_id", job, sizeof job);
+        idletoken_http_json_extract_str((const char *)req.body, req.body_len,
+                                        "body_sha256", hash, sizeof hash);
+        if (strlen(hash) != 64) {
+            idletoken_http_send_error(conn_fd, 400,
+                "body_sha256 must be the 64-hex-character SHA-256 of the request "
+                "that will be admitted");
+            free(req.body);
+            return;
+        }
+        {
+            size_t i;
+            for (i = 0; i < 32; i++) {
+                unsigned v = 0;
+                if (sscanf(hash + i * 2, "%2x", &v) != 1) break;
+                bh[i] = (uint8_t)v;
+            }
+            if (i != 32) {
+                idletoken_http_send_error(conn_fd, 400, "body_sha256 is not hex");
+                free(req.body);
+                return;
+            }
+        }
+        if (idletoken_admission_mint(job, bh, (long long)time(NULL),
+                                     ticket, sizeof ticket, aerr, sizeof aerr) != 0) {
+            char esc[240], eb[400];
+            json_escape_text(esc, sizeof(esc), aerr, strlen(aerr));
+            int n = snprintf(eb, sizeof(eb),
+                             "{\"error\":{\"type\":\"invalid_request_error\","
+                             "\"message\":\"%s\"}}", esc);
+            idletoken_http_send_json(conn_fd, 400, eb, (size_t)n);
+            free(req.body);
+            return;
+        }
+        g_is_provider = 1;   /* something is dispatching work here */
+        bl = snprintf(body, sizeof(body),
+                      "{\"capability\":\"%s\",\"expires_in\":%d}",
+                      ticket, IDLETOKEN_ADM_TTL_S);
+        idletoken_http_send_json(conn_fd, 200, body, (size_t)bl);
+        free(req.body);
+        return;
+    }
+
+    /* GET /idletoken/v1/privacy/posture — what this coordinator ENFORCES.
+     *
+     * Not a promise and not a UI string: every field is read out of the state
+     * that actually decides, so a client cannot display "local only" while the
+     * engine is forwarding. Its honest scope is the OFFICIAL coordinator —
+     * a modified one can answer anything, which is why HOST-06 stays open and
+     * this endpoint is described as a consistency check rather than as proof.
+     * Exempt from the token gate for the same reason /health is: it carries
+     * settings, never content. */
+    if (!strcmp(req.method, "GET") && !strcmp(req.path, IDLETOKEN_PATH_PRIVACY)) {
+        long long minted = 0, consumed = 0, rejected = 0;
+        int inflight = 0;
+        long long spent = 0, cap = 0;
+        char ovf_url[320] = "", ovf_esc[660];
+        char body[1200];
+        int bl;
+        idletoken_admission_counters(&minted, &consumed, &rejected, &inflight);
+        idletoken_overflow_spend_today(&spent, &cap);
+        /* The endpoint is reported because a user cannot judge PRIV-08 without
+         * it: "my prompts stay inside IdleToken" is false the moment this points
+         * somewhere else, and only the value actually dialled can say so. It is
+         * a configured string, so it is escaped like any other. */
+        idletoken_overflow_endpoint(ovf_url, sizeof ovf_url);
+        json_escape_text(ovf_esc, sizeof(ovf_esc), ovf_url, strlen(ovf_url));
+        bl = snprintf(body, sizeof(body),
+            "{\"shared_mode\":%s,\"overflow_enabled\":%s,"
+            "\"overflow_endpoint\":\"%s\","
+            "\"overflow_origin_policy\":\"%s\",\"max_exposure_hops\":%d,"
+            "\"prompt_excerpt_logging\":\"%s\","
+            "\"prompt_cache_to_disk\":false,"
+            "\"admission\":{\"armed\":%s,\"minted\":%lld,\"consumed\":%lld,"
+            "\"rejected\":%lld,\"platform_jobs_in_flight\":%d},"
+            "\"overflow_spend_today_milli\":%lld,\"overflow_daily_cap_milli\":%lld,"
+            "\"plaintext_seen_by\":[\"this machine\"%s]}",
+            g_shared_mode ? "true" : "false",
+            idletoken_overflow_enabled() ? "true" : "false",
+            ovf_esc,
+            idletoken_overflow_policy_name(idletoken_overflow_policy()),
+            IDLETOKEN_OVF_MAX_HOPS,
+            prompt_excerpt_log_on() ? "on" : "off",
+            idletoken_admission_ready() ? "true" : "false",
+            minted, consumed, rejected, inflight, spent, cap,
+            /* The honest answer to "who can read my prompt", and it is a list
+             * rather than a boolean because the answer grows with the settings
+             * the user turned on. Nothing here claims the platform or a
+             * borrowed provider CANNOT read it — they can, and saying otherwise
+             * would be the dishonesty PRIV-01/PRIV-02 exist to forbid. */
+            idletoken_overflow_enabled()
+                ? ",\"the IdleToken platform\",\"the provider a borrowed request lands on\""
+                : "");
         idletoken_http_send_json(conn_fd, 200, body, (size_t)bl);
         free(req.body);
         return;
@@ -4790,7 +5531,7 @@ static void handle_http_request(int conn_fd,
             snprintf(engine_extra, sizeof(engine_extra),
                      ",\"engine\":\"llamacpp\",\"engine_state\":\"%s\","
                      "\"engine_restarts\":%d",
-                     idletoken_llama_state_name(idletoken_llama_get_state(g_llama)),
+                     coord_llama_state_name(),
                      idletoken_llama_restart_count(g_llama));
         /* Shared-mode posture, on the endpoint the client dashboard and the
          * platform agent already poll (P1-6). Reported as facts rather than a
@@ -4805,17 +5546,36 @@ static void handle_http_request(int conn_fd,
                      (g_llama &&
                       strncmp(idletoken_llama_endpoint_of(g_llama), "unix:", 5) == 0)
                          ? "unix" : "tcp");
-        char body[1088];  /* grew for the concurrency / model / engine / shared fields */
+        /* Effective KV cache dtypes, for the client's "what am I actually
+         * running" readback (ctx-kv-simplification): same resolution the
+         * spawn uses (env — which the auto rule exports into — with the f16
+         * default), so the report can never disagree with the engine. */
+        char stats_kvk[12] = "f16", stats_kvv[12] = "";
+        {
+            char rk[12], rv[12], rerr[64];
+            if (idletoken_llama_kv_types(rk, rv, rerr, sizeof rerr) == 0) {
+                if (rk[0]) snprintf(stats_kvk, sizeof stats_kvk, "%s", rk);
+                if (rv[0]) snprintf(stats_kvv, sizeof stats_kvv, "%s", rv);
+            }
+        }
+        if (!stats_kvv[0]) snprintf(stats_kvv, sizeof stats_kvv, "%s", stats_kvk);
+        char body[1184];  /* grew for the concurrency / model / engine / shared / kv fields */
         pthread_mutex_lock(&g_stats_mu);
         int bl = snprintf(body, sizeof(body),
             "{\"model\":\"%s\",\"model_label\":\"%s\",\"quant\":\"%s\","
              "\"requests\":%llu,\"input_tokens\":%llu,\"output_tokens\":%llu,"
              "\"cache_hits\":%llu,\"cached_tokens\":%llu,"
              "\"seq_slots\":%d,\"seq_slots_auto\":%d,\"seq_slots_live\":%d,\"slot_prefix_tokens\":%u,"
+             /* `concurrency` is the historical platform contract and means
+              * the local execution cap, not the momentary active count. */
              "\"concurrency\":%d,"
              "\"queue_depth\":%d,\"queue_cap\":%d,\"avg_service_ms\":%.0f,"
              "\"avg_ttft_ms\":%.0f,"
-             "\"ctx_size\":%u,"
+             /* ctx_size is the exact selected window and therefore identical
+              * to the live engine window. The portal keys service identity on
+              * it, so it must never change at runtime. */
+             "\"ctx_size\":%u,\"ctx_now\":%u,"
+             "\"kv_cache_k\":\"%s\",\"kv_cache_v\":\"%s\","
              "\"uptime_s\":%lld,\"last_request_unix\":%lld,"
              "\"last_tok_per_s\":%.2f%s%s}",
             coord_model()->id, coord_model()->label, coord_quant(),
@@ -4827,7 +5587,9 @@ static void handle_http_request(int conn_fd,
             rep_slots, rep_slots_auto, slots_live, slot_tokens,
             rep_conc,
             rep_qdepth, rep_qcap, g_stats.service_ms_ewma,
-            g_stats.ttft_ms_ewma, ctx_size,
+            g_stats.ttft_ms_ewma,
+            g_ctx_display ? g_ctx_display : ctx_size, ctx_size,
+            stats_kvk, stats_kvv,
             g_stats.started_at ? now - g_stats.started_at : 0,
             g_stats.last_request_at,
             g_stats.last_tok_per_s,
@@ -4845,13 +5607,15 @@ static void handle_http_request(int conn_fd,
      * phases on top. */
     if (!strcmp(req.method, "GET") && !strcmp(req.path, IDLETOKEN_PATH_CLUSTER)) {
         if (g_llama) {
-            const char *estate = idletoken_llama_state_name(
-                idletoken_llama_get_state(g_llama));
+            const char *estate = coord_llama_state_name();
             const char *phase = !strcmp(estate, "ready") ? "ready" : "starting";
             char local_host[64] = "coordinator";
             if (gethostname(local_host, sizeof(local_host) - 1) != 0)
                 snprintf(local_host, sizeof(local_host), "coordinator");
             local_host[sizeof(local_host) - 1] = '\0';
+            char esc_local[260];
+            idletoken_json_escape(esc_local, sizeof(esc_local),
+                                  local_host, strlen(local_host));
             char body[4096];
             size_t off = 0;
             off += (size_t)snprintf(body + off, sizeof(body) - off,
@@ -4859,12 +5623,22 @@ static void handle_http_request(int conn_fd,
                 "\"engine_state\":\"%s\",\"cluster_size\":%d,\"members\":["
                 "{\"hostname\":\"%s\",\"role\":\"coordinator\","
                 "\"state\":\"%s\"}",
-                phase, estate, g_n_rpc_peers + 1, local_host, phase);
+                phase, estate, g_n_rpc_peers + 1, esc_local, phase);
             for (int i = 0; i < g_n_rpc_peers && off < sizeof(body); i++) {
+                /* Peer-chosen bytes crossing into a document someone else
+                 * parses (CLUS-14). The HELLO gate already refused quotes and
+                 * control characters; escaping here as well means this stays
+                 * correct if a later field arrives on a path that forgets to
+                 * validate, which is how the first hole got in. */
+                char eh[260], ee[260];
+                idletoken_json_escape(eh, sizeof(eh), g_rpc_peers[i].hostname,
+                                      strlen(g_rpc_peers[i].hostname));
+                idletoken_json_escape(ee, sizeof(ee), g_rpc_peers[i].endpoint,
+                                      strlen(g_rpc_peers[i].endpoint));
                 off += (size_t)snprintf(body + off, sizeof(body) - off,
                     ",{\"hostname\":\"%s\",\"role\":\"worker\","
                     "\"rpc_endpoint\":\"%s\",\"state\":\"%s\"}",
-                    g_rpc_peers[i].hostname, g_rpc_peers[i].endpoint, phase);
+                    eh, ee, phase);
             }
             if (off < sizeof(body))
                 off += (size_t)snprintf(body + off, sizeof(body) - off, "]}");
@@ -4877,10 +5651,17 @@ static void handle_http_request(int conn_fd,
         off += (size_t)snprintf(body + off, sizeof(body) - off,
                                 "{\"phase\":\"ready\",\"cluster_size\":%d,\"members\":[", n);
         for (int i = 0; i < n && off < sizeof(body); i++) {
+            /* Same reasoning as the llamacpp branch above: hostname and GPU
+             * name are strings the peer chose (CLUS-14). */
+            char eh[260], eg[260];
+            idletoken_json_escape(eh, sizeof(eh), ws[i].hostname,
+                                  strlen(ws[i].hostname));
+            idletoken_json_escape(eg, sizeof(eg), ws[i].gpu_name,
+                                  strlen(ws[i].gpu_name));
             off += (size_t)snprintf(body + off, sizeof(body) - off,
                 "%s{\"hostname\":\"%s\",\"gpu\":\"%s\",\"stage\":%u,"
                 "\"layer_lo\":%u,\"layer_hi\":%u,\"state\":\"ready\"}",
-                i ? "," : "", ws[i].hostname, ws[i].gpu_name,
+                i ? "," : "", eh, eg,
                 (unsigned)ws[i].stage_id, (unsigned)ws[i].layer_lo,
                 (unsigned)ws[i].layer_hi);
         }
@@ -4896,15 +5677,30 @@ static void handle_http_request(int conn_fd,
      * good for. Same advisor as `idletoken-worker --advise`, but over the whole
      * roster, so the answer changes (correctly) as machines join or leave. */
     if (!strcmp(req.method, "GET") && !strcmp(req.path, IDLETOKEN_PATH_CAPABILITY)) {
-        idletoken_node_mem nodes[IDLETOKEN_MAX_WORKERS];
+        idletoken_node_mem nodes[IDLETOKEN_MAX_WORKERS] = {0};
+        int advice_n = n;
         for (int i = 0; i < n && i < IDLETOKEN_MAX_WORKERS; i++) {
             nodes[i].vram_usable = ws[i].vram_usable;
             nodes[i].ram_usable  = ws[i].ram_usable;
             nodes[i].ram_pinnable= ws[i].ram_pinnable;
             nodes[i].unified     = ws[i].unified;
+            nodes[i].backend     = IDLETOKEN_BACKEND_OF_OS(ws[i].os_family);
+            snprintf(nodes[i].label, sizeof nodes[i].label, "%s", ws[i].hostname);
+        }
+        if (advice_n <= 0 && g_n_capability_nodes > 0) {
+            advice_n = g_n_capability_nodes;
+            memcpy(nodes, g_capability_nodes,
+                   (size_t)advice_n * sizeof(nodes[0]));
+        }
+        if (advice_n <= 0) {
+            idletoken_http_send_error(conn_fd, 503,
+                                      "resource report is not ready");
+            free(req.body);
+            return;
         }
         idletoken_advice_row rows[IDLETOKEN_ADVISE_MAX_ROWS];
-        int nr = idletoken_advise(nodes, n > 0 ? n : 1, rows, IDLETOKEN_ADVISE_MAX_ROWS);
+        int nr = idletoken_advise(nodes, advice_n, rows,
+                                  IDLETOKEN_ADVISE_MAX_ROWS);
         if (nr < 0) {
             idletoken_http_send_error(conn_fd, 500, "capability advisor failed");
             free(req.body);
@@ -4923,7 +5719,7 @@ static void handle_http_request(int conn_fd,
             free(req.body);
             return;
         }
-        int len = idletoken_advise_json(rows, nr, n > 0 ? n : 1, body, cap);
+        int len = idletoken_advise_json(rows, nr, advice_n, body, cap);
         if (len < 0) {
             idletoken_http_send_error(conn_fd, 500, "capability report too large");
             free(body);
@@ -5046,7 +5842,7 @@ static void handle_http_request(int conn_fd,
         if (is_tokenize)       llama_tokenize_route(conn_fd, &req);
         else if (is_count_tok) llama_count_tokens_route(conn_fd, &req);
         else                   llama_chat_route(conn_fd, &req, is_anthropic, want_stream,
-                                                from_platform);
+                                                origin, hops_in);
         free(req.body);
         return;
     }
@@ -5286,11 +6082,14 @@ static void handle_http_request(int conn_fd,
      * "The coordinator has a momentary plaintext window" was true; the window
      * just had a tape recorder pointed at it.
      *
-     * The excerpt survives as an opt-in debugging aid, and ONLY for locally
-     * originated requests: whatever the operator sets, a request the platform
-     * dispatched is never quoted, because that content is not theirs to read.
+     * The excerpt survives as an opt-in debugging aid, and ONLY for requests
+     * POSITIVELY attributed to this machine. The old test was `!from_platform`
+     * — "the sender did not claim to be the platform" — which is the absence of
+     * a claim, not a fact, and an agent that stripped its header defeated it
+     * (PROV-28). Now an unattributed request is excluded too, and a --shared
+     * machine gets no excerpts at all (prompt_excerpt_log_on()).
      * Counts stay unconditional -- they are what operating the thing needs. */
-    if (getenv("IDLETOKEN_LOG_PROMPTS") && !from_platform) {
+    if (prompt_excerpt_log_on() && origin == IDLETOKEN_ORIGIN_LOCAL) {
         fprintf(stderr, "coord: chat: tokenized %d-tok prompt (%d msgs) text=%.40s%s\n",
                 prompt.len, n_msgs > 0 ? n_msgs : 1, first_text,
                 strlen(first_text) > 40 ? "..." : "");
@@ -5311,10 +6110,9 @@ static void handle_http_request(int conn_fd,
      * chats are fine") is impossible to interpret from the old message.
      *
      * Switching models makes it arrive sooner: ctx_size is clamped to the
-     * model's own ceiling at startup (1M for DSv4, 262K for the Qwen3.5
-     * family, 40K for qwen3-8b), so the same conversation that fitted before
-     * can stop fitting after a switch, with nothing on screen connecting the
-     * two events.
+     * lesser of the model's ability and the current 256K product ceiling at
+     * startup, so the same conversation that fitted before can stop fitting
+     * after a switch, with nothing on screen connecting the two events.
      *
      * Deliberately placed BEFORE the SSE head goes out, so this is still a
      * real HTTP status rather than an error smuggled through the stream. */
@@ -5369,8 +6167,9 @@ static void handle_http_request(int conn_fd,
          * readable. Same rules, same order, one predicate — see
          * idletoken_overflow_should_forward. */
         const char *ovf_why = "off";
-        if (idletoken_overflow_should_forward(from_platform, want_stream, est, &ovf_why)) {
-            if (coord_overflow_relay(conn_fd, &req, is_anthropic, coord_next_req_id()) == 0) {
+        if (idletoken_overflow_should_forward(origin, want_stream, est, hops_in, &ovf_why)) {
+            if (coord_overflow_relay(conn_fd, &req, is_anthropic, want_stream,
+                                     coord_next_req_id(), hops_in) == 0) {
                 ds4_tokens_free(&prompt);
                 free(req.body);
                 return;
@@ -5765,21 +6564,19 @@ static void engine_integrity_check(const char *bin) {
     }
 }
 
-/* Thread pool sizing lives with the slot cap it is derived from: slots +
- * queue + 1 spare, so a bounded slot count bounds the pool (see the pool
- * block below for why that "+1" is what keeps stats answering). */
+/* Thread pool sizing remains bounded by the measurement-only slot cap. The
+ * default uses four threads: one local, two overflow, one status spare. */
 #define LLAMA_POOL_MAX_THREADS  (IDLETOKEN_LLAMA_SLOT_CAP * 2 + 1)
 #define LLAMA_POOL_QUEUE_MAX    (LLAMA_POOL_MAX_THREADS + 1)
 
-/* How many sequence slots to run with. The formula lives in plan.c (one
- * definition, shared with the tests); this adds the operator override and says
- * out loud what it settled on — a user who wonders why their machine serves two
- * requests and not four should be able to find the answer in the log.
+/* How many sequence slots to run with. plan.c still computes the resource
+ * ceiling for diagnostics and controlled measurements, but the product policy
+ * is one local sequence: a second local request is cheaper and safer to hand to
+ * platform overflow than to reserve another full KV window on the home GPU.
  *
  * IDLETOKEN_LLAMA_SLOTS is an escape hatch for measurement (the -np 1/2/4
  * throughput curve), not a setting: it is deliberately absent from the client
- * UI, because "how many at once" is a memory question the machine can answer
- * better than its owner can. */
+ * UI because the shipped local width is fixed at one. */
 static int llama_decide_slots(int autov, const idletoken_node_mem *node,
                               const idletoken_llm_model_size *msize,
                               uint32_t ctx_size, const char *what) {
@@ -5801,15 +6598,16 @@ static int llama_decide_slots(int autov, const idletoken_node_mem *node,
      * allocated in the second. */
     const uint64_t pool = idletoken_llama_kv_pool(node);
     fprintf(stderr,
-            "coord: %d sequence slot(s) at ctx %u (%s): %.2f GiB of %s for KV, "
-            "%.1f KiB of KV per token%s\n",
-            autov, ctx_size, what, (double)pool / 1073741824.0,
+            "coord: local policy: 1 sequence slot at ctx %u (%s; resources "
+            "could hold %d): %.2f GiB of %s for KV, %.1f KiB of KV per token%s; "
+            "simultaneous local work uses platform overflow\n",
+            ctx_size, what, autov, (double)pool / 1073741824.0,
             node && !node->unified ? "VRAM" : "unified memory",
             (double)msize->kv_bytes_per_token / 1024.0,
             msize->kv_bytes_per_token == 0
                 ? " unknown -> 1 slot (a KV cost we cannot compute is a reason "
                   "to open fewer slots, not more)" : "");
-    return autov;
+    return 1;
 }
 
 /* --- llamacpp-mode connection pool (P2) ------------------------------------
@@ -5820,11 +6618,10 @@ static int llama_decide_slots(int autov, const idletoken_node_mem *node,
  * dashboard, and including a second chat from the same user. That serialisation
  * was never a decision; it was the shape of the first version.
  *
- * Threads = slots + queue + 1. Sizing it that way is what makes the "+1" real:
- * at most `slots` threads are inside the engine and at most `queue` are parked
- * waiting for one (infer_gate_acquire caps both), so a thread is always free to
- * pick up the next connection. A stats poll therefore never waits behind a
- * generation, no matter how long that generation runs.
+ * The default four threads are one local generation + up to two overflow
+ * exchanges (the client's safety ceiling is three) + one spare, so health and
+ * stats remain responsive. The historical `2N+1` sizing is retained for the
+ * measurement-only multi-slot override.
  *
  * Every worker serves a whole connection start to finish, so nothing about a
  * request's handling changes — including the per-connection liveness watch on
@@ -5857,6 +6654,13 @@ static void *llama_pool_worker(void *ud) {
         handle_http_request(cfd, NULL, 0, NULL, 0, &g_llpool.running_pos,
                             NULL, NULL, g_llpool.ctx_size,
                             g_llpool.api_token, NULL);
+        /* This thread is done with whatever capability it spent. Called here,
+         * once, rather than at each of handle_http_request's many returns:
+         * every one of those would have to remember, and the one that forgot
+         * would leave this machine permanently "busy with platform work" and
+         * therefore permanently unable to borrow (PROV-28's fee-expansion rule
+         * failing closed forever is still a failure). */
+        idletoken_admission_request_end();
         /* idletoken_close_fd, not close(): on Windows this fd is a SOCKET and
          * CRT close() treats it as a CRT fd index — it leaks the socket and,
          * when the handle value lands inside the CRT fd table, closes some
@@ -5935,11 +6739,77 @@ static int llama_resolve_quant(const char *quant, const char *llama_gguf) {
     return 0;
 }
 
+/* The context the coordinator may GRANT for a model: its trained/curated
+ * ability capped by today's 256K product policy. Higher native/YaRN metadata
+ * stays in the registry for a future long-context decision, but default and
+ * explicit client launches are clamped here so estimation and runtime agree. */
+static uint32_t model_ctx_ceiling(const idletoken_model_spec *m) {
+    return idletoken_llama_product_ctx_ceiling(m);
+}
+
+static void *coord_postload_prefetch_thread(void *opaque) {
+    (void)opaque;
+    fprintf(stderr, "coord: engine model load complete; warming local CPU "
+                    "layers before inference readiness\n");
+    const int rc = idletoken_local_model_prefetch(
+        g_postload_prefetch.base_url, g_postload_prefetch.layer_hi,
+        g_postload_prefetch.gguf);
+    pthread_mutex_lock(&g_postload_prefetch.mu);
+    if (rc == 0) {
+        g_postload_prefetch.state = 0;
+        g_postload_prefetch.error[0] = '\0';
+    } else {
+        g_postload_prefetch.state = -1;
+        snprintf(g_postload_prefetch.error,
+                 sizeof(g_postload_prefetch.error),
+                 "could not make local CPU layers [0,%u) resident after "
+                 "the engine loaded",
+                 g_postload_prefetch.layer_hi);
+    }
+    pthread_mutex_unlock(&g_postload_prefetch.mu);
+    if (rc == 0)
+        fprintf(stderr, "coord: local CPU layers are resident; inference "
+                        "engine is now ready\n");
+    return NULL;
+}
+
 static int run_llamacpp_mode(const char *llama_bin, const char *llama_gguf,
                              int llama_port, const char *api_bind,
                              const char *api_token, uint32_t ctx_size,
+                             const char *ngl_arg,
                              const char *cluster_args,
-                             const idletoken_rpc_peer *peers, int n_peers) {
+                             const idletoken_rpc_peer *peers, int n_peers,
+                             const char *postload_prefetch_url,
+                             unsigned postload_prefetch_layers,
+                             const idletoken_node_mem *capability_nodes,
+                             int n_capability_nodes) {
+    memset(g_capability_nodes, 0, sizeof(g_capability_nodes));
+    g_n_capability_nodes = 0;
+    if (capability_nodes && n_capability_nodes > 0) {
+        if (n_capability_nodes > IDLETOKEN_LLPLAN_MAX_NODES)
+            n_capability_nodes = IDLETOKEN_LLPLAN_MAX_NODES;
+        memcpy(g_capability_nodes, capability_nodes,
+               (size_t)n_capability_nodes * sizeof(g_capability_nodes[0]));
+        g_n_capability_nodes = n_capability_nodes;
+    }
+    pthread_mutex_lock(&g_postload_prefetch.mu);
+    g_postload_prefetch.state = 0;
+    g_postload_prefetch.error[0] = '\0';
+    g_postload_prefetch.base_url[0] = '\0';
+    g_postload_prefetch.gguf[0] = '\0';
+    g_postload_prefetch.layer_hi = 0;
+    if (postload_prefetch_url && postload_prefetch_url[0] &&
+        postload_prefetch_layers > 0) {
+        snprintf(g_postload_prefetch.base_url,
+                 sizeof(g_postload_prefetch.base_url), "%s",
+                 postload_prefetch_url);
+        snprintf(g_postload_prefetch.gguf,
+                 sizeof(g_postload_prefetch.gguf), "%s", llama_gguf);
+        g_postload_prefetch.layer_hi = postload_prefetch_layers;
+        g_postload_prefetch.state = 1;
+    }
+    pthread_mutex_unlock(&g_postload_prefetch.mu);
+
     /* The user's state directory, created 0700. Two things live here and both
      * depend on it being private: the engine log, and (shared mode) the socket
      * the engine listens on — a Unix socket is exactly as reachable as the
@@ -6009,8 +6879,8 @@ static int run_llamacpp_mode(const char *llama_bin, const char *llama_gguf,
     printf("  api bind    : %s\n", api_bind);
     printf("  api token   : %s\n", (api_token && api_token[0]) ? "required" : "off");
     printf("  ctx size    : %u  (per sequence slot)\n", ctx_size);
-    printf("  seq slots   : %d  (concurrent requests; queue %d, then 429)\n\n",
-           g_llama_slots, g_llama_slots);
+    printf("  seq slots   : %d  (local queue 0; overflow when busy)\n\n",
+           g_llama_slots);
 
     /* Pre-flight the two paths so a typo fails with a sentence, not with a
      * respawn loop chewing through its backoff budget. */
@@ -6072,10 +6942,34 @@ static int run_llamacpp_mode(const char *llama_bin, const char *llama_gguf,
                  llama_port);
     }
 
+    /* Beyond the trained window = YaRN territory: hand the sidecar the trained
+     * window so it emits --rope-scaling yarn with the right origin. Decided
+     * HERE, next to the one idletoken_llama_start call, so a ctx the clamps
+     * upstream let through can never reach the engine without its matching
+     * RoPE args (positions past the trained window with no scaling = garbage
+     * attention, silently). g_model is NULL on the --llama-gguf dev channel —
+     * there the user owns the args (IDLETOKEN_LLAMA_ARGS). */
+    uint32_t yarn_orig = 0;
+    if (g_model && ctx_size > g_model->ctx_max) {
+        yarn_orig = g_model->ctx_max;
+        fprintf(stderr,
+                "coord: ctx %u exceeds %s trained window %u — YaRN rope "
+                "scaling x%.3g will be applied (declared extension up to %u; "
+                "long-context quality is a trade-off, not free)\n",
+                ctx_size, g_model->id, g_model->ctx_max,
+                (double)ctx_size / (double)g_model->ctx_max,
+                g_model->ctx_yarn_max);
+    }
+
+    /* Every path serves exactly the selected window it advertises. */
+    if (g_ctx_display == 0) g_ctx_display = ctx_size;
+
     char err[256] = "";
     g_llama = idletoken_llama_start(llama_bin, llama_gguf, llama_port,
-                                    engine_sock, ctx_size, g_llama_slots,
-                                    cluster_args, log_path, g_shared_mode,
+                                    engine_sock, ctx_size, yarn_orig,
+                                    g_llama_slots, g_llama_gpu_only,
+                                    ngl_arg, cluster_args, log_path, g_shared_mode,
+                                    NULL,
                                     err, sizeof(err));
     if (!g_llama) {
         fprintf(stderr, "idletoken-coord: could not start the inference engine: %s\n",
@@ -6145,7 +7039,7 @@ static int run_llamacpp_mode(const char *llama_bin, const char *llama_gguf,
     pthread_cond_init(&g_llpool.cv, NULL);
     g_llpool.ctx_size  = ctx_size;
     g_llpool.api_token = api_token;
-    const int n_threads = g_llama_slots * 2 + 1;   /* slots + queue + spare */
+    const int n_threads = g_llama_slots == 1 ? 4 : g_llama_slots * 2 + 1;
     pthread_t pool[LLAMA_POOL_MAX_THREADS];
     int n_started = 0;
     for (int i = 0; i < n_threads && i < LLAMA_POOL_MAX_THREADS; i++) {
@@ -6183,6 +7077,8 @@ static int run_llamacpp_mode(const char *llama_bin, const char *llama_gguf,
                     "answers 503 until the engine is ready). Ctrl-C to stop.\n",
             api_bind, g_llama_slots, n_started);
     time_t last_hb = 0;
+    pthread_t postload_tid;
+    int postload_started = 0;
     /* Engine conditions we refuse over rather than serve around. Checked on the
      * accept loop's own 1 s tick because that is the one place that is awake
      * whether or not a request ever arrives: a machine that would freeze under
@@ -6192,6 +7088,30 @@ static int run_llamacpp_mode(const char *llama_bin, const char *llama_gguf,
         int ready_fd = llama_lfd_readable2(lfd, ufd, 1000);
         if (g_llama_stop_sig) {
             fprintf(stderr, "coord: signal received — stopping the sidecar\n");
+            break;
+        }
+        if (!postload_started && coord_postload_prefetch_state() > 0 &&
+            idletoken_llama_get_state(g_llama) == IDLETOKEN_LLAMA_READY) {
+            if (pthread_create(&postload_tid, NULL,
+                               coord_postload_prefetch_thread, NULL) != 0) {
+                pthread_mutex_lock(&g_postload_prefetch.mu);
+                g_postload_prefetch.state = -1;
+                snprintf(g_postload_prefetch.error,
+                         sizeof(g_postload_prefetch.error),
+                         "could not start the local CPU residency worker");
+                pthread_mutex_unlock(&g_postload_prefetch.mu);
+            } else {
+                postload_started = 1;
+            }
+        }
+        if (coord_postload_prefetch_state() < 0) {
+            char why[192];
+            pthread_mutex_lock(&g_postload_prefetch.mu);
+            snprintf(why, sizeof(why), "%s", g_postload_prefetch.error);
+            pthread_mutex_unlock(&g_postload_prefetch.mu);
+            fprintf(stderr, "idletoken-coord: refuse: %s\n",
+                    why[0] ? why : "local CPU layer residency failed");
+            fatal_exit = 1;
             break;
         }
         {
@@ -6234,6 +7154,7 @@ static int run_llamacpp_mode(const char *llama_bin, const char *llama_gguf,
     pthread_cond_broadcast(&g_llpool.cv);
     pthread_mutex_unlock(&g_llpool.mu);
     for (int i = 0; i < n_started; i++) pthread_join(pool[i], NULL);
+    if (postload_started) pthread_join(postload_tid, NULL);
     idletoken_close_fd(lfd);
     /* Take the socket file with us. A leftover would be removed by the next
      * bind anyway, but leaving a 0600 file named like a live endpoint lying in
@@ -6349,6 +7270,259 @@ static int allow_small_cluster_env(void) {
     return *p == '\0';
 }
 
+typedef struct {
+    char dir[1024];
+    char bind[80];
+} coord_weight_repo_args;
+
+static void *coord_weight_repo_thread(void *opaque) {
+    coord_weight_repo_args *a = (coord_weight_repo_args *)opaque;
+    int rc = idletoken_serve_weights(a->dir, a->bind);
+    fprintf(stderr, "coord: weight repository stopped on %s (rc=%d)\n",
+            a->bind, rc);
+    return NULL;
+}
+
+static void coord_sleep_ms(unsigned ms) {
+#ifdef _WIN32
+    Sleep(ms);
+#else
+    usleep(ms * 1000u);
+#endif
+}
+
+/* Start a byte-range repository for this exact GGUF. A deployment may instead
+ * set IDLETOKEN_SHARD_REPO to a DGX/LAN repository; the automatic local server
+ * is the zero-configuration desktop path. */
+static int coord_weight_repo_start(const char *gguf,
+                                   char *url, size_t url_cap) {
+    const char *external = getenv("IDLETOKEN_SHARD_REPO");
+    if (external && external[0]) {
+        if (snprintf(url, url_cap, "%s", external) < 0 ||
+            strlen(external) >= url_cap) return -1;
+        fprintf(stderr, "coord: using configured layer repository %s\n", url);
+        return 0;
+    }
+
+    char idx[1200];
+    snprintf(idx, sizeof(idx), "%s.idx", gguf);
+    if (idletoken_idx_stale(gguf, idx)) {
+        fprintf(stderr, "coord: building layer index %s\n", idx);
+        if (idletoken_write_idx(gguf, idx) != 0) return -1;
+    }
+
+    coord_weight_repo_args *a =
+        (coord_weight_repo_args *)calloc(1, sizeof(*a));
+    if (!a) return -1;
+    snprintf(a->dir, sizeof(a->dir), "%s", gguf);
+    char *slash = strrchr(a->dir, '/');
+#ifdef _WIN32
+    { char *bs = strrchr(a->dir, '\\'); if (!slash || (bs && bs > slash)) slash = bs; }
+#endif
+    const char *base = gguf;
+    for (const char *p = gguf; *p; p++)
+        if (*p == '/' || *p == '\\') base = p + 1;
+    if (slash) *slash = '\0';
+    else snprintf(a->dir, sizeof(a->dir), ".");
+
+    char lan_ip[64] = "";
+    if (idletoken_local_ipv4(lan_ip, sizeof(lan_ip)) != 0 || !lan_ip[0]) {
+        free(a);
+        return -1;
+    }
+    int port = 8001;
+    const char *pe = getenv("IDLETOKEN_WEIGHT_REPO_PORT");
+    if (pe && atoi(pe) > 0 && atoi(pe) <= 65535) port = atoi(pe);
+    snprintf(a->bind, sizeof(a->bind), "%s:%d", lan_ip, port);
+#ifdef _WIN32
+    {
+        char rule[80];
+        snprintf(rule, sizeof(rule), "IdleToken layer repository TCP %d", port);
+        idletoken_win_ensure_firewall_rule(rule, "TCP", port);
+    }
+#endif
+
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, coord_weight_repo_thread, a) != 0) {
+        free(a);
+        return -1;
+    }
+    pthread_detach(tid);
+    int ready = 0;
+    for (int i = 0; i < 50; i++) {
+        int fd = idletoken_connect_tcp(a->bind);
+        if (fd >= 0) {
+            idletoken_close_fd(fd);
+            ready = 1;
+            break;
+        }
+        coord_sleep_ms(100);
+    }
+    if (!ready) {
+        fprintf(stderr, "coord: layer repository did not listen on %s\n", a->bind);
+        return -1;
+    }
+    int n = snprintf(url, url_cap, "http://%s:%d/%s", lan_ip, port, base);
+    if (n < 0 || (size_t)n >= url_cap) return -1;
+    fprintf(stderr, "coord: layer repository ready: %s\n", url);
+    return 0;
+}
+
+static int coord_local_model_cache_dir(char *out, size_t cap) {
+    const char *configured = getenv("IDLETOKEN_LOCAL_MODEL_CACHE");
+    if (configured && configured[0]) {
+        int n = snprintf(out, cap, "%s", configured);
+        return n >= 0 && (size_t)n < cap ? 0 : -1;
+    }
+#ifdef _WIN32
+    const char *base = getenv("LOCALAPPDATA");
+    if (base && base[0]) {
+        int n = snprintf(out, cap, "%s\\IdleToken\\model-views", base);
+        return n >= 0 && (size_t)n < cap ? 0 : -1;
+    }
+    base = getenv("USERPROFILE");
+    int n = snprintf(out, cap, "%s\\.idletoken\\model-views",
+                     base && base[0] ? base : ".");
+#else
+    const char *base = getenv("HOME");
+    int n = snprintf(out, cap, "%s/.idletoken/model-views",
+                     base && base[0] ? base : ".");
+#endif
+    return n >= 0 && (size_t)n < cap ? 0 : -1;
+}
+
+typedef struct {
+    const idletoken_rpc_peer *peers;
+    int n_peers;
+    volatile int stop;
+    int failed;
+} coord_prepare_heartbeat;
+
+/* Preparing a cold local prefix can take minutes on a large HDD. Workers
+ * intentionally close their rpc-server after 60 seconds of coordinator
+ * silence, so keep the already-paired control links alive while the
+ * coordinator is doing that legitimate work. No other thread touches these
+ * sockets until this helper is joined. */
+static void *coord_prepare_heartbeat_thread(void *opaque) {
+    coord_prepare_heartbeat *hb = (coord_prepare_heartbeat *)opaque;
+    while (!hb->stop) {
+        idletoken_msg_header h = {
+            .magic = IDLETOKEN_PROTO_MAGIC,
+            .version = IDLETOKEN_PROTO_VERSION,
+            .msg_type = IDLETOKEN_MSG_HEARTBEAT,
+            .payload_bytes = 0,
+            .request_id = 0,
+            .stage_id = IDLETOKEN_STAGE_COORD,
+            .segment_id = IDLETOKEN_SEGMENT_NONE,
+        };
+        for (int i = 0; i < hb->n_peers; i++) {
+            if (idletoken_send_msg(hb->peers[i].fd, &h, NULL, 0) != 0) {
+                fprintf(stderr, "coord: preparation heartbeat to %s (%s) "
+                                "failed: %s\n",
+                        hb->peers[i].hostname, hb->peers[i].endpoint,
+                        strerror(errno));
+                hb->failed = 1;
+                hb->stop = 1;
+                break;
+            }
+        }
+        for (int i = 0; i < 40 && !hb->stop; i++) coord_sleep_ms(250);
+    }
+    return NULL;
+}
+
+/* Mirror llama_model::load_tensors' LLAMA_SPLIT_MODE_LAYER assignment. Device
+ * interval [dev_lo,dev_hi) belongs to one remote machine. Output tensors are
+ * shared/global in the GGUF index and are fetched for every worker, so only
+ * repeating layers are returned here. */
+static int coord_send_rpc_cache_plan(const idletoken_rpc_peer *peer,
+                                     uint64_t request_id,
+                                     unsigned lo, unsigned hi,
+                                     const char *repo) {
+    uint8_t pay[512];
+    idletoken_buf b;
+    idletoken_buf_init(&b, pay, sizeof(pay));
+    idletoken_buf_put_u8(&b, 1);
+    idletoken_buf_put_u8(&b, 0);
+    idletoken_buf_put_u16(&b, (uint16_t)lo);
+    idletoken_buf_put_u16(&b, (uint16_t)hi);
+    idletoken_buf_put_u16(&b, 0);
+    idletoken_buf_put_str(&b, repo);
+    idletoken_msg_header h = {
+        .magic = IDLETOKEN_PROTO_MAGIC,
+        .version = IDLETOKEN_PROTO_VERSION,
+        .msg_type = IDLETOKEN_MSG_RPC_CACHE_PLAN,
+        .payload_bytes = b.pos,
+        .request_id = request_id,
+        .stage_id = 0,
+        .segment_id = IDLETOKEN_SEGMENT_NONE,
+    };
+    return b.err ? -1 : idletoken_send_msg(peer->fd, &h, pay, b.pos);
+}
+
+static int coord_wait_rpc_cache_ready(const idletoken_rpc_peer *peer,
+                                      uint64_t request_id,
+                                      unsigned want_lo, unsigned want_hi) {
+    /* Bounded silence, not a bounded fetch (CLUS-13). A real shard takes as
+     * long as it takes and reports progress every 256 MiB; a worker that says
+     * nothing at all for this long has either gone away or is deliberately
+     * holding the coordinator, and both deserve the same answer. */
+    idletoken_set_recv_timeout(peer->fd, IDLETOKEN_CACHE_SILENCE_TIMEOUT_MS);
+    for (;;) {
+        uint8_t pay[512];
+        idletoken_msg_header h;
+        if (idletoken_recv_msg(peer->fd, &h, pay, sizeof(pay)) != 0) {
+            fprintf(stderr, "coord: %s went silent or disconnected while "
+                            "preparing its local shard\n",
+                    peer->hostname);
+            return -1;
+        }
+        if (h.request_id != request_id) continue;
+        idletoken_buf b;
+        idletoken_buf_init(&b, pay, h.payload_bytes);
+        if (h.msg_type == IDLETOKEN_MSG_RPC_CACHE_PROGRESS) {
+            uint64_t done = 0, total = 0;
+            idletoken_buf_get_u64(&b, &done);
+            idletoken_buf_get_u64(&b, &total);
+            if (!b.err)
+                fprintf(stderr, "coord: %s local shard %.2f/%.2f GiB (%.0f%%)\n",
+                        peer->hostname,
+                        (double)done / 1073741824.0,
+                        (double)total / 1073741824.0,
+                        total ? 100.0 * (double)done / (double)total : 100.0);
+            continue;
+        }
+        if (h.msg_type != IDLETOKEN_MSG_RPC_CACHE_READY) continue;
+        uint8_t ok = 0, z3[3];
+        uint16_t lo = 0, hi = 0;
+        uint64_t bytes = 0;
+        uint32_t tensors = 0;
+        char detail[256] = "";
+        idletoken_buf_get_u8(&b, &ok);
+        idletoken_buf_get_bytes(&b, z3, 3);
+        idletoken_buf_get_u16(&b, &lo);
+        idletoken_buf_get_u16(&b, &hi);
+        idletoken_buf_get_u64(&b, &bytes);
+        idletoken_buf_get_u32(&b, &tensors);
+        idletoken_buf_get_str(&b, detail, sizeof(detail));
+        /* The worker chose these bytes and we are about to print them. A
+         * newline here forges a log line; the rest of this file's log parsing
+         * (engine.rs keys on a "refuse:" marker) makes that worth closing. */
+        if (!idletoken_peer_label_ok(detail, sizeof(detail)))
+            snprintf(detail, sizeof(detail), "(unprintable detail from the worker)");
+        if (b.err || lo != want_lo || hi != want_hi || !ok) {
+            fprintf(stderr, "coord: worker %s failed local shard preparation: %s\n",
+                    peer->hostname, detail[0] ? detail : "malformed response");
+            return -1;
+        }
+        fprintf(stderr, "coord: worker %s local shard ready: layers [%u,%u), "
+                        "%u tensors, %.2f GiB\n",
+                peer->hostname, (unsigned)lo, (unsigned)hi, tensors,
+                (double)bytes / 1073741824.0);
+        return 0;
+    }
+}
+
 /* --- llamacpp cluster mode (v2 WS-C + the B2 plan consumer) ----------------
  *
  * Accept `n_remote` rpc-supervisor workers over the existing pairing/HELLO
@@ -6368,7 +7542,7 @@ static int allow_small_cluster_env(void) {
 static int run_llamacpp_cluster_mode(
         const char *llama_bin, const char *llama_gguf, int llama_port,
         const char *api_bind, const char *api_token, uint32_t ctx_size,
-        const char *bind, int disc_port, int n_remote,
+        const char *bind, int disc_port, int n_remote, int force_cluster,
         const char *pair_code_in, int create,
         const char *pair_acct, const char *acct_token, const char *rendezvous,
         const idletoken_llm_model_size *msize, const idletoken_node_mem *me) {
@@ -6523,6 +7697,15 @@ static int run_llamacpp_cluster_mode(
         }
         ws[n].fd = cfd;
 
+        /* Every read below this point is bounded (CLUS-05). This loop is
+         * serial by design — one machine is admitted at a time — so an
+         * unbounded read on any step turns "open a TCP connection and say
+         * nothing" into a complete, credential-free denial of cluster
+         * formation by anything on the LAN. The join-wait deadline above
+         * cannot save us: it is measured around accept(), and the stall
+         * happens after accept() has already returned. */
+        idletoken_set_recv_timeout(cfd, IDLETOKEN_JOIN_STEP_TIMEOUT_MS);
+
         if (idletoken_pair_server_auth(cfd, &pair_id, ws[n].session_key) != 0) {
             fprintf(stderr, "coord: rejected an unauthenticated join attempt (%s)\n",
                     strerror(errno));
@@ -6655,6 +7838,11 @@ static int run_llamacpp_cluster_mode(
          * it has the PSK). A worker that cannot start its rpc-server reports
          * an error instead — surface it and fail closed for that worker. */
         {
+            /* Starting a real rpc-server means loading a backend and binding a
+             * port; on a cold Windows machine that is tens of seconds, not the
+             * handshake's 15. Still bounded — this is the last unbounded read
+             * in the join path. */
+            idletoken_set_recv_timeout(cfd, IDLETOKEN_RPC_READY_TIMEOUT_MS);
             uint8_t rp[512];
             idletoken_msg_header rh;
             if (idletoken_recv_msg(cfd, &rh, rp, sizeof(rp)) != 0 ||
@@ -6669,9 +7857,37 @@ static int run_llamacpp_cluster_mode(
             idletoken_buf rb;
             idletoken_buf_init(&rb, rp, rh.payload_bytes);
             char ep[64] = "";
-            idletoken_buf_get_str(&rb, ep, sizeof(ep));
-            if (!rb.err && ep[0])
-                snprintf(ws[n].bind_addr, sizeof(ws[n].bind_addr), "%s", ep);
+            /* The endpoint the coordinator will DIAL and hand to llama-server.
+             * Strict read + address charset: a truncated or decorated endpoint
+             * points somewhere else, and "somewhere else" is chosen by the
+             * peer (CLUS-14). */
+            idletoken_buf_get_str_strict(&rb, ep, sizeof(ep));
+            if (rb.err || !idletoken_peer_host_ok(ep, sizeof(ep))) {
+                fprintf(stderr, "coord: worker %s reported an rpc endpoint that "
+                                "is not an address — dropping it\n",
+                        ws[n].hostname);
+                close(cfd);
+                continue;
+            }
+            /* Invariant #9 again, on the value we actually dial: the HELLO
+             * check above ran on the address the worker PREDICTED it would
+             * bind, and this is the one it really bound. Checking only the
+             * first left the second unchecked. */
+            {
+                char h2[64] = "";
+                const char *c2 = strrchr(ep, ':');
+                size_t l2 = c2 ? (size_t)(c2 - ep) : strlen(ep);
+                if (l2 < sizeof(h2)) { memcpy(h2, ep, l2); h2[l2] = '\0'; }
+                if (idletoken_ip_is_overlay(h2)) {
+                    fprintf(stderr, "coord: worker %s bound its rpc-server to %s, "
+                                    "which is on an overlay network — tensor "
+                                    "traffic must use the real LAN. Dropping it.\n",
+                            ws[n].hostname, ep);
+                    close(cfd);
+                    continue;
+                }
+            }
+            snprintf(ws[n].bind_addr, sizeof(ws[n].bind_addr), "%s", ep);
         }
 
         /* "Bound" is not "reachable from here": Windows Firewall filters the
@@ -6710,25 +7926,54 @@ static int run_llamacpp_cluster_mode(
     }
     if (disc) { disc->destroy(disc); disc = NULL; }
 
+    /* The join deadlines above exist to stop a stranger holding the accept
+     * loop. Past this point every fd belongs to a machine that proved the join
+     * code and the sockets carry long-lived control traffic (heartbeats, and a
+     * shard fetch that legitimately runs for minutes), so the per-step deadline
+     * comes off here and each long phase sets its own. Leaving it on would turn
+     * a slow-but-honest worker into a dropped one. */
+    for (int i = 0; i < n; i++) idletoken_set_recv_timeout(ws[i].fd, 0);
+
+    /* Partial local loading is a cluster invariant, not an optional warm-start
+     * optimization. An older worker would accept the run and silently receive
+     * its model tensors from the coordinator over RPC. */
+    for (int i = 0; i < n; i++) {
+        if (!strstr(ws[i].version, "rpc-cache-v1")) {
+            fprintf(stderr, "idletoken-coord: refuse: worker %s does not "
+                            "support local layer shards (rpc-cache-v1). Upgrade "
+                            "IdleToken on that machine; full-model RPC transfer "
+                            "is no longer allowed.\n", ws[i].hostname);
+            for (int j = 0; j < n; j++) close(ws[j].fd);
+            close(lfd);
+            return 3;
+        }
+    }
+
     /* --- consume the WS-B2 plan ------------------------------------------ */
     idletoken_node_mem nodes[IDLETOKEN_LLPLAN_MAX_NODES];
     memset(nodes, 0, sizeof(nodes));
     nodes[0] = *me;   /* coordinator = node 0 (the planner pins layer 0 here) */
     for (int i = 0; i < n; i++) {
         nodes[i + 1].vram_usable = ws[i].vram_usable;
-        nodes[i + 1].ram_usable  = ws[i].ram_usable;
+        /* RAM stays on the roster for compatibility and diagnostics, but is
+         * never a compute device or a serving-capacity contribution. */
+        nodes[i + 1].ram_usable  = 0;
         nodes[i + 1].unified     = ws[i].unified;
+        nodes[i + 1].backend     = IDLETOKEN_BACKEND_OF_OS(ws[i].os_family);
+        snprintf(nodes[i + 1].label, sizeof nodes[i + 1].label,
+                 "%s", ws[i].hostname);
     }
     const int n_nodes = n + 1;
-    const int allow_small = allow_small_cluster_env();
-    if (allow_small)
+    const int legacy_force = allow_small_cluster_env();
+    if (force_cluster)
+        fprintf(stderr, "coord: deployment: multi-machine mode selected by the user\n");
+    else if (legacy_force)
         fprintf(stderr, "coord: WARNING: IDLETOKEN_ALLOW_SMALL_CLUSTER=1 — "
-                        "forcing a cluster even if the model fits one machine "
-                        "(test vehicle, not a supported configuration)\n");
+                        "legacy alias for --force-cluster\n");
 
     idletoken_llama_plan lplan;
     if (idletoken_plan_llamacpp(msize, nodes, n_nodes, 0, ctx_size,
-                                allow_small, &lplan) != 0) {
+                                force_cluster || legacy_force, &lplan) != 0) {
         fprintf(stderr, "idletoken-coord: internal scheduler error\n");
         for (int i = 0; i < n; i++) close(ws[i].fd);
         close(lfd);
@@ -6751,7 +7996,8 @@ static int run_llamacpp_cluster_mode(
                                       IDLETOKEN_LLAMA_SLOT_CAP),
             me, msize, ctx_size, "single machine after all");
         return run_llamacpp_mode(llama_bin, llama_gguf, llama_port, api_bind,
-                                 api_token, ctx_size, NULL, NULL, 0);
+                                 api_token, ctx_size, NULL, NULL, NULL, 0,
+                                 NULL, 0, me, 1);
     }
 
     /* CLUSTER. Build --rpc / --device / --tensor-split from the plan.
@@ -6786,15 +8032,24 @@ static int run_llamacpp_cluster_mode(
     char rpc_list[576] = "", dev_list[320] = "", split_list[320] = "";
     snprintf(dev_list, sizeof(dev_list), "%s", local_dev);
     snprintf(split_list, sizeof(split_list), "%.4f", lplan.tensor_split[0]);
+    int peer_dev_lo[IDLETOKEN_LLPLAN_MAX_NODES] = {0};
+    int peer_dev_hi[IDLETOKEN_LLPLAN_MAX_NODES] = {0};
     static idletoken_rpc_peer peers[IDLETOKEN_LLPLAN_MAX_NODES];
-    int n_peers = 0;
+    int n_peers = 0, next_rpc_dev = 0, placement_dev = 1;
     for (int i = 1; i < lplan.n_nodes; i++) {
         const int widx = lplan.order[i] - 1;   /* nodes[k] -> ws[k-1] */
         if (widx < 0 || widx >= n) continue;   /* cannot happen; belt+braces */
         size_t rl = strlen(rpc_list), dl = strlen(dev_list), sl = strlen(split_list);
         snprintf(rpc_list + rl, sizeof(rpc_list) - rl, "%s%s",
                  rl ? "," : "", ws[widx].bind_addr);
-        snprintf(dev_list + dl, sizeof(dev_list) - dl, ",RPC%d", i - 1);
+        const int rpc_cpu = strstr(ws[widx].version, "rpc-cpu-v1") != NULL;
+        peer_dev_lo[n_peers] = placement_dev++;
+        /* Registering one endpoint registers ALL devices it exposes. Even a
+         * GPU-only plan must skip the hidden CPU device when numbering the
+         * next endpoint: with two new workers their GPUs are RPC0 and RPC2,
+         * not RPC0 and RPC1. */
+        snprintf(dev_list + dl, sizeof(dev_list) - dl, ",RPC%d", next_rpc_dev++);
+        if (rpc_cpu) next_rpc_dev++;
         snprintf(split_list + sl, sizeof(split_list) - sl, ",%.4f",
                  lplan.tensor_split[i]);
         snprintf(peers[n_peers].endpoint, sizeof(peers[n_peers].endpoint), "%s",
@@ -6802,12 +8057,13 @@ static int run_llamacpp_cluster_mode(
         snprintf(peers[n_peers].hostname, sizeof(peers[n_peers].hostname), "%s",
                  ws[widx].hostname);
         peers[n_peers].fd = ws[widx].fd;
+        peer_dev_hi[n_peers] = placement_dev;
         n_peers++;
     }
 
     char cluster_args[1024];
     snprintf(cluster_args, sizeof(cluster_args),
-             "--rpc %s --device %s --tensor-split %s",
+             "--rpc %s --device %s --tensor-split %s --fit off",
              rpc_list, dev_list, split_list);
 
     /* Bytes each share actually hands a node, against the memory that node's
@@ -6817,7 +8073,7 @@ static int run_llamacpp_cluster_mode(
      * (results/t14-engine-bump-phaseb-20260820.md). Now the over-allocation
      * would be visible in the line above the stack trace. */
     const double split_bytes = (double)msize->total_bytes +
-        (double)msize->kv_bytes_per_token * (double)ctx_size;
+        (double)idletoken_llama_kv_bytes(msize, ctx_size);
     fprintf(stderr, "\ncoord: cluster topology (device order = tensor-split "
                     "order; layer 0 on the local device):\n");
     fprintf(stderr, "  node 0 -> %-24s share=%.4f = %.2f GiB into %.2f GiB "
@@ -6829,18 +8085,173 @@ static int run_llamacpp_cluster_mode(
     for (int i = 0; i < n_peers; i++) {
         const int ni = lplan.order[i + 1];
         fprintf(stderr, "  node %d -> %-24s share=%.4f = %.2f GiB into %.2f GiB "
-                        "addressable  (RPC%d, %s)\n",
+                        "addressable  (%s)\n",
                 i + 1, peers[i].endpoint, lplan.tensor_split[i + 1],
                 lplan.tensor_split[i + 1] * split_bytes / 1073741824.0,
                 (ni >= 0 && ni < n_nodes)
                     ? (double)idletoken_llama_kv_pool(&nodes[ni]) / 1073741824.0
                     : 0.0,
-                i, peers[i].hostname);
+                peers[i].hostname);
     }
     fprintf(stderr, "coord: G-PRIV-7 precondition holds: the local device takes "
                     "the first nonzero tensor-split share, and llama.cpp pins "
                     "the input (token_embd) layer to the host CPU. The "
                     "packet-level G-PRIV-7 gate lands in WS-F.\n\n");
+
+    /* Pre-seed every remote model slice before llama-server opens the GGUF.
+     * Once the engine starts, its RPC SET_TENSOR_HASH requests become local
+     * cache hits and carry hashes only; model bytes never travel on the
+     * inference transport. */
+    char weight_repo[512];
+    if (coord_weight_repo_start(llama_gguf, weight_repo,
+                                sizeof(weight_repo)) != 0) {
+        fprintf(stderr, "idletoken-coord: could not start or reach a layer "
+                        "weight repository; refusing full-model RPC fallback\n");
+        for (int i = 0; i < n_peers; i++) close(peers[i].fd);
+        close(lfd);
+        return 3;
+    }
+    double placement_shares[IDLETOKEN_LLPLAN_MAX_DEVICES] = {0};
+    const int placement_devices = lplan.n_nodes;
+    const int placement_ngl = 99;
+    for (int d = 0; d < placement_devices; d++)
+        placement_shares[d] = lplan.tensor_split[d];
+    unsigned peer_layer_lo[IDLETOKEN_LLPLAN_MAX_NODES] = {0};
+    unsigned peer_layer_hi[IDLETOKEN_LLPLAN_MAX_NODES] = {0};
+    uint64_t cache_request[IDLETOKEN_LLPLAN_MAX_NODES] = {0};
+    for (int i = 0; i < n_peers; i++) {
+        if (idletoken_llama_device_layer_range(
+                msize->n_layers, placement_ngl,
+                placement_shares, placement_devices,
+                peer_dev_lo[i], peer_dev_hi[i],
+                &peer_layer_lo[i], &peer_layer_hi[i]) != 0) {
+            fprintf(stderr, "idletoken-coord: cannot map device placement to "
+                            "worker %s's layer range\n", peers[i].hostname);
+            for (int j = 0; j < n_peers; j++) close(peers[j].fd);
+            close(lfd);
+            return 1;
+        }
+    }
+
+    /* The coordinator owns the CPU prefix plus the first placement device.
+     * Because the device list is coordinator-first, those two intervals must
+     * combine into [0, local_layer_hi). Every following GPU owns one adjacent
+     * interval. Validate the complete partition before downloading a byte: a
+     * hole or overlap here would otherwise become either corrupt local
+     * weights or a privacy-breaking remote layer 0. */
+    const int cpu_prefix = (int)msize->n_layers + 1 - placement_ngl > 0
+                               ? (int)msize->n_layers + 1 - placement_ngl : 0;
+    unsigned local_dev_lo = 0, local_dev_hi = 0;
+    if (idletoken_llama_device_layer_range(
+            msize->n_layers, placement_ngl,
+            placement_shares, placement_devices, 0, 1,
+            &local_dev_lo, &local_dev_hi) != 0) {
+        fprintf(stderr, "idletoken-coord: cannot derive the coordinator's "
+                        "local layer prefix\n");
+        for (int j = 0; j < n_peers; j++) close(peers[j].fd);
+        close(lfd);
+        return 1;
+    }
+    unsigned local_layer_hi = (unsigned)cpu_prefix;
+    if (local_dev_lo < msize->n_layers) {
+        if (local_dev_lo != (unsigned)cpu_prefix) {
+            fprintf(stderr, "idletoken-coord: local device interval [%u,%u) "
+                            "does not follow CPU prefix [0,%d)\n",
+                    local_dev_lo, local_dev_hi, cpu_prefix);
+            for (int j = 0; j < n_peers; j++) close(peers[j].fd);
+            close(lfd);
+            return 1;
+        }
+        local_layer_hi = local_dev_hi;
+    }
+    unsigned next_layer = local_layer_hi;
+    for (int i = 0; i < n_peers; i++) {
+        if (peer_layer_lo[i] == peer_layer_hi[i]) continue;
+        if (peer_layer_lo[i] != next_layer ||
+            peer_layer_hi[i] > msize->n_layers) {
+            fprintf(stderr, "idletoken-coord: heterogeneous layer plan is not "
+                            "a partition at %s: expected layer %u, got "
+                            "[%u,%u)\n", peers[i].hostname, next_layer,
+                    peer_layer_lo[i], peer_layer_hi[i]);
+            for (int j = 0; j < n_peers; j++) close(peers[j].fd);
+            close(lfd);
+            return 1;
+        }
+        next_layer = peer_layer_hi[i];
+    }
+    if (next_layer != msize->n_layers) {
+        fprintf(stderr, "idletoken-coord: heterogeneous layer plan leaves "
+                        "[%u,%u) unassigned\n", next_layer, msize->n_layers);
+        for (int j = 0; j < n_peers; j++) close(peers[j].fd);
+        close(lfd);
+        return 1;
+    }
+
+    char local_cache[1024], local_gguf[1280];
+    coord_prepare_heartbeat prep_hb = {
+        .peers = peers,
+        .n_peers = n_peers,
+        .stop = 0,
+        .failed = 0,
+    };
+    pthread_t prep_hb_thread;
+    ignore_sigpipe();
+    int prep_hb_started = pthread_create(&prep_hb_thread, NULL,
+                                         coord_prepare_heartbeat_thread,
+                                         &prep_hb) == 0;
+    if (!prep_hb_started) {
+        fprintf(stderr, "idletoken-coord: cannot start the model-preparation "
+                        "heartbeat; refusing to let paired workers time out "
+                        "silently\n");
+        for (int j = 0; j < n_peers; j++) close(peers[j].fd);
+        close(lfd);
+        return 1;
+    }
+    const int local_prepare_rc =
+        coord_local_model_cache_dir(local_cache, sizeof(local_cache)) != 0
+            ? -1
+            : idletoken_local_model_prepare_from_file(
+                  weight_repo, llama_gguf, local_layer_hi,
+                  local_cache, local_gguf, sizeof(local_gguf));
+    prep_hb.stop = 1;
+    pthread_join(prep_hb_thread, NULL);
+    if (local_prepare_rc != 0 || prep_hb.failed) {
+        fprintf(stderr, "idletoken-coord: could not prepare the coordinator's "
+                        "dynamic local model prefix [0,%u); refusing a full "
+                        "model fallback\n", local_layer_hi);
+        for (int j = 0; j < n_peers; j++) close(peers[j].fd);
+        close(lfd);
+        return 3;
+    }
+    fprintf(stderr, "coord: coordinator local model: layers [0,%u) + shared "
+                    "tensors at %s\n", local_layer_hi, local_gguf);
+
+    for (int i = 0; i < n_peers; i++) {
+        cache_request[i] = ((uint64_t)time(NULL) << 24) ^
+                           ((uint64_t)(i + 1) << 8) ^ UINT64_C(0x52);
+        fprintf(stderr, "coord: assigning %s only layers [%u,%u) from %s\n",
+                peers[i].hostname, peer_layer_lo[i], peer_layer_hi[i],
+                weight_repo);
+        if (coord_send_rpc_cache_plan(&peers[i], cache_request[i],
+                                      peer_layer_lo[i], peer_layer_hi[i],
+                                      weight_repo) != 0) {
+            fprintf(stderr, "idletoken-coord: send RPC_CACHE_PLAN to %s failed\n",
+                    peers[i].hostname);
+            for (int j = 0; j < n_peers; j++) close(peers[j].fd);
+            close(lfd);
+            return 1;
+        }
+    }
+    for (int i = 0; i < n_peers; i++) {
+        if (coord_wait_rpc_cache_ready(&peers[i], cache_request[i],
+                                       peer_layer_lo[i], peer_layer_hi[i]) != 0) {
+            for (int j = 0; j < n_peers; j++) close(peers[j].fd);
+            close(lfd);
+            return 3;
+        }
+    }
+    fprintf(stderr, "coord: all remote layer shards are local; starting "
+                    "llama-server with hash-only RPC model loading\n");
 
     /* The idletoken-server child (RPC client side of the TLS transport) reads the
      * PSK from its environment, inherited across fork — and, on Windows, across
@@ -6854,34 +8265,41 @@ static int run_llamacpp_cluster_mode(
      * behaved correctly; the cluster simply could never form on Windows.
      * setenv() is MinGW-shimmed in src/platform/win/win_compat.c. */
     setenv("GGML_RPC_PSK", psk_hex, 1);
+    /* A remote model-weight cache miss must stop the engine. Otherwise
+     * llama.cpp falls back to SET_TENSOR and a sparse coordinator GGUF would
+     * silently send hole bytes while also recreating the old full-weight RPC
+     * transfer. Dynamic graph inputs are still allowed to use SET_TENSOR. */
+    setenv("GGML_RPC_REQUIRE_MODEL_CACHE", "1", 1);
 
     /* Slots across a cluster = the MINIMUM over nodes, never the sum: under
      * tensor-split every node holds its own layers' KV for the SAME sequence,
-     * so the tightest node decides how many sequences the cluster can carry
-     * (scheduler-design §4.5b). Each node is charged its tensor share of both
+     * so the tightest GPU decides how many sequences the cluster can carry
+     * (scheduler-design §4.5b). Each GPU is charged its tensor share of both
      * the weights and the KV. */
-    {
-        int cluster_slots = IDLETOKEN_LLAMA_SLOT_CAP;
-        for (int i = 0; i < lplan.n_nodes; i++) {
-            const int ni = lplan.order[i];
-            if (ni < 0 || ni >= n_nodes) continue;
-            const int s = idletoken_llama_seq_slots(
-                &nodes[ni], msize, ctx_size,
-                lplan.tensor_split[i], IDLETOKEN_LLAMA_SLOT_CAP);
-            if (s < cluster_slots) cluster_slots = s;
-        }
-        g_llama_slots = llama_decide_slots(cluster_slots, &nodes[0],
-                                           msize, ctx_size,
-                                           "tightest node in the cluster");
+    int cluster_slots = IDLETOKEN_LLAMA_SLOT_CAP;
+    for (int i = 0; i < lplan.n_nodes; i++) {
+        const int ni = lplan.order[i];
+        if (ni < 0 || ni >= n_nodes) continue;
+        const int s = idletoken_llama_seq_slots(
+            &nodes[ni], msize, ctx_size,
+            lplan.tensor_split[i], IDLETOKEN_LLAMA_SLOT_CAP);
+        if (s < cluster_slots) cluster_slots = s;
     }
+    g_llama_slots = llama_decide_slots(cluster_slots, &nodes[0],
+                                       msize, ctx_size,
+                                       "tightest GPU in the cluster");
 
     close(lfd);   /* the worker control fds in ws[].fd stay open on purpose:
                    * they carry the 15 s HEARTBEAT (llama_peers_heartbeat), and
                    * workers shut their rpc-server down on EOF *or* 60 s of
                    * silence — so a coordinator that hangs without closing the
                    * socket no longer leaves remote compute ports open. */
-    return run_llamacpp_mode(llama_bin, llama_gguf, llama_port, api_bind,
-                             api_token, ctx_size, cluster_args, peers, n_peers);
+    return run_llamacpp_mode(
+        llama_bin, local_gguf, llama_port, api_bind, api_token, ctx_size,
+        NULL, cluster_args, peers, n_peers,
+        lplan.working_set_fits && cpu_prefix > 0 ? weight_repo : NULL,
+        lplan.working_set_fits && cpu_prefix > 0 ? (unsigned)cpu_prefix : 0,
+        nodes, n_nodes);
 }
 
 int main(int argc, char **argv) {
@@ -6900,6 +8318,7 @@ int main(int argc, char **argv) {
         if (getppid() == 1) _exit(0);
     }
 #elif defined(_WIN32)
+    if (idletoken_win_require_utf8_paths() != 0) return 2;
     /* Windows side of parent-death: watch the client's process handle. */
     idletoken_die_with_parent();
 #endif
@@ -6916,12 +8335,13 @@ int main(int argc, char **argv) {
     int num_workers_set    = 0;      /* explicit --num-workers: in llamacpp mode
                                       * this switches on the WS-C cluster path
                                       * (N remote rpc workers + local device) */
+    int force_cluster      = 0;      /* explicit user choice; capacity remains
+                                      * the default only when this is false */
     int n_predict          = 1;
     int max_decode         = 4096;   /* per-request generation ceiling */
     int http_serve         = 0;
     int tokenizer_only     = 0;
     uint32_t ctx_size      = 0;   /* 0 = defaulted per mode below */
-    int ctx_fit            = 0;   /* --ctx-fit: ctx_size is a ceiling, size to memory */
     /* Pairing / discovery: when a code (or account) is given, advertise this
      * coordinator over the LAN so workers self-assemble by code — no manual
      * --coordinator on the worker side. */
@@ -6964,8 +8384,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--api-bind")    && i + 1 < argc) api_bind    = argv[++i];
         else if (!strcmp(a, "--api-token")   && i + 1 < argc) api_token   = argv[++i];
         else if (!strcmp(a, "--num-workers") && i + 1 < argc) { num_workers = atoi(argv[++i]); num_workers_set = 1; }
+        else if (!strcmp(a, "--force-cluster"))                force_cluster = 1;
         else if (!strcmp(a, "--ctx-size")    && i + 1 < argc) ctx_size    = (uint32_t)atoi(argv[++i]);
-        else if (!strcmp(a, "--ctx-fit"))                     ctx_fit     = 1;
         else if (!strcmp(a, "--model-id")    && i + 1 < argc) model_id    = argv[++i];
         else if (!strcmp(a, "--model-path")  && i + 1 < argc) model_path  = argv[++i];
         else if (!strcmp(a, "--gguf-dir")    && i + 1 < argc) gguf_dir    = argv[++i];
@@ -7049,6 +8469,92 @@ int main(int argc, char **argv) {
                             "serves this machine only\n", api_bind, loop_bind);
             api_bind = loop_bind;
         }
+    }
+
+    /* Admission: arm the capability channel BEFORE anything can serve a
+     * request, and decide out loud what "no marker" is going to mean here.
+     *
+     * The two files (0600, next to the rest of our state) are the whole
+     * interface to the platform agent: it reads the channel key to mint, and
+     * the client reads the local-origin marker to attribute its own traffic.
+     * Publishing them is not fatal on its own — a machine with no writable
+     * state directory still runs, it just cannot PROVE anything about origin —
+     * so this warns and continues rather than refusing to start. What would be
+     * dishonest is being quiet about it, because the symptom of a missing
+     * channel key on a sharing machine is "the platform stopped sending me
+     * work", which points nowhere near here.
+     *
+     * The policy:
+     *   --shared            -> STRICT. This machine serves strangers, so a
+     *                          request with no marker might be one of theirs
+     *                          with the marker removed (PROV-28), and the safe
+     *                          reading of an ambiguous request is "serve it, do
+     *                          not forward it".
+     *   otherwise           -> CAPABILITY. Nothing here is anybody else's, so
+     *                          "no marker" has exactly one meaning and the
+     *                          feature keeps working for plain curl.
+     *   env override        -> whatever was asked for, printed every time.
+     *                          `legacy` is the pre-2026-08-30 behaviour and
+     *                          exists so the gate can demonstrate the attack on
+     *                          the same binary that stops it. */
+    {
+        char adm_chan[400] = "", adm_local[400] = "", aerr[320] = "";
+        const char *pol_env = getenv("IDLETOKEN_OVERFLOW_ORIGIN_POLICY");
+        idletoken_ovf_policy pol = g_shared_mode ? IDLETOKEN_OVF_ORIGIN_STRICT
+                                                 : IDLETOKEN_OVF_ORIGIN_CAPABILITY;
+        if (idletoken_admission_default_paths(adm_chan, sizeof adm_chan,
+                                              adm_local, sizeof adm_local) != 0) {
+            adm_chan[0] = adm_local[0] = '\0';
+            fprintf(stderr, "coord: admission: no home directory — the capability "
+                            "channel exists only in memory, so the platform agent "
+                            "beside this coordinator cannot mint and its jobs will "
+                            "arrive unattributed\n");
+        }
+        if (idletoken_admission_init(adm_chan, adm_local, aerr, sizeof aerr) != 0)
+            fprintf(stderr, "coord: admission: could not publish the capability "
+                            "channel — %s. Platform jobs will arrive unattributed; "
+                            "on a --shared machine they are still served and still "
+                            "not forwarded.\n", aerr[0] ? aerr : "unknown error");
+        else if (adm_chan[0])
+            fprintf(stderr, "coord: admission: capability channel published to %s "
+                            "(0600); local-origin marker at %s\n", adm_chan, adm_local);
+
+        if (pol_env && pol_env[0]) {
+            if      (!strcmp(pol_env, "legacy"))     pol = IDLETOKEN_OVF_ORIGIN_LEGACY;
+            else if (!strcmp(pol_env, "capability")) pol = IDLETOKEN_OVF_ORIGIN_CAPABILITY;
+            else if (!strcmp(pol_env, "strict"))     pol = IDLETOKEN_OVF_ORIGIN_STRICT;
+            else {
+                fprintf(stderr, "idletoken-coord: refuse: "
+                        "IDLETOKEN_OVERFLOW_ORIGIN_POLICY='%s' is not one of "
+                        "legacy|capability|strict\n", pol_env);
+                return 2;
+            }
+            /* Loud on every start, not just the dangerous value: an override
+             * nobody can see in the log is an override nobody remembers
+             * setting (threat register OPS-03). */
+            fprintf(stderr, "coord: overflow: origin policy OVERRIDDEN to '%s' by "
+                            "IDLETOKEN_OVERFLOW_ORIGIN_POLICY%s\n",
+                    idletoken_overflow_policy_name(pol),
+                    pol == IDLETOKEN_OVF_ORIGIN_LEGACY
+                        ? " — this is the pre-hardening behaviour in which a "
+                          "request with no origin marker is forwardable, i.e. a "
+                          "modified platform agent can make this machine pay a "
+                          "third machine for a job it was already paid for "
+                          "(threat register PROV-28). For attack reproduction only."
+                        : "");
+        } else {
+            fprintf(stderr, "coord: overflow: origin policy '%s' (%s)\n",
+                    idletoken_overflow_policy_name(pol),
+                    g_shared_mode ? "this machine serves platform work, so an "
+                                    "unattributed request is not forwardable"
+                                  : "this machine does not serve platform work");
+        }
+        idletoken_overflow_set_policy(pol);
+        if (g_shared_mode) g_is_provider = 1;
+        /* Resolve the prompt-excerpt decision now, so a --shared machine says
+         * at STARTUP that it is ignoring IDLETOKEN_LOG_PROMPTS rather than
+         * leaving its operator to notice the lines are missing. */
+        (void)prompt_excerpt_log_on();
     }
 
     /* Overflow: switch it on here, before anything can serve a request, and
@@ -7171,20 +8677,9 @@ int main(int argc, char **argv) {
             idletoken_llm_model_size msize;
             memset(&msize, 0, sizeof msize);
             char budget_src[512] = "";
-            if (!model_id) {
-                msize.total_bytes       = auto_model.file_bytes;
-                msize.n_layers          = auto_model.spec.n_layers;
-                msize.kv_bytes_per_token = auto_model.kv_bytes_per_token;
-                /* Straight from the GGUF header — the one source that cannot
-                 * drift from the file actually being loaded. */
-                msize.n_expert          = auto_model.n_expert;
-                msize.n_expert_used     = auto_model.n_expert_used;
-                snprintf(budget_src, sizeof budget_src,
-                         "the GGUF header of %s (%.2f GiB)",
-                         llama_gguf, (double)auto_model.file_bytes / 1073741824.0);
-            } else if (idletoken_model_size_resolve(g_model, quant, llama_gguf,
-                                                    &msize, budget_src,
-                                                    sizeof budget_src) != 0) {
+            if (idletoken_model_size_resolve(g_model, quant, llama_gguf,
+                                             &msize, budget_src,
+                                             sizeof budget_src) != 0) {
                 fprintf(stderr, "idletoken-coord: internal error: cannot size %s\n",
                         g_model->id);
                 return 1;
@@ -7210,8 +8705,7 @@ int main(int argc, char **argv) {
                 }
                 const double kvs = idletoken_llama_kv_scale(kvk, kvv);
                 if (kvs != 1.0) {
-                    msize.kv_bytes_per_token =
-                        (uint64_t)((double)msize.kv_bytes_per_token * kvs + 0.5);
+                    idletoken_llama_model_kv_scale(&msize, kvs);
                     fprintf(stderr,
                             "coord: KV cache K=%s V=%s -> %.0f%% of f16 "
                             "(%.1f KiB/token for planning)\n",
@@ -7224,6 +8718,7 @@ int main(int argc, char **argv) {
 
             idletoken_node_mem me;
             memset(&me, 0, sizeof(me));
+            snprintf(me.label, sizeof me.label, "this machine");
             const char *fake_usable = getenv("IDLETOKEN_TEST_USABLE_BYTES");
             if (fake_usable && fake_usable[0]) {
                 /* TEST ONLY: lets the refusal path be exercised on a machine
@@ -7264,33 +8759,57 @@ int main(int argc, char **argv) {
                 me.ram_pinnable = 0;
                 me.unified      = rep.unified_memory ? 1 : 0;
             }
-            const uint64_t usable = idletoken_llama_node_usable(&me);
-
             /* Both llamacpp branches below return without ever reaching the
              * variant resolution near the end of main(), so the precision has
              * to be settled here or it stays blank for the whole run. */
             if (llama_resolve_quant(quant, llama_gguf) != 0) return 2;
 
-            /* --- WS-C cluster path: remote rpc workers requested ----------
-             * BEFORE the single-machine ctx fitting below: a coordinator
+            /* Low-bit weight tiers have a fixed, uniform KV dtype independent
+             * of available capacity. Apply it BEFORE the cluster branch so
+             * single and multi-machine planners price the same bytes the
+             * engine will allocate. High/unknown weight tiers stay f16 here;
+             * the single-machine path may select q8_0 below only when it makes
+             * the complete exact context fit. */
+            {
+                char kvk[12], kvv[12], kverr[128];
+                if (idletoken_llama_kv_types(kvk, kvv, kverr, sizeof kverr) != 0) {
+                    fprintf(stderr, "idletoken-coord: %s\n", kverr);
+                    return 2;
+                }
+                if (!kvk[0] && !kvv[0]) {
+                    int wbits = quant && quant[0]
+                        ? idletoken_quant_weight_bits(quant) : 0;
+                    if (!wbits && llama_gguf)
+                        wbits = idletoken_quant_bits_from_path(llama_gguf);
+                    const char *fixed =
+                        idletoken_llama_kv_type_for_weight(wbits);
+                    if (fixed) {
+                        setenv("IDLETOKEN_KV_CACHE_TYPE", fixed, 1);
+                        setenv("IDLETOKEN_KV_CACHE_TYPE_V", fixed, 1);
+                        idletoken_llama_model_kv_scale(
+                            &msize, idletoken_llama_kv_scale(fixed, fixed));
+                        fprintf(stderr,
+                                "coord: KV cache auto: %d-bit weights -> "
+                                "K=%s V=%s (%.1f KiB/token)\n",
+                                wbits, fixed, fixed,
+                                (double)msize.kv_bytes_per_token / 1024.0);
+                    }
+                }
+            }
+
+            /* --- WS-C cluster path: remote RPC GPUs requested --------------
+             * BEFORE the single-machine admission below: a coordinator
              * that cannot hold the model alone is exactly the machine that
              * clusters, so the single-machine refusals must not run here.
-             * Cluster ctx sizing stays simple (default ask, model clamp);
-             * the planner's needed() accounts for the KV bytes. */
+             * The exact context is checked after every worker reports its GPU
+             * budget inside run_llamacpp_cluster_mode(). */
             if (num_workers_set && num_workers >= 1) {
-                /* --ctx-fit has no per-node fitting here (the pool is not one
-                 * machine's memory); it falls back to the conservative default
-                 * ask rather than honoring a ceiling nobody sized. */
-                if (ctx_fit && ctx_size)
-                    fprintf(stderr, "coord: --ctx-fit: cluster mode sizes the "
-                                    "context conservatively (ask %u); pass an "
-                                    "explicit --ctx-size tier to override\n",
-                            (unsigned)32768);
-                uint32_t cctx = (ctx_size && !ctx_fit) ? ctx_size : 32768;
-                if (cctx > g_model->ctx_max) {
+                uint32_t cctx = ctx_size ? ctx_size : 262144u;
+                if (cctx > model_ctx_ceiling(g_model)) {
                     fprintf(stderr, "idletoken-coord: ctx-size %u clamped to %s "
-                                    "max %u\n", cctx, g_model->id, g_model->ctx_max);
-                    cctx = g_model->ctx_max;
+                                    "max %u\n", cctx, g_model->id,
+                            model_ctx_ceiling(g_model));
+                    cctx = model_ctx_ceiling(g_model);
                 }
                 g_max_decode = max_decode;
                 printf("idletoken-coord v0.1.0-pre  (llamacpp cluster mode)\n");
@@ -7298,53 +8817,23 @@ int main(int argc, char **argv) {
                 return run_llamacpp_cluster_mode(llama_bin, llama_gguf,
                                                  llama_port, api_bind, api_token,
                                                  cctx, bind, disc_port,
-                                                 num_workers, pair_code, create,
+                                                 num_workers, force_cluster,
+                                                 pair_code, create,
                                                  pair_acct, acct_token,
                                                  rendezvous, &msize, &me);
             }
 
-            /* Context: an explicit --ctx-size is honored (and fit-checked by
-             * the planner below); otherwise size it from memory. Default ask
-             * stays 32K — the Anthropic face must fit a real Claude Code
-             * session, whose system prompt alone is ~13K tokens (measured; 8K
-             * failed on first contact). The 16K floor exists for the same
-             * reason: silently granting less would fail mid-conversation
-             * instead of here, so we refuse loudly instead. */
-            const uint32_t ctx_ask = ctx_size ? ctx_size : 32768;
+            /* Runtime serves one exact product context. 256K is the default;
+             * an explicit 1M request stays 1M. The planner either admits that
+             * exact window or refuses it, with no context ladder. */
+            const uint32_t ctx_ask = ctx_size ? ctx_size : 262144u;
             uint32_t ctx_capped = ctx_ask;
-            if (ctx_capped > g_model->ctx_max) {
+            if (ctx_capped > model_ctx_ceiling(g_model)) {
                 fprintf(stderr, "idletoken-coord: ctx-size %u clamped to %s max %u\n",
-                        ctx_capped, g_model->id, g_model->ctx_max);
-                ctx_capped = g_model->ctx_max;
+                        ctx_capped, g_model->id, model_ctx_ceiling(g_model));
+                ctx_capped = model_ctx_ceiling(g_model);
             }
-            if (ctx_size == 0 || ctx_fit) {
-                const uint32_t granted =
-                    idletoken_llama_fit_ctx(usable, &msize, ctx_capped, 16384);
-                if (granted == 0) {
-                    fprintf(stderr,
-                            "idletoken-coord: refuse: %s (%.2f GiB weights) on this "
-                            "machine's %.2f GiB usable memory leaves room for less "
-                            "than a 16K-token context (%.1f KiB of KV cache per "
-                            "token). A Claude Code session needs ~13K tokens of "
-                            "input, so a smaller window would fail mid-conversation "
-                            "instead of here. Free memory, pick a smaller "
-                            "quantization, or pass an explicit --ctx-size to "
-                            "accept a small window deliberately.\n",
-                            g_model->id,
-                            (double)msize.total_bytes / 1073741824.0,
-                            (double)usable / 1073741824.0,
-                            (double)msize.kv_bytes_per_token / 1024.0);
-                    return 3;
-                }
-                if (granted < ctx_capped)
-                    fprintf(stderr,
-                            "coord: ctx sized to %u from available memory "
-                            "(asked %u; %.2f GiB usable)\n",
-                            granted, ctx_capped, (double)usable / 1073741824.0);
-                ctx_size = granted;
-            } else {
-                ctx_size = ctx_capped;
-            }
+            ctx_size = ctx_capped;
 
             idletoken_llama_plan lplan;
             if (idletoken_plan_llamacpp(&msize, &me, 1, 0, ctx_size, 0,
@@ -7369,12 +8858,17 @@ int main(int argc, char **argv) {
                                           IDLETOKEN_LLAMA_SLOT_CAP),
                 &me, &msize, ctx_size, "this machine");
 
+            g_ctx_display = ctx_size;
+            g_llama_gpu_only = 1;
+            fprintf(stderr, "coord: context: exact GPU-only %u-token service "
+                            "(--poll 0; no automatic resize)\n", ctx_size);
+
             g_max_decode = max_decode;
             printf("idletoken-coord v0.1.0-pre  (llamacpp single-machine mode)\n");
             printf("  model id    : %s (%s)\n", g_model->id, g_model->label);
             return run_llamacpp_mode(llama_bin, llama_gguf, llama_port,
                                      api_bind, api_token, ctx_size,
-                                     NULL, NULL, 0);
+                                     NULL, NULL, NULL, 0, NULL, 0, &me, 1);
         }
     }
 
@@ -7439,10 +8933,10 @@ int main(int argc, char **argv) {
                     g_model->id, num_workers, why);
         }
     }
-    if (ctx_size > g_model->ctx_max) {
+    if (ctx_size > model_ctx_ceiling(g_model)) {
         fprintf(stderr, "idletoken-coord: ctx-size %u clamped to %s max %u\n",
-                ctx_size, g_model->id, g_model->ctx_max);
-        ctx_size = g_model->ctx_max;
+                ctx_size, g_model->id, model_ctx_ceiling(g_model));
+        ctx_size = model_ctx_ceiling(g_model);
     }
     /* Resolve precision: pick the requested variant, or the model's default.
      * A model with no variant menu keeps quant = "" (single implicit precision). */
@@ -7625,6 +9119,7 @@ int main(int argc, char **argv) {
             }
             handle_http_request(cfd, NULL, 0, NULL, 0, &tk_pos,   /* parking mode does not apply */
                                 tok_engine, NULL, ctx_size, api_token, NULL);
+            idletoken_admission_request_end();
             close(cfd);
         }
         ds4_engine_close(tok_engine);
@@ -7711,6 +9206,10 @@ int main(int argc, char **argv) {
         int cfd = idletoken_accept_tcp(lfd);
         if (cfd < 0) { fprintf(stderr, "coord: accept: %s\n", strerror(errno)); close(lfd); return 1; }
         ws[n].fd = cfd;
+
+        /* Same bounded-read rule as the rpc path (CLUS-05): this loop is serial
+         * too, so one silent connection used to stall it forever. */
+        idletoken_set_recv_timeout(cfd, IDLETOKEN_JOIN_STEP_TIMEOUT_MS);
 
         /* Pairing auth preamble: prove both sides know the code/account secret
          * before HELLO. A node with the wrong code is rejected here. */
@@ -7817,20 +9316,27 @@ int main(int argc, char **argv) {
     /* All workers joined — stop advertising (roster is frozen). */
     if (disc) { disc->destroy(disc); disc = NULL; }
 
+    /* Join deadlines off (see the rpc path for the reasoning): from here these
+     * sockets carry inference rounds whose honest duration is the model's, not
+     * the handshake's. */
+    for (int i = 0; i < n; i++) idletoken_set_recv_timeout(ws[i].fd, 0);
+
     /* Rank by score, decide mode, split layers. */
     qsort(ws, (size_t)n, sizeof(ws[0]), cmp_worker_desc);
 
-    idletoken_node_mem mode_nodes[IDLETOKEN_MAX_WORKERS];
+    idletoken_node_mem mode_nodes[IDLETOKEN_MAX_WORKERS] = {0};
     for (int i = 0; i < n; i++) {
         mode_nodes[i].vram_usable = ws[i].vram_usable;
         mode_nodes[i].ram_usable  = ws[i].ram_usable;
         mode_nodes[i].ram_pinnable= ws[i].ram_pinnable;
         mode_nodes[i].unified     = ws[i].unified;
+        mode_nodes[i].backend     = IDLETOKEN_BACKEND_OF_OS(ws[i].os_family);
         /* Every number above is that machine's own declaration; when one is
          * wrong the cluster refuses to start, and the owner of five machines
          * needs to be told WHICH one to look at (same standard as the
          * engine-version gate naming the machine to upgrade). */
-        mode_nodes[i].label       = ws[i].hostname;
+        snprintf(mode_nodes[i].label, sizeof mode_nodes[i].label,
+                 "%s", ws[i].hostname);
     }
     char mode_why[256] = "";
     idletoken_mode mode = idletoken_mode_decide(coord_model(), mode_nodes, n, ctx_size,
@@ -7842,14 +9348,6 @@ int main(int argc, char **argv) {
         close(lfd);
         return 1;
     }
-    if (mode == IDLETOKEN_MODE_HYBRID) {
-        /* Layers are sized by VRAM+RAM below; each worker auto-offloads the
-         * portion of its assigned layers that exceeds its VRAM to pinned host
-         * RAM (cudaHostAlloc, PCIe-accessed). Overflow weights run slower. */
-        fprintf(stderr, "coord: HYBRID — sizing layers by VRAM+RAM; workers "
-                        "auto-offload VRAM overflow to host RAM\n");
-    }
-
     plan_layers(ws, n, mode, ctx_size);
 
     fprintf(stderr, "\ncoord: planned topology (stage 0 = strongest)\n");
@@ -8184,7 +9682,14 @@ int main(int argc, char **argv) {
                     parked->admit_ms  = t0;
                     parked->queued_ms = queued_ms;
                     active[n_active++] = parked;
+                    /* Deliberately NOT releasing the admission in-flight mark
+                     * here: this request is still running, just elsewhere in
+                     * this loop. The mark then survives until the 900 s
+                     * self-heal, which over-counts platform work — and
+                     * over-counting only ever REFUSES a forward, which is the
+                     * safe direction to be wrong in. */
                 } else {
+                    idletoken_admission_request_end();
                     close(cfd);                          /* non-decode paths have already replied */
                     COORD_ACCOUNT(t0, queued_ms);
                 }

@@ -8,7 +8,7 @@
 // Anything from the sim is marked `source: "dev-sim"` and the UI badges it, so
 // simulated peers can never be mistaken for a real cluster (philosophy 9/15).
 
-import type { EngineTuning } from "./settings";
+import type { EngineTuning, OverflowTuning } from "./settings";
 import { forgetSimLoadedModel } from "./clusterStats";
 
 export type NodeRole = "coordinator" | "worker";
@@ -30,24 +30,35 @@ export interface PeerNode {
    *  timeout (audit 2.8). Optional so absence (older snapshot shapes) reads as
    *  online — which is what absence used to mean. */
   online?: boolean;
-  /** What this machine brings to the pool, as its OWN probe measured it
-   *  (2026-08-15): free VRAM and free RAM in bytes, and whether the two are
-   *  one physical pool (Apple Silicon). Carried by the roster so any member
+  /** What this machine brings to the pool, as its OWN uncapped probe measured
+   *  it: real currently-free VRAM in bytes, and
+   *  whether the two are one physical pool (Apple Silicon). The wire names
+   *  stay vramFree/ramFree for compatibility. Carried by the roster so any member
    *  can total the cluster and answer "does the model fit on all of us" before
    *  anyone presses Start. 0/absent = a member that does not report it — the
    *  total is then incomplete and the UI must say so, not guess. */
   vramFree?: number;
   ramFree?: number;
   unifiedMemory?: boolean;
+  /** True only when this node has the cluster's exact model+precision as a
+   * complete, integrity-checked local GGUF. Start is gated on every member. */
+  modelReady?: boolean;
+  /** Creator-local continuity label for this install. It is a digest prefix,
+   *  never the raw device id, and is absent from member roster broadcasts.
+   *  It proves only "the same roster identity asked again" — not official
+   *  software, honest hardware, or remote attestation. */
+  deviceIdentity?: string;
+  /** This member is currently asking the creator for the coordinator role.
+   *  A request never changes the role by itself. */
+  wantsCoordinator?: boolean;
 }
 
 export interface SelfInfo {
   hostname: string;
   gpu: string;
   // This machine's local GGUF, as resolved by weights.resolveLocalWeights.
-  // Empty = nothing local, which is correct for a joiner (the coordinator's
-  // shard service feeds its layers) and a mock load in P3. Non-empty = real
-  // weights the engines should load from disk (P4/P6).
+  // Empty = not ready. Cluster joiners also keep a complete local GGUF; the
+  // worker imports only its assigned tensors from that file.
   modelPath?: string;
   // Settings-derived engine tuning (API bind/token, inter-stage port,
   // discovery port). Omitted = the Rust side's defaults (the historical
@@ -84,6 +95,9 @@ export interface PairingSnapshot {
   phase: OrchestrationPhase;
   api: ClusterApi | null;
   source: "engine" | "dev-sim";
+  // The creator-selected identity every joining machine must prepare.
+  modelId?: string;
+  quant?: string;
   // True on the creator while the roster is still open and big enough to
   // launch — the UI shows the "start cluster" button. (Real provider only;
   // the dev-sim auto-orchestrates.)
@@ -91,6 +105,64 @@ export interface PairingSnapshot {
   // Why the last join attempt failed; null/absent while nothing has. (Real
   // provider only — the dev-sim never fails.)
   lastError?: PairingError | null;
+  /** Set together with `lastError.code === "modelNotReady"`: the model and
+   *  precision the cluster refused us for not having. A refused joiner never
+   *  reaches the roster, so this refusal is the only place it can learn what to
+   *  fetch. Two fields, not a sentence — the UI turns them into one exact
+   *  download. */
+  requiredModel?: { modelId: string; quant: string } | null;
+  /** True only in the creator process. Missing values from an older native
+   *  backend fail closed and never expose a role-approval action. */
+  isCreator?: boolean;
+}
+
+export const COORDINATOR_ROLE_RISK =
+  "The coordinator can see local prompts and responses in plaintext and controls the cluster. " +
+  "The device label shows roster continuity only; it does not prove official software or honest hardware.";
+
+/** Whether this exact snapshot is eligible to present an approval action. */
+export function canApproveCoordinatorRequest(
+  snapshot: PairingSnapshot,
+  peer: PeerNode | undefined,
+): peer is PeerNode {
+  return snapshot.isCreator === true
+    && snapshot.phase === "idle"
+    && !!peer
+    && peer.self === false
+    && peer.role !== "coordinator"
+    && peer.online !== false
+    && peer.wantsCoordinator === true
+    && typeof peer.deviceIdentity === "string"
+    && peer.deviceIdentity.length > 0;
+}
+
+export function coordinatorApprovalPrompt(peer: PeerNode): string {
+  const device = peer.deviceIdentity || "unavailable";
+  return `Approve ${peer.hostname} (device ${device}) as coordinator?\n\n${COORDINATOR_ROLE_RISK}`;
+}
+
+export type CoordinatorApprovalOutcome = "approved" | "cancelled" | "stale";
+
+/**
+ * UI-side confirmation flow. The native `pairing_set_coordinator` command is
+ * still the enforcement boundary and re-checks creator/request/member state;
+ * this helper only makes the security decision explicit to the person.
+ */
+export async function approveCoordinatorRequest(
+  provider: Pick<PairingProvider, "setCoordinator">,
+  snapshot: PairingSnapshot,
+  peerId: string,
+  confirmApproval: (message: string) => boolean | Promise<boolean>,
+): Promise<CoordinatorApprovalOutcome> {
+  const peer = snapshot.peers.find((candidate) => candidate.id === peerId);
+  if (!canApproveCoordinatorRequest(snapshot, peer)) return "stale";
+  if (!await confirmApproval(coordinatorApprovalPrompt(peer))) return "cancelled";
+  // The snapshot captured by this click may become stale while the modal is
+  // open. Do not pretend a second read of that same object closes the race:
+  // the native command performs the authoritative current-roster check across
+  // the IPC boundary and rejects a withdrawal or leave that won the race.
+  await provider.setCoordinator(peerId);
+  return "approved";
 }
 
 export const DS4_TOTAL_LAYERS = 43;
@@ -129,7 +201,10 @@ export interface PairingProvider {
   // creator: freeze the roster, launch the engines (P4 entry).
   // allowSolo=true is the single-machine flow saying it really does mean one
   // machine; without it the engine enforces a 2-machine floor.
-  start(allowSolo?: boolean): Promise<void>;
+  start(allowSolo?: boolean, modelPath?: string, overflow?: OverflowTuning): Promise<void>;
+  // Publish a newly downloaded and verified local copy to the roster. The
+  // path stays on this machine; peers receive only modelReady.
+  updateModel(modelId: string, quant: string, modelPath: string): Promise<void>;
   leave(): Promise<void>;
   setCoordinator(peerId: string): Promise<void>;
   subscribe(cb: (s: PairingSnapshot) => void): () => void;
@@ -144,9 +219,12 @@ export function isValidCode(code: string): boolean {
 // find each other over the existing beacon/roster mechanics without a typed
 // code. Material = platform user id (stable, account-scoped — deliberately NOT
 // the raw email, and NOT the JWT which differs per login) + the normalized
-// platform URL (accounts from different platforms never collide) + the cluster
-// name (lets one account run separate clusters side by side; machines must
-// share the setting — default "IdleToken-Home"). The secret itself is never
+// platform URL (accounts from different platforms never collide). Cluster
+// names were removed from the product in 2026-08; a stale stored name must not
+// split two machines that are signed in to the same account. The fixed final
+// field below preserves wire compatibility with older clients that kept the
+// former default, while giving the stored setting no meaning at all. The
+// secret itself is never
 // broadcast, and since 2026-08-20 (audit A-P0-3) neither is anything derived
 // from it: the UDP beacon carries a random session id and a per-packet nonce
 // only, and the full value travels solely inside the LAN TCP join as proof —
@@ -156,12 +234,13 @@ export function isValidCode(code: string): boolean {
 // the engine's --pair-account path, a later convergence).
 export async function accountPairSecret(
   userId: string,
-  platformUrl: string,
-  clusterName: string
+  platformUrl: string
 ): Promise<string> {
   const url = platformUrl.trim().replace(/\/+$/, "").toLowerCase();
-  const name = clusterName.trim() || "IdleToken-Home";
-  const material = `idletoken-account-pair|v1|${userId}|${url}|${name}`;
+  // Protocol constant, not a cluster name. Keeping the old default bytes lets
+  // a newly updated client still find an older client that never changed the
+  // now-retired setting.
+  const material = `idletoken-account-pair|v1|${userId}|${url}|IdleToken-Home`;
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(material));
   const hex = Array.from(new Uint8Array(buf))
     .map((b) => b.toString(16).padStart(2, "0"))
@@ -189,6 +268,7 @@ class DevSimPairing implements PairingProvider {
     phase: "idle",
     api: null,
     source: "dev-sim",
+    isCreator: false,
   };
   private subs = new Set<(s: PairingSnapshot) => void>();
   private timers: ReturnType<typeof setTimeout>[] = [];
@@ -207,7 +287,7 @@ class DevSimPairing implements PairingProvider {
   private selfPeer(self: SelfInfo, role: NodeRole): PeerNode {
     // Memory the dev-sim reports for this machine, so the pooled verdict can
     // be exercised in a browser (the real path fills these from the probe).
-    return { id: "self", hostname: self.hostname, gpu: self.gpu, role, self: true, stage: "joined", online: true,
+    return { id: "self", hostname: self.hostname, gpu: self.gpu, role, self: true, stage: "joined", online: true, modelReady: true,
              vramFree: 13.2 * 1024 ** 3, ramFree: 20.6 * 1024 ** 3, unifiedMemory: false };
   }
 
@@ -220,6 +300,7 @@ class DevSimPairing implements PairingProvider {
       phase: "idle",
       api: null,
       source: "dev-sim",
+      isCreator: true,
     };
     this.emit();
     // Simulate two machines joining, then auto-orchestrate (P4).
@@ -239,7 +320,7 @@ class DevSimPairing implements PairingProvider {
     this.state = {
       code: _code.trim().toUpperCase(),
       peers: [
-        { id: "peer-coord", hostname: "machine-a", gpu: "RTX 5060 Ti", role: "coordinator", self: false, stage: "joined", online: true,
+        { id: "peer-coord", hostname: "machine-a", gpu: "RTX 5060 Ti", role: "coordinator", self: false, stage: "joined", online: true, modelReady: true,
           vramFree: 13.2 * 1024 ** 3, ramFree: 20.6 * 1024 ** 3, unifiedMemory: false },
         this.selfPeer(self, "worker"),
       ],
@@ -247,6 +328,7 @@ class DevSimPairing implements PairingProvider {
       phase: "idle",
       api: null,
       source: "dev-sim",
+      isCreator: false,
     };
     this.emit();
     this.timers.push(setTimeout(() => this.orchestrate(), 900));
@@ -267,7 +349,7 @@ class DevSimPairing implements PairingProvider {
     this.emit();
   }
 
-  async start(allowSolo?: boolean): Promise<void> {
+  async start(allowSolo?: boolean, _modelPath?: string, _overflow?: OverflowTuning): Promise<void> {
     // allowSolo is not decoration: it is how "run on this machine alone"
     // differs from "create a cluster". The sim used to ignore it and always
     // fabricate two joiners, so a one-machine deployment — a headline mode —
@@ -278,21 +360,28 @@ class DevSimPairing implements PairingProvider {
     this.orchestrate();
   }
 
+  async updateModel(_modelId: string, _quant: string, _modelPath: string): Promise<void> {}
+
   async leave(): Promise<void> {
     this.clearTimers();
     // The simulated coordinator is gone, so what it "loaded" is gone with it —
     // the next create latches the model that is selected then. (A real
     // coordinator gets this for free by exiting.)
     forgetSimLoadedModel();
-    this.state = { code: null, peers: [], coordinatorId: null, phase: "idle", api: null, source: "dev-sim" };
+    this.state = { code: null, peers: [], coordinatorId: null, phase: "idle", api: null, source: "dev-sim", isCreator: false };
     this.emit();
   }
 
   async setCoordinator(peerId: string): Promise<void> {
+    const peer = this.state.peers.find((candidate) => candidate.id === peerId);
+    if (!canApproveCoordinatorRequest(this.state, peer)) {
+      throw new Error("[PAIR_ROLE_NOT_REQUESTED] that machine is not requesting the coordinator role");
+    }
     this.state.coordinatorId = peerId;
     this.state.peers = this.state.peers.map((p) => ({
       ...p,
       role: p.id === peerId ? "coordinator" : "worker",
+      wantsCoordinator: p.id === peerId ? false : p.wantsCoordinator,
     }));
     this.emit();
   }
@@ -302,8 +391,22 @@ class DevSimPairing implements PairingProvider {
     // Unified-memory machines report one pool (the max, not the sum) — the
     // same rule the engine applies, exercised here by the DGX fixture.
     const unified = /unified/i.test(gpu);
-    this.state.peers.push({ id: `sim-${this.seq}`, hostname, gpu, role: "worker", self: false, stage: "joined", online: true,
-      vramFree: (unified ? 96 : 6.5) * 1024 ** 3, ramFree: (unified ? 96 : 12) * 1024 ** 3, unifiedMemory: unified });
+    this.state.peers.push({
+      id: `sim-${this.seq}`,
+      hostname,
+      gpu,
+      role: "worker",
+      self: false,
+      stage: "joined",
+      online: true,
+      modelReady: true,
+      deviceIdentity: `sim-${this.seq.toString().padStart(4, "0")}`,
+      // One simulated request keeps the browser-only review path observable.
+      wantsCoordinator: this.seq === 1,
+      vramFree: (unified ? 96 : 6.5) * 1024 ** 3,
+      ramFree: (unified ? 96 : 12) * 1024 ** 3,
+      unifiedMemory: unified,
+    });
     this.emit();
   }
 
@@ -424,8 +527,16 @@ class EnginePairing implements PairingProvider {
     });
   }
 
-  async start(allowSolo?: boolean): Promise<void> {
-    await this.call("pairing_start", { allowSolo: allowSolo ?? false });
+  async start(allowSolo?: boolean, modelPath?: string, overflow?: OverflowTuning): Promise<void> {
+    await this.call("pairing_start", {
+      allowSolo: allowSolo ?? false,
+      modelPath: modelPath ?? null,
+      overflowTuning: overflow ?? null,
+    });
+  }
+
+  async updateModel(modelId: string, quant: string, modelPath: string): Promise<void> {
+    await this.call("pairing_update_model", { modelId, quant, modelPath });
   }
 
   async leave(): Promise<void> {

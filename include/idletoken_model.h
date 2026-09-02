@@ -30,23 +30,16 @@ typedef enum {
                                    * ASSIGN_PLAN and manifests can name it. */
 } idletoken_backend;
 
-/* How a model may be deployed (CLAUDE.md hard constraint: large models may be
- * spread over a homogeneous LAN cluster; small models run on ONE machine only).
- *
- * The split is per-model and declared in models/<id>.json, NOT derived from the
- * backend or from a weight-size threshold: `backend` would misfile GLM-5.2 and
- * Kimi (large models that also run on ds4x), and a byte threshold is an
- * arbitrary line that drifts every time a quant is added.
- *
- * Why forbid it rather than merely not recommend it: a 4 GiB model split across
- * three houses' machines spends its whole per-token budget on pipeline
- * round-trips, so the cluster is strictly slower than the single machine that
- * could have held it. "Works" is not the bar (design philosophy 10). */
+/* Technical placement capability. This is deliberately NOT the default
+ * deployment: the same medium-sized model may fit locally at a low-bit quant
+ * and need several machines at a high-precision quant. The client derives a
+ * quiet default from model + quant + current memory, then honors the user's
+ * explicit choice. Current llama.cpp-backed models are all cluster-capable. */
 typedef enum {
     IDLETOKEN_DEPLOY_UNSPECIFIED = 0, /* never valid in the registry — see
                                        * idletoken_model_may_cluster() */
-    IDLETOKEN_DEPLOY_SINGLE_NODE = 1, /* one machine; multi-node is refused */
-    IDLETOKEN_DEPLOY_CLUSTER     = 2, /* may span a homogeneous cluster (N=1 is
+    IDLETOKEN_DEPLOY_SINGLE_NODE = 1, /* reserved for an unsplittable backend */
+    IDLETOKEN_DEPLOY_CLUSTER     = 2, /* may span a LAN cluster (N=1 is
                                        * the degenerate case, still allowed) */
 } idletoken_deployment;
 
@@ -97,10 +90,16 @@ typedef struct {
     uint8_t  hc_streams;       /* activation streams crossing a stage boundary
                                 * (DSv4 mHC = 4; plain residual models = 1) */
     uint32_t n_vocab;
+    uint16_t n_expert;         /* 0 on dense models */
+    uint16_t n_expert_used;    /* routed experts consulted per token */
 
     uint64_t layer_weight_bytes;   /* Σ all blk.* tensors at the shipped quant */
     uint64_t shared_weight_bytes;  /* embd + output head + mtp — every stage loads */
-    uint32_t ctx_max;
+    uint32_t ctx_max;              /* trained context window */
+    uint32_t ctx_yarn_max;         /* curated/validated YaRN-extended window
+                                    * (Qwen: 4x the trained one); 0 = no
+                                    * approved extension, ctx_max is the hard
+                                    * ceiling */
     uint16_t split_boundary_multiple; /* prefer PP cuts at multiples (0/1 = none;
                                        * GLM-5.2: 4 — shared DSA indexer group) */
 
@@ -110,8 +109,32 @@ typedef struct {
      * the full-attention period (every full_attn_interval-th layer is full). */
     uint32_t state_bytes_per_layer;
     uint32_t full_attn_interval;
+    /* DeepSeek4's pinned llama.cpp cache is not a linear
+     * bytes-per-token-per-layer allocation: it keeps one raw K cache for every
+     * layer plus CSA (1/4) and HCA (1/128) compressed caches, each rounded to
+     * 256 cells, and fixed f32 compressor state. These are WHOLE-MODEL f16
+     * bytes per cache cell / per sequence, read from the GGUF geometry and the
+     * pinned engine allocation code. Zero for every other KV family. */
+    uint64_t dsv4_raw_bytes_per_cell;
+    uint64_t dsv4_csa_bytes_per_cell;
+    uint64_t dsv4_hca_bytes_per_cell;
+    uint64_t dsv4_fixed_bytes_per_seq;
     uint64_t overhead_base_bytes;      /* MLA/GQA: non-KV per-node overhead
                                         * (activations/workspace/comms) */
+    /* MEASURED graph workspace at the two product context tiers, in bytes,
+     * from llama.cpp's own no_alloc dry-run — `scripts/measure_model_memory.sh`
+     * against the pinned engine. NOT estimated, and not derivable from any
+     * other field here: the growth rate is set by the model's architecture
+     * (results/memory-need-measured-20260901.md). 0 = not yet measured.
+     *
+     * Per BACKEND: the value is identical across GPUs and across every
+     * quantization in the menu, but NOT across backends — GLM-5.2 at 256K
+     * measures 1.50 GiB on CUDA and 33.3 GiB on Metal. Re-measure when the
+     * engine pin moves. */
+    uint64_t compute_bytes_256k_cuda;
+    uint64_t compute_bytes_1m_cuda;
+    uint64_t compute_bytes_256k_metal;
+    uint64_t compute_bytes_1m_metal;
 
     const char *default_gguf;  /* default filename when --model-path is absent;
                                 * mirrors variants[default_variant].gguf */
@@ -151,10 +174,9 @@ const idletoken_model_variant *idletoken_model_variant_get(const idletoken_model
 void idletoken_model_weight_bytes(const idletoken_model_spec *m, const char *quant,
                                uint64_t *layer_out, uint64_t *shared_out);
 
-/* May this model be served by more than one node? False for single-node models
- * AND for a model whose deployment was never declared — an undeclared model is
- * a maintainer mistake, and the fail-closed answer is the one that cannot
- * quietly produce a cluster nobody meant to allow. NULL is false.
+/* May this backend/model combination technically be served by more than one
+ * node? This is not a recommendation. False for an explicitly unsplittable
+ * model and for an undeclared model; NULL is false.
  *
  * `why` (optional, may be NULL) receives a user-facing sentence explaining the
  * refusal; it is left untouched when the answer is true. */

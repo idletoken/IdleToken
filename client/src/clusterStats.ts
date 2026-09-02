@@ -32,6 +32,13 @@ export interface ClusterStats {
   engine?: string; // "llamacpp"
   engine_state?: "starting" | "ready" | "restarting" | "failed";
   engine_restarts?: number;
+  // What the coordinator ACTUALLY granted this launch (ctx-kv-simplification:
+  // context and KV precision are automatic now, so the readback is the only
+  // honest place these numbers exist — the settings no longer claim them).
+  // Absent on older engines; the UI then says nothing.
+  ctx_size?: number;
+  kv_cache_k?: string; // "f16" | "q8_0" | … (escape-hatch values included)
+  kv_cache_v?: string;
 }
 
 /** What the coordinator reports it loaded, once it has reported anything. */

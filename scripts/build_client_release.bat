@@ -22,6 +22,27 @@ setlocal enabledelayedexpansion
 cd /d "%~dp0.."
 set ROOT=%CD%
 set TRIPLE=x86_64-pc-windows-msvc
+set ALT_TRIPLE=x86_64-pc-windows-gnu
+set "RUST_TOOLCHAIN="
+
+REM A normal MSVC Rust host still cannot link when this shell has no Visual
+REM Studio/Windows SDK `link.exe` (the Windows test-bed build node intentionally
+REM has only WinLibs). In that case use the installed Rust GNU host: it shares
+REM the same MinGW runtime as the native coord/worker build and needs no SDK.
+REM The sidecar suffix MUST follow the selected Rust target or Tauri refuses the
+REM build before compiling the client.
+where link.exe >nul 2>&1
+if errorlevel 1 (
+    rustup run stable-x86_64-pc-windows-gnu rustc -vV >nul 2>&1
+    if errorlevel 1 (
+        echo CLIENT_RELEASE_FAIL: neither MSVC link.exe nor stable-x86_64-pc-windows-gnu is available
+        exit /b 1
+    )
+    set TRIPLE=x86_64-pc-windows-gnu
+    set ALT_TRIPLE=x86_64-pc-windows-msvc
+    set "RUST_TOOLCHAIN=+stable-x86_64-pc-windows-gnu"
+    echo   using Rust GNU toolchain ^(Visual Studio linker is unavailable^)
+)
 
 REM --- build cache from a different repo path -----------------------------
 REM Cargo and Tauri bake ABSOLUTE paths into target\ (the generated plugin
@@ -46,15 +67,36 @@ if defined OLDROOT if /i not "!OLDROOT!"=="%ROOT%" (
 if not exist "%ROOT%\client\src-tauri\target" mkdir "%ROOT%\client\src-tauri\target"
 > "%STAMP%" echo %ROOT%
 
+REM --- native sidecars ---------------------------------------------------
+REM Release packaging must compile these from the sources that were just
+REM synced. Merely checking that an exe exists is not provenance: on 2026-09-02
+REM an old worker survived several source syncs and made a freshly built client
+REM report 13.1 GiB available while NVML reported 15.7 GiB free. The source had
+REM already removed that discount; the stale binary silently put it back into
+REM the installer. Fail closed if any current-source build fails.
+call "%ROOT%\build_worker_win.bat"
+if errorlevel 1 (
+    echo CLIENT_RELEASE_FAIL: current-source worker build failed
+    exit /b 1
+)
+call "%ROOT%\scripts\build_coord_win.bat"
+if errorlevel 1 (
+    echo CLIENT_RELEASE_FAIL: current-source coordinator build failed
+    exit /b 1
+)
+call "%ROOT%\scripts\build_agent_win.bat"
+if errorlevel 1 (
+    echo CLIENT_RELEASE_FAIL: current-source platform agent build failed
+    exit /b 1
+)
+
 REM --- engine binaries ---------------------------------------------------
 if not exist "%ROOT%\idletoken-worker.exe" (
-    REM build_ds4x_win.bat lives at the REPO ROOT and is the only copy —
-    REM scripts\build_ds4x.bat was a drifted second copy, deleted 2026-08-03.
-    echo CLIENT_RELEASE_FAIL: no idletoken-worker.exe ^(run build_ds4x_win.bat first^)
+    echo CLIENT_RELEASE_FAIL: no idletoken-worker.exe after current-source build
     exit /b 1
 )
 if not exist "%ROOT%\idletoken-coord.exe" (
-    echo CLIENT_RELEASE_FAIL: no idletoken-coord.exe ^(run scripts\build_coord_win.bat first^)
+    echo CLIENT_RELEASE_FAIL: no idletoken-coord.exe after current-source build
     exit /b 1
 )
 REM The coord must carry the pinned platform verify key, or sharing can never
@@ -76,14 +118,18 @@ if errorlevel 1 (
 if not exist "%ROOT%\client\src-tauri\binaries" mkdir "%ROOT%\client\src-tauri\binaries"
 copy /y "%ROOT%\idletoken-worker.exe" "%ROOT%\client\src-tauri\binaries\idletoken-worker-%TRIPLE%.exe" >nul
 copy /y "%ROOT%\idletoken-coord.exe"  "%ROOT%\client\src-tauri\binaries\idletoken-coord-%TRIPLE%.exe" >nul
-if exist "%ROOT%\idletoken-platform-agent.exe" (
-    copy /y "%ROOT%\idletoken-platform-agent.exe" "%ROOT%\client\src-tauri\binaries\idletoken-platform-agent-%TRIPLE%.exe" >nul
-) else (
-    echo WARN: no idletoken-platform-agent.exe — the Platform panel will fail to start the agent
-    REM Tauri fails the build on a missing externalBin, so keep a truthful stub
-    REM out of it: copy the coord and let the agent's own --selftest report.
-    copy /y "%ROOT%\idletoken-coord.exe" "%ROOT%\client\src-tauri\binaries\idletoken-platform-agent-%TRIPLE%.exe" >nul
+REM cargo-tauri itself may have been installed for the other Windows ABI and
+REM chooses externalBin names from its own host triple. The sidecars are
+REM standalone processes, not linked libraries, so keep BOTH suffixes current
+REM instead of letting an old alternate-suffix copy enter the installer.
+copy /y "%ROOT%\idletoken-worker.exe" "%ROOT%\client\src-tauri\binaries\idletoken-worker-%ALT_TRIPLE%.exe" >nul
+copy /y "%ROOT%\idletoken-coord.exe"  "%ROOT%\client\src-tauri\binaries\idletoken-coord-%ALT_TRIPLE%.exe" >nul
+if not exist "%ROOT%\idletoken-platform-agent.exe" (
+    echo CLIENT_RELEASE_FAIL: no idletoken-platform-agent.exe after current-source build
+    exit /b 1
 )
+copy /y "%ROOT%\idletoken-platform-agent.exe" "%ROOT%\client\src-tauri\binaries\idletoken-platform-agent-%TRIPLE%.exe" >nul
+copy /y "%ROOT%\idletoken-platform-agent.exe" "%ROOT%\client\src-tauri\binaries\idletoken-platform-agent-%ALT_TRIPLE%.exe" >nul
 
 REM llama.cpp sidecars are the v2 compute engine: idletoken-server serves local
 REM models and drives clusters; idletoken-rpc-server is supervised on worker nodes.
@@ -98,6 +144,7 @@ REM it failed every time with "run scripts\build_llamacpp_win.bat first" —
 REM advice that cannot fix it, because that script had already run.
 set "LLAMA_BIN=%ROOT%\vendor\llama.cpp\build\bin\Release"
 if not exist "%LLAMA_BIN%\llama-server.exe" set "LLAMA_BIN=%ROOT%\vendor\llama.cpp\build\bin"
+if not exist "%ROOT%\client\src-tauri\runtime\windows" mkdir "%ROOT%\client\src-tauri\runtime\windows"
 call :stage_engine llama-server    idletoken-server     || exit /b 1
 call :stage_engine ggml-rpc-server idletoken-rpc-server || exit /b 1
 goto :engines_staged
@@ -109,14 +156,26 @@ if not exist "%LLAMA_BIN%\%1.exe" (
 )
 copy /y "%LLAMA_BIN%\%1.exe" "%ROOT%\client\src-tauri\binaries\%2-%TRIPLE%.exe" >nul || (
     echo CLIENT_RELEASE_FAIL: could not stage %1.exe as %2 & exit /b 1)
+copy /y "%LLAMA_BIN%\%1.exe" "%ROOT%\client\src-tauri\binaries\%2-%ALT_TRIPLE%.exe" >nul || (
+    echo CLIENT_RELEASE_FAIL: could not stage %1.exe as %2 for alternate target & exit /b 1)
+REM externalBin carries only the executable. Shared-mode integrity checks the
+REM installed engine against a digest beside it, so bundle that digest as an
+REM explicit root resource under the FINAL installed sidecar name.
+powershell -NoProfile -Command ^
+  "$h=(Get-FileHash '%ROOT%\client\src-tauri\binaries\%2-%TRIPLE%.exe' -Algorithm SHA256).Hash.ToLower(); Set-Content -Encoding ascii '%ROOT%\client\src-tauri\runtime\windows\%2.exe.sha256' ($h + '  %2.exe')"
+if errorlevel 1 (
+    echo CLIENT_RELEASE_FAIL: could not record the %2.exe engine digest
+    exit /b 1
+)
 exit /b 0
 
 :engines_staged
 
 REM --- licences ----------------------------------------------------------
-REM The sidecars staged above contain vendored third-party code (ds4 = MIT,
-REM rax = BSD 3-Clause); both require the notice to travel with a BINARY
-REM distribution, and Apache-2.0 section 4(d) says the same about our NOTICE.
+REM Apache-2.0 section 4(d) requires our NOTICE to travel with a BINARY
+REM distribution. The retained ds4 source is not compiled into this package,
+REM but its MIT licence deliberately remains in every distribution under the
+REM project's archival/public-mirror contract.
 REM An installer IS a binary distribution. Staged into src-tauri\licenses so
 REM tauri.conf.json `bundle.resources` puts them inside the installer.
 if not exist "%ROOT%\client\src-tauri\licenses" mkdir "%ROOT%\client\src-tauri\licenses"
@@ -128,68 +187,72 @@ copy /y "%ROOT%\vendor\ds4\LICENSE" "%ROOT%\client\src-tauri\licenses\ds4-MIT.tx
     echo CLIENT_RELEASE_FAIL: cannot stage the ds4 licence & exit /b 1)
 copy /y "%ROOT%\vendor\llama.cpp\LICENSE" "%ROOT%\client\src-tauri\licenses\llamacpp-MIT.txt" >nul || (
     echo CLIENT_RELEASE_FAIL: cannot stage the llama.cpp licence & exit /b 1)
-powershell -NoProfile -Command ^
-  "$t = Get-Content -Raw '%ROOT%\vendor\ds4\rax.c'; $m = [regex]::Match($t, '(?s)^/\* Rax.*?\*/'); if (-not $m.Success -or $m.Value -notmatch 'Redistribution and use in source and binary forms') { exit 1 }; Set-Content -Path '%ROOT%\client\src-tauri\licenses\rax-BSD-3-Clause.txt' -Value $m.Value"
-if errorlevel 1 (
-    echo CLIENT_RELEASE_FAIL: could not extract the rax BSD-3 licence from vendor\ds4\rax.c
+
+REM --- CUDA runtime -----------------------------------------------------
+REM ds4/ds4x are not a backend: delete their stale DLLs. The llama.cpp CUDA
+REM sidecars are different. DSv4 on the pinned Windows build was measured to
+REM fail at process load with 0xC0000135 when cudart/cuBLAS were absent, so the
+REM installer must carry the exact CUDA 12 runtime beside the sidecars. This is
+REM what lets a compute node need only the NVIDIA driver, not the Toolkit.
+if not exist "%ROOT%\client\src-tauri\runtime\windows" mkdir "%ROOT%\client\src-tauri\runtime\windows"
+for %%D in (ds4cuda.dll ds4xcuda.dll) do (
+    if exist "%ROOT%\client\src-tauri\runtime\windows\%%D" del /q "%ROOT%\client\src-tauri\runtime\windows\%%D"
+)
+
+REM The GNU WebView2 binding links its loader dynamically, but Tauri does not
+REM add that DLL to the bundle by itself. Stage the x64 loader shipped by the
+REM exact webview2-com-sys version locked in Cargo.lock BEFORE running cargo:
+REM bundle resource paths are validated before compilation starts, so copying
+REM target\release\WebView2Loader.dll after a prebuild creates a clean-build
+REM deadlock (the prebuild itself refuses the missing resource).
+set "WEBVIEW2_LOADER="
+for /d %%D in ("%USERPROFILE%\.cargo\registry\src\*") do (
+    if exist "%%~fD\webview2-com-sys-0.38.2\x64\WebView2Loader.dll" set "WEBVIEW2_LOADER=%%~fD\webview2-com-sys-0.38.2\x64\WebView2Loader.dll"
+)
+if not defined WEBVIEW2_LOADER (
+    echo CLIENT_RELEASE_FAIL: missing webview2-com-sys 0.38.2 x64 WebView2Loader.dll in the Cargo registry ^(must match Cargo.lock^)
     exit /b 1
 )
+copy /y "%WEBVIEW2_LOADER%" "%ROOT%\client\src-tauri\runtime\windows\WebView2Loader.dll" >nul || exit /b 1
 
-REM --- CUDA runtime DLLs -------------------------------------------------
-if not exist "%ROOT%\client\src-tauri\runtime\windows" mkdir "%ROOT%\client\src-tauri\runtime\windows"
-REM Repo root FIRST, dist\ only as a fallback: the build scripts write their
-REM output to the root, while dist\ is a hand-assembled copy that goes stale.
-REM Shipping a stale ds4cuda.dll cost a full cross-machine debug round — the
-REM 07-16 copy in dist\ predated the WDDM DMA fix, so the packaged worker died
-REM in cudaMemcpy and fell back to MOCK, i.e. the cluster came up "ready" and
-REM answered with garbage. The timestamps are echoed for exactly that reason.
-REM 2026-08-04: cudart/cublas/cublasLt are NO LONGER SHIPPED. cuBLAS alone was
-REM 769 MB of a 790 MB payload and is Toolkit-only, not driver (philosophy 12).
-REM `objdump -p` confirms both our DLLs import only KERNEL32 at load time, and
-REM cuBLAS is delay-loaded with an actionable message when absent.
-for %%D in (ds4cuda.dll ds4xcuda.dll) do (
-    if exist "%ROOT%\%%D" (
-        copy /y "%ROOT%\%%D" "%ROOT%\client\src-tauri\runtime\windows\%%D" >nul
-        for %%T in ("%ROOT%\%%D") do echo   DLL %%D  ^<- repo root  %%~tT
-    ) else if exist "%ROOT%\dist\%%D" (
-        copy /y "%ROOT%\dist\%%D" "%ROOT%\client\src-tauri\runtime\windows\%%D" >nul
-        for %%T in ("%ROOT%\dist\%%D") do echo   DLL %%D  ^<- dist\  %%~tT
-    ) else (
-        echo CLIENT_RELEASE_FAIL: missing runtime DLL %%D ^(looked in repo root and dist\^)
+set "CUDA_RUNTIME_DIR=%IDLETOKEN_CUDA_RUNTIME_DIR%"
+if not defined CUDA_RUNTIME_DIR if defined CUDA_PATH set "CUDA_RUNTIME_DIR=%CUDA_PATH%\bin"
+if not defined CUDA_RUNTIME_DIR if exist "%LOCALAPPDATA%\IdleToken\cudart64_12.dll" set "CUDA_RUNTIME_DIR=%LOCALAPPDATA%\IdleToken"
+for %%D in (cudart64_12.dll cublas64_12.dll cublasLt64_12.dll) do (
+    if not exist "%CUDA_RUNTIME_DIR%\%%D" (
+        echo CLIENT_RELEASE_FAIL: missing %%D ^(set IDLETOKEN_CUDA_RUNTIME_DIR to the pinned CUDA 12 runtime directory^)
         exit /b 1
     )
+    copy /y "%CUDA_RUNTIME_DIR%\%%D" "%ROOT%\client\src-tauri\runtime\windows\%%D" >nul || exit /b 1
+    for %%T in ("%CUDA_RUNTIME_DIR%\%%D") do echo   CUDA %%D  %%~zT bytes
 )
+if not exist "%SystemRoot%\System32\vcomp140.dll" (
+    echo CLIENT_RELEASE_FAIL: missing %SystemRoot%\System32\vcomp140.dll ^(required by the pinned llama.cpp engine^)
+    exit /b 1
+)
+copy /y "%SystemRoot%\System32\vcomp140.dll" "%ROOT%\client\src-tauri\runtime\windows\vcomp140.dll" >nul || exit /b 1
 
-REM tauri.windows.conf.json lists ONLY ds4cuda.dll + ds4xcuda.dll as RUNTIME
-REM resources — plus, since 2026-08-14, the licence texts. That platform file
-REM does not ADD to `bundle.resources` from tauri.conf.json, it REPLACES it
-REM (base = a glob array, Windows = a source->target map), so the Windows
-REM installer shipped with no LICENSE/NOTICE at all while every other platform
-REM had them. Found by listing the built NSIS installer with 7-Zip; G_RELEASE
-REM now asserts the installer's file list so it cannot regress silently.
-REM cudart/cublas/cublasLt were removed on 2026-08-04: cuBLAS alone was 769 MB of
-REM a 790 MB payload (97%), and it comes from the CUDA Toolkit, not the display
-REM driver, so the user installs it (acceptance-criteria philosophy 12, E3).
-REM Keep that list EXPLICIT per file — a directory glob would silently re-ship
-REM whatever an older build left in runtime\windows\.
-REM (The note lives here, not in the .json: Tauri's schema rejects unknown keys,
-REM so a comment inside the config fails the build with
-REM  "Additional properties are not allowed".)
-REM
-REM Purge CUDA runtime DLLs an older build staged here. tauri.windows.conf.json
-REM no longer lists them, but leaving 800 MB of files in the staging directory
-REM invites the next person to "fix" the config by adding them back — and it is
-REM how dist\ silently stayed 447 MB for weeks.
-for %%D in (cudart64_12.dll cublas64_12.dll cublasLt64_12.dll) do (
-    if exist "%ROOT%\client\src-tauri\runtime\windows\%%D" (
-        del /q "%ROOT%\client\src-tauri\runtime\windows\%%D"
-        echo   removed stale staged %%D ^(user supplies it via CUDA Toolkit^)
-    )
+REM Chinese Windows profile/model/cache/key/socket paths are a release gate,
+REM not an opt-in smoke. It inspects every native manifest and performs real
+REM file, AF_UNIX, cache and persistent-key operations below a Chinese path.
+REM Run it only after staging the exact CUDA DLLs the installer carries: the
+REM source-tree llama-server otherwise exits at process load on machines where
+REM the Toolkit is not globally visible, while an old runtime directory could
+REM make a wrongly ordered gate pass by accident.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\scripts\windows_unicode_path_gate.ps1" -RepoRoot "%ROOT%"
+if errorlevel 1 (
+    echo CLIENT_RELEASE_FAIL: Windows Unicode path gate failed
+    exit /b 1
 )
 
 REM --- frontend ----------------------------------------------------------
 if not exist "%ROOT%\client\dist\index.html" (
     echo CLIENT_RELEASE_FAIL: no client\dist ^(build the frontend on a node machine and copy it here^)
+    exit /b 1
+)
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\client\scripts\verify_frontend_provenance.ps1" -ClientRoot "%ROOT%\client"
+if errorlevel 1 (
+    echo CLIENT_RELEASE_FAIL: client\dist is stale or does not match the synced frontend sources
     exit /b 1
 )
 
@@ -214,9 +277,9 @@ if not defined TAURI_BUNDLER_TOOLS_GITHUB_MIRROR set "TAURI_BUNDLER_TOOLS_GITHUB
 set "BUNDLE=%ROOT%\client\src-tauri\target\release\bundle\nsis"
 cd /d "%ROOT%\client"
 if "%IDLETOKEN_DEFER_UPDATER_SIGNING%"=="1" (
-    cargo tauri build --bundles nsis --config "{\"build\":{\"beforeBuildCommand\":\"\"},\"bundle\":{\"createUpdaterArtifacts\":false}}"
+    cargo %RUST_TOOLCHAIN% tauri build --bundles nsis --config "{\"build\":{\"beforeBuildCommand\":\"\"},\"bundle\":{\"createUpdaterArtifacts\":false}}"
 ) else (
-    cargo tauri build --bundles nsis --config "{\"build\":{\"beforeBuildCommand\":\"\"}}"
+    cargo %RUST_TOOLCHAIN% tauri build --bundles nsis --config "{\"build\":{\"beforeBuildCommand\":\"\"}}"
 )
 if errorlevel 1 (
     echo CLIENT_RELEASE_FAIL: tauri build failed

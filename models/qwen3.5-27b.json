@@ -5,7 +5,7 @@
   "backend": "ds4x",
   "arch": "qwen35",
   "available": true,
-  "deployment": "single-node",
+  "deployment": "cluster",
   "license": "Apache-2.0",
   "params_summary": "27B · 64 layers · hybrid linear attention (Gated DeltaNet 3:1 full)",
   "n_layers": 64,
@@ -13,6 +13,7 @@
   "hc_streams": 1,
   "n_vocab": 248320,
   "context_max": 262144,
+  "context_yarn_max": 1048576,
   "attn": {
     "kind": "hybrid",
     "full_attention_interval": 4,
@@ -37,7 +38,7 @@
   },
   "kv": {
     "kind": "hybrid",
-    "bytes_per_token_per_layer": 8192,
+    "bytes_per_token_per_layer": 4096,
     "state_bytes_per_layer": 3268608,
     "full_attention_interval": 4
   },
@@ -46,6 +47,10 @@
     "boundary_multiple": 0
   },
   "overhead_base_bytes": 2147483648,
+  "compute_bytes_256k_cuda": 529530880,
+  "compute_bytes_1m_cuda": 1201689068,
+  "compute_bytes_256k_metal": 797987308,
+  "compute_bytes_1m_metal": 1224873083,
   "chat_template": "gguf",
   "layer_weight_bytes": 8573593504,
   "shared_weight_bytes": 0,
@@ -351,7 +356,7 @@
   "notes": [
     "The linear path shares k heads at grp=3 (k_heads 16 / v_heads 48); 4B and 9B are grp=2 and 0.8B is grp=1 -- all three ratios have now run on real weights.",
     "Full layers: 24 q heads / 4 KV heads × 256; conv channels 10240 = k_dim*2 + v_dim(6144); FFN width 17408. All derived from GGUF metadata, so the loader needs no change.",
-    "Full layers: 4 KV heads × 256 × 2 (K+V) × 4 B = 8192 B per token per layer. Linear layers: state 48×128×128×4 plus conv window 3×10240×4 = 3268608 B, independent of context length.",
+    "Full layers: 4 KV heads × (256 K + 256 V) × 2 B/f16 = 4096 B per token per layer. Linear layers: state 48×128×128×4 plus conv window 3×10240×4 = 3268608 B, independent of context length.",
     "Verified on a unified-memory Linux node 2026-07-28: greedy continuation of \"Count: 1, 2, 3,\" matches llama.cpp character for character (\" 4, 5, 6, \"); layer 0 attn_output 3.9443 vs 3.9477 and final_output 10.1229 vs 10.1200 (<0.1%). CPU and CUDA produce the same recurrence token ids.",
     "Stated honestly: on a reasoning prompt (\"What is the capital of France?\") we diverge from llama.cpp after <think> at a near-tie. Both continuations are reasonable and layer 0 agrees to within quantization noise, **but we have not established token-for-token equality over a long output the way we did for 4B and 9B**.",
     "layer_weight_bytes / shared_weight_bytes are measured, summed tensor by tensor via scripts/gguf_shard.py index.",

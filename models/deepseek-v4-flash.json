@@ -21,9 +21,21 @@
   },
   "kv": {
     "kind": "dsv4",
-    "bytes_per_token_per_layer": 0
+    "bytes_per_token_per_layer": 0,
+    "raw_bytes_per_cell": 44032,
+    "csa_bytes_per_cell": 26880,
+    "hca_bytes_per_cell": 20480,
+    "fixed_bytes_per_sequence": 12206080
+  },
+  "moe": {
+    "n_expert": 256,
+    "n_expert_used": 6
   },
   "overhead_base_bytes": 0,
+  "compute_bytes_256k_cuda": 585986212,
+  "compute_bytes_1m_cuda": 1800237220,
+  "compute_bytes_256k_metal": 804090020,
+  "compute_bytes_1m_metal": 2688643236,
   "default_gguf": "UD-IQ1_S/DeepSeek-V4-Flash-UD-IQ1_S-00001-of-00003.gguf",
   "chat_template": "ds4",
   "sources": [

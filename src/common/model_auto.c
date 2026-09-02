@@ -219,6 +219,13 @@ int idletoken_model_from_gguf(const char *path, idletoken_auto_model *out,
     if (arch_u32(m, out->arch, "block_count", &n_layers) != 0 || n_layers == 0)
         FAILF("%s (arch %s) declares no %s.block_count — cannot plan a model "
               "with an unknown layer count", base, out->arch, out->arch);
+    /* Several current GGUFs append one NextN/MTP draft block to block_count.
+     * The ordinary llama-server does not load it without a draft context, so
+     * treating it as a decode layer overstates KV and corrupts PP boundaries. */
+    uint32_t n_nextn = 0;
+    if (arch_u32(m, out->arch, "nextn_predict_layers", &n_nextn) == 0 &&
+        n_nextn > 0 && n_nextn < n_layers)
+        n_layers -= n_nextn;
 
     uint32_t n_embd = 0;
     (void)arch_u32(m, out->arch, "embedding_length", &n_embd);
@@ -237,7 +244,81 @@ int idletoken_model_from_gguf(const char *path, idletoken_auto_model *out,
             n_vocab = (uint32_t)ntok;
     }
 
-    out->kv_bytes_per_token = kv_bytes_per_token(m, out->arch, n_layers, n_embd);
+    uint8_t kv_kind = IDLETOKEN_KV_GQA;
+    uint32_t kv_per_attn_layer = 0;
+    uint32_t state_per_linear_layer = 0;
+    uint32_t full_attn_interval = 0;
+    uint64_t dsv4_raw = 0, dsv4_csa = 0, dsv4_hca = 0, dsv4_fixed = 0;
+
+    /* DeepSeek4 uses a custom K-only raw + padded compressed cache in this
+     * exact engine pin. Derive every byte from the GGUF instead of feeding its
+     * metadata through the generic K+V formula (which is the wrong cache). */
+    char ratios_key[128];
+    snprintf(ratios_key, sizeof ratios_key, "%s.attention.compress_ratios", out->arch);
+    uint64_t n_ratios = 0;
+    if (!strcmp(out->arch, "deepseek4") &&
+        idletoken_gguf_meta_arr_len(m, ratios_key, &n_ratios) == 0) {
+        uint32_t n_kv = 1, key_len = 0, indexer_len = 0;
+        (void)arch_u32(m, out->arch, "attention.head_count_kv", &n_kv);
+        (void)arch_u32(m, out->arch, "attention.key_length", &key_len);
+        (void)arch_u32(m, out->arch, "attention.indexer.key_length", &indexer_len);
+        uint32_t csa_layers = 0, hca_layers = 0;
+        const uint64_t scan = n_ratios < n_layers ? n_ratios : n_layers;
+        for (uint64_t i = 0; i < scan; i++) {
+            int32_t ratio = 0;
+            if (idletoken_gguf_meta_arr_i32(m, ratios_key, i, &ratio) != 0) continue;
+            if (ratio == 4) csa_layers++;
+            else if (ratio == 128) hca_layers++;
+        }
+        const uint64_t raw_layer = (uint64_t)n_kv * key_len * 2; /* f16 K only */
+        dsv4_raw = raw_layer * n_layers;
+        dsv4_csa = (raw_layer + (uint64_t)indexer_len * 2) * csa_layers;
+        dsv4_hca = raw_layer * hca_layers;
+        /* Two f32 tensors (state + score) per compressor. CSA/LID retain
+         * 2*ratio rows; HCA retains ratio rows. n_rs_seq=0 in the shipped
+         * non-speculative server, hence one plane per sequence. */
+        dsv4_fixed = csa_layers *
+                (2ull * (2ull * key_len) * 8ull * 4ull +
+                 2ull * (2ull * indexer_len) * 8ull * 4ull) +
+            hca_layers * (2ull * key_len * 128ull * 4ull);
+        out->kv_bytes_per_token = dsv4_raw + (dsv4_csa + 3) / 4 +
+                                  (dsv4_hca + 127) / 128;
+        kv_kind = IDLETOKEN_KV_DSV4;
+    } else {
+        /* MLA stores one latent K row: (kv_lora_rank + RoPE dims) f16 values,
+         * not generic key_length + value_length. */
+        uint32_t kv_rank = 0, rope_dim = 0;
+        if (arch_u32(m, out->arch, "attention.kv_lora_rank", &kv_rank) == 0 &&
+            kv_rank > 0) {
+            (void)arch_u32(m, out->arch, "rope.dimension_count", &rope_dim);
+            kv_per_attn_layer = (kv_rank + rope_dim) * 2;
+            out->kv_bytes_per_token = (uint64_t)kv_per_attn_layer * n_layers;
+            kv_kind = IDLETOKEN_KV_MLA;
+        } else {
+            out->kv_bytes_per_token =
+                kv_bytes_per_token(m, out->arch, n_layers, n_embd);
+            uint32_t n_kv = 0, key_len = 0, val_len = 0;
+            (void)arch_u32(m, out->arch, "attention.head_count_kv", &n_kv);
+            (void)arch_u32(m, out->arch, "attention.key_length", &key_len);
+            (void)arch_u32(m, out->arch, "attention.value_length", &val_len);
+            if (val_len == 0) val_len = key_len;
+            kv_per_attn_layer = n_kv && key_len
+                ? n_kv * (key_len + val_len) * 2 : 0;
+            if (arch_u32(m, out->arch, "full_attention_interval",
+                         &full_attn_interval) == 0 && full_attn_interval > 1) {
+                uint32_t inner = 0, state = 0, groups = 0, conv = 0;
+                (void)arch_u32(m, out->arch, "ssm.inner_size", &inner);
+                (void)arch_u32(m, out->arch, "ssm.state_size", &state);
+                (void)arch_u32(m, out->arch, "ssm.group_count", &groups);
+                (void)arch_u32(m, out->arch, "ssm.conv_kernel", &conv);
+                state_per_linear_layer =
+                    (uint32_t)(((uint64_t)state * inner +
+                        (uint64_t)(conv > 0 ? conv - 1 : 0) *
+                            (inner + 2ull * groups * state)) * 4ull);
+                kv_kind = IDLETOKEN_KV_HYBRID;
+            }
+        }
+    }
 
     /* MoE shape. Absent on a dense model, and absence must stay 0/0 — the
      * working-set estimate reads that as "every byte is hot", which is the
@@ -247,6 +328,8 @@ int idletoken_model_from_gguf(const char *path, idletoken_auto_model *out,
         if (arch_u32(m, out->arch, "expert_count", &ec) == 0)      out->n_expert = ec;
         if (arch_u32(m, out->arch, "expert_used_count", &eu) == 0) out->n_expert_used = eu;
     }
+    uint32_t hc_streams = 1;
+    (void)arch_u32(m, out->arch, "hyper_connection.count", &hc_streams);
 
     uint64_t layer_b = 0, shared_b = 0;
     const uint64_t data_off = idletoken_gguf_data_offset(m);
@@ -269,24 +352,29 @@ int idletoken_model_from_gguf(const char *path, idletoken_auto_model *out,
     s->label   = out->label;
     s->backend = IDLETOKEN_BACKEND_LLAMACPP;
     s->available = 1;
-    /* Deployment is CLUSTER here NOT because every open model should span
-     * machines, but because the static single/cluster flag is superseded by
-     * the dynamic judgement (v2 plan §1.9): idletoken_plan_llamacpp() decides
-     * per run from real bytes vs real memory, with "fits -> don't cluster" as
-     * a hard rule. A static SINGLE_NODE here would veto legitimately large
-     * open models before the scheduler ever saw the numbers. */
+    /* CLUSTER means technically splittable, not "must span machines". The
+     * client derives a default from model + precision + current memory, while
+     * an explicit user choice wins over that default. A static SINGLE_NODE
+     * here would veto legitimately large precisions before planning. */
     s->deployment = IDLETOKEN_DEPLOY_CLUSTER;
     s->n_layers = (uint16_t)n_layers;
     s->n_embd   = n_embd;
-    s->hc_streams = 1;
+    s->hc_streams = (uint8_t)(hc_streams > 255 ? 255 : hc_streams);
     s->n_vocab  = n_vocab;
+    s->n_expert = (uint16_t)out->n_expert;
+    s->n_expert_used = (uint16_t)out->n_expert_used;
     s->layer_weight_bytes  = layer_b;
     s->shared_weight_bytes = shared_b;
     s->ctx_max  = ctx_max;
     s->split_boundary_multiple = 0;
-    s->kv_kind = IDLETOKEN_KV_GQA;
-    s->kv_bytes_per_token_layer =
-        n_layers ? (uint32_t)(out->kv_bytes_per_token / n_layers) : 0;
+    s->kv_kind = kv_kind;
+    s->kv_bytes_per_token_layer = kv_per_attn_layer;
+    s->state_bytes_per_layer = state_per_linear_layer;
+    s->full_attn_interval = full_attn_interval;
+    s->dsv4_raw_bytes_per_cell = dsv4_raw;
+    s->dsv4_csa_bytes_per_cell = dsv4_csa;
+    s->dsv4_hca_bytes_per_cell = dsv4_hca;
+    s->dsv4_fixed_bytes_per_seq = dsv4_fixed;
     /* Engine compute buffers + margin. ESTIMATE, calibration TODO (WS-B2):
      * llama.cpp's compute buffer scales with n_embd and batch size; 1 GiB
      * covers every model measured so far on the M4/DGX with headroom. */
@@ -295,6 +383,39 @@ int idletoken_model_from_gguf(const char *path, idletoken_auto_model *out,
     s->variants = NULL;
     s->n_variants = 0;
     s->default_variant = 0;
+
+    /* Measured GPU workspace, when this file IS one of the curated models.
+     *
+     * `plan.c` refuses to plan a model whose `compute_bytes_*` are zero, and it
+     * is right to: charging 0 for the workspace understated a 15.7 GiB model at
+     * 256K by 9764 MiB, which reads as "fits" and OOMs after a full load. But
+     * nothing here ever set those fields, and the CLIENT starts every engine —
+     * single machine and cluster alike — with `--llama-gguf`, which lands on
+     * this function. So the refusal fired on every curated model on the product
+     * path: measured on a Windows node 2026-09-02, both qwen3.8-27b and
+     * qwen3.5-0.8b refused at 32K and at 256K, i.e. the client could not start
+     * an engine at all.
+     *
+     * Copying the registry's measurement for a matching id is NOT the guess the
+     * gate exists to stop. The gate's subject is "we never measured this
+     * model"; when `idletoken_model_get()` finds the id, we did measure it, and
+     * these are the same bytes the `--model-id` path would use. A GGUF that is
+     * NOT in the registry (open intake) still finds nothing here, keeps its
+     * zeros, and is still refused — which is the case the gate was written for.
+     *
+     * Copied per field rather than by struct: only these four are the registry's
+     * to supply. Everything else in `spec` describes THIS file and must keep
+     * coming from its header — a registry row for the same id can name a
+     * different quantization with different layer sizes. */
+    {
+        const idletoken_model_spec *reg = idletoken_model_get(out->id);
+        if (reg) {
+            s->compute_bytes_256k_cuda  = reg->compute_bytes_256k_cuda;
+            s->compute_bytes_1m_cuda    = reg->compute_bytes_1m_cuda;
+            s->compute_bytes_256k_metal = reg->compute_bytes_256k_metal;
+            s->compute_bytes_1m_metal   = reg->compute_bytes_1m_metal;
+        }
+    }
     return 0;
 #undef FAILF
 }

@@ -33,6 +33,7 @@
   #include <winsock2.h>
   #include <windows.h>
 #else
+  #include <dirent.h>
   #include <fcntl.h>
   #include <signal.h>
   #include <sys/socket.h>
@@ -59,19 +60,31 @@
 #define LLAMA_ARGV_MAX 64
 
 struct idletoken_llama {
-    /* config (immutable after start) */
+    /* config (immutable in product; the legacy sidecar grow test rewrites
+     * ctx_size / yarn_orig_ctx under the mutex before respawning) */
     char bin[512];
     char gguf[1024];
     char log_path[512];
     char cluster_args[1024];  /* WS-C cluster flags (--rpc/--device/--tensor-split) */
+    char ngl_arg[16];         /* coordinator override, or auto/99 policy result */
     char extra_args[1024];    /* IDLETOKEN_LLAMA_ARGS copy, split at spawn */
     char kv_type[12];         /* IDLETOKEN_KV_CACHE_TYPE (validated); "" = f16 default */
     char kv_type_v[12];       /* IDLETOKEN_KV_CACHE_TYPE_V; "" = follow kv_type */
     int  shared;              /* serving OTHER people's requests — see below */
+    int  gpu_only;            /* sole product mode: every layer and KV allocation
+                               * fits the GPU working-set budget;
+                               * spawn with --poll 0 (the CPU threads would
+                               * only busy-wait — measured 11.9 spinning cores
+                               * on a fully-offloaded 5060 Ti). */
+    char grow_dir[300];       /* legacy sidecar-test hook; product passes "" */
     char sock_path[256];      /* AF_UNIX path, or "" for TCP loopback */
     char endpoint[300];       /* "127.0.0.1:<port>" | "unix:<sock_path>" */
     int  port;
     uint32_t ctx_size;        /* context of ONE slot */
+    uint32_t yarn_orig_ctx;   /* model's TRAINED window when ctx_size exceeds it
+                               * via a vendor-endorsed YaRN extension; 0 = no
+                               * RoPE scaling (ctx_size is within the trained
+                               * window) */
     int  n_parallel;          /* -np: independent sequences the engine serves */
 
     /* state (under mu) */
@@ -453,9 +466,11 @@ static int llama_health_ok(const char *endpoint) {
  *
  * So shared mode does to the environment what it already does to argv: an
  * allow-list whose allowed set is (almost) empty. Everything in the engine's
- * own namespaces goes, and exactly one variable comes back — GGML_RPC_PSK,
- * which the coordinator sets itself and the cluster TLS link cannot work
- * without. Note this also drops GGML_RPC_ALLOW_PLAINTEXT, which is right:
+ * own namespaces goes, and exactly two coordinator-owned variables come back:
+ * GGML_RPC_PSK, which the cluster TLS link cannot work without, and
+ * GGML_RPC_REQUIRE_MODEL_CACHE, which prevents a sparse cluster GGUF from
+ * falling back to weight transfer and disables whole-file mmap prefetch.
+ * Note this still drops GGML_RPC_ALLOW_PLAINTEXT, which is right:
  * "testing only" is not a thing to honour while holding someone else's prompt.
  *
  * Deliberately NOT applied in local mode — LLAMA_ARG_* is how you experiment
@@ -475,6 +490,11 @@ static void llama_scrub_env(void) {
     char keep_psk[160] = "";
     const char *psk = getenv("GGML_RPC_PSK");
     if (psk) snprintf(keep_psk, sizeof(keep_psk), "%s", psk);
+    char keep_require_cache[16] = "";
+    const char *require_cache = getenv("GGML_RPC_REQUIRE_MODEL_CACHE");
+    if (require_cache)
+        snprintf(keep_require_cache, sizeof(keep_require_cache), "%s",
+                 require_cache);
 
     char names[128][64];
     int n = 0;
@@ -489,6 +509,8 @@ static void llama_scrub_env(void) {
     }
     for (int i = 0; i < n; i++) unsetenv(names[i]);
     if (keep_psk[0]) setenv("GGML_RPC_PSK", keep_psk, 1);
+    if (keep_require_cache[0])
+        setenv("GGML_RPC_REQUIRE_MODEL_CACHE", keep_require_cache, 1);
 }
 #endif
 
@@ -646,10 +668,8 @@ static int llama_spawn(idletoken_llama *lc) {
         snprintf(listen_args, sizeof(listen_args), "--host \"%s\"", lc->sock_path);
     else
         snprintf(listen_args, sizeof(listen_args), "--host 127.0.0.1 --port %s", portstr);
-    /* Must track the real argv below, including the single-vs-cluster -ngl
-     * split: this string is what the user is shown and what gets pasted into
-     * a bug report, so a preview that says 99 while the child was given `auto`
-     * sends whoever reads it looking in the wrong place. */
+    /* Must track the real argv below. GPU placement and fit are locked here,
+     * so the preview is also evidence that no CPU-offload fitter was enabled. */
     /* K set, V unset → V follows K (mixed dtypes are a deliberate choice, not
      * a default). V set alone keeps K at f16. */
     const char *ctk = lc->kv_type[0] ? lc->kv_type : "f16";
@@ -658,14 +678,39 @@ static int llama_spawn(idletoken_llama *lc) {
     kv_frag[0] = '\0';
     if (lc->kv_type[0] || lc->kv_type_v[0])
         snprintf(kv_frag, sizeof(kv_frag), " -ctk %s -ctv %s -fa on", ctk, ctv);
+    /* Vendor-endorsed context extension: the per-SLOT window (not ctx_total —
+     * RoPE positions are per sequence) exceeds the trained one, so tell the
+     * engine to YaRN-scale from the trained window up. Same fragment on the
+     * POSIX path below — the two spawn paths must not diverge. */
+    char yarn_frag[80];
+    yarn_frag[0] = '\0';
+    if (lc->yarn_orig_ctx)
+        snprintf(yarn_frag, sizeof(yarn_frag),
+                 " --rope-scaling yarn --rope-scale %.6g --yarn-orig-ctx %u",
+                 (double)lc->ctx_size / (double)lc->yarn_orig_ctx,
+                 lc->yarn_orig_ctx);
+    /* Slot save/restore across a context-ladder restart. PRIVATE mode only:
+     * shared mode keeps --no-slots (above), and a buyer's KV must never land
+     * on the provider's disk — the grow there re-prefills instead. Same
+     * fragment on the POSIX path below; the two spawn paths must not diverge. */
+    char slotsave_frag[340];
+    slotsave_frag[0] = '\0';
+    if (lc->grow_dir[0] && !lc->shared)
+        snprintf(slotsave_frag, sizeof(slotsave_frag),
+                 " --slot-save-path \"%s\"", lc->grow_dir);
     int n = snprintf(cmd, sizeof(cmd),
-                     "\"%s\" -m \"%s\" %s%s "
-                     "-ngl %s --reasoning off%s%s -np %s%s%s%s",
+                     "\"%s\" -m \"%s\" %s%s%s%s "
+                     "-ngl %s --fit off --reasoning off%s%s%s -np %s%s%s%s",
                      lc->bin, lc->gguf, listen_args,
                      lc->shared ? " --no-slots" : "",
-                     idletoken_llama_ngl_arg(lc->cluster_args),
+                     /* --poll 0 rides with GPU_ONLY (see the struct field);
+                      * same on the POSIX path — the two must not diverge. */
+                     lc->gpu_only ? " --poll 0" : "",
+                     slotsave_frag,
+                     lc->ngl_arg,
                      lc->ctx_size > 0 ? " -c " : "",
                      lc->ctx_size > 0 ? ctxstr : "",
+                     yarn_frag,
                      nparstr, kv_frag,
                      lc->cluster_args[0] ? " " : "", lc->cluster_args);
     if (n < 0 || (size_t)n >= sizeof(cmd)) {
@@ -708,7 +753,8 @@ static int llama_spawn(idletoken_llama *lc) {
             /* An entry may begin with '=' (the per-drive cwd variables Windows
              * keeps, e.g. "=C:=C:\path"); those are not ours to judge. */
             if (p[0] != '=' && llama_env_is_engine_namespace(p) &&
-                strncmp(p, "GGML_RPC_PSK=", 13) != 0)
+                strncmp(p, "GGML_RPC_PSK=", 13) != 0 &&
+                strncmp(p, "GGML_RPC_REQUIRE_MODEL_CACHE=", 29) != 0)
                 continue;
             size_t n2 = strlen(p) + 1;
             memcpy(child_env + off, p, n2);
@@ -793,36 +839,24 @@ static int llama_spawn(idletoken_llama *lc) {
      * (Prompts on DISK were already impossible: --slot-save-path is never
      * passed, and without it the engine refuses the save/restore action.) */
     if (lc->shared) argv[argc++] = "--no-slots";
-    /* How many layers go on the GPU — and it is NOT the same answer for one
-     * machine and for a cluster (2026-08-21).
-     *
-     * SINGLE MACHINE: "auto", which is upstream's default (-1). The engine then
-     * runs common_fit_params, measures free device memory, and picks a layer
-     * count that fits — putting the overflow in system RAM. That is HYBRID,
-     * which hard constraint #6 says we must support.
-     *
-     * This used to be a flat "99" on both paths, and on a single machine that
-     * was a bug with a very confusing face. Pinning n_gpu_layers does not just
-     * ask for all layers on the GPU, it DISABLES the fitting procedure:
-     * fit.cpp throws `n_gpu_layers already set by user to 99, abort` at the
-     * exact point where it was about to reduce the layer count, and that throw
-     * surfaces as `failed to fit params to free device memory`. The
-     * coordinator's own guard (llama_scan_log) then refuses to serve. Net
-     * effect: we blocked the engine's remedy and then refused to start because
-     * the problem was unsolved. Measured on a 16 GiB discrete card (~13.2 GiB
-     * usable) with 64 GiB of system RAM, serving Qwen3.8-27B Q4_K_M (15.33 GiB
-     * of weights): it does not fit in VRAM, it fits comfortably in VRAM+RAM,
-     * and the user got "pick a smaller quantization" instead of a running
-     * model.
-     *
-     * CLUSTER: still 99, deliberately. Layer placement there is OURS, not the
-     * engine's — the `--device` order in cluster_args puts this machine's
-     * device first so layer 0 stays with the embedding table (hard constraint
-     * #10, the privacy invariant). An engine free to move layers around could
-     * break that, and it is not a rule we can let a memory heuristic decide.
-     * A cluster that does not fit must still fail loudly. */
+    /* --poll 0 rides with GPU_ONLY (see the struct field) — mirrors the
+     * Windows fragment above; the two spawn paths must not diverge. */
+    if (lc->gpu_only) { argv[argc++] = "--poll"; argv[argc++] = "0"; }
+    /* Slot save/restore across a context-ladder restart (private mode only —
+     * mirrors slotsave_frag on the Windows path above; the two spawn paths
+     * must not diverge). Without this flag the engine refuses the /slots
+     * save/restore actions, which is exactly the shared-mode posture. */
+    if (lc->grow_dir[0] && !lc->shared) {
+        argv[argc++] = "--slot-save-path";
+        argv[argc++] = lc->grow_dir;
+    }
+    /* Every repeating layer is GPU-resident in both single and cluster mode.
+     * --fit off is equally important: a numeric -ngl alone still lets the
+     * pinned engine enter common_fit_params and seek a CPU-offload remedy. */
     argv[argc++] = "-ngl";
-    argv[argc++] = (char *)idletoken_llama_ngl_arg(lc->cluster_args);
+    argv[argc++] = lc->ngl_arg;
+    argv[argc++] = "--fit";
+    argv[argc++] = "off";
     /* Reasoning off by default: thinking models (Qwen3.5 etc.) otherwise burn
      * the whole token budget inside <think> and the visible answer comes back
      * EMPTY with finish_reason "length" — measured with Qwen3.5-0.8B at
@@ -831,6 +865,18 @@ static int llama_spawn(idletoken_llama *lc) {
      * last, so a user-supplied --reasoning wins). */
     argv[argc++] = "--reasoning"; argv[argc++] = "off";
     if (lc->ctx_size > 0) { argv[argc++] = "-c"; argv[argc++] = ctxstr; }
+    /* Mirrors the Windows yarn_frag above — the two spawn paths must not
+     * diverge. Scale is per-SLOT ctx over the trained window: RoPE positions
+     * are per sequence, so ctx_total (which -c carries) would overshoot. */
+    char ropestr[24], yarnorigstr[16];
+    if (lc->yarn_orig_ctx) {
+        snprintf(ropestr, sizeof(ropestr), "%.6g",
+                 (double)lc->ctx_size / (double)lc->yarn_orig_ctx);
+        snprintf(yarnorigstr, sizeof(yarnorigstr), "%u", lc->yarn_orig_ctx);
+        argv[argc++] = "--rope-scaling";  argv[argc++] = "yarn";
+        argv[argc++] = "--rope-scale";    argv[argc++] = ropestr;
+        argv[argc++] = "--yarn-orig-ctx"; argv[argc++] = yarnorigstr;
+    }
     /* Continuous batching is already the upstream default, so `-np` alone is
      * enough to get overlapping prefill/decode across slots. */
     argv[argc++] = "-np";       argv[argc++] = nparstr;
@@ -909,7 +955,8 @@ const char *idletoken_llama_placement_flag(const char *args) {
      * upstream's short aliases for `--device`/`--tensor-split`; refusing the
      * long form alone would be a doorway, not a guard. */
     static const char *placement[] = { "--device", "-dev", "--rpc",
-                                       "--tensor-split", "-ts" };
+                                       "--tensor-split", "-ts", "-ngl",
+                                       "--n-gpu-layers", "--fit" };
     if (!args || !args[0]) return NULL;
 
     /* Walk token by token rather than substring-searching the whole string:
@@ -953,17 +1000,11 @@ const char *idletoken_llama_placement_flag(const char *args) {
  * Contract and the reasoning about upstream's wording: the header. Kept as a
  * pure function of the text so coord --selftest can drive it with a real log
  * line AND with lines that must NOT match. */
-/* Which `-ngl` the engine is given. A pure function for the same reason
- * idletoken_llama_log_fit_failed is one: coord --selftest can then assert BOTH
- * arms, and both are load-bearing for different reasons.
- *   single machine → "auto" (upstream's default): re-enables the engine's own
- *     fitting, which is what makes HYBRID work. Pinning a number here disables
- *     the fit and turns "runs slower" into "refuses to start".
- *   cluster        → "99": layer placement is ours, and the --device order in
- *     cluster_args keeps layer 0 with the embedding table (hard constraint #10).
- * See the call site in llama_spawn for the measurement behind this. */
+/* Which `-ngl` the engine is given. There is one product mode: all repeating
+ * layers on GPU. `--fit off` is added next to this value at both spawn sites. */
 const char *idletoken_llama_ngl_arg(const char *cluster_args) {
-    return (cluster_args && cluster_args[0]) ? "99" : "auto";
+    (void)cluster_args;
+    return "99";
 }
 
 int idletoken_llama_log_fit_failed(const char *text) {
@@ -995,40 +1036,17 @@ static void llama_scan_log(idletoken_llama *lc) {
         lc->log_off += (long long)n;
         if (!idletoken_llama_log_fit_failed(line)) continue;
 
-        const char *allow = getenv("IDLETOKEN_ALLOW_VRAM_OVERCOMMIT");
-        if (allow && !strcmp(allow, "1")) {
-            fprintf(stderr,
-                    "coord: ==========================================================\n"
-                    "coord: == IDLETOKEN_ALLOW_VRAM_OVERCOMMIT=1: the engine says it ==\n"
-                    "coord: == could not fit this model into free device memory, and ==\n"
-                    "coord: == we are starting anyway. On Windows the driver pages   ==\n"
-                    "coord: == VRAM to system memory instead of failing, which can   ==\n"
-                    "coord: == freeze the whole machine. Measurement only.           ==\n"
-                    "coord: ==========================================================\n");
-            lc->log_off = (long long)ftell(f);   /* consume the rest, stay quiet */
-            break;
-        }
-        /* On a cluster this is the whole story: WE place the layers, so the
-         * engine has no move left to make. On a single machine the engine
-         * fits its own layer count, so reaching here means it could not make
-         * the model fit even with the overflow in system RAM — a genuinely
-         * too-large model, not a knob we forgot to turn.
-         * ⚠ Until 2026-08-21 the single-machine path pinned n_gpu_layers to 99,
-         * which is what produced this message for models that fit perfectly
-         * well in VRAM+RAM. If this text ever shows up again with the engine
-         * log naming `n_gpu_layers already set by user`, the -ngl split above
-         * has been undone — that reason means the fitting procedure was
-         * skipped, NOT that the memory was measured and found wanting. */
+        /* Placement is locked for both single and cluster execution. Reaching
+         * this line is a runtime confirmation that the exact GPU-only service
+         * does not fit; no environment escape hatch may turn it into paging. */
         snprintf(lc->fatal, sizeof(lc->fatal),
-                 "the inference engine could not fit this model into free "
+                 "[RESOURCE_INSUFFICIENT] the inference engine could not fit this model into free "
                  "device memory and started anyway (its log: \"%s\"). Serving "
                  "in that state makes the GPU driver page video memory out to "
                  "system memory — on Windows that can freeze the whole machine "
                  "rather than fail. What to do: ask for a smaller --ctx-size, "
                  "pick a smaller quantization of this model, close other GPU "
-                 "users, or add a machine to the cluster. Set "
-                 "IDLETOKEN_ALLOW_VRAM_OVERCOMMIT=1 to start anyway (for "
-                 "measurement — it is not a supported way to run)",
+                 "users, or add a machine to the cluster.",
                  line);
         /* Trim the copied engine line to one line's worth of noise. */
         for (char *p = lc->fatal; *p; p++) if (*p == '\n' || *p == '\r') *p = ' ';
@@ -1180,13 +1198,225 @@ static void *llama_monitor(void *arg) {
     }
 }
 
+/* --- context growth (the ladder's restart primitive) -----------------------
+ * Contract: the header. The engine is stopped and respawned with a larger -c;
+ * this must NOT read as a crash anywhere — no quick-restart counting, no
+ * backoff, and restarts_total stays a crash signal for the dashboard. */
+
+/* Readiness bound for the regrown engine. A reload from page cache takes
+ * seconds even at 27B (measured 15.5 s); five minutes covers a cold disk
+ * while still honouring "never wait forever" (the same discipline as
+ * IDLETOKEN_JOIN_WAIT_S). */
+#define LLAMA_GROW_READY_TIMEOUT_MS 300000
+/* Slot files reach GB scale on large models; the save/restore round-trip is
+ * disk-speed-bound, not compute-bound. */
+#define LLAMA_GROW_IO_TIMEOUT_MS    120000
+#define LLAMA_GROW_MAX_SLOTS        16
+
+/* Delete every file in grow_dir. A saved slot file IS conversation KV: it
+ * must not outlive the restart that consumed it, so both the grow path (stale
+ * files from an interrupted run) and shutdown sweep here. */
+static void llama_sweep_grow_dir(idletoken_llama *lc) {
+    if (!lc->grow_dir[0]) return;
+#ifdef _WIN32
+    char pat[340];
+    snprintf(pat, sizeof(pat), "%s\\*", lc->grow_dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        char p[700];
+        snprintf(p, sizeof(p), "%s\\%s", lc->grow_dir, fd.cFileName);
+        DeleteFileA(p);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR *d = opendir(lc->grow_dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char p[700];
+        snprintf(p, sizeof(p), "%s/%s", lc->grow_dir, e->d_name);
+        unlink(p);
+    }
+    closedir(d);
+#endif
+}
+
+/* POST /slots/<slot>?action=<save|restore> {"filename":...} and return the
+ * engine's n_saved / n_restored count, or -1 (unreachable / non-200 / no
+ * count in the body — all three mean "this slot's KV does not migrate"). */
+static long long llama_slot_action(const char *endpoint, int slot,
+                                   const char *action, const char *fname,
+                                   const char *count_key) {
+    char path[64], body[160], key[32];
+    snprintf(path, sizeof(path), "/slots/%d?action=%s", slot, action);
+    snprintf(body, sizeof(body), "{\"filename\":\"%s\"}", fname);
+    idletoken_llama_conn c;
+    if (idletoken_llama_http_open(endpoint, "POST", path, body, strlen(body),
+                                  LLAMA_GROW_IO_TIMEOUT_MS, &c) != 0)
+        return -1;
+    size_t blen = 0;
+    char *resp = idletoken_llama_http_read_all(&c, &blen, 1u << 20);
+    const int st = c.status;
+    idletoken_llama_http_close(&c);
+    if (!resp) return -1;
+    long long count = -1;
+    snprintf(key, sizeof(key), "\"%s\":", count_key);
+    if (st == 200) {
+        const char *p = strstr(resp, key);
+        if (p) count = atoll(p + strlen(key));
+    } else {
+        fprintf(stderr, "coord: llama-sidecar: grow: slot %d %s -> HTTP %d "
+                        "(%.120s)\n", slot, action, st, resp);
+    }
+    free(resp);
+    return count;
+}
+
+int idletoken_llama_grow(idletoken_llama *lc, uint32_t new_ctx,
+                         uint32_t yarn_orig_ctx, int do_save,
+                         char *err, size_t err_cap) {
+    if (err && err_cap) err[0] = '\0';
+    if (!lc || new_ctx == 0) {
+        if (err && err_cap) snprintf(err, err_cap, "grow: invalid arguments");
+        return -1;
+    }
+    const long long t0 = llama_now_ms();
+    const int npar = lc->n_parallel > 0 ? lc->n_parallel : 1;
+    const uint32_t old_ctx = lc->ctx_size;
+
+    if (do_save && (!lc->grow_dir[0] || lc->shared)) {
+        /* Shared mode never saves (buyer KV must not touch disk); a private
+         * run without a dir simply cannot. Both degrade, neither errors. */
+        fprintf(stderr, "coord: llama-sidecar: grow: no slot-save dir in this "
+                        "configuration — the conversation re-prefills\n");
+        do_save = 0;
+    }
+
+    /* 1. Save each slot's KV while the old engine still holds it. The caller
+     * serialises against in-flight inference (the admission gate), so the
+     * slots are quiescent here. */
+    char fnames[LLAMA_GROW_MAX_SLOTS][80];
+    int  saved[LLAMA_GROW_MAX_SLOTS] = {0};
+    int  n_saved_slots = 0;
+    if (do_save) {
+        llama_sweep_grow_dir(lc);   /* stale files from an interrupted grow */
+        pthread_mutex_lock(&lc->mu);
+        const long long child_pid = lc->pid;
+        pthread_mutex_unlock(&lc->mu);
+        for (int i = 0; i < npar && i < LLAMA_GROW_MAX_SLOTS; i++) {
+            snprintf(fnames[i], sizeof(fnames[i]), "grow-%lld-%d.bin",
+                     child_pid, i);
+            long long n = llama_slot_action(lc->endpoint, i, "save",
+                                            fnames[i], "n_saved");
+            if (n >= 0) {
+                saved[i] = 1;
+                n_saved_slots++;
+                fprintf(stderr, "coord: llama-sidecar: grow: slot %d saved "
+                                "(%lld tokens of KV)\n", i, n);
+            } else {
+                fprintf(stderr, "coord: llama-sidecar: grow: WARNING slot %d "
+                                "save failed — that conversation re-prefills\n", i);
+            }
+        }
+    }
+
+    /* 2. Stop and respawn at the new window, under the mutex so the monitor
+     * thread never observes the intentional kill and books it as a crash. */
+    pthread_mutex_lock(&lc->mu);
+    fprintf(stderr, "coord: llama-sidecar: growing context %u -> %u tokens per "
+                    "slot (-c %llu, %s)\n", old_ctx, new_ctx,
+            (unsigned long long)new_ctx * (unsigned long long)npar,
+            n_saved_slots ? "carrying saved KV" : "re-prefill");
+    llama_kill_child(lc);
+    lc->ctx_size = new_ctx;
+    /* The grow target is by construction a window the KV pool could NOT hold
+     * fully (else no growth was armed): the respawn is HYBRID, where the CPU
+     * threads do real work — back to the engine's default polling. */
+    lc->gpu_only = 0;
+    /* Same guard as at start: scaling only when the new window truly exceeds
+     * the trained one. The CALLER must have passed do_save=0 when this
+     * changes the RoPE frequencies (see the header). */
+    lc->yarn_orig_ctx = (yarn_orig_ctx && new_ctx > yarn_orig_ctx)
+                            ? yarn_orig_ctx : 0;
+    if (llama_spawn(lc) != 0) {
+        lc->state = IDLETOKEN_LLAMA_FAILED;
+        if (!lc->fail[0])
+            snprintf(lc->fail, sizeof(lc->fail), "grow respawn failed");
+        if (err && err_cap)
+            snprintf(err, err_cap, "grow respawn failed: %s", lc->fail);
+        pthread_mutex_unlock(&lc->mu);
+        return -1;
+    }
+    lc->state = IDLETOKEN_LLAMA_STARTING;
+    if (lc->yarn_orig_ctx)
+        fprintf(stderr, "coord: llama-sidecar: grow: YaRN rope scaling x%.6g "
+                        "(trained window %u)\n",
+                (double)new_ctx / (double)lc->yarn_orig_ctx, lc->yarn_orig_ctx);
+    pthread_mutex_unlock(&lc->mu);
+
+    /* 3. Wait — boundedly — for the regrown engine. The monitor thread does
+     * the actual probing; this only watches the state it publishes. */
+    const long long deadline = llama_now_ms() + LLAMA_GROW_READY_TIMEOUT_MS;
+    for (;;) {
+        const idletoken_llama_state st = idletoken_llama_get_state(lc);
+        if (st == IDLETOKEN_LLAMA_READY) break;
+        if (st == IDLETOKEN_LLAMA_FAILED) {
+            char why[256] = "";
+            idletoken_llama_fail_reason(lc, why, sizeof(why));
+            if (err && err_cap)
+                snprintf(err, err_cap, "engine failed after the context grow: %s", why);
+            return -1;
+        }
+        if (llama_now_ms() > deadline) {
+            if (err && err_cap)
+                snprintf(err, err_cap, "engine not ready %d s after the context "
+                         "grow — check the engine log",
+                         LLAMA_GROW_READY_TIMEOUT_MS / 1000);
+            return -1;
+        }
+        llama_sleep_ms(200);
+    }
+
+    /* 4. Restore. A restored file is deleted at once (conversation KV must
+     * not linger); a failed restore stays for the next sweep and the
+     * conversation re-prefills — loud, but not an error. */
+    int restored = 0;
+    for (int i = 0; i < npar && i < LLAMA_GROW_MAX_SLOTS; i++) {
+        if (!saved[i]) continue;
+        long long n = llama_slot_action(lc->endpoint, i, "restore",
+                                        fnames[i], "n_restored");
+        char p[400];
+        snprintf(p, sizeof(p), "%s/%s", lc->grow_dir, fnames[i]);
+        if (n >= 0) {
+            restored++;
+            remove(p);
+            fprintf(stderr, "coord: llama-sidecar: grow: slot %d restored "
+                            "(%lld tokens of KV)\n", i, n);
+        } else {
+            fprintf(stderr, "coord: llama-sidecar: grow: WARNING slot %d "
+                            "restore failed — that conversation re-prefills\n", i);
+        }
+    }
+    fprintf(stderr, "coord: llama-sidecar: context grow %u -> %u done in %.1f s "
+                    "(%d/%d slot KV carried over)\n", old_ctx, new_ctx,
+            (double)(llama_now_ms() - t0) / 1000.0, restored, n_saved_slots);
+    return restored;
+}
+
 /* --- public lifecycle ----------------------------------------------------- */
 
 idletoken_llama *idletoken_llama_start(const char *bin, const char *gguf,
                                        int port, const char *engine_sock,
-                                       uint32_t ctx_size, int n_parallel,
+                                       uint32_t ctx_size, uint32_t yarn_orig_ctx,
+                                       int n_parallel, int gpu_only,
+                                       const char *ngl_arg,
                                        const char *cluster_args,
                                        const char *log_path, int shared,
+                                       const char *grow_dir,
                                        char *err, size_t err_cap) {
     idletoken_llama *lc = calloc(1, sizeof(*lc));
     if (!lc) {
@@ -1197,9 +1427,31 @@ idletoken_llama *idletoken_llama_start(const char *bin, const char *gguf,
     snprintf(lc->gguf, sizeof(lc->gguf), "%s", gguf);
     if (cluster_args)
         snprintf(lc->cluster_args, sizeof(lc->cluster_args), "%s", cluster_args);
+    snprintf(lc->ngl_arg, sizeof(lc->ngl_arg), "%s",
+             ngl_arg && ngl_arg[0] ? ngl_arg
+                                   : idletoken_llama_ngl_arg(cluster_args));
     snprintf(lc->log_path, sizeof(lc->log_path), "%s", log_path);
+    /* Slot save/restore dir for context growth — private mode only (shared
+     * mode drops it here so no later path can pass it to the engine). Created
+     * 0700: its files are conversation KV. A stale file from a crashed run is
+     * swept now rather than trusted. */
+    if (grow_dir && grow_dir[0] && !shared) {
+        snprintf(lc->grow_dir, sizeof(lc->grow_dir), "%s", grow_dir);
+#ifdef _WIN32
+        CreateDirectoryA(lc->grow_dir, NULL);
+#else
+        mkdir(lc->grow_dir, 0700);
+        chmod(lc->grow_dir, 0700);
+#endif
+        llama_sweep_grow_dir(lc);
+    }
     lc->port = port;
+    lc->gpu_only = gpu_only;
     lc->ctx_size = ctx_size;
+    /* Only meaningful when the granted window actually exceeds the trained
+     * one — a yarn_orig_ctx at or above ctx_size would ask the engine for a
+     * sub-1 RoPE scale, which is compression, not extension. */
+    lc->yarn_orig_ctx = (yarn_orig_ctx && ctx_size > yarn_orig_ctx) ? yarn_orig_ctx : 0;
     lc->n_parallel = n_parallel > 0 ? n_parallel : 1;
     lc->shared = shared;
     /* The endpoint is decided ONCE, here, and every later connect reads it —
@@ -1358,6 +1610,11 @@ idletoken_llama *idletoken_llama_start(const char *bin, const char *gguf,
             lc->n_parallel, lc->ctx_size,
             (unsigned long long)lc->ctx_size * (unsigned long long)lc->n_parallel,
             lc->n_parallel, lc->log_path);
+    if (lc->yarn_orig_ctx)
+        fprintf(stderr, "coord: llama-sidecar: YaRN rope scaling x%.6g "
+                        "(trained window %u)\n",
+                (double)lc->ctx_size / (double)lc->yarn_orig_ctx,
+                lc->yarn_orig_ctx);
     if (pthread_create(&lc->tid, NULL, llama_monitor, lc) != 0) {
         if (err_cap) snprintf(err, err_cap, "pthread_create: %s", strerror(errno));
 #ifdef _WIN32
@@ -1413,6 +1670,9 @@ void idletoken_llama_shutdown(idletoken_llama *lc) {
 #ifdef _WIN32
     if (lc->job) CloseHandle(lc->job);
 #endif
+    /* A slot file left in grow_dir is conversation KV on disk; it must not
+     * outlive the process that wrote it (a failed restore leaves one). */
+    llama_sweep_grow_dir(lc);
     /* Take the socket file with us. Leaving it behind is not a security hole
      * (nothing listens on it once the engine is gone) but it does leave a
      * dead entry in the user's state directory, and the next run would have to

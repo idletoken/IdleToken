@@ -1,0 +1,9 @@
+# SHA-256 of each llama.cpp patch, recorded by scripts/dependency_audit.sh --record-digests.
+# A patch file is a diff applied to third-party source at build time. No lockfile
+# covers it, so an edit here changes the shipped engine while looking like an
+# ordinary file in git. Regenerate ONLY when deliberately changing the series,
+# and say which patch changed and why in the same commit.
+13a0a133331a7c3a31f2e53a63e000c7fa39161f8eddc849c896fb9258cb26f5  0001-rpc-tls-transport.patch
+051715d179dda32270e64e6ed8903c488b517e19a5ea57a4bc847c1a180b5740  0002-server-yarn-ctx-cap.patch
+2d27aba860c33835e71eb3f94c6f51e4d70e4e5d88739c92af0631ac2f54dd10  0003-rpc-cache-all-tensors.patch
+0e7acbf8f7d2e13cad2e27873fa0b05e254975229b50f6c81b7805a3f55dc655  0004-prefetch-local-mmap-tensors.patch

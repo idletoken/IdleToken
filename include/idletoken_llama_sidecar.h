@@ -89,13 +89,63 @@ typedef struct idletoken_llama idletoken_llama;   /* opaque; one per sidecar */
  * without touching `-c` would quarter every conversation's window instead of
  * adding capacity — a Claude Code session's system prompt alone is ~13K tokens,
  * so that single-line mistake turns a working machine into one that refuses
- * every real request. Slots are bought with MEMORY, never with context. */
+ * every real request. Slots are bought with MEMORY, never with context.
+ *
+ * `yarn_orig_ctx`: the model's TRAINED window when ctx_size deliberately
+ * exceeds it via a vendor-endorsed YaRN extension — the sidecar then passes
+ * --rope-scaling yarn with the matching scale. 0 = no scaling (ctx_size is
+ * within the trained window).
+ *
+ * `gpu_only`: the sole product mode. The spawn adds `--poll 0`; fully-offloaded
+ * engine CPU threads otherwise busy-wait between GPU kernels (measured: 11.9
+ * spinning cores on a 5060 Ti at 12 threads).
+ *
+ * `ngl_arg`: optional coordinator-computed -ngl value. NULL/empty resolves to
+ * 99. Both spawn implementations also force `--fit off`, so neither single nor
+ * cluster execution may offload layers to system RAM.
+ *
+ * `grow_dir` is a legacy sidecar-test hook and must be NULL in product. It is a private directory
+ * (created 0700) for slot save/restore files across a context-ladder restart
+ * (idletoken_llama_grow below). When set AND the sidecar is NOT shared, the
+ * engine gets `--slot-save-path grow_dir`. Shared mode ignores it entirely:
+ * --no-slots stays, and a buyer's KV never touches the provider's disk. */
 idletoken_llama *idletoken_llama_start(const char *bin, const char *gguf,
                                        int port, const char *engine_sock,
-                                       uint32_t ctx_size, int n_parallel,
+                                       uint32_t ctx_size, uint32_t yarn_orig_ctx,
+                                       int n_parallel, int gpu_only,
+                                       const char *ngl_arg,
                                        const char *cluster_args,
                                        const char *log_path, int shared,
+                                       const char *grow_dir,
                                        char *err, size_t err_cap);
+
+/* Restart the engine with a LARGER per-slot context — the GPU_ONLY -> HYBRID
+ * mode switch (docs/ctx-ladder-handoff-2026-08.md §3.2). Not a crash: the
+ * child is stopped and respawned with `-c new_ctx * n_parallel` (gpu_only
+ * cleared, so the respawn polls normally) without touching the quick-crash
+ * counter or the restart backoff, then this call waits (boundedly) for the
+ * respawned engine to answer {"status":"ok"}.
+ *
+ * `do_save` (private mode only, needs grow_dir at start): each slot's KV is
+ * saved via POST /slots/<i>?action=save before the stop and restored after the
+ * restart, so the running conversation keeps its prefix instead of paying a
+ * full re-prefill. A failed save/restore degrades to re-prefill with a loud
+ * warning — it is a slowdown, not an error. Restored files are deleted at
+ * once; whatever remains in grow_dir is swept on the next grow and at
+ * shutdown.
+ *
+ * `yarn_orig_ctx` follows the same contract as at start, re-evaluated for the
+ * NEW window. ⚠ Callers must pass do_save=0 when the RoPE scaling changes
+ * across the grow (entering YaRN, or growing while under it): the saved KV
+ * was computed at the old frequencies and restoring it would corrupt
+ * attention silently.
+ *
+ * Returns the number of slots restored (>= 0) on success — the engine is
+ * READY at the new window — or -1 with `err` filled when the respawn failed
+ * or readiness timed out. */
+int idletoken_llama_grow(idletoken_llama *lc, uint32_t new_ctx,
+                         uint32_t yarn_orig_ctx, int do_save,
+                         char *err, size_t err_cap);
 
 /* Resolve the KV cache dtypes in force: IDLETOKEN_KV_CACHE_TYPE (K; with the
  * ~/.idletoken/kv-cache-type file fallback) and IDLETOKEN_KV_CACHE_TYPE_V
@@ -159,29 +209,8 @@ void idletoken_llama_fatal_reason(idletoken_llama *lc, char *out, size_t cap);
  * this catches the cases the budget's estimates get wrong. */
 int idletoken_llama_log_fit_failed(const char *text);
 
-/* The `-ngl` value the engine is spawned with, from the cluster-args string
- * (NULL/"" = single machine). Returns a static string.
- *
- * Both arms are load-bearing, for unrelated reasons, which is why this is a
- * named function with a test rather than a ternary in the middle of spawn:
- *
- *   single machine → "auto" — upstream's default, which leaves
- *     common_fit_params free to pick a layer count that fits and put the
- *     remainder in system RAM. That is HYBRID (hard constraint #6). Pinning a
- *     NUMBER here does not merely ask for more GPU: it makes fit.cpp throw
- *     `n_gpu_layers already set by user to N, abort`, which surfaces as
- *     `failed to fit params to free device memory` and trips
- *     idletoken_llama_log_fit_failed above — so we would block the engine's own
- *     remedy and then refuse to start because the problem was unsolved. That
- *     was the bug on 2026-08-21: Qwen3.8-27B Q4_K_M (15.33 GiB) on a 16 GiB
- *     card with 64 GiB of RAM was refused outright; with "auto" it loads in
- *     15.5 s and serves at 4.38 tok/s with 14.1 GiB resident on the GPU.
- *
- *   cluster → "99" — placement there is OURS. The `--device` order in the
- *     cluster args keeps layer 0 on this machine with the embedding table
- *     (hard constraint #10, the privacy invariant), and a memory heuristic
- *     must not be allowed to move it. A cluster that does not fit still fails
- *     loudly. */
+/* The `-ngl` value the engine is spawned with. Always returns "99": all
+ * repeating layers must be GPU-resident. Spawn also supplies `--fit off`. */
 const char *idletoken_llama_ngl_arg(const char *cluster_args);
 
 /* Does this IDLETOKEN_LLAMA_ARGS string set a flag that decides WHERE tensors

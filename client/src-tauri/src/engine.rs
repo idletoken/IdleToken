@@ -103,8 +103,8 @@ pub struct EngineStatus {
 struct Slot {
     state: EngineState,
     args: Vec<String>,
-    /// Extra env vars for the sidecar (e.g. IDLETOKEN_SHARD_REPO on a remote
-    /// worker so it fetches only its layers from the coordinator's repo).
+    /// Extra env vars for the sidecar (e.g. an internal repository override
+    /// used by diagnostics and compatibility tests).
     env: Vec<(String, String)>,
     pid: Option<u32>,
     started_at: Option<u64>,
@@ -736,14 +736,23 @@ pub fn engine_logs(state: State<'_, Engine>, max_lines: Option<usize>) -> Vec<Lo
 /// Why a socket at all: on loopback TCP that leg carries the prompt in the
 /// clear, and one `tcpdump -i lo` reads it. Measured on a real node
 /// 2026-08-16 (results/shared-mode-realmachine-20260816.md).
-pub(crate) fn coord_api_socket() -> Option<String> {
-    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok()?;
+pub(crate) fn native_path_arg(path: &std::path::Path, purpose: &str) -> Result<String, String> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{purpose} is not valid Unicode: {}", path.display()))
+}
+
+pub(crate) fn coord_api_socket() -> Result<String, String> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map_err(|_| "coordinator socket path needs HOME or USERPROFILE".to_string())?;
     if home.is_empty() {
-        return None;
+        return Err("coordinator socket path has an empty HOME/USERPROFILE".into());
     }
     let dir = std::path::PathBuf::from(home).join(".idletoken");
-    let _ = std::fs::create_dir_all(&dir);
-    Some(dir.join("coord-api.sock").to_string_lossy().into_owned())
+    std::fs::create_dir_all(&dir).map_err(|e|
+        format!("cannot create the coordinator socket directory {}: {e}", dir.display()))?;
+    native_path_arg(&dir.join("coord-api.sock"), "coordinator socket path")
 }
 
 /// The platform base URL as the ENGINE-side processes can dial it.
@@ -849,23 +858,19 @@ pub fn platform_agent_start(
     // Hand the plaintext over the socket instead of loopback TCP. The agent
     // treats this as exclusive: if the socket is not there it exits loudly
     // rather than falling back to a transport this machine's owner can sniff.
-    if let Some(sock) = coord_api_socket() {
-        args.push("--coord-unix".into());
-        args.push(sock);
-    }
+    let coord_socket = coord_api_socket()?;
+    args.push("--coord-unix".into());
+    args.push(coord_socket.clone());
     // A STABLE machine identity. Without --key-file the agent generates an
     // EPHEMERAL keypair per start (platform_agent.c load_or_make_key(NULL)),
     // and the platform now keys provider identity by that pubkey — so every
     // agent restart minted a brand-new provider row (measured 2026-08-24:
     // cluster-2 and cluster-3 within nine seconds, both orphans on the next
     // restart). The key lives beside the coord socket in ~/.idletoken.
-    if let Some(sock) = coord_api_socket() {
-        let dir = std::path::Path::new(&sock).parent().map(|d| d.to_path_buf());
-        if let Some(dir) = dir {
-            args.push("--key-file".into());
-            args.push(dir.join("agent.key").to_string_lossy().into_owned());
-        }
-    }
+    let dir = std::path::Path::new(&coord_socket).parent()
+        .ok_or_else(|| "coordinator socket path has no parent directory".to_string())?;
+    args.push("--key-file".into());
+    args.push(native_path_arg(&dir.join("agent.key"), "platform agent key path")?);
     let args = args;
     start_engine(&app, ROLE_PLATFORM_AGENT.into(), args, env)
 }
@@ -1017,6 +1022,7 @@ pub fn llamacpp_serve(
         return Err(format!("GGUF file not found: {gguf}"));
     }
     let engine_bin = llama_server_bin()?;
+    let engine_bin_arg = native_path_arg(&engine_bin, "llama-server path")?;
     // Loopback regardless of what the settings still say: the coordinator
     // rewrites a non-loopback API bind to 127.0.0.1 anyway (2026-08-15), and
     // passing one through would only add a warning line to explain away.
@@ -1031,7 +1037,7 @@ pub fn llamacpp_serve(
         // and sharing is switched on later.
         "--shared".into(),
         "--llama-server-bin".into(),
-        engine_bin.to_string_lossy().into_owned(),
+        engine_bin_arg,
         "--llama-gguf".into(),
         gguf,
         "--http".into(),
@@ -1040,13 +1046,11 @@ pub fn llamacpp_serve(
     ];
     // Shared mode's second door. The TCP listener above stays — this machine's
     // own user talks to it — but platform work arrives on the socket, so the
-    // buyer's plaintext never crosses the IP stack. No socket (no HOME) simply
-    // means the extra door is not offered; the agent then refuses to start
-    // rather than quietly using TCP.
-    if let Some(sock) = coord_api_socket() {
-        args.push("--api-unix".into());
-        args.push(sock);
-    }
+    // buyer's plaintext never crosses the IP stack. Failure to construct the
+    // path refuses startup here; omitting the door would only defer the failure
+    // until sharing is requested and risks a future loopback fallback.
+    args.push("--api-unix".into());
+    args.push(coord_api_socket()?);
     // Through the environment, not `--api-token` (A-P0-4): argv is readable by
     // every account on the machine. The coordinator reads IDLETOKEN_API_TOKEN
     // as a fallback for this exact flag.

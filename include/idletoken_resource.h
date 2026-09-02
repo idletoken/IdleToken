@@ -1,8 +1,12 @@
 /* IdleToken Cluster — resource probe.
  *
- * Reports usable VRAM and RAM after subtracting system overhead and safety
- * margins, per docs/architecture.md §5.1. The numbers map 1:1 to the
- * RESOURCE_REPORT wire message (docs/wire-protocol.md).
+ * Reports usable VRAM and RAM, per docs/architecture.md §5.1. The numbers map
+ * 1:1 to the RESOURCE_REPORT wire message (docs/wire-protocol.md).
+ *
+ * VRAM is MEASURED, not budgeted: total minus what other processes already
+ * hold, with no discount on top (see the retirement note below). Inference
+ * overhead is charged once, by the scheduler, on the need side. RAM still keeps
+ * a safety floor — it backs the OS itself, which VRAM does not.
  *
  * GPU via NVML (Linux: linked nvml.h; Windows: nvml.dll loaded from the
  * driver at runtime). RAM via /proc/meminfo (Linux) or GlobalMemoryStatusEx
@@ -15,8 +19,28 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define IDLETOKEN_VRAM_SAFETY_BYTES     (1ull * 1024ull * 1024ull * 1024ull)  /* 1.0 GB */
-#define IDLETOKEN_VRAM_WORKSPACE_BYTES  (3ull * 1024ull * 1024ull * 1024ull / 2ull) /* 1.5 GB */
+/* RETIRED 2026-09-01 — deliberately left as a comment, not deleted, because
+ * the reason they existed is the reason they must not come back.
+ *
+ * The CUDA probe used to subtract IDLETOKEN_VRAM_SAFETY_BYTES (1.0 GiB, "CUDA
+ * context") + IDLETOKEN_VRAM_WORKSPACE_BYTES (1.5 GiB, "inference workspace")
+ * from vram_usable. Both are ALSO charged by the scheduler on the need side —
+ * plan.c budgets 768 MiB fixed (documented there as "CUDA context + small-model
+ * buffers", measured at ~550 MiB) + weights/64 (the width-scaled compute
+ * buffers) per node. So a discrete card paid for its CUDA context twice and an
+ * otherwise idle 16 GiB card advertised ~13.2 GiB usable, a number that looks
+ * like a lie next to any GPU monitor.
+ *
+ * This is the exact bug fixed on the Metal side on 2026-08-15
+ * (results/resource-calibration-20260815.md: a ~2.3 GiB double reservation on a
+ * 16 GiB Mac). That report left the CUDA constants alone for one stated reason:
+ * "the frozen ds4 line still budgets against them". ds4 stopped being compiled
+ * into any binary on 2026-08-16, so the reason expired with it.
+ *
+ * The rule now: vram_usable is MEASURED (total - what other processes hold) and
+ * every inference cost is charged exactly once, on the need side. If a real
+ * shortfall shows up, raise the plan.c overhead term — do not reintroduce a
+ * discount here, or the two will silently disagree about what "fits" means. */
 /* Metal working-set reserve, CALIBRATED 2026-08-15 (M4 16 GiB; the llamacpp
  * engine's whole non-weight footprint measured ~133 MiB, and the scheduler
  * charges width-scaled engine buffers separately — plan.c). The old value

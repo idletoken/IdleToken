@@ -39,6 +39,13 @@ extern "C" {
  * no-op when either is unset. */
 void    idletoken_die_with_parent(void);
 
+/* Fail closed unless the executable's UTF-8 active-code-page manifest is
+ * actually in force. Every path crossing Rust -> native argv/env and every
+ * narrow CRT/Win32 file API in the native sidecars relies on this contract.
+ * Returning an error is safer than turning a Chinese username into "????"
+ * and then opening, deleting, or binding a different path. */
+int     idletoken_win_require_utf8_paths(void);
+
 /* Best-effort idempotent inbound firewall allow (architecture §9, productization).
  * Checks `netsh advfirewall firewall show rule` first; adds only when missing.
  * Adding needs elevation — otherwise prints the exact netsh command once so

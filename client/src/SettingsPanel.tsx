@@ -1,29 +1,20 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useI18n, type Lang } from "./i18n";
 import { EndpointsPanel } from "./EndpointsPanel";
-import { MODEL_BRANDS, shortModelLabel, hasQuantChoice, quantOptions, defaultQuant, getManifest } from "./models";
-import { resolveDownload, weightsState, defaultModelDir, type DownloadTarget } from "./weights";
+import { defaultModelDir } from "./weights";
 import { inTauri } from "./platform";
 import Capability from "./Capability";
-import { fmtBytes } from "./format";
 import {
   APP_VERSION,
   DEFAULT_SETTINGS,
-  KV_CACHE_TYPES,
-  MODEL_DEFAULT_TIER,
-  TIERS,
   effectiveCaps,
-  modelCtxMax,
-  recommendKvCache,
   saveSettings,
   type AppSettings,
   type ResourcePreset,
 } from "./settings";
 import type { NodeSnapshot } from "./types";
 import type { Session } from "./auth";
-import WeightsRow from "./WeightsRow";
 import StoredModels from "./StoredModels";
-import { getEngineProvider } from "./provider/engine";
 import { exportableSettings } from "./diagnostics";
 
 type Theme = "dark" | "light";
@@ -56,7 +47,7 @@ interface Field {
   step?: number;
   unit?: string;
   placeholder?: string;
-  action?: "export" | "import" | "clearData" | "clearKv" | "checkUpdate";
+  action?: "export" | "import" | "clearData" | "checkUpdate";
   showIf?: (s: AppSettings) => boolean;
 }
 interface Section {
@@ -112,64 +103,6 @@ function CapSlider(props: { label: string; noCap: string; totalBytes: number; va
       </div>
       <input className="slider" type="range" min={1024} max={totalMb} step={512} value={pos} onChange={(e) => { const v = Number(e.target.value); props.onChange(v >= totalMb ? 0 : v); }} />
     </div>
-  );
-}
-
-/**
- * One model's weight state + download control — the unit of the download
- * manager (2026-08-15 split: Settings downloads, Cluster starts/switches,
- * Chat displays). The cell probes its own file on disk (re-probing when
- * `version` bumps) and renders the shared WeightsRow with THIS row's progress
- * and error, so every model downloads independently of every other row and of
- * whichever model is selected.
- */
-function ModelWeightsCell(props: {
-  file: string;
-  target: DownloadTarget;
-  modelDir: string;
-  version: number;
-  dl: { have: number; total: number; note?: string } | null;
-  lastError: string | null;
-  onStart: () => void;
-  onCancel: () => void;
-}) {
-  const [st, setSt] = useState<{ needs: boolean; partial: number } | null>(null);
-  useEffect(() => {
-    let live = true;
-    (async () => {
-      // Browser dev build: no filesystem bridge; report "ready" so the page
-      // stays usable (same policy as resolveLocalWeights).
-      if (!inTauri()) {
-        if (live) setSt({ needs: false, partial: 0 });
-        return;
-      }
-      try {
-        const dir = props.modelDir || (await defaultModelDir());
-        const w = await weightsState(dir, props.file, props.target.expectBytes, props.target.sha256);
-        if (live) setSt({ needs: !w.complete, partial: w.complete ? 0 : w.have_bytes });
-      } catch {
-        if (live) setSt({ needs: true, partial: 0 });
-      }
-    })();
-    return () => {
-      live = false;
-    };
-    // A settled download (or a deletion) bumps `version`, re-running the probe.
-  }, [props.file, props.modelDir, props.version, props.target.expectBytes]);
-  if (!st && !props.dl) return null;
-  return (
-    <WeightsRow
-      w={{
-        needs: st?.needs ?? true,
-        path: "",
-        dl: props.dl,
-        partialBytes: st?.partial ?? 0,
-        lastError: props.lastError,
-        onDownload: props.onStart,
-        onCancel: props.onCancel,
-      }}
-      idle="show"
-    />
   );
 }
 
@@ -254,10 +187,9 @@ const CATEGORIES: Category[] = [
       // returns, the fix is auto-detecting overlay adapters, not re-adding the
       // field. Settings import still applies both keys for hand-edited files.
       { label: { en: "Pairing & discovery", zh: "组网与发现" }, fields: [
-        // No cluster-name field (owner's call, 2026-08-21): the provider's
-        // public identity comes from the account username + a number now, and
-        // account-mode pairing derives its secret from the fixed default. The
-        // settings key stays for stored-value compatibility; nothing edits it.
+        // No cluster-name field (owner's call, 2026-08-21): provider identity
+        // and account-mode pairing are both independent of a user-defined
+        // cluster label, and the v9 settings migration removes the old key.
         { key: "mdns", type: "toggle", label: { en: "LAN auto-discovery", zh: "局域网自动发现" } },
         { key: "discoveryPort", type: "number", label: { en: "Discovery port", zh: "发现端口" } },
         { key: "manualPeers", type: "text", label: { en: "Manual peer IPs", zh: "手动节点 IP" }, placeholder: "192.168.1.50, 192.168.1.51" },
@@ -381,17 +313,6 @@ function visibleCategories(): Category[] {
   return CATEGORIES.filter((c) => !c.visible || c.visible());
 }
 
-/** Where the engine keeps the KV cache when the field is left empty, per
- *  platform — matching worker_main.c's own choice (LOCALAPPDATA on Windows,
- *  XDG_CACHE_HOME/HOME elsewhere). Shown as a placeholder only; nothing here
- *  is written to settings. */
-function defaultKvHint(): string {
-  const ua = typeof navigator !== "undefined" ? navigator.userAgent : "";
-  if (/Windows/i.test(ua)) return "%LOCALAPPDATA%\\IdleToken\\kv";
-  if (/Mac OS X|Macintosh/i.test(ua)) return "~/Library/Caches/idletoken/kv";
-  return "~/.cache/idletoken/kv";
-}
-
 // AboutLinks (guide / source / issues / security / notices) and LegalDocs (the
 // platform's terms and privacy policy, fetched and rendered in a modal) both
 // lived here until 2026-08-21, when the About and Privacy pages were cut back
@@ -418,17 +339,8 @@ export default function SettingsPanel(props: {
   initialCategory?: string | null;
   // ---- the download manager (2026-08-15 split) ----
   // Settings owns downloading and ONLY downloading: every model row shows its
-  // own weight state with its own download/cancel, independent of which model
-  // is selected. Selection and switching live on the Cluster page; chatting
-  // shows the model read-only. App owns the progress-event subscription, so
-  // the live pieces arrive as props keyed by gguf file name.
-  downloads?: Record<string, { have: number; total: number; note?: string }>;
-  downloadErrors?: Record<string, string>;
-  /** Bumped by App whenever a download settles or weights are deleted — every
-   *  row re-probes the disk. */
-  weightsVersion?: number;
-  onStartDownload?: (file: string, target: DownloadTarget) => void;
-  onCancelDownload?: (file: string) => void;
+  // The download manager left this page 2026-08-26 (Cluster downloads in
+  // place now); Settings keeps the storage half only.
   /** Something changed the model folder (the stored-models list calls it after
    *  a deletion) — App re-probes and bumps weightsVersion. */
   onWeightsChanged?: () => void;
@@ -453,23 +365,13 @@ export default function SettingsPanel(props: {
     props.initialCategory && cats.some((c) => c.id === props.initialCategory) ? props.initialCategory : "quick"
   );
   const [query, setQuery] = useState("");
-  // "Clear my cache now" feedback (philosophy 15: every action has clear
-  // loading/success/failure feedback).
-  const [kvClear, setKvClear] = useState<"idle" | "busy" | "ok" | "err">("idle");
   // The button says "checking" while the feed is being asked; the ANSWER is
   // the dialog App opens, so there is nothing to report back here.
   const [upd, setUpd] = useState<"idle" | "busy">("idle");
   const fileRef = useRef<HTMLInputElement>(null);
   const s = props.settings;
-  // Which model card is unfolded in the download manager. Clicking a card is
-  // browsing — "show me this model's precisions" — and nothing more; what RUNS
-  // is chosen on the Cluster page. Defaults to the model in use.
-  const [openModelId, setOpenModelId] = useState<string>(s.modelId);
-  // Per-model precision being VIEWED (and downloaded) — pure page state, never
-  // written to settings.
-  const [viewQuant, setViewQuant] = useState<Record<string, string>>({});
   const set = <K extends keyof AppSettings>(k: K, v: AppSettings[K]) => props.onChange({ ...s, [k]: v });
-  const setCap = (k: "maxVramMb" | "maxRamMb", v: number) => props.onChange({ ...s, [k]: v, resourcePreset: "custom" });
+  const setCap = (v: number) => props.onChange({ ...s, maxVramMb: v, maxRamMb: 0, resourcePreset: "custom" });
 
   // Model-folder editing. The draft is committed on blur/Enter rather than per
   // keystroke — see the field for why. It re-syncs when the stored value
@@ -527,14 +429,6 @@ export default function SettingsPanel(props: {
       void Promise.resolve(props.onCheckUpdate?.()).finally(() => setUpd("idle"));
     } else if (a === "import") {
       fileRef.current?.click();
-    } else if (a === "clearKv") {
-      if (kvClear === "busy") return;
-      setKvClear("busy");
-      getEngineProvider()
-        .clearKvCache(s.kvDir)
-        .then(() => setKvClear("ok"))
-        .catch(() => setKvClear("err"))
-        .finally(() => setTimeout(() => setKvClear("idle"), 2500));
     } else if (a === "clearData") {
       if (confirm(lang === "zh" ? "确定清除本机全部 IdleToken 数据？" : "Clear all IdleToken data on this machine?")) {
         localStorage.clear();
@@ -587,21 +481,13 @@ export default function SettingsPanel(props: {
     if (f.type === "action") {
       let btnLabel = label;
       if (f.action === "checkUpdate" && upd === "busy") btnLabel = t("update.checking");
-      if (f.action === "clearKv" && kvClear !== "idle") {
-        btnLabel =
-          kvClear === "busy"
-            ? L({ en: "Clearing…", zh: "清除中…" }, lang)
-            : kvClear === "ok"
-              ? L({ en: "Cleared ✓", zh: "已清除 ✓" }, lang)
-              : L({ en: "Clear failed", zh: "清除失败" }, lang);
-      }
       return (
         <div key={i} className="setting-row setting-row--inline">
           <div className="setting-row__label">
             <span className="setting-row__k">{label}</span>
             {hint ? <span className="setting-row__hint">{hint}</span> : null}
           </div>
-          <button className={`btn-secondary${f.action === "clearData" ? " btn-danger" : ""}${f.action === "clearKv" && kvClear === "err" ? " btn-danger" : ""}`} disabled={(f.action === "clearKv" && kvClear === "busy") || (f.action === "checkUpdate" && upd === "busy")} onClick={() => runAction(f.action)}>{btnLabel}</button>
+          <button className={`btn-secondary${f.action === "clearData" ? " btn-danger" : ""}`} disabled={f.action === "checkUpdate" && upd === "busy"} onClick={() => runAction(f.action)}>{btnLabel}</button>
         </div>
       );
     }
@@ -646,185 +532,18 @@ export default function SettingsPanel(props: {
 
   const renderQuick = () => (
     <>
-      <div className="setting-group">
-        <div className="setting-group__label">{t("settings.model")}</div>
-        {/* The download manager (2026-08-15 split). Clicking a card unfolds it
-            — that is browsing, not choosing what runs (the Cluster page owns
-            that; the tag on a card only reports it). The unfolded card shows
-            ONE precision dropdown and ONE weights row for the precision being
-            viewed — every precision was listed flat here once, and a page of
-            near-identical rows drowned the two facts that matter. Downloads
-            keep running when the card folds or the dropdown moves; the header
-            badge keeps them discoverable. */}
-        <div className="model-list">
-          {/* One card per BRAND (2026-08-15): a flat list of ~10 models, each
-              with up to 26 precisions, ran off the screen. The choice is a
-              funnel — whose model, then how big, then how precise — so the UI
-              is one too: pick a brand card, pick a size inside it, pick the
-              precision next to the size. */}
-          {MODEL_BRANDS.map((brand) => {
-            const inBrand = brand.models.some((m) => m.id === openModelId);
-            const sel = inBrand
-              ? brand.models.find((m) => m.id === openModelId)!
-              : brand.models[0];
-            const open = inBrand;
-            const variants = hasQuantChoice(sel.id) ? quantOptions(sel.id) : [];
-            const q =
-              viewQuant[sel.id] ??
-              (s.modelId === sel.id ? s.quant || defaultQuant(sel.id) : defaultQuant(sel.id));
-            const target = resolveDownload(getManifest(sel.id), q);
-            // "Something in this brand is downloading" — computed over every
-            // size AND precision, so a collapsed card still says so.
-            const busy = brand.models.some((m) =>
-              (hasQuantChoice(m.id) ? quantOptions(m.id) : []).some(
-                (v) => props.downloads?.[resolveDownload(getManifest(m.id), v.quant)?.file ?? ""]
-              ) || props.downloads?.[resolveDownload(getManifest(m.id))?.file ?? ""]
-            );
-            const current = brand.models.find((m) => m.id === s.modelId);
-            return (
-              <div key={brand.id} className={`model-opt model-opt--rows${open ? " is-on" : ""}`}>
-                <div
-                  className="model-opt__head"
-                  role="button"
-                  tabIndex={0}
-                  onClick={() => setOpenModelId(open ? "" : brand.models[0].id)}
-                  onKeyDown={(e) =>
-                    (e.key === "Enter" || e.key === " ") && setOpenModelId(open ? "" : brand.models[0].id)
-                  }
-                >
-                  <span className="model-opt__name">{brand.label}</span>
-                  {/* Singular matters now (2026-08-21): splitting the Qwen card
-                      by generation left Qwen3 and Qwen3.8 with exactly one
-                      model each, and "1 sizes" was suddenly on screen. */}
-                  <span className="model-opt__params">
-                    {brand.models.length}
-                    {L(
-                      brand.models.length === 1
-                        ? { en: " size", zh: " 个规格" }
-                        : { en: " sizes", zh: " 个规格" },
-                      lang
-                    )}
-                  </span>
-                  {current ? (
-                    <span className="model-opt__deploy">{t("settings.model.current")}</span>
-                  ) : null}
-                  {busy && !open ? (
-                    <span className="model-opt__deploy model-opt__deploy--busy">
-                      {L({ en: "Downloading", zh: "下载中" }, lang)}
-                    </span>
-                  ) : null}
-                </div>
-                {open ? (
-                  <>
-                    {/* The sizes in this brand. One click switches which size
-                        the precision row below is about; nothing is applied to
-                        the cluster from here (that is the Cluster page's job). */}
-                    <div className="model-sizes">
-                      {brand.models.map((m) => (
-                        <button
-                          key={m.id}
-                          className={`model-size${m.id === sel.id ? " is-on" : ""}`}
-                          onClick={() => setOpenModelId(m.id)}
-                        >
-                          {/* Brand stripped (the card title already says it)
-                              and the params suppressed when the name already
-                              carries them — "Qwen3.5 4B" beside "4B" said the
-                              same thing twice. */}
-                          <span className="model-size__name">{shortModelLabel(m.label, brand.label)}</span>
-                          {shortModelLabel(m.label, brand.label)
-                            .replace(/\s+/g, "")
-                            .toUpperCase()
-                            .includes(m.params.split("·")[0].replace(/\s+/g, "").toUpperCase()) ? null : (
-                            <span className="model-size__params">{m.params}</span>
-                          )}
-                        </button>
-                      ))}
-                    </div>
-                    <div className="model-variant">
-                      {variants.length > 0 ? (
-                        <>
-                          <span className="model-variant__q">{t("settings.precision")}</span>
-                          <select
-                            className="select"
-                            value={q}
-                            onChange={(e) => setViewQuant((v) => ({ ...v, [sel.id]: e.target.value }))}
-                          >
-                            {variants.map((v) => (
-                              <option key={v.quant} value={v.quant}>
-                                {v.quant} · {fmtBytes(v.layer_weight_bytes + v.shared_weight_bytes)}
-                              </option>
-                            ))}
-                          </select>
-                        </>
-                      ) : target ? (
-                        <span className="model-variant__size">{fmtBytes(target.expectBytes)}</span>
-                      ) : null}
-                      {target ? (
-                        <ModelWeightsCell
-                          file={target.file}
-                          target={target}
-                          modelDir={s.modelDir}
-                          version={props.weightsVersion ?? 0}
-                          dl={props.downloads?.[target.file] ?? null}
-                          lastError={props.downloadErrors?.[target.file] ?? null}
-                          onStart={() => props.onStartDownload?.(target.file, target)}
-                          onCancel={() => props.onCancelDownload?.(target.file)}
-                        />
-                      ) : null}
-                    </div>
-                  </>
-                ) : null}
-              </div>
-            );
-          })}
-        </div>
-      </div>
+      {/* The model download manager LEFT Settings on 2026-08-26 (owner's call):
+          downloading now lives where the choice is made — the Cluster page's
+          model picker offers "Download weights" in place when the selected
+          model+precision is not in the model folder yet. Settings keeps the
+          storage half (the folder, what it holds, deleting). */}
       {/* Page order (2026-08-15, user-specified): models → context/performance
           → storage → inference & cache → the capability table LAST. The table
           is a summary verdict over everything set above it — context tier
           changes its "max context" column — so it reads best at the bottom. */}
-      <div className="setting-group">
-        <div className="setting-group__label">{t("settings.tier")}</div>
-        {/* Bounded by the selected model (2026-08-24): a window past the
-            trained one is not "more context", it is attention positions the
-            model never saw — output degrades, so those tiers are disabled,
-            not merely discouraged. Tier 0 asks for the trained window itself
-            and lets the coordinator size DOWN to memory (--ctx-fit). */}
-        <div className="tier-list">
-          {(() => {
-            const cap = modelCtxMax(s.modelId);
-            const capLabel = cap >= 1048576 ? `${Math.round(cap / 1048576)}M` : `${Math.round(cap / 1024)}K`;
-            return (
-              <>
-                <button
-                  key={MODEL_DEFAULT_TIER}
-                  className={`tier-opt${s.tier === MODEL_DEFAULT_TIER ? " is-on" : ""}`}
-                  onClick={() => set("tier", MODEL_DEFAULT_TIER)}
-                >
-                  <span className="tier-opt__name">{L({ en: "Model default", zh: "模型默认" }, lang)}</span>
-                  <span className="tier-opt__ctx">{capLabel}</span>
-                </button>
-                {TIERS.map((tier) => {
-                  const ctxLabel = tier.ctx >= 1048576 ? "1M" : `${tier.ctx / 1024}K`;
-                  const over = tier.ctx > cap;
-                  return (
-                    <button
-                      key={tier.id}
-                      className={`tier-opt${s.tier === tier.id ? " is-on" : ""}${over ? " is-disabled" : ""}`}
-                      disabled={over}
-                      title={over ? L({ en: `Beyond this model's trained window (${capLabel})`, zh: `超出该模型的训练上下文上限(${capLabel})` }, lang) : undefined}
-                      onClick={() => !over && set("tier", tier.id)}
-                    >
-                      <span className="tier-opt__name">{t(`tier.${tier.id}.name` as const)}</span>
-                      <span className="tier-opt__ctx">{ctxLabel}</span>
-                    </button>
-                  );
-                })}
-              </>
-            );
-          })()}
-        </div>
-      </div>
+      {/* Context is selected on the cluster page beside the model: exact 256K
+          by default, or explicit 1M. It is a service identity decision rather
+          than an advanced tuning knob. */}
       {/* Storage: the folder the download manager writes into, and what it
           holds. Moved here from "Cluster & API" (2026-08-15 reorg) — it
           belongs next to the downloads it serves, not under cluster plumbing.
@@ -870,71 +589,16 @@ export default function SettingsPanel(props: {
         </div>
         <StoredModels modelDir={s.modelDir} onChanged={props.onWeightsChanged} />
       </div>
-      {/* Moved from "Cluster & API" (2026-08-15 reorg): reply length and the
-          KV cache are properties of running models, not of cluster plumbing.
-          Rendered through the same field renderer the schema pages use. */}
+      {/* Reply length is an inference property, not cluster plumbing. */}
       <div className="setting-group">
-        <div className="setting-group__label">{L({ en: "Inference & cache", zh: "推理与缓存" }, lang)}</div>
+        <div className="setting-group__label">{L({ en: "Inference", zh: "推理" }, lang)}</div>
         {renderField({ key: "maxTokens", type: "number", label: { en: "Max tokens per reply", zh: "单次回复最大词元数" } }, 0)}
-        {/* KV cache precision (2026-08-24). Every dtype the pinned engine
-            supports is selectable; "auto" resolves to the recommendation at
-            launch. The recommendation is recomputed per render from model ×
-            memory × effective context, so it tracks the pickers above. */}
-        {(() => {
-          const rec = recommendKvCache(s, {
-            vramBytes: props.snap.vram_total,
-            ramBytes: props.snap.ram_total,
-            unified: props.snap.unified_memory,
-          });
-          const kvOptions = (auto: Bi) => [
-            { value: "", label: auto },
-            ...KV_CACHE_TYPES.map((k) => ({
-              value: k.type,
-              label: {
-                en: `${k.type} — ${Math.round((k.blockBytes / 64) * 100)}% of f16`,
-                zh: `${k.type} — f16 的 ${Math.round((k.blockBytes / 64) * 100)}%`,
-              },
-            })),
-          ];
-          const gib = (b: number) => (b / 1024 ** 3).toFixed(1);
-          const ctxLabel = rec.ctx >= 1048576 ? `${Math.round(rec.ctx / 1048576)}M` : `${Math.round(rec.ctx / 1024)}K`;
-          return (
-            <>
-              {renderField({
-                key: "kvCacheK", type: "select",
-                label: { en: "KV cache precision (K)", zh: "KV 缓存精度(K)" },
-                options: kvOptions({ en: `Auto — recommended: ${rec.type}`, zh: `自动 — 推荐 ${rec.type}` }),
-              }, 3)}
-              {renderField({
-                key: "kvCacheV", type: "select",
-                label: { en: "Value cache precision (V, activations)", zh: "值缓存精度(V,激活)" },
-                options: kvOptions({ en: "Auto — follow K", zh: "自动 — 跟随 K" }),
-              }, 4)}
-              <div className="setting-row">
-                <span className="setting-row__hint">
-                  {rec.tight
-                    ? L({
-                        en: `Recommended ${rec.type}: even the smallest KV cache (${gib(rec.kvNeedBytes)} GiB at ${ctxLabel} context) overflows the ${gib(rec.budgetBytes)} GiB left after the weights — the engine will size the context down at launch.`,
-                        zh: `推荐 ${rec.type}:即使最小的 KV 缓存(${ctxLabel} 上下文需 ${gib(rec.kvNeedBytes)} GiB)也超出权重之外剩余的 ${gib(rec.budgetBytes)} GiB,引擎启动时会自动缩小上下文。`,
-                      }, lang)
-                    : L({
-                        en: `Recommended ${rec.type}: at ${ctxLabel} context the KV cache needs ${gib(rec.kvNeedBytes)} GiB of the ${gib(rec.budgetBytes)} GiB left after the weights on this machine.`,
-                        zh: `推荐 ${rec.type}:${ctxLabel} 上下文下 KV 缓存需 ${gib(rec.kvNeedBytes)} GiB,本机权重之外剩余 ${gib(rec.budgetBytes)} GiB。`,
-                      }, lang)}
-                </span>
-              </div>
-            </>
-          );
-        })()}
-        {/* A-P2-6: the placeholder used to suggest /tmp/idletoken-kv on every
-            platform, which on Windows is a path that does not exist and on
-            macOS is one the OS empties without warning. It now shows where the
-            engine puts the cache on THIS machine, which is also what an empty
-            field means — so the "empty = the engine's own location" hint under
-            it was saying the placeholder over again (removed 2026-08-21). */}
-        {renderField({ key: "kvDir", type: "text", label: { en: "KV cache directory", zh: "KV 缓存目录" },
-                       placeholder: defaultKvHint() }, 1)}
-        {renderField({ type: "action", action: "clearKv", label: { en: "Clear KV cache", zh: "清除 KV 缓存" } }, 2)}
+        {/* KV precision selectors REMOVED 2026-08-25 (ctx-kv-simplification):
+            the coordinator tiers KV by weight precision (1-2 bit q4_0, 3-4 bit
+            q8_0, higher precision f16-first). Escape hatch for measurements =
+            IDLETOKEN_KV_CACHE_TYPE env on the coordinator, deliberately not a
+            setting. The cluster page reads back what actually runs
+            (/idletoken/v1/stats kv_cache_k/_v). */}
       </div>
       {/* "What can I run?" — the summary verdict, last on purpose (see the
           order note above). Moved out of the model group 2026-08-15. */}
@@ -949,16 +613,22 @@ export default function SettingsPanel(props: {
   // whatever model runs, so it is machine configuration, not model choice.
   const renderResources = () => (
     <div className="setting-group">
-      <Segmented<ResourcePreset>
-        value={s.resourcePreset}
-        options={[
-          { value: "conservative", label: t("preset.conservative") },
-          { value: "balanced", label: t("preset.balanced") },
-          { value: "max", label: t("preset.max") },
-          ...(s.resourcePreset === "custom" ? [{ value: "custom" as ResourcePreset, label: t("preset.custom") }] : []),
-        ]}
-        onChange={(v) => set("resourcePreset", v)}
-      />
+      {/* The bare Segmented has no margin of its own and .setting-row only
+          spaces itself DOWNWARD, so unwrapped it sat flush against the first
+          slider. The wrapper buys the page's standard row rhythm (and the
+          compact-density override) instead of a bespoke margin. */}
+      <div className="setting-row">
+        <Segmented<ResourcePreset>
+          value={s.resourcePreset}
+          options={[
+            { value: "conservative", label: t("preset.conservative") },
+            { value: "balanced", label: t("preset.balanced") },
+            { value: "max", label: t("preset.max") },
+            ...(s.resourcePreset === "custom" ? [{ value: "custom" as ResourcePreset, label: t("preset.custom") }] : []),
+          ]}
+          onChange={(v) => set("resourcePreset", v)}
+        />
+      </div>
       {/* The sliders show the limit that is IN EFFECT, not the stored custom
           number. They are not a second, separate cap — they are the precise
           form of the control above, and under a preset the value comes from
@@ -966,8 +636,7 @@ export default function SettingsPanel(props: {
           here meant the default install said "Balanced" and "No limit" in the
           same box, one line apart, while 75% was what the engine got.
           Dragging either one takes over as a custom limit (setCap). */}
-      <CapSlider label={t("settings.maxVram")} noCap={t("settings.noCap")} totalBytes={props.snap.vram_total} valueMb={liveCaps.maxVramMb} onChange={(mb) => setCap("maxVramMb", mb)} />
-      <CapSlider label={t("settings.maxRam")} noCap={t("settings.noCap")} totalBytes={props.snap.ram_total} valueMb={liveCaps.maxRamMb} onChange={(mb) => setCap("maxRamMb", mb)} />
+      <CapSlider label={t("settings.maxVram")} noCap={t("settings.noCap")} totalBytes={props.snap.vram_total} valueMb={liveCaps.maxVramMb} onChange={setCap} />
     </div>
   );
 

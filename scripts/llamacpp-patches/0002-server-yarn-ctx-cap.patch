@@ -1,0 +1,41 @@
+From: IdleToken <maintainers@idletoken.local>
+Subject: [PATCH] server: respect CLI rope scaling in the slot-context cap
+
+The server caps each slot's context at the model's trained window even
+when the operator explicitly extended the position space with
+--rope-scaling yarn --rope-scale N: the -c asked for is granted at
+startup, then every long request is refused with
+exceed_context_size_error naming the trained window. With YaRN the
+usable window is trained * N; cap there instead (and still cap past it).
+---
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1197,10 +1197,25 @@
+ 
+         const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
+ 
++        // IdleToken patch 0002: respect CLI rope scaling when capping the
++        // slot context. Upstream caps at the model's trained window even when
++        // the operator explicitly extended the position space (--rope-scaling
++        // yarn --rope-scale N), which silently shrinks a deliberately
++        // requested long window back to the trained one — the -c the operator
++        // asked for is granted at startup and then refused per request. With
++        // YaRN the usable window is trained * N; anything beyond still caps.
++        int n_ctx_limit = n_ctx_train;
++        if (params_base.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN &&
++            params_base.rope_freq_scale > 0.0f && params_base.rope_freq_scale < 1.0f) {
++            n_ctx_limit = (int)((float) n_ctx_train / params_base.rope_freq_scale);
++            SRV_INF("rope scaling (yarn, scale %.2f) extends the usable context to %d\n",
++                    1.0f / params_base.rope_freq_scale, n_ctx_limit);
++        }
++
+         int n_ctx_slot = llama_n_ctx_seq(ctx_tgt);
+-        if (n_ctx_slot > n_ctx_train) {
+-            SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - capping\n", n_ctx_slot, n_ctx_train);
+-            n_ctx_slot = n_ctx_train;
++        if (n_ctx_slot > n_ctx_limit) {
++            SRV_WRN("the slot context (%d) exceeds the usable context of the model (%d) - capping\n", n_ctx_slot, n_ctx_limit);
++            n_ctx_slot = n_ctx_limit;
+         }
+ 
+         slots.clear();

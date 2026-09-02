@@ -2,7 +2,8 @@
 // Split into a Simple set (what a home user needs) and an Advanced set (precise
 // control). Persisted to localStorage and restored on launch. Theme + language
 // live separately (pure UI state) but are surfaced in the Simple tab.
-import { DEFAULT_MODEL_ID, defaultQuant, getManifest, getVariant, isAvailable, quantOptions } from "./models";
+import { version as OFFICIAL_CLIENT_VERSION } from "../package.json";
+import { DEFAULT_MODEL_ID, defaultQuant, getManifest, isAvailable, quantOptions } from "./models";
 
 const MiB = 1024 ** 2;
 
@@ -15,117 +16,71 @@ export const TIERS: Tier[] = [
   { id: 1, ctx: 8192 },
   { id: 2, ctx: 32768 },
   { id: 3, ctx: 131072 },
-  { id: 4, ctx: 524288 },
-  { id: 5, ctx: 1048576 },
+  { id: 4, ctx: 262144 },
+  // Stored-schema compatibility only: the tier selector is retired and v8+
+  // migrates to tier 0. A stale tier 5 must not enable 1M without the checkbox.
+  { id: 5, ctx: 262144 },
 ];
 
+/** The two product contexts. 256K is the default; 1M is an explicit opt-in
+ * that changes estimation, runtime admission and marketplace service identity
+ * together. There is no automatic down-sizing between them. */
+export const DEFAULT_CONTEXT_TOKENS = 262144;
+export const LONG_CONTEXT_TOKENS = 1048576;
+export const PRODUCT_CONTEXT_CAP = LONG_CONTEXT_TOKENS;
+
 // ---- context bounded by the model -----------------------------------------
-// `tier: 0` = "model default": ask for the model's own trained window and let
-// the coordinator size DOWN to what this machine's memory affords (--ctx-fit).
-// Tiers above the model's trained window are refused in the picker: the model
-// cannot attend past it, so a longer window only buys degraded output.
+// `tier` is stored-schema compatibility only. Runtime context is now exactly
+// 256K or the explicit 1M opt-in; the coordinator never silently sizes down.
 export const MODEL_DEFAULT_TIER = 0;
 
-/** The selected model's trained context window (manifest `context_max`). */
-export function modelCtxMax(modelId: string): number {
+/** The largest window this model may ask for. The coordinator then computes
+ * the actual promise from the selected precision and current hardware. */
+export function modelCtxMax(modelId: string, longContext = false): number {
   try {
-    return getManifest(modelId || DEFAULT_MODEL_ID).context_max || 8192;
+    const m = getManifest(modelId || DEFAULT_MODEL_ID);
+    return Math.min(
+      longContext ? LONG_CONTEXT_TOKENS : DEFAULT_CONTEXT_TOKENS,
+      Math.max(m.context_max || 8192, m.context_yarn_max || 0),
+    );
   } catch {
     return 8192;
   }
 }
 
-/** The context the engine is actually asked for: the tier's window bounded by
- *  the model's trained one (tier 0 = the trained window itself). The same
- *  clamp exists in the coordinator; this copy keeps every client-side
- *  estimate (capacity cards, KV recommendation) honest about what will run. */
-export function effectiveCtx(s: Pick<AppSettings, "tier" | "modelId">): number {
-  const cap = modelCtxMax(s.modelId);
-  return s.tier === MODEL_DEFAULT_TIER ? cap : Math.min(tierCtx(s.tier), cap);
+/** Alias used by explicit legacy tiers; mirrors modelCtxMax(). */
+export function modelCtxCeil(modelId: string): number {
+  try {
+    const m = getManifest(modelId || DEFAULT_MODEL_ID);
+    return Math.min(
+      PRODUCT_CONTEXT_CAP,
+      Math.max(m.context_max || 8192, m.context_yarn_max || 0),
+    );
+  } catch {
+    return 8192;
+  }
+}
+
+export function modelSupportsLongContext(modelId: string): boolean {
+  return modelCtxCeil(modelId) >= LONG_CONTEXT_TOKENS;
+}
+
+/** The exact context sent to the engine. The caller chooses 256K or 1M; model
+ * metadata is a safety ceiling, never a reason to invent an intermediate
+ * runtime window. */
+export function effectiveCtx(s: Pick<AppSettings, "modelId" | "longContext">): number {
+  return modelCtxMax(s.modelId, !!s.longContext);
 }
 
 // ---- KV cache precision ----------------------------------------------------
-// The engine's own KV cache dtypes (vendor/llama.cpp kv_cache_types; mirror of
-// the coordinator's allow-list in src/coord/llama_sidecar.c — the two must
-// agree or a stored choice refuses to launch). `blockBytes` is the storage
-// cost of one 32-element quant block; f16's is 64, so scale = blockBytes/64.
-export const KV_CACHE_TYPES = [
-  { type: "f16", blockBytes: 64 },
-  { type: "bf16", blockBytes: 64 },
-  { type: "q8_0", blockBytes: 34 },
-  { type: "q5_1", blockBytes: 24 },
-  { type: "q5_0", blockBytes: 22 },
-  { type: "iq4_nl", blockBytes: 18 },
-  { type: "q4_1", blockBytes: 20 },
-  { type: "q4_0", blockBytes: 18 },
-] as const;
-export type KvCacheType = (typeof KV_CACHE_TYPES)[number]["type"] | "";
-
-export function kvScale(type: string): number {
-  const t = KV_CACHE_TYPES.find((k) => k.type === type);
-  return t ? t.blockBytes / 64 : 1;
-}
-
-/** f16 KV bytes per token for the WHOLE model, from the manifest. Hybrid
- *  models only pay attention KV on every `full_attention_interval`-th layer;
- *  their per-layer recurrent state is context-independent and therefore not
- *  part of this number. Estimate parity: src/common/model.c. */
-export function kvBytesPerTokenF16(modelId: string): number {
-  const m = getManifest(modelId || DEFAULT_MODEL_ID);
-  const kv = m.kv as { bytes_per_token_per_layer: number; full_attention_interval?: number };
-  const layers = kv.full_attention_interval
-    ? Math.max(1, Math.round(m.n_layers / kv.full_attention_interval))
-    : m.n_layers;
-  return kv.bytes_per_token_per_layer * layers;
-}
-
-export interface KvRecommendation {
-  /** The dtype "auto" resolves to. */
-  type: (typeof KV_CACHE_TYPES)[number]["type"];
-  /** Why, in numbers the user can check: KV need at the effective context vs
-   *  the memory left after weights. Rendered verbatim in the panel. */
-  kvNeedBytes: number;
-  budgetBytes: number;
-  ctx: number;
-  /** True when even the smallest dtype does not fit — the pick is then "least
-   *  bad", and the panel must say so instead of implying it fits. */
-  tight: boolean;
-}
-
-/**
- * Recommend a KV cache dtype from the model's size, this machine's memory and
- * the effective context (the user's ask: the default should come from model ×
- * resources, not from a fixed constant).
- *
- * Ladder deliberately stops at q4_0 and skips the exotic middle steps for the
- * recommendation itself (they all stay selectable): f16 when it fits with the
- * weights, else the highest of q8_0/q5_1/q4_0 that does. Below q4_0 there is
- * nothing, so a machine where even that overflows still gets q4_0 — flagged
- * `tight` so the UI says "will size the context down" rather than "fits".
- */
-export function recommendKvCache(
-  s: Pick<AppSettings, "tier" | "modelId" | "quant">,
-  mem: { vramBytes: number; ramBytes: number; unified: boolean }
-): KvRecommendation {
-  const ctx = effectiveCtx(s);
-  const m = getManifest(s.modelId || DEFAULT_MODEL_ID);
-  const v = getVariant(s.modelId, s.quant || undefined);
-  const weights = (v ? v.layer_weight_bytes + v.shared_weight_bytes
-                     : m.layer_weight_bytes + m.shared_weight_bytes) || 0;
-  // Unified memory is one physical pool — count it once (plan.c rule).
-  const have = mem.unified ? Math.max(mem.vramBytes, mem.ramBytes) : mem.vramBytes + mem.ramBytes;
-  // Engine parity: per-node overhead = 768 MiB + weights/64 (calibrated
-  // 2026-08-15, results/resource-calibration-20260815.md).
-  const overhead = 768 * MiB + weights / 64;
-  const budget = Math.max(0, have - weights - overhead);
-  const perTok = kvBytesPerTokenF16(s.modelId);
-  const ladder = ["f16", "q8_0", "q5_1", "q4_0"] as const;
-  for (const t of ladder) {
-    if (perTok * kvScale(t) * ctx <= budget)
-      return { type: t, kvNeedBytes: perTok * kvScale(t) * ctx, budgetBytes: budget, ctx, tight: false };
-  }
-  return { type: "q4_0", kvNeedBytes: perTok * kvScale("q4_0") * ctx, budgetBytes: budget, ctx, tight: true };
-}
+// Retired from the UI on 2026-08-25 (docs/ctx-kv-simplification-2026-08.md):
+// the KV dtype is the COORDINATOR's automatic rule now — q4_0 for 1-2 bit
+// weights, q8_0 for 3-4 bit, and f16-first for higher/unknown precision. The
+// client passes nothing; the escape hatch
+// for measurements is the coordinator's IDLETOKEN_KV_CACHE_TYPE env, on
+// purpose not a setting. The dtype table, the per-token estimator and
+// recommendKvCache() that used to live here duplicated the coordinator's
+// planner and are gone with the selector that consumed them.
 
 export type ResourcePreset = "conservative" | "balanced" | "max" | "custom";
 // Fraction of a machine's total the preset lets IdleToken use (max = no cap).
@@ -135,7 +90,6 @@ export const PRESET_FRACTION: Record<Exclude<ResourcePreset, "custom">, number> 
   max: 1,
 };
 
-export type ComputeMode = "auto" | "gpu_only" | "hybrid";
 export type KvEviction = "lru" | "fifo";
 export type Density = "comfortable" | "compact";
 export type Accent = "amber" | "teal" | "violet" | "rose";
@@ -149,15 +103,15 @@ export interface AppSettings {
   // customHfFile, removed 2026-08-15 with the open model intake): the curated
   // registry is the whole selectable set, and a stored "local-gguf" selection
   // migrates back to the default model below.
-  /** 0 = "model default": the model's trained window, sized down to memory by
-   *  the coordinator (--ctx-fit). 1-5 = the fixed tier ladder, bounded by the
-   *  model's trained window in the picker. */
+  /** Retired context-tier schema field. Runtime context comes exclusively from
+   *  `longContext`: exact 256K by default, exact 1M when explicitly enabled. */
   tier: Tier["id"] | 0;
+  /** Explicit 1M service. False = the exact 256K default. */
+  longContext: boolean;
   resourcePreset: ResourcePreset;
   // ---- advanced: resources (precise; used when resourcePreset === "custom") ----
   maxVramMb: number; // 0 = no cap
-  maxRamMb: number; // 0 = no cap
-  computeMode: ComputeMode; // reserved — engine auto-determines GPU_ONLY/HYBRID, no override flag yet
+  maxRamMb: number; // legacy stored field; serving capacity is GPU memory only
   // No "weights source" / "GGUF file path" any more (2026-08-13). Resolution is
   // policy, not preference — see resolveLocalWeights: a complete local copy is
   // used, a joiner streams its layers from the coordinator, everyone else
@@ -176,14 +130,12 @@ export interface AppSettings {
   // could not read from this same store. An operator who sets one still gets
   // it enforced.
   apiToken: string;
-  // ---- sharing: lend when idle, borrow when busy (one switch) ----
-  //
-  // One setting, because it is one deal: this machine takes other people's work
-  // when it is free and hands its own overflow to someone else when it is full.
-  // Splitting it into two switches would offer "only earn" and "only spend" as
-  // if they were separate products; they are the two halves of the same
-  // exchange, and the pricing only works if most machines do both.
-  sharingEnabled: boolean;
+  // ---- marketplace: two independent choices ------------------------------
+  // Providing and borrowing used to share one switch. They are intentionally
+  // independent now: a machine may earn Sparks without spending them, or ask
+  // for help without accepting other people's prompts.
+  providerEnabled: boolean;
+  overflowEnabled: boolean;
   /** What borrowing may cost in one UTC day, in milli-credits. NOT a user
    *  setting any more (owner's call, 2026-08-21): borrowing may spend the
    *  whole balance, and the balance itself is the ceiling — the platform
@@ -191,12 +143,12 @@ export interface AppSettings {
    *  a positive number (it reads 0 as "use my own default"); it is pinned to
    *  OVERFLOW_UNCAPPED_MILLI by the v6 migration and no UI edits it. */
   overflowDailyCapMilli: number;
-  /** Only borrow once this machine's estimated wait reaches this many seconds.
-   *  0 = borrow as soon as it is full. Advanced: the useful default is 0 and
-   *  the setting only matters to someone who would rather queue than pay. */
+  /** Internal coordinator compatibility field. The public product policy is
+   *  fixed at 0: when the one local inference slot is occupied, an eligible
+   *  second request asks for help immediately instead of entering a queue. */
   overflowWaitS: number;
   /** The provider name this machine registered on the platform, written by
-   *  the sharing toggle: `<clusterName>-<N>`, N = the smallest free number
+   *  the sharing toggle: `cluster-<N>`, N = the smallest free number
    *  among the account's providers. Per-machine because the gateway dedupes
    *  providers by (account, name) — two machines sharing the bare cluster
    *  name upserted into ONE row and fought over its pubkey (found
@@ -219,26 +171,22 @@ export interface AppSettings {
   maxTokens: number;
   /** Bumped when a stored value must be discarded; see loadSettings. */
   schemaVersion: number;
-  // ---- advanced: KV warm-cache policy (acceptance P5) ----
-  // Honesty note (2026-07 audit): today the engine's ONLY real KV-disk surface
-  // is maintenance — `idletoken-worker --kv-clear [--kv-dir DIR]`. So kvDir is
-  // real (it targets the clear action); kvMaxMb / kvTtlDays / kvEviction /
-  // kvOffload have NO engine implementation yet (no size bound, no TTL/LRU
-  // eviction, no live offload) and stay `reserved` in the panel until the
-  // engine grows them. Do not fake flags for them (design philosophy 15).
-  kvOffload: boolean; // reserved — engine has no live KV offload
-  kvDir: string; // real: passed to `--kv-clear --kv-dir` (empty = platform dir)
-  // ---- KV cache precision (real: engine -ctk/-ctv via the coordinator) ----
-  /** K cache dtype. "" = auto: the client resolves recommendKvCache() at
-   *  launch and passes the concrete dtype. Any other value must be in
-   *  KV_CACHE_TYPES (the coordinator refuses unknown ones loudly). */
+  // ---- retired KV-cache settings (stored-schema compatibility only) ----
+  // The product has no persistent disk KV cache and exposes none of these in
+  // the UI. The running engine may reuse hot prefixes in-process; stopping the
+  // service destroys that state. A future host-RAM LRU needs an explicit byte
+  // cap, eviction tests, and stop-time clearing before any field can return.
+  kvOffload: boolean;
+  kvDir: string;
+  // ---- KV cache precision: RETIRED 2026-08-25 (ctx-kv-simplification) ----
+  /** Stored for schema compatibility only; the v8 migration pins both to ""
+   *  and nothing reads them. The dtype is the coordinator's automatic
+   *  weight-tier rule; the escape hatch is its IDLETOKEN_KV_CACHE_TYPE env. */
   kvCacheK: string;
-  /** V (activation) cache dtype. "" = auto: follows the K choice. A quantized
-   *  V cache needs flash attention; the coordinator adds `-fa on` itself. */
   kvCacheV: string;
-  kvMaxMb: number; // reserved — engine enforces no size bound yet
-  kvTtlDays: number; // reserved — engine has no TTL eviction yet
-  kvEviction: KvEviction; // reserved — engine has no eviction policy yet
+  kvMaxMb: number;
+  kvTtlDays: number;
+  kvEviction: KvEviction;
   // ---- advanced: network ----
   bindNic: string; // "auto" or a specific IP
   interStagePort: number;
@@ -273,7 +221,6 @@ export interface AppSettings {
   mdns: boolean;
   discoveryPort: number;
   manualPeers: string; // comma-separated IPs
-  clusterName: string;
   heartbeatSec: number;
   preferCoordinator: boolean;
   sameSubnetOnly: boolean;
@@ -371,11 +318,9 @@ export const OVERFLOW_UNCAPPED_MILLI = 2_000_000_000;
 export const DEFAULT_SETTINGS: AppSettings = {
   modelId: DEFAULT_MODEL_ID,
   quant: defaultQuant(DEFAULT_MODEL_ID),
-  // Model default (2026-08-24, was tier 2/32K): the model's own trained window
-  // sized down to memory. A fixed 32K default silently under-served models
-  // trained for 256K, and a real client with a large toolset (Nimbalyst's
-  // opencode: 48.5K tokens of tool schemas) overflowed it on first contact.
+  // Exact 256K by default. Long context is a separate explicit service choice.
   tier: MODEL_DEFAULT_TIER,
+  longContext: false,
   // Full power by default (2026-08-15, was "balanced"): the product's whole
   // promise is using this machine's idle capacity, and a fresh install that
   // silently keeps 25% back both underuses the hardware and misreports what
@@ -383,16 +328,14 @@ export const DEFAULT_SETTINGS: AppSettings = {
   resourcePreset: "max",
   maxVramMb: 0,
   maxRamMb: 0,
-  computeMode: "auto",
   apiHost: "127.0.0.1",
   apiPort: 8000,
   apiOpenAI: true,
   apiAnthropic: true,
   apiToken: "",
-  // Off by default. Sharing sends this machine other people's prompts and
-  // spends this account's credits; both are decisions to be made, not defaults
-  // to be discovered.
-  sharingEnabled: false,
+  // Both directions are explicit, independent opt-ins.
+  providerEnabled: false,
+  overflowEnabled: false,
   // 50 credits/day. Matches the coordinator's own default
   // (IDLETOKEN_OVF_DEFAULT_DAILY_CAP_MILLI) so the number shown here is the
   // number in force. Raised from 5 on 2026-08-19 against the measured rate card
@@ -415,12 +358,12 @@ export const DEFAULT_SETTINGS: AppSettings = {
   // sees a reply that stops mid-sentence and concludes the model is bad —
   // whereas a long generation is visible, streaming, and interruptible (Stop).
   // The cost is real and accepted: a model that never emits EOS runs until the
-  // context fills, which at ~13 tok/s and a 1M window is many hours of the
+  // context fills, which at ~13 tok/s and a 256K window is still many hours of the
   // cluster. Anyone who wants a bound sets one here, or sends max_tokens.
   maxTokens: 0,
   // Literal, not SCHEMA_VERSION: that const is declared further down and this
   // object is built at module init. Keep the two in step by hand.
-  schemaVersion: 7,
+  schemaVersion: 11,
   kvOffload: false,
   kvDir: "",
   kvCacheK: "",
@@ -447,7 +390,6 @@ export const DEFAULT_SETTINGS: AppSettings = {
   mdns: true,
   discoveryPort: 14099,
   manualPeers: "",
-  clusterName: "IdleToken-Home",
   // 1s, not the 5 it used to say: these six were hollow until 2026-08-13, so
   // the stored numbers described nothing. Now that the poll really uses it, the
   // default has to be the interval the client has always polled at — otherwise
@@ -501,17 +443,16 @@ export const DEFAULT_SETTINGS: AppSettings = {
   privacyDummyTokens: false,
 };
 
-// Displayed version. Source of truth is src-tauri/tauri.conf.json (`version`),
-// which package.json mirrors — keep this literal in step with it. (Not read
-// from the Tauri API because it renders synchronously in the About note and
-// must also work in the browser dev build, where there is no shell to ask.)
-export const APP_VERSION = "0.1.24";
+// The About note renders synchronously and must also work in the browser dev
+// build, so it shares the browser build's existing release metadata instead
+// of maintaining a second handwritten version string.
+export const APP_VERSION = OFFICIAL_CLIENT_VERSION;
 
 const KEY = "idletoken.settings";
 
 // Bump when a stored value must be discarded rather than merged. Absent in
 // blobs written before versioning existed, which reads as 0.
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 11;
 
 // ---- UI scale --------------------------------------------------------------
 // The fixed factors the panel offers. `0` means auto; anything else must be one
@@ -674,11 +615,48 @@ export function loadSettings(): AppSettings {
     if ((parsed.schemaVersion ?? 0) < 7 && merged.providerName) {
       merged.providerName = "";
     }
-    // No migration for the cluster-name default rename ("home" →
-    // "IdleToken-Home", 2026-08-15): a stored "home" MAY be a deliberate
-    // choice, and rewriting a name the user could have typed is worse than
-    // letting old and new defaults coexist. Machines that should pair must
-    // simply agree on the name — which the field says out loud.
+    // v7 → v8: the context tier ladder and the KV precision selectors left
+    // the UI (docs/ctx-kv-simplification-2026-08.md). The KV dtype is the
+    // coordinator's automatic weight-tier rule.
+    // A stored tier or dtype was set
+    // against knobs that no longer exist — honouring it would silently pin
+    // yesterday's trade-off on exactly the machines that ran the old build.
+    if ((parsed.schemaVersion ?? 0) < 8) {
+      merged.tier = MODEL_DEFAULT_TIER;
+      merged.kvCacheK = "";
+      merged.kvCacheV = "";
+    }
+    // v8 → v9: cluster names left the product. Remove the legacy property
+    // unconditionally so imported or hand-edited settings cannot silently
+    // bring the retired pairing split back. The account pairing protocol keeps
+    // its own fixed compatibility bytes; no user setting feeds them.
+    delete (merged as AppSettings & { clusterName?: unknown }).clusterName;
+    // v9 → v10: accepting work and requesting help are separate choices. An
+    // existing ON switch enabled both directions, so preserve that behaviour
+    // on upgrade; explicitly present new fields win for development builds
+    // that wrote the split shape before the schema bump. The public busy rule
+    // is also fixed here: no local queue, immediate overflow when occupied.
+    const legacyMarket = parsed as Partial<AppSettings> & { sharingEnabled?: unknown };
+    if ((parsed.schemaVersion ?? 0) < 10) {
+      const legacyOn = legacyMarket.sharingEnabled === true;
+      merged.providerEnabled =
+        typeof legacyMarket.providerEnabled === "boolean" ? legacyMarket.providerEnabled : legacyOn;
+      merged.overflowEnabled =
+        typeof legacyMarket.overflowEnabled === "boolean" ? legacyMarket.overflowEnabled : legacyOn;
+    }
+    // v10 → v11: context became an explicit two-state product choice. Existing
+    // installs stay on the safe/default 256K service until the user checks 1M.
+    if ((parsed.schemaVersion ?? 0) < 11) merged.longContext = false;
+    merged.overflowWaitS = 0;
+    delete (merged as AppSettings & { sharingEnabled?: unknown }).sharingEnabled;
+    // Long context stopped being a separate model SKU on 2026-08-29. Preserve
+    // the selected weights/precision while folding stored `*-1m` ids back into
+    // the one real model. This is unconditional because users may already have
+    // saved the current schema version.
+    if (merged.modelId.endsWith("-1m")) {
+      const baseId = merged.modelId.slice(0, -3);
+      if (isAvailable(baseId)) merged.modelId = baseId;
+    }
     // The picker only lists models the engine can run, so a stored id outside
     // that set (hand-edited storage, a model withdrawn between releases, or
     // the "local-gguf" sentinel of the open intake removed 2026-08-15) would
@@ -736,10 +714,10 @@ export function saveSettings(s: AppSettings): void {
 //                       adopt it via the roster broadcast)
 //   quant             → coord `--quant` (selected precision; "" = the model's
 //                       default variant. Joiners adopt it via the roster too)
-//   ctxSize           → coord `--ctx-size` (tier → context window; feeds mode
-//                       decision + per-node overhead in the layer split)
+//   ctxSize           → coord `--ctx-size` (exact 256K or explicit 1M; feeds
+//                       GPU admission and KV sizing without a fallback ladder)
 // Settings without a real engine implementation (KV size/TTL/eviction,
-// computeMode, sampling defaults, ...) are deliberately NOT carried here —
+// sampling defaults, ...) are deliberately NOT carried here —
 // they stay `reserved` in the panel instead of being silently dropped.
 export interface EngineTuning {
   apiHost: string;
@@ -750,23 +728,19 @@ export interface EngineTuning {
   modelId: string;
   quant: string;
   ctxSize: number;
-  /** Tier 0 ("model default"): `ctxSize` is a CEILING and the coordinator
-   *  sizes down to memory (--ctx-fit) instead of refusing when it does not
-   *  fit. Explicit tiers keep today's refuse-loudly contract. */
-  ctxFit: boolean;
-  /** KV cache dtypes → coord env IDLETOKEN_KV_CACHE_TYPE / _V ("" = engine
-   *  default f16). "auto" is resolved to a concrete dtype HERE, at launch,
-   *  because the recommendation depends on the machine the engine starts on. */
+  /** KV cache dtypes → coord env IDLETOKEN_KV_CACHE_TYPE / _V. Always "" since
+   *  2026-08-25: the coordinator decides from the weight tier, with f16-first
+   *  sizing for high/unknown precision (docs/ctx-kv-simplification-2026-08.md). The
+   *  fields stay so the Rust Tuning struct keeps its shape. */
   kvCacheK: string;
   kvCacheV: string;
   /** Per-request generation ceiling → coord `--max-decode`. 0 = context-bound. */
   maxDecode: number;
-  /** This machine's usage caps (MiB, 0 = no cap) → worker `--max-vram-mb` /
-   *  `--max-ram-mb`. Per-machine, unlike the model/ctx settings: it is the
+  /** This machine's usage cap (MiB, 0 = no cap) → worker `--max-vram-mb`.
+   *  Unlike the model/ctx settings, the VRAM cap is the
    *  answer to "how much of MY computer may IdleToken use", so each node
    *  passes its own and joiners never adopt the creator's. */
   maxVramMb: number;
-  maxRamMb: number;
   // ---- pairing behaviour (client-side, consumed by src-tauri/src/pairing.rs) --
   /** Announce/listen for the UDP discovery beacon. Off = this machine is found
    *  (or finds others) only through `manualPeers`. */
@@ -786,7 +760,7 @@ export interface EngineTuning {
   // ---- overflow (borrow when full) -> coord --overflow-* ------------------
   //
   // Launch parameters, not live controls: the coordinator reads them once, at
-  // start. Turning sharing on therefore restarts the engine, which is the same
+  // start. Turning Request help on therefore restarts the engine, which is the same
   // thing switching models does and is described to the user in the same words
   // -- there is no hot swap and pretending otherwise would leave the switch
   // showing a state the engine is not in.
@@ -798,6 +772,35 @@ export interface EngineTuning {
   overflowKey: string;
   overflowWaitS: number;
   overflowDailyCapMilli: number;
+}
+
+/** The launch-time subset that may change while a roster is already forming.
+ *
+ * Pairing freezes the rest of EngineTuning when the cluster is created: model,
+ * ports, NIC and resource caps are already part of the roster contract. The
+ * top-right Request help button may change after the roster forms, so these
+ * fields must be refreshed at the instant the creator starts the engines. */
+export interface OverflowTuning {
+  /** Explicit backend gate. When false, stale credentials are ignored. */
+  enabled: boolean;
+  overflowUrl: string;
+  overflowKey: string;
+  overflowWaitS: number;
+  overflowDailyCapMilli: number;
+}
+
+export function overflowTuning(s: AppSettings): OverflowTuning {
+  const enabled = s.overflowEnabled && !!s.overflowKey;
+  return {
+    enabled,
+    // Keep credentials empty in the off state as defence in depth; Rust also
+    // enforces `enabled` so a stale or hand-written payload cannot route.
+    overflowUrl: enabled ? s.platformUrl.trim().replace(/\/+$/, "") : "",
+    overflowKey: enabled ? s.overflowKey : "",
+    // Fixed product policy: the occupied local slot never creates a queue.
+    overflowWaitS: 0,
+    overflowDailyCapMilli: Math.max(1, s.overflowDailyCapMilli || OVERFLOW_UNCAPPED_MILLI),
+  };
 }
 
 export function tierCtx(tier: Tier["id"] | 0): number {
@@ -817,16 +820,11 @@ export function tierCtx(tier: Tier["id"] | 0): number {
  */
 export function engineTuning(
   s: AppSettings,
-  caps: { maxVramMb: number; maxRamMb: number },
-  /** This machine's memory, for resolving kvCache "auto" into a concrete
-   *  dtype. Optional so a caller without a probe still launches — "auto" then
-   *  degrades to the engine's own default (f16), never to a guess. */
-  mem?: { vramBytes: number; ramBytes: number; unified: boolean }
+  caps: { maxVramMb: number }
 ): EngineTuning {
-  const autoKv = mem ? recommendKvCache(s, mem).type : "";
+  const overflow = overflowTuning(s);
   return {
     maxVramMb: caps.maxVramMb,
-    maxRamMb: caps.maxRamMb,
     lanDiscovery: s.mdns,
     manualPeers: s.manualPeers,
     // Clamped where it is read (pairing.rs) too; here it just keeps a 0 from a
@@ -845,22 +843,20 @@ export function engineTuning(
     discoveryPort: s.discoveryPort || 14099,
     modelId: s.modelId || DEFAULT_MODEL_ID,
     quant: s.quant ?? "",
-    // Bounded by the model's trained window in both cases — the coordinator
-    // clamps too, but the number the client quotes should be the one in force.
+    // Exact selected service window: 256K by default or explicit 1M. Runtime
+    // may refuse it for insufficient VRAM but never silently reduces it.
     ctxSize: effectiveCtx(s),
-    ctxFit: s.tier === MODEL_DEFAULT_TIER,
-    kvCacheK: s.kvCacheK || autoKv,
-    // V follows K when only K is set (or recommended): mixed K/V dtypes are a
-    // deliberate choice, not a default.
-    kvCacheV: s.kvCacheV || s.kvCacheK || autoKv,
+    // Always empty (2026-08-25): the coordinator's auto rule decides the KV
+    // dtype where the memory plan is made, so the plan and the engine's
+    // -ctk/-ctv can never disagree. See the field comment above.
+    kvCacheK: "",
+    kvCacheV: "",
     // The engine's per-request ceiling comes from the same setting the chat
     // sends, so the number the user typed is the number that governs — for
     // third-party API clients too, not just our own chat.
     maxDecode: s.maxTokens,
-    // Overflow reaches the coordinator only when the sharing switch is on AND
-    // a key has been minted for it. Anything less and the URL is left empty,
-    // which is how the coordinator is told "do not enable this" -- there is no
-    // separate off flag to fall out of step with the credentials.
+    // Overflow reaches the coordinator only when Request help is on AND a key
+    // has been minted for it. Providing work is deliberately unrelated.
     //
     // This stays the URL as the user configured it (usually https://). The
     // coordinator has no TLS client, so the spawn layer translates it to the
@@ -868,12 +864,10 @@ export function engineTuning(
     // translation lives in Rust because both launch paths (coord overflow and
     // the platform agent) pass through there, and a second copy here would be
     // the kind that drifts.
-    overflowUrl: s.sharingEnabled && s.overflowKey ? s.platformUrl.trim().replace(/\/+$/, "") : "",
-    overflowKey: s.sharingEnabled ? s.overflowKey : "",
-    overflowWaitS: Math.max(0, s.overflowWaitS || 0),
-    // Never 0: 0 means "the coordinator's own default", not "no ceiling", and
-    // the coordinator has no way to express "no ceiling" at all.
-    overflowDailyCapMilli: Math.max(1, s.overflowDailyCapMilli || OVERFLOW_UNCAPPED_MILLI),
+    overflowUrl: overflow.overflowUrl,
+    overflowKey: overflow.overflowKey,
+    overflowWaitS: overflow.overflowWaitS,
+    overflowDailyCapMilli: overflow.overflowDailyCapMilli,
   };
 }
 
@@ -883,15 +877,14 @@ export function engineTuning(
 export function effectiveCaps(
   s: AppSettings,
   totals: { vram_total: number; ram_total: number } | null
-): { maxVramMb: number; maxRamMb: number } {
+): { maxVramMb: number } {
   if (s.resourcePreset === "custom") {
-    return { maxVramMb: s.maxVramMb, maxRamMb: s.maxRamMb };
+    return { maxVramMb: s.maxVramMb };
   }
   const f = PRESET_FRACTION[s.resourcePreset];
-  if (!totals || f >= 1) return { maxVramMb: 0, maxRamMb: 0 };
+  if (!totals || f >= 1) return { maxVramMb: 0 };
   return {
     maxVramMb: Math.floor((totals.vram_total * f) / MiB),
-    maxRamMb: Math.floor((totals.ram_total * f) / MiB),
   };
 }
 

@@ -155,13 +155,13 @@ esac
 
 cmake -S "$SRC_DIR" -B "$BUILD_DIR" "${COMMON_FLAGS[@]}" "${PLATFORM_FLAGS[@]}"
 cmake --build "$BUILD_DIR" -j "$NPROC" \
-      --target llama-server ggml-rpc-server llama-perplexity
+      --target llama-server ggml-rpc-server llama-perplexity llama-fit-params
 
 # --- verify -----------------------------------------------------------------
 # Stale artifacts from earlier shared-lib builds caused a broken-but-present
 # llama-server once (dyld missing-symbol at startup). Actually execute each
 # product; existence alone proves nothing.
-for bin in llama-server ggml-rpc-server llama-perplexity; do
+for bin in llama-server ggml-rpc-server llama-perplexity llama-fit-params; do
     [ -x "$BUILD_DIR/bin/$bin" ] || { echo "FATAL: $bin not built" >&2; exit 1; }
 done
 VERSION_LINE=$("$BUILD_DIR/bin/llama-server" --version 2>&1 | grep -m1 'version:') \

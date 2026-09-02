@@ -24,6 +24,8 @@ REM open-source repository.
 if defined IDLETOKEN_MINGW_BIN (set "M=%IDLETOKEN_MINGW_BIN%") else (set "M=%LOCALAPPDATA%\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT.LLVM_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin")
 set PATH=%M%;C:\WINDOWS\system32;C:\WINDOWS;C:\WINDOWS\System32\Wbem;C:\WINDOWS\System32\OpenSSH\
 del coord_build.log 2>nul
+where windres >nul 2>&1
+if errorlevel 1 goto :fail
 
 REM Same flags as CFLAGS_COORD in the Makefile, plus the Windows shim.
 set CF=-D_GNU_SOURCE -DDS4_NO_GPU -Isrc/platform/win -Ivendor/ds4 -Iinclude -std=gnu11 -O2 -include src/platform/win/win_compat.h
@@ -58,6 +60,8 @@ gcc -c vendor/ds4/rax.c -Ivendor/ds4 -std=gnu11 -O2 -o c_rax.o >> coord_build.lo
 if errorlevel 1 goto :fail
 gcc -c src/platform/win/win_compat.c -Isrc/platform/win -std=gnu11 -O2 -o c_win_compat.o >> coord_build.log 2>&1
 if errorlevel 1 goto :fail
+windres -I src/platform/win src/platform/win/idletoken_utf8.rc -O coff -o c_utf8_manifest.o >> coord_build.log 2>&1
+if errorlevel 1 goto :fail
 
 echo === common ===>> coord_build.log
 REM advise.c = the capability table served by GET /idletoken/v1/capability.
@@ -70,7 +74,7 @@ REM file there is NOT enough -- a file missing here surfaces only as a Windows
 REM link error, on a machine nobody builds on daily (it did: nodecrypt/privacy/
 REM resource/model_auto were all absent, so the coord had no Windows build at
 REM all after the pivot and the release gate died on a missing exe).
-for %%F in (net discovery model modelsize http plan gguf advise enginever resource model_auto apiconv) do (
+for %%F in (net discovery model modelsize http plan gguf weights advise enginever resource model_auto apiconv admission) do (
     gcc -c src/common/%%F.c %CF% -o c_%%F.o >> coord_build.log 2>&1
     if errorlevel 1 goto :fail
 )
@@ -114,7 +118,7 @@ if errorlevel 1 goto :fail
 echo === link ===>> coord_build.log
 REM -static-libgcc + static winpthread: the exe must run on a machine with only
 REM the NVIDIA driver and no MinGW on PATH (same reason as the worker link).
-gcc -static-libgcc -o idletoken-coord.exe c_coord_main.o c_llama_sidecar.o c_overflow.o c_net.o c_discovery.o c_model.o c_modelsize.o c_http.o c_plan.o c_gguf.o c_advise.o c_enginever.o c_resource.o c_model_auto.o c_apiconv.o c_b64.o c_sodium_seal.o c_blake2b.o c_nodecrypt.o c_privacy.o c_tweetnacl.o c_ds4x_tokenizer.o c_ds4.o c_rax.o c_win_compat.o -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic -lws2_32 -lbcrypt >> coord_build.log 2>&1
+gcc -static-libgcc -o idletoken-coord.exe c_coord_main.o c_llama_sidecar.o c_overflow.o c_net.o c_discovery.o c_model.o c_modelsize.o c_http.o c_plan.o c_gguf.o c_weights.o c_advise.o c_enginever.o c_resource.o c_model_auto.o c_apiconv.o c_admission.o c_b64.o c_sodium_seal.o c_blake2b.o c_nodecrypt.o c_privacy.o c_tweetnacl.o c_ds4x_tokenizer.o c_ds4.o c_rax.o c_win_compat.o c_utf8_manifest.o -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic -lws2_32 -lbcrypt >> coord_build.log 2>&1
 if errorlevel 1 goto :fail
 
 echo COORD_WIN_OK

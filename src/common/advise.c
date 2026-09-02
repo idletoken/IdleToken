@@ -7,28 +7,26 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Context tiers, descending so the first fit is the largest. */
-static const uint32_t TIERS[] = { 1048576u, 524288u, 131072u, 32768u, 8192u };
+/* The advisor reports the two product service choices. Runtime never searches
+ * or silently selects smaller tiers. */
+static const uint32_t TIERS[] = { 1048576u, 262144u };
 #define N_TIERS ((int)(sizeof(TIERS) / sizeof(TIERS[0])))
 
 static const double GiB = 1024.0 * 1024.0 * 1024.0;
 
-/* Tiers this model can actually be asked for: never above its context_max, and
- * always at least one entry (a model with a small window still gets judged at
- * that window rather than dropping out of the table). */
+/* Tiers this model can actually be asked for: never above either its own
+ * ability or today's product ceiling. Always return at least one tier. */
 static int tiers_for(const idletoken_model_spec *m, uint32_t *out) {
+    const uint32_t ceiling = idletoken_llama_product_ctx_ceiling(m);
     int n = 0;
     for (int i = 0; i < N_TIERS; i++) {
-        if (m->ctx_max == 0 || TIERS[i] <= m->ctx_max) out[n++] = TIERS[i];
+        if (ceiling == 0 || TIERS[i] <= ceiling) out[n++] = TIERS[i];
     }
-    if (n == 0) out[n++] = m->ctx_max ? m->ctx_max : 8192u;
+    if (n == 0) out[n++] = ceiling ? ceiling : 8192u;
     return n;
 }
 
-/* Best verdict for one (model, quant): the largest tier that fits GPU_ONLY,
- * else the largest that fits HYBRID, else REFUSE with the shortfall measured at
- * the SMALLEST tier (the friendliest possible answer — "even at 8K you are
- * still N GB short"). */
+/* Best GPU-only verdict for one (model, quant). */
 static void judge(const idletoken_model_spec *m, const char *quant,
                   const idletoken_node_mem *nodes, int n_nodes,
                   idletoken_advice_row *row) {
@@ -40,21 +38,16 @@ static void judge(const idletoken_model_spec *m, const char *quant,
     row->shortfall = 0;
     row->need_bytes = 0;
 
-    for (int pass = 0; pass < 2; pass++) {
-        const idletoken_mode want = pass == 0 ? IDLETOKEN_MODE_GPU_ONLY : IDLETOKEN_MODE_HYBRID;
-        for (int i = 0; i < nt; i++) {
-            const idletoken_mode got = idletoken_mode_decide_quant(
-                m, quant, nodes, n_nodes, tiers[i], NULL, NULL, 0);
-            if (got == want) {
-                row->mode = want;
-                row->max_ctx = tiers[i];
-                /* The requirement AT THE TIER WE JUST ACCEPTED. Quoting it at a
-                 * fixed tier instead would contradict the row beside it: a
-                 * model whose verdict is "yes at 1M context" needs the memory
-                 * that 1M of KV costs, not the memory 8K costs. */
-                row->need_bytes = idletoken_needed_bytes_quant(m, quant, tiers[i], n_nodes);
-                return;
-            }
+    for (int i = 0; i < nt; i++) {
+        const idletoken_mode got = idletoken_mode_decide_quant(
+            m, quant, nodes, n_nodes, tiers[i], NULL, NULL, 0);
+        if (got == IDLETOKEN_MODE_GPU_ONLY) {
+            row->mode = got;
+            row->max_ctx = tiers[i];
+            row->need_bytes = idletoken_needed_bytes_quant(
+                m, quant, tiers[i], n_nodes,
+                idletoken_llama_roster_backend(nodes, n_nodes));
+            return;
         }
     }
 
@@ -64,7 +57,9 @@ static void judge(const idletoken_model_spec *m, const char *quant,
     uint64_t missing = 0;
     idletoken_mode_decide_quant(m, quant, nodes, n_nodes, tiers[nt - 1], &missing, NULL, 0);
     row->shortfall = missing;
-    row->need_bytes = idletoken_needed_bytes_quant(m, quant, tiers[nt - 1], n_nodes);
+    row->need_bytes = idletoken_needed_bytes_quant(
+        m, quant, tiers[nt - 1], n_nodes,
+        idletoken_llama_roster_backend(nodes, n_nodes));
 }
 
 int idletoken_advise(const idletoken_node_mem *nodes, int n_nodes,
@@ -108,12 +103,11 @@ int idletoken_advise(const idletoken_node_mem *nodes, int n_nodes,
             /* A single-node model is judged against the BEST ONE machine, not
              * the roster's sum — that is the only verdict the coordinator will
              * honour (it refuses --num-workers > 1 for these). "Best" is by
-             * total usable memory, which is what the planner spends. */
+             * usable VRAM, which is what the planner spends. */
             if (!idletoken_model_may_cluster(m, NULL, 0)) {
                 int best = 0;
                 for (int i = 1; i < n_nodes; i++)
-                    if (nodes[i].vram_usable + nodes[i].ram_usable >
-                        nodes[best].vram_usable + nodes[best].ram_usable) best = i;
+                    if (nodes[i].vram_usable > nodes[best].vram_usable) best = i;
                 row->single_node = 1;
                 judge(m, quant, &nodes[best], 1, row);
             } else {
@@ -137,7 +131,6 @@ static void size_word(uint64_t bytes, char out[16]) {
 static const char *mode_word(const idletoken_advice_row *r) {
     if (r->unavailable)                  return "not in this build";
     if (r->mode == IDLETOKEN_MODE_GPU_ONLY) return "yes (GPU only)";
-    if (r->mode == IDLETOKEN_MODE_HYBRID)   return "yes (GPU + RAM)";
     return "no";
 }
 
@@ -169,8 +162,6 @@ void idletoken_advise_print(const idletoken_advice_row *rows, int n,
             snprintf(note, sizeof note, "needs %.0f GB more%s",
                      (double)r->shortfall / GiB,
                      r->single_node ? " on one machine — try a lower precision" : "");
-        else if (r->mode == IDLETOKEN_MODE_HYBRID)
-            snprintf(note, sizeof note, "slower: part of the model sits in RAM");
         if (r->single_node && !r->unavailable && r->mode != IDLETOKEN_MODE_REFUSE) {
             const size_t used = strlen(note);
             snprintf(note + used, sizeof note - used, "%sruns on one machine",
@@ -180,8 +171,8 @@ void idletoken_advise_print(const idletoken_advice_row *rows, int n,
                r->model_id, r->quant[0] ? r->quant : "-", size,
                mode_word(r), ctx, note);
     }
-    printf("\n  \"yes (GPU only)\" is the fast path. \"yes (GPU + RAM)\" works but is\n"
-           "  slower. \"no\" tells you how much memory is missing — for a cluster\n"
+    printf("\n  \"yes (GPU only)\" means the full service fits in GPU memory.\n"
+           "  \"no\" tells you how much GPU memory is missing — for a cluster\n"
            "  model, adding another machine adds its memory to the pool.\n"
            "  Models marked \"runs on one machine\" are served by a single node:\n"
            "  they are small enough that splitting them over a LAN would cost more\n"
@@ -209,7 +200,7 @@ int idletoken_advise_json(const idletoken_advice_row *rows, int n, int n_nodes,
              i ? "," : "", r->model_id, r->label, r->quant,
              r->unavailable ? "unavailable"
                : r->mode == IDLETOKEN_MODE_GPU_ONLY ? "gpu_only"
-               : r->mode == IDLETOKEN_MODE_HYBRID   ? "hybrid" : "no",
+               : "no",
              r->max_ctx,
              (unsigned long long)r->weight_bytes,
              (unsigned long long)r->need_bytes,

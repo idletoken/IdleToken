@@ -1,0 +1,8 @@
+#include <windows.h>
+
+/* Keep every narrow-char native sidecar on one explicit path contract.
+ * MinGW/UCRT then supplies UTF-8 argv/getenv/fopen/stat, and Win32 A APIs
+ * (CreateProcessA, FindFirstFileA, CreateFileA, ...) consume the same bytes.
+ * Without this resource a non-ASCII Windows profile path is irreversibly
+ * replaced with '?' before main() sees it. */
+1 RT_MANIFEST "idletoken_utf8.manifest"

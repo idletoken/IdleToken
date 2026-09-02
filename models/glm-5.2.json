@@ -22,7 +22,15 @@
     "kind": "mla",
     "bytes_per_token_per_layer": 1152
   },
+  "moe": {
+    "n_expert": 256,
+    "n_expert_used": 8
+  },
   "overhead_base_bytes": 3221225472,
+  "compute_bytes_256k_cuda": 1614880440,
+  "compute_bytes_1m_cuda": 4836105912,
+  "compute_bytes_256k_metal": 35706707640,
+  "compute_bytes_1m_metal": 141201841848,
   "default_gguf": "UD-IQ1_S/GLM-5.2-UD-IQ1_S-00001-of-00006.gguf",
   "chat_template": "gguf",
   "sources": [

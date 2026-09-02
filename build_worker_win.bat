@@ -8,7 +8,7 @@ REM tested, not published. Building them cost a CUDA Toolkit dependency — a
 REM machine with only the NVIDIA driver could not build the worker at all —
 REM and about ten minutes of nvcc for code that never executes.
 REM
-REM This script builds the same worker against src/common/ds4_stub.c: the call
+REM This public script builds the same worker against the refusal-only ABI: the call
 REM sites in worker_main.c are untouched (frozen code), the real ds4 objects
 REM are simply not compiled. Needs gcc only; no CUDA Toolkit, no nvcc.
 REM
@@ -27,17 +27,30 @@ if "%IDLETOKEN_MINGW_BIN%"=="" if exist "%~dp0mingw64\bin\gcc.exe" set "IDLETOKE
 if "%IDLETOKEN_MINGW_BIN%"=="" set "IDLETOKEN_MINGW_BIN=%LOCALAPPDATA%\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT.LLVM_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin"
 set "PATH=%IDLETOKEN_MINGW_BIN%;%PATH%"
 where gcc >NUL 2>&1 || (echo WORKER_BUILD_FAIL: no gcc on PATH ^(set IDLETOKEN_MINGW_BIN^) & exit /b 1)
+where windres >NUL 2>&1 || (echo WORKER_BUILD_FAIL: no windres on PATH ^(set IDLETOKEN_MINGW_BIN^) & exit /b 1)
 
 set "LOG=worker_build.log"
 del "%LOG%" 2>nul
-set "CF=-D_GNU_SOURCE -Isrc/platform/win -Ivendor/ds4 -Iinclude -std=gnu11 -O2"
+set "CF=-D_GNU_SOURCE -Isrc/platform/win -Ibuild/public-compat -Ivendor/ds4 -Iinclude -std=gnu11 -O2"
 set "OBJ=build\win-worker"
 if not exist "%OBJ%" mkdir "%OBJ%"
+set "COMPAT=build\public-compat"
+if not exist "%COMPAT%" mkdir "%COMPAT%"
+>"%COMPAT%\ds4.h" echo #include "idletoken_legacy_backend_refusal.h"
+>"%COMPAT%\idletoken_ds4x.h" echo #include "idletoken_legacy_backend_refusal.h"
+>"%COMPAT%\idletoken_ds4x_tok.h" echo #include "idletoken_legacy_backend_refusal.h"
+>"%COMPAT%\idletoken_ds4x_cuda.h" echo #include "idletoken_legacy_backend_refusal.h"
+
+REM Narrow argv/CRT/Win32-A paths are UTF-8 only when this manifest is embedded.
+REM It is a release invariant, not decoration: without it a Chinese Windows
+REM username becomes ???? before main() can bind the coord socket or open a
+REM model/cache path. win_compat.c verifies the active code page at startup.
+windres -I src/platform/win src/platform/win/idletoken_utf8.rc -O coff -o "%OBJ%\utf8_manifest.o" >> "%LOG%" 2>&1
+if errorlevel 1 (echo WORKER_BUILD_FAIL: compiling UTF-8 manifest ^(see %LOG%^) & exit /b 1)
 
 REM Every compile appends to the log and its exit code is checked immediately:
 REM a failure four steps back is invisible by link time, which is exactly how
 REM the old script kept "succeeding".
-call :cc "vendor/ds4/rax.c"          "-Ivendor/ds4 -std=gnu11 -O2"                          rax          || goto :fail
 call :cc "src/platform/win/win_compat.c" "-Isrc/platform/win -std=gnu11 -O2"                win_compat   || goto :fail
 call :cc "src/common/net.c"          "-Iinclude -std=gnu11 -O2"                             net          || goto :fail
 call :cc "src/common/resource.c"     "-Iinclude -std=gnu11 -O2"                             resource     || goto :fail
@@ -53,9 +66,9 @@ call :cc "src/common/plan.c"         "-Iinclude -std=gnu11 -O2"                 
 call :cc "src/common/enginever.c"    "-Iinclude -std=gnu11 -O2"                             enginever    || goto :fail
 call :cc "src/common/advise.c"       "-Iinclude -std=gnu11 -O2"                             advise       || goto :fail
 
-REM The stub stands in for the whole ds4/ds4x API. It includes the real headers,
-REM so a signature drifting from its declaration is a compile error here.
-call :cc "src/common/ds4_stub.c"     "%CF%"                                                 ds4_stub     || goto :fail
+REM The public refusal stands in for the retired API and has no inference code.
+REM The private build keeps the real-header signature check.
+call :cc "src/common/legacy_backend_refusal.c" "%CF%"                                  legacy_refusal || goto :fail
 
 REM No -DIDLETOKEN_DS4X_CUDA: that define exists to wire worker_main.c into the
 REM ds4x CUDA kernels, which this build does not have. Leaving it out is what

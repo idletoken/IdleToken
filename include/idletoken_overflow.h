@@ -136,18 +136,33 @@ typedef struct {
     const char *api_key;          /* the account's overflow key; sealed, never a header */
     long long   wait_ms;          /* forward only when the estimated wait is at least this */
     long long   daily_cap_milli;  /* <= 0 means the default above; there is no "off" */
-    int         api_token_set;    /* does this coordinator have an --api-token? (RULE 2) */
+    int         api_token_set;    /* retained config field; tokenless loopback is supported */
 } idletoken_overflow_cfg;
 
 /* Turn overflow on. Returns 0, or -1 with a reason in `err` and overflow left
- * OFF. Refuses when: no --api-token (RULE 2 — an open local API plus automatic
- * spending is a drainable balance); no platform URL or key; or this build
- * pinned no platform signing key and none was supplied (RULE 3 — without the
- * anchor the envelope protects nothing). */
+ * OFF. Refuses when there is no platform URL/key, or this build pinned no
+ * platform signing key and none was supplied (without the trust anchor the
+ * envelope protects nothing). A local API token is optional: the API is
+ * loopback-only and browser Origin requests are rejected. */
 int idletoken_overflow_configure(const idletoken_overflow_cfg *cfg,
                                  char *err, size_t err_cap);
 
 int idletoken_overflow_enabled(void);
+
+/* Where borrowed requests are sent, verbatim, or "" when overflow is off.
+ *
+ * Exposed so the coordinator can DISCLOSE it rather than only dial it. A
+ * borrowed prompt is decrypted by whatever is at this URL and then by whichever
+ * provider that endpoint chooses (PRIV-01/PRIV-02), and when the URL is not the
+ * IdleToken platform the user's mental model of "still inside IdleToken's
+ * envelope" is simply wrong (PRIV-08). The client can only show that if the
+ * engine will say it; and saying it here, from the value that is actually
+ * dialled, is the difference between a disclosure and a caption.
+ *
+ * Returns 0 on success. Note the honest scope: this is the OFFICIAL
+ * coordinator answering about itself. A modified one can answer anything, which
+ * is why HOST-06 stays open — see docs/modified-client-threat-register-2026-08.md. */
+int idletoken_overflow_endpoint(char *out, size_t cap);
 
 /* Milli-credits spent today, and the ceiling in force (either may be NULL). */
 void idletoken_overflow_spend_today(long long *spent_milli, long long *cap_milli);
@@ -158,26 +173,102 @@ void idletoken_overflow_spend_today(long long *spent_milli, long long *cap_milli
  * this one is only a brake. */
 void idletoken_overflow_note_spend(long long milli);
 
+/* --- where a request came from --------------------------------------------
+ *
+ * RULE 1 used to read one header and call the answer a boolean. It is not a
+ * boolean, because the header is set by the sender, and one of the senders is
+ * an agent running on a provider's own machine (threat register PROV-28): an
+ * agent that simply omits the marker had every dispatched job treated as local
+ * work and forwarded on, spending a second fee and showing the prompt to one
+ * more stranger. Four states, not two, so the difference between "proven" and
+ * "merely claimed" and "not said at all" survives to the decision. */
+typedef enum {
+    /* Attributed to a caller on this machine — either it presented the
+     * coordinator's local-origin marker, or the machine is not a provider and
+     * "no marker" therefore has only one possible meaning. */
+    IDLETOKEN_ORIGIN_LOCAL = 0,
+    /* Spent a single-use capability this coordinator minted (idletoken_admission.h).
+     * The only state that CANNOT be produced by editing the sender. */
+    IDLETOKEN_ORIGIN_PLATFORM_PROVEN,
+    /* Sent the legacy X-IdleToken-Origin header and nothing else. Still treated
+     * as platform work — believing a claim in the SAFE direction costs nothing,
+     * and refusing it would break every agent older than this change. */
+    IDLETOKEN_ORIGIN_PLATFORM_CLAIMED,
+    /* No marker at all, on a machine that is also serving the platform. This is
+     * exactly the shape of a stripped header, and it is exactly the shape of an
+     * ordinary curl. Which is why it is its own state: under the strict policy
+     * it is not forwardable, and the log says so in those words. */
+    IDLETOKEN_ORIGIN_UNATTRIBUTED
+} idletoken_origin;
+
+const char *idletoken_origin_name(idletoken_origin o);
+
+/* How much of the above the coordinator acts on.
+ *
+ * LEGACY reproduces the pre-2026-08-30 behaviour exactly (no marker = local =
+ * forwardable). It exists so the gate can demonstrate the vulnerability it is
+ * closing on the same binary that closes it — an attack oracle that has to be
+ * run against an older build is an oracle nobody runs.
+ *
+ * CAPABILITY recognises and consumes capabilities but still forwards
+ * unattributed work; it is the right setting for a machine that borrows and
+ * never lends, where "unattributed" has no second meaning.
+ *
+ * STRICT additionally refuses to forward unattributed work. Default while
+ * --shared is on, because that is the only configuration in which an
+ * unattributed request might be somebody else's prompt. */
+typedef enum {
+    IDLETOKEN_OVF_ORIGIN_LEGACY = 0,
+    IDLETOKEN_OVF_ORIGIN_CAPABILITY,
+    IDLETOKEN_OVF_ORIGIN_STRICT
+} idletoken_ovf_policy;
+
+void idletoken_overflow_set_policy(idletoken_ovf_policy p);
+idletoken_ovf_policy idletoken_overflow_policy(void);
+const char *idletoken_overflow_policy_name(idletoken_ovf_policy p);
+
+/* How many times one request may be handed on before somebody refuses.
+ *
+ * RULE 1 kills the loop that goes through the platform and back. It does NOT
+ * kill a chain that grows one machine at a time — A borrows from the platform,
+ * the platform dispatches to B, B is full and borrows again — because from B's
+ * side the job is platform work and RULE 1 already stops it, but only while B
+ * can TELL. A hop budget is the belt to that brace: it does not depend on
+ * anyone's honesty about origin, only on a counter that travels with the
+ * request, and one hop is all the feature was ever specified to need. */
+#define IDLETOKEN_OVF_MAX_HOPS 1
+
 /* May THIS request be forwarded, right now?
  *
  * `*why` (may be NULL) always receives a short phrase naming the deciding
  * reason, including on the yes path, so the log line says why rather than only
  * what. The order of the checks is the order of the rules:
  *
- *   RULE 1  from_platform      -> never. Not a threshold, not a setting.
- *   §5.4    want_stream        -> never; refuse locally with an estimate
- *                                 instead. Handing back half a stream whose
- *                                 upstream died has no defined meaning yet.
- *   §5.4    daily cap reached  -> never, until the UTC day turns over.
- *   §4      est_wait < wait_ms -> not yet: the user asked to wait this long
- *                                 before paying someone else.
+ *   RULE 1  platform work        -> never. Not a threshold, not a setting.
+ *   RULE 1b unattributed, strict  -> never, for the same reason: on a machine
+ *                                    that serves the platform, "no marker" is
+ *                                    indistinguishable from a stripped one.
+ *   RULE 1c a platform job is in flight -> never: a machine in the middle of
+ *                                    somebody else's paid job must not pay a
+ *                                    third machine for what may be the same
+ *                                    prompt (fee expansion, CHAIN-05).
+ *   hops    already forwarded once -> never; the chain ends here.
+ *   §5.4    daily cap reached      -> never, until the UTC day turns over.
+ *   §4      est_wait < wait_ms     -> not yet: the user asked to wait this long
+ *                                    before paying someone else.
+ *
+ * stream requests are eligible: the coordinator obtains the complete sealed
+ * answer before opening the local SSE response, so an upstream failure still
+ * produces an ordinary 429 and a success is re-emitted as a complete
+ * OpenAI/Anthropic event sequence.
  *
  * est_wait is the same queue-depth x service-time estimate that already goes
  * into the 429's X-IdleToken-Est-Wait-Ms header. GPU utilisation and free VRAM
  * are deliberately NOT consulted (design §4): neither has a stable relationship
  * with "how long will this request wait". */
-int idletoken_overflow_should_forward(int from_platform, int want_stream,
-                                      long long est_wait_ms, const char **why);
+int idletoken_overflow_should_forward(idletoken_origin origin, int want_stream,
+                                      long long est_wait_ms, int hops_in,
+                                      const char **why);
 
 /* --- the sealed exchange ---------------------------------------------------
  *
@@ -230,11 +321,40 @@ void idletoken_overflow_reply_free(idletoken_overflow_reply *r);
  * platform's insides rather than anything the caller did.
  *
  * On success the charge the platform REPORTED is added to the day's spend, so
- * the local ceiling counts the same currency the platform bills in. */
+ * the local ceiling counts the same currency the platform bills in.
+ *
+ * `hops_in` is how many times this request had already been forwarded when it
+ * arrived here (0 for a request that started on this machine). It is not used
+ * to decide anything at this point — should_forward() already did that — but it
+ * is written INSIDE the envelope as `hops`, together with `max_hops` and a
+ * stable pseudonymous `origin_id` for this installation, so that:
+ *
+ *   - the platform can refuse to dispatch a request back to the machine that
+ *     forwarded it (the loop RULE 1 cannot see, because from each machine's own
+ *     side of it every hop looks like a first one), and
+ *   - the exposure set of one prompt has a declared ceiling rather than an
+ *     emergent one (PRIV-04).
+ *
+ * The coordinator emits and honours these fields; the platform side of the
+ * contract is a cross-owner request, recorded in
+ * results/security-hardening-overflow-privacy-20260830.md. Emitting them before
+ * anyone reads them is deliberate: an unread field costs bytes, while a field
+ * added later means every deployed coordinator is exempt from the rule. */
 int idletoken_overflow_exchange(const char *messages_json,
                                 const char *model, int max_tokens,
+                                int hops_in,
                                 idletoken_overflow_reply *out,
                                 char *err, size_t err_cap);
+
+/* A stable, pseudonymous id for this installation, hex, for the `origin_id`
+ * field above. Derived from the persisted local-origin marker, so it survives a
+ * restart and reveals nothing about the machine.
+ *
+ * It adds no linkability the platform did not already have: every overflow
+ * request carries the account's own overflow key inside the same envelope, so
+ * the account is identified exactly either way (PRIV-10 is unchanged by this
+ * field). Returns 0 on success. */
+int idletoken_overflow_origin_id(char *out, size_t cap);
 
 /* Self-test for everything above: builds its own signing key pair, signs a good
  * sample, and asserts the good one passes and each bad one is refused for the

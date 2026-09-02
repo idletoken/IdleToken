@@ -8,7 +8,7 @@
 //     each other) and the marketplace.
 // The selector picks by the `platformUrl` setting; the UI is unchanged.
 import { loadSettings } from "./settings";
-import { SESSION_KEY, clearSecret, getSecret, setSecret } from "./secrets";
+import { SESSION_KEY, clearAllSecrets, clearSecret, getSecret, setSecret } from "./secrets";
 import { platformRequest, replyJson } from "./platformHttp";
 
 export interface Session {
@@ -212,7 +212,11 @@ export const localAuthProvider: AuthProvider = {
   },
 
   signOut(): void {
-    clearSecret(SESSION_KEY);
+    // Everything, not just the session: the platform agent's scoped token is
+    // also an account credential, and leaving it behind means a signed-out
+    // machine still holds something that speaks for the account (threat
+    // register HOST-02/HOST-04).
+    clearAllSecrets();
   },
 };
 

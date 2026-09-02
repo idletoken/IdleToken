@@ -30,13 +30,14 @@ static uint64_t g(double gib) { return (uint64_t)(gib * (double)GiB); }
  * and `unified` (the pinned-capacity model). Every `{v, r, u}` in this file
  * silently became `{v, r, .ram_pinnable = u}` with `unified` defaulting to 0
  * — so the "unified 50/50" case stopped exercising unified memory at all and
- * started reporting HYBRID (50+50=100) where it must refuse. The compiler did
+ * started counting 50+50=100 where it must refuse. The compiler did
  * say `-Wmissing-field-initializers` 29 times; nothing treated that as fatal.
  *
  * Naming the fields makes the next insertion a compile-time no-op instead of a
  * silent semantic shift. `ram_pinnable = 0` means "unknown/unconstrained",
  * which is what these planner cases intend. */
 #define NM(v, r, u) { .vram_usable = (v), .ram_usable = (r), \
+                      .backend = IDLETOKEN_NODE_BACKEND_CUDA, \
                       .ram_pinnable = 0, .unified = (u) }
 
 /* A file of exactly `bytes`, without writing them: seek past the end and put
@@ -97,6 +98,10 @@ int main(void) {
        "DSv4 has a precision menu, scalars mirror the default");
     ok(strstr(M->default_gguf, ".gguf") != NULL && M->layer_weight_bytes > 0,
        "DSv4 default GGUF is named and measured");
+    ok(idletoken_model_get("deepseek-v4-flash-1m") == M &&
+           idletoken_model_get("qwen3.8-27b-1m") ==
+               idletoken_model_get("qwen3.8-27b"),
+       "retired -1m ids resolve to the one base model for compatibility");
 
     /* ---- small-model precision menu (small-model-design.md §3.2) ------ */
     {
@@ -169,14 +174,14 @@ int main(void) {
     }
 
     /* ---- needed() sanity -------------------------------------------- */
-    ok(idletoken_needed_bytes(M, 8192, 4)  <  idletoken_needed_bytes(M, 32768, 4),
+    ok(idletoken_needed_bytes(M, 8192, 4, IDLETOKEN_NODE_BACKEND_CUDA)  <  idletoken_needed_bytes(M, 32768, 4, IDLETOKEN_NODE_BACKEND_CUDA),
        "needed() grows with context tier");
-    ok(idletoken_needed_bytes(M, 8192, 2)  <  idletoken_needed_bytes(M, 8192, 6),
+    ok(idletoken_needed_bytes(M, 8192, 2, IDLETOKEN_NODE_BACKEND_CUDA)  <  idletoken_needed_bytes(M, 8192, 6, IDLETOKEN_NODE_BACKEND_CUDA),
        "needed() grows with node count");
-    ok(idletoken_needed_bytes(M, 1048576, 4) > g(110),
+    ok(idletoken_needed_bytes(M, 1048576, 4, IDLETOKEN_NODE_BACKEND_CUDA) > g(110),
        "1M-context 4-node need exceeds 110 GiB");
-    ok(idletoken_needed_bytes(idletoken_model_get("glm-5.2"), 8192, 4) >
-       2 * idletoken_needed_bytes(M, 8192, 4),
+    ok(idletoken_needed_bytes(idletoken_model_get("glm-5.2"), 8192, 4, IDLETOKEN_NODE_BACKEND_CUDA) >
+       2 * idletoken_needed_bytes(M, 8192, 4, IDLETOKEN_NODE_BACKEND_CUDA),
        "GLM-5.2 needs far more than DSv4 (240GB-class weights)");
 
     /* ---- mode: plenty of VRAM → GPU_ONLY ----------------------------- */
@@ -207,14 +212,14 @@ int main(void) {
 
     /* ---- unified pool must not be double counted --------------------- */
     {
-        /* One unified node with 50+50: if double-counted (100) HYBRID would
-         * pass for a 90 GiB need; correctly counted (50) it must refuse. */
+        /* One unified node with 50+50: if double-counted, a 90 GiB need would
+         * pass; correctly counted (50) it must refuse. */
         idletoken_node_mem uni[] = { NM(g(50), g(50), 1) };
         idletoken_mode m = idletoken_mode_decide(M, uni, 1, 8192, why, sizeof(why));
         ok(m == IDLETOKEN_MODE_REFUSE, "unified 50/50 counts once → refuse");
     }
 
-    /* ---- HYBRID: VRAM short, VRAM+RAM covers, all nodes ≥4G ---------- */
+    /* ---- RAM-rich but VRAM-short still refuses ------------------------ */
     {
         idletoken_node_mem nodes[] = {
             NM(g(24), g(48), 0),
@@ -222,23 +227,20 @@ int main(void) {
             NM(g(8), g(24), 0),
         };  /* vram 48 < need; all 48+104=152 > need */
         idletoken_mode m = idletoken_mode_decide(M, nodes, 3, 32768, why, sizeof(why));
-        ok(m == IDLETOKEN_MODE_HYBRID, "VRAM-short RAM-rich trio → HYBRID");
+        ok(m == IDLETOKEN_MODE_REFUSE, "VRAM-short RAM-rich trio → REFUSE");
+        ok(strstr(why, "[RESOURCE_INSUFFICIENT]") != NULL,
+           "GPU-only refusal carries the stable client error code");
     }
 
-    /* ---- HYBRID blocked by <4G VRAM node ----------------------------- */
+    /* ---- Host RAM never rescues a small GPU -------------------------- */
     {
         idletoken_node_mem nodes[] = {
             NM(g(24), g(64), 0),
             NM(g(2), g(64), 0),   /* below the 4 GiB floor */
         };
         idletoken_mode m = idletoken_mode_decide(M, nodes, 2, 8192, why, sizeof(why));
-        ok(m == IDLETOKEN_MODE_REFUSE, "HYBRID with a <4GiB-VRAM node → refuse");
-        ok(strstr(why, "4 GiB") != NULL, "refusal reason names the floor");
-        /* Attribution (plan D3): the numbers are each machine's own
-         * declaration, so a refusal must say WHICH machine — "a node has only
-         * 2 GiB" sends the owner of five machines looking through all five.
-         * Unnamed rows fall back to an index, which is still actionable. */
-        ok(strstr(why, "node #2") != NULL, "unnamed rows are blamed by position");
+        ok(m == IDLETOKEN_MODE_REFUSE, "RAM-rich node with 2 GiB VRAM → refuse");
+        ok(strstr(why, "GPU memory") != NULL, "refusal names the GPU-only resource");
 
         idletoken_node_mem named[] = {
             { .vram_usable = g(24), .ram_usable = g(64), .ram_pinnable = 0,
@@ -248,10 +250,18 @@ int main(void) {
         };
         idletoken_mode mn = idletoken_mode_decide(M, named, 2, 8192, why, sizeof(why));
         ok(mn == IDLETOKEN_MODE_REFUSE, "same case, named rows → still refuse");
-        ok(strstr(why, "gaming-pc") != NULL, "refusal names the machine at fault");
+        ok(strstr(why, "[RESOURCE_INSUFFICIENT]") != NULL,
+           "named rows keep the stable GPU-capacity refusal code");
         /* Control: it must name the OFFENDER, not just any machine it has. A
          * message that always printed the first row would pass the check above. */
         ok(strstr(why, "studio-mac") == NULL, "and does not blame the healthy one");
+
+        /* The name is value-owned by the resource row. This is deliberately a
+         * compile-time-sensitive regression: changing it back to `char *`
+         * makes sizeof(label) the pointer width and reopens the capability
+         * endpoint crash that reset live Windows chat streams. */
+        ok(sizeof(named[0].label) == 64,
+           "node labels are inline values, not borrowed roster pointers");
     }
 
     /* ---- flat-out insufficient → refuse with actionable text --------- */
@@ -259,7 +269,7 @@ int main(void) {
         idletoken_node_mem tiny[] = { NM(g(8), g(16), 0) };
         idletoken_mode m = idletoken_mode_decide(M, tiny, 1, 8192, why, sizeof(why));
         ok(m == IDLETOKEN_MODE_REFUSE, "single small node → refuse");
-        ok(strstr(why, "Add nodes") != NULL, "refusal suggests remedies");
+        ok(strstr(why, "add nodes") != NULL, "refusal suggests remedies");
     }
 
     /* ---- layer split: coverage, floor, proportionality ---------------- */
@@ -298,22 +308,6 @@ int main(void) {
         int c[2];
         ok(idletoken_plan_layers(M, z, 2, 8192, c, IDLETOKEN_MODE_GPU_ONLY) == 0 && c[0] + c[1] == 43 && c[0] >= 1,
            "zero-report node still gets a floor share");
-    }
-
-    {
-        /* HYBRID split sizes by VRAM+RAM: a low-VRAM/high-RAM node should get
-         * MORE layers than under GPU_ONLY (VRAM-only) sizing, so it can hold
-         * more of the model and offload the overflow to its RAM. */
-        idletoken_node_mem nodes[] = {
-            NM(g(16), g(16), 0),   /* strong VRAM */
-            NM(g(4), g(40), 0),   /* weak VRAM, ample RAM */
-        };
-        int cg[2], ch[2];
-        idletoken_plan_layers(M, nodes, 2, 8192, cg, IDLETOKEN_MODE_GPU_ONLY);
-        idletoken_plan_layers(M, nodes, 2, 8192, ch, IDLETOKEN_MODE_HYBRID);
-        ok(cg[0]+cg[1]==43 && ch[0]+ch[1]==43, "hybrid split still covers 43");
-        ok(ch[1] > cg[1], "HYBRID gives the ample-RAM node more layers than GPU_ONLY");
-        printf("      GPU_ONLY %d/%d  vs  HYBRID %d/%d\n", cg[0],cg[1],ch[0],ch[1]);
     }
 
     {
@@ -438,6 +432,19 @@ int main(void) {
         ok(found_no_with_shortfall,
            "an out-of-reach model reports HOW MUCH memory is missing");
 
+        /* Higher native/YaRN metadata remains on the base model. The explicit
+         * long-context product choice is priced at 1M. */
+        idletoken_node_mem roomy[] = { NM(g(240), g(240), 1) };
+        idletoken_advice_row rowsR[IDLETOKEN_ADVISE_MAX_ROWS];
+        int nR = idletoken_advise(roomy, 1, rowsR, IDLETOKEN_ADVISE_MAX_ROWS);
+        int qwen_long = 0;
+        for (int i = 0; i < nR; i++)
+            if (!strcmp(rowsR[i].model_id, "qwen3.5-0.8b") &&
+                !strcmp(rowsR[i].quant, "Q4_K_M") &&
+                rowsR[i].max_ctx == 1048576)
+                qwen_long = 1;
+        ok(qwen_long, "advisor prices the explicit 1M product context");
+
         /* Every verdict must agree with the planner asked directly. */
         int agreed = 1;
         for (int i = 0; i < n1 && agreed; i++) {
@@ -462,14 +469,11 @@ int main(void) {
             if (rows4[i].mode == IDLETOKEN_MODE_REFUSE && rows[i].mode != IDLETOKEN_MODE_REFUSE) regressed = 1;
         }
         ok(!regressed, "adding machines never turns a yes into a no");
-        ok(!improved, "extra machines do NOT unlock a single-node model");
+        ok(improved, "extra machines can unlock a higher model or precision");
 
-        /* ...but they must still unlock a CLUSTER model. This used to be one
-         * assertion ("adding machines turns some no into a yes") over the whole
-         * table; since single-node models stopped pooling memory, the only
-         * model that can flip is a cluster one, and it takes a roster big
-         * enough to hold 81 GiB. Asserting it on the specific model keeps the
-         * check honest instead of letting it pass on whatever happens to flip. */
+        /* A large model still needs a roster big enough to hold it. Asserting
+         * it on the specific model keeps the check honest instead of letting
+         * it pass on whichever smaller quant happens to flip first. */
         idletoken_node_mem big[8] = {0};
         for (int i = 0; i < 8; i++) { big[i].vram_usable = g(12); big[i].ram_usable = g(12); big[i].ram_pinnable = 0; big[i].unified = 0; }
         idletoken_advice_row rows8[IDLETOKEN_ADVISE_MAX_ROWS];
@@ -480,18 +484,14 @@ int main(void) {
                 rows8[i].mode != IDLETOKEN_MODE_REFUSE) dsv4_flipped = 1;
         ok(dsv4_flipped, "a big enough cluster unlocks the cluster model");
 
-        /* The flag the UI reads, and the invariant behind it: a single-node
-         * model's verdict must not depend on how many machines are present. */
-        int flag_ok = 1, verdict_stable = 1;
+        /* Deployment is a technical capability, not a size recommendation.
+         * Every currently selectable llama.cpp model can use either path. */
+        int flag_ok = 1;
         for (int i = 0; i < n1; i++) {
             const idletoken_model_spec *m = idletoken_model_get(rows[i].model_id);
             if (rows[i].single_node != !idletoken_model_may_cluster(m, NULL, 0)) flag_ok = 0;
-            if (rows[i].single_node &&
-                (rows4[i].mode != rows[i].mode || rows4[i].max_ctx != rows[i].max_ctx))
-                verdict_stable = 0;
         }
         ok(flag_ok, "single_node flag matches the registry's deployment field");
-        ok(verdict_stable, "a single-node model's verdict ignores the roster size");
 
         /* Halving the cap must not increase the context tier anywhere. */
         idletoken_node_mem tight[] = { NM(g(2), g(3), 0) };
@@ -530,15 +530,24 @@ int main(void) {
     {
         /* An 8 GiB model with a known KV shape (64 KiB/token — big enough
          * that ctx sizing is visible in the numbers). */
+        /* compute_bytes_* stands in for the MEASURED graph workspace the
+         * manifest carries since 2026-09-01. Round numbers, not real ones:
+         * the point is that the planner reads a measurement instead of
+         * evaluating a formula, and these fixtures have to exercise that path
+         * or the tests would still be green with the workspace charged at 0. */
         idletoken_llm_model_size small_m = {
             .total_bytes = g(8), .n_layers = 32, .kv_bytes_per_token = 65536,
+            .compute_bytes_256k_cuda = 256ull << 20, .compute_bytes_1m_cuda = 512ull << 20,
+            .compute_bytes_256k_metal = 256ull << 20, .compute_bytes_1m_metal = 512ull << 20,
         };
         idletoken_llm_model_size big_m = {
             .total_bytes = g(80), .n_layers = 43, .kv_bytes_per_token = 65536,
+            .compute_bytes_256k_cuda = g(2), .compute_bytes_1m_cuda = g(4),
+            .compute_bytes_256k_metal = g(2), .compute_bytes_1m_metal = g(4),
         };
         idletoken_llama_plan p;
 
-        /* Q1: fits one machine, several present → SINGLE (invariant #5). */
+        /* Q1: fits one machine, several present → SINGLE by default. */
         idletoken_node_mem trio[] = {
             NM(g(12), g(20), 0),   /* coordinator */
             NM(g(24), g(24), 0),
@@ -546,20 +555,19 @@ int main(void) {
         };
         ok(idletoken_plan_llamacpp(&small_m, trio, 3, 0, 32768, 0, &p) == 0 &&
                p.kind == IDLETOKEN_LLPLAN_SINGLE,
-           "fits-one + multi roster → SINGLE, never cluster");
+           "fits-one + multi roster → SINGLE by default");
         ok(p.single_node == 0 && p.layer0_node == 0,
            "SINGLE prefers the coordinator when the coordinator fits");
         ok(strstr(p.why, "SINGLE") != NULL, "single decision explains itself");
 
-        /* Q1b: escape hatch (acceptance vehicle) flips the same input to
-         * CLUSTER — without it every cross-machine gate loses its vehicle. */
+        /* Q1b: an explicit user choice flips the same input to CLUSTER. */
         ok(idletoken_plan_llamacpp(&small_m, trio, 3, 0, 32768, 1, &p) == 0 &&
                p.kind == IDLETOKEN_LLPLAN_CLUSTER,
-           "allow_small_cluster=1 forces CLUSTER on a fitting model");
+           "force_cluster=1 keeps CLUSTER on a fitting model");
         ok(p.order[0] == 0 && p.layer0_node == 0,
-           "escape-hatch cluster still pins layer 0 to the coordinator");
-        ok(strstr(p.why, "FITS") != NULL && strstr(p.why, "ALLOW_SMALL_CLUSTER") != NULL,
-           "forced cluster says the model fits and names the override");
+           "user-selected cluster still pins layer 0 to the coordinator");
+        ok(strstr(p.why, "FITS") != NULL && strstr(p.why, "user's multi-machine choice") != NULL,
+           "selected cluster says the model fits and names the user's choice");
         ok(strstr(p.why, "exceeds") == NULL,
            "forced cluster does not claim need exceeds usable (it does not)");
 
@@ -629,8 +637,79 @@ int main(void) {
                p.kind == IDLETOKEN_LLPLAN_REFUSE,
            "roster too small in total → REFUSE");
         ok(strstr(p.why, "GiB") != NULL && strstr(p.why, "short") != NULL &&
-               strstr(p.why, "Add machines") != NULL,
+               strstr(p.why, "[RESOURCE_INSUFFICIENT]") != NULL,
            "refusal names the numbers and suggests remedies");
+
+        /* ---- unmeasured workspace is a refusal, not a zero ---------------
+         * The whole point of 2026-09-01: the workspace is measured, and a
+         * model with no measurement has an UNKNOWN requirement. Charging 0
+         * would make the plan say "fits" and the engine OOM after a full load
+         * (measured 9764 MiB on one curated model at 256K). This must refuse
+         * on a machine that is otherwise enormous, or the check is really
+         * just testing that the machine is small. */
+        {
+            idletoken_llm_model_size unmeasured = {
+                .total_bytes = g(8), .n_layers = 32, .kv_bytes_per_token = 65536,
+                /* compute_bytes_* deliberately left at 0 */
+            };
+            idletoken_node_mem huge[] = { NM(g(400), g(400), 1) };
+            ok(idletoken_plan_llamacpp(&unmeasured, huge, 1, 0, 32768, 0, &p) == 0 &&
+                   p.kind == IDLETOKEN_LLPLAN_REFUSE,
+               "a model with no measured workspace refuses instead of charging 0");
+            ok(strstr(p.why, "measure") != NULL &&
+                   strstr(p.why, "[RESOURCE_INSUFFICIENT]") != NULL,
+               "...and the refusal says how to fix it");
+            /* Control: the SAME model on the SAME machine runs once measured,
+             * so the refusal above is about the missing measurement and not
+             * about anything else in the fixture. */
+            unmeasured.compute_bytes_256k_cuda  = 256ull << 20;
+            unmeasured.compute_bytes_256k_metal = 256ull << 20;
+            ok(idletoken_plan_llamacpp(&unmeasured, huge, 1, 0, 32768, 0, &p) == 0 &&
+                   p.kind == IDLETOKEN_LLPLAN_SINGLE,
+               "control: the same model plans normally once measured");
+
+            /* Measuring only ONE backend is still unmeasured for the other.
+             * Without this the per-backend split is decorative: a manifest
+             * could carry CUDA numbers alone and Metal machines would silently
+             * budget zero workspace. */
+            idletoken_llm_model_size cuda_only = unmeasured;
+            cuda_only.compute_bytes_256k_metal = 0;
+            idletoken_node_mem mac[] = { NM(g(400), g(400), 1) };
+            mac[0].backend = IDLETOKEN_NODE_BACKEND_METAL;
+            ok(idletoken_plan_llamacpp(&cuda_only, mac, 1, 0, 32768, 0, &p) == 0 &&
+                   p.kind == IDLETOKEN_LLPLAN_REFUSE,
+               "a Metal node refuses a model measured only on CUDA");
+            ok(idletoken_plan_llamacpp(&cuda_only, huge, 1, 0, 32768, 0, &p) == 0 &&
+                   p.kind == IDLETOKEN_LLPLAN_SINGLE,
+               "...while a CUDA node runs it, so the split is per-backend");
+        }
+
+        /* The backends carry DIFFERENT numbers and the planner must read the
+         * node's own. GLM-5.2 measured 1.50 GiB on CUDA against 33.3 GiB on
+         * Metal, which is 22x — reading the wrong one is not a rounding error,
+         * it is the difference between running and OOM. */
+        {
+            idletoken_llm_model_size skewed = {
+                .total_bytes = g(8), .n_layers = 32, .kv_bytes_per_token = 65536,
+                .compute_bytes_256k_cuda = g(1), .compute_bytes_1m_cuda = g(1),
+                .compute_bytes_256k_metal = g(20), .compute_bytes_1m_metal = g(20),
+            };
+            idletoken_node_mem cu[] = { NM(g(24), g(24), 1) };
+            idletoken_node_mem mt[] = { NM(g(24), g(24), 1) };
+            mt[0].backend = IDLETOKEN_NODE_BACKEND_METAL;
+            ok(idletoken_plan_llamacpp(&skewed, cu, 1, 0, 32768, 0, &p) == 0 &&
+                   p.kind == IDLETOKEN_LLPLAN_SINGLE,
+               "24 GiB fits the model at the CUDA workspace");
+            ok(idletoken_plan_llamacpp(&skewed, mt, 1, 0, 32768, 0, &p) == 0 &&
+                   p.kind == IDLETOKEN_LLPLAN_REFUSE,
+               "...and does not at the Metal one, on the same machine size");
+            /* An unreported backend charges the LARGER, never the cheaper. */
+            idletoken_node_mem un[] = { NM(g(24), g(24), 1) };
+            un[0].backend = IDLETOKEN_NODE_BACKEND_UNKNOWN;
+            ok(idletoken_plan_llamacpp(&skewed, un, 1, 0, 32768, 0, &p) == 0 &&
+                   p.kind == IDLETOKEN_LLPLAN_REFUSE,
+               "an unknown backend is charged the larger of the two");
+        }
 
         /* ---- hard vs soft need (2026-08-16 measurement) ------------------
          * Weights are mmap'd and evictable, so they are NOT a capacity bound;
@@ -640,7 +719,7 @@ int main(void) {
         {
             /* big_m: 80 GiB weights, 43 layers, 64 KiB/token KV.
              * hard @32K = 2 GiB KV + 2 x (768 MiB + 1.25 GiB) ~ 6 GiB. */
-            const uint64_t hard = idletoken_llama_hard_need(&big_m, 32768, 2);
+            const uint64_t hard = idletoken_llama_hard_need(&big_m, 32768, 2, IDLETOKEN_NODE_BACKEND_CUDA);
             ok(hard < g(8) && hard > g(4),
                "hard need excludes the weights (KV + per-node overhead only)");
             ok(idletoken_llama_working_set(&big_m) == big_m.total_bytes,
@@ -656,28 +735,23 @@ int main(void) {
                    p.kind == IDLETOKEN_LLPLAN_CLUSTER && p.working_set_fits == 1,
                "weights over one node but cached by the cluster → CLUSTER, full speed");
 
-            /* Between the two: enough to be resident, not enough to cache the
-             * working set, but inside the measured 2x — runs, labelled slow.
-             *
-             * UNIFIED nodes since 2026-08-20, and that is the whole point: the
-             * slow tier is the page-cache story (2026-08-16), and page cache is
-             * something only a node whose engine addresses the machine's one
-             * pool can have. The discrete twin of this fixture is asserted
-             * below — it does not get a slow tier, it gets a refusal. */
+            /* RAM/page-cache over-subscription is retired. Even unified hosts
+             * must fit the exact service in their reported GPU budget. */
             idletoken_node_mem mid2[] = { NM(g(24), g(24), 1), NM(g(24), g(24), 1) };
             ok(idletoken_plan_llamacpp(&big_m, mid2, 2, 0, 32768, 0, &p) == 0 &&
-                   p.kind == IDLETOKEN_LLPLAN_CLUSTER && p.working_set_fits == 0,
-               "within 2x over-subscription → runs, marked slow");
-            ok(strstr(p.why, "slow") != NULL && strstr(p.why, "stream") != NULL,
-               "the slow plan says so, and says why");
+                   p.kind == IDLETOKEN_LLPLAN_REFUSE,
+               "GPU memory shortfall refuses instead of over-subscribing");
+            ok(strstr(p.why, "[RESOURCE_INSUFFICIENT]") != NULL,
+               "over-subscription refusal is localized by stable code");
 
-            /* MoE: only the consulted experts are hot, so the same file size
-             * needs far less cache. 256 experts, 8 used → the working set must
-             * come out well under the file. */
+            /* MoE routing counts alone do not identify the exact GGUF bytes in
+             * always-hot tensors versus expert tensors. The planner must not
+             * invent a ratio: without byte buckets it conservatively charges
+             * the whole mapped file. */
             idletoken_llm_model_size moe = big_m;
             moe.n_expert = 256; moe.n_expert_used = 8;
-            ok(idletoken_llama_working_set(&moe) < big_m.total_bytes / 2,
-               "MoE working set is a fraction of the file, not the whole file");
+            ok(idletoken_llama_working_set(&moe) == big_m.total_bytes,
+               "MoE working set is not guessed from expert counts");
         }
 
         /* Unified pool counted once (Apple Silicon / Grace): 50 GiB vram aliasing
@@ -693,36 +767,99 @@ int main(void) {
                p.working_set_fits == 0,
            "unified 50/50 counts once → the 80 GiB model cannot be cached");
 
-        /* ---- ctx sizing (idletoken_llama_fit_ctx) ---------------------- */
-        /* Overhead is the calibrated 768 MiB + weights/64 (2026-08-15):
-         * for 8 GiB weights that is 896 MiB. */
-        /* Inside 12 GiB → ~3.1 GiB KV budget → well past the 32K ask. */
-        ok(idletoken_llama_fit_ctx(g(12), &small_m, 32768, 16384) == 32768,
+        /* ---- ctx sizing (idletoken_llama_fit_ctx) ----------------------
+         * Per-node overhead is now the measured CUDA context (878 MiB) plus
+         * the single 100 MiB margin = 978 MiB, and the graph workspace is a
+         * separate measured term rather than a slope on the weights
+         * (2026-09-01). For small_m: 8 GiB weights + 978 MiB + 256 MiB. */
+        /* Inside 12 GiB → ~2.8 GiB KV budget → well past the 32K ask. */
+        ok(idletoken_llama_fit_ctx(g(12), &small_m, 32768, 16384, IDLETOKEN_NODE_BACKEND_CUDA) == 32768,
            "roomy machine grants the full 32K ask");
-        /* 10 GiB usable → 10 − 8 − 0.875 = 1.125 GiB KV budget
-         * = 18432 tokens at 64 KiB/token (already 1024-aligned). */
-        ok(idletoken_llama_fit_ctx(g(10), &small_m, 32768, 16384) == 18432,
+        /* 11 GiB usable → 11 − 8 − 0.955 − 0.25 = 1.795 GiB KV budget
+         * = 28672 tokens at 64 KiB/token (already 1024-aligned). */
+        ok(idletoken_llama_fit_ctx(g(11), &small_m, 32768, 16384, IDLETOKEN_NODE_BACKEND_CUDA) == 28672,
            "tight machine grants a smaller (floor-respecting) context");
         /* 9.5 GiB usable → 0.5 GiB KV = 8192 tokens < 16K floor → 0 (refuse
          * loudly rather than silently under-serve Claude Code). */
         ok(idletoken_llama_fit_ctx((uint64_t)(9.5 * (double)GiB), &small_m,
-                                   32768, 16384) == 0,
+                                   32768, 16384, IDLETOKEN_NODE_BACKEND_CUDA) == 0,
            "below the ctx floor → 0 (caller must refuse, not shrink silently)");
         /* Weights alone exceed the machine → 0. */
-        ok(idletoken_llama_fit_ctx(g(6), &small_m, 32768, 16384) == 0,
+        ok(idletoken_llama_fit_ctx(g(6), &small_m, 32768, 16384, IDLETOKEN_NODE_BACKEND_CUDA) == 0,
            "weights don't fit → 0");
         /* Unknown KV shape grants the ask unchanged (never invents a cost). */
         idletoken_llm_model_size nokv = { .total_bytes = g(8), .n_layers = 32,
                                           .kv_bytes_per_token = 0 };
-        ok(idletoken_llama_fit_ctx(g(12), &nokv, 32768, 16384) == 32768,
+        ok(idletoken_llama_fit_ctx(g(12), &nokv, 32768, 16384, IDLETOKEN_NODE_BACKEND_CUDA) == 32768,
            "unknown KV shape passes the ask through");
 
-        /* usable-metric helper: unified counts once, discrete sums. */
+        /* ---- weight-quant bit parser (tiered KV rule, 2026-08-26) -------- */
+        ok(idletoken_quant_weight_bits("IQ1_S") == 1 &&
+               idletoken_quant_weight_bits("IQ2_XXS") == 2 &&
+               idletoken_quant_weight_bits("Q2_K_XL") == 2 &&
+               idletoken_quant_weight_bits("Q3_K_M") == 3 &&
+               idletoken_quant_weight_bits("IQ4_NL") == 4 &&
+               idletoken_quant_weight_bits("Q4_K_M") == 4 &&
+               idletoken_quant_weight_bits("Q5_K_M") == 5 &&
+               idletoken_quant_weight_bits("Q8_0") == 8 &&
+               idletoken_quant_weight_bits("BF16") == 16 &&
+               idletoken_quant_weight_bits("Qwen3.5-35B-A3B-MXFP4_MOE") == 4 &&
+               idletoken_quant_weight_bits("FP4") == 4,
+           "quant bit parser reads the leading bit count");
+        ok(idletoken_quant_weight_bits("") == 0 &&
+               idletoken_quant_weight_bits(NULL) == 0 &&
+               idletoken_quant_weight_bits("weird") == 0,
+           "quant bit parser: unknown/empty -> 0 (treated as high, never guessed low)");
+        ok(!strcmp(idletoken_llama_kv_type_for_weight(1), "q4_0") &&
+               !strcmp(idletoken_llama_kv_type_for_weight(2), "q4_0"),
+           "auto KV tier: 1-2 bit weights use uniform q4_0");
+        ok(!strcmp(idletoken_llama_kv_type_for_weight(3), "q8_0") &&
+               !strcmp(idletoken_llama_kv_type_for_weight(4), "q8_0"),
+           "auto KV tier: 3-4 bit weights use uniform q8_0");
+        ok(idletoken_llama_kv_type_for_weight(0) == NULL &&
+               idletoken_llama_kv_type_for_weight(5) == NULL &&
+               idletoken_llama_kv_type_for_weight(16) == NULL,
+           "auto KV tier: unknown and >=5 bit weights keep f16-first sizing");
+        /* Filename variant — the client's real launch shape passes only a
+         * GGUF path. "Qwen3"/"V4"/"Flash" must not read as quants. */
+        ok(idletoken_quant_bits_from_path("D:\\gguf\\Qwen3.8-27B-UD-IQ2_XXS.gguf") == 2 &&
+               idletoken_quant_bits_from_path("/w/Qwen3-8B-Q4_K_M.gguf") == 4 &&
+               idletoken_quant_bits_from_path("/w/DeepSeek-V4-Flash-UD-IQ1_S-00001-of-00003.gguf") == 1 &&
+               idletoken_quant_bits_from_path("/w/Qwen3.5-0.8B-Q8_0.gguf") == 8 &&
+               idletoken_quant_bits_from_path("/w/Qwen3.5-4B-BF16.gguf") == 16,
+           "filename quant parser reads the variant token");
+        ok(idletoken_quant_bits_from_path("/w/model.gguf") == 0 &&
+               idletoken_quant_bits_from_path(NULL) == 0 &&
+               idletoken_quant_bits_from_path("/w/Qwen3.8-2.4T-A95B.gguf") == 0,
+           "filename quant parser: no token -> 0, model-name digits don't fool it");
+
+        /* ---- exact GPU fit diagnostic + legacy display rounding ---------
+         * fit_ctx computes capacity but product startup never substitutes its
+         * answer for the user's exact 256K/1M selection. */
+        ok(idletoken_llama_fit_ctx(g(12), &small_m, 262144, 16384, IDLETOKEN_NODE_BACKEND_CUDA) == 45056,
+           "GPU fit diagnostic: leftover KV budget is computed, not tiered");
+        ok(idletoken_llama_fit_ctx((uint64_t)(9.5 * (double)GiB), &small_m,
+                                   262144, 16384, IDLETOKEN_NODE_BACKEND_CUDA) == 0,
+           "GPU fit diagnostic: pool below the floor -> 0");
+        /* Display tier: the portal's number — recognisable, never above the
+         * capability it rounds. */
+        ok(idletoken_llama_ctx_display_tier(1048576) == 1048576 &&
+               idletoken_llama_ctx_display_tier(262144) == 262144,
+           "display tier: exact tiers pass through");
+        ok(idletoken_llama_ctx_display_tier(137216) == 131072 &&
+               idletoken_llama_ctx_display_tier(261120) == 131072 &&
+               idletoken_llama_ctx_display_tier(2000000) == 1048576,
+           "display tier: capability rounds DOWN to a familiar number");
+        ok(idletoken_llama_ctx_display_tier(16384) == 16384 &&
+               idletoken_llama_ctx_display_tier(16000) == 0,
+           "display tier: 16384 is the floor; below it there is no tier");
+
+        /* Usable serving capacity is always the GPU budget. */
         idletoken_node_mem um = NM(g(10), g(12), 1);
         idletoken_node_mem dm = NM(g(10), g(12), 0);
-        ok(idletoken_llama_node_usable(&um) == g(12) &&
-               idletoken_llama_node_usable(&dm) == g(22),
-           "usable metric: unified=max(once), discrete=vram+ram");
+        ok(idletoken_llama_node_usable(&um) == g(10) &&
+               idletoken_llama_node_usable(&dm) == g(10),
+           "usable metric: all platforms use vram_usable only");
 
         /* ---- sequence slots (idletoken_llama_seq_slots, §4.5b) ----------
          *
@@ -730,11 +867,12 @@ int main(void) {
          * on purpose: the KV budget is the whole usable pool exactly when the
          * machine has one pool. The discrete cases below are where the two
          * pools differ, and where this file used to say nothing. */
-        /* small_m at 8K: kv_per_seq = 64 KiB x 8192 = 0.5 GiB. Overhead for
-         * 8 GiB of weights is 768 MiB + 128 MiB = 896 MiB. */
-        /* 12 GiB − 8 − 0.875 = 3.125 GiB → 6 slots, capped to 4. */
+        /* small_m at 8K: kv_per_seq = 64 KiB x 8192 = 0.5 GiB. Non-KV fixed
+         * cost is 8 GiB of weights + the measured 256 MiB workspace + the
+         * 978 MiB per-node overhead (878 CUDA context + 100 margin). */
+        /* 12 GiB − 9.21 = 2.79 GiB → 5 slots, capped to 4. */
         idletoken_node_mem u12 = NM(g(12), g(12), 1);
-        idletoken_node_mem u10 = NM(g(10), g(10), 1);
+        idletoken_node_mem u11 = NM(g(11), g(11), 1);
         idletoken_node_mem u6  = NM(g(6),  g(6),  1);
         idletoken_node_mem u64 = NM(g(64), g(64), 1);
         ok(idletoken_llama_seq_slots(&u12, &small_m, 8192, 1.0, 4) == 4,
@@ -744,8 +882,8 @@ int main(void) {
          * 8K and 1-wide at 32K. */
         ok(idletoken_llama_seq_slots(&u12, &small_m, 32768, 1.0, 4) == 1,
            "same machine, longer context → fewer slots");
-        /* 10 GiB − 8.875 = 1.125 GiB → 2 slots at 8K. */
-        ok(idletoken_llama_seq_slots(&u10, &small_m, 8192, 1.0, 4) == 2,
+        /* 11 GiB − 9.21 = 1.79 GiB → 3 slots at 8K, below the cap of 4. */
+        ok(idletoken_llama_seq_slots(&u11, &small_m, 8192, 1.0, 4) == 3,
            "tight machine: the arithmetic, not the cap, decides");
         /* Weights alone do not fit → still 1, never 0: one slot is what the
          * engine does anyway, and 0 would tell the platform "cannot serve". */
@@ -795,8 +933,8 @@ int main(void) {
         idletoken_llm_model_size q8 = { .total_bytes = g(5), .n_layers = 36,
                                         .kv_bytes_per_token = 144 * 1024 };
         idletoken_node_mem discrete16 = NM(g(16), g(64), 0);
-        ok(idletoken_llama_node_usable(&discrete16) == g(80),
-           "16+64 fixture: 80 GiB across the machine (what the old budget used)");
+        ok(idletoken_llama_node_usable(&discrete16) == g(16),
+           "16+64 fixture: serving capacity is the 16 GiB card only");
         ok(idletoken_llama_kv_pool(&discrete16) == g(16),
            "16+64 fixture: but only 16 GiB of it can hold KV");
         /* 16 − 5 − 0.83 = 10.17 GiB over 5.625 GiB/seq → 1. */
@@ -818,10 +956,8 @@ int main(void) {
         idletoken_node_mem spill = NM(g(8), g(64), 0);
         ok(idletoken_llama_seq_slots(&spill, &big8, 8192, 1.0, 4) == 1,
            "weights spill out of VRAM (slow tier) → 1 slot");
-        /* And the same node is NOT refused by the capacity model — slow is a
-         * speed verdict, not a feasibility one. This keeps the two apart. */
-        ok(idletoken_llama_node_usable(&spill) > g(16),
-           "the slow-tier node still has capacity for the model (slow ≠ refuse)");
+        ok(idletoken_llama_node_usable(&spill) == g(8),
+           "host RAM never rescues weights that do not fit the GPU");
 
         /* Mac bench regression floor: the 0.8B multi-slot measurement
          * (results/llamacpp-multislot-mac-20260818.md) ran 4-wide and must
@@ -852,6 +988,7 @@ int main(void) {
         ok(idletoken_llama_seq_slots(&as_before, &q8, 40960, 1.0, 4) == 4 &&
                idletoken_llama_seq_slots(&as_before, &q8, 40960, 0.75, 4) == 4,
            "control: budgeted against the whole machine, every case is 4");
+
     }
 
     /* ---- the CLUSTER split is charged to the same pool (T16) --------------
@@ -873,18 +1010,19 @@ int main(void) {
         idletoken_llm_model_size dsv4 = {
             .total_bytes = (uint64_t)(80.76 * (double)GiB),
             .n_layers = 43, .kv_bytes_per_token = 65536,
+            .compute_bytes_256k_cuda = g(1), .compute_bytes_1m_cuda = g(2),
+            .compute_bytes_256k_metal = g(1), .compute_bytes_1m_metal = g(2),
         };
         idletoken_node_mem cell[] = {
             NM(g(107.61), g(107.61), 1),                 /* unified memory    */
             NM(g(13.2),   g(37.3),   0),                 /* discrete GPU      */
         };
-        /* The layer bytes the split divides: weights + the KV it sizes. */
-        const double  slice = 80.76 + 2.0;               /* GiB, ctx 32768 */
-        /* allow_small_cluster = 1 throughout this block, because that is how
-         * the cell ran: 80.76 GiB fits the 107.61 GiB node on its own, so the
-         * matrix harness sets IDLETOKEN_ALLOW_SMALL_CLUSTER=1 to get a cluster
-         * at all (hard invariant #5 — fits → don't cluster). Without it these
-         * fixtures would all return SINGLE and assert nothing about splitting. */
+        /* The layer bytes the split divides: weights, the KV it sizes, and the
+         * measured graph workspace — all three ride the tensor split. */
+        const double  slice = 80.76 + 2.0 + 1.0;         /* GiB, ctx 32768 */
+        /* force_cluster = 1 throughout this block: the model fits the first
+         * node, but these fixtures exercise the explicitly selected cluster
+         * placement and would otherwise return the default SINGLE plan. */
 
         /* First, that the fixture really is the incident: the OLD rule's ratio
          * is a pure function of node_usable, so it can be computed here and
@@ -894,10 +1032,10 @@ int main(void) {
             (double)idletoken_llama_node_usable(&cell[1]) /
             (double)(idletoken_llama_node_usable(&cell[0]) +
                      idletoken_llama_node_usable(&cell[1]));
-        ok(old_share > 0.318 && old_share < 0.320,
-           "fixture replays the incident: the old rule hands the joiner 0.3193");
-        ok(old_share * slice > 25.0 && old_share * slice > 13.2,
-           "...which is 25.8 GiB onto a 13.2 GiB card (the crash)");
+        ok(old_share > 0.109 && old_share < 0.110,
+           "GPU-only ratio gives the joiner only its VRAM share");
+        ok(old_share * slice < 13.2,
+           "the proportional seed fits the 13.2 GiB card before cap repair");
 
         ok(idletoken_plan_llamacpp(&dsv4, cell, 2, 0, 32768, 1, &p) == 0 &&
                p.kind == IDLETOKEN_LLPLAN_CLUSTER && p.order[1] == 1,
@@ -930,41 +1068,54 @@ int main(void) {
                p.tensor_split[1] > 0.318 && p.tensor_split[1] < 0.320,
            "control: two unified nodes still split by usable (0.3193)");
 
-        /* Control 2 — the SINGLE path is not touched. One discrete machine
-         * whose card cannot hold the model but whose machine can is HYBRID's
-         * whole reason to exist: llama-server offloads what fits and keeps the
-         * rest in host RAM, so vram+ram remains the right budget there. If
-         * this ever flips to REFUSE, the cluster fix has leaked. */
+        /* Single-machine startup also requires the complete exact service in
+         * GPU memory. */
         idletoken_llm_model_size m8 = { .total_bytes = g(8), .n_layers = 32,
                                         .kv_bytes_per_token = 65536 };
-        idletoken_node_mem hybrid1[] = { NM(g(4), g(32), 0) };
-        ok(idletoken_plan_llamacpp(&m8, hybrid1, 1, 0, 8192, 0, &p) == 0 &&
-               p.kind == IDLETOKEN_LLPLAN_SINGLE,
-           "control: single-node HYBRID still budgets VRAM+RAM (4 GiB card, 8 GiB model)");
+        idletoken_node_mem ram_spill[] = { NM(g(4), g(32), 0) };
+        ok(idletoken_plan_llamacpp(&m8, ram_spill, 1, 0, 8192, 0, &p) == 0 &&
+               p.kind == IDLETOKEN_LLPLAN_REFUSE,
+           "single-node RAM spill is refused");
 
-        /* Refusal quality: a cluster whose cards cannot hold the model between
-         * them is refused, and the refusal names the machine and which memory
-         * it ran out of. The aggregate vram+ram of this pair is 205 GiB, which
-         * is why the checks above it wave it through. */
+        /* Large host RAM cannot make two thin cards a valid cluster. */
         idletoken_node_mem thin[] = { NM(g(8),  g(96), 0),
                                       NM(g(8),  g(96), 0) };
         ok(idletoken_plan_llamacpp(&dsv4, thin, 2, 0, 32768, 1, &p) == 0 &&
                p.kind == IDLETOKEN_LLPLAN_REFUSE,
-           "two thin cards behind big host RAM → REFUSE (they cannot hold it)");
-        ok(strstr(p.why, "video memory") != NULL &&
-               strstr(p.why, "system RAM") != NULL &&
-               strstr(p.why, "short") != NULL,
-           "...and the refusal names the node, the memory kind and the shortfall");
+           "two thin cards behind big host RAM → REFUSE");
+        ok(strstr(p.why, "[RESOURCE_INSUFFICIENT]") != NULL,
+           "cluster refusal carries the GPU-capacity error code");
 
-        /* The coordinator's own card is subject to the same rule, and there
-         * the refusal is the privacy invariant's: layer 0 may not move, so a
-         * coordinator that cannot hold one layer is the end of the road. */
+        /* Cache placement uses the engine's discrete layer rounding, not a
+         * two-machine shortcut. Four unequal GPU devices model a
+         * heterogeneous local CUDA + three remote-GPU topology. */
+        {
+            const double split4[] = { 0.10, 0.20, 0.30, 0.40 };
+            unsigned lo[4] = {0}, hi[4] = {0};
+            int mapped = 1;
+            for (int d = 0; d < 4; d++)
+                mapped &= idletoken_llama_device_layer_range(
+                    43, 99, split4, 4, d, d + 1, &lo[d], &hi[d]) == 0;
+            ok(mapped && lo[0] == 0 && hi[0] == 5 &&
+                   lo[1] == 5 && hi[1] == 14 &&
+                   lo[2] == 14 && hi[2] == 27 &&
+                   lo[3] == 27 && hi[3] == 43,
+               "four unequal heterogeneous devices partition all 43 layers exactly");
+            unsigned machine_lo = 0, machine_hi = 0;
+            ok(idletoken_llama_device_layer_range(
+                   43, 99, split4, 4, 1, 3,
+                   &machine_lo, &machine_hi) == 0 &&
+                   machine_lo == 5 && machine_hi == 27,
+               "adjacent GPU device ranges combine into one contiguous shard");
+        }
+
+        /* A coordinator card too small for layer 0 is a hard refusal; CPU is
+         * not a serving device. */
         idletoken_node_mem tinycoord[] = { NM(g(1), g(96), 0),
                                            NM(g(96), g(96), 1) };
         ok(idletoken_plan_llamacpp(&dsv4, tinycoord, 2, 0, 32768, 1, &p) == 0 &&
-               p.kind == IDLETOKEN_LLPLAN_REFUSE &&
-               strstr(p.why, "layer 0") != NULL,
-           "coordinator's card too small for one layer → REFUSE, naming layer 0");
+               p.kind == IDLETOKEN_LLPLAN_REFUSE,
+           "coordinator card too small for one layer → REFUSE");
     }
 
     /* ---- where the budget's byte count comes from (T8) ------------------
@@ -982,6 +1133,45 @@ int main(void) {
         const idletoken_model_spec *q27 = idletoken_model_get("qwen3.5-27b");
         ok(q27 != NULL && q27->n_variants > 1, "27B spec has a variant menu");
 
+        const idletoken_model_spec *q38 = idletoken_model_get("qwen3.8-27b");
+        const idletoken_model_spec *q3 = idletoken_model_get("qwen3-8b");
+        const idletoken_model_spec *flash_cap =
+            idletoken_model_get("deepseek-v4-flash");
+        ok(IDLETOKEN_PRODUCT_CONTEXT_CAP == 1048576u &&
+               idletoken_llama_product_ctx_ceiling(q38) == 1048576u &&
+               idletoken_llama_product_ctx_ceiling(flash_cap) == 1048576u,
+           "explicit long-context services share the 1M product ceiling");
+        ok(idletoken_llama_product_ctx_ceiling(q3) == 163840u &&
+               idletoken_llama_product_ctx_ceiling(NULL) == 0,
+           "models below 256K retain their smaller declared ability");
+
+        /* DeepSeek4 is deliberately nonlinear in ctx because both compressed
+         * caches round to 256 cells. Pin the exact engine-shaped formula; a
+         * bytes/token approximation cannot pass this at small boundaries. */
+        {
+            const idletoken_model_spec *flash =
+                idletoken_model_get("deepseek-v4-flash");
+            idletoken_llm_model_size ds = {0};
+            ok(flash && idletoken_model_size_resolve(
+                   flash, NULL, NULL, &ds, NULL, 0) == 0 &&
+                   ds.dsv4_raw_bytes_per_cell == 44032 &&
+                   ds.dsv4_csa_bytes_per_cell == 26880 &&
+                   ds.dsv4_hca_bytes_per_cell == 20480 &&
+                   ds.kv_fixed_bytes_per_seq == 12206080,
+               "DeepSeek4 cache geometry is copied from measured manifest fields");
+            const uint64_t exact = 12206080ull +
+                44032ull * 32768ull +
+                26880ull * 8192ull +
+                20480ull * 256ull;
+            ok(idletoken_llama_kv_bytes(&ds, 32768) == exact,
+               "DeepSeek4 32K KV includes raw + padded CSA/HCA + fixed state exactly");
+            idletoken_llm_model_size q4 = ds;
+            idletoken_llama_model_kv_scale(&q4, 18.0 / 64.0);
+            ok(q4.kv_fixed_bytes_per_seq == ds.kv_fixed_bytes_per_seq &&
+                   q4.dsv4_raw_bytes_per_cell == 12384,
+               "KV quantization scales growth caches but never f32 compressor state");
+        }
+
         /* The machine, as measured: RTX 5060 Ti, 13.17 GiB of usable VRAM next
          * to 64 GiB of system RAM, serving at 4096 tokens per slot. */
         idletoken_node_mem discrete13 = NM((uint64_t)(13.17 * (double)GiB), g(64), 0);
@@ -994,17 +1184,16 @@ int main(void) {
            "no quant, no path → the manifest's default variant");
         ok(strstr(rwhy, "DEFAULT") != NULL && strstr(rwhy, "WARNING") != NULL,
            "...and it warns that a different quant makes this budget wrong");
-        ok(ms.n_layers == q27->n_layers && ms.kv_bytes_per_token ==
-               (uint64_t)q27->kv_bytes_per_token_layer * q27->n_layers,
-           "shape (layers, KV/token) comes from the manifest in every case");
-        /* THE BUG, kept as a live control: this is the number the pre-fix code
-         * fed the planner on the T3 run, and it really does derive 2 slots. If
-         * a future change makes the default source produce 1 anyway, the
-         * assertions below would pass for the wrong reason. */
+        ok(ms.n_layers == q27->n_layers && ms.kv_bytes_per_token == 65536 &&
+               ms.kv_fixed_bytes_per_seq == 156893184,
+           "hybrid shape charges 16 full-attention KV layers plus 48 fixed-state layers");
+        /* With the correct hybrid geometry the small default quant has ample
+         * KV room; the exact cap is the control that proves the later Q4 row
+         * falls to one because of its REAL weight bytes, not stale KV inflation. */
         const int slots_from_default =
             idletoken_llama_seq_slots(&discrete13, &ms, 4096, 1.0, 4);
-        ok(slots_from_default == 2,
-           "control: the pre-fix source (default quant) really does say 2 slots");
+        ok(slots_from_default == 4,
+           "control: corrected 27B hybrid KV geometry reaches the four-slot test cap");
 
         /* --- source 2: the named precision. */
         ok(idletoken_model_size_resolve(q27, "Q4_K_M", NULL, &ms, rwhy, sizeof rwhy) == 0 &&
@@ -1062,8 +1251,8 @@ int main(void) {
                 ok(strstr(rwhy, "GGUF on disk") != NULL && strstr(rwhy, "Q4_K_M") != NULL,
                    "...and it names the file and the quant it recognised");
                 ok(idletoken_llama_seq_slots(&discrete13, &ms, 4096, 1.0, 4) == 1 &&
-                       slots_from_default == 2,
-                   "T3 replay: 27B Q4_K_M on the 16 GiB card → 1 slot (was 2)");
+                       slots_from_default == 4,
+                   "T3 replay: real Q4_K_M stays at 1 slot while corrected default reaches 4");
 
                 /* An explicit --quant that contradicts the file: the file wins,
                  * loudly. Believing the flag is how the budget got here. */

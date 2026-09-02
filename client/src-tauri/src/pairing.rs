@@ -24,8 +24,9 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::path::Path;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -79,14 +80,9 @@ pub struct Tuning {
     /// model's default variant / single-precision models. Broadcast with the
     /// model_id so joiners host the same precision.
     quant: String,
-    /// Context window (settings.tier → ctx) → coord `--ctx-size`. Feeds the
-    /// engine's mode decision + per-node overhead in the layer split.
+    /// Exact product context window (256K or explicit 1M) passed to coord
+    /// `--ctx-size` for the runtime VRAM admission check.
     ctx_size: u32,
-    /// Tier 0 ("model default"): ctx_size is a CEILING → coord `--ctx-fit`
-    /// sizes the window down to memory instead of refusing to start. Explicit
-    /// tiers keep the refuse-loudly contract and do not set this.
-    #[serde(default)]
-    ctx_fit: bool,
     /// KV cache dtypes (settings "KV cache precision") → the coordinator's
     /// IDLETOKEN_KV_CACHE_TYPE / _V environment variables. Empty = engine
     /// default (f16). Env, not argv, to match the coordinator's existing knob;
@@ -102,7 +98,7 @@ pub struct Tuning {
     #[serde(default = "default_max_decode")]
     max_decode: u32,
     /// How much of THIS machine IdleToken may use (settings "This machine's
-    /// usage") → worker `--max-vram-mb` / `--max-ram-mb`, MiB, 0 = no cap.
+    /// usage") → worker `--max-vram-mb`, MiB, 0 = no cap.
     ///
     /// Per-machine, so it is never adopted from the roster the way model_id and
     /// quant are: the creator's "conservative" says nothing about how much of
@@ -111,8 +107,6 @@ pub struct Tuning {
     /// changed the dashboard's numbers and nothing else.
     #[serde(default)]
     max_vram_mb: u64,
-    #[serde(default)]
-    max_ram_mb: u64,
     // ---- pairing behaviour (settings "Pairing & discovery") ------------------
     // Wired on 2026-08-13. Before that these six were rendered as live controls
     // and read by nobody; settings.ts resets stored values once (schema v3)
@@ -154,6 +148,40 @@ pub struct Tuning {
     overflow_daily_cap_milli: u64,
 }
 
+/// The only launch settings that may change after a roster has formed.
+///
+/// Model, network and capacity fields are frozen when pairing starts because
+/// peers have already agreed on them. Overflow is different: the creator is
+/// offered its switch beside Start, so the coordinator must refresh these
+/// fields immediately before materializing the engine. Keeping this as a
+/// narrow type prevents a late UI action from silently changing the roster's
+/// model, ports or resource contract.
+#[derive(Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct OverflowTuning {
+    enabled: bool,
+    overflow_url: String,
+    overflow_key: String,
+    overflow_wait_s: u32,
+    overflow_daily_cap_milli: u64,
+}
+
+fn apply_overflow_tuning(tuning: &mut Tuning, latest: OverflowTuning) {
+    if latest.enabled {
+        tuning.overflow_url = latest.overflow_url;
+        tuning.overflow_key = latest.overflow_key;
+        tuning.overflow_wait_s = latest.overflow_wait_s;
+        tuning.overflow_daily_cap_milli = latest.overflow_daily_cap_milli;
+    } else {
+        // The boolean is authoritative. Never let a stale key or URL turn an
+        // off switch into a partially configured forwarding path.
+        tuning.overflow_url.clear();
+        tuning.overflow_key.clear();
+        tuning.overflow_wait_s = 0;
+        tuning.overflow_daily_cap_milli = 0;
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -182,13 +210,11 @@ impl Default for Tuning {
             discovery_port: DISCOVERY_PORT,
             model_id: "deepseek-v4-flash".into(),
             quant: String::new(),
-            ctx_size: 8192,
-            ctx_fit: false,
+            ctx_size: 262144,
             kv_cache_k: String::new(),
             kv_cache_v: String::new(),
             max_decode: default_max_decode(),
             max_vram_mb: 0,
-            max_ram_mb: 0,
             lan_discovery: true,
             manual_peers: String::new(),
             heartbeat_sec: default_heartbeat(),
@@ -261,23 +287,413 @@ fn token_eq(a: &str, b: &str) -> bool {
 /// never used as a prefix. Using it avoids adding a crate to a bundle whose
 /// size is a hard constraint. The `v1` tag is there so a future change of
 /// scheme cannot be replayed as this one.
+/// Iterations folded into the proof (see `pair_proof`).
+///
+/// The number is chosen from the ATTACKER's side of the trade, not ours. One
+/// `hello` answer is a verifiable sample of the code, and the code is ~30 bits,
+/// so a single plain SHA-256 lets the whole space be walked in seconds on a
+/// GPU. Stretching multiplies that by the iteration count: at 600k a full sweep
+/// costs ~2^49 compressions instead of ~2^30. It is not "safe" — 30 bits never
+/// is against an offline attack — but it moves the cost from "seconds" to
+/// "days per cluster", which is the difference between a drive-by and a
+/// deliberate campaign.
+///
+/// The price we pay is one ~70 ms computation per handshake, once per join
+/// (measured, release build, Mac control machine 2026-08-30: 70 ms median of 3;
+/// the same loop in a debug build is ~3.6 s, which is why the unit test states
+/// its ceiling per profile). The price an attacker pays is the same 70 ms per
+/// GUESS. That asymmetry is the
+/// entire mechanism, and it is also why the roster port has a request-rate gate
+/// (`GATE_REQ_MAX`): without one, this constant would be a CPU-exhaustion lever
+/// pointed at the creator.
+const PAIR_PROOF_ROUNDS: u32 = 600_000;
+
+/// Proof that the sender knows the join code, bound to one nonce and one
+/// direction ("creator" or "joiner").
+///
+/// v2 (2026-08-30) — why the iteration exists. The v1 proof was a single
+/// SHA-256 over a fixed format, and the creator answers `hello` from ANY
+/// unauthenticated caller on the LAN. One request therefore yielded
+/// `H("idletoken-pair-v1|creator|" + code + "|" + attacker_chosen_nonce)`: a
+/// perfect offline oracle for a 30-bit secret. The online-guessing throttle
+/// cannot touch that, because after the first reply the attacker never talks to
+/// us again. This was strictly worse than the beacon hash that was removed in
+/// A-P0-3 — the leak had moved rather than closed.
+///
+/// The domain tag changes with the scheme so a v1 transcript can never be
+/// replayed as a v2 one, and the version travels in the handshake so a peer
+/// that cannot do v2 is told to update instead of silently falling back to the
+/// breakable proof.
 fn pair_proof(role: &str, code: &str, nonce: &str) -> String {
     use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(b"idletoken-pair-v1|");
-    h.update(role.as_bytes());
-    h.update(b"|");
-    h.update(code.as_bytes());
-    h.update(b"|");
-    h.update(nonce.as_bytes());
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    let mut acc = {
+        let mut h = Sha256::new();
+        h.update(b"idletoken-pair-v2|");
+        h.update(role.as_bytes());
+        h.update(b"|");
+        h.update(code.as_bytes());
+        h.update(b"|");
+        h.update(nonce.as_bytes());
+        h.finalize()
+    };
+    // Chained, so the work cannot be parallelised within one guess; the
+    // counter keeps a fixed point from collapsing the chain into a short cycle.
+    for i in 0..PAIR_PROOF_ROUNDS {
+        let mut h = Sha256::new();
+        h.update(acc);
+        h.update(i.to_le_bytes());
+        acc = h.finalize();
+    }
+    acc.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Handshake version this build speaks. Sent in `hello` and echoed in the
+/// reply; a missing value on either side means the peer predates the stretched
+/// proof and is refused with an explicit "update that machine" rather than
+/// being handed the v1 oracle.
+const PAIR_PROTO_V: u64 = 2;
+
+/// This machine's stable device identity (CLUS-06, CLUS-20).
+///
+/// The roster used to key members by hostname, which is neither unique nor
+/// secret: anyone holding the join code could register as "DESKTOP-PC" and take
+/// over the real DESKTOP-PC's row — its address, its token, its resource
+/// numbers. Hostname is a LABEL; this is the IDENTITY.
+///
+/// Persisted, because a device id that changed on restart would defeat its own
+/// purpose: every reboot would look like a new machine and the roster would
+/// fill with ghosts of the same computer (which is the CLUS-20 pollution this
+/// is also meant to prevent). Not a secret and not a credential — it only has
+/// to be stable and collision-free, so a read by another local program buys
+/// nothing that the member token does not already gate.
+fn device_id() -> String {
+    let dir = dirs_home().join(".idletoken");
+    let path = dir.join("device-id");
+    if let Ok(s) = std::fs::read_to_string(&path) {
+        let s = s.trim().to_string();
+        if s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+            return s;
+        }
+    }
+    let fresh = random_hex(16);
+    let _ = std::fs::create_dir_all(&dir);
+    if std::fs::write(&path, &fresh).is_err() {
+        // Non-fatal and deliberately loud: an unwritable config dir means the
+        // id is fresh every launch, so rejoins look like new machines. That is
+        // a degraded roster, not an unsafe one — impersonation still fails,
+        // because the incumbent's id will not match either.
+        eprintln!(
+            "[pairing] could not persist the device id at {} — this machine will \
+             look like a new one to the cluster after every restart",
+            path.display()
+        );
+    }
+    fresh
+}
+
+/// A short, non-secret label for the creator to compare across role requests.
+///
+/// The raw device id stays creator-side bookkeeping.  Only this digest prefix
+/// enters the creator's own webview snapshot; it is never included in
+/// `roster_reply`, so ordinary members do not receive a stable identifier for
+/// every other machine (HOST-15).  This is continuity evidence inside one
+/// roster, not remote attestation: a modified client can choose its own device
+/// id and this label says nothing about its binary or hardware.
+fn device_identity_label(device: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    if device.is_empty() {
+        return None;
+    }
+    let digest = Sha256::digest(device.as_bytes());
+    let groups = digest[..16]
+        .chunks(4)
+        .map(|chunk| chunk.iter().map(|b| format!("{b:02x}")).collect::<String>())
+        .collect::<Vec<_>>();
+    Some(groups.join("-"))
+}
+
+fn dirs_home() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+/// Accept a peer-chosen string only if it is short, printable ASCII and free of
+/// the bytes that break the JSON and log lines it gets spliced into (CLUS-14).
+///
+/// The Rust mirror of `idletoken_peer_label_ok` in the engine. Same reasoning,
+/// same alphabet: this side stores these values in the roster and echoes them
+/// to every other member, so a name that can close a JSON string here rewrites
+/// the document every member's UI parses.
+fn peer_field_ok(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_PEER_FIELD
+        && s.bytes()
+            .all(|b| (0x20..0x7f).contains(&b) && b != b'"' && b != b'\\')
+}
+
+/// The same gate, applied to an optional field: absent is fine (older client),
+/// present-but-hostile is not.
+fn peer_field_opt_ok(v: Option<&str>) -> bool {
+    v.map_or(true, peer_field_ok)
 }
 
 /// How long a nonce the creator handed out stays usable, and how many are kept.
 /// Both are small on purpose: the window only has to cover one round trip on a
 /// LAN, and an unbounded list is a memory leak anyone on the network can drive.
 const CHALLENGE_TTL: Duration = Duration::from_secs(60);
-const MAX_CHALLENGES: usize = 64;
+const MAX_CHALLENGES: usize = 128;
+
+/// How many outstanding nonces ONE source may hold (CLUS-05).
+///
+/// The global cap alone is not a fair-share rule: with a single list and
+/// oldest-out eviction, a machine spraying `hello` pushes every honest joiner's
+/// nonce out before it can be used, and the join that follows fails with "bad
+/// code" for a reason that has nothing to do with the code. A per-source quota
+/// means a sprayer can only ever evict *its own* nonces.
+const MAX_CHALLENGES_PER_SOURCE: usize = 4;
+
+/// Hard ceiling on one roster request (CLUS-05, CLUS-14).
+///
+/// `BufRead::read_line` grows a String until it meets a newline. Nothing on
+/// this socket is authenticated before it is parsed, so without a ceiling any
+/// device on the LAN can open TCP 14098 and stream bytes that never contain
+/// `\n` until the client is out of memory — no join code required. A roster
+/// request is a small flat JSON object; 8 KiB is far more than the largest one
+/// this protocol can legitimately produce.
+const MAX_ROSTER_REQUEST_BYTES: u64 = 8 * 1024;
+
+/// Longest peer-chosen string this side will store or echo (CLUS-14).
+/// Mirrors the engine's 64-byte identity fields so the two faces of the same
+/// cluster agree on what a name may be.
+const MAX_PEER_FIELD: usize = 64;
+
+// ---- LAN admission budgets (CLUS-02, CLUS-05) -----------------------------
+//
+// The engine's join port already prices guessing per source and cluster-wide
+// (discovery.c). The CLIENT's roster port had none of that: `hello`/`join` were
+// answered as fast as a machine could ask. The numbers below are deliberately
+// the same as the engine's, because they are the same promise to the same user
+// about the same 30-bit code, and two faces of one cluster disagreeing about
+// how many typos are free is a bug report waiting to happen.
+const GATE_FREE_TRIES: u32 = 5;
+const GATE_BASE: Duration = Duration::from_secs(1);
+const GATE_MAX: Duration = Duration::from_secs(30);
+const GATE_FORGET: Duration = Duration::from_secs(600);
+const GATE_GLOBAL_WINDOW: Duration = Duration::from_secs(60);
+const GATE_GLOBAL_MAX_FAILS: u32 = 120;
+const GATE_GLOBAL_BLOCK: Duration = Duration::from_secs(5);
+/// Request-rate ceiling per source, independent of whether requests succeed.
+/// Failure backoff prices *wrong* answers; this prices *volume*, which is what
+/// a `hello` flood is — every one of those is a correct, answerable request.
+const GATE_REQ_WINDOW: Duration = Duration::from_secs(10);
+const GATE_REQ_MAX: u32 = 40;
+const GATE_REQ_BLOCK: Duration = Duration::from_secs(5);
+/// Bounded source table. Sized like the engine's for the same reason: an
+/// attacker with more addresses than slots must not be able to evict penalties
+/// simply by rotating through them.
+const GATE_SOURCES: usize = 256;
+
+/// One source address's admission record.
+struct SourceRecord {
+    ip: String,
+    fails: u32,
+    last: Instant,
+    blocked_until: Option<Instant>,
+    req_window: Instant,
+    reqs: u32,
+}
+
+/// Per-source and cluster-wide admission state for the roster port.
+///
+/// Every method takes `now` rather than reading the clock itself: the backoff
+/// curve IS the security property, and a property that can only be tested by
+/// sleeping is a property that ends up untested.
+#[derive(Default)]
+struct LanGate {
+    sources: Vec<SourceRecord>,
+    global_window: Option<Instant>,
+    global_fails: u32,
+    global_blocked_until: Option<Instant>,
+}
+
+/// How long a source waits after `fails` consecutive failures. Free allowance
+/// first (typos cost nothing), then doubling to a ceiling — never a permanent
+/// lockout, which would turn a mistyped code into a support call.
+fn gate_backoff(fails: u32) -> Option<Duration> {
+    if fails <= GATE_FREE_TRIES {
+        return None;
+    }
+    let steps = fails - GATE_FREE_TRIES - 1;
+    let mut ms = GATE_BASE;
+    for _ in 0..steps.min(16) {
+        if ms >= GATE_MAX {
+            break;
+        }
+        ms *= 2;
+    }
+    Some(ms.min(GATE_MAX))
+}
+
+impl LanGate {
+    /// Find or claim this source's slot. Eviction prefers a free slot, then the
+    /// least recently seen slot that is NOT currently serving a penalty. Plain
+    /// LRU would let an attacker's next address erase the penalty the previous
+    /// one had just earned — the table would be busiest exactly when it stopped
+    /// working.
+    fn slot(&mut self, ip: &str, now: Instant) -> &mut SourceRecord {
+        if let Some(i) = self.sources.iter().position(|s| s.ip == ip) {
+            if now.duration_since(self.sources[i].last) > GATE_FORGET {
+                self.sources[i].fails = 0;
+                self.sources[i].blocked_until = None;
+            }
+            return &mut self.sources[i];
+        }
+        if self.sources.len() < GATE_SOURCES {
+            self.sources.push(SourceRecord {
+                ip: ip.to_string(),
+                fails: 0,
+                last: now,
+                blocked_until: None,
+                req_window: now,
+                reqs: 0,
+            });
+            let i = self.sources.len() - 1;
+            return &mut self.sources[i];
+        }
+        let victim = self
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.blocked_until.map_or(true, |b| b <= now))
+            .min_by_key(|(_, s)| s.last)
+            .map(|(i, _)| i)
+            .or_else(|| {
+                self.sources
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, s)| s.last)
+                    .map(|(i, _)| i)
+            })
+            .unwrap_or(0);
+        self.sources[victim] = SourceRecord {
+            ip: ip.to_string(),
+            fails: 0,
+            last: now,
+            blocked_until: None,
+            req_window: now,
+            reqs: 0,
+        };
+        &mut self.sources[victim]
+    }
+
+    /// May this source be served right now? `Err` carries how long it must
+    /// wait. Touching `last` on every check (not only on failures) is what
+    /// stops a source from aging out its own penalty by hammering.
+    fn admit(&mut self, ip: &str, now: Instant) -> Result<(), Duration> {
+        if let Some(until) = self.global_blocked_until {
+            if until > now {
+                return Err(until - now);
+            }
+        }
+        if self
+            .global_window
+            .map_or(true, |w| now.duration_since(w) > GATE_GLOBAL_WINDOW)
+        {
+            self.global_window = Some(now);
+            self.global_fails = 0;
+        }
+        let s = self.slot(ip, now);
+        s.last = now;
+        if let Some(until) = s.blocked_until {
+            if until > now {
+                return Err(until - now);
+            }
+            // The block has expired, so the count that tripped it has to go
+            // with it. Without this the counter is still above the ceiling when
+            // the source comes back, the next request re-blocks it, and it is
+            // told "5 s" again — forever, as long as it keeps asking on time.
+            // A rate cap that a well-behaved client can never come back from is
+            // a ban, and an honest member polling its own roster is exactly the
+            // client that would hit it.
+            //
+            // `fails` is deliberately NOT cleared here. `blocked_until` carries
+            // both the request-rate block and the online-guessing backoff, and
+            // only the rate half is a fresh-start-after-serving-it rule. The
+            // guessing curve is a property of how many wrong codes this source
+            // has offered, so it keeps counting across expiries and the next
+            // gate_backoff() still returns the escalated wait.
+            s.blocked_until = None;
+            s.req_window = now;
+            s.reqs = 0;
+        }
+        if now.duration_since(s.req_window) > GATE_REQ_WINDOW {
+            s.req_window = now;
+            s.reqs = 0;
+        }
+        s.reqs += 1;
+        if s.reqs > GATE_REQ_MAX {
+            s.blocked_until = Some(now + GATE_REQ_BLOCK);
+            let ip = s.ip.clone();
+            eprintln!(
+                "[pairing] {ip} is sending roster requests faster than any real \
+                 client does — refusing it for {}s",
+                GATE_REQ_BLOCK.as_secs()
+            );
+            return Err(GATE_REQ_BLOCK);
+        }
+        Ok(())
+    }
+
+    /// A failed proof. Counts against this source AND against the cluster-wide
+    /// meter, which is what prices the same attacker spread over many addresses
+    /// (each of those otherwise buys its own free allowance).
+    fn note_failure(&mut self, ip: &str, now: Instant) {
+        self.global_fails += 1;
+        if self.global_fails >= GATE_GLOBAL_MAX_FAILS {
+            self.global_blocked_until = Some(now + GATE_GLOBAL_BLOCK);
+            eprintln!(
+                "[pairing] {} failed joins cluster-wide inside {}s — that is a machine \
+                 walking the join-code space, not typing mistakes. Refusing new joins \
+                 for {}s at a time. If you did not expect this, form the cluster again \
+                 with a fresh code.",
+                self.global_fails,
+                GATE_GLOBAL_WINDOW.as_secs(),
+                GATE_GLOBAL_BLOCK.as_secs()
+            );
+        }
+        let s = self.slot(ip, now);
+        s.last = now;
+        s.fails = s.fails.saturating_add(1);
+        if let Some(back) = gate_backoff(s.fails) {
+            s.blocked_until = Some(now + back);
+            let (ip, fails) = (s.ip.clone(), s.fails);
+            eprintln!(
+                "[pairing] refused join #{fails} from {ip}; ignoring it for {}s \
+                 (online-guessing throttle)",
+                back.as_secs()
+            );
+        }
+    }
+
+    /// A proof that checked out. Clears this source's record only — a success
+    /// says nothing about the hundred failures that came from elsewhere, so the
+    /// cluster-wide meter deliberately survives it.
+    fn note_success(&mut self, ip: &str, now: Instant) {
+        let s = self.slot(ip, now);
+        s.last = now;
+        s.fails = 0;
+        s.blocked_until = None;
+    }
+}
+
+/// A nonce this creator handed out, and who asked for it.
+struct Challenge {
+    nonce: String,
+    at: Instant,
+    src: String,
+}
 
 /// Windows only: allow the pairing traffic *inbound* before we start listening.
 ///
@@ -387,8 +803,25 @@ pub struct Peer {
     /// snapshot the webview sees.
     #[serde(skip)]
     token: String,
-    /// What this member brings to the pool: free VRAM and free RAM in bytes,
-    /// as ITS OWN probe measured them (2026-08-15). Every machine already
+    /// Stable per-install identity behind `id` (CLUS-06). `id`/`hostname` are a
+    /// LABEL the user chose and two machines can share; this is what actually
+    /// decides "is the machine sending this the same one that joined". Empty
+    /// for a member running a client from before device ids existed, which is
+    /// its own identity value — see `join_identity_ok`.
+    ///
+    /// Never serialized: it is roster bookkeeping, and broadcasting a stable
+    /// per-machine identifier to every member is exactly the profiling material
+    /// HOST-15 says to keep to a minimum.
+    #[serde(skip)]
+    device_id: String,
+    /// This member asked to be the coordinator (its own "Prefer this machine as
+    /// coordinator" setting). A REQUEST, never an instruction (CLUS-08): the
+    /// coordinator is the cluster's plaintext window, so moving it is the
+    /// creator's decision and nobody else's.
+    #[serde(rename = "wantsCoordinator")]
+    wants_coordinator: bool,
+    /// What this member brings to the pool: scheduler-usable VRAM and RAM after
+    /// OS/engine reserves, in bytes, as ITS OWN probe measured them. Every machine already
     /// knows its own memory; sending it with the join is what lets the whole
     /// cluster answer "is this enough for the model we picked" BEFORE anyone
     /// presses Start — until now that question was only answered by the
@@ -402,6 +835,17 @@ pub struct Peer {
     /// must be counted once, not summed (the engine's plan.c rule).
     #[serde(rename = "unifiedMemory")]
     unified_memory: bool,
+    /// True only when this machine has the creator-selected model + precision
+    /// as a complete, integrity-checked local GGUF. The path never leaves the
+    /// machine; the boolean is roster state and gates Start.
+    #[serde(rename = "modelReady")]
+    model_ready: bool,
+    /// The identity behind model_ready. Kept creator-side so a machine cannot
+    /// report "ready" for Q4 while the cluster is about to serve Q2.
+    #[serde(skip)]
+    model_id: String,
+    #[serde(skip)]
+    quant: String,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -421,7 +865,7 @@ struct Inner {
     self_id: String,
     self_host: String,
     self_gpu: String,
-    /// This machine's own free VRAM/RAM (bytes) and whether it is unified
+    /// This machine's own scheduler-usable VRAM/RAM (bytes) and whether it is unified
     /// memory, as reported by the UI's probe through `pairing_report_memory`.
     /// Sent with every join/poll so the roster can total the pool.
     self_vram_free: u64,
@@ -433,8 +877,10 @@ struct Inner {
     phase: String,
     /// ip of the machine running idletoken-coord (set at start)
     coord_ip: Option<String>,
-    /// The GGUF is required on the coordinator. rpc workers do not open it;
-    /// llama-server streams their assigned tensors over authenticated RPC.
+    /// Every compute node keeps the complete selected GGUF on its own disk.
+    /// Each RPC worker copies only its assigned tensors into its persistent
+    /// cache and loads only that slice; inference RPC then carries graphs and
+    /// activations, not model payloads.
     model_path: String,
     engine_started: bool,
     /// Account-mode pairing (integration plan 3.3): the "code" is a secret
@@ -452,9 +898,27 @@ struct Inner {
     /// the variable part (the discovery port, or the creator's verbatim
     /// rejection). Cleared on every new create/join/leave.
     last_error: Option<(String, String)>,
+    /// The (model id, quant) a cluster demanded when it refused this machine
+    /// for not having the weights (2026-09-01). A joiner is refused BEFORE it
+    /// is in the roster, so the roster — which used to be how it learned what
+    /// to download — is no longer available to tell it. The refusal carries the
+    /// identity instead, and it is kept here so the UI can name the exact model
+    /// and offer to fetch it. Cleared on every new create/join/leave.
+    required_model: Option<(String, String)>,
     /// Nonces this creator issued in `hello` replies and has not seen used yet
-    /// (see pair_proof). Consumed by the matching `join`, swept by age.
-    challenges: Vec<(String, std::time::Instant)>,
+    /// (see pair_proof). Consumed by the matching `join`, swept by age, and
+    /// quota'd per source so one sprayer cannot evict everyone else's.
+    challenges: Vec<Challenge>,
+    /// This machine's stable device identity, sent with every join/poll.
+    self_device_id: String,
+    /// Per-source and cluster-wide admission budgets for the roster port.
+    gate: LanGate,
+    /// Membership changes, newest last, bounded. Not decoration: a roster that
+    /// silently absorbs a rejoin under a different device, or flaps a member in
+    /// and out, is one where CLUS-06 and CLUS-20 leave no trace at all. Kept in
+    /// memory only — it describes the current cluster, and writing home LAN
+    /// topology to disk is the profiling material HOST-15 warns about.
+    audit: Vec<String>,
     generation: u64,
     /// Settings-derived engine tuning (defaults = historical hard-coded
     /// ports). On a joiner, `api_port` is overwritten by the roster so it
@@ -484,7 +948,11 @@ impl Default for Pairing {
             engine_started: false,
             account_mode: false,
             last_error: None,
+            required_model: None,
             challenges: Vec::new(),
+            self_device_id: String::new(),
+            gate: LanGate::default(),
+            audit: Vec::new(),
             generation: 0,
             tuning: Tuning::default(),
         }))
@@ -512,13 +980,42 @@ fn engine_pair_code(proof: &str, account_mode: bool) -> String {
 }
 
 fn snapshot_json(inner: &Inner) -> Value {
+    // Peer::device_id is deliberately #[serde(skip)].  The creator needs a
+    // stable, reviewable identity when a peer asks for the plaintext-bearing
+    // coordinator role, but joiners must not receive a durable home-network
+    // fingerprint.  Enrich only the creator's local snapshot, and only with a
+    // short digest label rather than the raw id.
+    let peers: Vec<Value> = inner
+        .peers
+        .iter()
+        .map(|peer| {
+            let mut value = serde_json::to_value(peer).unwrap_or_else(|_| json!({}));
+            if inner.mode == Mode::Creator {
+                if let Some(label) = device_identity_label(&peer.device_id) {
+                    value["deviceIdentity"] = json!(label);
+                }
+            } else if let Some(object) = value.as_object_mut() {
+                // A role request is addressed to the creator, not roster
+                // gossip for every member.  Hide it at the native snapshot
+                // boundary as well as in the UI so a joiner's renderer never
+                // receives another machine's request state.
+                object.remove("wantsCoordinator");
+            }
+            value
+        })
+        .collect();
     json!({
         // Account mode: the derived secret is not a shareable code — hide it.
         "code": if inner.account_mode { &None } else { &inner.code },
         "accountMode": inner.account_mode,
-        "peers": inner.peers,
+        "peers": peers,
+        // Fail closed on old snapshot shapes: the TypeScript side treats an
+        // absent value as false and never shows a role-approval action.
+        "isCreator": inner.mode == Mode::Creator,
         "coordinatorId": inner.coordinator_id,
         "phase": inner.phase,
+        "modelId": inner.tuning.model_id,
+        "quant": inner.tuning.quant,
         // The inference API is loopback-only on the coordinator (2026-08-15,
         // coord enforces it) — so only the coordinator's own UI gets a base
         // URL. Joiner machines contribute compute; chatting happens on the
@@ -531,13 +1028,24 @@ fn snapshot_json(inner: &Inner) -> Value {
             }))
         } else { None },
         "source": "engine",
-        "canStart": inner.mode == Mode::Creator && inner.phase == "idle" && inner.peers.len() >= 2,
+        "canStart": inner.mode == Mode::Creator
+            && inner.phase == "idle"
+            && inner.peers.len() >= 2
+            && inner.peers.iter().all(|p| p.online && p.model_ready),
         // Why the last join attempt failed (see Inner::last_error). null while
         // nothing has failed, or after a new attempt started.
         "lastError": inner
             .last_error
             .as_ref()
             .map(|(code, detail)| json!({ "code": code, "detail": detail })),
+        // The model this cluster demanded when it refused us for not having the
+        // weights (paired with lastError.code == "modelNotReady"). The UI needs
+        // the two fields apart, not as prose: it turns them into the exact
+        // download the user is asked to confirm. null when nothing was refused.
+        "requiredModel": inner
+            .required_model
+            .as_ref()
+            .map(|(id, quant)| json!({ "modelId": id, "quant": quant })),
     })
 }
 
@@ -565,8 +1073,17 @@ fn roster_reply(inner: &Inner) -> Value {
         "modelId": inner.tuning.model_id,
         // Precision travels with the model so joiners host the same variant.
         "quant": inner.tuning.quant,
+        // Per-member LAN addresses are deliberately NOT here (CLUS-19,
+        // HOST-15). Every member needs the COORDINATOR's address, which is
+        // `coordIp` above; none of them needs each other's, because workers
+        // never dial each other — the coordinator drives every RPC link. The
+        // field used to be broadcast to everyone anyway, which handed any
+        // member (or anything that got one member's token) a map of the home
+        // network for free. The creator still keeps each member's address
+        // privately, in Peer::ip, which is what member_authorized checks
+        // against and what the layer plan is built from.
         "members": inner.peers.iter().map(|p| json!({
-            "id": p.id, "hostname": p.hostname, "gpu": p.gpu, "ip": p.ip,
+            "id": p.id, "hostname": p.hostname, "gpu": p.gpu,
             "stage": p.stage,
             // Liveness travels with the roster so every member's UI shows the
             // same offline states the creator sees.
@@ -580,8 +1097,78 @@ fn roster_reply(inner: &Inner) -> Value {
             // can total the pool (not just the creator that collected them).
             "vramFree": p.vram_free, "ramFree": p.ram_free,
             "unifiedMemory": p.unified_memory,
+            "modelReady": p.model_ready,
         })).collect::<Vec<_>>(),
     })
+}
+
+fn model_path_ready(path: &str) -> bool {
+    if path.trim().is_empty() {
+        return false;
+    }
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false)
+}
+
+/// Merge a member's local model report and bind readiness to this cluster's
+/// exact model identity. Missing fields are an old client and fail closed.
+fn merge_peer_model(peer: &mut Peer, req: &Value, model_id: &str, quant: &str) {
+    if let Some(v) = req["modelId"].as_str() {
+        peer.model_id = v.to_string();
+    }
+    if let Some(v) = req["quant"].as_str() {
+        peer.quant = v.to_string();
+    }
+    peer.model_ready = req["modelReady"].as_bool() == Some(true)
+        && peer.model_id == model_id
+        && peer.quant == quant;
+}
+
+/// The largest memory figure a member may claim (CLUS-09).
+///
+/// These numbers are self-reported and the cluster adds them up to decide
+/// whether the selected model fits before anyone presses Start. A member that
+/// claims 2^63 bytes of free VRAM does not just lie about itself — it makes the
+/// pool total meaningless, so every machine's UI says "this model fits" and the
+/// engine fails at load time instead, which is the least debuggable place for
+/// it to fail. 4 TiB is far above any home machine and far below the range
+/// where the totals stop making sense.
+const MAX_CLAIMED_MEMORY: u64 = 4 << 40;
+
+/// Refresh a roster member's resource report from a join or heartbeat.
+///
+/// Missing keys mean an older client and leave the last observation intact;
+/// an explicit zero remains meaningful (probe unavailable / no such pool).
+/// Keeping this in one helper prevents the accepted-join path and the steady
+/// roster path from drifting again.
+///
+/// An out-of-range claim is dropped loudly rather than clamped: clamping would
+/// silently turn a lie into a plausible number and the pool total would still
+/// be wrong, just harder to notice. Nothing here can verify a claim that IS
+/// plausible — that residual is CLUS-09 and it stays open.
+fn merge_peer_memory(peer: &mut Peer, req: &Value) {
+    let sane = |v: u64, what: &str| -> Option<u64> {
+        if v > MAX_CLAIMED_MEMORY {
+            eprintln!(
+                "[pairing] {} reported {v} bytes of free {what} — refusing a figure no \
+                 machine has; its contribution is counted as unknown",
+                peer.id
+            );
+            None
+        } else {
+            Some(v)
+        }
+    };
+    if let Some(v) = req["vramFree"].as_u64().and_then(|v| sane(v, "VRAM")) {
+        peer.vram_free = v;
+    }
+    if let Some(v) = req["ramFree"].as_u64().and_then(|v| sane(v, "RAM")) {
+        peer.ram_free = v;
+    }
+    if let Some(v) = req["unifiedMemory"].as_bool() {
+        peer.unified_memory = v;
+    }
 }
 
 /// Map an engine lifecycle state to the roster's per-node stage (P4 live
@@ -624,19 +1211,26 @@ fn apply_roster(inner: &mut Inner, v: &Value) -> RosterEffect {
             inner.tuning.api_port = p as u16;
         }
     }
-    // Adopt the creator's model: the cluster serves ONE model and the
-    // coordinator picked it. A joiner's own modelId setting only applies when
-    // it creates a cluster itself.
-    if let Some(m) = v["modelId"].as_str() {
-        if !m.is_empty() {
-            inner.tuning.model_id = m.to_string();
-        }
+    // Adopt the creator's exact model identity: the cluster serves ONE model.
+    // A local path resolved for another selection must be forgotten here. It
+    // is especially dangerous on a joiner that selected Q4 before joining a
+    // creator serving Q2: existence alone would otherwise make the wrong file
+    // look ready and the worker would seed its cache with unrelated tensors.
+    let old_model = inner.tuning.model_id.clone();
+    let old_quant = inner.tuning.quant.clone();
+    if let Some(m) = v["modelId"].as_str().filter(|m| !m.is_empty()) {
+        inner.tuning.model_id = m.to_string();
     }
     // Adopt the creator's precision alongside the model (absent for older
     // creators → keep our default, which the coord maps to the model default).
-    if let Some(q) = v["quant"].as_str() {
+    if let Some(q) = v["quant"].as_str().filter(|q| !q.is_empty()) {
         inner.tuning.quant = q.to_string();
     }
+    if inner.tuning.model_id != old_model || inner.tuning.quant != old_quant {
+        inner.model_path.clear();
+    }
+    let cluster_model = inner.tuning.model_id.clone();
+    let cluster_quant = inner.tuning.quant.clone();
 
     inner.peers = members
         .iter()
@@ -663,11 +1257,18 @@ fn apply_roster(inner: &mut Inner, v: &Value) -> RosterEffect {
                 // are never broadcast, so every entry here is blank. This
                 // machine's own token lives in its roster loop.
                 token: String::new(),
+                // Device ids and peer addresses are creator-side bookkeeping
+                // too, and are not broadcast (CLUS-19/HOST-15).
+                device_id: String::new(),
+                wants_coordinator: m["wantsCoordinator"].as_bool().unwrap_or(false),
                 // Memory travels with the roster so every machine can total
                 // the pool, not just the creator (0 = an older peer).
                 vram_free: m["vramFree"].as_u64().unwrap_or(0),
                 ram_free: m["ramFree"].as_u64().unwrap_or(0),
                 unified_memory: m["unifiedMemory"].as_bool().unwrap_or(false),
+                model_ready: m["modelReady"].as_bool().unwrap_or(false),
+                model_id: cluster_model.clone(),
+                quant: cluster_quant.clone(),
             }
         })
         .collect();
@@ -677,8 +1278,7 @@ fn apply_roster(inner: &mut Inner, v: &Value) -> RosterEffect {
     eff.start_engine = phase == "starting" && inner.phase == "idle" && !inner.engine_started;
     // Back to "idle" after we had already started means the cluster we belong
     // to no longer exists in the form we joined. Drop our engine and re-arm, so
-    // the next "starting" launches a worker for whatever model the coordinator
-    // has now (its weight server is the source, so nothing local to update).
+    // the next "starting" launches a worker for the newly selected local GGUF.
     eff.stop_engine = phase == "idle" && inner.engine_started;
     if eff.stop_engine {
         inner.engine_started = false;
@@ -760,10 +1360,6 @@ fn usage_cap_args(tuning: &Tuning) -> Vec<String> {
         v.push("--max-vram-mb".into());
         v.push(tuning.max_vram_mb.to_string());
     }
-    if tuning.max_ram_mb > 0 {
-        v.push("--max-ram-mb".into());
-        v.push(tuning.max_ram_mb.to_string());
-    }
     v
 }
 
@@ -837,8 +1433,9 @@ fn secret_env(tuning: &Tuning) -> Vec<(String, String)> {
 
 /// Start this machine's engine(s) per its role in the frozen roster. The
 /// coordinator's llama-server uses local compute directly; only other machines
-/// run rpc-supervisors. There is deliberately no co-located RPC worker and no
-/// legacy layer-shard server in this topology.
+/// run rpc-supervisors. The coordinator's repository remains the authoritative
+/// tensor index (and an old-client compatibility source), while current workers
+/// seed only their assigned tensors from their own complete local GGUF.
 fn materialize_engine(app: &AppHandle) {
     let (is_coord, coord_ip, remote_workers, model_path, engine_code, tuning) = {
         let pairing = app.state::<Pairing>();
@@ -870,6 +1467,14 @@ fn materialize_engine(app: &AppHandle) {
                 return;
             }
         };
+        let engine_bin_arg = match crate::engine::native_path_arg(
+            &engine_bin, "llama-server path") {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[pairing] coordinator start refused: {e}");
+                return;
+            }
+        };
         let host = bind_host(&tuning);   // "Bind interface / IP", else 0.0.0.0
         let mut coord_args = vec![
             // Hardened engine, always — not only once someone presses "share
@@ -886,7 +1491,7 @@ fn materialize_engine(app: &AppHandle) {
             // opt-in. See docs/shared-mode-plan-2026-08.md P0-1.
             "--shared".into(),
             "--bind".into(), format!("{host}:{COORD_PORT}"),
-            "--llama-server-bin".into(), engine_bin.to_string_lossy().into_owned(),
+            "--llama-server-bin".into(), engine_bin_arg,
             "--llama-gguf".into(), model_path,
             "--llama-port".into(), LLAMA_PORT.to_string(),
             "--http".into(),
@@ -897,12 +1502,6 @@ fn materialize_engine(app: &AppHandle) {
             "--ctx-size".into(), tuning.ctx_size.to_string(),
             "--max-decode".into(), tuning.max_decode.to_string(),
         ];
-        if tuning.ctx_fit {
-            // "Model default" context: the size above is a ceiling, the
-            // coordinator grants the largest window this machine's memory
-            // affords (floor 16K) instead of refusing to start.
-            coord_args.push("--ctx-fit".into());
-        }
         // Shared mode's second door — the SAME one llamacpp_serve opens, and
         // missing here until 2026-08-21. The comment above says this engine is
         // hardened "always, not only once someone presses share compute", and
@@ -918,10 +1517,15 @@ fn materialize_engine(app: &AppHandle) {
         // Taken from engine.rs rather than rebuilt here: the coordinator and
         // the agent must agree on this path, and a second derivation is the
         // kind of copy that drifts silently.
-        if let Some(sock) = crate::engine::coord_api_socket() {
-            coord_args.push("--api-unix".into());
-            coord_args.push(sock);
-        }
+        let coord_socket = match crate::engine::coord_api_socket() {
+            Ok(sock) => sock,
+            Err(e) => {
+                eprintln!("[pairing] coordinator start refused: {e}");
+                return;
+            }
+        };
+        coord_args.push("--api-unix".into());
+        coord_args.push(coord_socket);
         // The user's "Resource usage" caps, which reached the WORKER (line
         // ~925) and not the coordinator until 2026-08-21. On a single machine
         // the coordinator budgets from its own probe rather than from a
@@ -934,6 +1538,11 @@ fn materialize_engine(app: &AppHandle) {
         if remote_workers > 0 {
             coord_args.push("--num-workers".into());
             coord_args.push(remote_workers.to_string());
+            // Reaching this branch means the user explicitly chose the
+            // multi-machine flow. Capacity still decides which choice the UI
+            // highlights by default; it must not silently undo this choice
+            // just because the selected quant also fits the coordinator.
+            coord_args.push("--force-cluster".into());
             // ⚠ Still argv, unlike the API token below: the coordinator has no
             // IDLETOKEN_PAIR_CODE fallback (the worker does — see the worker
             // branch). Moving it needs a one-line env read in
@@ -957,14 +1566,44 @@ fn materialize_engine(app: &AppHandle) {
                 return;
             }
         };
+        let engine_dir_arg = match crate::engine::native_path_arg(
+            &engine_dir, "llama.cpp engine directory") {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[pairing] rpc worker start refused: {e}");
+                return;
+            }
+        };
         let mut worker_args = vec![
             "--rpc-supervisor".into(),
-            "--engine-dir".into(), engine_dir.to_string_lossy().into_owned(),
+            "--engine-dir".into(), engine_dir_arg,
             "--coordinator".into(), format!("{coord_ip}:{COORD_PORT}"),
             "--discovery-port".into(), tuning.discovery_port.to_string(),
             "--rpc-host".into(), self_ip(&tuning),
             "--rpc-port".into(), tuning.inter_stage_port.to_string(),
         ];
+        // Every node keeps the complete curated GGUF on its own disk. The RPC
+        // supervisor uses it only as a source for the tensor range assigned to
+        // this machine; llama.cpp still imports just that range into the
+        // worker's cache/GPU/RAM. Passing both the primary file and its folder
+        // also handles split GGUF siblings without teaching the client their
+        // naming scheme.
+        if model_path_ready(&model_path) {
+            worker_args.push("--model".into());
+            worker_args.push(model_path.clone());
+            if let Some(parent) = Path::new(&model_path).parent() {
+                match crate::engine::native_path_arg(parent, "GGUF directory") {
+                    Ok(path) => {
+                        worker_args.push("--gguf-dir".into());
+                        worker_args.push(path);
+                    }
+                    Err(e) => {
+                        eprintln!("[pairing] rpc worker start refused: {e}");
+                        return;
+                    }
+                }
+            }
+        }
         worker_args.extend(usage_cap_args(&tuning));
         // The pairing code is the secret the cluster TLS PSK is derived from,
         // so it does not belong in a world-readable command line (A-P0-4).
@@ -1113,30 +1752,107 @@ fn member_authorized(inner: &Inner, req: &Value, peer_ip: &str) -> Option<String
     Some(id.to_string())
 }
 
-/// One roster-protocol request on the creator side.
-fn handle_roster_conn(app: &AppHandle, stream: TcpStream, generation: u64) {
-    let peer_ip = stream.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    if reader.read_line(&mut line).is_err() {
-        return;
+/// Is this join allowed to bind to `id`, given who already holds it? (CLUS-06)
+///
+/// The rule is first-wins on the LABEL, with the DEVICE deciding sameness:
+///
+/// * nobody holds the name           → bind it;
+/// * the holder's device matches     → the same machine is back (reboot, new
+///                                     DHCP lease, creator restart) → rebind;
+/// * the holder is a pre-device-id   → adopt it only if it has gone offline,
+///   client and this one has an id     so an upgrade is not a takeover of a
+///                                     machine that is sitting right there;
+/// * anything else                   → a DIFFERENT machine wants a name that is
+///                                     taken. Refused, not merged.
+///
+/// The refusal matters more than it looks. Before this, a second machine
+/// claiming an existing hostname simply overwrote that member's address, token
+/// and resource numbers — so anyone holding the join code could silently
+/// displace a real node, and the displaced machine's next poll would be told
+/// "unauthorized" and re-join, producing a flap rather than an error anyone
+/// could see (CLUS-20).
+enum JoinIdentity {
+    /// Free to take (new member, or the same device coming back).
+    Bind,
+    /// Taken by a different machine that is still present.
+    Conflict,
+}
+
+fn join_identity(inner: &Inner, id: &str, device: &str, now: Instant) -> JoinIdentity {
+    let Some(p) = inner.peers.iter().find(|p| p.id == id) else {
+        return JoinIdentity::Bind;
+    };
+    if !p.device_id.is_empty() && p.device_id == device {
+        return JoinIdentity::Bind;
     }
-    let Ok(req) = serde_json::from_str::<Value>(&line) else { return };
-    let pairing = app.state::<Pairing>();
-    let mut inner = pairing.0.lock().unwrap();
-    if inner.generation != generation || inner.mode != Mode::Creator {
-        return;
+    if p.device_id.is_empty() && !device.is_empty() {
+        // An older client is holding the name. Let a device-id client take it
+        // over only once that machine has stopped answering — otherwise "I
+        // upgraded" and "I am impersonating the machine next to me" are the
+        // same request.
+        let stale = p.last_seen.map_or(true, |seen| {
+            now.duration_since(seen)
+                > Duration::from_secs((p.hb_secs.clamp(1, 60) as u64 * 3).max(OFFLINE_AFTER_S))
+        });
+        return if stale || !p.online { JoinIdentity::Bind } else { JoinIdentity::Conflict };
     }
+    if p.device_id.is_empty() && device.is_empty() {
+        // Both sides predate device ids. Nothing here can tell impersonation
+        // from a legitimate rejoin, so keep the historical behaviour rather
+        // than lock out working clusters — and say so in the audit trail.
+        return JoinIdentity::Bind;
+    }
+    JoinIdentity::Conflict
+}
+
+/// Append one bounded line to the membership audit trail.
+fn audit(inner: &mut Inner, line: String) {
+    eprintln!("[pairing] {line}");
+    inner.audit.push(line);
+    // Bounded: an attacker who can drive membership changes must not be able to
+    // drive memory growth with them.
+    while inner.audit.len() > 64 {
+        inner.audit.remove(0);
+    }
+}
+
+/// The roster protocol, as a pure-ish function of (state, request, source).
+///
+/// Split out of the socket handling on purpose: everything below is reachable
+/// by any device on the LAN, so it is the part that has to be testable without
+/// a network. `now` is a parameter for the same reason the engine's backoff
+/// curve is a pure function — a timing property asserted by sleeping is a
+/// property that is not really asserted.
+fn roster_request(inner: &mut Inner, req: &Value, peer_ip: &str, now: Instant) -> Value {
     // "Only same subnet": refuse before anything else is considered, and say
     // why. A silent drop here is indistinguishable from a firewall and would
     // send someone hunting the wrong problem. Applied to `hello` too, because
     // that step is where THIS machine proves it knows the code — a restriction
     // that leaks the proof to the excluded network is not one.
-    let wrong_subnet = inner.tuning.same_subnet_only && !same_subnet(&peer_ip, &self_ip(&inner.tuning));
-    let subnet_err = json!({"ok": false, "err": "different subnet (this cluster is restricted to one subnet)"});
+    let wrong_subnet =
+        inner.tuning.same_subnet_only && !same_subnet(peer_ip, &self_ip(&inner.tuning));
+    let subnet_err =
+        json!({"ok": false, "err": "different subnet (this cluster is restricted to one subnet)"});
 
-    let reply = match req["op"].as_str() {
+    // Every peer-chosen string that will be stored or echoed is gated here,
+    // once, before any of it reaches the roster (CLUS-14). A hostname that can
+    // close a JSON string rewrites the document every member's UI parses, and
+    // it does not need a parser bug to do it.
+    let fields_ok = peer_field_opt_ok(req["id"].as_str())
+        && peer_field_opt_ok(req["hostname"].as_str())
+        && peer_field_opt_ok(req["gpu"].as_str())
+        && peer_field_opt_ok(req["modelId"].as_str())
+        && peer_field_opt_ok(req["quant"].as_str())
+        && peer_field_opt_ok(req["token"].as_str())
+        && peer_field_opt_ok(req["deviceId"].as_str())
+        && peer_field_opt_ok(req["proof"].as_str())
+        && peer_field_opt_ok(req["engine"].as_str());
+    if !fields_ok {
+        eprintln!("[pairing] refused a request from {peer_ip} carrying an unusable field value");
+        return json!({"ok": false, "err": "bad field"});
+    }
+
+    match req["op"].as_str() {
         // Step one of the join handshake (A-P0-3): answer the caller's nonce
         // with proof that we hold the same join code, and hand out a nonce of
         // our own for its answering proof. A caller that cannot verify this
@@ -1145,24 +1861,49 @@ fn handle_roster_conn(app: &AppHandle, stream: TcpStream, generation: u64) {
         Some("hello") => {
             let their_nonce = req["nonce"].as_str().unwrap_or("");
             let code = inner.code.clone().unwrap_or_default();
-            if their_nonce.is_empty() || code.is_empty() {
-                json!({"ok": false, "err": "bad hello"})
-            } else {
-                let ours = random_hex(16);
-                let now = std::time::Instant::now();
-                inner.challenges.retain(|(_, at)| now.duration_since(*at) < CHALLENGE_TTL);
-                // Oldest out first if someone is spraying hellos; a live joiner
-                // uses its nonce within one round trip.
-                while inner.challenges.len() >= MAX_CHALLENGES {
-                    inner.challenges.remove(0);
-                }
-                inner.challenges.push((ours.clone(), now));
-                json!({
-                    "ok": true,
-                    "proof": pair_proof("creator", &code, their_nonce),
-                    "nonce": ours,
-                })
+            // A peer that does not speak v2 is told to update rather than
+            // handed a v1 proof. v1 was a single SHA-256 over a fixed format,
+            // i.e. an offline oracle for the whole 30-bit code space; answering
+            // it "for compatibility" would keep the hole open for anyone who
+            // simply omits the field.
+            if req["v"].as_u64().unwrap_or(1) < PAIR_PROTO_V {
+                return json!({"ok": false, "err":
+                    "this machine is running an older IdleToken whose pairing handshake \
+                     is no longer accepted; update it and try again"});
             }
+            if their_nonce.is_empty() || !peer_field_ok(their_nonce) || code.is_empty() {
+                return json!({"ok": false, "err": "bad hello"});
+            }
+            let ours = random_hex(16);
+            inner.challenges.retain(|c| now.duration_since(c.at) < CHALLENGE_TTL);
+            // Fair share: a source spraying `hello` may only ever evict its
+            // OWN oldest nonce. Before this, one sprayer emptied the shared
+            // 64-entry list and every honest joiner's follow-up `join` failed
+            // with "bad code" — a denial of service that reported itself as a
+            // wrong code.
+            while inner.challenges.iter().filter(|c| c.src == peer_ip).count()
+                >= MAX_CHALLENGES_PER_SOURCE
+            {
+                if let Some(i) = inner.challenges.iter().position(|c| c.src == peer_ip) {
+                    inner.challenges.remove(i);
+                } else {
+                    break;
+                }
+            }
+            while inner.challenges.len() >= MAX_CHALLENGES {
+                inner.challenges.remove(0);
+            }
+            inner.challenges.push(Challenge {
+                nonce: ours.clone(),
+                at: now,
+                src: peer_ip.to_string(),
+            });
+            json!({
+                "ok": true,
+                "v": PAIR_PROTO_V,
+                "proof": pair_proof("creator", &code, their_nonce),
+                "nonce": ours,
+            })
         }
         Some("join") if wrong_subnet => subnet_err,
         Some("join") => {
@@ -1172,73 +1913,154 @@ fn handle_roster_conn(app: &AppHandle, stream: TcpStream, generation: u64) {
             // decoration.
             let proof = req["proof"].as_str().unwrap_or("");
             let code = inner.code.clone().unwrap_or_default();
-            let now = std::time::Instant::now();
-            inner.challenges.retain(|(_, at)| now.duration_since(*at) < CHALLENGE_TTL);
-            let matched = inner
-                .challenges
-                .iter()
-                .position(|(n, _)| token_eq(&pair_proof("joiner", &code, n), proof));
-            if let Some(at) = matched {
-                inner.challenges.remove(at);
-                let id = req["hostname"].as_str().unwrap_or("?").to_string();
-                let hb = req["hb"].as_u64().unwrap_or(0) as u32;
-                // A fresh token on every accepted join, including a re-join.
-                // Rotating it is what keeps a token that leaked from outliving
-                // the session it was seen in; the member always gets the new
-                // one in this very reply, so nothing has to be reconciled.
-                let token = random_hex(16);
-                if let Some(p) = inner.peers.iter_mut().find(|p| p.id == id) {
-                    // Re-register under a known id: the machine is back (or
-                    // re-joined after a creator restart). Refresh liveness and
-                    // its address — a reboot may have changed the IP.
-                    p.online = true;
-                    p.last_seen = Some(std::time::Instant::now());
-                    p.hb_secs = hb;
-                    p.ip = peer_ip.clone();
-                    p.token = token.clone();
-                } else {
-                    inner.peers.push(Peer {
-                        id: id.clone(),
-                        hostname: id.clone(),
-                        gpu: req["gpu"].as_str().unwrap_or("").to_string(),
-                        role: "worker",
-                        is_self: false,
-                        stage: "joined".into(),
-                        layer_lo: None,
-                        layer_hi: None,
-                        online: true,
-                        last_seen: Some(std::time::Instant::now()),
-                        hb_secs: hb,
-                        ip: peer_ip.clone(),
-                        token: token.clone(),
-                        vram_free: req["vramFree"].as_u64().unwrap_or(0),
-                        ram_free: req["ramFree"].as_u64().unwrap_or(0),
-                        unified_memory: req["unifiedMemory"].as_bool().unwrap_or(false),
-                    });
-                }
-                // The joiner asked to be the coordinator ("Prefer this machine
-                // as coordinator" on ITS settings page). Same effect as the
-                // creator picking it by hand in Manage cluster, so the roles
-                // stay in one place — and only while the roster is still open:
-                // moving the coordinator after the engines are up would point
-                // half the cluster at a coord that is not running.
-                if req["prefer"].as_bool() == Some(true) && inner.phase == "idle" {
-                    inner.coordinator_id = Some(id.clone());
-                    for p in inner.peers.iter_mut() {
-                        p.role = if p.id == id { "coordinator" } else { "worker" };
-                    }
-                }
-                let mut r = roster_reply(&inner);
-                r["id"] = json!(id);
-                // The member's proof for every later request. It travels only
-                // in the reply to the machine that just proved the code.
-                r["token"] = json!(token);
-                r
-            } else {
-                json!({"ok": false, "err": "bad code"})
+            inner.challenges.retain(|c| now.duration_since(c.at) < CHALLENGE_TTL);
+            // Only nonces WE issued to THIS source count. A nonce is handed to
+            // one address; letting another address spend it would turn the
+            // challenge list into a shared pool.
+            let matched = inner.challenges.iter().position(|c| {
+                c.src == peer_ip && token_eq(&pair_proof("joiner", &code, &c.nonce), proof)
+            });
+            let Some(at) = matched else {
+                inner.gate.note_failure(peer_ip, now);
+                return json!({"ok": false, "err": "bad code"});
+            };
+            inner.challenges.remove(at);
+            inner.gate.note_success(peer_ip, now);
+
+            let id = req["hostname"].as_str().unwrap_or("?").to_string();
+            let device = req["deviceId"].as_str().unwrap_or("").to_string();
+            if let JoinIdentity::Conflict = join_identity(inner, &id, &device, now) {
+                audit(
+                    inner,
+                    format!(
+                        "refused a join from {peer_ip}: the name {id:?} already belongs to \
+                         another machine in this cluster. Rename one of them and try again."
+                    ),
+                );
+                return json!({"ok": false, "err":
+                    "that machine name is already used by another machine in this cluster — \
+                     rename one of them and try again"});
             }
+
+            let cluster_model = inner.tuning.model_id.clone();
+            let cluster_quant = inner.tuning.quant.clone();
+
+            // Admission requires the weights to ALREADY be on the joiner's disk
+            // (2026-09-01). Until now a member was admitted first and
+            // downloaded afterwards, which had two costs: a roster could sit
+            // for an hour in a state that could not start, and joining silently
+            // began a transfer the size of the model — 90 GB, on a link the
+            // user never agreed to spend.
+            //
+            // The refusal carries this cluster's model identity because being
+            // refused is now the ONLY way a joiner can learn it: it never
+            // reaches the roster that used to carry it. That is also why this
+            // check sits AFTER the code proof — the identity goes only to a
+            // machine that proved it holds the join code, not to anything on
+            // the LAN that opens this port.
+            let their_model = req["modelId"].as_str().unwrap_or("");
+            let their_quant = req["quant"].as_str().unwrap_or("");
+            let claims_ready = req["modelReady"].as_bool() == Some(true);
+            if !claims_ready || their_model != cluster_model || their_quant != cluster_quant {
+                audit(
+                    inner,
+                    format!(
+                        "refused a join from {peer_ip}: this cluster runs {cluster_model} \
+                         {cluster_quant}, and that machine reported {their_model} {their_quant} \
+                         (weights ready: {claims_ready})"
+                    ),
+                );
+                return json!({
+                    "ok": false,
+                    "err": "model not ready",
+                    "modelId": cluster_model,
+                    "quant": cluster_quant,
+                });
+            }
+
+            let hb = (req["hb"].as_u64().unwrap_or(0) as u32).clamp(0, 60);
+            // A fresh token on every accepted join, including a re-join.
+            // Rotating it is what keeps a token that leaked from outliving
+            // the session it was seen in; the member always gets the new
+            // one in this very reply, so nothing has to be reconciled.
+            let token = random_hex(16);
+            let known = inner.peers.iter().any(|p| p.id == id);
+            if let Some(p) = inner.peers.iter_mut().find(|p| p.id == id) {
+                // Re-register under a known id: the machine is back (or
+                // re-joined after a creator restart). Refresh liveness and
+                // its address — a reboot may have changed the IP.
+                p.online = true;
+                p.last_seen = Some(now);
+                p.hb_secs = hb;
+                p.ip = peer_ip.to_string();
+                p.token = token.clone();
+                p.device_id = device.clone();
+                // The probe may have completed after the first join, or a
+                // restarted client may now know more than its old roster
+                // entry. Re-registration must refresh resources too.
+                merge_peer_memory(p, req);
+                merge_peer_model(p, req, &cluster_model, &cluster_quant);
+            } else {
+                let mut peer = Peer {
+                    id: id.clone(),
+                    hostname: id.clone(),
+                    gpu: req["gpu"].as_str().unwrap_or("").to_string(),
+                    role: "worker",
+                    is_self: false,
+                    stage: "joined".into(),
+                    layer_lo: None,
+                    layer_hi: None,
+                    online: true,
+                    last_seen: Some(now),
+                    hb_secs: hb,
+                    ip: peer_ip.to_string(),
+                    token: token.clone(),
+                    device_id: device.clone(),
+                    wants_coordinator: false,
+                    vram_free: 0,
+                    ram_free: 0,
+                    unified_memory: req["unifiedMemory"].as_bool().unwrap_or(false),
+                    model_ready: false,
+                    model_id: String::new(),
+                    quant: String::new(),
+                };
+                merge_peer_memory(&mut peer, req);
+                merge_peer_model(&mut peer, req, &cluster_model, &cluster_quant);
+                inner.peers.push(peer);
+            }
+
+            // The joiner's "Prefer this machine as coordinator" is recorded as
+            // a REQUEST and nothing more (CLUS-08). It used to move
+            // coordinator_id on the spot, which handed any machine holding the
+            // join code the power to relocate the cluster's plaintext window —
+            // the one node that sees every prompt in the clear — to itself,
+            // with no confirmation anywhere. Applying it is now
+            // `pairing_set_coordinator`, which only the creator's own UI calls.
+            let wants = req["prefer"].as_bool() == Some(true);
+            if let Some(p) = inner.peers.iter_mut().find(|p| p.id == id) {
+                let changed = p.wants_coordinator != wants;
+                p.wants_coordinator = wants;
+                if wants && changed {
+                    let line = format!(
+                        "{id} asked to become the coordinator. It stays a worker until you \
+                         approve it in Manage cluster — the coordinator is the machine that \
+                         sees prompts in the clear."
+                    );
+                    audit(inner, line);
+                }
+            }
+            if !known {
+                audit(inner, format!("{id} joined from {peer_ip}"));
+            }
+
+            let mut r = roster_reply(inner);
+            r["id"] = json!(id);
+            // The member's proof for every later request. It travels only
+            // in the reply to the machine that just proved the code.
+            r["token"] = json!(token);
+            r
         }
-        Some("roster") => match member_authorized(&inner, &req, &peer_ip) {
+        Some("roster") => match member_authorized(inner, req, peer_ip) {
             None => {
                 eprintln!(
                     "[pairing] refused an unauthenticated roster request from {peer_ip} \
@@ -1251,20 +2073,27 @@ fn handle_roster_conn(app: &AppHandle, stream: TcpStream, generation: u64) {
                 // Live per-node progress: a member's poll carries its engine state.
                 let eng = req["engine"].as_str().unwrap_or("");
                 let forming = inner.phase == "idle"; // read before the &mut borrow below
+                let cluster_model = inner.tuning.model_id.clone();
+                let cluster_quant = inner.tuning.quant.clone();
                 if let Some(p) = inner.peers.iter_mut().find(|p| p.id == id) {
                     // The poll IS the liveness signal: hearing it revives a
                     // member the sweep had marked offline.
                     p.online = true;
-                    p.last_seen = Some(std::time::Instant::now());
-                    p.hb_secs = req["hb"].as_u64().unwrap_or(0) as u32;
+                    p.last_seen = Some(now);
+                    p.hb_secs = (req["hb"].as_u64().unwrap_or(0) as u32).clamp(0, 60);
+                    // Memory is live roster data, not a one-shot join fact.
+                    // This is what makes a probe that finishes after pairing
+                    // repair the pool verdict without leaving/rejoining.
+                    merge_peer_memory(p, req);
+                    merge_peer_model(p, req, &cluster_model, &cluster_quant);
                     if !eng.is_empty() && !forming && p.stage != "ready" {
                         p.stage = stage_for_engine(eng).to_string();
                     }
                 }
-                roster_reply(&inner)
+                roster_reply(inner)
             }
         },
-        Some("leave") => match member_authorized(&inner, &req, &peer_ip) {
+        Some("leave") => match member_authorized(inner, req, peer_ip) {
             None => {
                 eprintln!(
                     "[pairing] refused an unauthenticated leave from {peer_ip} (id={:?}) \
@@ -1278,11 +2107,87 @@ fn handle_roster_conn(app: &AppHandle, stream: TcpStream, generation: u64) {
             // "leave" cannot be aimed at anybody else's machine.
             Some(id) => {
                 inner.peers.retain(|p| p.id != id);
+                audit(inner, format!("{id} left"));
                 json!({"ok": true})
             }
         },
         _ => json!({"ok": false, "err": "bad op"}),
+    }
+}
+
+/// One roster-protocol request on the creator side: bounded I/O around
+/// `roster_request`.
+fn handle_roster_conn(app: &AppHandle, stream: TcpStream, generation: u64) {
+    let peer_ip = stream.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+
+    // Admission BEFORE the read (CLUS-05). The accept loop is serial, so a
+    // source that is already serving a penalty must cost us a close() and not a
+    // read window — otherwise being refused is itself the way to hold the
+    // thread. Nothing is parsed, nothing is allocated.
+    {
+        let pairing = app.state::<Pairing>();
+        let mut inner = pairing.0.lock().unwrap();
+        if inner.generation != generation || inner.mode != Mode::Creator {
+            return;
+        }
+        let now = Instant::now();
+        if let Err(wait) = inner.gate.admit(&peer_ip, now) {
+            drop(inner);
+            let mut s = stream;
+            let _ = writeln!(
+                s,
+                "{}",
+                json!({"ok": false, "err": format!(
+                    "too many attempts from this machine — try again in {}s", wait.as_secs().max(1))})
+            );
+            return;
+        }
+    }
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    // `read_line` on a raw socket grows until it meets a newline. `take` is what
+    // makes that bounded: an unauthenticated LAN peer streaming bytes with no
+    // `\n` used to be an out-of-memory condition, reachable without the join
+    // code (CLUS-05, CHAIN-08).
+    let read = (&mut reader)
+        .take(MAX_ROSTER_REQUEST_BYTES + 1)
+        .read_line(&mut line);
+    match read {
+        Ok(n) if n as u64 > MAX_ROSTER_REQUEST_BYTES => {
+            eprintln!(
+                "[pairing] refused an oversized roster request from {peer_ip} \
+                 ({n} bytes with no end of line)"
+            );
+            let pairing = app.state::<Pairing>();
+            let mut inner = pairing.0.lock().unwrap();
+            inner.gate.note_failure(&peer_ip, Instant::now());
+            return;
+        }
+        Ok(0) | Err(_) => return,
+        Ok(_) => {}
+    }
+    let Ok(req) = serde_json::from_str::<Value>(&line) else {
+        // Unparseable input from an unauthenticated source is not a neutral
+        // event on a serial loop; it costs the sender the same as a wrong code.
+        let pairing = app.state::<Pairing>();
+        let mut inner = pairing.0.lock().unwrap();
+        inner.gate.note_failure(&peer_ip, Instant::now());
+        return;
     };
+    // A JSON scalar or array indexes as null everywhere below, which would read
+    // as "every field absent" rather than "this is not a request".
+    if !req.is_object() {
+        return;
+    }
+
+    let pairing = app.state::<Pairing>();
+    let mut inner = pairing.0.lock().unwrap();
+    if inner.generation != generation || inner.mode != Mode::Creator {
+        return;
+    }
+    let reply = roster_request(&mut inner, &req, &peer_ip, Instant::now());
     drop(inner);
     emit_snapshot(app);
     let mut stream = reader.into_inner();
@@ -1501,6 +2406,11 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
             }
         }
 
+        let self_device = {
+            let pairing = app.state::<Pairing>();
+            let inner = pairing.0.lock().unwrap();
+            inner.self_device_id.clone()
+        };
         let (self_host, self_gpu) = {
             let pairing = app.state::<Pairing>();
             let inner = pairing.0.lock().unwrap();
@@ -1527,14 +2437,26 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
         // the code, against a nonce we pick, BEFORE we prove anything to it.
         let hello = |ip: &str| -> Handshake {
             let mine = random_hex(16);
-            let Some(v) = roster_call(ip, &json!({"op": "hello", "nonce": mine})) else {
+            let Some(v) = roster_call(ip, &json!({"op": "hello", "nonce": mine, "v": PAIR_PROTO_V}))
+            else {
                 return Handshake::Silent;
             };
             if v["ok"].as_bool() == Some(false) {
                 return match v["err"].as_str() {
                     Some("bad op") => Handshake::TooOld,
+                    // A v2 creator refusing a v1 handshake says so explicitly;
+                    // surface it as "that machine is too old" rather than as a
+                    // wrong code, which is what it would otherwise look like.
+                    Some(e) if e.contains("older IdleToken") => Handshake::TooOld,
                     _ => Handshake::NotOurs,
                 };
+            }
+            // No version in the reply means a creator that predates the
+            // stretched proof (pair_proof v2). Refuse rather than recompute the
+            // v1 proof: v1 is the offline oracle this replaced, and a client
+            // that silently falls back keeps the hole open for both machines.
+            if v["v"].as_u64().unwrap_or(1) < PAIR_PROTO_V {
+                return Handshake::TooOld;
             }
             let want = pair_proof("creator", &code, &mine);
             if !token_eq(v["proof"].as_str().unwrap_or(""), &want) {
@@ -1555,15 +2477,27 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
         //   one that measured them, and the roster is where the cluster totals
         //   them up (pre-flight "will this model fit on all of us together").
         let join_req = |nonce: &str| {
-            let (vram_free, ram_free, unified) = {
+            let (vram_free, ram_free, unified, model_id, quant, model_ready) = {
                 let pairing = app.state::<Pairing>();
                 let inner = pairing.0.lock().unwrap();
-                (inner.self_vram_free, inner.self_ram_free, inner.self_unified)
+                (
+                    inner.self_vram_free,
+                    inner.self_ram_free,
+                    inner.self_unified,
+                    inner.tuning.model_id.clone(),
+                    inner.tuning.quant.clone(),
+                    model_path_ready(&inner.model_path),
+                )
             };
             json!({"op": "join", "proof": pair_proof("joiner", &code, nonce),
                    "hostname": self_host, "gpu": self_gpu,
+                   // Stable identity for this install (CLUS-06): what tells a
+                   // rejoin of THIS machine apart from another machine that
+                   // happens to share its name.
+                   "deviceId": self_device,
                    "prefer": prefer, "hb": poll.as_secs(),
-                   "vramFree": vram_free, "ramFree": ram_free, "unifiedMemory": unified})
+                   "vramFree": vram_free, "ramFree": ram_free, "unifiedMemory": unified,
+                   "modelId": model_id, "quant": quant, "modelReady": model_ready})
         };
 
         // 3) offer the code to each candidate until one accepts. A refusal is
@@ -1574,6 +2508,10 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
         let mut member_token = String::new();
         let mut first_reply: Option<Value> = None;
         let mut last_refusal: Option<String> = None;
+        // What the cluster demanded when it refused us for missing weights.
+        // Carried out of the loop so the UI can name the model to download —
+        // a refused joiner never enters the roster that used to tell it.
+        let mut required_model: Option<(String, String)> = None;
         for cand in &candidates {
             {
                 let pairing = app.state::<Pairing>();
@@ -1608,6 +2546,16 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
             if v["ok"].as_bool() == Some(false) {
                 let err = v["err"].as_str().unwrap_or("").to_string();
                 eprintln!("[pairing] {cand} refused this machine: {err}");
+                if err == "model not ready" {
+                    // The one refusal that carries a payload: without it the
+                    // user would be told to download something the UI cannot
+                    // name. Both fields must be present — a creator that sends
+                    // neither is one this build cannot guide the user through,
+                    // so leave it unset and fall back to the plain refusal.
+                    if let (Some(m), Some(q)) = (v["modelId"].as_str(), v["quant"].as_str()) {
+                        required_model = Some((m.to_string(), q.to_string()));
+                    }
+                }
                 last_refusal = Some(err);
                 continue;
             }
@@ -1644,10 +2592,18 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
                     Some("bad code") => ("badCode".into(), String::new()),
                     Some("old creator") => ("oldCreator".into(), String::new()),
                     Some(e) if e.starts_with("different subnet") => ("subnet".into(), String::new()),
+                    // Only claim "download this" when we actually know WHAT to
+                    // download. A creator that refused without naming the model
+                    // falls through to the verbatim refusal below rather than
+                    // to a sentence with a hole in it.
+                    Some("model not ready") if required_model.is_some() => {
+                        ("modelNotReady".into(), String::new())
+                    }
                     Some(e) => ("rejected".into(), e.to_string()),
                     None if listen => ("notFound".into(), discovery_port.to_string()),
                     None => ("notFoundManual".into(), String::new()),
                 });
+                inner.required_model = required_model;
             }
             drop(inner);
             emit_snapshot(&app);
@@ -1698,9 +2654,25 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
                 // report this machine's live engine state so the whole roster
                 // sees per-node progress (P4). The token is what makes this a
                 // MEMBER's poll rather than anyone's TCP connection (A-P0-2).
+                let (vram_free, ram_free, unified, model_id, quant, model_ready) = {
+                    let pairing = app.state::<Pairing>();
+                    let inner = pairing.0.lock().unwrap();
+                    (
+                        inner.self_vram_free,
+                        inner.self_ram_free,
+                        inner.self_unified,
+                        inner.tuning.model_id.clone(),
+                        inner.tuning.quant.clone(),
+                        model_path_ready(&inner.model_path),
+                    )
+                };
                 json!({"op": "roster", "id": self_host, "token": member_token,
+                       "deviceId": self_device,
                        "engine": crate::engine::current_state_str(&app),
-                       "hb": poll.as_secs()})
+                       "hb": poll.as_secs(),
+                       "vramFree": vram_free, "ramFree": ram_free,
+                       "unifiedMemory": unified,
+                       "modelId": model_id, "quant": quant, "modelReady": model_ready})
             } else {
                 // Re-joining (the creator restarted, or our token aged out).
                 // A fresh handshake every time: the creator consumed the last
@@ -1892,6 +2864,14 @@ pub fn pairing_create(
     tuning: Option<Tuning>,
     account: Option<bool>,
 ) -> Result<(), String> {
+    let model_path = model_path.unwrap_or_default();
+    // Formation itself is gated, not only Start. This prevents a creator from
+    // advertising a cluster that can never become runnable and fixes the
+    // async UI race where an empty path was captured while the verified GGUF
+    // resolver was still finishing.
+    if !model_path_ready(&model_path) {
+        return Err("[WEIGHTS_NOT_DOWNLOADED] selected GGUF is not ready".into());
+    }
     let generation;
     let discovery_port;
     {
@@ -1908,12 +2888,29 @@ pub fn pairing_create(
         inner.coordinator_id = Some(hostname.clone());
         inner.phase = "idle".into();
         inner.coord_ip = None;
-        inner.model_path = model_path.unwrap_or_default();
+        inner.model_path = model_path.clone();
         inner.engine_started = false;
         inner.last_error = None;
+        inner.required_model = None;
         inner.challenges.clear();
+        // A new cluster starts with a clean admission table and audit trail:
+        // both describe the cluster that is forming, not the one before it.
+        inner.gate = LanGate::default();
+        inner.audit.clear();
+        if inner.self_device_id.is_empty() {
+            inner.self_device_id = device_id();
+        }
+        let self_device = inner.self_device_id.clone();
         inner.tuning = tuning.unwrap_or_default();
         discovery_port = inner.tuning.discovery_port;
+        // The hardware probe normally runs before the user creates a cluster.
+        // Preserve that already-known observation instead of resetting the
+        // roster row to zero and waiting for a probe that may not run again.
+        let self_vram_free = inner.self_vram_free;
+        let self_ram_free = inner.self_ram_free;
+        let self_unified = inner.self_unified;
+        let model_id = inner.tuning.model_id.clone();
+        let quant = inner.tuning.quant.clone();
         inner.peers = vec![Peer {
             id: hostname.clone(),
             hostname,
@@ -1931,12 +2928,17 @@ pub fn pairing_create(
             // The creator never authenticates to itself: its own entry is
             // written in-process, never over the roster socket.
             token: String::new(),
-            // Filled by pairing_report_memory once the probe has run — the
-            // creator's own numbers come from the same command the joiners
-            // send, so one path fills every entry.
-            vram_free: 0,
-            ram_free: 0,
-            unified_memory: false,
+            device_id: self_device.clone(),
+            // The creator is already the coordinator; it never has to ask.
+            wants_coordinator: false,
+            // Usually filled already by pairing_report_memory; later probe
+            // refreshes still update this same row.
+            vram_free: self_vram_free,
+            ram_free: self_ram_free,
+            unified_memory: self_unified,
+            model_ready: true,
+            model_id,
+            quant,
         }];
     }
     emit_snapshot(&app);
@@ -1975,7 +2977,13 @@ pub fn pairing_join(
         inner.model_path = model_path.unwrap_or_default();
         inner.engine_started = false;
         inner.last_error = None;
+        inner.required_model = None;
         inner.challenges.clear();
+        inner.gate = LanGate::default();
+        inner.audit.clear();
+        if inner.self_device_id.is_empty() {
+            inner.self_device_id = device_id();
+        }
         inner.peers = Vec::new();
         inner.tuning = tuning.unwrap_or_default();
         discovery_port = inner.tuning.discovery_port;
@@ -1986,6 +2994,43 @@ pub fn pairing_join(
     Ok(())
 }
 
+/// Tell the native roster that this machine has finished resolving,
+/// downloading and integrity-checking the creator-selected GGUF. The file path
+/// remains local; only the exact identity-bound readiness bit is broadcast.
+#[tauri::command]
+pub fn pairing_update_model(
+    app: AppHandle,
+    state: State<'_, Pairing>,
+    model_id: String,
+    quant: String,
+    model_path: String,
+) -> Result<(), String> {
+    {
+        let mut inner = state.0.lock().unwrap();
+        if inner.mode == Mode::Off {
+            return Err("[PAIR_NO_MEMBER] this machine is not in a cluster".into());
+        }
+        if model_id != inner.tuning.model_id || quant != inner.tuning.quant {
+            return Err(format!(
+                "[PAIR_MODEL_MISMATCH] cluster needs {} {}, not {} {}",
+                inner.tuning.model_id, inner.tuning.quant, model_id, quant
+            ));
+        }
+        if !model_path_ready(&model_path) {
+            return Err("[WEIGHTS_NOT_DOWNLOADED] selected GGUF is not ready".into());
+        }
+        inner.model_path = model_path;
+        let self_id = inner.self_id.clone();
+        if let Some(p) = inner.peers.iter_mut().find(|p| p.id == self_id) {
+            p.model_ready = true;
+            p.model_id = model_id;
+            p.quant = quant;
+        }
+    }
+    emit_snapshot(&app);
+    Ok(())
+}
+
 /// Creator freezes the roster and everyone launches engines. The chosen
 /// coordinator machine's ip comes from the roster (creator = local).
 #[tauri::command]
@@ -1993,6 +3038,8 @@ pub fn pairing_start(
     app: AppHandle,
     state: State<'_, Pairing>,
     allow_solo: Option<bool>,
+    model_path: Option<String>,
+    overflow_tuning: Option<OverflowTuning>,
 ) -> Result<(), String> {
     let generation;
     {
@@ -2002,6 +3049,12 @@ pub fn pairing_start(
             // ERROR_KEYS in client/src/i18n.ts): the UI translates the code,
             // logs keep the English sentence.
             return Err("[PAIR_NOT_CREATOR] only the cluster creator can start it".into());
+        }
+        // The user can change this beside the Start button, after pairing_create
+        // captured the rest of the tuning. Apply both the on and off shapes;
+        // the explicit backend gate clears stale credentials in the off state.
+        if let Some(latest) = overflow_tuning {
+            apply_overflow_tuning(&mut inner.tuning, latest);
         }
         // Two machines is the right floor for the PAIRING flow — pressing Start
         // before anyone joined is a mistake there. It is the wrong floor for the
@@ -2016,8 +3069,37 @@ pub fn pairing_start(
         if inner.peers.len() < 2 && allow_solo != Some(true) {
             return Err("[PAIR_NEED_TWO] need at least 2 machines".into());
         }
-        generation = inner.generation;
+        // Refresh the path at the point of use. The JS resolver is async and
+        // old clients captured its initial empty value at create time.
+        if let Some(path) = model_path.filter(|p| model_path_ready(p)) {
+            inner.model_path = path;
+            let self_id = inner.self_id.clone();
+            let model_id = inner.tuning.model_id.clone();
+            let quant = inner.tuning.quant.clone();
+            if let Some(p) = inner.peers.iter_mut().find(|p| p.id == self_id) {
+                p.model_ready = true;
+                p.model_id = model_id;
+                p.quant = quant;
+            }
+        }
+        if let Some(p) = inner.peers.iter().find(|p| !p.online || !p.model_ready) {
+            return Err(format!(
+                "[PAIR_MODEL_NOT_READY] {} has not prepared {} {}",
+                p.hostname, inner.tuning.model_id, inner.tuning.quant
+            ));
+        }
         let coord_id = inner.coordinator_id.clone().unwrap_or_else(|| inner.self_id.clone());
+        // The creator used to transition the whole roster to "starting" and
+        // return Ok before materialize_engine noticed an empty path. That
+        // function could only write to stderr, so the installed UI looked as
+        // if Start did nothing and no engine process appeared. Reject while
+        // the roster is still idle: the invoke reaches PairingPanel's visible
+        // error strip and the Start button remains available after the user
+        // puts the selected weights in the model folder.
+        if coord_id == inner.self_id && !model_path_ready(&inner.model_path) {
+            return Err("[WEIGHTS_NOT_DOWNLOADED] no GGUF file selected".into());
+        }
+        generation = inner.generation;
         // self_ip, not local_lan_ip: on a machine with a chosen NIC the address
         // we hand out has to be the one we are listening on.
         let mine = self_ip(&inner.tuning);
@@ -2047,25 +3129,62 @@ pub fn pairing_set_coordinator(
 ) -> Result<(), String> {
     {
         let mut inner = state.0.lock().unwrap();
-        if inner.mode != Mode::Creator {
-            return Err("[PAIR_NOT_CREATOR] only the cluster creator can pick the coordinator".into());
-        }
-        if inner.phase != "idle" {
-            return Err("[PAIR_ALREADY_STARTED] cluster already started".into());
-        }
-        if !inner.peers.iter().any(|p| p.id == peer_id) {
-            return Err("[PAIR_NO_MEMBER] no such member".into());
-        }
-        inner.coordinator_id = Some(peer_id.clone());
-        for p in inner.peers.iter_mut() {
-            p.role = if p.id == peer_id { "coordinator" } else { "worker" };
-        }
+        approve_coordinator_request(&mut inner, &peer_id)?;
     }
     emit_snapshot(&app);
     Ok(())
 }
 
-/// This machine's free memory, from the UI's own probe snapshot.
+/// Apply one creator-approved coordinator request.
+///
+/// This is the security boundary behind the UI.  A fork can remove the
+/// confirmation dialog, but it still cannot promote an arbitrary row: the
+/// native roster must currently contain an online member with a stable device
+/// identity and an outstanding request.  The request is consumed on success,
+/// so replaying the command is refused rather than silently reapplying it.
+fn approve_coordinator_request(inner: &mut Inner, peer_id: &str) -> Result<(), String> {
+    if inner.mode != Mode::Creator {
+        return Err("[PAIR_NOT_CREATOR] only the cluster creator can approve a coordinator request".into());
+    }
+    if inner.phase != "idle" {
+        return Err("[PAIR_ALREADY_STARTED] cluster already started".into());
+    }
+    let Some(peer) = inner.peers.iter().find(|p| p.id == peer_id) else {
+        return Err("[PAIR_NO_MEMBER] no such member".into());
+    };
+    if !peer.online {
+        return Err("[PAIR_ROLE_REQUEST_STALE] that machine is no longer online".into());
+    }
+    if !peer.wants_coordinator {
+        return Err("[PAIR_ROLE_NOT_REQUESTED] that machine is not requesting the coordinator role".into());
+    }
+    if peer.device_id.is_empty() {
+        return Err(
+            "[PAIR_DEVICE_ID_REQUIRED] update that machine before approving a coordinator request"
+                .into(),
+        );
+    }
+
+    let hostname = peer.hostname.clone();
+    let device = device_identity_label(&peer.device_id).unwrap_or_else(|| "unknown".into());
+    inner.coordinator_id = Some(peer_id.to_string());
+    for p in inner.peers.iter_mut() {
+        p.role = if p.id == peer_id { "coordinator" } else { "worker" };
+        if p.id == peer_id {
+            // One approval consumes exactly the request that authorized it.
+            p.wants_coordinator = false;
+        }
+    }
+    audit(
+        inner,
+        format!(
+            "approved coordinator request from {hostname} (device {device}); this machine may now see local prompts in plaintext and control the cluster"
+        ),
+    );
+    Ok(())
+}
+
+/// This machine's scheduler-usable memory, from the UI's own probe snapshot.
 ///
 /// Called whenever the probe refreshes, in every mode — the numbers must be in
 /// place BEFORE a join is sent, and the creator's own roster entry is filled
@@ -2086,7 +3205,9 @@ pub fn pairing_report_memory(
         inner.self_unified = unified_memory;
         let self_id = inner.self_id.clone();
         match inner.peers.iter_mut().find(|p| p.id == self_id) {
-            Some(p) if p.vram_free != vram_free || p.ram_free != ram_free => {
+            Some(p) if p.vram_free != vram_free
+                || p.ram_free != ram_free
+                || p.unified_memory != unified_memory => {
                 p.vram_free = vram_free;
                 p.ram_free = ram_free;
                 p.unified_memory = unified_memory;
@@ -2116,6 +3237,7 @@ pub fn pairing_leave(app: AppHandle, state: State<'_, Pairing>) -> Result<(), St
         inner.engine_started = false;
         inner.account_mode = false;
         inner.last_error = None;
+        inner.required_model = None;
         inner.challenges.clear();
     }
     // Leaving the cluster also stops this machine's engine process.
@@ -2189,7 +3311,7 @@ pub fn headless_pair(app: &AppHandle, spec: &str) {
                     inner.mode == Mode::Creator && inner.phase == "idle" && inner.peers.len() >= 2
                 };
                 if ready_to_start {
-                    let _ = pairing_start(app2.clone(), app2.state(), None);
+                    let _ = pairing_start(app2.clone(), app2.state(), None, None, None);
                     return;
                 }
             });
@@ -2299,11 +3421,10 @@ mod pairing_settings_tests {
         assert!(usage_cap_args(&Tuning::default()).is_empty());
         let t = tuning(|t| {
             t.max_vram_mb = 8192;
-            t.max_ram_mb = 16384;
         });
         assert_eq!(
             usage_cap_args(&t),
-            vec!["--max-vram-mb", "8192", "--max-ram-mb", "16384"]
+            vec!["--max-vram-mb", "8192"]
         );
         let only_vram = tuning(|t| t.max_vram_mb = 4096);
         assert_eq!(usage_cap_args(&only_vram), vec!["--max-vram-mb", "4096"]);
@@ -2336,6 +3457,49 @@ mod pairing_settings_tests {
             t.overflow_key = "sk".into();
         });
         assert!(!overflow_args(&no_cap).contains(&"--overflow-daily-cap".to_string()));
+    }
+
+    #[test]
+    fn launch_time_overflow_refresh_changes_only_the_routing_fields() {
+        let mut t = tuning(|t| {
+            t.model_id = "qwen3-8b".into();
+            t.api_port = 8123;
+            t.max_vram_mb = 8192;
+            t.overflow_url = "http://old-platform".into();
+            t.overflow_key = "old-key".into();
+        });
+        let latest: OverflowTuning = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "overflowUrl": "http://new-platform",
+            "overflowKey": "new-key",
+            "overflowWaitS": 7,
+            "overflowDailyCapMilli": 4200,
+        }))
+        .expect("the launch button's camelCase routing payload must deserialize");
+        apply_overflow_tuning(&mut t, latest);
+        assert_eq!(t.overflow_url, "http://new-platform");
+        assert_eq!(t.overflow_key, "new-key");
+        assert_eq!(t.overflow_wait_s, 7);
+        assert_eq!(t.overflow_daily_cap_milli, 4200);
+        assert_eq!(t.model_id, "qwen3-8b", "launch routing must not change the roster model");
+        assert_eq!(t.api_port, 8123, "launch routing must not move the local API");
+        assert_eq!(t.max_vram_mb, 8192, "launch routing must not alter resource caps");
+
+        // Off is an explicit backend decision. Even stale credentials in the
+        // payload must not revive a choice captured when the roster was made.
+        let off_with_stale_credentials: OverflowTuning = serde_json::from_value(serde_json::json!({
+            "enabled": false,
+            "overflowUrl": "http://stale-platform",
+            "overflowKey": "stale-key",
+            "overflowWaitS": 30,
+            "overflowDailyCapMilli": 9999,
+        }))
+        .expect("the explicit off payload must deserialize");
+        apply_overflow_tuning(&mut t, off_with_stale_credentials);
+        assert!(t.overflow_url.is_empty());
+        assert!(t.overflow_key.is_empty());
+        assert_eq!(t.overflow_wait_s, 0);
+        assert_eq!(t.overflow_daily_cap_milli, 0);
     }
 
     /// The bug that shipped as 0.1.4 (2026-08-21): the client handed the
@@ -2555,9 +3719,14 @@ mod pairing_settings_tests {
             hb_secs: 0,
             ip: ip.into(),
             token: token.into(),
+            device_id: String::new(),
+            wants_coordinator: false,
             vram_free: 0,
             ram_free: 0,
             unified_memory: false,
+            model_ready: false,
+            model_id: String::new(),
+            quant: String::new(),
         }
     }
 
@@ -2644,6 +3813,753 @@ mod pairing_settings_tests {
         assert!(!roster.contains("s3cr3t"), "{roster}");
         let snap = snapshot_json(&inner).to_string();
         assert!(!snap.contains("s3cr3t"), "{snap}");
+    }
+
+    #[test]
+    fn roster_heartbeat_refreshes_memory_without_erasing_old_clients() {
+        let mut peer = joined_member("machine-a", "192.168.1.50", "token");
+        peer.vram_free = 1;
+        peer.ram_free = 2;
+
+        merge_peer_memory(
+            &mut peer,
+            &json!({
+                "vramFree": 13_u64 << 30,
+                "ramFree": 42_u64 << 30,
+                "unifiedMemory": true,
+            }),
+        );
+        assert_eq!(peer.vram_free, 13_u64 << 30);
+        assert_eq!(peer.ram_free, 42_u64 << 30);
+        assert!(peer.unified_memory);
+
+        // Backward compatibility: an older heartbeat has no resource keys.
+        // It must not turn a complete pool back into "cannot tell".
+        merge_peer_memory(&mut peer, &json!({"op": "roster"}));
+        assert_eq!(peer.vram_free, 13_u64 << 30);
+        assert_eq!(peer.ram_free, 42_u64 << 30);
+        assert!(peer.unified_memory);
+    }
+
+    #[test]
+    fn model_readiness_is_bound_to_exact_model_and_precision() {
+        let mut peer = joined_member("machine-b", "192.168.1.51", "token");
+        merge_peer_model(
+            &mut peer,
+            &json!({"modelId": "qwen3.8-27b", "quant": "Q4_K_XL", "modelReady": true}),
+            "qwen3.8-27b",
+            "Q2_K_XL",
+        );
+        assert!(!peer.model_ready, "Q4 must not satisfy a Q2 cluster");
+        merge_peer_model(
+            &mut peer,
+            &json!({"modelId": "qwen3.8-27b", "quant": "Q2_K_XL", "modelReady": true}),
+            "qwen3.8-27b",
+            "Q2_K_XL",
+        );
+        assert!(peer.model_ready);
+    }
+
+    #[test]
+    fn adopting_creator_selection_forgets_a_stale_local_path() {
+        let mut inner = inner_with(Vec::new());
+        inner.mode = Mode::Joiner;
+        inner.self_id = "machine-b".into();
+        inner.model_path = "F:/gguf/Qwen-Q4.gguf".into();
+        inner.tuning.model_id = "qwen3.8-27b".into();
+        inner.tuning.quant = "Q4_K_XL".into();
+        apply_roster(
+            &mut inner,
+            &json!({
+                "phase": "idle",
+                "coordinatorId": "machine-a",
+                "modelId": "qwen3.8-27b",
+                "quant": "Q2_K_XL",
+                "members": [{
+                    "id": "machine-b", "hostname": "machine-b", "gpu": "GPU",
+                    "modelReady": false
+                }]
+            }),
+        );
+        assert_eq!(inner.tuning.quant, "Q2_K_XL");
+        assert!(inner.model_path.is_empty());
+    }
+
+    #[test]
+    fn cluster_start_waits_for_the_model_not_the_capacity_estimate() {
+        let mut creator = joined_member("machine-a", "", "");
+        creator.role = "coordinator";
+        creator.is_self = true;
+        creator.model_ready = true;
+        creator.model_id = "qwen3.8-27b".into();
+        creator.quant = "Q2_K_XL".into();
+        let worker = joined_member("machine-b", "192.168.1.51", "token");
+        let mut inner = inner_with(vec![creator, worker]);
+        inner.coordinator_id = Some("machine-a".into());
+        assert_eq!(snapshot_json(&inner)["canStart"], false);
+        inner.peers[1].model_ready = true;
+        // Memory reports feed the guidance card and runtime planner. They do
+        // not suppress the UI Start control; authoritative admission happens
+        // after the click for the exact selected context.
+        for peer in &mut inner.peers {
+            peer.vram_free = 0;
+            peer.ram_free = 0;
+        }
+        assert_eq!(snapshot_json(&inner)["canStart"], true);
+    }
+
+    // ---- CLUS-02/05/06/08/14/19/20: the roster port's admission rules -------
+
+    /// Drive a request through the creator-side protocol core with a chosen
+    /// clock, the way a machine on the LAN would.
+    fn ask(inner: &mut Inner, req: Value, ip: &str, now: Instant) -> Value {
+        roster_request(inner, &req, ip, now)
+    }
+
+    /// A creator holding join code ABC234, with one member already joined.
+    fn creator_with_code() -> Inner {
+        let mut inner = inner_with(Vec::new());
+        inner.code = Some("ABC234".into());
+        inner.self_id = "creator".into();
+        // A cluster is a model AND a precision (the 2026-09-01 admission gate),
+        // and an empty precision is not a realistic cluster — the picker always
+        // produces one, and an empty peer field is refused as malformed long
+        // before the gate. Set both so these tests join the way a machine does.
+        inner.tuning.model_id = "deepseek-v4-flash".into();
+        inner.tuning.quant = "IQ2_XXS".into();
+        inner
+    }
+
+    /// Complete a real `hello` + `join` the way a joiner does.
+    fn do_join_request(
+        inner: &mut Inner,
+        host: &str,
+        device: &str,
+        ip: &str,
+        prefer: bool,
+        now: Instant,
+    ) -> Value {
+        // Admission requires this cluster's exact weights (2026-09-01). Every
+        // test below is about identity, tokens or admission — not about
+        // downloading — so the joiner presents what the cluster asked for. The
+        // weight gate has its own tests, which vary these three fields.
+        let model = inner.tuning.model_id.clone();
+        let quant = inner.tuning.quant.clone();
+        do_join_claiming(inner, host, device, ip, prefer, now, &model, &quant, true)
+    }
+
+    /// A join that says whatever it likes about its local weights. Only the
+    /// weight-gate tests need this; everything else goes through `do_join`.
+    #[allow(clippy::too_many_arguments)]
+    fn do_join_claiming(
+        inner: &mut Inner,
+        host: &str,
+        device: &str,
+        ip: &str,
+        prefer: bool,
+        now: Instant,
+        model: &str,
+        quant: &str,
+        ready: bool,
+    ) -> Value {
+        let mine = random_hex(16);
+        let hello = ask(inner, json!({"op": "hello", "nonce": mine, "v": PAIR_PROTO_V}), ip, now);
+        let nonce = hello["nonce"].as_str().unwrap_or("").to_string();
+        let mut req = json!({"op": "join", "proof": pair_proof("joiner", "ABC234", &nonce),
+                             "hostname": host, "gpu": "GPU", "prefer": prefer,
+                             "modelId": model, "quant": quant, "modelReady": ready});
+        if !device.is_empty() {
+            req["deviceId"] = json!(device);
+        }
+        ask(
+            inner,
+            req,
+            ip,
+            now,
+        )
+    }
+
+    fn do_join(inner: &mut Inner, host: &str, device: &str, ip: &str, now: Instant) -> Value {
+        do_join_request(inner, host, device, ip, false, now)
+    }
+
+    #[test]
+    fn a_join_still_works_end_to_end() {
+        // The baseline every assertion below leans on. Without it, "refused"
+        // could mean the handshake is simply broken.
+        let mut inner = creator_with_code();
+        let now = Instant::now();
+        let r = do_join(&mut inner, "box-a", "dev-a", "192.168.1.50", now);
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(!r["token"].as_str().unwrap_or("").is_empty(), "a member token is issued");
+        assert_eq!(inner.peers.len(), 1);
+    }
+
+    /// 2026-09-01: a member must ALREADY hold this cluster's weights.
+    ///
+    /// Before this, a machine was admitted first and downloaded afterwards, so
+    /// a roster could sit for an hour in a state that could not start, and the
+    /// act of joining silently began a transfer the size of the model. The
+    /// refusal has to carry the model identity: a refused joiner never reaches
+    /// the roster, which used to be how it learned what to fetch.
+    #[test]
+    fn a_machine_without_the_weights_is_refused_and_told_what_to_fetch() {
+        let mut inner = creator_with_code();
+        inner.tuning.model_id = "deepseek-v4-flash".into();
+        inner.tuning.quant = "IQ2_XXS".into();
+        let now = Instant::now();
+
+        let r = do_join_claiming(
+            &mut inner, "box-a", "dev-a", "192.168.1.50", false, now,
+            "deepseek-v4-flash", "IQ2_XXS", false,
+        );
+        assert_eq!(r["ok"], false, "{r}");
+        assert_eq!(r["err"], "model not ready");
+        assert_eq!(r["modelId"], "deepseek-v4-flash", "the refusal must name the model");
+        assert_eq!(r["quant"], "IQ2_XXS", "and the precision — the UI fetches one exact file");
+        assert!(inner.peers.is_empty(), "a refused machine must not appear in the roster");
+    }
+
+    /// A cluster is a model AND a precision. Q2 weights cannot serve an
+    /// IQ2_XXS cluster, and admitting them only moves the failure to load time.
+    #[test]
+    fn a_machine_holding_a_different_precision_is_refused_until_it_matches() {
+        let mut inner = creator_with_code();
+        inner.tuning.model_id = "deepseek-v4-flash".into();
+        inner.tuning.quant = "IQ2_XXS".into();
+        let now = Instant::now();
+
+        let r = do_join_claiming(
+            &mut inner, "box-a", "dev-a", "192.168.1.50", false, now,
+            "deepseek-v4-flash", "Q2_K_XL", true,
+        );
+        assert_eq!(r["ok"], false, "having SOME copy is not having THIS one: {r}");
+        assert_eq!(r["quant"], "IQ2_XXS", "the refusal names what the cluster wants, not what we hold");
+        assert!(inner.peers.is_empty());
+
+        // The same machine once it holds the right precision. Being refused for
+        // weights must not have burned its admission: the code was correct, so
+        // this is a member coming back prepared, not an intruder retrying.
+        let r = do_join_claiming(
+            &mut inner, "box-a", "dev-a", "192.168.1.50", false, now,
+            "deepseek-v4-flash", "IQ2_XXS", true,
+        );
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(inner.peers.len(), 1);
+        assert!(inner.peers[0].model_ready, "and it lands in the roster already ready");
+    }
+
+    /// CLUS-06: hostname is a label, not an identity. A second machine that
+    /// claims a name already held must not inherit that member's row.
+    #[test]
+    fn a_different_machine_cannot_take_over_an_existing_members_name() {
+        let mut inner = creator_with_code();
+        let now = Instant::now();
+        do_join(&mut inner, "box-a", "dev-a", "192.168.1.50", now);
+        let victim_token = inner.peers[0].token.clone();
+
+        // Same name, same valid join code, different machine.
+        let r = do_join(&mut inner, "box-a", "dev-EVIL", "192.168.1.99", now);
+        assert_eq!(r["ok"], false, "the impostor must be refused: {r}");
+        assert_eq!(inner.peers.len(), 1, "no second row, and no replaced row");
+        assert_eq!(inner.peers[0].ip, "192.168.1.50", "the real machine keeps its address");
+        assert_eq!(inner.peers[0].token, victim_token, "and its token is not rotated out from under it");
+        assert_eq!(inner.peers[0].device_id, "dev-a");
+
+        // The real machine coming back on a new DHCP lease is NOT a conflict.
+        let r = do_join(&mut inner, "box-a", "dev-a", "192.168.1.77", now);
+        assert_eq!(r["ok"], true, "the same device rejoining must still work: {r}");
+        assert_eq!(inner.peers.len(), 1);
+        assert_eq!(inner.peers[0].ip, "192.168.1.77");
+        assert_ne!(inner.peers[0].token, victim_token, "a rejoin still rotates the token");
+    }
+
+    /// CLUS-08 / CHAIN-04: the coordinator is the plaintext window. A joiner may
+    /// ASK for the role; only the creator's own action grants it.
+    #[test]
+    fn a_joiner_cannot_make_itself_the_coordinator() {
+        let mut inner = creator_with_code();
+        inner.coordinator_id = Some("creator".into());
+        let now = Instant::now();
+        let mine = random_hex(16);
+        let hello = ask(&mut inner, json!({"op": "hello", "nonce": mine, "v": PAIR_PROTO_V}), "192.168.1.50", now);
+        let nonce = hello["nonce"].as_str().unwrap().to_string();
+        let r = ask(
+            &mut inner,
+            json!({"op": "join", "proof": pair_proof("joiner", "ABC234", &nonce),
+                   "hostname": "box-a", "deviceId": "dev-a", "prefer": true,
+                   // This test is about the coordinator role, so the machine
+                   // clears the weight gate the ordinary way.
+                   "modelId": "deepseek-v4-flash", "quant": "IQ2_XXS", "modelReady": true}),
+            "192.168.1.50",
+            now,
+        );
+        assert_eq!(r["ok"], true, "the join itself is legitimate: {r}");
+        assert_eq!(
+            inner.coordinator_id.as_deref(),
+            Some("creator"),
+            "asking must not move the plaintext window"
+        );
+        assert_eq!(inner.peers.iter().find(|p| p.id == "box-a").unwrap().role, "worker");
+        let asked = inner.peers.iter().find(|p| p.id == "box-a").unwrap().wants_coordinator;
+        assert!(asked, "the request is recorded so the creator can approve it");
+        assert!(
+            inner.audit.iter().any(|l| l.contains("asked to become the coordinator")),
+            "and it leaves a trace: {:?}",
+            inner.audit
+        );
+    }
+
+    #[test]
+    fn creator_snapshot_exposes_only_a_local_device_fingerprint_for_review() {
+        let mut inner = creator_with_code();
+        inner.mode = Mode::Creator;
+        let now = Instant::now();
+        let r = do_join_request(
+            &mut inner,
+            "box-a",
+            "0123456789abcdef0123456789abcdef",
+            "192.168.1.50",
+            true,
+            now,
+        );
+        assert_eq!(r["ok"], true, "{r}");
+
+        let snap = snapshot_json(&inner);
+        assert_eq!(snap["isCreator"], true);
+        assert_eq!(snap["peers"][0]["wantsCoordinator"], true);
+        let label = snap["peers"][0]["deviceIdentity"].as_str().unwrap_or("");
+        assert!(
+            label.len() == 35 && label.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
+            "the review label is a short stable fingerprint: {label:?}"
+        );
+        assert_ne!(
+            label,
+            "0123456789abcdef0123456789abcdef",
+            "the raw stable id must not enter the webview"
+        );
+        assert!(
+            !snap.to_string().contains("0123456789abcdef0123456789abcdef"),
+            "the creator snapshot carries only the digest label: {snap}"
+        );
+
+        let wire = roster_reply(&inner);
+        assert!(
+            wire["members"][0].get("deviceIdentity").is_none()
+                && wire["members"][0].get("deviceId").is_none(),
+            "stable device identities must not be broadcast to members: {wire}"
+        );
+
+        // The identical snapshot function on a joiner fails closed: no creator
+        // bit and no stable labels, even if a hostile local mirror somehow
+        // contained one.
+        inner.mode = Mode::Joiner;
+        let joiner_snap = snapshot_json(&inner);
+        assert_eq!(joiner_snap["isCreator"], false);
+        assert!(joiner_snap["peers"][0].get("deviceIdentity").is_none());
+        assert!(joiner_snap["peers"][0].get("wantsCoordinator").is_none());
+    }
+
+    #[test]
+    fn coordinator_approval_requires_a_live_current_stable_request() {
+        let now = Instant::now();
+
+        let mut non_creator = creator_with_code();
+        non_creator.mode = Mode::Joiner;
+        assert!(
+            approve_coordinator_request(&mut non_creator, "box-a")
+                .unwrap_err()
+                .contains("PAIR_NOT_CREATOR")
+        );
+
+        let mut absent = creator_with_code();
+        absent.mode = Mode::Creator;
+        assert!(
+            approve_coordinator_request(&mut absent, "box-a")
+                .unwrap_err()
+                .contains("PAIR_NO_MEMBER")
+        );
+
+        let mut not_requested = creator_with_code();
+        not_requested.mode = Mode::Creator;
+        do_join(&mut not_requested, "box-a", "dev-a", "192.168.1.50", now);
+        assert!(
+            approve_coordinator_request(&mut not_requested, "box-a")
+                .unwrap_err()
+                .contains("PAIR_ROLE_NOT_REQUESTED")
+        );
+
+        let mut offline = creator_with_code();
+        offline.mode = Mode::Creator;
+        do_join_request(&mut offline, "box-a", "dev-a", "192.168.1.50", true, now);
+        offline.peers[0].online = false;
+        assert!(
+            approve_coordinator_request(&mut offline, "box-a")
+                .unwrap_err()
+                .contains("PAIR_ROLE_REQUEST_STALE")
+        );
+
+        let mut legacy = creator_with_code();
+        legacy.mode = Mode::Creator;
+        do_join_request(&mut legacy, "box-a", "", "192.168.1.50", true, now);
+        assert!(
+            approve_coordinator_request(&mut legacy, "box-a")
+                .unwrap_err()
+                .contains("PAIR_DEVICE_ID_REQUIRED")
+        );
+    }
+
+    #[test]
+    fn request_withdrawal_leave_and_approval_are_fail_closed() {
+        let now = Instant::now();
+
+        let mut withdrawn = creator_with_code();
+        withdrawn.mode = Mode::Creator;
+        do_join_request(&mut withdrawn, "box-a", "dev-a", "192.168.1.50", true, now);
+        // A same-device rejoin carrying prefer=false is the protocol's request
+        // withdrawal.  It must remove the approval authority immediately.
+        do_join_request(
+            &mut withdrawn,
+            "box-a",
+            "dev-a",
+            "192.168.1.50",
+            false,
+            now + Duration::from_millis(1),
+        );
+        assert_eq!(withdrawn.peers[0].wants_coordinator, false);
+        assert!(
+            approve_coordinator_request(&mut withdrawn, "box-a")
+                .unwrap_err()
+                .contains("PAIR_ROLE_NOT_REQUESTED")
+        );
+
+        let mut left = creator_with_code();
+        left.mode = Mode::Creator;
+        let joined = do_join_request(&mut left, "box-a", "dev-a", "192.168.1.50", true, now);
+        let token = joined["token"].as_str().unwrap_or("").to_string();
+        let reply = ask(
+            &mut left,
+            json!({"op": "leave", "id": "box-a", "token": token}),
+            "192.168.1.50",
+            now + Duration::from_millis(1),
+        );
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert!(
+            approve_coordinator_request(&mut left, "box-a")
+                .unwrap_err()
+                .contains("PAIR_NO_MEMBER")
+        );
+
+        let mut approved = creator_with_code();
+        approved.mode = Mode::Creator;
+        approved.coordinator_id = Some("creator".into());
+        do_join_request(&mut approved, "box-a", "dev-a", "192.168.1.50", true, now);
+        approve_coordinator_request(&mut approved, "box-a").unwrap();
+        assert_eq!(approved.coordinator_id.as_deref(), Some("box-a"));
+        assert_eq!(approved.peers[0].role, "coordinator");
+        assert!(!approved.peers[0].wants_coordinator, "approval consumes the request");
+        assert!(
+            approved
+                .audit
+                .iter()
+                .any(|line| line.contains("approved coordinator request")
+                    && line.contains("device ")),
+            "the creator's decision leaves a bounded audit trace: {:?}",
+            approved.audit
+        );
+        assert!(
+            approve_coordinator_request(&mut approved, "box-a")
+                .unwrap_err()
+                .contains("PAIR_ROLE_NOT_REQUESTED"),
+            "an already-consumed request is not replayable"
+        );
+    }
+
+    /// CLUS-05: one source spraying `hello` must not evict the nonces other
+    /// machines are about to use.
+    #[test]
+    fn a_hello_flood_cannot_starve_an_honest_joiner() {
+        let mut inner = creator_with_code();
+        let now = Instant::now();
+
+        // An honest joiner takes a nonce and is briefly interrupted.
+        let honest = random_hex(16);
+        let hello = ask(&mut inner, json!({"op": "hello", "nonce": honest, "v": PAIR_PROTO_V}), "192.168.1.50", now);
+        let honest_nonce = hello["nonce"].as_str().unwrap().to_string();
+
+        // The attacker sprays several times its own quota. Three times is
+        // enough to prove the property: the per-source cap is applied on every
+        // request, so a source is already held to MAX_CHALLENGES_PER_SOURCE
+        // long before the shared list could fill — spraying MAX_CHALLENGES * 3
+        // exercised no additional code path and cost this one test hundreds of
+        // production-strength (600k-round) proofs, minutes of it in a debug
+        // build.
+        for i in 0..(MAX_CHALLENGES_PER_SOURCE * 3) {
+            let n = format!("{i:032x}");
+            ask(&mut inner, json!({"op": "hello", "nonce": n, "v": PAIR_PROTO_V}), "192.168.1.99", now);
+        }
+        assert!(
+            inner.challenges.iter().filter(|c| c.src == "192.168.1.99").count()
+                <= MAX_CHALLENGES_PER_SOURCE,
+            "a source may only ever hold its own small quota"
+        );
+
+        // The honest joiner's nonce is still spendable.
+        let r = ask(
+            &mut inner,
+            json!({"op": "join", "proof": pair_proof("joiner", "ABC234", &honest_nonce),
+                   "hostname": "box-a", "deviceId": "dev-a",
+                   // This test is about nonce fairness, so the machine clears
+                   // the weight gate the ordinary way.
+                   "modelId": "deepseek-v4-flash", "quant": "IQ2_XXS", "modelReady": true}),
+            "192.168.1.50",
+            now,
+        );
+        assert_eq!(r["ok"], true, "the flood must not have cost the honest joiner its nonce: {r}");
+    }
+
+    /// A nonce is handed to one address; another address must not spend it.
+    #[test]
+    fn a_nonce_issued_to_one_machine_cannot_be_spent_by_another() {
+        let mut inner = creator_with_code();
+        let now = Instant::now();
+        let mine = random_hex(16);
+        let hello = ask(&mut inner, json!({"op": "hello", "nonce": mine, "v": PAIR_PROTO_V}), "192.168.1.50", now);
+        let nonce = hello["nonce"].as_str().unwrap().to_string();
+        let r = ask(
+            &mut inner,
+            json!({"op": "join", "proof": pair_proof("joiner", "ABC234", &nonce),
+                   "hostname": "box-b", "deviceId": "dev-b"}),
+            "192.168.1.99",
+            now,
+        );
+        assert_eq!(r["ok"], false, "a stolen nonce is not a join: {r}");
+    }
+
+    /// CLUS-02: the client roster face throttles guessing the same way the
+    /// engine's join port does, and the curve is the promise to the user.
+    #[test]
+    fn wrong_codes_get_slower_but_typos_stay_free() {
+        assert_eq!(gate_backoff(1), None, "a typo costs nothing");
+        assert_eq!(gate_backoff(GATE_FREE_TRIES), None, "the whole allowance is free");
+        assert_eq!(gate_backoff(GATE_FREE_TRIES + 1), Some(Duration::from_secs(1)));
+        assert_eq!(gate_backoff(GATE_FREE_TRIES + 2), Some(Duration::from_secs(2)));
+        assert_eq!(gate_backoff(99), Some(GATE_MAX), "capped: never a permanent lockout");
+
+        let mut gate = LanGate::default();
+        let now = Instant::now();
+        assert!(gate.admit("10.0.0.5", now).is_ok(), "a fresh source is served");
+        for _ in 0..(GATE_FREE_TRIES + 1) {
+            gate.note_failure("10.0.0.5", now);
+        }
+        assert!(gate.admit("10.0.0.5", now).is_err(), "past the allowance it must wait");
+        // A different machine is not punished for its neighbour's mistakes.
+        assert!(gate.admit("10.0.0.6", now).is_ok(), "the penalty is per source");
+        // And it expires rather than latching.
+        assert!(
+            gate.admit("10.0.0.5", now + GATE_MAX + Duration::from_secs(1)).is_ok(),
+            "the block lifts on its own"
+        );
+    }
+
+    /// CLUS-05: volume alone is refused, even when every request is well formed.
+    #[test]
+    fn a_request_flood_is_refused_by_rate_not_only_by_failure() {
+        let mut gate = LanGate::default();
+        let now = Instant::now();
+        for _ in 0..GATE_REQ_MAX {
+            assert!(gate.admit("10.0.0.7", now).is_ok(), "normal traffic is served");
+        }
+        assert!(
+            gate.admit("10.0.0.7", now).is_err(),
+            "past the ceiling the source is refused without parsing anything"
+        );
+        assert!(
+            gate.admit("10.0.0.7", now + GATE_REQ_BLOCK + Duration::from_secs(1)).is_ok(),
+            "and it is a rate cap, not a ban"
+        );
+    }
+
+    /// CLUS-02 distributed-source residual: many addresses, one attacker.
+    #[test]
+    fn many_addresses_still_hit_a_cluster_wide_ceiling() {
+        let mut gate = LanGate::default();
+        let now = Instant::now();
+        // Each address stays inside its own free allowance, so only the
+        // cluster-wide meter can possibly refuse anything here.
+        for i in 0..GATE_GLOBAL_MAX_FAILS {
+            gate.note_failure(&format!("10.0.{}.{}", i / 250, i % 250), now);
+        }
+        assert!(
+            gate.admit("10.0.9.9", now).is_err(),
+            "a hundred fresh addresses do not buy a hundred free allowances"
+        );
+        assert!(
+            gate.admit("10.0.9.9", now + GATE_GLOBAL_BLOCK + Duration::from_secs(1)).is_ok(),
+            "the cluster-wide block is a short rate cap, not a lockout"
+        );
+    }
+
+    /// CLUS-14 / CHAIN-08: peer-chosen strings are gated before they are stored
+    /// or echoed. The first case is the payload that rewrites the document
+    /// every member's UI parses.
+    #[test]
+    fn hostile_field_values_are_refused_before_they_reach_the_roster() {
+        assert!(!peer_field_ok("a\",\"role\":\"coordinator\",\"x\":\""), "JSON injection");
+        assert!(!peer_field_ok("box-a\nJan 01 coord: all clear"), "log forging");
+        assert!(!peer_field_ok("back\\slash"));
+        assert!(!peer_field_ok(""), "empty is not a name");
+        assert!(!peer_field_ok(&"a".repeat(MAX_PEER_FIELD + 1)), "over-long is refused, not clamped");
+        assert!(!peer_field_ok("caf\u{e9}"), "non-ASCII is refused");
+        assert!(peer_field_ok("box-a"), "and real names still pass");
+        assert!(peer_field_ok(&"a".repeat(MAX_PEER_FIELD)), "exactly the limit passes");
+
+        let mut inner = creator_with_code();
+        let now = Instant::now();
+        let r = do_join(&mut inner, "a\",\"role\":\"coordinator\",\"x\":\"", "dev-x", "192.168.1.50", now);
+        assert_eq!(r["ok"], false, "{r}");
+        assert!(inner.peers.is_empty(), "nothing hostile reached the roster");
+    }
+
+    /// The whole request surface is reachable by anything on the LAN, so it has
+    /// to survive rubbish without panicking or half-applying state.
+    #[test]
+    fn malformed_requests_never_panic_and_never_authorize() {
+        let mut inner = creator_with_code();
+        let now = Instant::now();
+        do_join(&mut inner, "box-a", "dev-a", "192.168.1.50", now);
+        let before = inner.peers.len();
+
+        let corpus = vec![
+            json!({}),
+            json!({"op": null}),
+            json!({"op": 12}),
+            json!({"op": "roster"}),
+            json!({"op": "roster", "id": "box-a"}),
+            json!({"op": "roster", "id": "box-a", "token": ""}),
+            json!({"op": "leave", "id": "box-a", "token": "guess"}),
+            json!({"op": "join"}),
+            json!({"op": "join", "proof": ""}),
+            json!({"op": "hello"}),
+            json!({"op": "hello", "nonce": ""}),
+            json!({"op": "hello", "nonce": "x", "v": 1}),
+            json!({"op": "hello", "nonce": {"nested": true}, "v": 2}),
+            json!({"op": "join", "hostname": 5, "proof": "x"}),
+            json!({"op": "join", "proof": "x", "hostname": "box-b", "vramFree": u64::MAX}),
+            json!({"op": "\u{0}\u{1}"}),
+            json!({"op": "join", "proof": "x", "hostname": "box-b", "hb": u64::MAX}),
+        ];
+        for req in corpus {
+            let r = ask(&mut inner, req.clone(), "192.168.1.99", now);
+            assert!(r.is_object(), "every reply is a JSON object: {req}");
+            if r["ok"].as_bool() == Some(true) {
+                panic!("malformed request was accepted: {req} -> {r}");
+            }
+        }
+        assert_eq!(inner.peers.len(), before, "and none of it changed the roster");
+        assert_eq!(inner.peers[0].ip, "192.168.1.50", "the real member is untouched");
+    }
+
+    /// CLUS-09: a member's self-reported memory decides whether the cluster
+    /// believes the model fits. An impossible claim must not enter that total.
+    #[test]
+    fn an_impossible_memory_claim_is_refused_not_believed() {
+        let mut peer = joined_member("box-a", "192.168.1.50", "t");
+        merge_peer_memory(&mut peer, &json!({"vramFree": 24_u64 << 30}));
+        assert_eq!(peer.vram_free, 24 << 30, "a real figure is taken");
+        merge_peer_memory(&mut peer, &json!({"vramFree": u64::MAX}));
+        assert_eq!(peer.vram_free, 24 << 30, "an impossible one is dropped, not clamped in");
+    }
+
+    /// CLUS-19 / HOST-15: the roster broadcast carries what collaboration needs
+    /// and no more. This is a whitelist, so ADDING a field breaks it on purpose.
+    #[test]
+    fn the_roster_broadcast_does_not_hand_out_the_home_network_map() {
+        let mut inner = creator_with_code();
+        let now = Instant::now();
+        do_join(&mut inner, "box-a", "dev-a", "192.168.1.50", now);
+        let reply = roster_reply(&inner);
+        let member = &reply["members"][0];
+
+        let allowed = [
+            "id", "hostname", "gpu", "stage", "online", "layerLo", "layerHi",
+            "vramFree", "ramFree", "unifiedMemory", "modelReady",
+        ];
+        for (k, _) in member.as_object().unwrap() {
+            assert!(allowed.contains(&k.as_str()), "new roster field {k:?} needs a disclosure decision");
+        }
+        let body = reply.to_string();
+        assert!(!body.contains("192.168.1.50"), "a member's LAN address is not broadcast: {body}");
+        assert!(!body.contains("dev-a"), "nor its stable device id: {body}");
+        assert!(!body.contains(&inner.peers[0].token), "nor anyone's member token");
+    }
+
+    /// The stretched proof is the only thing standing between one unauthenticated
+    /// `hello` and the whole 30-bit code space, so its cost is a property.
+    #[test]
+    fn the_pairing_proof_is_stretched_and_version_tagged() {
+        let a = pair_proof("creator", "ABC234", "nonce-1");
+        let b = pair_proof("creator", "ABC234", "nonce-2");
+        let c = pair_proof("joiner", "ABC234", "nonce-1");
+        assert_ne!(a, b, "the nonce binds the proof");
+        assert_ne!(a, c, "so does the direction");
+        assert_eq!(a, pair_proof("creator", "ABC234", "nonce-1"), "and it is deterministic");
+
+        // v1 was a single SHA-256 of a fixed format. If this ever matches, the
+        // oracle is back.
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"idletoken-pair-v1|creator|ABC234|nonce-1");
+        let v1: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        assert_ne!(a, v1, "the v1 single-hash proof must not be reachable");
+
+        // Cheap enough to join with, expensive enough to be worth doing.
+        //
+        // Both halves of that are asserted on the CONSTANT, not on a stopwatch.
+        // A wall-clock threshold cannot express this reliably: `cargo test`
+        // builds without optimisation and runs these in parallel, so the same
+        // 600_000 rounds measure ~70 ms in the release build a user runs and
+        // ~3.6 s here (measured on the Mac control machine, 2026-08-30). A bound
+        // tight enough to catch a regression in one profile is a flaky failure
+        // in the other, and a bound loose enough never to flake asserts nothing.
+        //
+        // The floor is the security property: below this the stretch stops
+        // being the thing that makes the ~2^30 code space expensive to sweep
+        // offline (see PAIR_PROOF_ROUNDS). The ceiling is the usability
+        // property the old comment was reaching for with "a ten-second join
+        // should fail" — at the measured 70 ms per 600_000 rounds, 5_000_000
+        // rounds is ~580 ms of release CPU, and anything past that starts being
+        // felt on every join and every rejoin after a coordinator restart.
+        assert!(
+            PAIR_PROOF_ROUNDS >= 100_000,
+            "the proof must stay stretched: {PAIR_PROOF_ROUNDS} rounds is close enough to \
+             the unstretched v1 hash to put the join code back within an easy offline sweep"
+        );
+        assert!(
+            PAIR_PROOF_ROUNDS <= 5_000_000,
+            "{PAIR_PROOF_ROUNDS} rounds is roughly {:.1}s of release CPU per join at the \
+             measured 70ms/600k; joining must stay interactive",
+            PAIR_PROOF_ROUNDS as f64 * 70e-3 / 600_000.0
+        );
+
+        // A smoke check only, and deliberately loose enough that it cannot flake
+        // under a loaded parallel run: it catches a proof that never terminates
+        // or that has become pathologically slow for a reason the round count
+        // does not explain. The two assertions above are the real gate.
+        let t0 = Instant::now();
+        let _ = pair_proof("creator", "ABC234", "timing");
+        let smoke_ceiling = if cfg!(debug_assertions) {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_secs(2)
+        };
+        assert!(
+            t0.elapsed() < smoke_ceiling,
+            "one proof took {:?} (smoke ceiling {smoke_ceiling:?}) — that is far beyond what \
+             {PAIR_PROOF_ROUNDS} rounds should cost, so something other than the round count \
+             changed",
+            t0.elapsed()
+        );
     }
 
     /// An older/hand-written payload without the new keys must behave exactly

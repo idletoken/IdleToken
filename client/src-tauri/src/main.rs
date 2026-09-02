@@ -374,6 +374,22 @@ struct PlatformResponse {
     body: String,
 }
 
+const IDLETOKEN_VERSION_HEADER: &str = "X-IdleToken-Version";
+
+fn platform_request_builder(
+    client: &reqwest::blocking::Client,
+    method: reqwest::Method,
+    url: reqwest::Url,
+) -> reqwest::blocking::RequestBuilder {
+    // Compatibility metadata only.  CARGO_PKG_VERSION is the package version
+    // Cargo compiled into this exact binary; the release gate keeps it aligned
+    // with package.json and tauri.conf.json.  A modified client can copy it, so
+    // the gateway must never treat this header as authentication or attestation.
+    client
+        .request(method, url)
+        .header(IDLETOKEN_VERSION_HEADER, env!("CARGO_PKG_VERSION"))
+}
+
 #[tauri::command]
 async fn platform_http(
     method: String,
@@ -401,7 +417,7 @@ async fn platform_http(
             .map_err(|e| e.to_string())?;
         let m = reqwest::Method::from_bytes(method.as_bytes())
             .map_err(|_| format!("bad HTTP method {method}"))?;
-        let mut req = client.request(m, parsed);
+        let mut req = platform_request_builder(&client, m, parsed);
         if let Some(t) = bearer {
             req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {t}"));
         }
@@ -418,6 +434,37 @@ async fn platform_http(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[cfg(test)]
+mod platform_http_tests {
+    #[test]
+    fn native_platform_requests_use_the_compiled_cargo_version() {
+        let client = reqwest::blocking::Client::new();
+        let request = super::platform_request_builder(
+            &client,
+            reqwest::Method::POST,
+            reqwest::Url::parse("https://idletoken.ai/providers/p-1/heartbeat").unwrap(),
+        )
+        .build()
+        .unwrap();
+        assert_eq!(
+            request
+                .headers()
+                .get(super::IDLETOKEN_VERSION_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(env!("CARGO_PKG_VERSION")),
+        );
+
+        // Drift check against the browser build's existing release metadata,
+        // not a second handwritten version constant.
+        let package: serde_json::Value =
+            serde_json::from_str(include_str!("../../package.json")).unwrap();
+        assert_eq!(
+            package.get("version").and_then(|value| value.as_str()),
+            Some(env!("CARGO_PKG_VERSION")),
+        );
+    }
 }
 
 /// The cluster's capability table (engine `GET /idletoken/v1/capability`).
@@ -810,19 +857,77 @@ fn find_seq(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-/// UI-test channel (acceptance §8): expose the launcher's IDLETOKEN_UI_TEST
-/// directive list to the frontend, which executes them through the same
-/// provider paths user actions take. Unset = empty = no effect.
-#[tauri::command]
-fn ui_test_directives() -> Vec<String> {
-    std::env::var("IDLETOKEN_UI_TEST")
-        .map(|v| {
-            v.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
+const UI_TEST_DISCLOSURE: &str =
+    "idletoken-client: *** TEST OVERRIDE ACTIVE *** IDLETOKEN_UI_TEST directives enabled";
+static UI_TEST_DIRECTIVES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+fn initialize_ui_test_directives(raw: Option<&str>, disclose: impl FnOnce(&str)) -> Vec<String> {
+    let directives: Vec<String> = raw
+        .map(|value| {
+            value
+                .split(',')
+                .map(|item| item.trim().to_string())
+                .filter(|item| !item.is_empty())
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if !directives.is_empty() {
+        // Deliberately fixed text: directives can contain API tokens, model
+        // paths and pairing material, none of which belongs in this banner.
+        disclose(UI_TEST_DISCLOSURE);
+    }
+    directives
+}
+
+fn configured_ui_test_directives() -> &'static [String] {
+    UI_TEST_DIRECTIVES
+        .get_or_init(|| {
+            let raw = std::env::var("IDLETOKEN_UI_TEST").ok();
+            initialize_ui_test_directives(raw.as_deref(), |line| eprintln!("{line}"))
+        })
+        .as_slice()
+}
+
+/// UI-test channel (acceptance §8): expose the launcher's IDLETOKEN_UI_TEST
+/// directive list to the frontend, which executes them through the same
+/// provider paths user actions take. The list is snapshotted and, when non-empty,
+/// disclosed at process entry before Tauri can return any directive. Unset or
+/// empty = no output and no effect.
+#[tauri::command]
+fn ui_test_directives() -> Vec<String> {
+    configured_ui_test_directives().to_vec()
+}
+
+#[cfg(test)]
+mod ui_test_disclosure_tests {
+    use super::{initialize_ui_test_directives, UI_TEST_DISCLOSURE};
+
+    #[test]
+    fn unset_empty_and_separator_only_directives_stay_silent() {
+        for raw in [None, Some(""), Some("   "), Some(" , , ")] {
+            let mut disclosures = Vec::new();
+            let directives =
+                initialize_ui_test_directives(raw, |line| disclosures.push(line.to_string()));
+            assert!(directives.is_empty());
+            assert!(disclosures.is_empty());
+        }
+    }
+
+    #[test]
+    fn non_empty_directives_are_disclosed_once_without_their_contents() {
+        let secret = "pairing-create:ABC234:apiToken=do-not-log,quit:10";
+        let mut disclosures = Vec::new();
+        let directives =
+            initialize_ui_test_directives(Some(secret), |line| disclosures.push(line.to_string()));
+
+        assert_eq!(disclosures, [UI_TEST_DISCLOSURE]);
+        assert_eq!(
+            directives,
+            ["pairing-create:ABC234:apiToken=do-not-log", "quit:10"]
+        );
+        assert!(!disclosures[0].contains("ABC234"));
+        assert!(!disclosures[0].contains("do-not-log"));
+    }
 }
 
 /// Sink for UI-test assertions: the frontend reports structured results here
@@ -925,6 +1030,7 @@ async fn http_get_json(url: &str) -> Result<Value, String> {
 }
 
 fn main() {
+    let _ = configured_ui_test_directives();
     // NVIDIA Linux (DGX, and any GTX/RTX desktop): WebKitGTK's DMA-BUF
     // renderer produces a fully blank window — no error, no log, just white.
     // Documented workaround is this env var; setting it here means installing
@@ -1055,6 +1161,7 @@ fn main() {
             pairing::pairing_create,
             pairing::pairing_join,
             pairing::pairing_start,
+            pairing::pairing_update_model,
             pairing::pairing_set_coordinator,
             pairing::pairing_leave,
             pairing::pairing_report_memory,

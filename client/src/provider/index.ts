@@ -3,7 +3,7 @@ import { tauriProvider } from "./tauri";
 import { devFixtureProvider } from "./devFixture";
 
 // Optional usage caps (MiB; 0/undefined = no cap) that the probe must honor,
-// so the "max VRAM / RAM" setting really takes effect (philosophy 15).
+// so the maximum-VRAM setting really takes effect (philosophy 15).
 export interface ProbeOptions {
   maxVramMb?: number;
   maxRamMb?: number;

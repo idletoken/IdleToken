@@ -13,7 +13,6 @@ import qwen354b from "../../models/qwen3.5-4b.json";
 import qwen359b from "../../models/qwen3.5-9b.json";
 import qwen3527b from "../../models/qwen3.5-27b.json";
 import qwen3827b from "../../models/qwen3.8-27b.json";
-import qwen3824t from "../../models/qwen3.8-2.4t-a95b.json";
 import qwen3535ba3b from "../../models/qwen3.5-35b-a3b.json";
 import glm52 from "../../models/glm-5.2.json";
 import kimiK25 from "../../models/kimi-k2.5.json";
@@ -61,12 +60,17 @@ export interface ModelManifest {
   backend: "ds4" | "ds4x" | "llamacpp";
   arch: string;
   available: boolean;
-  // "cluster" = may be spread over a homogeneous LAN cluster; "single-node" =
-  // served by one machine, and the coordinator REFUSES --num-workers > 1 for it
-  // (src/common/model.c idletoken_model_may_cluster). Mirrors the engine
-  // registry; model_manifest_check.py fails the build if the two disagree.
+  // Technical placement capability, not the default. "cluster" means the
+  // model may run either locally or across machines; a future "single-node"
+  // value is reserved for a backend that genuinely cannot be split. The UI's
+  // default is decided from the selected precision and current hardware.
   deployment: "single-node" | "cluster";
   license: string;
+  /** False keeps a locally runnable model out of the paid service-sharing
+   * marketplace when its weight licence does not permit that use. Missing is
+   * the backwards-compatible true value. The gateway enforces the actual
+   * fail-closed catalogue gate; the client keeps the metadata for display. */
+  marketplace_allowed?: boolean;
   params_summary: string;
   n_layers: number;
   n_embd: number;
@@ -75,8 +79,35 @@ export interface ModelManifest {
   layer_weight_bytes: number;
   shared_weight_bytes: number;
   context_max: number;
+  /** Curated/validated YaRN-extended window (Qwen publishes 4x configs);
+   *  absent/0 = the trained window is the hard ceiling. */
+  context_yarn_max?: number;
+  /** MEASURED graph workspace at the two product context tiers, in bytes,
+   *  from llama.cpp's own no_alloc dry-run (scripts/measure_model_memory.sh).
+   *  Mirrors idletoken_model_spec.compute_bytes_* one for one; absent/0 means
+   *  "not measured", which the estimate must surface rather than treat as 0 —
+   *  the old closed form was 9.6x low on one curated model at 256K.
+   *  Per BACKEND: identical across GPUs and quantizations, but GLM-5.2 at 256K
+   *  is 1.50 GiB on CUDA and 33.3 GiB on Metal
+   *  (results/memory-need-measured-20260901.md). */
+  compute_bytes_256k_cuda?: number;
+  compute_bytes_1m_cuda?: number;
+  compute_bytes_256k_metal?: number;
+  compute_bytes_1m_metal?: number;
   split: { boundary_multiple: number };
-  kv: { kind: string; bytes_per_token_per_layer: number };
+  kv: {
+    kind: string;
+    bytes_per_token_per_layer: number;
+    state_bytes_per_layer?: number;
+    full_attention_interval?: number;
+    /** DeepSeek4 whole-model f16 cache geometry from the GGUF plus the pinned
+     * engine's padded raw/CSA/HCA allocation. */
+    raw_bytes_per_cell?: number;
+    csa_bytes_per_cell?: number;
+    hca_bytes_per_cell?: number;
+    fixed_bytes_per_sequence?: number;
+  };
+  moe?: { n_expert: number; n_expert_used: number };
   overhead_base_bytes: number;
   default_gguf: string;
   // Content hash of default_gguf for models WITHOUT a variants table (the
@@ -107,7 +138,6 @@ export interface ModelSpec {
   available: boolean; // false = shown greyed out, backend not implemented yet
   backend: "ds4" | "ds4x" | "llamacpp";
   contextMax: number;
-  singleNode: boolean; // served by one machine; clustering it is refused
   note?: string;
 }
 
@@ -121,7 +151,7 @@ export interface ModelSpec {
 // cover this file).
 const MANIFESTS = [
   dsv4, dsv4pro,
-  qwen3508b, qwen354b, qwen38b, qwen359b, qwen3527b, qwen3827b, qwen3824t, qwen3535ba3b,
+  qwen3508b, qwen354b, qwen38b, qwen359b, qwen3527b, qwen3827b, qwen3535ba3b,
   glm52, kimiK25,
 ] as ModelManifest[];
 
@@ -170,13 +200,30 @@ function toSpec(m: ModelManifest): ModelSpec {
     approxWeightsBytes: m.layer_weight_bytes + m.shared_weight_bytes,
     available: m.available,
     backend: m.backend,
-    contextMax: m.context_max,
-    singleNode: m.deployment !== "cluster",
+    contextMax: Math.max(m.context_max, m.context_yarn_max || 0),
     note: m.note,
   };
 }
 
 export const MODELS: ModelSpec[] = MANIFESTS.map(toSpec);
+
+/**
+ * Families withdrawn from the client (product decision). 2026-08-25: the
+ * original Qwen3 generation. 2026-09-02: the whole qwen3.5 generation as well —
+ * little of it gets used for agent work, which is the case these endpoints are
+ * for. Only qwen3.8 remains offered.
+ *
+ * Delisted, NOT deleted: the manifests stay imported and the engine registry is
+ * untouched, so these can come back by removing a string from the set below.
+ * (Contrast qwen3.8-2.4t-a95b, removed outright on 2026-09-02 — its shipped
+ * quant does not load on the pinned engine and it is not coming back.)
+ * The manifests stay imported on purpose — weights already on disk keep their
+ * names (describeGguf) and a stored selection still resolves via getManifest —
+ * but nothing user-facing lists them, and isAvailable() saying "no" makes the
+ * settings loader migrate a stored selection of a delisted model back to the
+ * default model.
+ */
+const DELISTED_FAMILIES = new Set(["qwen3", "qwen3.5"]);
 
 /**
  * The models a user can actually pick.
@@ -186,9 +233,12 @@ export const MODELS: ModelSpec[] = MANIFESTS.map(toSpec);
  * reporting what it serves). But nothing user-facing should list a model the
  * engine cannot run: a greyed-out row with a "coming soon" badge is a promise
  * in the settings panel, and it pushed the four models that DO run below the
- * fold. Roadmap belongs in the docs, not in a picker.
+ * fold. Roadmap belongs in the docs, not in a picker. Delisted families are
+ * excluded here for the same reason, even though the engine CAN run them.
  */
-export const AVAILABLE_MODELS: ModelSpec[] = MODELS.filter((m) => m.available);
+export const AVAILABLE_MODELS: ModelSpec[] = MODELS.filter(
+  (m) => m.available && !DELISTED_FAMILIES.has(m.family)
+);
 
 /**
  * Models grouped into picker cards (2026-08-15; regrouped 2026-08-21).
@@ -235,7 +285,6 @@ export interface ModelBrand {
 const BRAND_OF: { family: string; id: string; label: string }[] = [
   { family: "qwen3.8", id: "qwen3.8", label: "Qwen3.8" },
   { family: "qwen3.5", id: "qwen3.5", label: "Qwen3.5" },
-  { family: "qwen3", id: "qwen3", label: "Qwen3" },
   { family: "deepseek", id: "deepseek", label: "DeepSeek" },
   { family: "kimi", id: "kimi", label: "Kimi" },
   { family: "glm", id: "glm", label: "GLM" },
@@ -283,9 +332,11 @@ export const DEFAULT_MODEL_ID = "deepseek-v4-flash";
 // (settings.ts still recognizes the stored sentinel and migrates it back to
 // the default model.)
 
-/** Is this id something the engine can run today? Unknown ids are not. */
+/** Is this id something the client offers today? Unknown and delisted ids
+ *  are not — the settings loader relies on that to migrate stored selections
+ *  of a withdrawn model back to the default. */
 export function isAvailable(id: string): boolean {
-  return MODELS.some((m) => m.id === id && m.available);
+  return AVAILABLE_MODELS.some((m) => m.id === id);
 }
 
 export function getModel(id: string): ModelSpec {
@@ -333,18 +384,6 @@ export function describeGguf(file: string): { label: string; quant?: string } | 
   const shard = /^L(\d+)[-_](\d+)\.gguf$/i.exec(want);
   if (shard) return { label: `Layer shard ${shard[1]}–${shard[2]}` };
   return null;
-}
-
-/**
- * Is this model served by a single machine?
- *
- * Small models are: they fit one node, and splitting one over a LAN spends more
- * time on pipeline round-trips than on compute. The coordinator enforces it
- * (it exits rather than accept a second worker), so the UI must not offer a
- * path that ends in that refusal.
- */
-export function isSingleNode(id: string): boolean {
-  return getManifest(id).deployment !== "cluster";
 }
 
 // ---- precision (quant) selection -------------------------------------------
@@ -399,71 +438,126 @@ export function estimateHostableLayers(usableVramBytes: number, model: ModelSpec
 }
 
 // ---- cluster capacity guidance ---------------------------------------------
-// Answers the question the dashboard must answer BEFORE pairing: "is my
-// hardware enough, and if not, how far off am I?" Mirrors the engine's
-// estimate shape (src/common/model.c idletoken_model_overhead + plan.c
-// idletoken_needed_bytes), driven by the model's manifest: DSv4 uses the
-// per-tier table, MLA-KV models (GLM/Kimi) use base + bytes/token/layer.
-// Same caveat as engine-side: ESTIMATES pending real-machine calibration.
-const GiB = 1024 ** 3;
+// One formula with the llama.cpp scheduler (src/common/plan.c): selected
+// weight bytes + the exact manifest/GGUF KV geometry + the calibrated per-node
+// engine allocation. Do not add a UI-only "safety margin" here; any number not
+// present in the engine formula makes the card and the eventual launch disagree.
+// Per-node cost, mirroring plan.c: the MEASURED CUDA context (878 MiB on the
+// RTX 5060 Ti, derived from NVML free outside the engine process minus the free
+// the engine reports from inside it) plus the single 100 MiB margin. Metal has
+// no context analogue, so charging the CUDA figure there is conservative.
+// This is per NODE because each machine runs its own engine process; weights,
+// KV and the graph workspace are split by the tensor split instead.
+const LLAMA_CUDA_CONTEXT_BYTES = 878 * 1024 ** 2;
+const LLAMA_NODE_MARGIN_BYTES = 100 * 1024 ** 2;
 
-function overheadBytes(m: ModelManifest, ctx: number, layersOnNode: number): number {
-  if (m.kv.kind === "mla") {
-    const kv = m.kv.bytes_per_token_per_layer * ctx * Math.max(1, layersOnNode);
-    return (m.overhead_base_bytes + kv) * 1.1; // +10% margin, engine parity
+/** The measured workspace for a context size on a backend, or 0 when
+ *  unmeasured. Two product tiers, two measurements — nothing in between to
+ *  interpolate, and interpolating is what this replaced.
+ *
+ *  An unknown backend takes the LARGER of the two, matching plan.c: picking one
+ *  would be a guess about the machine, and on GLM-5.2 that guess is wrong by
+ *  22x in the direction that OOMs. */
+export type NodeBackend = "cuda" | "metal" | "unknown";
+
+/** OS -> backend, mirroring IDLETOKEN_BACKEND_OF_OS in include/idletoken_plan.h.
+ *  Sound because hard constraint #3 admits exactly two compute configurations:
+ *  Windows/Linux on CUDA, macOS on Metal. An unknown OS stays "unknown", which
+ *  charges the larger of the two rather than guessing the common case. */
+export function backendOfOs(os: string | undefined): NodeBackend {
+  if (os === "macos") return "metal";
+  if (os === "windows" || os === "linux") return "cuda";
+  return "unknown";
+}
+
+export function computeBytesFor(
+  man: ModelManifest,
+  ctx: number,
+  backend: NodeBackend = "unknown",
+): number {
+  const oneM = ctx > 262144;
+  const cuda = (oneM ? man.compute_bytes_1m_cuda : man.compute_bytes_256k_cuda) ?? 0;
+  const metal = (oneM ? man.compute_bytes_1m_metal : man.compute_bytes_256k_metal) ?? 0;
+  if (backend === "cuda") return cuda;
+  if (backend === "metal") return metal;
+  if (cuda === 0 || metal === 0) return 0;
+  return Math.max(cuda, metal);
+}
+
+function quantBits(quant: string): number {
+  const m = /(?:^|[^A-Za-z0-9])(?:MXFP|FP|I?Q|BF|F)(\d+)/i.exec(quant);
+  return m ? Number(m[1]) : 0;
+}
+
+function kvGrowthScale(quant: string): number {
+  const bits = quantBits(quant);
+  if (bits >= 1 && bits <= 2) return 18 / 64; // q4_0 block bytes / f16
+  if (bits >= 3 && bits <= 4) return 34 / 64; // q8_0 block bytes / f16
+  return 1; // >=5-bit and unknown use the engine's conservative f16-first rule
+}
+
+function roundCells256(cells: number): number {
+  return Math.ceil(cells / 256) * 256;
+}
+
+/** One sequence's actual cache/state allocation for the selected context and
+ * automatic KV tier. Fixed recurrent/compressor state stays f32 and is not
+ * scaled with K/V dtype. */
+export function kvBytesForContext(m: ModelManifest, ctx: number, quant: string): number {
+  const scale = kvGrowthScale(quant);
+  if (m.kv.raw_bytes_per_cell) {
+    const raw = m.kv.raw_bytes_per_cell * ctx;
+    const csa = (m.kv.csa_bytes_per_cell ?? 0) * roundCells256(Math.ceil(ctx / 4));
+    const hca = (m.kv.hca_bytes_per_cell ?? 0) * roundCells256(Math.ceil(ctx / 128));
+    return (raw + csa + hca) * scale + (m.kv.fixed_bytes_per_sequence ?? 0);
   }
-  // dsv4: calibrated per-tier table (docs/architecture.md §5)
-  if (ctx <= 8192) return 1.5 * GiB;
-  if (ctx <= 32768) return 2 * GiB;
-  if (ctx <= 131072) return 3 * GiB;
-  if (ctx <= 524288) return 6 * GiB;
-  return 9 * GiB;
+  if (m.kv.kind === "hybrid") {
+    const interval = Math.max(1, m.kv.full_attention_interval ?? 1);
+    const full = Math.ceil(m.n_layers / interval);
+    const linear = m.n_layers - full;
+    return m.kv.bytes_per_token_per_layer * full * ctx * scale
+      + (m.kv.state_bytes_per_layer ?? 0) * linear;
+  }
+  return m.kv.bytes_per_token_per_layer * m.n_layers * ctx * scale;
 }
 
 export interface CapacityEstimate {
   needBytes: number; // whole-cluster requirement at this tier / node count
-  haveBytes: number; // this machine's usable contribution (VRAM+RAM aware)
+  haveBytes: number; // this machine's usable VRAM contribution
   gapBytes: number; // max(0, need - have)
-  hostableLayers: number; // layers THIS machine could hold (incl. RAM offload)
-  // Node count the estimate was actually computed for. Equals the `nNodes`
-  // argument for cluster models and is always 1 for single-node ones — the UI
-  // must quote THIS number, not what it asked for, or it would tell the user
-  // "needs 5 GB across 3 machines" about a model the engine will only ever run
-  // on one.
+  hostableLayers: number; // layers THIS GPU could hold
+  // Node count the estimate was actually computed for.
   nodes: number;
 }
 
-/** One machine's contribution to the pool, in the shape the estimator takes. */
+/** One machine's contribution to the GPU-only serving pool. Legacy roster
+ * fields may still carry RAM for wire compatibility; estimation ignores it. */
 export interface NodeMemory {
   vramFree?: number;
-  ramFree?: number;
-  unifiedMemory?: boolean;
 }
 
 /**
  * Add up what a whole cluster brings (2026-08-15).
  *
- * Every machine measures its own memory and sends it with its join, so the
- * roster already carries the numbers — this just totals them, applying the
- * engine's rule per machine: unified memory (Apple Silicon) is ONE physical
- * pool and is counted once, discrete VRAM and RAM add up.
+ * Every machine measures its own GPU working-set budget and sends it with its
+ * join, so the roster already carries the numbers — this just totals VRAM.
+ * Unified-memory platforms report their one GPU budget in vramFree.
  *
  * `complete` is false when any member reported nothing (an older build). The
  * total is then a lower bound, and the caller must say "cannot tell" rather
  * than declare a shortfall that may not exist — a wrong "not enough" would
  * send someone shopping for hardware they already have.
  */
-export function poolMemory(nodes: NodeMemory[]): { bytes: number; complete: boolean } {
+export function poolVram(nodes: NodeMemory[]): { bytes: number; complete: boolean } {
   let bytes = 0;
   let complete = nodes.length > 0;
   for (const n of nodes) {
     const v = n.vramFree ?? 0;
-    const r = n.ramFree ?? 0;
-    if (v === 0 && r === 0) {
+    if (v === 0) {
       complete = false;
       continue;
     }
-    bytes += n.unifiedMemory ? Math.max(v, r) : v + r;
+    bytes += v;
   }
   return { bytes, complete };
 }
@@ -473,30 +567,38 @@ export function poolMemory(nodes: NodeMemory[]): { bytes: number; complete: bool
 // the guidance stays honest either way.
 export function estimateClusterCapacity(
   model: ModelSpec,
-  mem: { vram_usable: number; ram_usable: number; unified_memory: boolean },
+  mem: { vram_usable: number },
   ctx: number,
   nNodes: number,
-  quant?: string // selected precision; changes the weight bytes → feasibility
+  quant?: string, // selected precision; changes the weight bytes → feasibility
+  // Which backend the machines run. Not cosmetic: GLM-5.2's measured workspace
+  // is 1.50 GiB on CUDA and 33.25 GiB on Metal, so charging the wrong one is a
+  // 22x error. Omitted = "unknown" = charge the larger, never the cheaper.
+  backend: NodeBackend = "unknown"
 ): CapacityEstimate {
   const man = getManifest(model.id);
-  // A single-node model is sized for ONE machine no matter how many are
-  // paired — pooling their memory would promise a configuration the
-  // coordinator refuses to start (engine parity: src/common/advise.c).
-  const n = man.deployment === "cluster" ? Math.max(1, nNodes) : 1;
-  const avgLayers = man.n_layers > 0 ? Math.ceil(man.n_layers / n) : 1;
-  const overhead = overheadBytes(man, ctx, avgLayers);
+  const n = Math.max(1, nNodes);
   // Size the SELECTED precision (falls back to the manifest scalars when the
   // model has no variant menu) so the guidance tracks the quant dropdown.
   const v = getVariant(model.id, quant);
   const layerBytes = v ? v.layer_weight_bytes : man.layer_weight_bytes;
   const sharedBytes = v ? v.shared_weight_bytes : man.shared_weight_bytes;
-  const needBytes = layerBytes + n * (sharedBytes + overhead);
-  // Unified memory is one physical pool — never count it twice (plan.c rule).
-  const haveBytes = mem.unified_memory
-    ? Math.max(mem.vram_usable, mem.ram_usable)
-    : mem.vram_usable + mem.ram_usable;
-  const perLayer = man.n_layers > 0 ? layerBytes / man.n_layers : 0;
-  const usableForLayers = haveBytes - sharedBytes - overhead;
+  const weightBytes = layerBytes + sharedBytes;
+  const kvBytes = kvBytesForContext(man, ctx, quant || defaultQuant(model.id));
+  const nodeOverhead = LLAMA_CUDA_CONTEXT_BYTES + LLAMA_NODE_MARGIN_BYTES;
+  // The graph workspace is charged ONCE for the cluster, like weights and KV:
+  // the tensor split divides the graph. Only the CUDA context is per-node.
+  const computeBytes = computeBytesFor(man, ctx, backend);
+  const needBytes = weightBytes + kvBytes + computeBytes + n * nodeOverhead;
+  // Product capacity is GPU-addressable memory only. On unified-memory
+  // machines the native probe already reports the GPU working-set budget in
+  // vram_usable, so there is still exactly one number to count.
+  const haveBytes = mem.vram_usable;
+  // Same split basis as plan.c's tensor-split cap: weights, KV and workspace
+  // all divide with the layers, so the workspace belongs in the per-layer cost.
+  const perLayer =
+    man.n_layers > 0 ? (weightBytes + kvBytes + computeBytes) / man.n_layers : 0;
+  const usableForLayers = haveBytes - nodeOverhead;
   const hostableLayers =
     perLayer > 0
       ? Math.max(0, Math.min(man.n_layers, Math.floor(usableForLayers / perLayer)))
@@ -524,12 +626,8 @@ export function estimateClusterCapacity(
  * Usage comes from `estimateClusterCapacity`'s needBytes, **the same source as
  * the capability panel and the planner** -- no second estimator.
  *
- * WARNING: the test must be GPU_ONLY, not that function's `gapBytes` -- its
- * "have" is VRAM+RAM, i.e. HYBRID, where weights spill into host memory. The
- * first version did exactly that and ended up recommending 27B for an 8 GB card
- * and 9B for a 4 GB one: technically "it fits", measured at **0.77 tok/s**.
- * Recommending a configuration slow enough to make someone uninstall is far
- * worse than recommending a small model.
+ * The estimator itself is GPU-only, so its `gapBytes` now answers this exact
+ * question without a second VRAM-vs-RAM interpretation.
  *
  * When nothing fits in VRAM it returns the **smallest** one: the capability panel
  * still explains how much is missing, and that beats leading with a 304B model,
@@ -539,7 +637,7 @@ export function pickBestFittingModel(
   mem: { vram_usable: number; ram_usable: number; unified_memory: boolean },
   ctx: number
 ): { modelId: string; quant: string } {
-  const usable = MODELS.filter((m) => getManifest(m.id).available);
+  const usable = AVAILABLE_MODELS;
   if (usable.length === 0) return { modelId: DEFAULT_MODEL_ID, quant: defaultQuant(DEFAULT_MODEL_ID) };
   const bytes = (m: ModelSpec) => weightsBytesForQuant(m, defaultQuant(m.id));
   const desc = [...usable].sort((a, b) => bytes(b) - bytes(a));

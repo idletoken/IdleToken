@@ -22,13 +22,11 @@
 // quality we can vouch for. Model requests go through GitHub issues.
 import { useEffect, useState } from "react";
 import { useI18n } from "./i18n";
-import { AVAILABLE_MODELS, defaultQuant, hasQuantChoice, quantOptions, isSingleNode } from "./models";
+import { AVAILABLE_MODELS, defaultQuant, hasQuantChoice, quantOptions } from "./models";
 import { fmtBytes } from "./format";
 import { useDialog } from "./useDialog";
-import { loadCapability, type CapabilityMode, type CapabilityRow } from "./Capability";
+import { loadLocalCapability, type CapabilityMode, type CapabilityRow } from "./Capability";
 import { fetchLeaderboard } from "./platform";
-import { openExternal } from "./auth";
-import { ISSUES_URL } from "./links";
 
 /** What the cluster is running right now, which is what a switch would have to
  *  restart. `null` = nothing is running, so a pick costs nothing.
@@ -43,27 +41,17 @@ export interface RunningModel {
   machines: number;
 }
 
-/** The advisor's three states, worded exactly as the capability table words
- *  them — one verdict must not read differently on two screens. "unavailable"
+/** The local advisor's three states. These labels deliberately say "locally":
+ *  a cluster may still run a model that this one machine cannot. "unavailable"
  *  (an old engine's "backend not implemented") collapses into "won't run",
  *  same as it does there. */
-function fitKey(mode: CapabilityMode): "cap.yesGpu" | "cap.yesHybrid" | "cap.no" {
+function fitKey(mode: CapabilityMode): "cap.yesGpu" | "cap.no" {
   if (mode === "gpu_only") return "cap.yesGpu";
-  if (mode === "hybrid") return "cap.yesHybrid";
   return "cap.no";
 }
 function fitClass(mode: CapabilityMode): string {
   if (mode === "gpu_only") return "is-fast";
-  if (mode === "hybrid") return "is-slow";
   return "is-no";
-}
-
-/** 1_234_567 → "1.2M". Order of magnitude is the point; exact counts are not. */
-function shortCount(n: number): string {
-  if (n >= 1e9) return `${(n / 1e9).toFixed(n >= 1e10 ? 0 : 1)}B`;
-  if (n >= 1e6) return `${(n / 1e6).toFixed(n >= 1e7 ? 0 : 1)}M`;
-  if (n >= 1e3) return `${(n / 1e3).toFixed(n >= 1e4 ? 0 : 1)}K`;
-  return String(n);
 }
 
 export default function ModelPicker(props: {
@@ -71,9 +59,6 @@ export default function ModelPicker(props: {
   modelId: string;
   quant: string;
   running: RunningModel | null;
-  /** The paired cluster's API, when there is one: the fit verdicts then cover
-   *  the whole pool instead of this machine alone. */
-  apiBaseUrl?: string | null;
   /** Apply the pick. The caller saves it and performs any restart. */
   onPick: (modelId: string, quant: string) => void;
   onClose: () => void;
@@ -103,14 +88,14 @@ export default function ModelPicker(props: {
     };
   }, []);
 
-  // The three-state fit verdict per model. NOT recomputed here: it comes from
-  // the engine's advisor through the same loader the capability table uses
-  // (Capability.tsx). A second derivation in TypeScript is exactly what that
-  // file's header forbids.
+  // The three-state LOCAL fit verdict per model. It always comes from this
+  // machine's advisor, even while a cluster is online: otherwise the same chip
+  // would silently change from "this machine" to "whole cluster" depending on
+  // connection state. A second derivation in TypeScript remains forbidden.
   const [fit, setFit] = useState<Map<string, CapabilityRow[]>>(new Map());
   useEffect(() => {
     let alive = true;
-    loadCapability(props.apiBaseUrl)
+    loadLocalCapability()
       .then((rep) => {
         if (!alive) return;
         const by = new Map<string, CapabilityRow[]>();
@@ -123,7 +108,7 @@ export default function ModelPicker(props: {
     return () => {
       alive = false;
     };
-  }, [props.apiBaseUrl]);
+  }, []);
   // A pick that is waiting for confirmation because it would restart something.
   const [pending, setPending] = useState<{ modelId: string; quant: string } | null>(null);
 
@@ -179,13 +164,6 @@ export default function ModelPicker(props: {
 
   const curQuant = cur.quant || defaultQuant(cur.modelId);
 
-  // Usage order when we have it, manifest order otherwise. Models the platform
-  // has never served keep their manifest position AFTER the ranked ones — a
-  // model nobody has run yet is not the same as a model that ranked last.
-  const ordered = usage
-    ? [...AVAILABLE_MODELS].sort((a, b) => (usage.get(b.id) ?? -1) - (usage.get(a.id) ?? -1))
-    : AVAILABLE_MODELS;
-
   /** The advisor's verdict for this model at this precision (exact row first,
    *  otherwise any row for the model — an older engine may report one quant). */
   const fitOf = (modelId: string, quant: string): CapabilityMode | null => {
@@ -199,6 +177,20 @@ export default function ModelPicker(props: {
   // could even reach the precision dropdown. Now the row and the dropdown
   // only edit this draft; the Apply button is the one thing that acts.
   const [sel, setSel] = useState({ modelId: cur.modelId, quant: curQuant });
+
+  // Usage rank (or manifest order) is the base sequence; runnable models then
+  // come first. "Unknown" sits between runnable and won't-run so a row does
+  // not jump to the bottom merely because the advisor is still loading.
+  const ranked = usage
+    ? [...AVAILABLE_MODELS].sort((a, b) => (usage.get(b.id) ?? -1) - (usage.get(a.id) ?? -1))
+    : AVAILABLE_MODELS;
+  const runRank = (m: (typeof AVAILABLE_MODELS)[number]): number => {
+    const mode = fitOf(m.id, m.id === sel.modelId ? sel.quant : defaultQuant(m.id));
+    if (mode === "gpu_only") return 0;
+    return mode ? 2 : 1;
+  };
+  // Array.prototype.sort is stable: equal ranks keep the usage/manifest order.
+  const ordered = [...ranked].sort((a, b) => runRank(a) - runRank(b));
 
   return (
     <div className="modelpick" ref={ref} role="dialog" aria-label={t("model.pick.title")}>
@@ -226,12 +218,10 @@ export default function ModelPicker(props: {
         </div>
       ) : (
         <>
-          {/* The label IS the signal that the order below came from usage data.
-              Absent = the static manifest order (see the fetch above). */}
-          {usage ? <p className="modelpick__ranked">{t("model.rank.byUsage")}</p> : null}
+          {/* No "ordered by usage" caption (cut 2026-08-26 with the token
+              chips): the ranking still drives the order, silently. */}
           <div className="modelpick__list">
             {ordered.map((m) => {
-              const tokens = usage?.get(m.id);
               const mode = fitOf(m.id, m.id === sel.modelId ? sel.quant : defaultQuant(m.id));
               return (
                 <button
@@ -240,37 +230,23 @@ export default function ModelPicker(props: {
                   onClick={() => setSel({ modelId: m.id, quant: defaultQuant(m.id) })}
                 >
                   <span className="modelpick__name">{m.label}</span>
-                  {/* Whether a model can be pooled changes what the Cluster screen
-                      will let you do next, and it is not guessable from the size. */}
-                  <span className="modelpick__deploy">
-                    {t(isSingleNode(m.id) ? "settings.model.singleNode" : "settings.model.cluster")}
-                  </span>
                   <span className="modelpick__meta">
-                    <span className="modelpick__params">{m.params}</span>
+                    {/* Parameter counts cut 2026-08-26 (owner's call): "1T ·
+                        32B active" does not help the pick; the name and the
+                        fit chip do. */}
                     {/* Can these machines actually run it — the advisor's verdict.
                         Since 2026-08-21 this chip is the ONLY place it appears:
                         the capability table was cut to four columns and the
                         "Can run" one went with the rest. */}
                     {mode ? <span className={`modelpick__fit ${fitClass(mode)}`}>{t(fitKey(mode))}</span> : null}
-                    {/* Usage only when there IS usage: a "0 tokens" chip reads as
-                        "nobody runs this", which is not what missing data means. */}
-                    {tokens ? (
-                      <span className="modelpick__usage">{t("model.rank.tokens", { n: shortCount(tokens) })}</span>
-                    ) : null}
+                    {/* The 7-day token chip was cut 2026-08-26 (owner's call):
+                        platform usage numbers do not help someone pick a model
+                        to RUN HERE. Ranking still uses the usage ordering. */}
                   </span>
                 </button>
               );
             })}
           </div>
-          {/* A model you want that is not listed: the answer is a GitHub issue,
-              not a file box — see model.request.hint. The sentence used to say
-              "request it in a GitHub issue" with nothing to click (A-P1-4). */}
-          <p className="modelpick__open-hint">
-            {t("model.request.hint")}{" "}
-            <button className="linkbtn" onClick={() => void openExternal(ISSUES_URL)}>
-              {t("model.request.link")} ↗
-            </button>
-          </p>
           {/* Precision belongs to the selected model, so it stays a separate row
               rather than multiplying the list by five. */}
           {hasQuantChoice(sel.modelId) ? (

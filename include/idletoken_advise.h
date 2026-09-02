@@ -3,9 +3,8 @@
  * The first question a non-expert has after installing is not "which quant
  * should I pick", it is "can my computer run any of this at all". This module
  * answers it: given the memory of one machine (or of a whole cluster), it walks
- * every registered model × every shipped precision and reports the best mode
- * (GPU_ONLY / HYBRID / no) plus the largest context tier that fits — and, when
- * the answer is no, HOW MUCH memory is missing.
+ * every registered model × every shipped precision and reports whether exact
+ * 256K and 1M GPU-only services fit — and, when not, how much VRAM is missing.
  *
  * Every verdict comes from the planner (`idletoken_mode_decide_quant`), never from
  * a second estimate written here. A capability table that disagrees with the
@@ -21,9 +20,8 @@
 #include "idletoken_model.h"
 #include "idletoken_plan.h"
 
-/* Context tiers (8K / 32K / 128K / 512K / 1M). The
- * advisor reports the largest tier a given (model, quant) fits in; a model
- * whose own context_max is smaller is capped to it. */
+/* Product contexts are exact 256K (default) and 1M (explicit opt-in), capped
+ * by the model's declared ability. There is no automatic smaller tier. */
 /* One row per (model, precision). Raised from 128 on 2026-08-15, when the
  * catalogue stopped listing "the three or four quants we measured" and started
  * listing every precision the upstream repos publish (~140 rows today). A cap
@@ -35,8 +33,8 @@ typedef struct {
     const char *model_id;
     const char *label;      /* human name from the manifest */
     const char *quant;      /* "" when the model ships a single precision */
-    idletoken_mode mode;       /* GPU_ONLY / HYBRID / REFUSE */
-    uint32_t    max_ctx;    /* largest tier that fits in `mode`; 0 when REFUSE */
+    idletoken_mode mode;       /* GPU_ONLY / REFUSE */
+    uint32_t    max_ctx;    /* exact product context that fits; 0 when REFUSE */
     uint64_t    weight_bytes;   /* download size at this precision */
     /* Memory the whole cluster must have to serve this (model, precision):
      * layer weights + per-node shared weights + per-node inference overhead,

@@ -19,19 +19,52 @@
 typedef enum {
     IDLETOKEN_MODE_REFUSE   = 0,
     IDLETOKEN_MODE_GPU_ONLY = 1,   /* value matches the ASSIGN_PLAN mode byte */
-    IDLETOKEN_MODE_HYBRID   = 2,
 } idletoken_mode;
+
+/* Product service ceiling. 256K is the client default; 1M is an explicit
+ * service choice. Context never changes automatically. */
+#define IDLETOKEN_PRODUCT_CONTEXT_CAP 1048576u
+
+uint32_t idletoken_llama_product_ctx_ceiling(
+    const idletoken_model_spec *model);
+
+/* Which compute backend a node runs. Needed because the graph workspace is
+ * NOT backend-independent: measured 2026-09-01, GLM-5.2 at 256K reserves
+ * 1.50 GiB on CUDA and 33.3 GiB on Metal — 22x — while the Qwen family agrees
+ * byte for byte. One number per model would therefore be right for some models
+ * and 22x wrong for others.
+ *
+ * UNKNOWN is 0 so that a zero-initialized row (which the node_mem contract
+ * below requires) cannot silently claim a backend it never reported. The
+ * planner charges the LARGER of the two backends for an unknown node — the
+ * safe direction, and visibly conservative rather than quietly wrong. */
+typedef enum {
+    IDLETOKEN_NODE_BACKEND_UNKNOWN = 0,
+    IDLETOKEN_NODE_BACKEND_CUDA    = 1,
+    IDLETOKEN_NODE_BACKEND_METAL   = 2,
+} idletoken_node_backend;
+
+/* OS family -> backend, using the idletoken_os_family values. Sound because
+ * hard constraint #3 admits exactly two compute configurations: Windows/Linux
+ * on CUDA, macOS on Metal. Derived from a field the roster already carries, so
+ * no wire change was needed to know this. An unknown OS stays UNKNOWN rather
+ * than defaulting to the common case. */
+#define IDLETOKEN_BACKEND_OF_OS(os) \
+    ((os) == 3 /* IDLETOKEN_OS_MACOS */ ? IDLETOKEN_NODE_BACKEND_METAL \
+   : ((os) == 1 || (os) == 2)           ? IDLETOKEN_NODE_BACKEND_CUDA  \
+   :                                      IDLETOKEN_NODE_BACKEND_UNKNOWN)
 
 typedef struct {
     uint64_t vram_usable;
     uint64_t ram_usable;
-    /* Measured ceiling on pinned host memory; 0 = unknown/unconstrained.
-     * HYBRID spills into pinned memory, so this — not ram_usable — bounds the
-     * host side of a node's shard. See idletoken_resource.h for why it must be
-     * measured rather than derived. */
+    /* Legacy probe fields retained for roster compatibility. Serving capacity
+     * is GPU-only; neither field contributes to planning. */
     uint64_t ram_pinnable;
     uint8_t  unified;   /* 1 = unified memory host (vram aliases ram) */
-    /* Which machine this row is (hostname / node id). NULL = unnamed, and the
+    /* idletoken_node_backend. Derived from the probe's gpu_vendor; unified
+     * memory is NOT a proxy for it (the DGX is CUDA and unified). */
+    uint8_t  backend;
+    /* Which machine this row is (hostname / node id). Empty = unnamed, and the
      * planner then says "node #i" instead.
      *
      * Why the planner needs a name at all: every number above is a machine's
@@ -41,23 +74,31 @@ typedef struct {
      * machines with no idea which one to look at. Same standard as the
      * engine-version gate, which names the machine that must upgrade.
      *
+     * Keep the name inline rather than borrowing a pointer into a roster. The
+     * capability endpoint is served by a thread pool and outlives several of
+     * the stack adapters that create these rows; a borrowed or uninitialized
+     * pointer here used to crash the coordinator while a chat stream was live.
+     *
      * ⚠ **Zero-initialize this struct** (`= {0}` / designated initializers /
-     * memset) before filling fields one by one. A pointer field left
-     * uninitialized on the stack is not a wrong name, it is a crash — which is
-     * exactly how adding this field broke plan_test on 2026-08-15. The struct
-     * already carries a scar from a field insertion (see `ram_pinnable` and
-     * the comment in src/tools/plan_test.c); this is its pointer-shaped twin. */
-    const char *label;
+     * memset) before filling fields one by one. This also protects every
+     * future scalar field from becoming stack garbage. */
+    char label[64];
 } idletoken_node_mem;
 
-/* needed = model layer weights + per-node duplicated shared weights (every
- * stage loads embd/head) + per-node inference overhead (KV + compressed
- * state + activations + CUDA workspace + comms — idletoken_model_overhead()
- * with an average layers-per-node estimate).
- * ⚠ Overheads are ESTIMATES pending real-machine calibration — Spark's
- * unified memory can't produce valid numbers. */
+/* Whole-cluster admission bytes for the selected precision:
+ *
+ *   exact measured GGUF weight bytes
+ * + exact engine-shaped KV/recurrent state for `ctx_size`
+ * + the MEASURED graph workspace for `ctx_size` on `backend`
+ * + n_nodes * (measured CUDA context + the single 100 MiB margin)
+ *
+ * Every term is measured, none is a slope on the weights: the closed form that
+ * used to sit here (768 MiB + weight_bytes/64) was 8.2x low on GLM-5.2 at 256K
+ * and 22x too high if applied with the wrong backend
+ * (results/memory-need-measured-20260901.md). Cache-cell padding still matches
+ * the compiled llama.cpp planner byte-for-byte. */
 uint64_t idletoken_needed_bytes(const idletoken_model_spec *model,
-                             uint32_t ctx_size, int n_nodes);
+                             uint32_t ctx_size, int n_nodes, uint8_t backend);
 
 /* Same, for an explicitly chosen precision. Small models ship several quants
  * whose weight bytes differ by 3-4x, so "can I run this?" is only answerable
@@ -65,16 +106,12 @@ uint64_t idletoken_needed_bytes(const idletoken_model_spec *model,
  * making this a strict superset of idletoken_needed_bytes. */
 uint64_t idletoken_needed_bytes_quant(const idletoken_model_spec *model,
                                    const char *quant,
-                                   uint32_t ctx_size, int n_nodes);
+                                   uint32_t ctx_size, int n_nodes,
+                                   uint8_t backend);
 
-/* Mode decision (docs/architecture.md §5):
- *   Σ usable_vram              >= needed  → GPU_ONLY
- *   Σ (usable_vram+usable_ram) >= needed  → HYBRID, but every node must keep
- *                                           ≥4 GiB usable VRAM (CUDA context
- *                                           + workspace + ≥1 GPU layer)
- *   else                                  → REFUSE
- * Unified-memory nodes contribute max(vram, ram) exactly once — the pool is
- * the same physical memory, summing both would double-count.
+/* Mode decision: Σ usable_vram >= exact need → GPU_ONLY, otherwise REFUSE.
+ * System RAM is never serving capacity. On unified-memory machines the probe
+ * reports the GPU working-set budget in vram_usable, so it is still one pool.
  * `why` (optional) receives a short human-readable reason. */
 /* Quant-aware mode decision + the shortfall when the answer is REFUSE.
  * `idletoken_mode_decide` below is this with quant=NULL and no shortfall — one
@@ -95,9 +132,8 @@ idletoken_mode idletoken_mode_decide(const idletoken_model_spec *model,
  * (callers pass nodes sorted strongest-first). Every node gets ≥1 layer;
  * remainders land on the strongest nodes. out_counts[i] = node i's layer
  * count, Σ == n_layers. Returns 0, or -1 when n <= 0 or n > n_layers.
- * `mode` sets the sizing weight: GPU_ONLY splits by usable VRAM (all layers in
- * fast device memory); HYBRID splits by total usable capacity (VRAM+RAM) so a
- * node holds layers up to its combined memory and offloads the overflow.
+ * `mode` is retained in this pure helper's ABI and must be GPU_ONLY. Splits use
+ * usable VRAM only, with every layer resident on a GPU.
  * `ctx_size` feeds the per-node capacity cap: after the proportional pass the
  * split is repaired so no node is assigned more layers than
  * (its usable memory − shared weights − per-tier overhead) can hold — the
@@ -124,23 +160,13 @@ int idletoken_plan_layers(const idletoken_model_spec *model,
  *
  * Usable memory per node (the formula; calibration constants are estimates):
  *
- *   unified == 0 (discrete GPU): usable = vram_usable + ram_usable.
- *       llama.cpp keeps -ngl layers in VRAM and the remainder in host RAM;
- *       both pools genuinely hold weights, so both count. The probe already
- *       subtracted other processes + safety margins (idletoken_resource.h).
- *
- *   unified == 1 (Apple Silicon / Grace): usable = max(vram_usable,
- *       ram_usable), counted ONCE — one physical pool, summing would
- *       double-count. On macOS the probe reports vram_usable =
- *       min(Metal recommendedMaxWorkingSetSize, ram_usable) − workspace
- *       reserve (src/common/resource.c, Darwin probe_gpu): the working-set
- *       recommendation IS Apple's "total minus OS reserve" number (measured
- *       ~74% of physical on the 16 GiB M4). Exact per-machine calibration of
- *       the workspace constant is TODO (v2 plan §1.3) — the structure is here,
- *       the constant is a reasoned reuse of the CUDA workspace reserve.
+ *   usable = vram_usable on every platform. On Apple Silicon / Grace this is
+ *   the probed GPU working-set budget for the unified pool, counted once.
+ *   ram_usable remains telemetry only and never enlarges serving capacity.
  */
 
 #define IDLETOKEN_LLPLAN_MAX_NODES 16
+#define IDLETOKEN_LLPLAN_MAX_DEVICES (IDLETOKEN_LLPLAN_MAX_NODES * 2 - 1)
 
 typedef enum {
     IDLETOKEN_LLPLAN_SINGLE  = 0,  /* run on one machine, no RPC */
@@ -155,6 +181,17 @@ typedef struct {
     uint32_t n_layers;           /* transformer blocks */
     uint64_t kv_bytes_per_token; /* whole-model KV bytes per context token;
                                   * 0 = unknown (charged as unknown, not free) */
+    /* Context-independent recurrent/compressor state for one sequence. This is
+     * NOT scaled when K/V cache dtype changes: Qwen hybrid state and DeepSeek4
+     * compressor state are f32 allocations in the pinned engine. */
+    uint64_t kv_fixed_bytes_per_seq;
+    /* DeepSeek4 exact cache geometry. Nonzero raw selects the padded cache
+     * formula in idletoken_llama_kv_bytes(); all are whole-model f16 bytes per
+     * cache cell. CSA/HCA cell counts are ceil(ctx/4) and ceil(ctx/128), then
+     * each is rounded up to 256 exactly like llama-kv-cache-dsv4.cpp. */
+    uint64_t dsv4_raw_bytes_per_cell;
+    uint64_t dsv4_csa_bytes_per_cell;
+    uint64_t dsv4_hca_bytes_per_cell;
     /* MoE: experts present and experts consulted per token (GGUF
      * `expert_count` / `expert_used_count`; both 0 on a dense model).
      *
@@ -167,7 +204,61 @@ typedef struct {
      * Same size, different machine requirement — one number cannot say both. */
     uint32_t n_expert;
     uint32_t n_expert_used;
+    /* MEASURED graph workspace at the two context tiers — llama.cpp's own
+     * no_alloc dry-run (`scripts/measure_model_memory.sh`), NOT an estimate.
+     * 0 = not measured for this model; the planner then refuses to guess.
+     *
+     * WHY MEASURED (2026-09-01, results/memory-need-measured-20260901.md):
+     * the closed form this replaces (`768 MiB + weights/64`) had no context
+     * term at all, and the workspace turns out to grow at a rate set by the
+     * model's ARCHITECTURE. Measured at 256K it was 59% high on Qwen3.5-0.8B
+     * and 9.6x LOW on DeepSeek-V2-Lite (9764 MiB actual vs 1013 MiB charged) —
+     * low enough to admit a run that then OOMs after a full load. No single
+     * formula covers both, so there is no formula here any more.
+     *
+     * Safe to carry per (model, ctx) alone: measured byte-identical across
+     * Metal / CUDA-unified / CUDA-discrete, and across every quantization
+     * (Q4_K_M..BF16 all 489.00 MiB on Qwen3.5-0.8B at 256K). It is a property
+     * of the compute graph, not of the GPU or the weights.
+     *
+     * ⚠ Re-measure when scripts/llamacpp-patches/UPSTREAM moves: the graph
+     * belongs to the engine. Same rule as the perplexity baselines.
+     *
+     * ⚠ Per BACKEND, not one number. Qwen3.5-0.8B and Qwen3.5-9B measure
+     * byte-identical on Metal and CUDA, which is what made a single value look
+     * safe; GLM-5.2 measures 33.3 GiB on Metal against 1.50 GiB on CUDA. Two
+     * agreeing models of one architecture family are not evidence about the
+     * rest of the list. */
+    uint64_t compute_bytes_256k_cuda;
+    uint64_t compute_bytes_1m_cuda;
+    uint64_t compute_bytes_256k_metal;
+    uint64_t compute_bytes_1m_metal;
 } idletoken_llm_model_size;
+
+/* The measured workspace for `ctx_size` on `backend`
+ * (idletoken_node_backend), or 0 when this model has no measurement for it.
+ * UNKNOWN yields the larger of the two. Exposed so the coordinator and the
+ * capability table ask the same question the planner does. */
+uint64_t idletoken_llama_compute_bytes(const idletoken_llm_model_size *model,
+                                       uint32_t ctx_size, uint8_t backend);
+
+/* The backend a homogeneous roster runs on, or UNKNOWN if the rows disagree or
+ * any row never reported one. Heterogeneous clusters are out of scope for the
+ * workspace budget (2026-09-01); UNKNOWN makes the planner charge the larger
+ * backend rather than pick one and be quietly wrong on the other machines. */
+uint8_t idletoken_llama_roster_backend(const idletoken_node_mem *nodes, int n);
+
+/* Exact one-sequence cache/state allocation for this model at `ctx_size`.
+ * Generic attention is linear KV + fixed recurrent state; DeepSeek4 follows
+ * the pinned engine's three-cache padded allocation. Saturates on overflow. */
+uint64_t idletoken_llama_kv_bytes(const idletoken_llm_model_size *model,
+                                  uint32_t ctx_size);
+
+/* Apply the chosen K/V dtype to growth caches only. Fixed recurrent state is
+ * f32 and deliberately unchanged. Used by the coordinator for both explicit
+ * and automatic KV precision so plan and spawned engine stay identical. */
+void idletoken_llama_model_kv_scale(idletoken_llm_model_size *model,
+                                    double scale);
 
 /* Bytes that must be RESIDENT (allocated, not evictable) for the model to run
  * at all, on `n_nodes` machines at `ctx_size`: KV cache + per-node engine
@@ -176,7 +267,8 @@ typedef struct {
  * 222 GiB model served from a 119 GiB machine with MemAvailable never below
  * 113 GiB (docs/resource-budget-rethink-2026-08.md §5). */
 uint64_t idletoken_llama_hard_need(const idletoken_llm_model_size *model,
-                                   uint32_t ctx_size, int n_nodes);
+                                   uint32_t ctx_size, int n_nodes,
+                                   uint8_t backend);
 
 /* Bytes touched per token — what memory has to CACHE for full speed. Dense:
  * the whole file. MoE: shared/attention layers plus only the experts a token
@@ -199,11 +291,7 @@ typedef struct {
     double tensor_split[IDLETOKEN_LLPLAN_MAX_NODES]; /* proportional, Σ = 1.0 */
     int    layer0_node;   /* == order[0] == coordinator (CLUSTER); == single_node (SINGLE) */
 
-    /* Expected speed, decided separately from feasibility (2026-08-16).
-     * 1 = the working set fits in memory, so weights are read from cache.
-     * 0 = it runs, but pages stream from disk each token — measured 0.91 tok/s
-     *     for GLM-5.2 at 1.9x over-subscription. Honest to offer, dishonest to
-     *     present as equivalent, and it USED to be reported as a plain refusal. */
+    /* GPU-only admission always keeps the complete working set resident. */
     int    working_set_fits;
     uint64_t hard_need_bytes;    /* what must be resident (KV + per-node overhead) */
     uint64_t working_set_bytes;  /* what memory should cache for full speed */
@@ -211,15 +299,28 @@ typedef struct {
     char why[512];        /* human-readable decision / refusal reason */
 } idletoken_llama_plan;
 
+/* Mirror llama.cpp's LLAMA_SPLIT_MODE_LAYER placement for one contiguous
+ * interval of devices [dev_lo, dev_hi).  The returned [layer_lo, layer_hi)
+ * contains only repeating transformer layers; GGUF shared tensors are handled
+ * separately by the model-cache layer.  A device interval which owns no
+ * repeating layer returns [n_layers, n_layers).
+ *
+ * This is deliberately a public planning primitive: coordinator cache plans,
+ * worker cache plans, and heterogeneous-topology tests must all use the exact
+ * same rounding rule as the engine. */
+int idletoken_llama_device_layer_range(
+    unsigned n_layers, int n_gpu_layers,
+    const double *shares, int n_devices,
+    int dev_lo, int dev_hi,
+    unsigned *layer_lo, unsigned *layer_hi);
+
 /* Decide how to run `model` on `nodes` (n of them, coordinator = index of the
  * node this coordinator process runs on).
  *
- *   - Fits the coordinator → SINGLE (hard invariant #5: fits → don't
- *     cluster). The coordinator is the only machine that can legally run
- *     single: layer 0 + embedding may not move to a worker, so a strong
- *     worker never substitutes. `allow_small_cluster` (the acceptance
- *     harness's IDLETOKEN_ALLOW_SMALL_CLUSTER=1) forces CLUSTER even then —
- *     test vehicle only; callers plumb the env var, this function reads none.
+ *   - Fits the coordinator → SINGLE by default. The coordinator is the only
+ *     machine that can legally run single: layer 0 + embedding may not move to
+ *     a worker, so a strong worker never substitutes. `force_cluster` records
+ *     an explicit user choice and keeps CLUSTER even when SINGLE would fit.
  *   - Needs several nodes → CLUSTER with tensor_split; coordinator first and
  *     holding at least one layer's worth. A coordinator with no usable local
  *     compute memory → REFUSE (layer 0 + embedding may not leave it).
@@ -230,7 +331,7 @@ typedef struct {
 int idletoken_plan_llamacpp(const idletoken_llm_model_size *model,
                             const idletoken_node_mem *nodes, int n,
                             int coordinator, uint32_t ctx_size,
-                            int allow_small_cluster,
+                            int force_cluster,
                             idletoken_llama_plan *out);
 
 /* Largest context that fits `usable` bytes next to the weights + fixed
@@ -242,22 +343,46 @@ int idletoken_plan_llamacpp(const idletoken_llm_model_size *model,
  * kv_bytes_per_token == 0 (unknown KV shape) grants ctx_want unchanged:
  * inventing a KV cost would refuse machines that are actually fine, and the
  * engine itself still fails loudly if it cannot allocate. */
+/* `backend` is idletoken_node_backend: the workspace term differs per backend
+ * and this helper has no roster to derive it from. */
 uint32_t idletoken_llama_fit_ctx(uint64_t usable_bytes,
                                  const idletoken_llm_model_size *model,
-                                 uint32_t ctx_want, uint32_t ctx_floor);
+                                 uint32_t ctx_want, uint32_t ctx_floor,
+                                 uint8_t backend);
 
-/* The usable-memory formula documented above, exposed so the coordinator's
- * preflight and the planner can never drift apart. */
+/* Leading bit count of a weight-quant name ("IQ2_XXS"→2, "Q4_K_M"→4,
+ * "Q8_0"→8, "BF16"/"F16"→16, unknown/empty→0). Drives the tiered KV rule:
+ * the weight noise floor bounds what KV precision can possibly matter, so
+ * 1-2 bit weights take q4_0/q4_0, 3-4 bit take q8_0/q8_0, and >=5 bit keep
+ * the f16-first rule. 0 = cannot tell — treated as high precision (the
+ * conservative direction), never guessed low. */
+int idletoken_quant_weight_bits(const char *quant);
+
+/* Same answer read from a GGUF file NAME (the client launches the coordinator
+ * with only --llama-gguf; curated downloads carry the variant token in the
+ * filename). Last quant-shaped token wins; no match -> 0 (conservative). */
+int idletoken_quant_bits_from_path(const char *path);
+
+/* Automatic uniform K/V cache dtype fixed by the weight tier. Returns q4_0
+ * for 1-2 bit weights, q8_0 for 3-4 bit weights, and NULL when the high-
+ * precision f16-first capacity rule must decide. K and V deliberately use the
+ * same dtype: mixed CUDA flash-attention pairs were measured falling back to
+ * CPU on the pinned engine. This rule is identical in private and shared mode. */
+const char *idletoken_llama_kv_type_for_weight(int weight_bits);
+
+/* Legacy diagnostic rounding helper. Product startup uses the exact selected
+ * 262144 or 1048576 tokens; it never walks this tier list automatically. */
+uint32_t idletoken_llama_ctx_display_tier(uint32_t max_ctx);
+
+/* GPU-addressable serving pool, exposed so coordinator and planner cannot
+ * drift. System RAM is deliberately ignored. */
 uint64_t idletoken_llama_node_usable(const idletoken_node_mem *node);
 
 /* The pool the KV cache actually LIVES IN on this node — which is NOT the same
  * as what the model can be laid out across (idletoken_llama_node_usable).
  *
- *   unified == 1 → the usable pool. One physical memory; the two answers
- *                  coincide, which is why this distinction stayed invisible on
- *                  every Mac we develop on.
- *   unified == 0 → vram_usable ONLY. We spawn the engine with -ngl 99, so the
- *                  KV cache is allocated on the GPU; host RAM holds none of it.
+ * All platforms → vram_usable only. Unified-memory probes must place their GPU
+ * working-set budget in this field; host RAM is never added separately.
  *
  * Despite the name it is the general answer to "what can the engine backend on
  * this node allocate", and the CLUSTER split asks the same question of the

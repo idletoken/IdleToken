@@ -88,12 +88,18 @@ static int http_get(const char *endpoint, const char *path,
 }
 
 /* One real completion through the sidecar's own HTTP client, carrying `marker`
- * in the prompt. Returns 0 when the engine answered 200. */
-static int completion_ok(const char *endpoint, const char *marker) {
+ * in the prompt. Returns 0 when the engine answered 200. `cached_out`
+ * (optional) receives the response's "tokens_cached" (-1 when absent) — the
+ * grow test below reads it to prove restored KV is actually reused. The
+ * prompt is IDENTICAL across calls on purpose: a cache hit needs the prefix. */
+static int completion_ok(const char *endpoint, const char *marker,
+                         long long *cached_out) {
     char body[512];
     snprintf(body, sizeof(body),
-             "{\"prompt\":\"%s\",\"n_predict\":4,\"temperature\":0}", marker);
+             "{\"prompt\":\"%s\",\"n_predict\":4,\"temperature\":0,"
+             "\"cache_prompt\":true}", marker);
     idletoken_llama_conn c;
+    if (cached_out) *cached_out = -1;
     if (idletoken_llama_http_open(endpoint, "POST", "/completion",
                                   body, strlen(body), 120000, &c) != 0) {
         fprintf(stderr, "  cannot reach the engine at %s\n", endpoint);
@@ -103,6 +109,10 @@ static int completion_ok(const char *endpoint, const char *marker) {
     char *resp = idletoken_llama_http_read_all(&c, &n, 1u << 20);
     int status = c.status;
     idletoken_llama_http_close(&c);
+    if (resp && cached_out) {
+        const char *p = strstr(resp, "\"tokens_cached\":");
+        if (p) *cached_out = atoll(p + strlen("\"tokens_cached\":"));
+    }
     free(resp);
     if (status != 200) { fprintf(stderr, "  engine HTTP %d\n", status); return -1; }
     return 0;
@@ -148,8 +158,8 @@ int main(int argc, char **argv) {
     printf("shared mode (engine socket %s)\n", sock);
     {
         char err[256] = "";
-        idletoken_llama *lc = idletoken_llama_start(bin, gguf, 0, sock, 2048, 1,
-                                                    NULL, log_shared, 1,
+        idletoken_llama *lc = idletoken_llama_start(bin, gguf, 0, sock, 2048, 0, 1, 0,
+                                                    NULL, NULL, log_shared, 1, NULL,
                                                     err, sizeof(err));
         if (!lc) { printf("SIDECAR_FAIL: shared start: %s\n", err); return 1; }
         printf("  endpoint: %s\n", idletoken_llama_endpoint_of(lc));
@@ -159,7 +169,7 @@ int main(int argc, char **argv) {
             idletoken_llama_shutdown(lc);
             return 1;
         }
-        if (completion_ok(idletoken_llama_endpoint_of(lc), marker) != 0) {
+        if (completion_ok(idletoken_llama_endpoint_of(lc), marker, NULL) != 0) {
             printf("SIDECAR_FAIL: no completion over the socket\n");
             idletoken_llama_shutdown(lc);
             return 1;
@@ -227,9 +237,12 @@ int main(int argc, char **argv) {
     /* --- local: the control. Same check MUST come out the other way. ------ */
     printf("local mode (loopback TCP) — positive control\n");
     {
+        char grow_dir[440];
+        snprintf(grow_dir, sizeof(grow_dir), "%s/kvgrow-test", dir);
         char err[256] = "";
-        idletoken_llama *lc = idletoken_llama_start(bin, gguf, 18711, "", 2048, 1,
-                                                    NULL, log_local, 0,
+        /* gpu_only=1: also proves the pinned engine accepts --poll 0 */
+        idletoken_llama *lc = idletoken_llama_start(bin, gguf, 18711, "", 2048, 0, 1, 1,
+                                                    NULL, NULL, log_local, 0, grow_dir,
                                                     err, sizeof(err));
         if (!lc) { printf("SIDECAR_FAIL: local start: %s\n", err); return 1; }
         printf("  endpoint: %s\n", idletoken_llama_endpoint_of(lc));
@@ -239,7 +252,7 @@ int main(int argc, char **argv) {
             idletoken_llama_shutdown(lc);
             return 1;
         }
-        if (completion_ok(idletoken_llama_endpoint_of(lc), marker) != 0) {
+        if (completion_ok(idletoken_llama_endpoint_of(lc), marker, NULL) != 0) {
             printf("SIDECAR_FAIL: no completion over TCP\n");
             idletoken_llama_shutdown(lc);
             return 1;
@@ -292,6 +305,60 @@ int main(int argc, char **argv) {
         } else {
             printf("  [ok] engine pid %lld holds a listening TCP socket — the "
                    "checker can see one when there is one\n", pid);
+        }
+
+        /* --- context-ladder grow (docs/ctx-ladder-handoff-2026-08.md §3.4):
+         * restart at 4x the -c with the slot KV carried over. The completion
+         * above left real KV in slot 0, so the proof is threefold: the
+         * regrown engine is READY, n_restored > 0, and re-sending the SAME
+         * prompt reports tokens_cached > 0 — reuse of the restored KV, not
+         * just a fresh engine that happens to answer. */
+        {
+            char gerr[256] = "";
+            int restored = idletoken_llama_grow(lc, 8192, 0, 1,
+                                                gerr, sizeof gerr);
+            if (restored < 1) {
+                printf("  [BAD] grow 2048 -> 8192 carried %d slot(s) of KV "
+                       "(%s)\n", restored, gerr[0] ? gerr : "no error text");
+                failed = 1;
+            } else {
+                printf("  [ok] grow 2048 -> 8192: engine ready again, %d "
+                       "slot(s) of KV carried over\n", restored);
+                long long cached = -1;
+                if (completion_ok(idletoken_llama_endpoint_of(lc), marker,
+                                  &cached) != 0) {
+                    printf("  [BAD] no completion after the grow\n");
+                    failed = 1;
+                } else if (cached <= 0) {
+                    printf("  [BAD] follow-up after the grow reports "
+                           "tokens_cached=%lld — the restored KV was not "
+                           "reused\n", cached);
+                    failed = 1;
+                } else {
+                    printf("  [ok] follow-up hit the restored KV "
+                           "(tokens_cached=%lld)\n", cached);
+                }
+            }
+            /* A consumed slot file must be gone at once (conversation KV on
+             * disk); anything left behind is residue the shutdown sweep
+             * exists for, and here means the delete-on-restore regressed. */
+            char lscmd[600];
+            snprintf(lscmd, sizeof(lscmd),
+                     "ls %s 2>/dev/null | grep -c '^grow-'", grow_dir);
+            FILE *lf = popen(lscmd, "r");
+            int leftovers = -1;
+            if (lf) {
+                char l[32] = "";
+                if (fgets(l, sizeof(l), lf)) leftovers = atoi(l);
+                pclose(lf);
+            }
+            if (leftovers != 0) {
+                printf("  [BAD] %d grow-*.bin file(s) left in %s after the "
+                       "restore\n", leftovers, grow_dir);
+                failed = 1;
+            } else {
+                printf("  [ok] no slot files left behind after the restore\n");
+            }
         }
         idletoken_llama_shutdown(lc);
     }

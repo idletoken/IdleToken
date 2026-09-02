@@ -5,7 +5,7 @@
   "backend": "ds4x",
   "arch": "qwen35",
   "available": true,
-  "deployment": "single-node",
+  "deployment": "cluster",
   "license": "Apache-2.0",
   "params_summary": "0.8B · 24 layers · hybrid linear attention (Gated DeltaNet 3:1 full)",
   "n_layers": 24,
@@ -13,6 +13,7 @@
   "hc_streams": 1,
   "n_vocab": 248320,
   "context_max": 262144,
+  "context_yarn_max": 1048576,
   "attn": {
     "kind": "hybrid",
     "full_attention_interval": 4,
@@ -37,7 +38,7 @@
   },
   "kv": {
     "kind": "hybrid",
-    "bytes_per_token_per_layer": 4096,
+    "bytes_per_token_per_layer": 2048,
     "state_bytes_per_layer": 1122304,
     "full_attention_interval": 4
   },
@@ -46,6 +47,10 @@
     "boundary_multiple": 0
   },
   "overhead_base_bytes": 858993459,
+  "compute_bytes_256k_cuda": 512753664,
+  "compute_bytes_1m_cuda": 1115852636,
+  "compute_bytes_256k_metal": 512753664,
+  "compute_bytes_1m_metal": 1115915551,
   "chat_template": "gguf",
   "layer_weight_bytes": 338227456,
   "shared_weight_bytes": 0,

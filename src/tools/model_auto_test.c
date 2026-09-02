@@ -59,13 +59,51 @@ int main(int argc, char **argv) {
                am.file_bytes,
            "layer+shared bytes cover the whole file");
     }
-    /* glm_dsa: scalar head_count_kv=1, key_length missing -> derived from
-     * embedding_length(6144)/head_count(64) = 96; kv/token =
-     * 78 * 1 * (96+96) * 2 = 29952. */
-    ok(am.kv_bytes_per_token == 78ull * 1 * (96 + 96) * 2,
-       "kv bytes/token derived from kv heads x head dim x layers");
+    /* MLA stores the latent row plus its RoPE component, not a conventional
+     * K+V pair: 78 * (kv_lora_rank 512 + rope 64) * f16. */
+    ok(am.kv_bytes_per_token == 78ull * (512 + 64) * 2,
+       "MLA bytes/token derived from latent rank plus RoPE dims");
     ok(am.spec.backend == IDLETOKEN_BACKEND_LLAMACPP && am.spec.available == 1,
        "auto spec is a runnable llamacpp entry");
+
+    /* ---- measured workspace comes from the registry when the id matches ----
+     *
+     * `plan.c` refuses any model whose compute_bytes are zero, and the client
+     * starts every engine through this function (`--llama-gguf`). So if an auto
+     * manifest for a CURATED model reports zero here, the product cannot start
+     * an engine at all -- which is exactly what shipped until 2026-09-02.
+     *
+     * Both directions, because copying unconditionally would be as wrong as
+     * copying never: an id the registry does not know must keep its zeros and
+     * stay refusable. */
+    {
+        const idletoken_model_spec *reg = idletoken_model_get("glm-5.2");
+        char curated[1024];
+        snprintf(path, sizeof(path), "%s/glm_dsa.gguf", dir);
+        snprintf(curated, sizeof(curated), "%s/glm-5.2.gguf", dir);
+        ok(reg != NULL && reg->compute_bytes_256k_cuda > 0,
+           "the registry itself carries a measured workspace for glm-5.2");
+        ok(copy_file(path, curated) == 0, "curated-name fixture staged");
+        ok(idletoken_model_from_gguf(curated, &am, err, sizeof(err)) == 0,
+           "a GGUF named after a curated model parses");
+        ok(strcmp(am.id, "glm-5.2") == 0, "id resolves to the registry id");
+        ok(reg && am.spec.compute_bytes_256k_cuda == reg->compute_bytes_256k_cuda &&
+           am.spec.compute_bytes_1m_cuda    == reg->compute_bytes_1m_cuda &&
+           am.spec.compute_bytes_256k_metal == reg->compute_bytes_256k_metal &&
+           am.spec.compute_bytes_1m_metal   == reg->compute_bytes_1m_metal,
+           "all four measured workspaces are adopted from the registry");
+        remove(curated);
+
+        /* The negative control: the gate must still bite for a GGUF nobody
+         * measured. `glm_dsa` is a fixture name, not a registry id. */
+        ok(idletoken_model_from_gguf(path, &am, err, sizeof(err)) == 0 &&
+           idletoken_model_get(am.id) == NULL &&
+           am.spec.compute_bytes_256k_cuda == 0 &&
+           am.spec.compute_bytes_1m_cuda == 0 &&
+           am.spec.compute_bytes_256k_metal == 0 &&
+           am.spec.compute_bytes_1m_metal == 0,
+           "an unregistered GGUF keeps zeros, so the planner still refuses it");
+    }
 
     /* ---- deepseek2 fixture: vocab via tokenizer token count, explicit
      * key/value lengths ---------------------------------------------------- */
@@ -74,8 +112,8 @@ int main(int argc, char **argv) {
        "deepseek2 fixture parses");
     ok(am.spec.n_layers == 61, "deepseek2 layer count");
     ok(am.spec.n_vocab == 1000, "vocab falls back to len(tokenizer.ggml.tokens)");
-    ok(am.kv_bytes_per_token == 61ull * 1 * (192 + 128) * 2,
-       "kv bytes/token uses explicit key_length + value_length");
+    ok(am.kv_bytes_per_token == 61ull * (512 + 64) * 2,
+       "DeepSeek2 MLA uses latent rank, not generic key/value lengths");
 
     /* ---- split (multi-file) GGUFs -----------------------------------------
      * Supported since 2026-08-16 (they used to be refused with "merge it

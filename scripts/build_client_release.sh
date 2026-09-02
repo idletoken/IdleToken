@@ -98,6 +98,15 @@ if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
 fi
 export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}"
 
+# --- release preflight ------------------------------------------------------
+# Two refusals that only this moment can make (see release-provenance-lib.sh):
+# a dirty tree means the artifacts match no commit, and a signing key that is
+# not THE key produces a release no installed client will accept — the second
+# fails silently all the way to the user's updater.
+# shellcheck disable=SC1091
+. "$ROOT/scripts/release-provenance-lib.sh"
+rp_preflight "linux" || fail "release preflight refused this build (see above)"
+
 # --- build ----------------------------------------------------------------
 cd client || fail "no client/ directory"
 pnpm install >/tmp/client-release-install.log 2>&1 || fail "pnpm install failed (see /tmp/client-release-install.log)"
@@ -195,6 +204,28 @@ if [ -n "$NEWEST_DEB" ]; then
             || { rm -rf "$XTMP"; fail "the .deb does not contain $b"; }
     done
     rm -rf "$XTMP"
+fi
+
+# --- provenance -------------------------------------------------------------
+# The signed record a user checks a downloaded file against, plus its
+# transparency-log entry. Without it the release page carries bytes and nothing
+# that distinguishes them from a lookalike (DIST-03, DIST-06, OPS-12), and a
+# release signed with a stolen key leaves no trace anyone can notice (CHAIN-07).
+#
+# Non-fatal on purpose: the artifacts already exist and are already signed at
+# this point, so aborting would leave a half-published release and no way to
+# retry the record. It is LOUD instead, and re-runnable by hand:
+#   scripts/release_manifest.sh --version V --platform linux-x86_64 --sign ARTIFACTS...
+#   scripts/release_transparency.sh append <the provenance json>
+PROV_ARTIFACTS=()
+while IFS= read -r f; do PROV_ARTIFACTS+=("$ROOT/client/$f"); done < <(
+    find "$BDIR" -type f \( -name '*.deb' -o -name '*.AppImage' -o -name '*.rpm' \) | sort)
+REL_VERSION=$(python3 -c "import json;print(json.load(open('$ROOT/client/src-tauri/tauri.conf.json'))['version'])" 2>/dev/null)
+if [ "${#PROV_ARTIFACTS[@]}" -gt 0 ] && [ -n "$REL_VERSION" ]; then
+    rp_emit "$REL_VERSION" "linux-$(uname -m)" "${PROV_ARTIFACTS[@]}" \
+        || echo "  !! PROVENANCE NOT WRITTEN — do not publish these artifacts until it is (see the commands above)"
+else
+    echo "  !! could not determine the version or the artifact list for the provenance record"
 fi
 
 # Put the tree back the way the acceptance gates expect it. `tauri build` ran

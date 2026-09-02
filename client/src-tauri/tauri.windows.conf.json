@@ -5,14 +5,21 @@
       "licenses/LICENSE.txt": "licenses/LICENSE.txt",
       "licenses/NOTICE.txt": "licenses/NOTICE.txt",
       "licenses/ds4-MIT.txt": "licenses/ds4-MIT.txt",
-      "licenses/rax-BSD-3-Clause.txt": "licenses/rax-BSD-3-Clause.txt",
-      "licenses/llamacpp-MIT.txt": "licenses/llamacpp-MIT.txt"
+      "licenses/llamacpp-MIT.txt": "licenses/llamacpp-MIT.txt",
+      "runtime/windows/cudart64_12.dll": ".",
+      "runtime/windows/cublas64_12.dll": ".",
+      "runtime/windows/cublasLt64_12.dll": ".",
+      "runtime/windows/WebView2Loader.dll": ".",
+      "runtime/windows/vcomp140.dll": ".",
+      "runtime/windows/idletoken-server.exe.sha256": ".",
+      "runtime/windows/idletoken-rpc-server.exe.sha256": "."
     },
     "windows": {
       "nsis": {
         "installMode": "currentUser",
         "languages": ["English", "SimpChinese"],
-        "installerIcon": "icons/icon.ico"
+        "installerIcon": "icons/icon.ico",
+        "installerHooks": "windows/installer-hooks.nsh"
       }
     }
   }

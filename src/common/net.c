@@ -300,6 +300,38 @@ int idletoken_accept_tcp(int listener) {
     return fd;
 }
 
+int idletoken_set_recv_timeout(int fd, int timeout_ms) {
+    if (fd < 0) { errno = EINVAL; return -1; }
+#ifdef _WIN32
+    DWORD tv = timeout_ms > 0 ? (DWORD)timeout_ms : 0;
+    return setsockopt((SOCKET)fd, SOL_SOCKET, SO_RCVTIMEO,
+                      (const char *)&tv, sizeof(tv)) == 0 ? 0 : -1;
+#else
+    struct timeval tv;
+    tv.tv_sec  = timeout_ms > 0 ? timeout_ms / 1000 : 0;
+    tv.tv_usec = timeout_ms > 0 ? (timeout_ms % 1000) * 1000 : 0;
+    return setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0 ? 0 : -1;
+#endif
+}
+
+int idletoken_get_recv_timeout(int fd, int *out_ms) {
+    if (fd < 0 || !out_ms) { errno = EINVAL; return -1; }
+#ifdef _WIN32
+    DWORD tv = 0;
+    int len = (int)sizeof(tv);
+    if (getsockopt((SOCKET)fd, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv, &len) != 0)
+        return -1;
+    *out_ms = (int)tv;
+#else
+    struct timeval tv;
+    socklen_t len = sizeof(tv);
+    memset(&tv, 0, sizeof(tv));
+    if (getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, &len) != 0) return -1;
+    *out_ms = (int)(tv.tv_sec * 1000 + tv.tv_usec / 1000);
+#endif
+    return 0;
+}
+
 int idletoken_accept_tcp_timeout(int listener, int timeout_ms) {
     if (listener < 0) { errno = EINVAL; return -1; }
 #ifndef _WIN32
@@ -619,6 +651,65 @@ int idletoken_ip_is_overlay(const char *ip) {
     return *p == ':' ? 1 : 0;
 }
 
+/* Shared body for the two peer-string gates. `strict` additionally narrows the
+ * alphabet to what a hostname or an "ip:port" endpoint can legitimately be. */
+static int peer_string_ok(const char *s, size_t max_len, int strict) {
+    if (!s || !s[0]) return 0;
+    size_t n = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++, n++) {
+        if (n >= max_len) return 0;             /* over-long: refuse, never clamp */
+        unsigned char c = *p;
+        if (c < 0x20 || c >= 0x7F) return 0;    /* control bytes and non-ASCII */
+        if (c == '"' || c == '\\') return 0;    /* the two JSON-hostile bytes */
+        if (!strict) continue;
+        int ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                 (c >= '0' && c <= '9') ||
+                 c == '.' || c == '-' || c == '_' || c == ':';
+        if (!ok) return 0;
+    }
+    return n > 0;
+}
+
+int idletoken_peer_label_ok(const char *s, size_t max_len) {
+    return peer_string_ok(s, max_len, 0);
+}
+
+int idletoken_peer_host_ok(const char *s, size_t max_len) {
+    return peer_string_ok(s, max_len, 1);
+}
+
+size_t idletoken_json_escape(char *dst, size_t cap, const char *src, size_t n) {
+    if (!dst || cap == 0) return 0;
+    size_t o = 0;
+    for (size_t i = 0; i < n && src; i++) {
+        unsigned char c = (unsigned char)src[i];
+        const char *seq = NULL;
+        char ubuf[7];
+        size_t need;
+        switch (c) {
+            case '"':  seq = "\\\""; need = 2; break;
+            case '\\': seq = "\\\\"; need = 2; break;
+            case '\n': seq = "\\n";  need = 2; break;
+            case '\r': seq = "\\r";  need = 2; break;
+            case '\t': seq = "\\t";  need = 2; break;
+            default:
+                if (c < 0x20) {
+                    snprintf(ubuf, sizeof(ubuf), "\\u%04x", c);
+                    seq = ubuf; need = 6;
+                } else {
+                    need = 1;
+                }
+        }
+        /* Stop at the last whole escape that fits: a body cut in the middle of
+         * "\u00" is not shorter JSON, it is broken JSON. */
+        if (o + need + 1 > cap) break;
+        if (seq) { memcpy(dst + o, seq, need); o += need; }
+        else       dst[o++] = (char)c;
+    }
+    dst[o] = '\0';
+    return o;
+}
+
 int idletoken_hex64_valid(const char *h) {
     if (!h) return 0;
     for (int i = 0; i < 64; i++) {
@@ -643,7 +734,13 @@ void idletoken_buf_init(idletoken_buf *b, void *backing, size_t cap) {
 
 static int buf_need(idletoken_buf *b, size_t n) {
     if (b->err) return -1;
-    if (b->pos + n > b->cap) { b->err = 1; return -1; }
+    /* `b->pos + n > b->cap` is the same test only while the addition cannot
+     * wrap. `n` reaches here straight off the wire (idletoken_buf_get_str
+     * passes an attacker-chosen u32), so on a 32-bit build — the Windows
+     * MinGW worker was one until recently — `pos + n` wraps and the bounds
+     * check passes for a length that is nowhere near in bounds. Subtracting
+     * cannot wrap because pos <= cap is an invariant of this cursor. */
+    if (b->pos > b->cap || n > b->cap - b->pos) { b->err = 1; return -1; }
     return 0;
 }
 
@@ -733,6 +830,24 @@ int idletoken_buf_get_str(idletoken_buf *b, char *out, size_t max) {
     size_t copy = n < (max - 1) ? n : (max - 1);
     if (copy > 0) memcpy(out, b->buf + b->pos, copy);
     out[copy] = '\0';
+    b->pos += n;
+    return 0;
+}
+
+int idletoken_buf_get_str_strict(idletoken_buf *b, char *out, size_t max) {
+    uint32_t n = 0;
+    if (idletoken_buf_get_u32(b, &n) != 0) return -1;
+    if (buf_need(b, n) != 0) return -1;
+    if (max == 0 || (size_t)n > max - 1) {
+        /* Consume nothing further and poison the cursor: the caller's whole
+         * parse is now untrustworthy, which is exactly what it should conclude
+         * from a field that did not fit. */
+        b->err = 1;
+        if (max > 0) out[0] = '\0';
+        return -1;
+    }
+    if (n > 0) memcpy(out, b->buf + b->pos, n);
+    out[n] = '\0';
     b->pos += n;
     return 0;
 }

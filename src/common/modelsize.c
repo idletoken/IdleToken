@@ -146,14 +146,47 @@ int idletoken_model_size_resolve(const idletoken_model_spec *spec,
     if (why && why_cap) why[0] = '\0';
 
     memset(out, 0, sizeof(*out));
-    /* Shape, not size: neither the layer count nor the KV bytes per token
-     * changes with the quantization, so these come from the manifest in all
-     * three cases. (MoE expert counts would too — the C registry does not carry
-     * them yet, and 0/0 reads as "dense", which over-charges the working set
-     * rather than under-charging it.) */
+    /* Shape, not size: these come from measured manifest/GGUF geometry and do
+     * not change with weight quantization. Hybrid attention has growing KV on
+     * only every Nth full-attention layer plus fixed f32 recurrent state on the
+     * remaining layers. DeepSeek4 uses the pinned engine's padded raw/CSA/HCA
+     * cache formula, carried separately rather than flattened into a guessed
+     * bytes/token slope. */
     out->n_layers = spec->n_layers;
-    out->kv_bytes_per_token =
-        (uint64_t)spec->kv_bytes_per_token_layer * (uint64_t)spec->n_layers;
+    out->n_expert = spec->n_expert;
+    out->n_expert_used = spec->n_expert_used;
+    /* Measured graph workspace, carried straight through from the manifest.
+     * Like the KV geometry above this is a property of the SHAPE, not of the
+     * weight quantization — verified 2026-09-01: Q4_K_M through BF16 all
+     * report 489.00 MiB on Qwen3.5-0.8B at 256K. Zero means "not measured for
+     * this model", which the planner treats as a refusal rather than as free.
+     * See results/memory-need-measured-20260901.md. */
+    out->compute_bytes_256k_cuda  = spec->compute_bytes_256k_cuda;
+    out->compute_bytes_1m_cuda    = spec->compute_bytes_1m_cuda;
+    out->compute_bytes_256k_metal = spec->compute_bytes_256k_metal;
+    out->compute_bytes_1m_metal   = spec->compute_bytes_1m_metal;
+    if (spec->kv_kind == IDLETOKEN_KV_HYBRID) {
+        const uint32_t iv = spec->full_attn_interval ? spec->full_attn_interval : 1;
+        const uint64_t n_full = ((uint64_t)spec->n_layers + iv - 1) / iv;
+        const uint64_t n_linear = (uint64_t)spec->n_layers - n_full;
+        out->kv_bytes_per_token =
+            (uint64_t)spec->kv_bytes_per_token_layer * n_full;
+        out->kv_fixed_bytes_per_seq =
+            (uint64_t)spec->state_bytes_per_layer * n_linear;
+    } else if (spec->dsv4_raw_bytes_per_cell != 0) {
+        out->dsv4_raw_bytes_per_cell = spec->dsv4_raw_bytes_per_cell;
+        out->dsv4_csa_bytes_per_cell = spec->dsv4_csa_bytes_per_cell;
+        out->dsv4_hca_bytes_per_cell = spec->dsv4_hca_bytes_per_cell;
+        out->kv_fixed_bytes_per_seq = spec->dsv4_fixed_bytes_per_seq;
+        /* Asymptotic slope for diagnostics only. Capacity calls the exact
+         * padded helper in plan.c. Round upward so the log never understates. */
+        out->kv_bytes_per_token = spec->dsv4_raw_bytes_per_cell +
+            (spec->dsv4_csa_bytes_per_cell + 3) / 4 +
+            (spec->dsv4_hca_bytes_per_cell + 127) / 128;
+    } else {
+        out->kv_bytes_per_token =
+            (uint64_t)spec->kv_bytes_per_token_layer * (uint64_t)spec->n_layers;
+    }
 
     const int has_quant = quant && quant[0];
     const int has_path  = gguf_path && gguf_path[0];

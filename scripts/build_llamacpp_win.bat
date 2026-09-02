@@ -3,26 +3,17 @@ REM Fetch, patch and build the pinned llama.cpp engine on Windows (MSVC + CUDA).
 REM Mirrors scripts/build_llamacpp.sh (which covers macOS/Linux and refuses to
 REM run on Windows). Same pin, same patch dir, same targets, same stamp format.
 REM
-REM Products (static CRT + static cudart -- no DLL soup next to them):
+REM Products (static CRT; CUDA runtime is staged by the client packager):
 REM   vendor\llama.cpp\build\bin\Release\llama-server.exe      inference + OpenAI API
 REM   vendor\llama.cpp\build\bin\Release\ggml-rpc-server.exe   worker-side RPC backend
 REM   vendor\llama.cpp\build\bin\Release\llama-perplexity.exe  numeric gate
+REM   vendor\llama.cpp\build\bin\Release\llama-fit-params.exe  memory dry-run (no_alloc)
 REM
-REM Runtime DLL note for packaging: cudart is linked statically (GGML_STATIC).
-REM cublas64_12.dll still appears as a string inside the exe, but it is NOT
-REM needed at load time -- measured 2026-08-20 at pin b10502 on a Windows box
-REM with the NVIDIA driver and NO CUDA Toolkit (all of cublas64_12.dll,
-REM cublasLt64_12.dll, cudart64_12.dll absent from System32): llama-server.exe
-REM started, loaded Qwen3.5-0.8B-Q4_K_M with -ngl 99, appeared in nvidia-smi as a
-REM CUDA compute process holding 776 MiB, and prefilled 1310 tokens at 5288
-REM tok/s. A Windows COMPUTE node therefore needs only the driver; the Toolkit is
-REM a BUILD-node requirement.
-REM
-REM Scope of that measurement, stated so nobody widens it by accident: one small
-REM Q4_K quant, whose matmuls take the MMQ path. A model or quant that falls back
-REM to dequant+GEMM could still reach for cuBLAS. Re-measure on the largest model
-REM a node is expected to serve before promising this to users, and keep
-REM `dumpbin /dependents` in the loop after any flag change.
+REM Runtime DLL note for packaging: the small-Q4 MMQ smoke once started without
+REM CUDA DLLs, but the real DSv4 cluster later failed at process load with
+REM 0xC0000135 until cudart64_12, cublas64_12 and cublasLt64_12 were present.
+REM `scripts/build_client_release.bat` therefore packages all three explicitly.
+REM Do not generalize the small-model observation into a driver-only bundle.
 REM
 REM No silent fallback (v2 hard invariant): if CUDA or MSVC is missing this
 REM script exits red. It never downgrades to a CPU build to "keep things green".
@@ -47,6 +38,10 @@ REM Usage:  scripts\build_llamacpp_win.bat              fetch + patch + build + 
 REM         scripts\build_llamacpp_win.bat --fetch-only clean checkout at the pin
 REM Env:    IDLETOKEN_LLAMACPP_SRC      checkout dir  (default <repo>\vendor\llama.cpp)
 REM         IDLETOKEN_CUDA_VER          toolkit ver   (default 12.8)
+REM         IDLETOKEN_CUDA_HOME         standalone toolkit root extracted from
+REM                                     NVIDIA's installer (optional). CMake's
+REM                                     cuda=<path> toolset keeps large build
+REM                                     dependencies off the system drive.
 REM         IDLETOKEN_CUDA_ARCHS        CUDA archs    (default 75-real;120 = RTX 2070
 REM                                     SASS + RTX 5060 Ti SASS + compute_120 PTX;
 REM                                     covers the whole Windows testbed fleet)
@@ -180,13 +175,22 @@ if "%~1"=="--fetch-only" (
 )
 
 REM --- toolchain checks (fail closed) ------------------------------------------
-set "CUDA_HOME=%ProgramFiles%\NVIDIA GPU Computing Toolkit\CUDA\v%IDLETOKEN_CUDA_VER%"
+set "CUDA_TOOLSET=cuda=%IDLETOKEN_CUDA_VER%"
+if defined IDLETOKEN_CUDA_HOME (
+    set "CUDA_HOME=%IDLETOKEN_CUDA_HOME%"
+    set "CUDA_TOOLSET=cuda=%IDLETOKEN_CUDA_HOME%"
+) else (
+    set "CUDA_HOME=%ProgramFiles%\NVIDIA GPU Computing Toolkit\CUDA\v%IDLETOKEN_CUDA_VER%"
+)
 if not exist "%CUDA_HOME%\bin\nvcc.exe" (
-    echo FATAL: CUDA %IDLETOKEN_CUDA_VER% not found at "%CUDA_HOME%".
+    echo FATAL: CUDA %IDLETOKEN_CUDA_VER% compiler not found at "%CUDA_HOME%".
     echo        This build is CUDA-only by design -- no CPU fallback. Install the
-    echo        toolkit or set IDLETOKEN_CUDA_VER to an installed version.
+    echo        toolkit, set IDLETOKEN_CUDA_VER to an installed version, or set
+    echo        IDLETOKEN_CUDA_HOME to a standalone toolkit extracted from the
+    echo        official NVIDIA installer.
     exit /b 1
 )
+set "CUDA_PATH=%CUDA_HOME%"
 
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 set "VSROOT="
@@ -201,17 +205,44 @@ if not defined VSROOT (
 )
 REM The VS generator drives nvcc through the toolkit's MSBuild integration;
 REM without these .props the configure error is cryptic, so check up front.
-if not exist "%VSROOT%\MSBuild\Microsoft\VC\v170\BuildCustomizations\CUDA %IDLETOKEN_CUDA_VER%.props" (
-    echo FATAL: CUDA %IDLETOKEN_CUDA_VER% MSBuild integration is missing under
-    echo        "%VSROOT%\MSBuild\Microsoft\VC\v170\BuildCustomizations".
-    echo        Re-run the CUDA installer and enable "Visual Studio Integration".
-    exit /b 1
+if defined IDLETOKEN_CUDA_HOME (
+    if not exist "%CUDA_HOME%\extras\visual_studio_integration\MSBuildExtensions\CUDA %IDLETOKEN_CUDA_VER%.props" (
+        echo FATAL: standalone CUDA %IDLETOKEN_CUDA_VER% has no MSBuild integration under
+        echo        "%CUDA_HOME%\extras\visual_studio_integration\MSBuildExtensions".
+        exit /b 1
+    )
+) else (
+    if not exist "%VSROOT%\MSBuild\Microsoft\VC\v170\BuildCustomizations\CUDA %IDLETOKEN_CUDA_VER%.props" (
+        echo FATAL: CUDA %IDLETOKEN_CUDA_VER% MSBuild integration is missing under
+        echo        "%VSROOT%\MSBuild\Microsoft\VC\v170\BuildCustomizations".
+        echo        Re-run the CUDA installer and enable "Visual Studio Integration".
+        exit /b 1
+    )
 )
 
 REM Prefer the cmake bundled with VS; any cmake works because the generator is
 REM forced, but the VS one is guaranteed present and MSVC-aware.
 set "CMAKE=%VSROOT%\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
 if not exist "%CMAKE%" set "CMAKE=cmake"
+
+REM mt.exe is the supported way to replace the application manifest in the
+REM upstream MSVC executables after build. The UTF-8 active code page is what
+REM makes their narrow argv/model paths agree with the Rust client and our
+REM MinGW sidecars on machines whose profile name is not ASCII.
+set "MT="
+where mt.exe >nul 2>&1 && set "MT=mt.exe"
+if not defined MT (
+    REM `dir` does not consistently expand a wildcard in the middle of this
+    REM path on cmd.exe. Enumerate installed SDK version directories instead;
+    REM the wildcard order is ascending, so the last existing x64 mt.exe is
+    REM the newest installed SDK. The old probe falsely reported mt.exe absent
+    REM on a clean Windows 11 SDK install even though it was present.
+    for /d %%D in ("%ProgramFiles(x86)%\Windows Kits\10\bin\*") do if exist "%%~fD\x64\mt.exe" set "MT=%%~fD\x64\mt.exe"
+)
+if not defined MT (
+    echo FATAL: Windows SDK mt.exe not found; cannot enforce UTF-8 model paths.
+    exit /b 1
+)
 
 REM --- configure ---------------------------------------------------------------
 REM Offline mbedTLS for the TLS transport patch: FetchContent needs github.com,
@@ -225,7 +256,7 @@ REM                                         see header note)
 REM   CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded   /MT -- no VC redist needed on
 REM                                         a machine with only the NVIDIA driver
 echo == configuring ^(MSVC + CUDA %IDLETOKEN_CUDA_VER%, archs %IDLETOKEN_CUDA_ARCHS%^)
-"%CMAKE%" -S "%SRC_DIR%" -B "%BUILD_DIR%" -G "Visual Studio 17 2022" -A x64 -T cuda=%IDLETOKEN_CUDA_VER% ^
+"%CMAKE%" -S "%SRC_DIR%" -B "%BUILD_DIR%" -G "Visual Studio 17 2022" -A x64 -T "%CUDA_TOOLSET%" ^
     -DGGML_CUDA=ON ^
     "-DCMAKE_CUDA_ARCHITECTURES=%IDLETOKEN_CUDA_ARCHS%" ^
     -DLLAMA_BUILD_NUMBER=%PIN_BUILD% ^
@@ -248,7 +279,7 @@ if errorlevel 1 (
 
 echo == building ^(this takes 30-60+ min for the CUDA kernels^)
 "%CMAKE%" --build "%BUILD_DIR%" --config Release -j %NUMBER_OF_PROCESSORS% ^
-    --target llama-server ggml-rpc-server llama-perplexity
+    --target llama-server ggml-rpc-server llama-perplexity llama-fit-params
 if errorlevel 1 (
     echo FATAL: build failed
     exit /b 1
@@ -259,9 +290,14 @@ REM Actually execute the product; existence alone proves nothing (a stale or
 REM half-linked exe sits there looking green). Multi-config generator puts the
 REM binaries under bin\Release, not bin\ -- consumers take note.
 set "BIN_DIR=%BUILD_DIR%\bin\Release"
-for %%B in (llama-server.exe ggml-rpc-server.exe llama-perplexity.exe) do (
+for %%B in (llama-server.exe ggml-rpc-server.exe llama-perplexity.exe llama-fit-params.exe) do (
     if not exist "%BIN_DIR%\%%B" (
         echo FATAL: %%B not built
+        exit /b 1
+    )
+    "%MT%" -nologo -manifest "%ROOT%\src\platform\win\idletoken_utf8.manifest" "-outputresource:%BIN_DIR%\%%B;#1"
+    if errorlevel 1 (
+        echo FATAL: could not embed the UTF-8 path manifest in %%B
         exit /b 1
     )
 )

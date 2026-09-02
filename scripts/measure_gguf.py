@@ -31,13 +31,20 @@ Two traps this script exists to avoid (both cost an afternoon once):
 """
 import argparse
 import json
+import os
 import struct
 import sys
 import urllib.error
 import urllib.request
 
-HF_API = "https://huggingface.co/api/models/{repo}?blobs=true"
-HF_FILE = "https://huggingface.co/{repo}/resolve/main/{name}"
+# `HF_ENDPOINT` is the same variable huggingface_hub itself honours, so a mirror
+# already configured for other tooling works here with no extra setting. Needed
+# because not every machine can reach huggingface.co directly, and hand-shipping
+# headers to the ones that cannot is a step that silently goes stale. Trailing
+# slashes are stripped so both spellings work.
+HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+HF_API = HF_ENDPOINT + "/api/models/{repo}?blobs=true"
+HF_FILE = HF_ENDPOINT + "/{repo}/resolve/main/{name}"
 
 # GGUF metadata value types, and how many bytes the fixed-width ones take.
 FIXED = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
@@ -85,10 +92,14 @@ class Reader:
         else:
             raise ValueError(f"unknown GGUF value type {t}")
 
-    def read_value(self, t, cap=8):
+    def read_value(self, t, cap=128):
         """Same walk as skip_value, but keeps the value (arrays truncated to `cap`).
 
-        Only --meta uses this. The byte cursor must advance identically either
+        Only --meta uses this. The 128-value cap is deliberate: architecture
+        arrays such as DeepSeek V4's one compression ratio per layer are
+        planning inputs and must be visible in full, while tokenizer arrays
+        still contain hundreds of thousands of entries and remain summarized.
+        The byte cursor must advance identically either
         way, so the two functions handle exactly the same type set: a value we
         can print but not skip (or vice versa) would desynchronise the reader
         and turn every later key into garbage.
@@ -111,12 +122,33 @@ class Reader:
         raise ValueError(f"unknown GGUF value type {t}")
 
 
+class _Redirect308(urllib.request.HTTPRedirectHandler):
+    """Follow 308 like 307.
+
+    urllib grew 308 support in Python 3.11; 3.9 ships on the machines this runs
+    on and raises HTTPError instead. hf-mirror.com answers the API path with a
+    308, so without this the mirror looks like a hard failure rather than a
+    redirect -- the third variant of the same "the redirect is the content"
+    trap already recorded at the top of this file.
+    """
+    def http_error_308(self, req, fp, code, msg, headers):
+        # Pass 307, not 308: 3.9's redirect_request() has an explicit allow-list
+        # (301/302/303/307) and raises on anything else, so delegating with the
+        # original code lands in the same rejection one frame deeper.
+        return self.http_error_307(req, fp, 307, msg, headers)
+
+    https_error_308 = http_error_308
+
+
+_OPENER = urllib.request.build_opener(_Redirect308)
+
+
 def http_get(url, byte_range=None):
     req = urllib.request.Request(url, headers={"User-Agent": "idletoken-measure/1"})
     if byte_range:
         req.add_header("Range", f"bytes={byte_range[0]}-{byte_range[1]}")
-    # urlopen follows the 302 to the CDN and re-sends the Range header.
-    with urllib.request.urlopen(req, timeout=120) as r:
+    # Follows the 302/308 to the CDN and re-sends the Range header.
+    with _OPENER.open(req, timeout=120) as r:
         return r.read()
 
 
@@ -157,9 +189,16 @@ def parse_header(buf, keep_kv=False):
     return tensors, data_start, kv
 
 
-def fetch_header(repo, name, keep_kv=False):
-    """-> (tensors, data_start, kv), growing the Range request until it fits."""
-    want = 16 << 20
+def fetch_header(repo, name, keep_kv=False, first=16 << 20):
+    """-> (tensors, data_start, kv), growing the Range request until it fits.
+
+    `first` is the initial probe size. 16 MiB suits a model's part 1, whose
+    tensor directory is megabytes; the LATER parts of a split set carry only a
+    few KiB of header, and probing those at 16 MiB apiece wastes over half a
+    gigabyte on a 37-part model. Callers that know which case they are in say
+    so; the doubling below still covers a wrong guess.
+    """
+    want = first
     while True:
         buf = http_get(HF_FILE.format(repo=repo, name=name), (0, want - 1))
         try:

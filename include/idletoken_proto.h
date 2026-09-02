@@ -209,9 +209,22 @@ typedef enum {
      *               nonce[IDLETOKEN_PAIR_NONCE_BYTES],
      *               ct[IDLETOKEN_SESSION_KEY_BYTES],
      *               tag[IDLETOKEN_PAIR_TAG_BYTES]
-     *   RPC_READY:  str endpoint ("lan_ip:port" the rpc-server listens on) */
+     *   RPC_READY:  str endpoint ("lan_ip:port" the rpc-server listens on)
+     *   RPC_CACHE_PLAN: u8 version(=1), u8 reserved, u16 layer_lo,
+     *                   u16 layer_hi, u16 reserved, str weight_repo_url
+     *   RPC_CACHE_PROGRESS: u64 downloaded_bytes, u64 total_bytes
+     *   RPC_CACHE_READY: u8 ok, u8 reserved[3], u16 layer_lo, u16 layer_hi,
+     *                    u64 cached_bytes, u32 tensor_count, str detail
+     *
+     * The cache plan is sent only after RPC_READY. The worker downloads the
+     * assigned layer tensors directly into ggml-RPC's content-addressed cache;
+     * the coordinator does not start llama-server until every worker replies
+     * RPC_CACHE_READY(ok=1). */
     IDLETOKEN_MSG_RPC_ASSIGN         = 0x0023,  /* coord -> worker: wrapped RPC TLS PSK */
     IDLETOKEN_MSG_RPC_READY          = 0x0024,  /* worker -> coord: rpc-server is listening */
+    IDLETOKEN_MSG_RPC_CACHE_PLAN     = 0x0025,  /* coord -> worker: layer range + weight repo */
+    IDLETOKEN_MSG_RPC_CACHE_READY    = 0x0026,  /* worker -> coord: local tensor cache seeded */
+    IDLETOKEN_MSG_RPC_CACHE_PROGRESS = 0x0027,  /* worker -> coord: cache download progress */
 
     /* --- inference -----------------------------------------------------
      * Payload prefixes (v4). Both carry seq_id at byte 3 — the slot whose KV

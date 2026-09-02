@@ -1,7 +1,10 @@
 import { useEffect, useState } from "react";
 import { useI18n } from "./i18n";
 import {
+  approveCoordinatorRequest,
   accountPairSecret,
+  canApproveCoordinatorRequest,
+  COORDINATOR_ROLE_RISK,
   getPairingProvider,
   isValidCode,
   type PairingError,
@@ -12,47 +15,73 @@ import {
 import type { Session } from "./auth";
 import { platformGate } from "./platform";
 import { useDialog } from "./useDialog";
-import { loadSettings } from "./settings";
-import { isSingleNode } from "./models";
+import { loadSettings, overflowTuning, type EngineTuning } from "./settings";
 
 type View = "choose" | "join" | "active";
 
-function PeerRow(props: { peer: PeerNode; orchestrating: boolean; onMakeCoord: (id: string) => void }) {
+function PeerRow(props: {
+  peer: PeerNode;
+  snapshot: PairingSnapshot;
+  orchestrating: boolean;
+  onApproveCoordinator: (id: string) => void;
+}) {
   const { t } = useI18n();
   const p = props.peer;
   const hasRange = p.layerLo !== undefined && p.layerHi !== undefined;
   // Explicit false only: older snapshots (and the dev-sim before the field)
   // omit `online`, and absence has always meant "fine".
   const offline = p.online === false;
+  const creatorCanSeeRequest = props.snapshot.isCreator === true
+    && p.self === false
+    && p.role !== "coordinator"
+    && p.online !== false
+    && p.wantsCoordinator === true;
+  const canApprove = canApproveCoordinatorRequest(props.snapshot, p);
   return (
-    <div className={`peer${p.role === "coordinator" ? " peer--coord" : ""}${offline ? " peer--offline" : ""}`}>
-      <span className="peer__dot" />
-      <div className="peer__id">
-        <span className="peer__host">
-          {p.hostname}
-          {p.self ? <span className="peer__you"> · {t("pairing.you")}</span> : null}
-          {offline ? <span className="offline-tag">{t("pairing.offline")}</span> : null}
-        </span>
-        <span className="peer__gpu">
-          {hasRange ? t("pairing.layers", { lo: p.layerLo!, hi: p.layerHi! - 1 }) : p.gpu}
-        </span>
-      </div>
-      {props.orchestrating ? (
-        <span className={`peer__stage peer__stage--${p.stage}`}>{t(`pairing.stage.${p.stage}` as const)}</span>
-      ) : (
-        <>
-          <span className={`peer__role peer__role--${p.role}`}>
-            {p.role === "coordinator" ? t("pairing.coordinator") : t("pairing.worker")}
+    <div>
+      <div className={`peer${p.role === "coordinator" ? " peer--coord" : ""}${offline ? " peer--offline" : ""}`}>
+        <span className="peer__dot" />
+        <div className="peer__id">
+          <span className="peer__host">
+            {p.hostname}
+            {p.self ? <span className="peer__you"> · {t("pairing.you")}</span> : null}
+            {offline ? <span className="offline-tag">{t("pairing.offline")}</span> : null}
           </span>
-          {p.role !== "coordinator" ? (
-            <button className="linkbtn" onClick={() => props.onMakeCoord(p.id)}>
-              {t("pairing.makeCoord")}
+          <span className="peer__gpu">
+            {hasRange
+              ? t("pairing.layers", { lo: p.layerLo!, hi: p.layerHi! - 1 })
+              : p.modelReady === false
+                ? t("pairing.model.preparing")
+                : p.gpu}
+          </span>
+        </div>
+        {props.orchestrating ? (
+          <span className={`peer__stage peer__stage--${p.stage}`}>{t(`pairing.stage.${p.stage}` as const)}</span>
+        ) : (
+          <>
+            <span className={`peer__role peer__role--${p.role}`}>
+              {p.role === "coordinator" ? t("pairing.coordinator") : t("pairing.worker")}
+            </span>
+            <span className="peer__spacer" />
+          </>
+        )}
+      </div>
+      {creatorCanSeeRequest ? (
+        <div className="auth-note" role="status" style={{ margin: "4px 12px 12px" }}>
+          <strong>{p.hostname} requests the coordinator role.</strong>{" "}
+          Device identity: <code>{p.deviceIdentity || "unavailable — update this machine"}</code>.
+          <br />
+          {COORDINATOR_ROLE_RISK}
+          <br />
+          {canApprove ? (
+            <button className="linkbtn" onClick={() => props.onApproveCoordinator(p.id)}>
+              Review and approve…
             </button>
           ) : (
-            <span className="peer__spacer" />
+            <span> Approval is blocked until a stable device identity is available.</span>
           )}
-        </>
-      )}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -62,12 +91,20 @@ export default function PairingPanel(props: {
   // Nullable by design: code-mode pairing needs no account (the engine pairs
   // by code alone) — only the same-account section requires a session.
   session: Session | null;
-  // The model this machine is set to serve. A single-node model cannot take a
-  // second machine (the coordinator was started with one worker slot and would
-  // refuse anyway), so the panel must not offer a join code for one — that
-  // would hand out an invitation nobody can accept.
-  modelId: string;
   initialView?: "choose" | "join";
+  // Preflight for BOTH roles: resolve and integrity-check the locally selected
+  // GGUF, downloading nothing. Returns the exact local primary GGUF path, or
+  // throws `[WEIGHTS_NOT_DOWNLOADED]` when the parts are not all here. A
+  // creator may not advertise a cluster without it; since 2026-09-01 a joiner
+  // may not be admitted without it either.
+  prepareSelectedModel: () => Promise<string>;
+  /** Fetch and verify the exact model a cluster demanded, then hand back the
+   *  path and the tuning that names it. Both are returned rather than read back
+   *  from props because the join follows in the same turn (see `join`). */
+  prepareClusterModel: (modelId: string, quant: string) => Promise<{
+    modelPath: string;
+    tuning: EngineTuning;
+  }>;
   onSignIn?: () => void;
   onClose: () => void;
 }) {
@@ -77,6 +114,13 @@ export default function PairingPanel(props: {
   const [code, setCode] = useState("");
   const [codeErr, setCodeErr] = useState(false);
   const [copied, setCopied] = useState(false);
+  // A weights fetch started from the refusal card is running.
+  const [fetching, setFetching] = useState(false);
+  // Which kind of join produced the current refusal. A modelNotReady card has
+  // to retry the SAME kind, and the two are reachable from the same screen
+  // (code-mode "back", then the account section) — so this cannot be inferred
+  // from the view without occasionally retrying the wrong one.
+  const [joinKind, setJoinKind] = useState<"code" | "account" | null>(null);
   // Revealed only on request while running solo; see the active view below.
   const [showCode, setShowCode] = useState(false);
   const [snap, setSnap] = useState<PairingSnapshot | null>(null);
@@ -119,6 +163,14 @@ export default function PairingPanel(props: {
         return t("pairing.err.oldCreator");
       case "subnet":
         return t("pairing.err.subnet");
+      // The Rust-side refusal code; the message key is `joinNeedsModel` because
+      // `pairing.err.modelNotReady` already names a different failure (a member
+      // that is in the cluster but not finished preparing, raised at start).
+      case "modelNotReady":
+        return t("pairing.err.joinNeedsModel", {
+          model: snap?.requiredModel?.modelId ?? "?",
+          quant: snap?.requiredModel?.quant ?? "?",
+        });
       case "rejected":
         return t("pairing.err.rejected", { detail: e.detail });
       case "portBusy":
@@ -131,44 +183,141 @@ export default function PairingPanel(props: {
   };
 
   const create = async () => {
-    await guard(getPairingProvider().create(props.self));
+    await guard(
+      props.prepareSelectedModel().then((modelPath) =>
+        getPairingProvider().create({ ...props.self, modelPath })
+      )
+    );
   };
   // Account mode (integration plan 3.3): machines signed in to the same
   // platform account derive the same pair secret locally — no code to type.
   // Gate = platform URL configured + a cloud session carrying the user id.
   const gate = platformGate();
   const accountReady = gate.ok && !!gate.session.userId;
-  const clusterName = loadSettings().clusterName.trim() || "IdleToken-Home";
   const deriveSecret = async (): Promise<string | null> => {
     const g = platformGate();
     if (!g.ok || !g.session.userId) return null;
-    return accountPairSecret(g.session.userId, g.url, clusterName);
+    return accountPairSecret(g.session.userId, g.url);
   };
   const accountCreate = async () => {
     const secret = await deriveSecret();
-    if (secret) await guard(getPairingProvider().createAccount(props.self, secret));
+    if (secret) {
+      await guard(
+        props.prepareSelectedModel().then((modelPath) =>
+          getPairingProvider().createAccount({ ...props.self, modelPath }, secret)
+        )
+      );
+    }
   };
-  const accountJoin = async () => {
+  const accountJoin = async (over?: { modelPath: string; tuning: EngineTuning }) => {
     const secret = await deriveSecret();
-    if (secret) await guard(getPairingProvider().joinAccount(props.self, secret));
+    if (!secret) return;
+    setJoinKind("account");
+    await guard(
+      (async () => {
+        const modelPath = over?.modelPath ?? (await verifiedLocalPath());
+        await getPairingProvider().joinAccount(
+          { ...props.self, modelPath, tuning: over?.tuning ?? props.self.tuning },
+          secret
+        );
+      })()
+    );
   };
-  const join = async () => {
+
+  /**
+   * The path this machine may HONESTLY claim to hold: verified, not merely
+   * present.
+   *
+   * `props.self.modelPath` only says every part is on disk — it does NOT say
+   * they were hash-checked, and admission must not accept a file that skipped
+   * the integrity gate because its name and size happened to look right. That
+   * was the reason joins used to be sent with an empty path; the check moved
+   * here rather than being dropped when admission started requiring weights.
+   *
+   * "" means the weights are simply not on this machine. That is a normal
+   * outcome, not an error: being refused is how a joiner learns which model the
+   * cluster wants. A hash mismatch is a different matter and is re-thrown.
+   */
+  const verifiedLocalPath = async (): Promise<string> => {
+    try {
+      return await props.prepareSelectedModel();
+    } catch (e) {
+      if (String(e).includes("[WEIGHTS_NOT_DOWNLOADED]")) return "";
+      throw e;
+    }
+  };
+  // `over` carries the weights this machine has JUST fetched after a
+  // modelNotReady refusal. It has to be threaded through rather than read from
+  // props: the download saves new settings and the join goes out in the same
+  // turn, before React has committed them, so `props.self` still describes the
+  // model we were refused for. Sending that would earn a second refusal for the
+  // model we just spent an hour downloading.
+  const join = async (over?: { modelPath: string; tuning: EngineTuning }) => {
     if (!isValidCode(code)) {
       setCodeErr(true);
       return;
     }
     setCodeErr(false);
-    await guard(getPairingProvider().join(code, props.self));
+    setJoinKind("code");
+    await guard(
+      (async () => {
+        // What this machine actually holds. Until 2026-09-01 this was hard-wired
+        // to "" because a joiner downloaded AFTER being admitted; admission now
+        // requires the weights, so a machine that already has them must say so
+        // and get in on the first try.
+        const modelPath = over?.modelPath ?? (await verifiedLocalPath());
+        await getPairingProvider().join(code, {
+          ...props.self,
+          modelPath,
+          tuning: over?.tuning ?? props.self.tuning,
+        });
+      })()
+    );
+  };
+
+  // The one recovery path from a modelNotReady refusal: fetch exactly what the
+  // cluster named, then retry. Never automatic — this is a download the size of
+  // the model, so it happens when the user asks for it and not before.
+  const fetchRequiredAndJoin = async () => {
+    const need = snap?.requiredModel;
+    if (!need || fetching) return;
+    setFetching(true);
+    setOpErr(null);
+    try {
+      const over = await props.prepareClusterModel(need.modelId, need.quant);
+      await (joinKind === "account" ? accountJoin(over) : join(over));
+    } catch (e) {
+      setOpErr(tErr(String(e)));
+    } finally {
+      setFetching(false);
+    }
   };
   const leave = async () => {
-    await guard(getPairingProvider().leave());
-    setView("choose");
-    setCode("");
+    setOpErr(null);
+    try {
+      await getPairingProvider().leave();
+      // Leaving finishes this task. Keeping the dialog open and switching it
+      // back to `choose` made four create/join choices appear as if leaving a
+      // cluster immediately required forming another one.
+      props.onClose();
+    } catch (e) {
+      setOpErr(tErr(String(e)));
+    }
+  };
+  const approveCoordinator = (peerId: string) => {
+    if (!snap) return;
+    void guard(
+      approveCoordinatorRequest(
+        getPairingProvider(),
+        snap,
+        peerId,
+        (message) => window.confirm(message),
+      ).then(() => undefined),
+    );
   };
   // "Running on one machine", not merely "one peer": while the cluster is still
   // forming, the roster is legitimately one machine and the code must stay put.
   const soloRunning = !!snap && snap.phase !== "idle" && snap.peers.length === 1;
-  const clusterable = !isSingleNode(props.modelId);
   const copyCode = async () => {
     if (!snap?.code) return;
     try {
@@ -202,16 +351,36 @@ export default function PairingPanel(props: {
         {/* Background pairing failures outside the join form (the join view
             renders lastError next to the code input instead). */}
         {view !== "join" && snap?.lastError ? (
-          <p className="field__hint field__hint--err" role="alert">
-            {lastErrText(snap.lastError)}
-          </p>
+          <>
+            <p className="field__hint field__hint--err" role="alert">
+              {lastErrText(snap.lastError)}
+            </p>
+            {/* An account-mode join lands here rather than in the join view, so
+                its modelNotReady refusal needs the same one-click recovery. */}
+            {snap.lastError.code === "modelNotReady" && snap.requiredModel ? (
+              <button
+                className="btn-primary btn-block"
+                disabled={fetching}
+                onClick={() => void fetchRequiredAndJoin()}
+              >
+                {fetching
+                  ? t("pairing.fetchingModel")
+                  : t("pairing.fetchModel", {
+                      model: snap.requiredModel.modelId,
+                      quant: snap.requiredModel.quant,
+                    })}
+              </button>
+            ) : null}
+          </>
         ) : null}
 
         {view === "choose" ? (
           <>
-            <button className="choice" onClick={create}>
+            <button className="choice" onClick={create} disabled={!props.self.modelPath}>
               <span className="choice__title">{t("pairing.chooseCreate")}</span>
-              <span className="choice__hint">{t("pairing.chooseCreateHint")}</span>
+              <span className="choice__hint">
+                {props.self.modelPath ? t("pairing.chooseCreateHint") : t("pairing.createNeedsModel")}
+              </span>
             </button>
             <button className="choice" onClick={() => setView("join")}>
               <span className="choice__title">{t("pairing.chooseJoin")}</span>
@@ -222,17 +391,19 @@ export default function PairingPanel(props: {
                 <div className="setting-group__label" style={{ marginTop: 8 }}>
                   {t("pairing.accountTitle")}
                 </div>
-                <button className="choice" onClick={accountCreate}>
+                <button className="choice" onClick={accountCreate} disabled={!props.self.modelPath}>
                   <span className="choice__title">{t("pairing.accountCreate")}</span>
                   <span className="choice__hint">{t("pairing.accountCreateHint")}</span>
                 </button>
-                <button className="choice" onClick={accountJoin}>
+                {/* Wrapped: accountJoin now takes an optional "weights we just
+                    fetched" argument, and a bare handler would hand it the
+                    click event as that argument. */}
+                <button className="choice" onClick={() => void accountJoin()}>
                   <span className="choice__title">{t("pairing.accountJoin")}</span>
                   <span className="choice__hint">
                     {t("pairing.accountJoinHint", { email: props.session?.email ?? "" })}
                   </span>
                 </button>
-                <p className="auth-note">{t("pairing.accountLanHint", { name: clusterName })}</p>
               </>
             ) : (
               <p className="auth-note">
@@ -277,9 +448,29 @@ export default function PairingPanel(props: {
                 </span>
               ) : null}
             </label>
-            <button className="btn-primary btn-block" onClick={join}>
-              {snap?.lastError ? t("state.retry") : t("pairing.join")}
-            </button>
+            {/* A modelNotReady refusal is the one failure retrying cannot fix:
+                this machine does not have the cluster's weights, and pressing
+                Join again only earns the same refusal. Offer the exact fetch
+                instead — named, so the user is agreeing to a specific download
+                and not to "whatever the cluster wants". */}
+            {snap?.lastError?.code === "modelNotReady" && snap.requiredModel ? (
+              <button
+                className="btn-primary btn-block"
+                disabled={fetching}
+                onClick={() => void fetchRequiredAndJoin()}
+              >
+                {fetching
+                  ? t("pairing.fetchingModel")
+                  : t("pairing.fetchModel", {
+                      model: snap.requiredModel.modelId,
+                      quant: snap.requiredModel.quant,
+                    })}
+              </button>
+            ) : (
+              <button className="btn-primary btn-block" onClick={() => void join()}>
+                {snap?.lastError ? t("state.retry") : t("pairing.join")}
+              </button>
+            )}
             <button className="linkbtn linkbtn--center" onClick={() => setView("choose")}>
               {t("pairing.back")}
             </button>
@@ -300,18 +491,12 @@ export default function PairingPanel(props: {
 
                 Only when RUNNING: while the cluster is still forming (idle) the
                 code is the whole point of the screen, however many peers. */}
-            {/* Running solo on a single-node model: there is no "add a machine"
-                to offer. Say why once, instead of a button that leads to a code
-                the coordinator will not honour. */}
-            {soloRunning && !clusterable ? (
-              <p className="auth-note">{t("pairing.singleNodeModel")}</p>
-            ) : null}
-            {snap.code && soloRunning && clusterable && !showCode ? (
+            {snap.code && soloRunning && !showCode ? (
               <button className="linkbtn linkbtn--center" onClick={() => setShowCode(true)}>
                 {t("pairing.addMachine")}
               </button>
             ) : null}
-            {snap.code && (!soloRunning || showCode) && (clusterable || !soloRunning) ? (
+            {snap.code && (!soloRunning || showCode) ? (
               <div className="code-share">
                 <span className="code-share__label">{t("pairing.yourCode")}</span>
                 <div className="code-share__row">
@@ -343,8 +528,9 @@ export default function PairingPanel(props: {
                 <PeerRow
                   key={p.id}
                   peer={p}
+                  snapshot={snap}
                   orchestrating={snap.phase !== "idle"}
-                  onMakeCoord={(id) => void guard(getPairingProvider().setCoordinator(id))}
+                  onApproveCoordinator={approveCoordinator}
                 />
               ))}
             </div>
@@ -352,13 +538,25 @@ export default function PairingPanel(props: {
               <p className="auth-note">{t("pairing.waiting")}</p>
             ) : null}
 
+            {snap.phase === "idle" && snap.peers.some((p) => p.modelReady === false) ? (
+              <p className="auth-note">{t("pairing.model.waiting")}</p>
+            ) : null}
+
             {snap.canStart ? (
-              <button
-                className="btn-primary btn-block"
-                onClick={() => void guard(getPairingProvider().start())}
-              >
-                {t("pairing.startCluster", { n: snap.peers.length })} →
-              </button>
+              <div className="cluster-start-actions cluster-start-actions--modal">
+                <button
+                  className="btn-primary btn-block cluster-start"
+                  onClick={() => void guard(
+                    getPairingProvider().start(
+                      false,
+                      props.self.modelPath,
+                      overflowTuning(loadSettings()),
+                    )
+                  )}
+                >
+                  {t("pairing.startCluster", { n: snap.peers.length })} →
+                </button>
+              </div>
             ) : null}
 
             {/* The API address lives on the dashboard's cluster card now —

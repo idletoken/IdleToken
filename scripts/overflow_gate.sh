@@ -11,8 +11,9 @@
 #      through the REAL platform agent binary
 #   2  a local request on a full machine IS forwarded, sealed, and no plaintext
 #      crosses the wire
-#   3  overflow without a local API token refuses the START
-#   4  stream:true never forwards
+#   3  overflow without a local API token remains supported on loopback
+#   4  stream:true forwards only after a complete sealed reply and is re-emitted
+#      as a complete local SSE sequence
 #   5  each of the four bad platform keys refuses to enable
 #   6  the daily spend cap stops forwarding once it is reached
 #
@@ -20,7 +21,7 @@
 # "nothing happened", and nothing happens by itself very reliably:
 #   - "no outbound connection" is judged from the stub platform's connection
 #     log, and the log is first PROVEN to record one (claim 2 runs before
-#     claims 1, 4 and 6 and leaves a connection behind);
+#     claims 1 and 6 and leaves a connection behind);
 #   - "no plaintext on the wire" is a search over the recorded bytes, and the
 #     searcher is first proven to find a marker that IS there;
 #   - "the machine is full" is proven by a plain 429 before overflow is
@@ -69,6 +70,7 @@ cleanup() {
     pkill -9 -f '[s]tub_engine_busy' 2>/dev/null
     pkill -9 -f '[s]tub_platform.cjs' 2>/dev/null
     pkill -9 -f '[i]dletoken-platform-agent --port '"$AGENT_PORT" 2>/dev/null
+    FILL_PID=""
 }
 
 # Missing prerequisites say nothing about whether overflow obeys its rules.
@@ -101,6 +103,7 @@ chmod +x /tmp/idletoken-ovf-engine.sh
 
 BODY="{\"model\":\"m\",\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"$MARKER\"}]}"
 STREAM_BODY="{\"model\":\"m\",\"stream\":true,\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"$MARKER\"}]}"
+ANTH_STREAM_BODY="{\"model\":\"m\",\"stream\":true,\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"$MARKER\"}]}"
 
 # Claim 6 needs ONE borrowed request to reach the daily ceiling, so the stub
 # platform must claim a charge above the coordinator's DEFAULT cap. That number
@@ -140,7 +143,16 @@ start_platform() {  # start_platform <mode> [charge_milli]
 }
 
 start_coord() {  # start_coord <extra args...>; overflow flags come from the caller
-    IDLETOKEN_LLAMA_SLOTS=1 IDLETOKEN_PLATFORM_VERIFY_KEY="$(cat "$REC/verify_key.txt")" \
+    # The admission channel and the local-origin marker are written into the
+    # gate's own recording directory, never into the operator's ~/.idletoken:
+    # this script starts and kills a dozen coordinators, and one of them
+    # clobbering the key a REAL coordinator on this machine published would
+    # break that machine's agent for reasons nobody would connect to running a
+    # gate. IDLETOKEN_OVERFLOW_ORIGIN_POLICY is passed through from the caller's
+    # environment so a claim can pick the policy it is judging.
+    mkdir -p "$REC/state"
+    IDLETOKEN_STATE_DIR="$REC/state" \
+    IDLETOKEN_PLATFORM_VERIFY_KEY="$(cat "$REC/verify_key.txt")" \
     ./idletoken-coord --llama-server-bin /tmp/idletoken-ovf-engine.sh \
         --llama-gguf "$GGUF" --http --api-bind "127.0.0.1:$API_PORT" \
         --model-id qwen3.5-0.8b --ctx-size 4096 --api-token gatetok \
@@ -177,15 +189,16 @@ start_coord_or_skip() {
     esac
 }
 
-# Occupy every slot and the queue behind it, then leave them occupied. Returns
-# once the machine really is full — proven by a request being refused, not by a
-# sleep.
+# Occupy the one local slot and leave it occupied. The local queue is
+# deliberately zero-deep now: the next request is the overflow candidate, so a
+# second filler would borrow and contaminate the outbound-connection oracle.
 fill_machine() {
-    for _ in 1 2; do
-        curl -s -m 40 -H 'Authorization: Bearer gatetok' -H 'Content-Type: application/json' \
-             -d "$BODY" "http://127.0.0.1:$API_PORT/v1/chat/completions" >/dev/null 2>&1 &
-    done
-    disown -a 2>/dev/null
+    if [ -n "${FILL_PID:-}" ] && kill -0 "$FILL_PID" 2>/dev/null; then
+        wait "$FILL_PID" 2>/dev/null || true
+    fi
+    curl -s -m 40 -H 'Authorization: Bearer gatetok' -H 'Content-Type: application/json' \
+         -d "$BODY" "http://127.0.0.1:$API_PORT/v1/chat/completions" >/dev/null 2>&1 &
+    FILL_PID=$!
     sleep 2
 }
 
@@ -196,7 +209,37 @@ post_chat() {  # post_chat <body> [extra curl args...]; echoes "<code> <body>"
          "http://127.0.0.1:$API_PORT/v1/chat/completions" 2>/dev/null
 }
 
+post_anthropic() {
+    local body="$1"
+    curl -s -m 25 -w '\n%{http_code}' -H 'Authorization: Bearer gatetok' \
+         -H 'Content-Type: application/json' -d "$body" \
+         "http://127.0.0.1:$API_PORT/v1/messages" 2>/dev/null
+}
+
 conns() { wc -l < "$REC/conn.log" 2>/dev/null | tr -d ' '; }
+
+# --- helpers for the admission-capability claims (7-10) ---------------------
+# sha256sum on Linux, shasum on macOS. Written once: a claim that silently got
+# an empty hash would mint a capability bound to nothing and then "pass".
+sha256_hex() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1
+    else shasum -a 256 | cut -d' ' -f1; fi
+}
+
+channel_key() { cat "$REC/state/coord-admission.key" 2>/dev/null | tr -d ' \r\n'; }
+local_marker() { cat "$REC/state/coord-local-origin.key" 2>/dev/null | tr -d ' \r\n'; }
+
+# mint_cap <job_id> <body> -> the capability, or "" on refusal.
+mint_cap() {
+    local job="$1" body="$2" h
+    h=$(printf '%s' "$body" | sha256_hex)
+    curl -s -m 5 -H "Authorization: Bearer $(channel_key)" \
+         -H 'Content-Type: application/json' \
+         -d "{\"job_id\":\"$job\",\"body_sha256\":\"$h\"}" \
+         "http://127.0.0.1:$API_PORT$ADMIT_PATH" 2>/dev/null |
+        sed -n 's/.*"capability":"\([^"]*\)".*/\1/p'
+}
+ADMIT_PATH=/idletoken/v1/platform/admit
 
 echo "======================================================"
 echo " G_OVERFLOW — overflow routing"
@@ -302,6 +345,16 @@ start_platform good "$CHARGE_MILLI" || fail "the stub platform did not come up"
 
 # --- control: the machine really does fill up, before overflow is involved ---
 start_coord_or_skip || fail "the coordinator never became ready (see $REC/coord.log)"
+stats=$(curl -s -m 3 "http://127.0.0.1:$API_PORT/idletoken/v1/stats")
+printf '%s' "$stats" | grep -q '"seq_slots":1' \
+    || fail "control: default local engine is not single-slot: $stats"
+printf '%s' "$stats" | grep -q '"concurrency":1' \
+    || fail "control: default local concurrency is not 1: $stats"
+printf '%s' "$stats" | grep -q '"queue_cap":0' \
+    || fail "control: local inference queue is not zero-deep: $stats"
+grep -q 'resources could hold 4' "$REC/coord.log" \
+    || fail "control: the fixture did not prove that product policy overrode a resource-derived multi-slot result"
+note "control: resources permit 4 slots, product policy starts 1 with queue 0"
 fill_machine
 got=$(post_chat "$BODY")
 code=$(printf '%s' "$got" | tail -1)
@@ -370,9 +423,10 @@ grep -q "daily spend cap" "$REC/coord.log" \
 note "claim 6: past the cap -> 429, and no outbound connection"
 
 # ===================================================================
-# Claim 4 — stream:true never forwards. Restarted so the daily cap is not
-# the reason it refuses; that would make this claim pass for claim 6's
-# reason and stay green if streaming forwarding were added tomorrow.
+# Claim 4 — stream:true borrows safely. The cloud exchange itself is
+# non-streaming and sealed; only after the complete reply arrives may the
+# coordinator open a local SSE response. That removes the old half-stream
+# failure ambiguity while letting the desktop chat use overflow.
 # ===================================================================
 cleanup; sleep 1
 : > "$REC/conn.log"
@@ -383,21 +437,31 @@ before=$(conns)
 fill_machine
 got=$(post_chat "$STREAM_BODY")
 code=$(printf '%s' "$got" | tail -1)
-[ "$code" = "429" ] \
-    || fail "claim 4: a streaming request on a full machine got $code, not 429"
-[ "$(conns)" = "$before" ] \
-    || fail "claim 4: a streaming request caused an outbound connection"
-grep -q "stream:true is refused locally" "$REC/coord.log" \
-    || fail "claim 4: refused, but not for being a stream"
-# Control: the same coordinator, same moment, non-streaming -> it DOES borrow.
-# Without this, claim 4 would also pass on a machine where overflow was simply
-# not working.
+[ "$code" = "200" ] \
+    || fail "claim 4: a streaming request on a full machine got $code, not 200"
+[ "$(conns)" -gt "$before" ] \
+    || fail "claim 4: a streaming request did not reach overflow"
+printf '%s' "$got" | grep -q 'chat.completion.chunk' \
+    || fail "claim 4: borrowed stream is not an OpenAI chunk sequence"
+printf '%s' "$got" | grep -q '\[DONE\]' \
+    || fail "claim 4: borrowed stream has no complete [DONE] trailer"
+note "claim 4: OpenAI stream:true borrowed after a complete reply and returned a complete SSE sequence"
+
+# The same rule must cover the Anthropic face used by Claude Code. It has a
+# different event grammar, so an OpenAI-only assertion cannot stand in for it.
 fill_machine
-got=$(post_chat "$BODY")
+before=$(conns)
+got=$(post_anthropic "$ANTH_STREAM_BODY")
 code=$(printf '%s' "$got" | tail -1)
 [ "$code" = "200" ] \
-    || fail "claim 4 control: the same coordinator would not borrow for a NON-streaming request either ($code) — the refusal above proves nothing about streaming"
-note "claim 4: stream:true -> 429 with no outbound; the same coordinator borrows for a non-stream"
+    || fail "claim 4: an Anthropic streaming request on a full machine got $code, not 200"
+[ "$(conns)" -gt "$before" ] \
+    || fail "claim 4: an Anthropic streaming request did not reach overflow"
+printf '%s' "$got" | grep -q 'event: message_start' \
+    || fail "claim 4: borrowed Anthropic stream has no message_start"
+printf '%s' "$got" | grep -q 'event: message_stop' \
+    || fail "claim 4: borrowed Anthropic stream has no message_stop"
+note "claim 4: Anthropic stream:true returned a complete message_start…message_stop sequence"
 
 # ===================================================================
 # Claim 1 — the ironclad rule, asserted through the REAL agent binary.
@@ -462,5 +526,250 @@ code=$(printf '%s' "$got" | tail -1)
     || fail "claim 1 control: a local request on the same full coordinator did not borrow ($code) — the absence above proves nothing"
 note "claim 1 control: a local request through the same coordinator DID go out"
 
+# And the capability the agent minted was really SPENT, not merely sent. Claim 1
+# above would hold on the legacy header alone; this is what says the mechanism
+# that a modified agent cannot fake actually ran.
+grep -q "capability spent" "$REC/coord.log" \
+    || fail "claim 1: the coordinator never spent an admission capability — the agent fell back to the legacy header, so PROV-28's proven path is untested (see $REC/agent.log)"
+note "claim 1: ...and the capability the real agent minted was spent by the coordinator"
+
+# ===================================================================
+# Claim 7 — PROV-28. On a machine that serves the platform, a request with NO
+# origin marker is not forwardable, because that is exactly the shape a
+# dispatched job takes once its agent deletes one line of itself.
+#
+# THREE PARTS, and the middle one is the whole reason this claim is credible:
+#
+#   7a  the fix:            unmarked + strict     -> 429, nothing dialled out
+#   7b  the attack oracle:  unmarked + legacy     -> 200, dialled out
+#   7c  the non-regression: marked   + strict     -> 200, dialled out
+#
+# Without 7b, 7a proves only that something refused; a coordinator with overflow
+# quietly broken would pass it. Without 7c, the "fix" could be "never forward
+# anything", which switches the feature off for the user who paid for it. The
+# attack is demonstrated on the SAME BINARY that stops it, via the documented
+# escape hatch, because an oracle that needs an older build is one nobody runs.
+#
+# --shared is deliberately NOT used to make this machine a provider. Spending
+# one real capability does it, which also exercises the rule that a machine
+# serving platform work is a provider whether or not the flag was typed.
+# ===================================================================
+ovf_become_provider() {   # spend one capability so "no marker" stops being unambiguous
+    local cap
+    cap=$(mint_cap "gate-provider" "$BODY")
+    [ -n "$cap" ] || return 1
+    post_chat "$BODY" -H "$ADMIT_HDR: $cap" >/dev/null 2>&1
+    grep -q "capability spent" "$REC/coord.log"
+}
+ADMIT_HDR=X-IdleToken-Job-Admission
+LOCAL_HDR=X-IdleToken-Local-Origin
+HOPS_HDR=X-IdleToken-Hops
+
+cleanup; sleep 1
+: > "$REC/conn.log"
+start_platform good 1 || fail "the stub platform did not come up"
+IDLETOKEN_OVERFLOW_ORIGIN_POLICY=strict \
+    start_coord_or_skip --overflow-url "http://127.0.0.1:$PLAT_PORT" --overflow-key sk-gate-key \
+    || fail "the coordinator never became ready under the strict origin policy (see $REC/coord.log)"
+grep -q "origin policy 'strict'" "$REC/coord.log" \
+    || fail "claim 7: the coordinator did not adopt the strict origin policy, so 7a would be testing the default"
+ovf_become_provider \
+    || fail "claim 7 fixture: could not spend a capability, so this coordinator never became a provider and an unmarked request is legitimately local — nothing below would be an assertion"
+note "claim 7 fixture: one capability spent; this coordinator now serves platform work"
+
+# --- 7a: the fix ---------------------------------------------------------
+before=$(conns)
+fill_machine
+got=$(post_chat "$BODY")
+code=$(printf '%s' "$got" | tail -1)
+[ "$code" = "429" ] \
+    || fail "claim 7a: an UNATTRIBUTED request on a machine that serves the platform was answered $code, not 429 — this is the PROV-28 shape and it must not be forwarded"
+[ "$(conns)" = "$before" ] \
+    || fail "claim 7a: an UNATTRIBUTED request was forwarded off this machine — a stripped-header platform job would be charged twice and shown to one more stranger"
+grep -q "unattributed request on a machine that serves the platform" "$REC/coord.log" \
+    || fail "claim 7a: refused, but not for the origin reason — the log must name why, or the next person will read it as an ordinary busy 429"
+note "claim 7a: unattributed + strict -> 429, nothing dialled out, reason named"
+
+# --- 7c: the non-regression control --------------------------------------
+# The SAME coordinator, the SAME body, one extra header: the local-origin
+# marker it published. If this does not go out, 7a is passing because overflow
+# is dead rather than because the origin rule held.
+before=$(conns)
+fill_machine
+got=$(post_chat "$BODY" -H "$LOCAL_HDR: $(local_marker)")
+code=$(printf '%s' "$got" | tail -1)
+[ "$code" = "200" ] && [ "$(conns)" -gt "$before" ] \
+    || fail "claim 7c: an ATTRIBUTED local request on the same strict coordinator did not borrow ($code) — the refusal in 7a is a dead feature, not an origin check"
+note "claim 7c: the same request WITH the local-origin marker still borrows under strict"
+
+# --- 7b: the attack oracle ------------------------------------------------
+cleanup; sleep 1
+: > "$REC/conn.log"
+start_platform good 1 || fail "the stub platform did not come up"
+IDLETOKEN_OVERFLOW_ORIGIN_POLICY=legacy \
+    start_coord_or_skip --overflow-url "http://127.0.0.1:$PLAT_PORT" --overflow-key sk-gate-key \
+    || fail "the coordinator never became ready under the legacy origin policy (see $REC/coord.log)"
+ovf_become_provider \
+    || fail "claim 7b fixture: could not spend a capability under the legacy policy"
+before=$(conns)
+fill_machine
+got=$(post_chat "$BODY")
+code=$(printf '%s' "$got" | tail -1)
+[ "$code" = "200" ] && [ "$(conns)" -gt "$before" ] \
+    || fail "claim 7b: the legacy policy did NOT reproduce the pre-hardening behaviour ($code) — 7a's refusal cannot be attributed to the fix, because this harness cannot show the machine ever forwarded an unmarked request"
+note "claim 7b attack oracle: under the legacy policy the same unmarked request IS forwarded — the hole is real and 7a closes it"
+
+# ===================================================================
+# Claim 8 — the capability's lifecycle over real HTTP. Each refusal must carry
+# its OWN reason: a verifier that answered "no" to everything would pass a test
+# that only asserted "rejected", and would silently stop this machine serving
+# the platform at all.
+# ===================================================================
+cleanup; sleep 1
+: > "$REC/conn.log"
+start_platform good 1 || fail "the stub platform did not come up"
+start_coord_or_skip --overflow-url "http://127.0.0.1:$PLAT_PORT" --overflow-key sk-gate-key \
+    || fail "the coordinator never became ready (see $REC/coord.log)"
+
+CAP=$(mint_cap "gate-job-8" "$BODY")
+[ -n "$CAP" ] || fail "claim 8: the coordinator would not mint a capability against its own channel key"
+
+# Minting requires the channel key and nothing else stands in for it.
+code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 -H 'Authorization: Bearer not-the-key' \
+        -H 'Content-Type: application/json' -d '{"job_id":"x","body_sha256":"00"}' \
+        "http://127.0.0.1:$API_PORT$ADMIT_PATH")
+[ "$code" = "401" ] \
+    || fail "claim 8: minting without the channel key answered $code, not 401 — anything on this machine could mint proofs of platform origin"
+note "claim 8: minting needs the channel key (401 without it)"
+
+# The capability admits its body once, and the coordinator says so.
+before=$(conns)
+fill_machine
+got=$(post_chat "$BODY" -H "$ADMIT_HDR: $CAP")
+[ "$(conns)" = "$before" ] \
+    || fail "claim 8: a request admitted by a capability was forwarded — proven platform work must never leave this machine"
+grep -q "platform job gate-job-8 admitted" "$REC/coord.log" \
+    || fail "claim 8: the coordinator did not record spending the capability, so the assertion above may be about an ordinary refusal"
+note "claim 8: a capability admits its request once, and that request is not forwarded"
+
+# Replay, body mismatch and garbage: each refused, each named, each a 403 that
+# stops the request rather than demoting it to an ordinary one. If a bad
+# capability quietly became "local", corrupting one byte of a ticket would be an
+# easier way to strip it than deleting the header.
+for probe in replay mismatch garbage; do
+    case "$probe" in
+        replay)   hdr="$CAP";              body="$BODY";        want="already spent" ;;
+        mismatch) hdr=$(mint_cap "gate-job-8b" "$BODY"); body="$STREAM_BODY"
+                  want="different request body" ;;
+        garbage)  hdr="itadm1.x.y.z.w";    body="$BODY";        want="not a v1 admission capability" ;;
+    esac
+    [ -n "$hdr" ] || fail "claim 8 ($probe): could not build the probe"
+    out=$(post_chat "$body" -H "$ADMIT_HDR: $hdr")
+    code=$(printf '%s' "$out" | tail -1)
+    [ "$code" = "403" ] \
+        || fail "claim 8 ($probe): answered $code, not 403 — a capability that does not verify must refuse the request, never be demoted to an unmarked one"
+    printf '%s' "$out" | grep -q "$want" \
+        || fail "claim 8 ($probe): refused, but not for its own reason (wanted \"$want\"): $(printf '%s' "$out" | head -1)"
+    note "claim 8: $probe -> 403 ($want)"
+done
+
+# ===================================================================
+# Claim 9 — the hop budget (CHAIN-05). RULE 1 ends the loop that goes out
+# through the platform and back, but it cannot see a chain that grows one
+# machine at a time: from each coordinator's own side, every hop looks like a
+# first one. A counter that travels with the request does not depend on anyone's
+# honesty about origin.
+# ===================================================================
+before=$(conns)
+fill_machine
+got=$(post_chat "$BODY" -H "$HOPS_HDR: $(awk '$1=="#define" && $2=="IDLETOKEN_OVF_MAX_HOPS" {print $3}' include/idletoken_overflow.h)")
+code=$(printf '%s' "$got" | tail -1)
+[ "$code" = "429" ] \
+    || fail "claim 9: a request that had already been forwarded was forwarded again ($code)"
+[ "$(conns)" = "$before" ] \
+    || fail "claim 9: a request at the hop budget still dialled out — the exposure set of one prompt has no ceiling"
+grep -q "already been forwarded once" "$REC/coord.log" \
+    || fail "claim 9: refused, but the log does not say it was the hop budget"
+note "claim 9: a request at the hop budget is refused, and nothing is dialled out"
+
+# Control: one hop below the budget still goes out, so claim 9 is a ceiling and
+# not an off-switch.
+before=$(conns)
+fill_machine
+got=$(post_chat "$BODY" -H "$HOPS_HDR: 0")
+code=$(printf '%s' "$got" | tail -1)
+[ "$code" = "200" ] && [ "$(conns)" -gt "$before" ] \
+    || fail "claim 9 control: a request BELOW the hop budget did not borrow ($code) — the budget is an off-switch, not a ceiling"
+note "claim 9 control: below the budget the same request still borrows"
+
+# ===================================================================
+# Claim 10 — fee expansion (CHAIN-05). A machine in the middle of somebody
+# else's paid job must not pay a third machine at the same time. Unlike the
+# origin question this needs no honesty from anybody: the count comes from
+# capabilities this coordinator minted and spent itself.
+# ===================================================================
+cleanup; sleep 1
+: > "$REC/conn.log"
+start_platform good 1 || fail "the stub platform did not come up"
+start_coord_or_skip --overflow-url "http://127.0.0.1:$PLAT_PORT" --overflow-key sk-gate-key \
+    || fail "the coordinator never became ready (see $REC/coord.log)"
+CAP=$(mint_cap "gate-job-10" "$BODY")
+[ -n "$CAP" ] || fail "claim 10: could not mint a capability"
+# Occupy the single local slot with a PLATFORM job and leave it running.
+curl -s -m 40 -H 'Authorization: Bearer gatetok' -H 'Content-Type: application/json' \
+     -H "$ADMIT_HDR: $CAP" -d "$BODY" \
+     "http://127.0.0.1:$API_PORT/v1/chat/completions" >/dev/null 2>&1 &
+PLAT_JOB_PID=$!
+sleep 2
+grep -q "platform job gate-job-10 admitted" "$REC/coord.log" \
+    || fail "claim 10 fixture: the platform job was not admitted, so no platform work is in flight and nothing below is an assertion"
+before=$(conns)
+got=$(post_chat "$BODY" -H "$LOCAL_HDR: $(local_marker)")
+code=$(printf '%s' "$got" | tail -1)
+[ "$code" = "429" ] \
+    || fail "claim 10: while a platform job was in flight, a local request was answered $code instead of 429 — this machine would have paid a third machine while already being paid for the slot"
+[ "$(conns)" = "$before" ] \
+    || fail "claim 10: while a platform job was in flight, the coordinator dialled out — the same prompt can now reach a third party and be charged twice"
+grep -q "platform-dispatched job is in flight" "$REC/coord.log" \
+    || fail "claim 10: refused, but the log does not say it was the in-flight platform job"
+wait "$PLAT_JOB_PID" 2>/dev/null || true
+note "claim 10: while a platform job is in flight, an attributed local request is not forwarded"
+
+# Control: once the platform job has finished, the very same attributed request
+# borrows again — the rule releases, it does not latch.
+sleep 1
+before=$(conns)
+fill_machine
+got=$(post_chat "$BODY" -H "$LOCAL_HDR: $(local_marker)")
+code=$(printf '%s' "$got" | tail -1)
+[ "$code" = "200" ] && [ "$(conns)" -gt "$before" ] \
+    || fail "claim 10 control: after the platform job finished the same request still would not borrow ($code) — the in-flight mark latched, and this machine can never borrow again"
+note "claim 10 control: the in-flight mark releases when the platform job ends"
+
+# ===================================================================
+# Claim 11 — the disclosure endpoint reports what is ENFORCED (PRIV-01/02,
+# HOST-06). Judged by making the state change and requiring the answer to
+# change with it: a constant string would otherwise pass.
+# ===================================================================
+posture() { curl -s -m 5 "http://127.0.0.1:$API_PORT$PRIVACY_PATH" 2>/dev/null; }
+PRIVACY_PATH=/idletoken/v1/privacy/posture
+p_on=$(posture)
+printf '%s' "$p_on" | grep -q '"overflow_enabled":true' \
+    || fail "claim 11: overflow is on but the posture endpoint does not say so: $p_on"
+printf '%s' "$p_on" | grep -q 'the provider a borrowed request lands on' \
+    || fail "claim 11: with borrowing on, the posture does not disclose that another provider will see the prompt (PRIV-01/PRIV-04)"
+printf '%s' "$p_on" | grep -q '"admission":{"armed":true' \
+    || fail "claim 11: the posture does not report the admission channel as armed"
+
+cleanup; sleep 1
+start_platform good 1 || fail "the stub platform did not come up"
+start_coord_or_skip || fail "the coordinator never became ready with overflow OFF"
+p_off=$(posture)
+printf '%s' "$p_off" | grep -q '"overflow_enabled":false' \
+    || fail "claim 11 control: with overflow off the posture still says it is on — the endpoint reports a constant, not the enforced state: $p_off"
+printf '%s' "$p_off" | grep -q 'the provider a borrowed request lands on' \
+    && fail "claim 11 control: with overflow off the posture still names a borrowed provider — the disclosure is boilerplate, not a reading of the state"
+note "claim 11: the posture endpoint tracks the enforced state in both directions"
+
 cleanup
-echo "OVERFLOW_GATE_OK: platform work never forwarded (via the real agent); local overflow sealed with no plaintext; fail-closed on token and on four bad keys; streams and the daily cap refuse without dialling out"
+echo "OVERFLOW_GATE_OK: platform work never forwarded (via the real agent, and its capability really spent); an unattributed request on a provider machine is refused while the same request WITH the local marker still borrows, and the legacy policy reproduces the hole on the same binary; capability replay/mismatch/garbage each 403 for their own reason; the hop budget and an in-flight platform job both stop a forward and both release; local overflow sealed with no plaintext; tokenless loopback is supported and four bad keys fail closed; stream and non-stream local work may borrow; the daily cap refuses without dialling out; the posture endpoint tracks what is enforced"

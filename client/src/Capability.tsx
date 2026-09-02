@@ -12,7 +12,7 @@ import { useEffect, useState } from "react";
 import { useI18n } from "./i18n";
 import { fmtBytes } from "./format";
 
-export type CapabilityMode = "gpu_only" | "hybrid" | "no" | "unavailable";
+export type CapabilityMode = "gpu_only" | "no" | "unavailable";
 
 export interface CapabilityRow {
   id: string;
@@ -73,6 +73,12 @@ export async function loadCapability(apiBaseUrl?: string | null): Promise<Capabi
   return (await invoke("advise_capability")) as CapabilityReport;
 }
 
+/** Always advise against this physical machine, regardless of cluster state. */
+export async function loadLocalCapability(): Promise<CapabilityReport> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  return (await invoke("advise_capability")) as CapabilityReport;
+}
+
 export default function Capability(props: { apiBaseUrl?: string | null }) {
   const { t } = useI18n();
   const [rep, setRep] = useState<CapabilityReport | null>(null);
@@ -95,7 +101,7 @@ export default function Capability(props: { apiBaseUrl?: string | null }) {
   // order a user scans when deciding what to try.
   const rows = [...rep.models].sort((a, b) => {
     const rank = (r: CapabilityRow) =>
-      r.mode === "gpu_only" ? 0 : r.mode === "hybrid" ? 1 : r.mode === "no" ? 2 : 3;
+      r.mode === "gpu_only" ? 0 : r.mode === "no" ? 1 : 2;
     return rank(a) - rank(b) || a.shortfall_bytes - b.shortfall_bytes;
   });
 

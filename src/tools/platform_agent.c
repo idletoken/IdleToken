@@ -40,6 +40,18 @@
 #include "idletoken_net.h"
 #include "idletoken_http.h"
 #include "idletoken_b64.h"
+#include "idletoken_admission.h"   /* prove to the coordinator that this job is
+                                    * platform work (threat register PROV-28) */
+
+/* Release builds inject this from client/package.json.  There is deliberately
+ * no fallback: a hand-maintained default would let one of the three platform
+ * agent build paths ship a stale compatibility claim forever. */
+#ifndef IDLETOKEN_CLIENT_VERSION
+#error "IDLETOKEN_CLIENT_VERSION must be generated from client/package.json"
+#endif
+
+#define IDLETOKEN_VERSION_HTTP_HEADER \
+    "X-IdleToken-Version: " IDLETOKEN_CLIENT_VERSION "\r\n"
 
 #include <errno.h>
 #include <signal.h>
@@ -361,12 +373,54 @@ static int agent_selftest(void) {
 
 /* POST /providers/:id/cache-state {bloom}. Skipped when there is nothing to
  * report. Returns 0 on success. */
+/* Is the KV-affinity report switched off for this machine? (PRIV-06/PRIV-11.)
+ *
+ * What this report contains is worth naming precisely, because "a Bloom filter
+ * of hashes" sounds like it contains nothing. The hashes are chained SHA-256
+ * over the rendered message text under a salt that is a PUBLIC CONSTANT — it
+ * has to be, or the platform could not compute the same values for a consumer's
+ * prompt and affinity routing would not work at all. So anyone holding the
+ * filter can TEST A GUESS: take a prompt prefix you suspect, hash it the same
+ * way, and see whether the bits are set. That is not recovery of unknown text,
+ * but it is confirmation of guessed text, about prompts that belong to this
+ * provider's CUSTOMERS rather than to its owner.
+ *
+ * It is left ON by default because it is what makes prefix-cache affinity work,
+ * and a provider that reports nothing simply loses that routing preference. But
+ * "the mechanism needs it" is not the same as "the operator agreed to it", so
+ * there is a switch, and it says what it costs. Making the salt per-provider
+ * instead would remove the confirmation oracle AND the feature; that trade is a
+ * platform-side decision, recorded as a cross-owner request in
+ * results/security-hardening-overflow-privacy-20260830.md. */
+static int cache_report_off(void) {
+    static int resolved = 0, off = 0;
+    if (!resolved) {
+        const char *e = getenv("IDLETOKEN_NO_CACHE_REPORT");
+        resolved = 1;
+        off = (e && e[0] && strcmp(e, "0") != 0) ? 1 : 0;
+        if (off)
+            fprintf(stderr, "platform-agent: IDLETOKEN_NO_CACHE_REPORT is set — "
+                            "not reporting cached prompt prefixes. This machine "
+                            "loses prefix-affinity routing; nothing derived from "
+                            "a customer's prompt text leaves it (PRIV-06).\n");
+    }
+    return off;
+}
+
 static int platform_post_cache_state(const char *platform_addr, const char *jwt,
                                      const char *provider_id) {
     /* Fold g_prefix into the Bloom filter under the lock, then let go: the HTTP
      * POST that follows can take seconds, and holding the lock across network
      * I/O would stall the inference threads with it. */
     uint8_t bloom[PFX_BLOOM_BYTES] = {0};
+    if (cache_report_off()) {
+        /* Clear the dirty flag as well, or every finished job re-enters this
+         * function and the "off" line becomes a per-request decision. */
+        pthread_mutex_lock(&g_prefix_mu);
+        g_prefix.dirty = 0;
+        pthread_mutex_unlock(&g_prefix_mu);
+        return -1;   /* -1 = nothing was posted; the caller only logs on 0 */
+    }
     pthread_mutex_lock(&g_prefix_mu);
     if (g_prefix.n <= 0) { g_prefix.dirty = 0; pthread_mutex_unlock(&g_prefix_mu); return 0; }
     for (int i = 0; i < g_prefix.n; i++)
@@ -761,7 +815,12 @@ static char *platform_register(const char *platform_addr, const char *jwt,
 static uint8_t *http_post_json(const char *addr, const char *path, const char *bearer,
                                const uint8_t *body, size_t body_len,
                                int *out_status, size_t *out_len, int timeout_secs) {
-    return http_request_json("POST", addr, path, bearer, NULL, body, body_len,
+    /* This wrapper is used only for authenticated platform control-plane
+     * requests (registration, cache state, heartbeat, relay poll/result).
+     * Local coordinator/OpenAI traffic uses its own wrapper below, so it does
+     * not inherit a platform-only compatibility header. */
+    return http_request_json("POST", addr, path, bearer,
+                             IDLETOKEN_VERSION_HTTP_HEADER, body, body_len,
                              out_status, out_len, timeout_secs);
 }
 
@@ -784,14 +843,217 @@ static uint8_t *http_post_json(const char *addr, const char *path, const char *b
  * read as "the platform stopped sending me work". */
 static char g_coord_token[256] = "";
 
+/* --- the admission capability (threat register PROV-28) --------------------
+ *
+ * The header above is a claim the sender chooses to make. It was, until
+ * 2026-08-30, the ONLY thing telling the coordinator that a job came from the
+ * platform — and an agent that deleted that one line had every dispatched job
+ * treated as local work: eligible to be forwarded to a third machine, charged
+ * a second time, and shown to one more stranger, with nothing anywhere
+ * reporting an error.
+ *
+ * So the agent now also mints a single-use capability under the channel key the
+ * coordinator beside it published to a 0600 file. What that proves is narrow
+ * and worth stating exactly: it proves the sender can read this coordinator's
+ * channel key, not that the sender is honest. A modified agent on the same
+ * machine reads the same file (the accepted HOST-02/HOST-16 boundary). What it
+ * closes is the PROV-28 attack itself — omitting the marker no longer reads as
+ * "local", because on a sharing coordinator absence is refused rather than
+ * promoted.
+ *
+ * Attachment is LAZY and RE-CHECKED, not done once at startup, because the
+ * client spawns the coordinator and the agent together and the file may not
+ * exist yet when this process starts. A failure is loud but never fatal: the
+ * legacy header still goes out on every request, so an agent that cannot mint
+ * gets its jobs served and not forwarded, which is the safe direction.
+ *
+ * ⚠ RE-CHECKED, not cached-forever. This WAS a latch until 2026-09-01, and the
+ * latch was the bug. The coordinator rolls its channel key on every start and
+ * the client deliberately keeps this process alive across a coordinator restart
+ * (engine.rs::stop_engine) — so after a model switch, a manual stop/start or a
+ * crash respawn, the cached key was one nobody recognised. Minting is a local
+ * HMAC, so it kept SUCCEEDING; the refusal appeared only at the coordinator, as
+ * a 403 on every dispatched job, which the platform read as a provider fault.
+ * Reproduced end to end on a Windows test node: one restart took it from
+ * serving to `providers_isolated` with `/v1/models` empty while its owner could
+ * see the engine running. So: an attachment is a CACHE, and it is invalidated
+ * whenever the file says something else. */
+static int  g_adm_attached  = 0;
+static int  g_adm_complained = 0;
+
+static void agent_admission_refresh(void) {
+    char path[400] = "", err[240] = "";
+    const char *env = getenv("IDLETOKEN_ADMISSION_KEY");
+
+    /* An explicit key wins: the client that spawned both processes may pass it
+     * directly rather than let this one go looking on disk. It cannot go stale
+     * behind our back the way the file can — the only way it changes is a
+     * restart of this process — so it is attached once and left alone. */
+    if (env && env[0]) {
+        if (g_adm_attached) return;
+        if (idletoken_admission_attach(env, err, sizeof err) == 0) {
+            g_adm_attached = 1;
+            fprintf(stderr, "platform-agent: admission channel attached from "
+                            "IDLETOKEN_ADMISSION_KEY\n");
+            return;
+        }
+    } else if (idletoken_admission_default_paths(path, sizeof path, NULL, 0) == 0) {
+        int rc = idletoken_admission_attach_file_if_changed(path, err, sizeof err);
+        if (rc >= 0) {
+            /* Name the re-attach. A coordinator restart under a live agent used
+             * to be invisible from here, and "invisible" is what let it run for
+             * days as an unexplained provider fault. */
+            if (rc == 1)
+                fprintf(stderr, "platform-agent: admission channel %s from %s\n",
+                        g_adm_attached ? "re-attached (the coordinator restarted)"
+                                       : "attached", path);
+            g_adm_attached = 1;
+            g_adm_complained = 0;   /* a later loss deserves to be said again */
+            return;
+        }
+    }
+    /* Complain once, then stop: this is retried on every job, and a coordinator
+     * that never publishes a key would otherwise fill the log. */
+    g_adm_attached = 0;
+    if (!g_adm_complained) {
+        g_adm_complained = 1;
+        fprintf(stderr, "platform-agent: cannot attach the coordinator's admission "
+                        "channel (%s). Dispatched jobs will still be served, and "
+                        "will still not be forwarded, because the legacy origin "
+                        "header is sent as well — but they arrive unproven "
+                        "(threat register PROV-28).\n",
+                err[0] ? err : "no channel key available");
+    }
+}
+
+/* A job id the capability can be bound to. The platform's own id when it is
+ * usable; otherwise one derived from the body hash, which is unique per request
+ * without inventing state. The id is a label inside the MAC — the single-use
+ * property comes from the nonce and the body binding, not from this — so a
+ * fallback here weakens nothing. */
+static void agent_job_label(const char *job_id, const uint8_t body_hash[32],
+                            char *out, size_t cap) {
+    size_t i;
+    int ok = job_id && job_id[0];
+    for (i = 0; ok && job_id[i]; i++) {
+        char c = job_id[i];
+        if (i >= 63) { ok = 0; break; }
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '-' || c == ':'))
+            ok = 0;
+    }
+    if (ok) { snprintf(out, cap, "%s", job_id); return; }
+    {
+        char hex[65];
+        idletoken_admission_hex(body_hash, 32, hex, sizeof hex);
+        snprintf(out, cap, "body-%.24s", hex);
+    }
+}
+
+/* The headers this agent puts on a plaintext forward into the coordinator.
+ *
+ * The legacy origin header is ALWAYS present, even when a capability was
+ * minted. Two mechanisms, one meaning: a coordinator older than this change
+ * understands only the header, and a coordinator that fails to mint for any
+ * reason must still be told this is platform work. Dropping the header once the
+ * capability existed would have made the upgrade a downgrade for every mixed
+ * pair of versions. */
+static void agent_forward_headers(const char *job_id, int hops,
+                                  const uint8_t *body, size_t body_len,
+                                  char *out, size_t cap) {
+    uint8_t bh[32];
+    char label[IDLETOKEN_ADM_JOB_CAP];
+    char ticket[IDLETOKEN_ADM_TICKET_CAP] = "";
+    char err[200] = "";
+    size_t off;
+
+    off = (size_t)snprintf(out, cap,
+                           IDLETOKEN_HDR_ORIGIN ": " IDLETOKEN_ORIGIN_PLATFORM "\r\n"
+                           IDLETOKEN_HDR_HOPS ": %d\r\n",
+                           hops < 0 ? 0 : hops);
+
+    agent_admission_refresh();
+    if (!g_adm_attached) return;
+
+    idletoken_admission_body_hash(body, body_len, bh);
+    agent_job_label(job_id, bh, label, sizeof label);
+    if (idletoken_admission_mint(label, bh, (long long)time(NULL),
+                                 ticket, sizeof ticket, err, sizeof err) != 0) {
+        /* Say which job could not be proven. Silence here would present as the
+         * coordinator refusing to forward the OWNER's traffic with no visible
+         * cause on a --shared machine. */
+        fprintf(stderr, "platform-agent: could not mint an admission capability "
+                        "for job %s (%s) — forwarding with the legacy header "
+                        "only\n", label, err[0] ? err : "unknown error");
+        g_adm_attached = 0;          /* re-read the key on the next job */
+        return;
+    }
+    snprintf(out + off, cap - off, IDLETOKEN_HDR_ADMISSION ": %s\r\n", ticket);
+}
+
+/* Defined with the other buffer helpers further down; needed here for the one
+ * response this function throws away. */
+static void wipe_free(void *p, size_t n);
+
+/* Did the coordinator refuse this because the capability did not verify?
+ *
+ * Matched on the coordinator's own wording (coord_main.c: "admission capability
+ * rejected: <reason>") and only ever used to decide whether to re-mint — never
+ * to decide anything about the answer, so a wording drift costs one retry, not
+ * a wrong result. Paired with the 403 status so an unrelated 403 body that
+ * happens to quote the phrase cannot trigger it.
+ *
+ * Scanned over an explicit length rather than with strstr: the body is
+ * attacker-adjacent bytes from a socket and is not promised to be NUL
+ * terminated. */
+static int coord_refused_admission(int status, const uint8_t *body, size_t len) {
+    static const char needle[] = "admission capability rejected";
+    const size_t n = sizeof needle - 1;
+    size_t i;
+    if (status != 403 || !body || len < n) return 0;
+    for (i = 0; i + n <= len; i++)
+        if (memcmp(body + i, needle, n) == 0) return 1;
+    return 0;
+}
+
+/* One retry, and only for a refused capability.
+ *
+ * The per-job key re-read in agent_admission_refresh() closes the steady state,
+ * but not the race: the coordinator can restart between the read and the
+ * request landing, and a single refusal is not free — the platform charges the
+ * provider a strike and a cooldown for it (reliability.ts), so the machine goes
+ * out of routing for something that was a version skew of a few milliseconds.
+ * Re-minting under the key that is on disk NOW costs one file read.
+ *
+ * Bounded at one attempt on purpose: if the second ticket is refused too, the
+ * cause is not a restart, and looping would turn a real refusal into a stall. */
 static uint8_t *http_post_json_platform(const char *addr, const char *path,
+                                        const char *job_id, int hops,
                                         const uint8_t *body, size_t body_len,
                                         int *out_status, size_t *out_len,
                                         int timeout_secs) {
-    return http_request_json("POST", addr, path,
-                             g_coord_token[0] ? g_coord_token : NULL,
-                             IDLETOKEN_HDR_ORIGIN ": " IDLETOKEN_ORIGIN_PLATFORM "\r\n",
-                             body, body_len, out_status, out_len, timeout_secs);
+    char hdrs[IDLETOKEN_ADM_TICKET_CAP + 160];
+    uint8_t *resp;
+    int attempt;
+
+    for (attempt = 0; ; attempt++) {
+        agent_forward_headers(job_id, hops, body, body_len, hdrs, sizeof hdrs);
+        resp = http_request_json("POST", addr, path,
+                                 g_coord_token[0] ? g_coord_token : NULL,
+                                 hdrs,
+                                 body, body_len, out_status, out_len, timeout_secs);
+        if (attempt > 0 || !coord_refused_admission(*out_status, resp, *out_len))
+            return resp;
+        fprintf(stderr, "platform-agent: the coordinator refused this job's "
+                        "admission capability — re-reading its channel key and "
+                        "minting once more (it restarted under us)\n");
+        if (resp) wipe_free(resp, *out_len);
+        *out_status = 0;
+        *out_len = 0;
+        /* No flag to clear: the next agent_forward_headers() re-reads the file
+         * and compares, so the fresh ticket is minted under whatever the
+         * coordinator published when it came back up. */
+    }
 }
 
 static uint8_t *http_get_json(const char *addr, const char *path,
@@ -1022,9 +1284,11 @@ static int platform_heartbeat(const char *platform_addr, const char *jwt,
 #define RELAY_WAIT_MS 25000            /* server default; must stay < proxies' idle cuts */
 #define RELAY_BACKOFF_MAX_SECS 30
 
-/* Shared sealed-envelope data path (defined below with the /infer handler). */
+/* Shared sealed-envelope data path (defined below with the /infer handler).
+ * `job_id` may be NULL on the direct transport, which has no platform-assigned
+ * id; it names the capability the forward into the coordinator carries. */
 static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
-                          const char *json, size_t json_len,
+                          const char *json, size_t json_len, const char *job_id,
                           char **out_b64, int *err_status, const char **err_msg);
 
 /* POST the job result (success or error). Best effort: on failure the job
@@ -1132,7 +1396,7 @@ static void relay_loop(const idletoken_keypair *node, const char *coord_addr,
         char *sealed_b64 = NULL;
         int err_status = 500;
         const char *err_msg = "internal error";
-        int rc = process_sealed(node, coord_addr, (const char *)resp, rlen,
+        int rc = process_sealed(node, coord_addr, (const char *)resp, rlen, job_id,
                                 &sealed_b64, &err_status, &err_msg);
         free(resp);
         fprintf(stderr, "platform-agent: relay infer job=%s -> %s\n",
@@ -1177,7 +1441,7 @@ static void wipe_free(void *p, size_t n) {
  * caller frees). On failure returns -1 and sets *err_status (HTTP-ish code:
  * 400 bad envelope / 500 internal / 502 coord) + *err_msg (static string). */
 static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
-                          const char *json, size_t json_len,
+                          const char *json, size_t json_len, const char *job_id,
                           char **out_b64, int *err_status, const char **err_msg) {
     *out_b64 = NULL;
 #define FAIL(code, msg) do { *err_status = (code); *err_msg = (msg); return -1; } while (0)
@@ -1232,6 +1496,13 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
         FAIL(400, "opened request has no messages array");
     }
     int max_tokens = json_int_field((const char *)plain, plain_len, "maxTokens", -1);
+    /* How many machines this prompt has already been handed through, as the
+     * platform declared it inside the envelope. Absent today, which reads as 0
+     * and is exactly the pre-existing behaviour; read now so that when the
+     * platform starts declaring it (the cross-owner request in
+     * results/security-hardening-overflow-privacy-20260830.md) every already
+     * deployed agent honours it instead of being exempt from the rule. */
+    int hops_in = json_int_field((const char *)plain, plain_len, "hops", 0);
     const char *tools_tok = NULL; size_t tools_len = 0;
     int have_req_tools = json_array_token((const char *)plain, plain_len, "tools",
                                           &tools_tok, &tools_len) == 0 && tools_len > 2;
@@ -1273,6 +1544,7 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
     uint8_t *cresp = NULL;
     if (cl > 0 && (size_t)cl < creq_cap)
         cresp = http_post_json_platform(coord_addr, "/v1/chat/completions",
+                               job_id, hops_in,
                                (const uint8_t *)creq, (size_t)cl, &cstatus, &cresp_len,
                                0 /* no timeout: real-model inference is slow by design */);
     /* plaintext request buffers are done — wipe immediately */
@@ -1510,7 +1782,7 @@ static void handle_infer(int conn_fd, const idletoken_keypair *node,
     char *resp_b64 = NULL;
     int err_status = 500;
     const char *err_msg = "internal error";
-    if (process_sealed(node, coord_addr, (const char *)body, body_len,
+    if (process_sealed(node, coord_addr, (const char *)body, body_len, NULL,
                        &resp_b64, &err_status, &err_msg) != 0) {
         idletoken_http_send_error(conn_fd, err_status, err_msg);
         return;
@@ -1711,6 +1983,7 @@ int main(int argc, char **argv) {
         if (getppid() == 1) _exit(0);
     }
 #elif defined(_WIN32)
+    if (idletoken_win_require_utf8_paths() != 0) return 2;
     idletoken_die_with_parent();
 #endif
     int         port           = 9700;

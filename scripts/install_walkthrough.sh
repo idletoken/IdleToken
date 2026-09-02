@@ -24,6 +24,8 @@
 # Contract: last line INSTALL_E2E_OK or INSTALL_E2E_FAIL: <reason>.
 set -u
 
+REPO_ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+
 TARGET="${1:-${IDLETOKEN_INSTALL_TARGET:-}}"
 BUILD_NODE="${IDLETOKEN_WIN_BUILD_NODE:-}"
 COORD_NODE="${IDLETOKEN_COORD_NODE:-}"
@@ -50,7 +52,9 @@ BUILD_HOME="$(testbed_profile "$BUILD_NODE")"
 # The GGUF on the coordinator: expanded from $HOME by the remote shell rather than
 # hardcoding anyone's home directory.
 GGUF="${IDLETOKEN_GGUF_ABS:-\$HOME/work/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf}"
-SETUP_WIN="$BUILD_HOME/IdleToken/client/src-tauri/target/release/bundle/nsis/IdleToken_0.1.0_x64-setup.exe"
+APP_VERSION="${IDLETOKEN_APP_VERSION:-$(awk -F'"' '/"version"/ { print $4; exit }' "$REPO_ROOT/client/package.json")}"
+[ -n "$APP_VERSION" ] || { echo "INSTALL_E2E_FAIL: could not read the client version"; exit 1; }
+SETUP_WIN="$BUILD_HOME/IdleToken/client/src-tauri/target/release/bundle/nsis/IdleToken_${APP_VERSION}_x64-setup.exe"
 APPDIR="$THOME/AppData/Local/IdleToken"
 APPDIR_WIN="${APPDIR//\//\\}"
 
@@ -105,14 +109,14 @@ for _ in $(seq 1 60); do
     sleep 5
 done
 sleep 3
-present=$($SSH "$TARGET" "powershell -NoProfile -Command \"@('idletoken-client.exe','idletoken-worker.exe','idletoken-coord.exe','idletoken-platform-agent.exe','ds4cuda.dll','ds4xcuda.dll') | Where-Object { Test-Path (Join-Path '$APPDIR' \$_) } | Measure-Object | Select-Object -ExpandProperty Count\"" 2>/dev/null | tr -d '\r ')
-[ "$present" = "6" ] || die "installed tree is incomplete ($present/6 expected files in $APPDIR)"
-# ...and the 769 MB we deliberately stopped shipping must NOT be there. Counting
-# what is present cannot catch a file that should be absent; this is the
-# executable form of the 2026-08-04 packaging decision (philosophy 12 / E3).
-extra=$($SSH "$TARGET" "powershell -NoProfile -Command \"@('cublas64_12.dll','cublasLt64_12.dll') | Where-Object { Test-Path (Join-Path '$APPDIR' \$_) } | Measure-Object | Select-Object -ExpandProperty Count\"" 2>/dev/null | tr -d '\r ')
-[ "${extra:-0}" = "0" ] || die "cuBLAS is in the installed tree ($extra file(s)) — it is supposed to come from the user's CUDA Toolkit now"
-echo "   installed 6/6 files into $APPDIR (no cuBLAS — user's Toolkit supplies it)"
+present=$($SSH "$TARGET" "powershell -NoProfile -Command \"@('idletoken-client.exe','idletoken-worker.exe','idletoken-coord.exe','idletoken-platform-agent.exe','idletoken-server.exe','idletoken-rpc-server.exe','idletoken-server.exe.sha256','idletoken-rpc-server.exe.sha256','cudart64_12.dll','cublas64_12.dll','cublasLt64_12.dll','vcomp140.dll','WebView2Loader.dll') | Where-Object { Test-Path (Join-Path '$APPDIR' \$_) } | Measure-Object | Select-Object -ExpandProperty Count\"" 2>/dev/null | tr -d '\r ')
+[ "$present" = "13" ] || die "installed tree is incomplete ($present/13 expected files in $APPDIR)"
+# Counting what is present cannot catch an obsolete file donated by install-over.
+# A clean installed tree must contain neither the retired ds4 backend nor the
+# upstream/pre-rename sidecar names.
+extra=$($SSH "$TARGET" "powershell -NoProfile -Command \"@('ds4cuda.dll','ds4xcuda.dll','llama-server.exe','ggml-rpc-server.exe') | Where-Object { Test-Path (Join-Path '$APPDIR' \$_) } | Measure-Object | Select-Object -ExpandProperty Count\"" 2>/dev/null | tr -d '\r ')
+[ "${extra:-0}" = "0" ] || die "installed tree contains $extra retired or pre-rename runtime file(s)"
+echo "   installed 13/13 current runtime files into $APPDIR (including engine digests; no retired artifacts)"
 
 echo "== [3/5] every shipped binary runs with a driver-only PATH =="
 # The engines print their probe/selftest output on stderr — merge it on the

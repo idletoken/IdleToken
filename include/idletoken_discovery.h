@@ -185,8 +185,51 @@ int idletoken_pair_server_auth(int fd, const idletoken_pair_id *id,
  * rather than inferred from timing. */
 long long idletoken_pair_backoff_ms(int fails);
 
-/* Forget every recorded source (test/maintenance hook). */
+/* Cluster-wide guessing meter (CLUS-02, the distributed-source residual).
+ *
+ * The per-source curve above prices ONE attacker at ONE address. An attacker
+ * holding many addresses buys a fresh free allowance with every one of them, so
+ * a second meter counts failed joins across ALL sources and refuses new
+ * attempts for a short window once the rate passes anything a home cluster can
+ * produce by mistyping.
+ *
+ * Exposed for the same reason idletoken_pair_backoff_ms is — the threshold IS
+ * the security property, so it gets asserted directly rather than inferred from
+ * timing. It needs the seam more than the curve does: this meter cannot be
+ * driven at all from a single loopback address (the per-source throttle refuses
+ * long before the cluster-wide count could climb), so without a seam the only
+ * "test" available would be one that passes whether or not the meter works.
+ *
+ * `idletoken_pair_global_would_block`: pure — would `fails` failures inside one
+ * window trip the meter? 1 = yes, 0 = no.
+ * `idletoken_pair_global_state`: snapshot of the live meter. Either pointer may
+ * be NULL. `*blocked_ms` is how long new attempts are still refused, 0 = not
+ * refusing. */
+int  idletoken_pair_global_would_block(int fails);
+void idletoken_pair_global_state(int *fails, long long *blocked_ms);
+
+/* Forget every recorded source AND reset the cluster-wide meter
+ * (test/maintenance hook). */
 void idletoken_pair_throttle_reset(void);
+
+/* Per-source table, driven by a synthetic address instead of a socket.
+ *
+ * The same seam argument as the meter above, for the other half of the policy:
+ * the table is keyed by SOURCE ADDRESS and its correctness question is "does a
+ * source that has just earned a penalty keep it when many other addresses show
+ * up?". A loopback test has exactly one address, so it cannot ask that question
+ * at all — and a table with the wrong eviction order passes every test that
+ * only ever uses one address, which is how plain LRU survived here: the
+ * attacker's next fresh address silently erased the penalty the previous one
+ * had just earned.
+ *
+ * `addr16` is a raw 16-byte key (v4-mapped IPv4, or IPv6), the same shape the
+ * live path derives from getpeername().
+ *
+ * record: count one failed (fail=1) or successful (fail=0) join from `addr16`.
+ * check:  milliseconds `addr16` must still wait; 0 = may attempt now. */
+void      idletoken_pair_throttle_test_record(const uint8_t addr16[16], int fail);
+long long idletoken_pair_throttle_test_check(const uint8_t addr16[16]);
 
 /* ---- secret wrapping under the pairing session key ----------------------
  *
