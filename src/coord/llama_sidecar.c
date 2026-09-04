@@ -295,6 +295,16 @@ int idletoken_llama_http_open_relay(const char *endpoint, const char *method,
                                 timeout_ms, downstream_fd, endpoint, c);
 }
 
+int idletoken_llama_http_open_cancelable(const char *endpoint,
+                                         const char *method,
+                                         const char *path,
+                                         const char *body, size_t body_len,
+                                         int timeout_ms, int downstream_fd,
+                                         idletoken_llama_conn *c) {
+    return llama_http_open_impl(endpoint, method, path, body, body_len,
+                                timeout_ms, downstream_fd, NULL, c);
+}
+
 /* Did that recv fail only because the slice expired, or for a real reason? */
 static int conn_recv_timed_out(void) {
 #ifdef _WIN32

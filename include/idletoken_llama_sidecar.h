@@ -292,6 +292,20 @@ int idletoken_llama_http_open_relay(const char *endpoint, const char *method,
                                     int timeout_ms, int downstream_fd,
                                     idletoken_llama_conn *c);
 
+/* Open an HTTP request while watching only for downstream cancellation.
+ *
+ * This is the variant used for a long platform scheduling wait.  It keeps the
+ * short recv slices needed to notice that the local API client disconnected,
+ * but deliberately does not health-probe the remote endpoint as though it were
+ * a llama.cpp sidecar.  `timeout_ms == 0` means there is no silence deadline;
+ * dropping `downstream_fd` is still observed within one slice. */
+int idletoken_llama_http_open_cancelable(const char *endpoint,
+                                         const char *method,
+                                         const char *path,
+                                         const char *body, size_t body_len,
+                                         int timeout_ms, int downstream_fd,
+                                         idletoken_llama_conn *c);
+
 /* Make reads on `c` wait BOUNDEDLY: recv in slices, and while the engine is
  * silent, check on a SEPARATE connection that it still answers GET /health.
  * `endpoint` is idletoken_llama_endpoint_of(); it must outlive `c`.

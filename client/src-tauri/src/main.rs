@@ -598,12 +598,11 @@ async fn api_chat_stream(
     .map_err(|e| e.to_string())
 }
 
-/// How long a streaming socket may stay completely silent before we call it
-/// dead. Named because the error message quotes it — a number the user is told
-/// and a number the code enforces must not be able to drift apart.
-/// ⚠ Also quoted by the localized copies of the two timeout sentences
-/// (`chat.err.timeoutMid` / `chat.err.timeoutNone` in client/src/i18n.ts) —
-/// change both together.
+/// How long a streaming socket may stay completely silent AFTER the response
+/// has started before we call it dead. Before the first byte there is no time
+/// limit: the coordinator may be holding this request in its local queue, and
+/// only the user's Stop action is allowed to remove it.
+/// ⚠ Also quoted by `chat.err.timeoutMid` in client/src/i18n.ts.
 const READ_TIMEOUT_S: u64 = 300;
 
 /// How long a single `read` may block. The cancel flag is only observable
@@ -700,17 +699,17 @@ fn stream_chat_inner(
                 // against the liveness ceiling; going back round the loop is
                 // what gives the cancel check above its chance to run.
                 silent_s = silent_s.saturating_add(READ_SLICE_S);
-                if silent_s < READ_TIMEOUT_S {
+                // Silence before the response begins is an honest queue. It is
+                // intentionally unbounded and remains cancelable because each
+                // read lasts only READ_SLICE_S. Once bytes have arrived,
+                // prolonged silence means a started stream stalled.
+                if !got_bytes || silent_s < READ_TIMEOUT_S {
                     continue;
                 }
                 // "[CODE] detail" (client-error convention, ERROR_KEYS in
                 // i18n.ts): the UI shows a localized sentence for the code;
                 // the English detail survives in logs and the problem record.
-                return Err(if got_bytes {
-                    format!("[CHAT_TIMEOUT_MID] the cluster went silent for {READ_TIMEOUT_S}s mid-reply, so this generation was cut off (what arrived is kept). Check the coordinator — it is most likely stuck, not merely slow.")
-                } else {
-                    format!("[CHAT_TIMEOUT_NONE] no response from the cluster in {READ_TIMEOUT_S}s. Check that the coordinator is running and not stuck loading the model.")
-                });
+                return Err(format!("[CHAT_TIMEOUT_MID] the cluster went silent for {READ_TIMEOUT_S}s mid-reply, so this generation was cut off (what arrived is kept). Check the coordinator — it is most likely stuck, not merely slow."));
             }
             Err(e) => return Err(format!("read: {e}")),
         };

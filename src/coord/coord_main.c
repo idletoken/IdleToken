@@ -1016,36 +1016,38 @@ static void ignore_sigpipe(void) {
  * requests were absorbed by the TCP backlog alone**, so the platform could
  * neither see how many were queued nor be told "I am busy". It is now two
  * halves:
- *   intake thread   accept -> enqueue (queue full -> immediate 429 plus an
- *                   estimated wait, so the platform picks another machine)
+ *   intake thread   accept -> enqueue (unbounded; disconnect removes demand)
  *   executor thread dequeue -> handle_http_request (**still one at a time**)
  *
  * Why execution stays serial: real concurrent execution means advancing rounds
  * of several sequences out of phase inside the PP pipeline (E3 micro-batching),
  * which requires rewriting the round driver and the workers' synchronization
  * points. E1 only makes concurrency **explicit**: queue depth is observable, a
- * full queue can be refused honestly, and E3 gets its precondition of having
- * more than one request in hand (decode within a single sequence is inherently
- * serial, and with no second request there is no bubble to fill).
+ * E3 gets its precondition of having more than one request in hand (decode
+ * within a single sequence is inherently serial, and with no second request
+ * there is no bubble to fill).
  *
  * The thread boundary is deliberately narrow: only this fd queue crosses
  * threads. `g_slots`, `g_stats` and the prefix history are still **touched by
  * the executor thread only**, so they need no locks -- deliberately, because
  * putting locks on the inference path is far too easy to get wrong.
  *
- * The queue length cap is **purely a memory backstop** (a home machine queueing
- * too much would OOM), not a scheduling input: the latency-budget decision lives
- * on the platform side (§4.2b). The coordinator's job is to say "full" when it
- * is full. */
-#define COORD_INTAKE_MAX 8
+ * Capacity is not a request error. The local coordinator owns a durable wait:
+ * it keeps accepted requests until execution or cancellation, and reports the
+ * live depth so the platform can prefer another machine. */
+
+typedef struct coord_intake_node {
+    int fd;
+    long long at_ms;
+    struct coord_intake_node *next;
+} coord_intake_node;
 
 typedef struct {
-    int      fds[COORD_INTAKE_MAX];
-    long long at_ms[COORD_INTAKE_MAX];   /* enqueue timestamp, for the real queueing delay */
-    int      head, len;
+    coord_intake_node *head, *tail;
+    int      len;
     pthread_mutex_t mu;
     pthread_cond_t  cv;
-    int      cap;          /* effective cap = min(COORD_INTAKE_MAX, seq_slots*2) */
+    int      cap;          /* 0 = unbounded, retained in the stats wire contract */
     int      stop;
 } coord_intake;
 
@@ -1058,8 +1060,9 @@ static long long now_ms(void) {
 }
 
 static void intake_init(int cap) {
+    (void)cap;
     memset(&g_intake, 0, sizeof(g_intake));
-    g_intake.cap = cap < 1 ? 1 : (cap > COORD_INTAKE_MAX ? COORD_INTAKE_MAX : cap);
+    g_intake.cap = 0;
     pthread_mutex_init(&g_intake.mu, NULL);
     pthread_cond_init(&g_intake.cv, NULL);
 }
@@ -1073,17 +1076,33 @@ static int intake_depth(void) {
     return d;
 }
 
-/* Enqueue. Returns -1 when the queue is full; the caller is responsible for
- * replying 429 and closing. */
+/* Enqueue. Returns -1 only during shutdown or after the peer disconnected.
+ * Allocation pressure delays admission instead of being reported as load. */
 static int intake_push(int fd) {
+    coord_intake_node *node = NULL;
+    while (!node) {
+        node = malloc(sizeof(*node));
+        if (node) break;
+        if (idletoken_peer_closed(fd)) return -1;
+#ifdef _WIN32
+        Sleep(250);
+#else
+        struct timespec nap = { 0, 250000000L };
+        nanosleep(&nap, NULL);
+#endif
+    }
+    node->fd = fd;
+    node->at_ms = now_ms();
+    node->next = NULL;
     pthread_mutex_lock(&g_intake.mu);
-    if (g_intake.len >= g_intake.cap) {
+    if (g_intake.stop) {
         pthread_mutex_unlock(&g_intake.mu);
+        free(node);
         return -1;
     }
-    int slot = (g_intake.head + g_intake.len) % COORD_INTAKE_MAX;
-    g_intake.fds[slot]   = fd;
-    g_intake.at_ms[slot] = now_ms();
+    if (g_intake.tail) g_intake.tail->next = node;
+    else g_intake.head = node;
+    g_intake.tail = node;
     g_intake.len++;
     pthread_cond_signal(&g_intake.cv);
     pthread_mutex_unlock(&g_intake.mu);
@@ -1098,11 +1117,14 @@ static int intake_push(int fd) {
 static int intake_try_pop(long long *queued_ms) {
     pthread_mutex_lock(&g_intake.mu);
     if (g_intake.len == 0) { pthread_mutex_unlock(&g_intake.mu); return -1; }
-    int fd = g_intake.fds[g_intake.head];
-    long long at = g_intake.at_ms[g_intake.head];
-    g_intake.head = (g_intake.head + 1) % COORD_INTAKE_MAX;
+    coord_intake_node *node = g_intake.head;
+    int fd = node->fd;
+    long long at = node->at_ms;
+    g_intake.head = node->next;
+    if (!g_intake.head) g_intake.tail = NULL;
     g_intake.len--;
     pthread_mutex_unlock(&g_intake.mu);
+    free(node);
     if (queued_ms) *queued_ms = now_ms() - at;
     return fd;
 }
@@ -1112,11 +1134,14 @@ static int intake_pop(long long *queued_ms) {
     while (g_intake.len == 0 && !g_intake.stop)
         pthread_cond_wait(&g_intake.cv, &g_intake.mu);
     if (g_intake.len == 0) { pthread_mutex_unlock(&g_intake.mu); return -1; }
-    int fd = g_intake.fds[g_intake.head];
-    long long at = g_intake.at_ms[g_intake.head];
-    g_intake.head = (g_intake.head + 1) % COORD_INTAKE_MAX;
+    coord_intake_node *node = g_intake.head;
+    int fd = node->fd;
+    long long at = node->at_ms;
+    g_intake.head = node->next;
+    if (!g_intake.head) g_intake.tail = NULL;
     g_intake.len--;
     pthread_mutex_unlock(&g_intake.mu);
+    free(node);
     if (queued_ms) *queued_ms = now_ms() - at;
     return fd;
 }
@@ -1174,40 +1199,13 @@ static uint64_t coord_next_req_id(void) {
     return ((uint64_t)time(NULL) << 16) ^ n;
 }
 
-/* "Busy, try elsewhere" — the one 429 shape both admission points emit.
- *
- * Deliberately shared rather than copied: the platform reads `Retry-After` and
- * `X-IdleToken-Est-Wait-Ms` to decide between waiting and switching machines
- * (scheduler-design §4.2b), and two writers of the same contract drift.
- * Header and body are written separately with Content-Length from sizeof: a
- * hardcoded length that does not match yields half a response, which the client
- * sees only as a truncated connection — harder to diagnose than the 429. */
-static void coord_send_busy_429(int cfd, long long est_ms) {
-    static const char busy_body[] = "{\"error\":{\"message\":\"coordinator busy\"}}";
-    if (est_ms < 0) est_ms = 0;
-    char hdr[256];
-    int hl = snprintf(hdr, sizeof(hdr),
-        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n"
-        "Retry-After: %lld\r\nX-IdleToken-Est-Wait-Ms: %lld\r\n"
-        "Content-Length: %zu\r\nConnection: close\r\n\r\n",
-        (est_ms + 999) / 1000, est_ms, sizeof(busy_body) - 1);
-    if (hl > 0 && hl < (int)sizeof(hdr)) {
-        /* idletoken_sendall, not write(): on Windows a socket is not a file
-         * descriptor and write() does not reach it. The cluster path got away
-         * with it because its intake thread is POSIX-only in practice; the
-         * llamacpp path this now also serves runs on Windows. */
-        if (idletoken_sendall(cfd, hdr, (size_t)hl) >= 0)
-            (void)idletoken_sendall(cfd, busy_body, sizeof(busy_body) - 1);
-    }
-}
-
 /* --- llamacpp-mode inference admission (P2) --------------------------------
  *
  * The engine normally serves one local sequence (`-np 1`). This gate is the
  * coordinator's half of that number: at most `slots` relays touch the engine
- * concurrently. The normal queue is intentionally zero-deep, so a simultaneous
- * local request reaches overflow immediately instead of sitting silently behind
- * a long generation. When borrowing is off or fails, it gets an honest 429.
+ * concurrently. Requests beyond that width stay queued for local service while
+ * periodically trying shared compute. Capacity never becomes a client-facing
+ * refusal; only the caller closing its socket removes a queued request.
  *
  * Non-inference routes (/health, stats, tokenize) never take the gate, which is
  * what keeps the dashboard answering while every slot is mid-generation. */
@@ -1215,7 +1213,7 @@ static struct {
     pthread_mutex_t mu;
     pthread_cond_t  cv;
     int slots;      /* concurrent relays allowed (== the engine's -np) */
-    int qcap;       /* how many may WAIT for a slot before we start refusing */
+    int qcap;       /* 0 means unbounded; retained in the stats wire contract */
     int active;     /* relays in flight */
     int waiting;    /* threads parked on cv */
 } g_infer;
@@ -1225,26 +1223,33 @@ static void infer_gate_init(int slots) {
     if (slots < 1) slots = 1;
     memset(&g_infer, 0, sizeof(g_infer));
     g_infer.slots = slots;
-    g_infer.qcap  = 0;       /* concurrency belongs to overflow, not local KV */
+    g_infer.qcap  = 0;       /* unbounded local wait; 0 is the wire sentinel */
     pthread_mutex_init(&g_infer.mu, NULL);
     pthread_cond_init(&g_infer.cv, NULL);
 }
 
-/* 0 = go ahead (caller MUST release), -1 = refuse now (429). */
-static int infer_gate_acquire(void) {
+/* 0 = go ahead (caller MUST release), -1 = busy right now (caller waits). */
+static int infer_gate_try_acquire(void) {
     pthread_mutex_lock(&g_infer.mu);
-    if (g_infer.active >= g_infer.slots && g_infer.waiting >= g_infer.qcap) {
+    if (g_infer.active >= g_infer.slots) {
         pthread_mutex_unlock(&g_infer.mu);
         return -1;
-    }
-    while (g_infer.active >= g_infer.slots) {
-        g_infer.waiting++;
-        pthread_cond_wait(&g_infer.cv, &g_infer.mu);
-        g_infer.waiting--;
     }
     g_infer.active++;
     pthread_mutex_unlock(&g_infer.mu);
     return 0;
+}
+
+static void infer_gate_waiter_add(void) {
+    pthread_mutex_lock(&g_infer.mu);
+    g_infer.waiting++;
+    pthread_mutex_unlock(&g_infer.mu);
+}
+
+static void infer_gate_waiter_remove(void) {
+    pthread_mutex_lock(&g_infer.mu);
+    if (g_infer.waiting > 0) g_infer.waiting--;
+    pthread_mutex_unlock(&g_infer.mu);
 }
 
 static void infer_gate_release(void) {
@@ -1268,11 +1273,9 @@ static void infer_gate_snapshot(int *active, int *waiting, int *slots, int *qcap
 static int g_intake_lfd = -1;
 
 /**
- * The intake thread: accept and enqueue, nothing else. When the queue is full it
- * replies 429 **immediately**, with an estimated wait, so the platform picks
- * another machine -- "switching machines is cheaper than queueing" (§4.2b, first
- * principle). Letting the request sit in the backlog instead would let the
- * platform believe it still has a chance, and then time out with the rest.
+ * The intake thread: accept and enqueue, nothing else. Queue depth is reported
+ * to the platform so new work can prefer another machine, but a request already
+ * accepted here is never rejected for capacity.
  */
 static void *intake_accept_thread(void *ud) {
     (void)ud;
@@ -1287,14 +1290,7 @@ static void *intake_accept_thread(void *ud) {
             return NULL;
         }
         if (intake_push(cfd) != 0) {
-            /* Estimated wait = queued requests x mean service time. The platform
-             * uses it to decide between retrying and switching machines. */
-            double svc = g_stats.service_ms_ewma > 0 ? g_stats.service_ms_ewma : 1000.0;
-            long long est = (long long)(svc * (double)g_intake.cap);
-            coord_send_busy_429(cfd, est);
             close(cfd);
-            fprintf(stderr, "coord: intake full (cap %d) -> 429, est_wait=%lldms\n",
-                    g_intake.cap, est);
         }
     }
 }
@@ -3231,78 +3227,6 @@ static int coord_json_top_int(const char *json, size_t len,
     return tail && *tail == '\0' && n >= 0 && n <= INT_MAX ? (int)n : dflt;
 }
 
-/* The platform's free-form message never crosses this boundary. Only stable
- * allowlisted codes from overflow.c reach here, and each maps to a fixed body.
- * In particular, api_key_daily_cap used to be collapsed to "coordinator busy";
- * retrying clients then waited for a slot that was never the problem. */
-static void coord_send_overflow_refusal(int conn_fd, int is_anthropic,
-                                        const char *reason) {
-    int status = 503;
-    const char *openai =
-        "{\"error\":{\"message\":\"the platform refused the borrowed request\","
-        "\"type\":\"api_error\",\"code\":\"platform_refused\"}}";
-    const char *anthropic =
-        "{\"type\":\"error\",\"error\":{\"type\":\"api_error\","
-        "\"message\":\"the platform refused the borrowed request\","
-        "\"code\":\"platform_refused\"}}";
-
-    if (!strcmp(reason, "api_key_daily_cap")) {
-        status = 429;
-        openai =
-            "{\"error\":{\"message\":\"the overflow API key reached its configured daily spend cap\","
-            "\"type\":\"rate_limit_error\",\"code\":\"api_key_daily_cap\"}}";
-        anthropic =
-            "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\","
-            "\"message\":\"the overflow API key reached its configured daily spend cap\","
-            "\"code\":\"api_key_daily_cap\"}}";
-    } else if (!strcmp(reason, "insufficient_credits")) {
-        status = 402;
-        openai =
-            "{\"error\":{\"message\":\"insufficient credits\","
-            "\"type\":\"insufficient_quota\",\"code\":\"insufficient_credits\"}}";
-        anthropic =
-            "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\","
-            "\"message\":\"insufficient credits\",\"code\":\"insufficient_credits\"}}";
-    } else if (!strcmp(reason, "invalid_request")) {
-        status = 400;
-        openai =
-            "{\"error\":{\"message\":\"the platform rejected the borrowed request\","
-            "\"type\":\"invalid_request_error\",\"code\":\"invalid_request\"}}";
-        anthropic =
-            "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\","
-            "\"message\":\"the platform rejected the borrowed request\","
-            "\"code\":\"invalid_request\"}}";
-    } else if (!strcmp(reason, "no_provider_online")) {
-        openai =
-            "{\"error\":{\"message\":\"no compatible provider is online\","
-            "\"type\":\"api_error\",\"code\":\"no_provider_online\"}}";
-        anthropic =
-            "{\"type\":\"error\",\"error\":{\"type\":\"api_error\","
-            "\"message\":\"no compatible provider is online\","
-            "\"code\":\"no_provider_online\"}}";
-    } else if (!strcmp(reason, "rate_limited")) {
-        status = 429;
-        openai =
-            "{\"error\":{\"message\":\"the platform is temporarily rate limited\","
-            "\"type\":\"rate_limit_error\",\"code\":\"platform_rate_limited\"}}";
-        anthropic =
-            "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\","
-            "\"message\":\"the platform is temporarily rate limited\","
-            "\"code\":\"platform_rate_limited\"}}";
-    } else if (!strcmp(reason, "provider_unavailable")) {
-        openai =
-            "{\"error\":{\"message\":\"the selected provider could not complete the request\","
-            "\"type\":\"api_error\",\"code\":\"provider_unavailable\"}}";
-        anthropic =
-            "{\"type\":\"error\",\"error\":{\"type\":\"api_error\","
-            "\"message\":\"the selected provider could not complete the request\","
-            "\"code\":\"provider_unavailable\"}}";
-    }
-
-    const char *body = is_anthropic ? anthropic : openai;
-    (void)idletoken_http_send_json(conn_fd, status, body, strlen(body));
-}
-
 /* `hops_in` is how many machines this request has already been handed through
  * before it reached us. It is not re-decided here — should_forward() has
  * already refused anything over budget — it is carried so the envelope can
@@ -3360,15 +3284,20 @@ static int coord_overflow_relay(int conn_fd, const idletoken_http_req *req,
                                          tool_choice, (size_t)tool_choice_len,
                                          coord_model()->id, coord_quant(),
                                          max_tokens,
-                                         hops_in, &rep, err, sizeof err);
+                                         hops_in, conn_fd, &rep, err, sizeof err);
     if (owned_openai) {
         idletoken_secure_zero(owned_openai, openai_len);
         free(owned_openai);
     }
     if (rc == IDLETOKEN_OVF_EXCHANGE_REFUSED) {
-        fprintf(stderr, "coord: overflow: platform refusal code=%s\n", err);
-        coord_send_overflow_refusal(conn_fd, is_anthropic, err);
-        return 0;
+        /* A platform refusal can be temporary capacity, a platform-only quota,
+         * or content policy.  None of those removes this machine's ability to
+         * answer its own caller once the local slot is free.  Keep the request
+         * queued locally instead of turning an optional accelerator into a
+         * new failure mode. */
+        fprintf(stderr, "coord: overflow: platform attempt declined code=%s; "
+                        "keeping the request in the local queue\n", err);
+        return -1;
     }
     if (rc != IDLETOKEN_OVF_EXCHANGE_OK) {
         /* Transport/crypto/malformed response failures remain the ordinary
@@ -4907,50 +4836,71 @@ static void llama_chat_route(int conn_fd, const idletoken_http_req *req,
                 n_input);
     }
     /* Admission. Taken AFTER tokenizing on purpose: the token count is what
-     * tells a client its request was too long for this machine, and a 429 that
-     * hides a 400 sends it away to be refused again everywhere else. */
-    if (infer_gate_acquire() != 0) {
+     * tells a client its request was too long for this machine. Capacity itself
+     * is never an error: a busy request remains here until local or shared
+     * compute completes it, or until its client disconnects. */
+    int queued_for_local = 0;
+    while (infer_gate_try_acquire() != 0) {
+        if (!queued_for_local) {
+            infer_gate_waiter_add();
+            queued_for_local = 1;
+            fprintf(stderr, "coord: llama-relay: local slot busy — request queued; "
+                            "shared compute will be retried until it or the local "
+                            "slot completes the request\n");
+        }
+        if (idletoken_peer_closed(conn_fd)) {
+            infer_gate_waiter_remove();
+            free(up);
+            return;
+        }
         pthread_mutex_lock(&g_stats_mu);
         double svc = g_stats.service_ms_ewma > 0 ? g_stats.service_ms_ewma : 1000.0;
         pthread_mutex_unlock(&g_stats_mu);
         int active = 1, waiting = 0;
         infer_gate_snapshot(&active, &waiting, NULL, NULL);
         /* What this request would wait if it stayed local: the active work and
-         * anyone already ahead of it, not the configured queue capacity. With
-         * a zero-deep queue this is still one service time, never zero. */
+         * anyone already ahead of it, not a configured queue ceiling. */
         int ahead = active + waiting;
         if (ahead < 1) ahead = 1;
         long long est = (long long)(svc * (double)ahead);
-        fprintf(stderr, "coord: llama-relay: all %d slot(s) busy and the queue "
-                        "is full -> 429\n", g_llama_slots);
-        /* Overflow's one usable trigger point on this path (api-surface §5.1).
-         * The other 429 in this coordinator fires in the intake accept loop,
-         * before a single byte has been read: no method, no path, no headers,
-         * so no way to know whether the request came from the platform. Routing
-         * there would forward platform work — silently, since nothing would
-         * report it. A smaller feature beats a quietly broken invariant.
-         *
-         * Reached only when every slot is busy AND the queue is full, i.e. the
-         * request was about to be refused anyway: overflow never diverts work a
-         * machine could have done itself. */
+        fprintf(stderr, "coord: llama-relay: all %d local slot(s) busy; "
+                        "estimated local wait %lldms\n", g_llama_slots, est);
+        /* Shared compute is attempted only while every local slot is busy.
+         * Platform-origin work remains non-forwardable in should_forward(); a
+         * local request keeps both options alive until one completes it. */
         const char *why = "off";
         if (idletoken_overflow_should_forward(origin, want_stream, est, hops_in, &why)) {
             if (coord_overflow_relay(conn_fd, req, is_anthropic, want_stream,
                                      coord_next_req_id(), hops_in,
                                      up, uplen) == 0) {
+                infer_gate_waiter_remove();
                 free(up);
                 return;
             }
-            /* Borrowing was allowed and did not work. The reason is already in
-             * the log; the client gets the same 429 it would have got before
-             * overflow existed. */
+            /* A failed marketplace attempt is not a client failure.  Recheck
+             * the local slot, then try the platform again while this request
+             * remains connected. */
         } else if (idletoken_overflow_enabled()) {
             fprintf(stderr, "coord: overflow: not forwarding — %s\n", why);
         }
-        coord_send_busy_429(conn_fd, est);
-        free(up);
-        return;
+        /* Avoid a hot loop when overflow is disabled, unreachable, or refuses
+         * this attempt.  The client socket is checked every 250 ms so Stop is
+         * still prompt while capacity waiting itself has no timeout. */
+        for (int pause = 0; pause < 4; pause++) {
+            if (idletoken_peer_closed(conn_fd)) {
+                infer_gate_waiter_remove();
+                free(up);
+                return;
+            }
+#ifdef _WIN32
+            Sleep(250);
+#else
+            struct timespec nap = { 0, 250000000L };
+            nanosleep(&nap, NULL);
+#endif
+        }
     }
+    if (queued_for_local) infer_gate_waiter_remove();
     const long long t0 = now_ms();
     const uint64_t req_id = coord_next_req_id();
     if (want_stream && tools_oneshot)
@@ -6834,10 +6784,16 @@ static void engine_integrity_check(const char *bin) {
     }
 }
 
-/* Thread pool sizing remains bounded by the measurement-only slot cap. The
- * default uses four threads: one local, two overflow, one status spare. */
-#define LLAMA_POOL_MAX_THREADS  (IDLETOKEN_LLAMA_SLOT_CAP * 2 + 1)
-#define LLAMA_POOL_QUEUE_MAX    (LLAMA_POOL_MAX_THREADS + 1)
+/* HTTP workers are deliberately wider than the one local inference slot.
+ * Queued chat requests spend most of their time waiting on shared-compute
+ * scheduling, while health/stats must remain responsive.  The handoff queue
+ * itself is dynamically allocated and has no capacity rejection. */
+#define LLAMA_POOL_MAX_THREADS  16
+
+typedef struct llama_pending_conn {
+    int fd;
+    struct llama_pending_conn *next;
+} llama_pending_conn;
 
 /* How many sequence slots to run with. plan.c still computes the resource
  * ceiling for diagnostics and controlled measurements, but the product policy
@@ -6901,8 +6857,8 @@ static int llama_decide_slots(int autov, const idletoken_node_mem *node,
 static struct {
     pthread_mutex_t mu;
     pthread_cond_t  cv;
-    int  fds[LLAMA_POOL_QUEUE_MAX];
-    int  head, len, stop;
+    llama_pending_conn *head, *tail;
+    int  len, stop;
     /* Serving parameters, fixed for the process's lifetime. */
     uint32_t    ctx_size;
     const char *api_token;
@@ -6916,10 +6872,13 @@ static void *llama_pool_worker(void *ud) {
         while (g_llpool.len == 0 && !g_llpool.stop)
             pthread_cond_wait(&g_llpool.cv, &g_llpool.mu);
         if (g_llpool.len == 0) { pthread_mutex_unlock(&g_llpool.mu); return NULL; }
-        int cfd = g_llpool.fds[g_llpool.head];
-        g_llpool.head = (g_llpool.head + 1) % LLAMA_POOL_QUEUE_MAX;
+        llama_pending_conn *pending = g_llpool.head;
+        int cfd = pending->fd;
+        g_llpool.head = pending->next;
+        if (!g_llpool.head) g_llpool.tail = NULL;
         g_llpool.len--;
         pthread_mutex_unlock(&g_llpool.mu);
+        free(pending);
 
         handle_http_request(cfd, NULL, 0, NULL, 0, &g_llpool.running_pos,
                             NULL, NULL, g_llpool.ctx_size,
@@ -6939,14 +6898,22 @@ static void *llama_pool_worker(void *ud) {
     }
 }
 
-/* 0 = queued, -1 = the queue is full (caller answers 429 and closes). */
+/* 0 = queued, -1 = allocation/shutdown failure.  There is deliberately no
+ * capacity ceiling: accepted local requests wait until served or cancelled. */
 static int llama_pool_push(int cfd) {
+    llama_pending_conn *pending = malloc(sizeof(*pending));
+    if (!pending) return -1;
+    pending->fd = cfd;
+    pending->next = NULL;
     pthread_mutex_lock(&g_llpool.mu);
-    if (g_llpool.stop || g_llpool.len >= LLAMA_POOL_QUEUE_MAX) {
+    if (g_llpool.stop) {
         pthread_mutex_unlock(&g_llpool.mu);
+        free(pending);
         return -1;
     }
-    g_llpool.fds[(g_llpool.head + g_llpool.len) % LLAMA_POOL_QUEUE_MAX] = cfd;
+    if (g_llpool.tail) g_llpool.tail->next = pending;
+    else g_llpool.head = pending;
+    g_llpool.tail = pending;
     g_llpool.len++;
     pthread_cond_signal(&g_llpool.cv);
     pthread_mutex_unlock(&g_llpool.mu);
@@ -7352,7 +7319,7 @@ static int run_llamacpp_mode(const char *llama_bin, const char *llama_gguf,
     pthread_cond_init(&g_llpool.cv, NULL);
     g_llpool.ctx_size  = ctx_size;
     g_llpool.api_token = api_token;
-    const int n_threads = g_llama_slots == 1 ? 4 : g_llama_slots * 2 + 1;
+    const int n_threads = LLAMA_POOL_MAX_THREADS;
     pthread_t pool[LLAMA_POOL_MAX_THREADS];
     int n_started = 0;
     for (int i = 0; i < n_threads && i < LLAMA_POOL_MAX_THREADS; i++) {
@@ -7448,15 +7415,16 @@ static int run_llamacpp_mode(const char *llama_bin, const char *llama_gguf,
             break;
         }
         if (llama_pool_push(cfd) != 0) {
-            /* The handoff queue is deeper than slots+queue can ever occupy, so
-             * reaching this means a burst of NON-inference work, not a busy
-             * engine. Same 429 either way — the caller's move is the same. */
-            pthread_mutex_lock(&g_stats_mu);
-            double svc = g_stats.service_ms_ewma > 0 ? g_stats.service_ms_ewma : 1000.0;
-            pthread_mutex_unlock(&g_stats_mu);
-            fprintf(stderr, "coord: http handoff queue full -> 429\n");
-            coord_send_busy_429(cfd, (long long)svc);
-            idletoken_close_fd(cfd);   /* SOCKET-safe on Windows (see the pool worker) */
+            /* Allocation failure must not be disguised as ordinary load.  Do
+             * the work synchronously instead of rejecting a request merely
+             * because the handoff node could not be allocated. */
+            fprintf(stderr, "coord: HTTP handoff allocation failed — serving "
+                            "the accepted connection synchronously\n");
+            handle_http_request(cfd, NULL, 0, NULL, 0, &g_llpool.running_pos,
+                                NULL, NULL, g_llpool.ctx_size,
+                                g_llpool.api_token, NULL);
+            idletoken_admission_request_end();
+            idletoken_close_fd(cfd);
         }
     }
     /* Wake every worker, then wait: a thread still inside handle_http_request
@@ -7467,6 +7435,13 @@ static int run_llamacpp_mode(const char *llama_bin, const char *llama_gguf,
     pthread_cond_broadcast(&g_llpool.cv);
     pthread_mutex_unlock(&g_llpool.mu);
     for (int i = 0; i < n_started; i++) pthread_join(pool[i], NULL);
+    while (g_llpool.head) {
+        llama_pending_conn *pending = g_llpool.head;
+        g_llpool.head = pending->next;
+        idletoken_close_fd(pending->fd);
+        free(pending);
+    }
+    g_llpool.tail = NULL;
     if (postload_started) pthread_join(postload_tid, NULL);
     idletoken_close_fd(lfd);
     /* Take the socket file with us. A leftover would be removed by the next
@@ -9973,10 +9948,9 @@ int main(int argc, char **argv) {
             close(lfd);
             return 1;
         }
-        /* E1: intake is separated from execution. The cap is min(queue capacity,
-         * seq_slots*2) -- purely a memory backstop, since queueing too much on a
-         * home machine means OOM; the latency-budget decision lives on the
-         * platform side (§4.2b). */
+        /* E1: intake is separated from execution. Accepted requests remain in
+         * the local queue until execution or cancellation; capacity is never a
+         * client-facing refusal. */
         intake_init(g_n_slots * 2);
         g_intake_lfd = api_lfd;
         pthread_t acc_tid;
@@ -9985,8 +9959,8 @@ int main(int argc, char **argv) {
             fprintf(stderr, "coord: pthread_create(accept) failed: %s — falling back to serial accept\n",
                     strerror(errno));
         }
-        fprintf(stderr, "\ncoord: HTTP API listening on %s (intake queue cap %d). Ctrl-C to stop.\n",
-                api_bind, g_intake.cap);
+        fprintf(stderr, "\ncoord: HTTP API listening on %s (unbounded intake queue). Ctrl-C to stop.\n",
+                api_bind);
         g_stats.started_at = (long long)time(NULL);
         /* The service-time EWMA (half-life of 8 requests) and cumulative
          * queueing time both feed /idletoken/v1/stats for the platform's cost function.

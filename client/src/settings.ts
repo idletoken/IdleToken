@@ -176,8 +176,8 @@ export interface AppSettings {
    *  The product always sends 0: the account balance is the spend gate. */
   overflowDailyCapMilli: number;
   /** Internal coordinator compatibility field. The public product policy is
-   *  fixed at 0: when the one local inference slot is occupied, an eligible
-   *  second request asks for help immediately instead of entering a queue. */
+   *  fixed at 0: a locally queued request starts asking for shared compute
+   *  immediately, then keeps both local and marketplace completion available. */
   overflowWaitS: number;
   /** The provider name this machine registered on the platform, written by
    *  the sharing toggle: `cluster-<N>`, N = the smallest free number
@@ -654,8 +654,7 @@ export function loadSettings(): AppSettings {
     // v9 → v10: accepting work and requesting help are separate choices. An
     // existing ON switch enabled both directions, so preserve that behaviour
     // on upgrade; explicitly present new fields win for development builds
-    // that wrote the split shape before the schema bump. The public busy rule
-    // is also fixed here: no local queue, immediate overflow when occupied.
+    // that wrote the split shape before the schema bump.
     const legacyMarket = parsed as Partial<AppSettings> & { sharingEnabled?: unknown };
     if ((parsed.schemaVersion ?? 0) < 10) {
       const legacyOn = legacyMarket.sharingEnabled === true;
@@ -843,7 +842,7 @@ export function overflowTuning(s: AppSettings): OverflowTuning {
     // enforces `enabled` so a stale or hand-written payload cannot route.
     overflowUrl: enabled ? s.platformUrl.trim().replace(/\/+$/, "") : "",
     overflowKey: enabled ? s.overflowKey : "",
-    // Fixed product policy: the occupied local slot never creates a queue.
+    // Start shared-compute attempts as soon as this request enters the local queue.
     overflowWaitS: 0,
     overflowDailyCapMilli: OVERFLOW_UNCAPPED_MILLI,
   };

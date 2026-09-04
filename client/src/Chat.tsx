@@ -65,12 +65,6 @@ const STORE_KEY = "idletoken.chat.v2";
 const LEGACY_KEY = "idletoken.chat.v1"; // single rolling transcript
 const MAX_STORED = 50; // messages kept per conversation
 const MAX_CONVOS = 40;
-/** Local inference is deliberately one request wide. The other two lanes are
- * allowed through the UI so a busy coordinator can hand them to platform
- * overflow instead of the client pre-emptively saying "wait". This is only a
- * browser-side safety ceiling; the coordinator remains authoritative and may
- * return 429 when borrowing is off or unavailable. */
-const CLIENT_MAX_INFLIGHT = 3;
 /** How long changes may sit unwritten before history hits localStorage. The
  *  whole table is serialized on every write, so with three streams appending
  *  deltas several times a second an unbatched write is a full re-serialize per
@@ -395,8 +389,8 @@ export default function Chat(props: {
   // Until 2026-08-18 this was a single global `busy` flag: one reply at a time,
   // and on a LAN cluster a reply is minutes — so the sidebar full of
   // conversations could be read but never used. Conversations are now
-  // independent, up to CLIENT_MAX_INFLIGHT. The local engine itself stays
-  // single-request; extra conversations are eligible for platform overflow.
+  // independent. The local engine itself stays single-request; extra
+  // conversations queue there while also trying platform overflow.
   // Within one conversation a second send is still refused (the two turns
   // would race the same transcript).
   const [liveMap, setLiveMap] = useState<Map<string, LiveGen>>(() => new Map());
@@ -468,11 +462,6 @@ export default function Chat(props: {
    *  spinner on whichever conversation you happened to open. */
   const here = activeId ? liveMap.get(activeId) ?? null : null;
   const liveHere = here !== null;
-  /** No more generations may be started until one of the running ones ends.
-   *  Deliberately NOT a local queue: a queue the user cannot see is a promise
-   *  the UI never shows itself keeping, and "why has nothing happened for two
-   *  minutes" has no answer on screen. */
-  const atLimit = liveMap.size >= CLIENT_MAX_INFLIGHT;
   /** Some OTHER conversation's generation has already been picked up by the
    *  cluster. That is the only evidence we have that a silent turn here is
    *  queued rather than merely not answered yet, and the copy below says so
@@ -631,23 +620,16 @@ export default function Chat(props: {
 
   /** May a fresh generation start in `convoId` right now?
    *
-   *  Two independent refusals, both read from the ref so the answer is the one
-   *  as of THIS tick: the conversation already has a reply in flight (a second
-   *  send would race the first over the same transcript), and the client-wide
-   *  ceiling. Both are also reflected in the composer, so reaching either of
-   *  them here should be rare — but "rare" is not "never", and a guard that
-   *  only the UI enforces is not a guard. */
+   *  One refusal remains: the same conversation already has a reply in flight,
+   *  because a second send would race the first over one transcript. Other
+   *  conversations are never rejected for aggregate load; the coordinator
+   *  owns their visible queue. */
   const canGenerate = (convoId: string) =>
-    !liveRef.current.has(convoId) && liveRef.current.size < CLIENT_MAX_INFLIGHT;
+    !liveRef.current.has(convoId);
 
   const send = async () => {
     const q = input.trim();
     if (!q || !online || !props.api) return;
-    // Checked BEFORE the conversation is created and before the box is cleared:
-    // a refused send that had already emptied the composer would look like the
-    // app swallowing the message.
-    if (liveRef.current.size >= CLIENT_MAX_INFLIGHT) return;
-
     // Sending from a fresh window creates the conversation.
     let id = activeId;
     if (!id || !convos.some((c) => c.id === id)) {
@@ -1056,7 +1038,7 @@ export default function Chat(props: {
                   {!(liveHere && i === msgs.length - 1) ? (
                     <MsgActions
                       m={m}
-                      canRegen={i === msgs.length - 1 && m.role === "assistant" && online && !liveHere && !atLimit}
+                      canRegen={i === msgs.length - 1 && m.role === "assistant" && online && !liveHere}
                       onRegen={() => void regen()}
                     />
                   ) : null}
@@ -1100,9 +1082,10 @@ export default function Chat(props: {
               rows={1}
               placeholder={t("chat.placeholder")}
               // Live while OTHER conversations generate — that is the whole
-              // point of the change. Only two things close it: this thread is
-              // already answering, and the client-wide ceiling.
-              disabled={liveHere || atLimit}
+              // point of the change. Only this conversation being mid-reply
+              // closes it; aggregate load is represented as a queue, not a
+              // disabled composer.
+              disabled={liveHere}
               onChange={(e) => setInput(e.target.value)}
               // Enter sends, Shift+Enter breaks the line — the convention every
               // chat client shares. isComposing guards IME candidate selection,
@@ -1133,7 +1116,7 @@ export default function Chat(props: {
             ) : (
               <button
                 className="composer__btn"
-                disabled={atLimit || !input.trim()}
+                disabled={!input.trim()}
                 onClick={() => send()}
                 title={t("tryit.send")}
                 aria-label={t("tryit.send")}
@@ -1148,11 +1131,7 @@ export default function Chat(props: {
           {/* Why the composer is dead — otherwise it just looks broken. The
               old "another conversation is generating, one at a time" hint is
               gone with the restriction it explained. */}
-          {atLimit ? (
-            <p className="composer__hint">{t("chat.limit", { n: CLIENT_MAX_INFLIGHT })}</p>
-          ) : (
-            <p className="composer__hint">{t("chat.sendHint")}</p>
-          )}
+          <p className="composer__hint">{t("chat.sendHint")}</p>
         </div>
         )}
       </div>

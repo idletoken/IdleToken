@@ -737,6 +737,7 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
                                 const char *model, const char *quant,
                                 int max_tokens,
                                 int hops_in,
+                                int downstream_fd,
                                 idletoken_overflow_reply *out,
                                 char *err, size_t err_cap) {
     if (err && err_cap) err[0] = '\0';
@@ -808,7 +809,8 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
         inner_len = snprintf(inner, inner_cap,
                              "{\"api_key\":\"%s\",\"model\":\"%s\"%s%s%s,"
                              "\"messages\":%.*s,\"max_tokens\":%d%s%.*s%s%.*s,"
-                             "\"nonce\":\"%s\",\"issued_at\":%lld%s}",
+                             "\"nonce\":\"%s\",\"issued_at\":%lld,"
+                             "\"dispatch_wait_ms\":5000%s}",
                              api_key, model ? model : "",
                              quant && quant[0] ? ",\"quant\":\"" : "",
                              quant && quant[0] ? quant : "",
@@ -824,7 +826,8 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
     else
         inner_len = snprintf(inner, inner_cap,
                              "{\"api_key\":\"%s\",\"model\":\"%s\"%s%s%s,\"messages\":%.*s%s%.*s%s%.*s,"
-                             "\"nonce\":\"%s\",\"issued_at\":%lld%s}",
+                             "\"nonce\":\"%s\",\"issued_at\":%lld,"
+                             "\"dispatch_wait_ms\":5000%s}",
                              api_key, model ? model : "",
                              quant && quant[0] ? ",\"quant\":\"" : "",
                              quant && quant[0] ? quant : "",
@@ -886,22 +889,37 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
         OVF_FAIL("out of memory");
     }
 
-    /* 120 s: long enough for a borrowed machine to answer a real prompt, short
-     * enough that a silent platform costs one slot rather than the machine.
-     * Unbounded waiting on a remote peer is the failure this coordinator has
-     * already been taken down by once. */
+    /* The platform holds this scheduling attempt for five seconds (the sealed
+     * dispatch_wait_ms above).  Once a provider accepts it, generation may
+     * legitimately take much longer, so there is no arbitrary response timer.
+     * The downstream socket remains the deadline: closing it cancels this
+     * exchange within one recv slice.  If no provider accepts during the short
+     * platform window, the caller rechecks the local slot and starts another
+     * attempt; this is how local work can finish even while the marketplace is
+     * saturated, without ever answering the user with a capacity error. */
     idletoken_llama_conn c;
-    int opened = idletoken_llama_http_open(addr, "POST", IDLETOKEN_NS "/sealed/chat",
-                                           body, (size_t)bl, 120000, &c);
+    int opened = idletoken_llama_http_open_cancelable(
+        addr, "POST", IDLETOKEN_NS "/sealed/chat",
+        body, (size_t)bl, 0, downstream_fd, &c);
     free(body);
     if (opened != 0) {
+        if (c.cancelled) {
+            idletoken_secure_zero(&reply_kp, sizeof reply_kp);
+            OVF_FAIL("downstream client cancelled while waiting for shared compute");
+        }
         idletoken_secure_zero(&reply_kp, sizeof reply_kp);
         OVF_FAIL("platform %s did not answer", addr);
     }
     int status = c.status;
     size_t rlen = 0;
     char *resp = idletoken_llama_http_read_all(&c, &rlen, 8u * 1024u * 1024u);
+    int cancelled = c.cancelled;
     idletoken_llama_http_close(&c);
+    if (cancelled) {
+        free(resp);
+        idletoken_secure_zero(&reply_kp, sizeof reply_kp);
+        OVF_FAIL("downstream client cancelled while waiting for shared compute");
+    }
     /* Any 2xx. NOT `== 200`, which is what it said until 2026-09-03 and is why
      * overflow had never once succeeded in production: NestJS answers a @Post
      * with 201 by default, so every borrowed answer — routed, generated and

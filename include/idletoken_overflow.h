@@ -352,6 +352,7 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
                                 const char *model, const char *quant,
                                 int max_tokens,
                                 int hops_in,
+                                int downstream_fd,
                                 idletoken_overflow_reply *out,
                                 char *err, size_t err_cap);
 

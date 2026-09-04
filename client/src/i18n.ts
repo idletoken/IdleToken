@@ -321,13 +321,13 @@ export const STRINGS = {
     "platform.share.off": "Off",
     "platform.share.working": "Working…",
     "platform.overflow.name": "Request help",
-    "platform.overflow.optionHint": "When the local inference slot is occupied, immediately ask another user to complete the request (spends Sparks).",
+    "platform.overflow.optionHint": "While a request waits for the local inference slot, keep asking shared compute to complete it sooner (spends Sparks only when borrowed compute succeeds).",
     "platform.overflow.off": "Request help when busy",
     "platform.overflow.on": "Help ready",
     "platform.overflow.needLogin": "Sign in to route unfinished local requests to another user's machine.",
     "platform.overflow.needService": "Start a model before turning on Request help.",
     "platform.overflow.hint":
-      "When the local inference slot is occupied, another IdleToken provider immediately completes the request using this account's Sparks. Changes apply the next time the model starts.",
+      "While a request waits locally, IdleToken keeps looking for an available provider. It remains queued locally if nobody is free. Changes apply the next time the model starts.",
     "platform.share.notReady": "This machine's cluster isn't ready yet. You can still turn sharing on — the agent waits for the coordinator on port {port}.",
     "platform.share.browser": "Sharing needs the desktop app; this is the browser dev build.",
     // The engine reads the borrowing settings once, at start. Same words as a
@@ -340,7 +340,7 @@ export const STRINGS = {
     "platform.share.capHint": "The most Request help may cost in one day (UTC). The platform's own record is the one that counts.",
     "platform.share.wait": "Borrow only after waiting",
     "platform.share.waitUnit": "seconds",
-    "platform.share.waitHint": "Request help is immediate when the local inference slot is occupied; the client does not queue locally.",
+    "platform.share.waitHint": "Shared-compute attempts start immediately while the request remains safely queued for local service.",
     "platform.share.advanced": "Advanced",
     "platform.agent.log": "Recent agent log",
     "platform.keys": "API keys",
@@ -394,18 +394,15 @@ export const STRINGS = {
     "chat.thinking": "Thinking…",
     "chat.prefill": "Reading your prompt… {done}/{total} tokens",
     "chat.copyError": "Copy error",
-    // Streaming timeouts (main.rs CHAT_TIMEOUT_*). ⚠ "300" mirrors
+    // Mid-stream timeout. Waiting for the first response byte has no timeout;
+    // only Stop removes a locally queued request. ⚠ "300" mirrors
     // READ_TIMEOUT_S in src-tauri/src/main.rs — change both together.
     "chat.err.timeoutMid":
       "The cluster went silent for 300 seconds mid-reply, so this generation was cut off (what arrived is kept). Check the coordinator — it is most likely stuck, not merely slow.",
-    "chat.err.timeoutNone":
-      "No response from the cluster in 300 seconds. Check that the coordinator is running and not stuck loading the model.",
-    // The coordinator refused the turn because no sequence slot was free
-    // (main.rs CHAT_BUSY). Not retried automatically: several conversations can
-    // be generating at once, and a client that retries a busy coordinator by
-    // itself turns one queue into a stampede.
+    // Compatibility surface for coordinators older than the durable local
+    // queue. Current coordinators never reject a turn merely for being busy.
     "chat.err.busy":
-      "The cluster had no free slot, so this turn was not run ({detail}). Send it again once one of the running replies finishes.",
+      "This coordinator is too old to queue busy requests ({detail}). Upgrade IdleToken on the coordinator; current versions wait until local or shared compute is available.",
     "chat.prefillCached": "Reading your prompt… {done}/{total} tokens ({reused} reused from cache, {fresh} new)",
     "chat.kvHit": "KV cache hit · {reused}/{total} prompt tokens reused",
     "chat.kvMiss": "KV cache miss · all {total} prompt tokens recomputed",
@@ -422,7 +419,6 @@ export const STRINGS = {
     // picked up (the coordinator serves one request at a time).
     "chat.queued": "Sent — waiting for the cluster to start on it",
     "chat.queuedBehind": "Queued — the cluster is finishing another conversation's reply first",
-    "chat.limit": "{n} replies are already being handled locally or by shared compute. Wait for one to finish.",
     "chat.toLatest": "Latest",
     "chat.toLive": "Follow the reply",
     // Which model is in play. Two deliberately different claims: "Answering
@@ -772,13 +768,13 @@ export const STRINGS = {
     "platform.share.off": "已关闭",
     "platform.share.working": "处理中…",
     "platform.overflow.name": "请求外援",
-    "platform.overflow.optionHint": "本地推理槽被占用时，立即交给其他用户完成（消耗火花）。",
+    "platform.overflow.optionHint": "请求等待本地推理槽时，持续寻找外援提前完成；只有外援成功时才消耗火花。",
     "platform.overflow.off": "繁忙时请求外援",
     "platform.overflow.on": "外援就绪",
     "platform.overflow.needLogin": "登录后才能把本地来不及完成的请求路由给其他用户。",
     "platform.overflow.needService": "启动模型后才能开启外援",
     "platform.overflow.hint":
-      "本地推理槽被占用时，立即由其他 IdleToken 用户使用本账号的火花完成请求；更改在模型下次启动时生效。",
+      "请求会继续在本地排队，同时持续寻找可用外援；暂时没有外援也不会拒绝。更改在模型下次启动时生效。",
     "platform.share.notReady": "本机集群尚未就绪。仍可开启——代理会等待端口 {port} 上的协调者。",
     "platform.share.browser": "共享功能需要桌面应用；当前是浏览器开发环境。",
     "platform.share.restart": "请求外援在引擎下次启动时生效。如需立即生效，请重启集群。",
@@ -789,7 +785,7 @@ export const STRINGS = {
     "platform.share.capHint": "一个自然日（UTC）内请求外援最多可花费的火花，以平台流水为准。",
     "platform.share.wait": "等待超过此时长才借用",
     "platform.share.waitUnit": "秒",
-    "platform.share.waitHint": "本地推理槽被占用时立即请求外援；客户端不在本地排队。",
+    "platform.share.waitHint": "请求会持续在本地排队，同时立即并持续尝试寻找可用外援。",
     "platform.share.advanced": "高级",
     "platform.agent.log": "最近代理日志",
     "platform.keys": "API 密钥",
@@ -844,8 +840,7 @@ export const STRINGS = {
     "chat.copyError": "复制错误信息",
     "chat.err.timeoutMid":
       "生成中途集群 300 秒没有任何响应，本次生成已被截断（已收到的内容会保留）。请检查协调者——它很可能已经卡住，而不只是响应慢。",
-    "chat.err.timeoutNone": "300 秒内没有收到集群的任何响应。请确认协调者在运行，且没有卡在加载模型。",
-    "chat.err.busy": "集群没有空闲槽位，这一轮没有执行（{detail}）。等其中一条正在生成的回复结束后再发一次。",
+    "chat.err.busy": "协调者版本过旧，无法排队处理繁忙请求（{detail}）。请升级协调者上的 IdleToken；当前版本会一直等待本地或外援算力可用。",
     "chat.prefillCached": "正在读取提示词… {done}/{total} 词元（复用缓存 {reused}，新算 {fresh}）",
     "chat.kvHit": "命中 KV 缓存 · 复用 {reused}/{total} 提示词词元",
     "chat.kvMiss": "未命中 KV 缓存 · {total} 个提示词词元全部重算",
@@ -857,7 +852,6 @@ export const STRINGS = {
     "chat.generating": "这个对话正在生成回复",
     "chat.queued": "已发送——正在等待集群开始处理",
     "chat.queuedBehind": "排队中——集群正在先完成另一个对话的回复",
-    "chat.limit": "已有 {n} 条回复正在由本机或共享算力处理。等其中一条结束后再发。",
     "chat.toLatest": "回到最新",
     "chat.toLive": "跟随生成",
     "model.serving": "正在回答",
@@ -940,7 +934,6 @@ const IS_DEV_BUILD: boolean =
 
 const ERROR_KEYS: Record<string, StringKey> = {
   CHAT_TIMEOUT_MID: "chat.err.timeoutMid",
-  CHAT_TIMEOUT_NONE: "chat.err.timeoutNone",
   CHAT_BUSY: "chat.err.busy",
   WEIGHTS_NO_SOURCE: "weights.err.noSource",
   WEIGHTS_PART_OVERRUN: "weights.note.partOverrun",

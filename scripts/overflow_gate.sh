@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # G_OVERFLOW — overflow routing: when this machine is full, may it borrow
-# another one, and under what conditions must it refuse?
+# another one, and under what conditions must it keep the request local?
 #
 # Design: docs/overflow-routing-design.md, docs/api-surface.md §5.
 # Plan:   docs/overflow-b2b-plan-2026-08.md §2 (the six claims below are its
@@ -15,7 +15,8 @@
 #   4  stream:true forwards only after a complete sealed reply and is re-emitted
 #      as a complete local SSE sequence
 #   5  each of the four bad platform keys refuses to enable
-#   6  an explicitly configured daily spend cap stops forwarding once reached
+#   6  an explicitly configured daily spend cap stops forwarding once reached,
+#      while the original request remains queued locally
 #
 # Claims 7-15 were added after that list and are documented where they run:
 # 7 origin policy, 8 admission capabilities, 9 the hop budget, 10 an in-flight
@@ -30,9 +31,9 @@
 #     claims 1 and 6 and leaves a connection behind);
 #   - "no plaintext on the wire" is a search over the recorded bytes, and the
 #     searcher is first proven to find a marker that IS there;
-#   - "the machine is full" is proven by a plain 429 before overflow is
-#     switched on at all — a gate that mistakes an idle machine for a full one
-#     would pass while testing nothing.
+#   - "the machine is full" is proven by a second request remaining pending
+#     before overflow is switched on — a gate that mistakes an idle machine for
+#     a full one would pass while testing nothing.
 #
 # THE FIXTURES are stubs on purpose. scripts/stub_engine_busy.py answers
 # correctly but slowly, so the coordinator's slots genuinely fill; a real model
@@ -189,9 +190,9 @@ start_coord_or_skip() {
     esac
 }
 
-# Occupy the one local slot and leave it occupied. The local queue is
-# deliberately zero-deep now: the next request is the overflow candidate, so a
-# second filler would borrow and contaminate the outbound-connection oracle.
+# Occupy the one local slot and leave it occupied. The next request enters the
+# durable local queue and, when allowed, simultaneously becomes an overflow
+# candidate; a second filler would contaminate the outbound-connection oracle.
 fill_machine() {
     if [ -n "${FILL_PID:-}" ] && kill -0 "$FILL_PID" 2>/dev/null; then
         wait "$FILL_PID" 2>/dev/null || true
@@ -350,16 +351,25 @@ printf '%s' "$stats" | grep -q '"seq_slots":1' \
 printf '%s' "$stats" | grep -q '"concurrency":1' \
     || fail "control: default local concurrency is not 1: $stats"
 printf '%s' "$stats" | grep -q '"queue_cap":0' \
-    || fail "control: local inference queue is not zero-deep: $stats"
+    || fail "control: queue_cap=0 no longer reports the unbounded queue sentinel: $stats"
 grep -q 'resources could hold 4' "$REC/coord.log" \
     || fail "control: the fixture did not prove that product policy overrode a resource-derived multi-slot result"
-note "control: resources permit 4 slots, product policy starts 1 with queue 0"
+note "control: resources permit 4 slots, product policy starts 1 with an unbounded local queue"
 fill_machine
-got=$(post_chat "$BODY")
+post_chat "$BODY" > "$REC/queued-control.out" &
+QUEUED_PID=$!
+sleep 2
+kill -0 "$QUEUED_PID" 2>/dev/null \
+    || fail "control: the second request did not remain pending behind the occupied local slot"
+queued_stats=$(curl -s -m 3 "http://127.0.0.1:$API_PORT/idletoken/v1/stats")
+printf '%s' "$queued_stats" | grep -Eq '"queue_depth":[1-9][0-9]*' \
+    || fail "control: the waiting request is not visible in queue_depth: $queued_stats"
+wait "$QUEUED_PID" 2>/dev/null || true
+got=$(cat "$REC/queued-control.out")
 code=$(printf '%s' "$got" | tail -1)
-[ "$code" = "429" ] \
-    || fail "control: a full machine answered $code, not 429 — the fixture never filled, so nothing below would be tested"
-note "control: a full machine refuses with 429 (overflow off)"
+[ "$code" = "200" ] \
+    || fail "control: the queued request answered $code instead of completing after the local slot freed"
+note "control: a busy machine keeps the request pending, reports it in queue_depth, then completes it locally"
 
 # ===================================================================
 # Claim 15 — a departed local API client releases both the coordinator slot
@@ -368,9 +378,9 @@ note "control: a full machine refuses with 429 (overflow off)"
 # leaves the entire expensive interval uncovered.
 #
 # The control immediately above proved this harness sees a genuinely occupied
-# slot as 429. Here curl deliberately leaves after one second; a second request
-# must then be ADMITTED (it times out waiting for the slow fixture, HTTP 000),
-# not immediately refused as 429. The fixture itself watches its upstream EOF,
+# slot as a pending request. Here curl deliberately leaves after one second; a
+# second request must then be ADMITTED (it times out waiting for the slow
+# fixture, HTTP 000), not remain stuck behind a cancelled orphan. The fixture watches its upstream EOF,
 # so this also exercises coordinator-close -> engine-cancel rather than merely
 # releasing an accounting counter.
 # ===================================================================
@@ -455,13 +465,13 @@ before=$(conns)
 fill_machine
 got=$(post_chat "$BODY")
 code=$(printf '%s' "$got" | tail -1)
-[ "$code" = "429" ] \
-    || fail "claim 6: past the daily cap the coordinator answered $code, not 429"
+[ "$code" = "200" ] \
+    || fail "claim 6: past the daily cap the locally queued request answered $code instead of completing"
 [ "$(conns)" = "$before" ] \
     || fail "claim 6: past the daily cap the coordinator still dialled the platform"
 grep -q "daily spend cap" "$REC/coord.log" \
-    || fail "claim 6: refused, but the log does not say it was the cap"
-note "claim 6: past the cap -> 429, and no outbound connection"
+    || fail "claim 6: borrowing was skipped, but the log does not say it was the cap"
+note "claim 6: past the cap -> no outbound connection; the request stayed queued and completed locally"
 
 # ===================================================================
 # Claim 4 — stream:true borrows safely. The cloud exchange itself is
@@ -569,12 +579,12 @@ printf '%s' "$agent_out" | grep -q "HTTP 0" \
 # And prove the job was really posted, before reading anything into its absence.
 printf '%s' "$agent_out" | grep -q "HTTP " \
     || fail "claim 1 fixture: seal_infer_job.cjs never posted a job, so nothing below is an assertion about the agent: $agent_out"
-# The agent turns the coordinator's 429 into a sealed error, so what matters is
-# not its status code but that the coordinator did NOT dial out.
+# The platform job waits for this coordinator, so what matters is that the
+# coordinator did NOT dial out to a third machine.
 [ "$(conns)" = "$before" ] \
     || fail "claim 1: a PLATFORM-DISPATCHED job was forwarded out of this machine — the one rule that may not break"
 grep -q "platform work is never forwarded" "$REC/coord.log" \
-    || fail "claim 1: the coordinator did not record refusing to forward platform work (did the agent send the origin header?)"
+    || fail "claim 1: the coordinator did not record keeping platform work local (did the agent send provenance?)"
 grep -q "origin=platform" "$REC/coord.log" \
     || fail "claim 1: the coordinator never saw a platform-origin request — the agent's header is missing, and the whole rule rests on it"
 note "claim 1: the real agent's job was recognised as platform work and never forwarded"
@@ -606,11 +616,11 @@ note "claim 1: ...and the capability the real agent minted was spent by the coor
 #
 # THREE PARTS, and the middle one is the whole reason this claim is credible:
 #
-#   7a  the strict opt-in:  unmarked + strict     -> 429, nothing dialled out
+#   7a  the strict opt-in:  unmarked + strict     -> local queue, nothing dialled out
 #   7b  the attack oracle:  unmarked + legacy     -> 200, dialled out
 #   7c  the non-regression: marked   + strict     -> 200, dialled out
 #
-# Without 7b, 7a proves only that something refused; a coordinator with overflow
+# Without 7b, 7a proves only that something stayed local; a coordinator with overflow
 # quietly broken would pass it. Without 7c, the "fix" could be "never forward
 # anything", which switches the feature off for the user who paid for it. The
 # attack is demonstrated on the SAME BINARY that stops it, via the documented
@@ -648,13 +658,13 @@ before=$(conns)
 fill_machine
 got=$(post_chat "$BODY")
 code=$(printf '%s' "$got" | tail -1)
-[ "$code" = "429" ] \
-    || fail "claim 7a: an UNATTRIBUTED request on a machine that serves the platform was answered $code, not 429 — this is the PROV-28 shape and it must not be forwarded"
+[ "$code" = "200" ] \
+    || fail "claim 7a: an UNATTRIBUTED request on a machine that serves the platform answered $code instead of waiting for local completion"
 [ "$(conns)" = "$before" ] \
     || fail "claim 7a: an UNATTRIBUTED request was forwarded off this machine — a stripped-header platform job would be charged twice and shown to one more stranger"
 grep -q "unattributed request on a machine that serves the platform" "$REC/coord.log" \
-    || fail "claim 7a: refused, but not for the origin reason — the log must name why, or the next person will read it as an ordinary busy 429"
-note "claim 7a: explicit strict opt-in + unattributed -> 429, nothing dialled out, reason named"
+    || fail "claim 7a: forwarding was skipped, but the log does not name the origin reason"
+note "claim 7a: explicit strict opt-in + unattributed -> local completion, nothing dialled out, reason named"
 
 # --- 7c: the non-regression control --------------------------------------
 # The SAME coordinator, the SAME body, one extra header: the local-origin
@@ -750,13 +760,13 @@ before=$(conns)
 fill_machine
 got=$(post_chat "$BODY" -H "$HOPS_HDR: $(awk '$1=="#define" && $2=="IDLETOKEN_OVF_MAX_HOPS" {print $3}' include/idletoken_overflow.h)")
 code=$(printf '%s' "$got" | tail -1)
-[ "$code" = "429" ] \
-    || fail "claim 9: a request that had already been forwarded was forwarded again ($code)"
+[ "$code" = "200" ] \
+    || fail "claim 9: a request at the hop budget answered $code instead of waiting for local completion"
 [ "$(conns)" = "$before" ] \
     || fail "claim 9: a request at the hop budget still dialled out — the exposure set of one prompt has no ceiling"
 grep -q "already been forwarded once" "$REC/coord.log" \
-    || fail "claim 9: refused, but the log does not say it was the hop budget"
-note "claim 9: a request at the hop budget is refused, and nothing is dialled out"
+    || fail "claim 9: forwarding was skipped, but the log does not say it was the hop budget"
+note "claim 9: a request at the hop budget stays local, and nothing is dialled out"
 
 # Control: one hop below the budget still goes out, so claim 9 is a ceiling and
 # not an off-switch.
@@ -792,14 +802,14 @@ grep -q "platform job gate-job-10 admitted" "$REC/coord.log" \
 before=$(conns)
 got=$(post_chat "$BODY" -H "$LOCAL_HDR: $(local_marker)")
 code=$(printf '%s' "$got" | tail -1)
-[ "$code" = "429" ] \
-    || fail "claim 10: while a platform job was in flight, a local request was answered $code instead of 429 — this machine would have paid a third machine while already being paid for the slot"
+[ "$code" = "200" ] \
+    || fail "claim 10: while a platform job was in flight, the local request answered $code instead of waiting for this machine"
 [ "$(conns)" = "$before" ] \
     || fail "claim 10: while a platform job was in flight, the coordinator dialled out — the same prompt can now reach a third party and be charged twice"
 grep -q "platform-dispatched job is in flight" "$REC/coord.log" \
-    || fail "claim 10: refused, but the log does not say it was the in-flight platform job"
+    || fail "claim 10: forwarding was skipped, but the log does not say it was the in-flight platform job"
 wait "$PLAT_JOB_PID" 2>/dev/null || true
-note "claim 10: while a platform job is in flight, an attributed local request is not forwarded"
+note "claim 10: while a platform job is in flight, an attributed local request waits locally and is not forwarded"
 
 # Control: once the platform job has finished, the very same attributed request
 # borrows again — the rule releases, it does not latch.
@@ -847,9 +857,8 @@ note "claim 11: the posture endpoint tracks the enforced state in both direction
 # providers). The gate could not see it because this fixture answered 200
 # while the thing it stood in for answered 201.
 #
-# Its control is the other half: a NON-2xx must still be refused. Without that,
-# "accepts 201" would also pass on a coordinator that had stopped looking at the
-# status at all, which is a different bug wearing this one's clothes.
+# Its control is the other half: a NON-2xx must not be mistaken for a borrowed
+# success. It is logged, then the request remains eligible for local service.
 # ===================================================================
 cleanup; sleep 1
 : > "$REC/conn.log"
@@ -871,13 +880,18 @@ start_platform good 1 418 || fail "the stub platform did not come up answering 4
 start_coord_or_skip --overflow-url "http://127.0.0.1:$PLAT_PORT" --overflow-key sk-gate-key \
     || fail "the coordinator never became ready with overflow on (see $REC/coord.log)"
 fill_machine
+before=$(conns)
 got=$(post_chat "$BODY")
 code=$(printf '%s' "$got" | tail -1)
-[ "$code" = "429" ] \
-    || fail "claim 12 control: the platform answered 418 and the coordinator relayed it as $code — it is no longer reading the status at all, so 'accepts 201' proves nothing"
+[ "$code" = "200" ] \
+    || fail "claim 12 control: a platform 418 escaped as $code instead of leaving the request queued locally"
+[ "$(conns)" -gt "$before" ] \
+    || fail "claim 12 control: the coordinator never made the deliberately failing platform attempt"
+printf '%s' "$got" | grep -q "borrowed-answer" \
+    && fail "claim 12 control: the platform's 418 was mistaken for a borrowed success"
 grep -q "platform answered 418" "$REC/coord.log" \
-    || fail "claim 12 control: refused, but the log does not name the status that caused it"
-note "claim 12 control: a non-2xx platform answer is still refused, and named"
+    || fail "claim 12 control: the failed attempt was not named in the log"
+note "claim 12 control: a non-2xx platform answer is logged and suppressed; the request completes locally"
 
 # ===================================================================
 # Claim 13 — the actual compatible-client product path. A provider machine runs
@@ -924,4 +938,4 @@ printf '%s' "$got" | grep -q 'event: message_stop' \
 note "claim 13: unmodified Anthropic traffic borrows while --shared is busy"
 
 cleanup
-echo "OVERFLOW_GATE_OK:platform work never forwarded (via the real agent, and its capability really spent); strict opt-in refuses an unattributed request while a marked request still borrows, and legacy reproduces the wider pre-hardening hole; the product default lets unmodified OpenAI and Anthropic clients borrow on a busy --shared machine; a disconnected local client cancels its engine request and releases the single slot; capability replay/mismatch/garbage each 403 for their own reason; the hop budget and an in-flight platform job both stop a forward and both release; local overflow sealed with no plaintext; tokenless loopback is supported and four bad keys fail closed; stream and non-stream local work may borrow; tool definitions, forced choice, call history and structured tool responses survive a borrow; an explicit operator cap refuses without dialling out; the posture endpoint tracks what is enforced; a 201 borrow succeeds and a non-2xx is still refused"
+echo "OVERFLOW_GATE_OK:busy local work stays queued until local or shared compute completes it; platform work never forwards (via the real agent, with its capability spent); strict opt-in keeps unattributed work local while marked work may borrow; the product default lets unmodified OpenAI and Anthropic clients borrow; disconnect cancels the engine request and releases the slot; capability replay/mismatch/garbage each 403 for their own reason; hop budget and in-flight platform work stop forwarding without rejecting local demand; overflow remains sealed; tokenless loopback is supported and bad keys fail closed; stream, tools and call history survive borrowing; an explicit operator cap falls back to local queue; posture tracks enforced state; a 201 borrow succeeds and a non-2xx attempt is suppressed while local completion remains available"
