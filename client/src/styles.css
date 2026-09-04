@@ -2947,9 +2947,14 @@ textarea {
 
 /* Same row, empty state: this one is the SETTING, not a running fact, so it is
    editable (the link) and sits flush above the two deploy options it governs. */
+/* The model row and the context row are one pair: the model, its precision and
+   its window all describe the same thing. The 16px that separates the pair from
+   the deploy options below therefore belongs to the LAST of the two — leaving it
+   on --pick put the gap in the middle of the pair and left the context row
+   sitting on top of "run on this machine only". */
 .cluster-model--pick {
   margin-top: 4px;
-  margin-bottom: 16px;
+  margin-bottom: 0;
 }
 
 .cluster-model__change {
@@ -2961,29 +2966,60 @@ textarea {
    rather than crowding the link. (It was adjacent to Change for one revision;
    that read as the two belonging together, which they do not — one is a
    setting, the other is a navigation affordance.) */
-.cluster-model__longctx {
+/* ---- context window row ---------------------------------------------------
+   Its own row under the model (2026-09-02, docs/ctx-tiers-2026-09.md), not a
+   knob at the end of the model line. It replaced a "1M" checkbox: the window is
+   now a three-way choice and pre-paid VRAM, so it needs to show which value is
+   live rather than only whether "long" is on.
+
+   Segmented control rather than a dropdown: three options that a user compares
+   against the capacity card next to them should all be visible at once. */
+.cluster-model--ctx {
+  margin-top: 6px;
+  margin-bottom: 16px;
+  gap: 8px;
+}
+
+.ctxtier {
+  /* Anchors the visually-hidden radio below. Without it the radio resolves to
+     .cluster-model (position: relative), so all three stack in one corner of
+     the row and the focus ring lands nowhere near the pill it belongs to. */
+  position: relative;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  margin-left: auto;
-  color: var(--ink);
-  cursor: pointer;
-}
-
-/* Secondary to the model name (15px) it sits beside: this is one optional knob,
-   not the headline of the row. At the inherited 16px it read as the loudest
-   text on the card. */
-.cluster-model__longctx > span {
+  padding: 3px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
   font-size: 13px;
+  color: var(--ink-dim);
+  cursor: pointer;
+  user-select: none;
 }
 
-.cluster-model__longctx input {
-  margin: 0;
+/* The radio itself is the accessibility anchor and the keyboard target; the
+   pill is the visible affordance. Hidden with clip rather than display:none so
+   focus and arrow-key group navigation keep working. */
+.ctxtier input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  clip-path: inset(50%);
 }
 
-.cluster-model__longctx.is-disabled {
-  opacity: 0.55;
-  cursor: not-allowed;
+.ctxtier:hover {
+  border-color: var(--accent);
+}
+
+.ctxtier.is-on {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.ctxtier:focus-within {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 /* ---- model picker popover -------------------------------------------------
@@ -3212,13 +3248,20 @@ textarea {
 /* cluster activity row (engine /idletoken/v1/stats) */
 .activity {
   display: flex;
-  gap: clamp(12px, 3vw, 26px);
+  gap: 8px clamp(12px, 2vw, 22px);
   flex-wrap: wrap;
   margin-top: 10px;
   padding-top: 10px;
   border-top: 1px dashed var(--line);
   font-size: 12.5px;
   color: var(--ink-dim);
+}
+
+.activity__item {
+  /* Counters grow forever. Keep each value and its unit together; App.tsx
+     compacts large values and exposes the exact number in a tooltip. */
+  white-space: nowrap;
+  min-width: 0;
 }
 
 .activity__item b {

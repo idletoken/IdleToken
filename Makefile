@@ -272,7 +272,7 @@ WORKER_MAIN_OBJ := $(WORKER_BUILD)/worker_main.o
 COORD_MAIN_OBJ  := $(COORD_BUILD)/coord_main.o $(COORD_BUILD)/llama_sidecar.o \
                    $(COORD_BUILD)/overflow.o
 
-.PHONY: all worker coord clean check info plantest weightstest workerjointest disctest autotest apitest sidecartest admissiontest platformversiontest
+.PHONY: all worker coord clean check info plantest weightstest ggufgeomtest workerjointest disctest autotest apitest sidecartest admissiontest platformversiontest
 
 all: worker coord
 
@@ -293,6 +293,19 @@ weightstest:
 	$(CC) -Wall -Wextra -std=c99 -D_GNU_SOURCE -Iinclude src/common/net.c \
 	    src/common/weights.c src/tools/weights_test.c -o build/weights_test -lpthread
 	./build/weights_test
+
+# The GGUF type-size table decides how many bytes of a model each node fetches.
+# A wrong row is invisible at runtime -- the index stays self-consistent and
+# describes a file nobody has -- so it is checked against the pinned engine's
+# own ggml-common.h rather than against a second copy of our numbers. One row
+# being wrong (IQ1_S) broke a real cluster on 2026-09-02; run this when the
+# engine pin moves.
+ggufgeomtest:
+	@mkdir -p build
+	$(CC) -Wall -Wextra -std=c99 -Iinclude -Ivendor/llama.cpp/ggml/src \
+	    -Ivendor/llama.cpp/ggml/include \
+	    src/tools/gguf_geom_test.c -o build/gguf_geom_test
+	./build/gguf_geom_test
 
 # Pin the shipped Tauri worker launch to RPC supervision, and prove that the
 # retired INFER network path refuses before it touches the LAN. The executable
@@ -391,7 +404,8 @@ autotest:
 	@mkdir -p build
 	python3 scripts/make_test_gguf.py build/fixtures
 	$(CC) -Wall -Wextra -std=c99 -Iinclude src/common/gguf.c src/common/model.c \
-	    src/common/modelsize.c src/common/model_auto.c src/tools/model_auto_test.c \
+	    src/common/modelsize.c src/common/model_auto.c src/common/plan.c \
+	    src/tools/model_auto_test.c \
 	    -o build/model_auto_test
 	./build/model_auto_test build/fixtures
 

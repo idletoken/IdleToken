@@ -68,8 +68,10 @@
  * and deliberately not called authentication — it is an ATTRIBUTION marker, and
  * a program on this machine can read the same file. Its job is to let the
  * coordinator distinguish the honest local caller from an unattributed one when
- * the strict origin policy is in force, so that closing the platform hole does
- * not also switch the feature off for the user who paid for it. */
+ * an operator explicitly enables the strict origin policy. The product default
+ * remains compatible with unmodified OpenAI/Anthropic clients, so this marker is
+ * optional for local callers; admitted or legacy-marked platform work is still
+ * non-forwardable under every hardened policy. */
 #define IDLETOKEN_HDR_LOCAL_ORIGIN "X-IdleToken-Local-Origin"
 
 /* Exposure hops already spent by this request (see idletoken_overflow.h).

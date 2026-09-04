@@ -61,6 +61,19 @@ typedef enum {
                           * charging every layer the full KV price. */
 } idletoken_kv_kind;
 
+/* KV cache DTYPE tier — which cache precision the coordinator's automatic rule
+ * (idletoken_llama_kv_tier_for_weight, src/common/plan.c) selects for a weight
+ * quantization. The graph workspace differs between these on some
+ * architectures, so every measured `compute_bytes_*` array below is indexed by
+ * one of them. Order is load-bearing: it is the on-disk order of the manifest
+ * arrays and of the registry initializers, so append only. */
+typedef enum {
+    IDLETOKEN_KV_TIER_F16  = 0, /* unquantized weights (>=16 bit) and unknown */
+    IDLETOKEN_KV_TIER_Q8_0 = 1, /* every quantized tier from 3 to 15 bit */
+    IDLETOKEN_KV_TIER_Q4_0 = 2, /* 1-2 bit weights */
+    IDLETOKEN_KV_TIER_COUNT = 3,
+} idletoken_kv_tier;
+
 /* One selectable precision (quant) of a model. Small models ship in several
  * quants (Q4_K_M default .. BF16) that differ only in byte size + download
  * source; the shape (layers/hidden/kv) is quant-independent and lives on the
@@ -127,14 +140,34 @@ typedef struct {
      * other field here: the growth rate is set by the model's architecture
      * (results/memory-need-measured-20260901.md). 0 = not yet measured.
      *
-     * Per BACKEND: the value is identical across GPUs and across every
+     * Per BACKEND: the value is identical across GPUs and across every WEIGHT
      * quantization in the menu, but NOT across backends — GLM-5.2 at 256K
-     * measures 1.50 GiB on CUDA and 33.3 GiB on Metal. Re-measure when the
-     * engine pin moves. */
-    uint64_t compute_bytes_256k_cuda;
-    uint64_t compute_bytes_1m_cuda;
-    uint64_t compute_bytes_256k_metal;
-    uint64_t compute_bytes_1m_metal;
+     * measures 1.50 GiB on CUDA and 33.3 GiB on Metal.
+     *
+     * Per KV TIER (added 2026-09-02): also NOT identical across KV cache
+     * dtypes on every architecture. Qwen3.5-0.8B at 256K on Metal measures
+     * 489.00 MiB with an f16 cache and 745.28 MiB with a quantized one — a 52%
+     * gap in the under-charging direction — while GLM-5.2 is flat across all
+     * three. Since the coordinator picks the KV dtype from the weight tier,
+     * each index below holds the workspace for the tier the product will
+     * actually launch. Index with IDLETOKEN_KV_TIER_*; never assume two
+     * indices are equal because they happen to be equal on the model you
+     * looked at. Re-measure when the engine pin moves.
+     *
+     * Per CONTEXT TIER: three product windows since 2026-09-02
+     * (docs/ctx-tiers-2026-09.md), 128K being the default. Each slot holds the
+     * window the product would really launch for that tier -- for a model whose
+     * ceiling falls between two tiers the slot holds the ceiling, not a zero,
+     * because a zero is a refusal. NOT interpolatable: the low tiers are
+     * dominated by an n_ubatch floor and only the high end is linear in ctx
+     * (qwen3.8-27b on CUDA at q8_0: 505 / 720 / 1360 / 5200 MiB at
+     * 64K/128K/256K/1M). */
+    uint64_t compute_bytes_128k_cuda[IDLETOKEN_KV_TIER_COUNT];
+    uint64_t compute_bytes_256k_cuda[IDLETOKEN_KV_TIER_COUNT];
+    uint64_t compute_bytes_1m_cuda[IDLETOKEN_KV_TIER_COUNT];
+    uint64_t compute_bytes_128k_metal[IDLETOKEN_KV_TIER_COUNT];
+    uint64_t compute_bytes_256k_metal[IDLETOKEN_KV_TIER_COUNT];
+    uint64_t compute_bytes_1m_metal[IDLETOKEN_KV_TIER_COUNT];
 
     const char *default_gguf;  /* default filename when --model-path is absent;
                                 * mirrors variants[default_variant].gguf */
@@ -173,6 +206,24 @@ const idletoken_model_variant *idletoken_model_variant_get(const idletoken_model
  * Convenience for planners that must size the SELECTED precision. */
 void idletoken_model_weight_bytes(const idletoken_model_spec *m, const char *quant,
                                uint64_t *layer_out, uint64_t *shared_out);
+
+/* The precision a GGUF file NAME denotes for `m`, or "" when nothing matches.
+ * Never NULL, so callers can print it unguarded.
+ *
+ * The FILE decides, not any flag: what matters is the GGUF the engine really
+ * opens, never a manifest's idea of a default. When `m` has no variant table
+ * of its own — every auto-generated manifest — the registry row with the same
+ * id supplies one, because that row describes the same model family.
+ *
+ * LIMIT, stated rather than papered over: this reads the file NAME, not the
+ * GGUF header's tensor types. A file renamed to look like another variant is
+ * believed. That is a weaker claim than a byte-level budget and a much
+ * stronger one than the blank string it replaces — blank means "any
+ * precision" to the marketplace's routing filter, so it is not a safe
+ * "unknown". Upgrading it means teaching gguf.c to report a precision, which
+ * is its own piece of work. */
+const char *idletoken_model_quant_from_gguf(const idletoken_model_spec *m,
+                                            const char *gguf);
 
 /* May this backend/model combination technically be served by more than one
  * node? This is not a recommendation. False for an explicitly unsplittable

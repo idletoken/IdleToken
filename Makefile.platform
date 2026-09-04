@@ -44,6 +44,7 @@ OBJS := $(BUILD)/tweetnacl.o \
         $(BUILD)/net.o \
         $(BUILD)/http.o \
         $(BUILD)/b64.o \
+        $(BUILD)/apiconv.o \
         $(BUILD)/admission.o \
         $(BUILD)/platform_agent.o
 
@@ -83,6 +84,9 @@ $(BUILD)/http.o: src/common/http.c include/idletoken_http.h | $(BUILD)
 $(BUILD)/b64.o: src/common/b64.c include/idletoken_b64.h | $(BUILD)
 	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
 
+$(BUILD)/apiconv.o: src/common/apiconv.c include/idletoken_apiconv.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
+
 # Local admission capabilities (PROV-28). The agent mints under the channel key
 # the coordinator beside it published; the coordinator spends. Same object on
 # both sides on purpose — a second implementation of the MAC input is a second
@@ -90,7 +94,7 @@ $(BUILD)/b64.o: src/common/b64.c include/idletoken_b64.h | $(BUILD)
 $(BUILD)/admission.o: src/common/admission.c include/idletoken_admission.h include/idletoken_sha256.h include/idletoken_privacy.h | $(BUILD)
 	$(CC) $(CFLAGS) -D_GNU_SOURCE $(INCLUDES) -c -o $@ $<
 
-$(BUILD)/platform_agent.o: src/tools/platform_agent.c include/idletoken_sodium_seal.h include/idletoken_privacy.h include/idletoken_net.h include/idletoken_http.h include/idletoken_b64.h include/idletoken_admission.h $(VERSION_HEADER) | $(BUILD)
+$(BUILD)/platform_agent.o: src/tools/platform_agent.c include/idletoken_sodium_seal.h include/idletoken_privacy.h include/idletoken_net.h include/idletoken_http.h include/idletoken_b64.h include/idletoken_apiconv.h include/idletoken_admission.h $(VERSION_HEADER) | $(BUILD)
 	$(CC) $(CFLAGS) -D_GNU_SOURCE $(INCLUDES) -include $(VERSION_HEADER) -c -o $@ $<
 
 $(BIN): $(OBJS)

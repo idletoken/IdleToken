@@ -46,11 +46,10 @@ void    idletoken_die_with_parent(void);
  * and then opening, deleting, or binding a different path. */
 int     idletoken_win_require_utf8_paths(void);
 
-/* Best-effort idempotent inbound firewall allow (architecture §9, productization).
- * Checks `netsh advfirewall firewall show rule` first; adds only when missing.
- * Adding needs elevation — otherwise prints the exact netsh command once so
- * the user/installer can run it. IDLETOKEN_NO_FIREWALL_RULE=1 skips everything.
- * Include the port in rule_name so a port change provisions a fresh rule. */
+/* Print what inbound access this port needs. It does NOT change the firewall:
+ * the installer provisions program rules while elevated (2026-09-02, see
+ * win_compat.c for why the self-provisioning was removed). Include the port in
+ * rule_name so the printed command is copy-pasteable. */
 void    idletoken_win_ensure_firewall_rule(const char *rule_name,
                                         const char *protocol, int port);
 

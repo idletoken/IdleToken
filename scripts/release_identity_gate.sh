@@ -7,8 +7,15 @@
 # The question this gate answers is narrow and it is the one users cannot check
 # for themselves: *is this tree still able to produce a release whose identity
 # somebody outside the project can verify?* Everything downstream of that — the
-# update channel, the "did I download the official installer" check, the ability
-# to notice a key-compromise release — is worthless if this drifts.
+# "did I download the official installer" check, the ability to notice a
+# key-compromise release — is worthless if this drifts.
+#
+# 2026-09-02: the in-app updater was removed, so the signed provenance record is
+# now the only verification path there is, for first installs and upgrades
+# alike. Checks that existed only to guard the updater were not deleted with it;
+# they were re-aimed at what still carries the property (R1, R2) or at keeping
+# the removal true (R4). Deleting them would have quietly handed back the
+# coverage the register claims for DIST-08, OPS-03, OPS-04 and OPS-12.
 #
 # **Every check carries its own positive control.** This repo has twice shipped
 # a check that could not fail (a grep pattern that never matched, a `grep -P` on
@@ -39,17 +46,28 @@ REGISTRY="$ROOT/scripts/release-escape-hatches.tsv"
 PINNED_KEYID="28F23C3CE24BFDE9"
 
 # ===========================================================================
-# R1 — the updater trust root is the one installed clients already have
+# R1 — the published release signing key is the one we actually sign with
 # ===========================================================================
-# CLAUDE.md calls this key non-regenerable: a different key orphans every
-# installed client permanently. So the pin is checked, not assumed, and the
-# check is proven able to notice a changed key before its green means anything.
-note "R1 updater trust root"
-keyid_of() {  # $1 = a tauri.conf.json path -> key id, or empty
+# Until 2026-09-02 this key was also the in-app updater's trust root, and the
+# check compared the client's compiled-in pin against the published copy. The
+# updater is gone; the key is not — it signs the provenance record, which is now
+# the ONLY thing standing between a user and a repacked installer, on the first
+# install and on every upgrade alike.
+#
+# That makes the published copy load-bearing in a way it was not before: it is
+# no longer a fingerprint users can also read off their own client, it is the
+# only place the fingerprint exists. So this checks the published record against
+# itself — the advertised key id must be the key id embedded in the advertised
+# key material — and proves it can notice tampering before its green counts.
+# A swapped publicKey left under the familiar keyId is exactly the edit an
+# attacker with commit access would make.
+note "R1 published release signing key"
+keyid_of() {  # $1 = a release-channels.json path -> key id, or empty
     python3 - "$1" <<'PY'
 import base64, json, sys
 try:
-    pk = json.load(open(sys.argv[1]))["plugins"]["updater"]["pubkey"]
+    d = json.load(open(sys.argv[1]))
+    pk = (d.get("releaseSigningKey") or d["updaterTrustRoot"])["publicKey"]
     raw = base64.b64decode(base64.b64decode(pk).decode().splitlines()[1])
     if raw[:2] != b"Ed" or len(raw) != 42:
         print(""); raise SystemExit(0)
@@ -58,88 +76,104 @@ except Exception:
     print("")
 PY
 }
-if [ ! -f "$CONF" ]; then
-    skip "no client/src-tauri/tauri.conf.json in this checkout"
+if [ ! -f "$CHANNELS" ]; then
+    bad "no scripts/release-channels.json — the release signing key is published nowhere (OPS-12: nothing for a user to compare against)"
 else
-    # Positive control FIRST: a copy with a DIFFERENT key must read differently.
+    # Positive control FIRST: a copy with DIFFERENT key material must read
+    # differently, even though its advertised keyId is untouched.
     ctl=$(mktemp -d "${TMPDIR:-/tmp}/idletoken-relid.XXXXXX")
-    python3 - "$CONF" "$ctl/tampered.json" <<'PY'
+    python3 - "$CHANNELS" "$ctl/tampered.json" <<'PY'
 import base64, json, sys
 d = json.load(open(sys.argv[1]))
-pk = base64.b64decode(d["plugins"]["updater"]["pubkey"]).decode()
+node = d.get("releaseSigningKey") or d["updaterTrustRoot"]
+pk = base64.b64decode(node["publicKey"]).decode()
 head, body = pk.splitlines()[0], base64.b64decode(pk.splitlines()[1])
 evil = body[:2] + bytes(b ^ 0xFF for b in body[2:10]) + body[10:]
-d["plugins"]["updater"]["pubkey"] = base64.b64encode(
+node["publicKey"] = base64.b64encode(
     (head + "\n" + base64.b64encode(evil).decode() + "\n").encode()).decode()
 json.dump(d, open(sys.argv[2], "w"))
 PY
     if [ "$(keyid_of "$ctl/tampered.json")" = "$PINNED_KEYID" ]; then
-        bad "CONTROL: a config with a swapped updater key still read as $PINNED_KEYID — this check does not check"
+        bad "CONTROL: swapped key material still read as $PINNED_KEYID — this check does not check"
     else
-        ok "control: swapping the updater public key changes what this check reads"
+        ok "control: swapping the published key material changes what this check reads"
     fi
     rm -rf "$ctl"
 
-    got=$(keyid_of "$CONF")
-    if [ "$got" = "$PINNED_KEYID" ]; then
-        ok "tauri.conf.json pins updater key $PINNED_KEYID"
-    elif [ -z "$got" ]; then
-        bad "tauri.conf.json has no readable minisign updater public key — a build from this tree ships a dead update channel"
+    got=$(keyid_of "$CHANNELS")
+    adv=$(python3 -c "
+import json
+try:
+    d = json.load(open('$CHANNELS'))
+    print((d.get('releaseSigningKey') or d['updaterTrustRoot'])['keyId'])
+except Exception: print('')" 2>/dev/null)
+    if [ -z "$got" ]; then
+        bad "release-channels.json publishes no readable minisign public key — a downloader has nothing to verify a release against"
+    elif [ "$got" != "$PINNED_KEYID" ]; then
+        bad "release-channels.json publishes key material for $got, NOT $PINNED_KEYID — every key id users wrote down would stop matching"
+    elif [ "$adv" != "$got" ]; then
+        bad "release-channels.json advertises keyId $adv but its key material is $got — users would be told to compare the wrong fingerprint"
     else
-        bad "tauri.conf.json pins updater key $got, NOT $PINNED_KEYID — every already-installed client would be orphaned by a release from this tree"
+        ok "the published key material is $PINNED_KEYID and its advertised key id agrees"
     fi
 
-    # The published copy has to agree, or the fingerprint we ask users to
-    # compare against is not the one their client enforces.
-    pub_ch=$(python3 -c "
-import json,sys
-try: print(json.load(open('$CHANNELS'))['updaterTrustRoot']['keyId'])
-except Exception: print('')" 2>/dev/null)
-    if [ -z "$pub_ch" ]; then
-        bad "scripts/release-channels.json does not publish an updater key id (OPS-12: nothing for a user to compare against)"
-    elif [ "$pub_ch" != "$got" ]; then
-        bad "release-channels.json publishes key $pub_ch but the client enforces $got — users would be told to check the wrong fingerprint"
-    else
-        ok "release-channels.json publishes the same key id the client enforces"
-    fi
+    # And the tool we tell people to run has to resolve to that key with no
+    # arguments. If the lookup path breaks, verify_release.sh does not fail
+    # open — but it does stop working, which is how a control stops being run.
+    vt=$(mktemp -d "${TMPDIR:-/tmp}/idletoken-relid-vr.XXXXXX")
+    printf '{"artifacts":[]}' > "$vt/p.json"; printf 'not-a-signature' > "$vt/p.json.sig"
+    printf 'x' > "$vt/thing.bin"
+    vout=$("$ROOT/scripts/verify_release.sh" --provenance "$vt/p.json" "$vt/thing.bin" 2>&1)
+    case "$vout" in
+        *"could not determine the official public key"*)
+            bad "verify_release.sh cannot find the published key by itself — the command in release-channels.json fails for every user who follows it" ;;
+        *)
+            ok "verify_release.sh resolves the published key with no --pubkey argument" ;;
+    esac
+    rm -rf "$vt"
 fi
 
 # ===========================================================================
 # R2 — private-key custody (OPS-04)
 # ===========================================================================
-# Two ways this key ends a product: losing it (nobody can ever be updated) and
-# using the WRONG one (a release nobody can install). The second is silent —
-# signing succeeds, verification succeeds against the signer's own pubkey, and
-# only the users find out. So when a key is present, prove it is THE key by
-# signing a nonce and verifying against the PINNED public key.
+# Retiring the in-app updater did NOT retire this key: it signs the provenance
+# record, so it is still the project's single release identity. Two ways it ends
+# a product: losing it (no release can ever be verified against the fingerprint
+# people already have) and using the WRONG one — which is silent, because
+# signing succeeds and verification succeeds against the signer's own pubkey,
+# and only the users find out. So when a key is present, prove it is THE key by
+# signing a nonce and verifying against the PUBLISHED public key.
+#
+# The file is still named updater.key. Renaming a non-regenerable key file buys
+# tidiness and risks the backup nobody has tested; the name is not the identity.
 note "R2 signing key custody"
 KEY_PATH="${TAURI_SIGNING_PRIVATE_KEY_PATH:-$HOME/.idletoken/updater.key}"
 SIGNER="$ROOT/client/node_modules/.bin/tauri"
 if [ ! -f "$KEY_PATH" ]; then
-    skip "no updater private key at $KEY_PATH (normal on a build node; the control machine holds it)"
+    skip "no release private key at $KEY_PATH (normal on a build node; the control machine holds it)"
 elif [ ! -x "$SIGNER" ]; then
     skip "no Tauri signer at $SIGNER (run pnpm install in client/) — key custody not proven"
 else
     case "$KEY_PATH" in
-        "$ROOT"/*) bad "the updater private key is INSIDE the repository at $KEY_PATH — move it out; a key in the tree is one `git add -A` from being public forever" ;;
+        "$ROOT"/*) bad "the release private key is INSIDE the repository at $KEY_PATH — move it out; a key in the tree is one `git add -A` from being public forever" ;;
         *) ok "the private key lives outside the repository" ;;
     esac
     mode=$(stat -f '%Lp' "$KEY_PATH" 2>/dev/null || stat -c '%a' "$KEY_PATH" 2>/dev/null)
     case "$mode" in
         600|400) ok "key file mode is $mode" ;;
         "")      skip "could not read the key file mode on this platform" ;;
-        *)       bad "the updater private key is mode $mode — every local process can read it; chmod 600 $KEY_PATH" ;;
+        *)       bad "the release private key is mode $mode — every local process can read it; chmod 600 $KEY_PATH" ;;
     esac
     T=$(mktemp -d "${TMPDIR:-/tmp}/idletoken-keymatch.XXXXXX")
     head -c 256 /dev/urandom > "$T/nonce.bin" 2>/dev/null
     if ! "$SIGNER" signer sign -f "$KEY_PATH" -p "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" "$T/nonce.bin" >/dev/null 2>&1; then
         bad "the key at $KEY_PATH could not sign anything (wrong password, or the file is not a signing key)"
     else
-        PINNED_PUB=$(python3 -c "import json;print(json.load(open('$CONF'))['plugins']['updater']['pubkey'])" 2>/dev/null)
+        PINNED_PUB=$(python3 -c "import json;print(json.load(open('$CHANNELS'))['releaseSigningKey']['publicKey'])" 2>/dev/null)
         if python3 "$ROOT/scripts/minisign_verify.py" --pubkey "$PINNED_PUB" --sig "$T/nonce.bin.sig" "$T/nonce.bin" >/dev/null 2>&1; then
-            ok "the private key on this machine IS the pinned release key $PINNED_KEYID (proved by signing a nonce)"
+            ok "the private key on this machine IS the published release key $PINNED_KEYID (proved by signing a nonce)"
         else
-            bad "the private key at $KEY_PATH is NOT the pinned release key $PINNED_KEYID — a release signed here would install on nobody's machine"
+            bad "the private key at $KEY_PATH is NOT the published release key $PINNED_KEYID — verify_release.sh would reject every artifact signed here"
         fi
         # Control: the same verification against a different key must refuse,
         # otherwise the line above proves nothing.
@@ -266,31 +300,106 @@ else
 fi
 
 # ===========================================================================
-# R4 — the updater override really is inert in a release build
+# R4 — the client cannot install anything by itself (DIST-08, OPS-03)
 # ===========================================================================
-# update.rs carries an assertion for both profiles, and until now nothing ran
-# the release half. An override that survived into a shipped build lets anyone
-# who can set the process environment swap the feed URL AND the trust root
-# together, which is a complete signed-update bypass (OPS-03, DIST-08).
-note "R4 updater override inert in release"
-[ -x "$HOME/.cargo/bin/cargo" ] && PATH="$HOME/.cargo/bin:$PATH"
-if ! command -v cargo >/dev/null 2>&1; then
-    skip "cargo not on PATH (release-profile updater assertion not run)"
-elif [ "${IDLETOKEN_RELEASE_ID_SKIP_CARGO:-0}" = "1" ]; then
-    skip "IDLETOKEN_RELEASE_ID_SKIP_CARGO=1 (release-profile updater assertion not run)"
+# This slot used to assert that the updater's env overrides were compiled out of
+# release builds. The updater was removed on 2026-09-02, so that assertion is
+# now vacuous — and a vacuous check is the failure mode this gate exists to
+# avoid. What replaces it guards the property the removal bought:
+#
+#   an installed client has no code path that fetches, verifies or executes a
+#   new build, so there is nothing to point at a hostile feed in the first place.
+#
+# That is worth a standing check rather than a changelog line, because it is
+# easy to undo by accident. `tauri add updater` writes the plugin, the config
+# and the capability in one command, and the resulting client would auto-install
+# whatever a feed served — with none of R1/R2/R4's old checks watching, because
+# they were deleted along with the code they guarded. Re-adding it has to be a
+# deliberate act that turns this gate red first.
+note "R4 no self-installing update path"
+updater_traces() {  # $1 = a tree root -> one trace per line, silence = clean
+    python3 - "$1" <<'PY'
+import json, os, re, sys
+root = sys.argv[1]
+found = []
+conf = os.path.join(root, "client/src-tauri/tauri.conf.json")
+try:
+    d = json.load(open(conf))
+    if "updater" in (d.get("plugins") or {}):
+        found.append("tauri.conf.json configures the updater plugin")
+    if (d.get("bundle") or {}).get("createUpdaterArtifacts"):
+        found.append("tauri.conf.json still asks for updater artifacts")
+except FileNotFoundError:
+    pass
+cargo = os.path.join(root, "client/src-tauri/Cargo.toml")
+try:
+    # Comment lines are dropped first: this file explains that the dependency is
+    # absent, and a substring scan reads that explanation as the dependency.
+    t = "\n".join(l for l in open(cargo).read().splitlines()
+                  if not l.lstrip().startswith("#"))
+    if re.search(r'(^|[\s"\'{,])tauri-plugin-updater\s*[=\.]', t, re.M):
+        found.append("Cargo.toml depends on tauri-plugin-updater")
+    if re.search(r'^\s*updater-override\s*=', t, re.M):
+        found.append("Cargo.toml still declares the updater-override feature")
+except FileNotFoundError:
+    pass
+if os.path.exists(os.path.join(root, "client/src-tauri/src/update.rs")):
+    found.append("client/src-tauri/src/update.rs is back")
+for sub, pats in (("client/src-tauri/src", (r"\bupdater::", r"tauri_plugin_updater")),
+                  ("client/src", (r"@tauri-apps/plugin-updater", r"\bcheckUpdate\b", r"\binstallUpdate\b")),
+                  ("client/src-tauri/capabilities", (r'"updater:',))):
+    base = os.path.join(root, sub)
+    for dirpath, _, names in os.walk(base):
+        for n in names:
+            p = os.path.join(dirpath, n)
+            try:
+                body = open(p, encoding="utf-8", errors="ignore").read()
+            except OSError:
+                continue
+            for pat in pats:
+                if re.search(pat, body):
+                    found.append(f"{os.path.relpath(p, root)} references the updater ({pat})")
+                    break
+print("\n".join(found))
+PY
+}
+# Positive control FIRST, on a copy with the plugin AND the crate planted back
+# — the exact pair `tauri add updater` leaves behind. Both are asserted
+# separately: the Cargo scan ignores comment lines (this file documents the
+# dependency's ABSENCE, and a substring scan reads that as its presence), and a
+# comment filter is one bad regex away from ignoring the real line too.
+ctl=$(mktemp -d "${TMPDIR:-/tmp}/idletoken-r4.XXXXXX")
+mkdir -p "$ctl/client/src-tauri"
+if [ -f "$CONF" ] && cp "$CONF" "$ctl/client/src-tauri/tauri.conf.json"; then
+    python3 - "$ctl/client/src-tauri/tauri.conf.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d.setdefault("plugins", {})["updater"] = {"endpoints": ["https://example.invalid/latest.json"],
+                                          "pubkey": "planted"}
+json.dump(d, open(sys.argv[1], "w"))
+PY
+    traces=$(updater_traces "$ctl")
+    case "$traces" in
+        *"configures the updater plugin"*) ok "control: a re-added updater plugin is detected" ;;
+        *) bad "CONTROL: a planted updater plugin was not detected — this check does not check" ;;
+    esac
+    printf '[dependencies]\ntauri-plugin-updater = "2"\n' > "$ctl/client/src-tauri/Cargo.toml"
+    case "$(updater_traces "$ctl")" in
+        *"depends on tauri-plugin-updater"*) ok "control: a re-added updater crate is detected" ;;
+        *) bad "CONTROL: a planted tauri-plugin-updater dependency was not detected — the comment filter blinded the scan" ;;
+    esac
 else
-    log=/tmp/idletoken-relid-updater.log
-    if (cd client/src-tauri && cargo test --release --bin idletoken-client \
-            update::tests::feed_url_routing -- --exact) >"$log" 2>&1; then
-        if grep -qE '^test .*feed_url_routing \.\.\. ok' "$log"; then
-            ok "release profile: IDLETOKEN_UPDATE_URL/PUBKEY are ignored and the compiled-in key stays the only trust root"
-        else
-            # A suite that ran zero tests exits 0 and looks exactly like a pass.
-            bad "the release-profile updater test reported success without running feed_url_routing (see $log)"
-        fi
-    else
-        bad "the release-profile updater override assertion FAILED (see $log) — a shipped build may honour IDLETOKEN_UPDATE_URL"
-    fi
+    bad "could not build the R4 control (no $CONF) — the no-self-install check is unproven"
+fi
+rm -rf "$ctl"
+
+r4=$(updater_traces "$ROOT")
+if [ -n "$r4" ]; then
+    while IFS= read -r line; do [ -n "$line" ] && bad "self-installing update path returned: $line"; done <<EOF
+$r4
+EOF
+else
+    ok "no updater plugin, dependency, module, capability or frontend call — the client installs nothing by itself"
 fi
 
 # ===========================================================================
@@ -400,16 +509,19 @@ import json, os, re, sys
 root = sys.argv[1]
 ch = json.load(open(os.path.join(root, "scripts/release-channels.json")))
 problems = []
-src = open(os.path.join(root, "client/src-tauri/src/update.rs")).read()
-for name, key in (("STABLE_FEED", "stable"), ("BETA_FEED", "beta")):
-    m = re.search(rf'{name}: &str = "([^"]+)"', src)
-    if not m:
-        problems.append(f"update.rs no longer defines {name}")
-    elif m.group(1) != ch["updateFeeds"][key]:
-        problems.append(f"{key} feed drift: client uses {m.group(1)}, release-channels.json publishes {ch['updateFeeds'][key]}")
+# The download page is where we send every user for every upgrade now that
+# nothing is pushed to them. A published URL outside our own origins is the
+# same failure as the old feed drift, with a bigger blast radius: it is the
+# one address a user is told to trust without checking anything else.
+dl = (ch.get("downloads") or {}).get("stable")
+prefix = (ch.get("officialOrigins") or {}).get("releasePagePrefix")
+if not dl:
+    problems.append("release-channels.json publishes no downloads.stable — users are told to update but not from where")
+elif not prefix or not dl.startswith(prefix):
+    problems.append(f"downloads.stable {dl} is not under the published official release origin {prefix}")
+if ch.get("updateFeeds"):
+    problems.append("release-channels.json still publishes updateFeeds — the in-app updater was removed on 2026-09-02 and a live feed URL invites someone to serve it")
 conf = json.load(open(os.path.join(root, "client/src-tauri/tauri.conf.json")))
-if ch["updateFeeds"]["stable"] not in conf["plugins"]["updater"]["endpoints"]:
-    problems.append("tauri.conf.json updater endpoints do not include the published stable feed")
 versions = {"tauri.conf.json": conf["version"],
             "package.json": json.load(open(os.path.join(root, "client/package.json")))["version"]}
 m = re.search(r'^version = "([^"]+)"', open(os.path.join(root, "client/src-tauri/Cargo.toml")).read(), re.M)
@@ -451,18 +563,17 @@ PY
     cp "$CHANNELS" "$ctl/scripts/" && cp "$CONF" "$ctl/client/src-tauri/" \
         && cp "$ROOT/client/src-tauri/Cargo.toml" "$ctl/client/src-tauri/" \
         && cp "$ROOT/client/package.json" "$ctl/client/" \
-        && cp "$ROOT/client/src/settings.ts" "$ctl/client/src/" \
-        && cp "$ROOT/client/src-tauri/src/update.rs" "$ctl/client/src-tauri/src/"
+        && cp "$ROOT/client/src/settings.ts" "$ctl/client/src/"
     python3 - "$ctl/scripts/release-channels.json" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
-d["updateFeeds"]["stable"] = "https://example.invalid/latest.json"
+d["downloads"]["stable"] = "https://idletoken-downloads.example.invalid/latest"
 json.dump(d, open(sys.argv[1], "w"))
 PY
     if [ -n "$(r6_problems "$ctl")" ]; then
-        ok "control: a published feed that disagrees with the client is detected"
+        ok "control: a download page outside the official origins is detected"
     else
-        bad "CONTROL: feed drift was not detected — this check does not compare anything"
+        bad "CONTROL: download-origin drift was not detected — this check does not compare anything"
     fi
     rm -rf "$ctl"
 
@@ -474,8 +585,7 @@ PY
     cp "$CHANNELS" "$ctl/scripts/" && cp "$CONF" "$ctl/client/src-tauri/" \
         && cp "$ROOT/client/src-tauri/Cargo.toml" "$ctl/client/src-tauri/" \
         && cp "$ROOT/client/package.json" "$ctl/client/" \
-        && cp "$ROOT/client/src/settings.ts" "$ctl/client/src/" \
-        && cp "$ROOT/client/src-tauri/src/update.rs" "$ctl/client/src-tauri/src/"
+        && cp "$ROOT/client/src/settings.ts" "$ctl/client/src/"
     python3 - "$ctl/client/src/settings.ts" <<'PY'
 import re, sys
 p = sys.argv[1]
@@ -499,7 +609,7 @@ PY
 $r6
 EOF
     else
-        ok "feeds, updater endpoints, the version and the support floor agree across the client, the config and the published channel record"
+        ok "the download origin, the version and the support floor agree across the client, the config and the published channel record"
     fi
 fi
 
@@ -743,4 +853,4 @@ if [ -n "$SKIPPED" ]; then
     echo "G_RELEASE_ID_SKIP: $SKIPPED"
     exit 0
 fi
-echo "G_RELEASE_ID_OK: trust-root pin, key custody, escape-hatch registry, release-profile updater inertness, signing-material scan, identity metadata, verifier + transparency controls, dependency review window, bundled support-floor policy"
+echo "G_RELEASE_ID_OK: published signing key, key custody, escape-hatch registry, no self-installing update path, signing-material scan, identity metadata, verifier + transparency controls, dependency review window, bundled support-floor policy"

@@ -406,14 +406,26 @@ int idletoken_model_from_gguf(const char *path, idletoken_auto_model *out,
      * Copied per field rather than by struct: only these four are the registry's
      * to supply. Everything else in `spec` describes THIS file and must keep
      * coming from its header — a registry row for the same id can name a
-     * different quantization with different layer sizes. */
+     * different quantization with different layer sizes.
+     *
+     * Each field is a KV-tier-indexed array since 2026-09-02, so the whole
+     * array is copied: which entry applies is decided later, by the precision
+     * this run launches with (idletoken_model_size_resolve). */
     {
         const idletoken_model_spec *reg = idletoken_model_get(out->id);
         if (reg) {
-            s->compute_bytes_256k_cuda  = reg->compute_bytes_256k_cuda;
-            s->compute_bytes_1m_cuda    = reg->compute_bytes_1m_cuda;
-            s->compute_bytes_256k_metal = reg->compute_bytes_256k_metal;
-            s->compute_bytes_1m_metal   = reg->compute_bytes_1m_metal;
+            memcpy(s->compute_bytes_128k_cuda,  reg->compute_bytes_128k_cuda,
+                   sizeof s->compute_bytes_128k_cuda);
+            memcpy(s->compute_bytes_256k_cuda,  reg->compute_bytes_256k_cuda,
+                   sizeof s->compute_bytes_256k_cuda);
+            memcpy(s->compute_bytes_1m_cuda,    reg->compute_bytes_1m_cuda,
+                   sizeof s->compute_bytes_1m_cuda);
+            memcpy(s->compute_bytes_128k_metal, reg->compute_bytes_128k_metal,
+                   sizeof s->compute_bytes_128k_metal);
+            memcpy(s->compute_bytes_256k_metal, reg->compute_bytes_256k_metal,
+                   sizeof s->compute_bytes_256k_metal);
+            memcpy(s->compute_bytes_1m_metal,   reg->compute_bytes_1m_metal,
+                   sizeof s->compute_bytes_1m_metal);
         }
     }
     return 0;

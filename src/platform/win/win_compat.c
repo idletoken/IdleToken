@@ -64,37 +64,40 @@ void idletoken_die_with_parent(void) {
      * risk beyond what the client's graceful-exit hook already covers. */
 }
 
-/* --- firewall: self-provision inbound allow rules -------------------------- *
+/* --- firewall: report what a hand-run needs, do not provision it ------------ *
  * Real-machine bring-up hit silently-filtered ports twice (UDP beacon 14097,
- * HC inter-stage 14322/14323) and needed manual netsh. Product behavior:
- * the engine provisions its own inbound rules on startup. Idempotent —
- * `show rule` exits 0 when the rule already exists. ADD requires elevation;
- * when we are not elevated the add fails and we print the exact command once
- * (the client installer, which runs elevated, can also pre-provision). */
+ * HC inter-stage 14322/14323), and the response was to have the engine add its
+ * own inbound rules at startup with `netsh advfirewall firewall add rule`.
+ *
+ * That was wrong twice over, and both were found on 2026-09-02:
+ *
+ *   It did not work. The client installs per user, so nothing here runs
+ *   elevated, so the ADD always failed. The rules on the test machines were
+ *   put there by hand during bring-up, and the code has been quietly failing
+ *   past them ever since.
+ *
+ *   It cost us something real. An unsigned binary that spawns cmd.exe to
+ *   modify the firewall is MITRE T1562.004, and Defender flagged the
+ *   coordinator as Behavior:Win32/DefenseEvasion.A!ml. Note honestly: a probe
+ *   doing only this netsh call did NOT reproduce the detection, so this is not
+ *   proven to be the trigger. It is removed because it is a cost with no
+ *   benefit, not because it is a proven cause.
+ *
+ * Provisioning now happens in the installer (client/src-tauri/windows/
+ * installer-hooks.nsh), which is elevated, which is where firewall changes are
+ * unremarkable, and which can write PROGRAM rules that do not go stale when a
+ * port changes. What stays here is the diagnostic: a hand-run engine on a
+ * machine without the installed rules still gets told exactly what to run. */
 
 void idletoken_win_ensure_firewall_rule(const char *rule_name,
                                      const char *protocol, int port) {
-    if (getenv("IDLETOKEN_NO_FIREWALL_RULE")) return;
-    char cmd[512];
-    snprintf(cmd, sizeof cmd,
-             "netsh advfirewall firewall show rule name=\"%s\" >NUL 2>&1",
-             rule_name);
-    if (system(cmd) == 0) return;   /* already provisioned */
-    snprintf(cmd, sizeof cmd,
-             "netsh advfirewall firewall add rule name=\"%s\" dir=in "
-             "action=allow protocol=%s localport=%d profile=any >NUL 2>&1",
-             rule_name, protocol, port);
-    if (system(cmd) == 0) {
-        fprintf(stderr, "idletoken/win: firewall rule \"%s\" added (%s %d inbound)\n",
-                rule_name, protocol, port);
-    } else {
-        fprintf(stderr,
-                "idletoken/win: could not add firewall rule \"%s\" (not elevated?). "
-                "Run once as admin:\n"
-                "  netsh advfirewall firewall add rule name=\"%s\" dir=in "
-                "action=allow protocol=%s localport=%d profile=any\n",
-                rule_name, rule_name, protocol, port);
-    }
+    fprintf(stderr,
+            "idletoken/win: inbound %s %d must be reachable for \"%s\". The "
+            "installer provisions this; if you are running the engine by hand, "
+            "run once as admin:\n"
+            "  netsh advfirewall firewall add rule name=\"%s\" dir=in "
+            "action=allow protocol=%s localport=%d profile=private,domain\n",
+            protocol, port, rule_name, rule_name, protocol, port);
 }
 
 /* --- mmap family ---------------------------------------------------------- */

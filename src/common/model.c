@@ -343,10 +343,12 @@ static const idletoken_model_spec MODELS[] = {
          * weight fetcher) tried to RESOLVE the default name. The -0731 suffix
          * is the official release; the unsuffixed files are the superseded
          * preview and must not be resolved by default any more. */
-        .compute_bytes_256k_cuda = 585986212ull,
-        .compute_bytes_1m_cuda = 1800237220ull,
-        .compute_bytes_256k_metal = 804090020ull,
-        .compute_bytes_1m_metal = 2688643236ull,
+        .compute_bytes_128k_cuda = { 391999652ull, 453865636ull, 428699812ull },
+        .compute_bytes_256k_cuda = { 585986212ull, 698183844ull, 656240804ull },
+        .compute_bytes_1m_cuda = { 1800237220ull, 1744295690ull, 1676987597ull },
+        .compute_bytes_128k_metal = { 568128963ull, 569114624ull, 521289073ull },
+        .compute_bytes_256k_metal = { 804090020ull, 772989256ull, 736886784ull },
+        .compute_bytes_1m_metal = { 2688643236ull, 2699170939ull, 2564565238ull },
         .default_gguf = "UD-IQ1_S/DeepSeek-V4-Flash-UD-IQ1_S-00001-of-00003.gguf",
         .variants = DSV4_FLASH_VARIANTS,
         .n_variants = sizeof(DSV4_FLASH_VARIANTS) / sizeof(DSV4_FLASH_VARIANTS[0]),
@@ -382,10 +384,12 @@ static const idletoken_model_spec MODELS[] = {
         .dsv4_hca_bytes_per_cell = 31744,
         .dsv4_fixed_bytes_per_seq = 18710528,
         .overhead_base_bytes = 3221225472ull,
-        .compute_bytes_256k_cuda = 719679652ull,
-        .compute_bytes_1m_cuda = 1948610724ull,
-        .compute_bytes_256k_metal = 1131245732ull,
-        .compute_bytes_1m_metal = 2948165796ull,
+        .compute_bytes_128k_cuda = { 617181348ull, 713650340ull, 713650340ull },
+        .compute_bytes_256k_cuda = { 719679652ull, 871723172ull, 871723172ull },
+        .compute_bytes_1m_cuda = { 1948610724ull, 1959778058ull, 1816752292ull },
+        .compute_bytes_128k_metal = { 995161539ull, 911359345ull, 911327887ull },
+        .compute_bytes_256k_metal = { 1131245732ull, 1113535283ull, 1054783570ull },
+        .compute_bytes_1m_metal = { 2948165796ull, 2888260649ull, 2673050911ull },
         .default_gguf = "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00001-of-00037.gguf",
         .variants = DSV4_PRO_VARIANTS,
         .n_variants = sizeof(DSV4_PRO_VARIANTS) / sizeof(DSV4_PRO_VARIANTS[0]),
@@ -430,10 +434,12 @@ static const idletoken_model_spec MODELS[] = {
          *       because a manifest that understates is the failure mode this
          *       whole change exists to remove.
          * results/memory-need-measured-20260901.md */
-        .compute_bytes_256k_cuda = 512753664ull,
-        .compute_bytes_1m_cuda = 1115852636ull,
-        .compute_bytes_256k_metal = 512753664ull,
-        .compute_bytes_1m_metal = 1115915551ull,
+        .compute_bytes_128k_cuda = { 512753664ull, 512753664ull, 512753664ull },
+        .compute_bytes_256k_cuda = { 512753664ull, 830765793ull, 830765793ull },
+        .compute_bytes_1m_cuda = { 1115852636ull, 3246684897ull, 3246684897ull },
+        .compute_bytes_128k_metal = { 512753664ull, 647264993ull, 647264993ull },
+        .compute_bytes_256k_metal = { 512753664ull, 781482721ull, 781482721ull },
+        .compute_bytes_1m_metal = { 1115915551ull, 1116198666ull, 1116198666ull },
         .default_gguf = "Qwen3.5-0.8B-UD-IQ2_XXS.gguf",
         .variants = QWEN35_08B_VARIANTS,
         .n_variants = sizeof(QWEN35_08B_VARIANTS) / sizeof(QWEN35_08B_VARIANTS[0]),
@@ -470,10 +476,12 @@ static const idletoken_model_spec MODELS[] = {
         .state_bytes_per_layer = 2195456,
         .full_attn_interval = 4,
         .overhead_base_bytes = (uint64_t)(1.2 * (double)GiB),
-        .compute_bytes_256k_cuda = 519045120ull,
-        .compute_bytes_1m_cuda = 1140871660ull,
-        .compute_bytes_256k_metal = 519045120ull,
-        .compute_bytes_1m_metal = 1157743247ull,
+        .compute_bytes_128k_cuda = { 519045120ull, 723811041ull, 723811041ull },
+        .compute_bytes_256k_cuda = { 519045120ull, 1394899681ull, 1394899681ull },
+        .compute_bytes_1m_cuda = { 1140871660ull, 5421431521ull, 5421431521ull },
+        .compute_bytes_128k_metal = { 519045120ull, 653556449ull, 653556449ull },
+        .compute_bytes_256k_metal = { 519045120ull, 787774177ull, 787774177ull },
+        .compute_bytes_1m_metal = { 1157743247ull, 1149239296ull, 1148977152ull },
         .default_gguf = "Qwen3.5-4B-UD-IQ2_XXS.gguf",
         .variants = QWEN35_4B_VARIANTS,
         .n_variants = sizeof(QWEN35_4B_VARIANTS) / sizeof(QWEN35_4B_VARIANTS[0]),
@@ -505,10 +513,12 @@ static const idletoken_model_spec MODELS[] = {
         .state_bytes_per_layer = 2195456,
         .full_attn_interval = 4,
         .overhead_base_bytes = (uint64_t)(1.5 * (double)GiB),
-        .compute_bytes_256k_cuda = 525336576ull,
-        .compute_bytes_1m_cuda = 1166037484ull,
-        .compute_bytes_256k_metal = 525336576ull,
-        .compute_bytes_1m_metal = 1174520463ull,
+        .compute_bytes_128k_cuda = { 525336576ull, 730102497ull, 730102497ull },
+        .compute_bytes_256k_cuda = { 525336576ull, 1401191137ull, 1401191137ull },
+        .compute_bytes_1m_cuda = { 1166037484ull, 5427722977ull, 5427722977ull },
+        .compute_bytes_128k_metal = { 525336576ull, 525336576ull, 525336576ull },
+        .compute_bytes_256k_metal = { 525336576ull, 525336576ull, 525336576ull },
+        .compute_bytes_1m_metal = { 1174520463ull, 1174803579ull, 1174803579ull },
         .default_gguf = "Qwen3.5-9B-UD-IQ2_XXS.gguf",
         .variants = QWEN35_9B_VARIANTS,
         .n_variants = sizeof(QWEN35_9B_VARIANTS) / sizeof(QWEN35_9B_VARIANTS[0]),
@@ -542,10 +552,12 @@ static const idletoken_model_spec MODELS[] = {
         .state_bytes_per_layer = 3268608,   /* 48×128×128×4 + conv 3×10240×4 */
         .full_attn_interval = 4,
         .overhead_base_bytes = (uint64_t)(2.0 * (double)GiB),
-        .compute_bytes_256k_cuda = 529530880ull,
-        .compute_bytes_1m_cuda = 1201689068ull,
-        .compute_bytes_256k_metal = 797987308ull,
-        .compute_bytes_1m_metal = 1224873083ull,
+        .compute_bytes_128k_cuda = { 646971392ull, 755268321ull, 755268321ull },
+        .compute_bytes_256k_cuda = { 529530880ull, 1426356961ull, 1426356961ull },
+        .compute_bytes_1m_cuda = { 1201689068ull, 5452888801ull, 5452888801ull },
+        .compute_bytes_128k_metal = { 663769580ull, 664042209ull, 664042209ull },
+        .compute_bytes_256k_metal = { 797987308ull, 798259937ull, 798259937ull },
+        .compute_bytes_1m_metal = { 1224873083ull, 1212447457ull, 1212447457ull },
         .default_gguf = "Qwen3.5-27B-UD-IQ2_XXS.gguf",
         .variants = QWEN35_27B_VARIANTS,
         .n_variants = sizeof(QWEN35_27B_VARIANTS) / sizeof(QWEN35_27B_VARIANTS[0]),
@@ -589,10 +601,12 @@ static const idletoken_model_spec MODELS[] = {
         .state_bytes_per_layer = 3268608,   /* 48x128x128x4 + conv 3x10240x4 */
         .full_attn_interval = 4,
         .overhead_base_bytes = (uint64_t)(2.0 * (double)GiB),
-        .compute_bytes_256k_cuda = 529530880ull,
-        .compute_bytes_1m_cuda = 1201689068ull,
-        .compute_bytes_256k_metal = 797987308ull,
-        .compute_bytes_1m_metal = 1224873083ull,
+        .compute_bytes_128k_cuda = { 646971392ull, 755268321ull, 755268321ull },
+        .compute_bytes_256k_cuda = { 529530880ull, 1426356961ull, 1426356961ull },
+        .compute_bytes_1m_cuda = { 1201689068ull, 5452888801ull, 5452888801ull },
+        .compute_bytes_128k_metal = { 663769580ull, 664042209ull, 664042209ull },
+        .compute_bytes_256k_metal = { 797987308ull, 798259937ull, 798259937ull },
+        .compute_bytes_1m_metal = { 1224873083ull, 1212447457ull, 1212447457ull },
         .default_gguf = "Qwen3.8-27B-UD-IQ1_S.gguf",
         .variants = QWEN38_27B_VARIANTS,
         .n_variants = sizeof(QWEN38_27B_VARIANTS) / sizeof(QWEN38_27B_VARIANTS[0]),
@@ -628,10 +642,12 @@ static const idletoken_model_spec MODELS[] = {
         .state_bytes_per_layer = 2195456,   /* 32×128×128×4 + conv 3×8192×4 */
         .full_attn_interval = 4,
         .overhead_base_bytes = (uint64_t)(1.5 * (double)GiB),
-        .compute_bytes_256k_cuda = 516947968ull,
-        .compute_bytes_1m_cuda = 1145065964ull,
-        .compute_bytes_256k_metal = 516947968ull,
-        .compute_bytes_1m_metal = 1146135511ull,
+        .compute_bytes_128k_cuda = { 516947968ull, 516947968ull, 516947968ull },
+        .compute_bytes_256k_cuda = { 516947968ull, 860125921ull, 860125921ull },
+        .compute_bytes_1m_cuda = { 1145065964ull, 3276045025ull, 3276045025ull },
+        .compute_bytes_128k_metal = { 516947968ull, 516947968ull, 516947968ull },
+        .compute_bytes_256k_metal = { 516947968ull, 516947968ull, 516947968ull },
+        .compute_bytes_1m_metal = { 1146135511ull, 1146408141ull, 1146408141ull },
         .default_gguf = "Qwen3.5-35B-A3B-UD-IQ2_XXS.gguf",
         .variants = QWEN35_35B_A3B_VARIANTS,
         .n_variants = sizeof(QWEN35_35B_A3B_VARIANTS) / sizeof(QWEN35_35B_A3B_VARIANTS[0]),
@@ -657,10 +673,12 @@ static const idletoken_model_spec MODELS[] = {
         .kv_kind  = IDLETOKEN_KV_GQA,
         .kv_bytes_per_token_layer = 4096,
         .overhead_base_bytes = (uint64_t)(1.5 * (double)GiB), /* n_embd 4096 + CUDA */
-        .compute_bytes_256k_cuda = 319553536ull,
-        .compute_bytes_1m_cuda = 0ull,
-        .compute_bytes_256k_metal = 327942144ull,
-        .compute_bytes_1m_metal = 0ull,
+        .compute_bytes_128k_cuda = { 319553536ull, 704737444ull, 704737444ull },
+        .compute_bytes_256k_cuda = { 319553536ull, 872509604ull, 872509604ull },
+        .compute_bytes_1m_cuda = { 0ull, 0ull, 0ull },
+        .compute_bytes_128k_metal = { 327942144ull, 319553536ull, 319553536ull },
+        .compute_bytes_256k_metal = { 327942144ull, 319553536ull, 319553536ull },
+        .compute_bytes_1m_metal = { 0ull, 0ull, 0ull },
         .default_gguf = "Qwen3-8B-Q4_K_M.gguf",
         .variants = QWEN3_8B_VARIANTS,
         .n_variants = sizeof(QWEN3_8B_VARIANTS) / sizeof(QWEN3_8B_VARIANTS[0]),
@@ -690,10 +708,12 @@ static const idletoken_model_spec MODELS[] = {
         .kv_kind  = IDLETOKEN_KV_MLA,
         .kv_bytes_per_token_layer = 1152,
         .overhead_base_bytes = 3ull * GiB,  /* activations at n_embd 6144 + CUDA */
-        .compute_bytes_256k_cuda = 1614880440ull,
-        .compute_bytes_1m_cuda = 4836105912ull,
-        .compute_bytes_256k_metal = 35706707640ull,
-        .compute_bytes_1m_metal = 141201841848ull,
+        .compute_bytes_128k_cuda = { 1078009528ull, 1296113336ull, 1296113336ull },
+        .compute_bytes_256k_cuda = { 1614880440ull, 1983979192ull, 1983979192ull },
+        .compute_bytes_1m_cuda = { 4836105912ull, 6111174328ull, 6111174328ull },
+        .compute_bytes_128k_metal = { 18325511864ull, 18325511864ull, 18325511864ull },
+        .compute_bytes_256k_metal = { 35706707640ull, 35706707640ull, 35706707640ull },
+        .compute_bytes_1m_metal = { 141201841848ull, 141201841848ull, 141201841848ull },
         .default_gguf = "UD-IQ1_S/GLM-5.2-UD-IQ1_S-00001-of-00006.gguf",
         .variants = GLM52_VARIANTS,
         .n_variants = sizeof(GLM52_VARIANTS) / sizeof(GLM52_VARIANTS[0]),
@@ -723,10 +743,12 @@ static const idletoken_model_spec MODELS[] = {
         .kv_kind  = IDLETOKEN_KV_MLA,
         .kv_bytes_per_token_layer = 1152,
         .overhead_base_bytes = 3ull * GiB,
-        .compute_bytes_256k_cuda = 532687094ull,
-        .compute_bytes_1m_cuda = 1337993462ull,
-        .compute_bytes_256k_metal = 679435305ull,
-        .compute_bytes_1m_metal = 1485528105ull,
+        .compute_bytes_128k_cuda = { 398469366ull, 564144374ull, 564144374ull },
+        .compute_bytes_256k_cuda = { 532687094ull, 849357046ull, 849357046ull },
+        .compute_bytes_1m_cuda = { 1337993462ull, 2560633078ull, 2560633078ull },
+        .compute_bytes_128k_metal = { 545091748ull, 545018348ull, 544976404ull },
+        .compute_bytes_256k_metal = { 679435305ull, 679372390ull, 679330447ull },
+        .compute_bytes_1m_metal = { 1485528105ull, 1485465190ull, 1485423247ull },
         .default_gguf = "moonshotai_Kimi-K2.5-IQ1_S/moonshotai_Kimi-K2.5-IQ1_S-00001-of-00006.gguf",
         .variants = KIMI_K25_VARIANTS,
         .n_variants = sizeof(KIMI_K25_VARIANTS) / sizeof(KIMI_K25_VARIANTS[0]),
@@ -804,6 +826,40 @@ void idletoken_model_weight_bytes(const idletoken_model_spec *m, const char *qua
     const idletoken_model_variant *v = idletoken_model_variant_get(m, quant);
     if (layer_out)  *layer_out  = v ? v->layer_weight_bytes  : m->layer_weight_bytes;
     if (shared_out) *shared_out = v ? v->shared_weight_bytes : m->shared_weight_bytes;
+}
+
+/* Leaf name of a path, tolerating either separator (Windows nodes pass
+ * backslashes; the variant table is written with forward ones). */
+static const char *gguf_leaf(const char *path) {
+    const char *base = path;
+    for (const char *p = path; *p; p++)
+        if (*p == '/' || *p == '\\') base = p + 1;
+    return base;
+}
+
+const char *idletoken_model_quant_from_gguf(const idletoken_model_spec *m,
+                                            const char *gguf) {
+    if (!m || !gguf || !gguf[0]) return "";
+    /* An AUTO-GENERATED manifest (model_auto.c, the `--llama-gguf` path the
+     * client actually launches) carries no variant table at all: it describes
+     * the one file it read a header from, not the family. Borrow the table
+     * from the registry row of the same id — the merge in model_auto.c already
+     * treats that row as describing the same model, and without this the
+     * precision of every client-launched coordinator resolves to "" and gets
+     * published as "any precision", which is the most permissive declaration
+     * there is rather than the honest one (measured 2026-09-03, both Windows
+     * nodes: results/agent-stale-registration-20260903.md). */
+    const idletoken_model_spec *table = m;
+    if (table->n_variants == 0 && m->id && m->id[0]) {
+        const idletoken_model_spec *reg = idletoken_model_get(m->id);
+        if (reg && reg->n_variants) table = reg;
+    }
+    if (table->n_variants == 0) return "";
+    const char *base = gguf_leaf(gguf);
+    for (uint8_t i = 0; i < table->n_variants; i++)
+        if (!strcmp(gguf_leaf(table->variants[i].gguf), base))
+            return table->variants[i].quant;
+    return "";
 }
 
 uint64_t idletoken_model_overhead(const idletoken_model_spec *m, uint32_t ctx_size,

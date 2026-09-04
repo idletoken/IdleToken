@@ -30,14 +30,10 @@
 # reads a stale file and answers yes to anything you ever built. The remote
 # dist is therefore DELETED, not overwritten.
 #
-# DEBUG MODE (--debug, added 2026-08-13). The product gates that drive the
-# client (G-UPDATE, G-TRAY) need a **debug** shell on the Windows box, for one
-# concrete reason: the updater plugin refuses a plain-http update endpoint in
-# release builds, and those gates serve their signed test feed from the control
-# machine over http. That refusal is a feature — it is exactly what stops a
-# shipped build from being pointed at an unencrypted feed — so the gates use a
-# debug binary rather than weakening it. --debug also ships the NON-release web
-# assets (a release dist points at the production platform address).
+# DEBUG MODE (--debug, added 2026-08-13). Product gates that drive the client
+# need a debug shell with the non-release web assets and test hooks. A release
+# dist points at the production platform address and deliberately omits those
+# hooks, so --debug keeps the two purposes separate.
 #
 # Usage:  scripts/build_client_win.sh [--debug] [<ssh-alias>]
 #         Default node: IDLETOKEN_WIN_BUILD_NODE from scripts/testbed.env.
@@ -131,8 +127,19 @@ done
 # in the directory. That is the "gate certifies the wrong artifact" shape
 # stage_sidecars.sh exists to prevent, except here it reaches a shipped .exe.
 stage_win() {   # stage_win <src-exe> <sidecar-name>
-    $SSH "$NODE" "copy /Y \"$1\" \"$BIN\\$2-$TRIPLE.exe\"" >/dev/null 2>&1 \
-        || fail "could not stage $2 from $1 on $NODE — build it there first"
+    # cargo-tauri can itself be an MSVC binary even when `cargo +...-gnu`
+    # builds the application with the GNU toolchain. In that configuration its
+    # bundler selects the *MSVC-named* externalBin while Cargo's output lands in
+    # the GNU target directory. Staging only rustc's reported host therefore
+    # made a freshly versioned installer silently carry yesterday's sidecars.
+    # Keep both x64 names byte-identical; the bundler may select either one.
+    local sidecar_triple staged=""
+    for sidecar_triple in "$TRIPLE" x86_64-pc-windows-gnu x86_64-pc-windows-msvc; do
+        case " $staged " in *" $sidecar_triple "*) continue ;; esac
+        $SSH "$NODE" "copy /Y \"$1\" \"$BIN\\$2-$sidecar_triple.exe\"" >/dev/null 2>&1 \
+            || fail "could not stage $2 from $1 on $NODE — build it there first"
+        staged="$staged $sidecar_triple"
+    done
 }
 stage_win "$WIN\\idletoken-worker.exe"         idletoken-worker
 stage_win "$WIN\\idletoken-coord.exe"          idletoken-coord
@@ -142,6 +149,19 @@ stage_win "$WIN\\idletoken-platform-agent.exe" idletoken-platform-agent
 # is ours (MIT attribution stays in About + NOTICE).
 stage_win "$LLAMA_DIR\\llama-server.exe"       idletoken-server
 stage_win "$LLAMA_DIR\\ggml-rpc-server.exe"    idletoken-rpc-server
+
+# Prove the two names the Tauri bundler may select are the same bytes. Merely
+# printing their timestamps did not catch the 0.1.41-rc1 failure: the new GNU
+# file and stale MSVC file happened to have the same size, and the installer
+# silently selected the latter.
+for sidecar in idletoken-worker idletoken-coord idletoken-platform-agent \
+               idletoken-server idletoken-rpc-server; do
+    h_gnu=$($SSH "$NODE" "powershell -NoProfile -Command \"(Get-FileHash '$BIN\\$sidecar-x86_64-pc-windows-gnu.exe' -Algorithm SHA256).Hash.ToLowerInvariant()\"" 2>/dev/null | tr -d '\r ')
+    h_msvc=$($SSH "$NODE" "powershell -NoProfile -Command \"(Get-FileHash '$BIN\\$sidecar-x86_64-pc-windows-msvc.exe' -Algorithm SHA256).Hash.ToLowerInvariant()\"" 2>/dev/null | tr -d '\r ')
+    [ -n "$h_gnu" ] && [ "$h_gnu" = "$h_msvc" ] \
+        || fail "$sidecar GNU/MSVC externalBin candidates differ on $NODE"
+done
+echo "   externalBin GNU/MSVC candidates are byte-identical"
 # Pre-rename leftovers: not in externalBin, so they never ship, but they sit
 # next to the real ones and read as current.
 $SSH "$NODE" "del /q \"$BIN\\ggml-rpc-server-$TRIPLE.exe\" \"$BIN\\llama-server-$TRIPLE.exe\" 2>NUL" >/dev/null 2>&1
@@ -162,7 +182,7 @@ for engine in idletoken-server idletoken-rpc-server; do
 done
 $SSH "$NODE" "del /q \"$RUNTIME\\ds4cuda.dll\" \"$RUNTIME\\ds4xcuda.dll\" 2>NUL" >/dev/null 2>&1
 CUDA_RUNTIME_DIR=
-for d in '%IDLETOKEN_CUDA_RUNTIME_DIR%' '%CUDA_PATH%\bin' '%LOCALAPPDATA%\IdleToken'; do
+for d in '%IDLETOKEN_CUDA_RUNTIME_DIR%' '%CUDA_PATH%\bin' '%ProgramFiles%\IdleToken' '%LOCALAPPDATA%\IdleToken'; do
     if $SSH "$NODE" "if exist \"$d\\cudart64_12.dll\" (exit 0) else (exit 1)" >/dev/null 2>&1; then
         CUDA_RUNTIME_DIR=$d
         break
@@ -227,51 +247,40 @@ if [ "$MODE" = debug ]; then
 fi
 
 echo "== [4/4] cargo tauri build (nsis) =="
-# ⚠ KNOWN-BROKEN SIGNING PATH (2026-08-20). The inline-signing below wedges
-# forever at Tauri's password prompt: cmd cannot represent an empty-valued
-# environment variable (`set "X="` DELETES it), so the updater key's
-# intentionally-empty password never reaches Tauri and it prompts — over a
-# non-tty ssh that is an infinite hang, and no stdin trick reliably feeds it
-# (the password reader flushes pending input). Use the DEFERRED-SIGNING flow
-# instead: `IDLETOKEN_DEFER_UPDATER_SIGNING=1 scripts\build_client_release.bat`
-# on the node, then sign the updater zip on the control machine and push the
-# sig back — acceptance.sh's g_release() is the reference implementation and
-# the certified path. This inline path is kept only for keys that carry a
-# real, non-empty password.
-# THE SIGNING KEY.
+# NO UPDATER ARTIFACT, NO SIGNING KEY (2026-09-02, user ruling).
 #
-# `createUpdaterArtifacts` is on in tauri.conf.json, so this build also produces
-# the update artifact and its minisign signature — and `tauri build` refuses to
-# run without a private key. That refusal is wanted: the in-app updater only
-# installs artifacts whose signature verifies against the pubkey compiled into
-# the client, so an unsigned release ships a dead update channel, and the build
-# is the last place that can notice.
+# `createUpdaterArtifacts` is false in tauri.conf.json: the product does not ship
+# an in-app update channel. Updating means downloading the current installer, the
+# same way the first install happened. So this build produces only the .exe —
+# no ~589 MB .nsis.zip, no minisign signature, and `tauri build` no longer needs
+# the private key, which is why nothing here reads one.
 #
-# This is NOT a paid code-signing certificate (Authenticode). It is a locally
-# generated keypair, free, no CA involved. The only real cost is custody: LOSE
-# THE PRIVATE KEY AND ALREADY-INSTALLED CLIENTS CAN NEVER BE UPDATED AGAIN —
-# they trust that one pubkey, so a new key means every user reinstalls by hand.
-#
-# The key is read HERE and passed to the build over ssh. It lives outside the
-# repository (default ~/.idletoken/updater.key) and is never written to the
-# build machine's disk by this script.
-KEY_PATH="${TAURI_SIGNING_PRIVATE_KEY_PATH:-$HOME/.idletoken/updater.key}"
-KEY_MATERIAL="${TAURI_SIGNING_PRIVATE_KEY:-}"
-if [ -z "$KEY_MATERIAL" ]; then
-    [ -f "$KEY_PATH" ] || fail "no updater signing key at $KEY_PATH — restore your backup, or (first time only) generate one: cd client && pnpm tauri signer generate -w ~/.idletoken/updater.key   [free, no certificate authority involved]"
-    KEY_MATERIAL=$(cat "$KEY_PATH")
-fi
-KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}"
-SIGN_ENV="set \"TAURI_SIGNING_PRIVATE_KEY=$KEY_MATERIAL\" && set \"TAURI_SIGNING_PRIVATE_KEY_PASSWORD=$KEY_PASSWORD\" && "
+# What went away with it: the deferred-signing dance this script used to warn
+# about (cmd cannot represent an empty-valued environment variable, so an
+# empty-password key made Tauri prompt and hang forever over non-tty ssh).
 
 # The override lives on the machine only for the duration of the build.
 printf '{"build":{"beforeBuildCommand":""}}' > /tmp/idletoken-nobuild.json
 scp -q /tmp/idletoken-nobuild.json "$NODE:$WHOME/client/src-tauri/nobuild.conf.json" || fail "could not ship the config override"
-out=$($SSH "$NODE" "cd /d $WIN\\client && ${SIGN_ENV}cargo $RUST_TOOLCHAIN tauri build --bundles nsis --config src-tauri\\nobuild.conf.json" 2>&1 | tr -d '\r')
+VERSION=$(node -p "require('./client/package.json').version")
+SETUP="$WHOME/client/src-tauri/target/release/bundle/nsis/IdleToken_${VERSION}_x64-setup.exe"
+# A failed build must not be certified by the same-version package left by an
+# earlier attempt. This happened when SSH disconnected after makensis: the old
+# code ignored cargo's exit status, found the existing file, and printed OK.
+$SSH "$NODE" "del /q \"${SETUP//\//\\}\" 2>NUL" >/dev/null 2>&1
+if out=$($SSH "$NODE" "cd /d $WIN\\client && cargo $RUST_TOOLCHAIN tauri build --bundles nsis --config src-tauri\\nobuild.conf.json" 2>&1 | tr -d '\r'); then
+    build_rc=0
+else
+    build_rc=$?
+fi
 echo "$out" | tail -4 | sed 's/^/   /'
 $SSH "$NODE" "del /q \"$WIN\\client\\src-tauri\\nobuild.conf.json\"" >/dev/null 2>&1
+[ "$build_rc" -eq 0 ] || fail "cargo tauri build failed on $NODE (exit $build_rc; see the tail above)"
+case "$out" in
+    *"Finished 1 bundle at:"*) ;;
+    *) fail "cargo tauri build did not report a finished NSIS bundle on $NODE" ;;
+esac
 
-SETUP=$($SSH "$NODE" "powershell -NoProfile -Command \"Get-ChildItem '$WHOME/client/src-tauri/target/release/bundle/nsis' -Filter '*-setup.exe' | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName\"" 2>/dev/null | tr -d '\r' | tail -1)
 size=$($SSH "$NODE" "for %I in (\"${SETUP//\//\\}\") do @echo %~zI" 2>/dev/null | tr -d '\r' | tail -1)
 case "$size" in ''|*[!0-9]*) fail "no installer produced (see the tail above)" ;; esac
 

@@ -1,6 +1,6 @@
 @echo off
-REM Build the installable Windows client (NSIS .exe setup + MSI when WiX is
-REM present). Run on the Windows build node (win-a) from the repo root:
+REM Build the installable Windows client (NSIS .exe setup). Run on the Windows
+REM build node from the repo root:
 REM     scripts\build_client_release.bat
 REM
 REM Two things this does that a plain `tauri build` does not:
@@ -14,10 +14,12 @@ REM The build node has no node/pnpm, so the frontend must already be built into
 REM client\dist (sync it from a machine that has node). beforeBuildCommand is
 REM therefore overridden to nothing.
 REM
-REM Contract: prints CLIENT_RELEASE_OK, CLIENT_RELEASE_DEFERRED_SIGNING, or
-REM CLIENT_RELEASE_FAIL: <reason>. Set IDLETOKEN_DEFER_UPDATER_SIGNING=1 when
-REM the trusted updater key lives on another machine: this builds the NSIS
-REM installer and its updater zip without asking Tauri to sign it.
+REM Contract: prints CLIENT_RELEASE_OK or CLIENT_RELEASE_FAIL: <reason>.
+REM
+REM There is no updater artifact and no signing since 2026-09-02 (user ruling):
+REM the product has no in-app updater, so a release is the installer alone.
+REM IDLETOKEN_DEFER_UPDATER_SIGNING and the deferred-signing dance it named are
+REM gone with it.
 setlocal enabledelayedexpansion
 cd /d "%~dp0.."
 set ROOT=%CD%
@@ -217,6 +219,10 @@ copy /y "%WEBVIEW2_LOADER%" "%ROOT%\client\src-tauri\runtime\windows\WebView2Loa
 
 set "CUDA_RUNTIME_DIR=%IDLETOKEN_CUDA_RUNTIME_DIR%"
 if not defined CUDA_RUNTIME_DIR if defined CUDA_PATH set "CUDA_RUNTIME_DIR=%CUDA_PATH%\bin"
+REM Last resort: borrow the DLLs from an installed IdleToken. Program Files is
+REM where the installer has put them since 2026-09-02; %LOCALAPPDATA% is where
+REM a pre-migration install still has them.
+if not defined CUDA_RUNTIME_DIR if exist "%ProgramFiles%\IdleToken\cudart64_12.dll" set "CUDA_RUNTIME_DIR=%ProgramFiles%\IdleToken"
 if not defined CUDA_RUNTIME_DIR if exist "%LOCALAPPDATA%\IdleToken\cudart64_12.dll" set "CUDA_RUNTIME_DIR=%LOCALAPPDATA%\IdleToken"
 for %%D in (cudart64_12.dll cublas64_12.dll cublasLt64_12.dll) do (
     if not exist "%CUDA_RUNTIME_DIR%\%%D" (
@@ -276,52 +282,16 @@ REM should not be signed and shipped.
 if not defined TAURI_BUNDLER_TOOLS_GITHUB_MIRROR set "TAURI_BUNDLER_TOOLS_GITHUB_MIRROR=https://github.com"
 set "BUNDLE=%ROOT%\client\src-tauri\target\release\bundle\nsis"
 cd /d "%ROOT%\client"
-if "%IDLETOKEN_DEFER_UPDATER_SIGNING%"=="1" (
-    cargo %RUST_TOOLCHAIN% tauri build --bundles nsis --config "{\"build\":{\"beforeBuildCommand\":\"\"},\"bundle\":{\"createUpdaterArtifacts\":false}}"
-) else (
-    cargo %RUST_TOOLCHAIN% tauri build --bundles nsis --config "{\"build\":{\"beforeBuildCommand\":\"\"}}"
-)
+cargo %RUST_TOOLCHAIN% tauri build --bundles nsis --config "{\"build\":{\"beforeBuildCommand\":\"\"}}"
 if errorlevel 1 (
     echo CLIENT_RELEASE_FAIL: tauri build failed
     exit /b 1
 )
 
-if "%IDLETOKEN_DEFER_UPDATER_SIGNING%"=="1" (
-    REM Tauri's updater artifact for NSIS is the installer in a .nsis.zip.
-    REM It will be signed on the trusted control machine and the detached .sig
-    REM copied back next to it; the private key never reaches this build node.
-    if exist "%BUNDLE%\*.nsis.zip" del /q "%BUNDLE%\*.nsis.zip"
-    if exist "%BUNDLE%\*.nsis.zip.sig" del /q "%BUNDLE%\*.nsis.zip.sig"
-    powershell -NoProfile -Command ^
-      "$i = Get-ChildItem '%BUNDLE%' -Filter *.exe | Sort-Object LastWriteTime -Descending | Select-Object -First 1; if (-not $i) { exit 2 }; $z = Join-Path $i.DirectoryName ($i.BaseName + '.nsis.zip'); Compress-Archive -LiteralPath $i.FullName -DestinationPath $z -Force"
-    if errorlevel 1 (
-        echo CLIENT_RELEASE_FAIL: could not create the deferred updater archive
-        exit /b 1
-    )
-)
-
 echo --- artifacts ---
 dir /b /s "%ROOT%\client\src-tauri\target\release\bundle\*.exe" 2>nul
 
-REM --- checksums ---------------------------------------------------------
-REM We ship UNSIGNED (product decision 2026-08-04: no code-signing certificate
-REM yet), so Windows greets every user with a SmartScreen block. The only thing
-REM a user can actually verify in that situation is the file hash — so it has to
-REM exist, and it has to be produced by the build, not by hand at upload time.
-REM Signing proves WHO shipped it; a checksum proves the file was not swapped.
-REM Publish SHA256SUMS.txt next to the installer on the release page, and see
-REM docs/user-guide.md §2.1 for the Get-FileHash line users are told to run.
-powershell -NoProfile -Command ^
-  "Get-ChildItem '%BUNDLE%' | Where-Object { $_.Extension -eq '.exe' -or $_.Name.EndsWith('.nsis.zip') } | ForEach-Object { ($_ | Get-FileHash -Algorithm SHA256).Hash.ToLower() + '  ' + $_.Name } | Set-Content -Encoding ascii '%BUNDLE%\SHA256SUMS.txt'"
-if exist "%BUNDLE%\SHA256SUMS.txt" (
-    echo --- sha256 ---
-    type "%BUNDLE%\SHA256SUMS.txt"
-) else (
-    echo CLIENT_RELEASE_FAIL: could not write SHA256SUMS.txt
-    exit /b 1
-)
-if "%IDLETOKEN_DEFER_UPDATER_SIGNING%"=="1" (
-    echo CLIENT_RELEASE_DEFERRED_SIGNING
-) else (
-    echo CLIENT_RELEASE_OK
-)
+REM GitHub computes and displays the asset digest. Do not emit a detached
+REM checksum, signature, updater archive or feed: the release contract is the
+REM native installer alone.
+echo CLIENT_RELEASE_OK

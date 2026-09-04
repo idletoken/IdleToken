@@ -42,9 +42,9 @@ REM         IDLETOKEN_CUDA_HOME         standalone toolkit root extracted from
 REM                                     NVIDIA's installer (optional). CMake's
 REM                                     cuda=<path> toolset keeps large build
 REM                                     dependencies off the system drive.
-REM         IDLETOKEN_CUDA_ARCHS        CUDA archs    (default 75-real;120 = RTX 2070
-REM                                     SASS + RTX 5060 Ti SASS + compute_120 PTX;
-REM                                     covers the whole Windows testbed fleet)
+REM         IDLETOKEN_CUDA_ARCHS        CUDA archs    (default covers every CUDA
+REM                                     12.8 architecture at or above the product
+REM                                     floor, with forward PTX on compute_120)
 REM         IDLETOKEN_LLAMACPP_GIT_URL  mirror URL tried when the UPSTREAM url fails
 REM         IDLETOKEN_MBEDTLS_SRC       local mbedTLS v3.6.7 source tree for the TLS
 REM                                     transport patch (default <repo>\tools\mbedtls
@@ -58,7 +58,7 @@ set "PATCH_DIR=%ROOT%\scripts\llamacpp-patches"
 if defined IDLETOKEN_LLAMACPP_SRC (set "SRC_DIR=%IDLETOKEN_LLAMACPP_SRC%") else (set "SRC_DIR=%ROOT%\vendor\llama.cpp")
 set "BUILD_DIR=%SRC_DIR%\build"
 if not defined IDLETOKEN_CUDA_VER set "IDLETOKEN_CUDA_VER=12.8"
-if not defined IDLETOKEN_CUDA_ARCHS set "IDLETOKEN_CUDA_ARCHS=75-real;120"
+if not defined IDLETOKEN_CUDA_ARCHS set "IDLETOKEN_CUDA_ARCHS=75-real;80-real;86-real;87-real;89-real;90-real;100-real;101-real;120"
 
 REM --- pin ---------------------------------------------------------------------
 set "REPO_URL="

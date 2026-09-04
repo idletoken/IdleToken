@@ -1,6 +1,6 @@
 [package]
 name = "idletoken-client"
-version = "0.1.35"
+version = "0.1.44"
 description = "IdleToken desktop/mobile client"
 authors = ["IdleToken"]
 edition = "2021"
@@ -22,20 +22,13 @@ tauri-plugin-single-instance = "2"
 # not expose. Same "three OS conventions we should not re-implement" reasoning
 # as autostart.
 tauri-plugin-dialog = "2"
-# In-app update: check a signed release manifest, download, verify the
-# signature, install, relaunch. The signature check is the reason to use the
-# plugin rather than a hand-rolled downloader — an updater that installs
-# whatever the endpoint served is a remote-code-execution channel, and minisign
-# verification against a pubkey baked into the binary is exactly the part we
-# must not get wrong ourselves.
-tauri-plugin-updater = "2"
+# In-app update was removed on 2026-09-02 (user ruling): updating means
+# downloading the current installer, so there is no update feed, no signed
+# update artifact and no `tauri-plugin-updater`.
 # "Launch at login" across the three platforms (registry Run key / .desktop
 # autostart entry / LaunchAgent plist). Same reasoning: three OS conventions we
 # would otherwise re-implement and get subtly wrong on one of them.
 tauri-plugin-autostart = "2"
-# Only for parsing the update feed URL into the `Url` the updater builder
-# wants; it is already in the tree as a transitive dependency of tauri.
-url = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Integrity gate for downloaded weights (weights.rs): curated manifests pin
@@ -73,4 +66,3 @@ custom-protocol = ["tauri/custom-protocol"]
 # build the acceptance gate drives against a feed it signed itself. NEVER
 # enable it for a build that ships: it makes the update trust root replaceable
 # by anyone who can set the process environment. See update.rs A-P0-1.
-updater-override = []

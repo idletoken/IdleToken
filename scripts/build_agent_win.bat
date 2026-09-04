@@ -75,6 +75,9 @@ REM as soon as platform_agent.c started base64-ing. Two lists of the same
 REM objects is the drift; keep them in step until one of them goes away.
 gcc -c src/common/b64.c %CF% -o a_b64.o >> agent_build.log 2>&1
 if errorlevel 1 goto :fail
+REM Top-level JSON spans keep tool_choice intact when relaying agent work.
+gcc -c src/common/apiconv.c %CF% -o a_apiconv.o >> agent_build.log 2>&1
+if errorlevel 1 goto :fail
 REM Local admission capabilities (PROV-28): the agent mints under the
 REM coordinator's channel key so the coordinator can recognise its jobs.
 gcc -c src/common/admission.c %CF% -o a_admission.o >> agent_build.log 2>&1
@@ -85,7 +88,7 @@ gcc -c src/tools/platform_agent.c %CF% -o a_platform_agent.o >> agent_build.log 
 if errorlevel 1 goto :fail
 
 echo === link ===>> agent_build.log
-gcc -static-libgcc -o idletoken-platform-agent.exe a_platform_agent.o a_sodium_seal.o a_privacy.o a_tweetnacl.o a_blake2b.o a_net.o a_http.o a_b64.o a_admission.o a_win_compat.o a_utf8_manifest.o -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic -lws2_32 -lbcrypt >> agent_build.log 2>&1
+gcc -static-libgcc -o idletoken-platform-agent.exe a_platform_agent.o a_sodium_seal.o a_privacy.o a_tweetnacl.o a_blake2b.o a_net.o a_http.o a_b64.o a_apiconv.o a_admission.o a_win_compat.o a_utf8_manifest.o -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic -lws2_32 -lbcrypt >> agent_build.log 2>&1
 if errorlevel 1 goto :fail
 
 echo AGENT_WIN_OK

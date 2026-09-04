@@ -88,4 +88,18 @@ int idletoken_model_size_resolve(const idletoken_model_spec *spec,
                                  idletoken_llm_model_size *out,
                                  char *why, size_t why_cap);
 
+/* Re-point the measured workspace at an explicitly chosen KV cache tier
+ * (IDLETOKEN_KV_TIER_*), overriding the one the precision implies.
+ *
+ * Only the coordinator needs this, and only when IDLETOKEN_KV_CACHE_TYPE
+ * overrides the automatic rule: resolve() has already priced the tier the rule
+ * would have picked, and the two workspaces are not interchangeable — on CUDA
+ * the gap reaches 4 GiB (qwen3.8-27b at 1M: 1146 MiB f16 vs 5200 MiB
+ * quantized). `tier` outside [0, IDLETOKEN_KV_TIER_COUNT) means the forced
+ * dtype has no measurement of its own; the largest measured tier is charged so
+ * an escape hatch can never make a configuration look cheaper than anything we
+ * have measured. */
+void idletoken_model_size_set_kv_tier(const idletoken_model_spec *spec,
+                                      idletoken_llm_model_size *out, int tier);
+
 #endif /* IDLETOKEN_MODELSIZE_H */

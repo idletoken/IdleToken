@@ -19,17 +19,22 @@ and how long a 0.8B takes today.
                                completion in llama-server's shape
 
 The coordinator spawns this through --llama-server-bin, so it accepts (and
-ignores) llama-server's arguments and reads only --port.
+ignores) llama-server's arguments and reads only --host/--port. A --host ending
+in .sock selects AF_UNIX, matching the shared-mode engine transport.
 """
 import json
+import os
 import socket
 import sys
 import threading
 import time
 
+host = "127.0.0.1"
 port = 8080
 hold_s = 8.0
 for i, a in enumerate(sys.argv):
+    if a == "--host" and i + 1 < len(sys.argv):
+        host = sys.argv[i + 1]
     if a == "--port" and i + 1 < len(sys.argv):
         port = int(sys.argv[i + 1])
     if a == "--hold-s" and i + 1 < len(sys.argv):
@@ -69,7 +74,19 @@ def handle(sock):
             # The whole point: hold the slot. /health keeps answering on other
             # connections while this one is parked, which is what lets the gate
             # tell "the machine is full" from "the machine is wedged".
-            time.sleep(hold_s)
+            # Watch the request socket during the hold as llama-server does.
+            # This makes the fixture prove the complete cancellation chain:
+            # coordinator closes upstream -> engine notices EOF -> work stops.
+            sock.setblocking(False)
+            deadline = time.monotonic() + hold_s
+            while time.monotonic() < deadline:
+                try:
+                    if sock.recv(1, socket.MSG_PEEK) == b"":
+                        return
+                except BlockingIOError:
+                    pass
+                time.sleep(0.05)
+            sock.setblocking(True)
             send(sock, "200 OK", json.dumps({
                 "choices": [{"index": 0,
                              "message": {"role": "assistant", "content": "local-answer"},
@@ -87,11 +104,26 @@ def handle(sock):
             pass
 
 
-srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-srv.bind(("127.0.0.1", port))
+if host.endswith(".sock"):
+    # Shared mode deliberately moves the coordinator<->engine link off TCP.
+    # The forwarding gate must exercise that production topology instead of
+    # disabling --shared merely because its engine fixture only understood a
+    # port. A stale path is ordinary after a killed test process.
+    try:
+        os.unlink(host)
+    except FileNotFoundError:
+        pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(host)
+    os.chmod(host, 0o600)
+    endpoint = f"unix:{host}"
+else:
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((host, port))
+    endpoint = f"{host}:{port}"
 srv.listen(64)
-print(f"stub engine (busy, hold={hold_s}s) listening on 127.0.0.1:{port}", flush=True)
+print(f"stub engine (busy, hold={hold_s}s) listening on {endpoint}", flush=True)
 while True:
     c, _ = srv.accept()
     threading.Thread(target=handle, args=(c,), daemon=True).start()

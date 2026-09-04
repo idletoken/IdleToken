@@ -537,13 +537,17 @@ int main(void) {
          * or the tests would still be green with the workspace charged at 0. */
         idletoken_llm_model_size small_m = {
             .total_bytes = g(8), .n_layers = 32, .kv_bytes_per_token = 65536,
+            .compute_bytes_128k_cuda = 256ull << 20,
             .compute_bytes_256k_cuda = 256ull << 20, .compute_bytes_1m_cuda = 512ull << 20,
+            .compute_bytes_128k_metal = 256ull << 20,
             .compute_bytes_256k_metal = 256ull << 20, .compute_bytes_1m_metal = 512ull << 20,
         };
         idletoken_llm_model_size big_m = {
             .total_bytes = g(80), .n_layers = 43, .kv_bytes_per_token = 65536,
-            .compute_bytes_256k_cuda = g(2), .compute_bytes_1m_cuda = g(4),
-            .compute_bytes_256k_metal = g(2), .compute_bytes_1m_metal = g(4),
+            .compute_bytes_128k_cuda = g(2), .compute_bytes_256k_cuda = g(2),
+            .compute_bytes_1m_cuda = g(4),
+            .compute_bytes_128k_metal = g(2), .compute_bytes_256k_metal = g(2),
+            .compute_bytes_1m_metal = g(4),
         };
         idletoken_llama_plan p;
 
@@ -662,8 +666,8 @@ int main(void) {
             /* Control: the SAME model on the SAME machine runs once measured,
              * so the refusal above is about the missing measurement and not
              * about anything else in the fixture. */
-            unmeasured.compute_bytes_256k_cuda  = 256ull << 20;
-            unmeasured.compute_bytes_256k_metal = 256ull << 20;
+            unmeasured.compute_bytes_128k_cuda  = 256ull << 20;
+            unmeasured.compute_bytes_128k_metal = 256ull << 20;
             ok(idletoken_plan_llamacpp(&unmeasured, huge, 1, 0, 32768, 0, &p) == 0 &&
                    p.kind == IDLETOKEN_LLPLAN_SINGLE,
                "control: the same model plans normally once measured");
@@ -673,7 +677,10 @@ int main(void) {
              * could carry CUDA numbers alone and Metal machines would silently
              * budget zero workspace. */
             idletoken_llm_model_size cuda_only = unmeasured;
-            cuda_only.compute_bytes_256k_metal = 0;
+            /* ctx 32768 reads the 128K slot (idletoken_llama_ctx_tier_of), so
+             * that is the one to blank — zeroing 256K here would leave the
+             * check passing for the wrong reason. */
+            cuda_only.compute_bytes_128k_metal = 0;
             idletoken_node_mem mac[] = { NM(g(400), g(400), 1) };
             mac[0].backend = IDLETOKEN_NODE_BACKEND_METAL;
             ok(idletoken_plan_llamacpp(&cuda_only, mac, 1, 0, 32768, 0, &p) == 0 &&
@@ -691,8 +698,10 @@ int main(void) {
         {
             idletoken_llm_model_size skewed = {
                 .total_bytes = g(8), .n_layers = 32, .kv_bytes_per_token = 65536,
-                .compute_bytes_256k_cuda = g(1), .compute_bytes_1m_cuda = g(1),
-                .compute_bytes_256k_metal = g(20), .compute_bytes_1m_metal = g(20),
+                .compute_bytes_128k_cuda = g(1), .compute_bytes_256k_cuda = g(1),
+                .compute_bytes_1m_cuda = g(1),
+                .compute_bytes_128k_metal = g(20), .compute_bytes_256k_metal = g(20),
+                .compute_bytes_1m_metal = g(20),
             };
             idletoken_node_mem cu[] = { NM(g(24), g(24), 1) };
             idletoken_node_mem mt[] = { NM(g(24), g(24), 1) };
@@ -813,13 +822,147 @@ int main(void) {
         ok(!strcmp(idletoken_llama_kv_type_for_weight(1), "q4_0") &&
                !strcmp(idletoken_llama_kv_type_for_weight(2), "q4_0"),
            "auto KV tier: 1-2 bit weights use uniform q4_0");
+        /* 2026-09-02: q8_0 covers every quantized tier, Q8 included. The upper
+         * end is the point of the change — 5/6/8 bit used to keep f16. */
         ok(!strcmp(idletoken_llama_kv_type_for_weight(3), "q8_0") &&
-               !strcmp(idletoken_llama_kv_type_for_weight(4), "q8_0"),
-           "auto KV tier: 3-4 bit weights use uniform q8_0");
+               !strcmp(idletoken_llama_kv_type_for_weight(4), "q8_0") &&
+               !strcmp(idletoken_llama_kv_type_for_weight(5), "q8_0") &&
+               !strcmp(idletoken_llama_kv_type_for_weight(6), "q8_0") &&
+               !strcmp(idletoken_llama_kv_type_for_weight(8), "q8_0") &&
+               !strcmp(idletoken_llama_kv_type_for_weight(15), "q8_0"),
+           "auto KV tier: every quantized tier (3-15 bit) uses uniform q8_0");
         ok(idletoken_llama_kv_type_for_weight(0) == NULL &&
-               idletoken_llama_kv_type_for_weight(5) == NULL &&
-               idletoken_llama_kv_type_for_weight(16) == NULL,
-           "auto KV tier: unknown and >=5 bit weights keep f16-first sizing");
+               idletoken_llama_kv_type_for_weight(16) == NULL &&
+               idletoken_llama_kv_type_for_weight(32) == NULL,
+           "auto KV tier: only unquantized weights and unknown names keep f16");
+        /* The tier INDEX is what selects the measured workspace, so it has to
+         * agree with the dtype name for every weight tier — they are two
+         * readings of one table and a drift between them would charge one
+         * cache's graph against another's. */
+        ok(idletoken_llama_kv_tier_for_weight(1) == IDLETOKEN_KV_TIER_Q4_0 &&
+               idletoken_llama_kv_tier_for_weight(2) == IDLETOKEN_KV_TIER_Q4_0 &&
+               idletoken_llama_kv_tier_for_weight(4) == IDLETOKEN_KV_TIER_Q8_0 &&
+               idletoken_llama_kv_tier_for_weight(8) == IDLETOKEN_KV_TIER_Q8_0 &&
+               idletoken_llama_kv_tier_for_weight(16) == IDLETOKEN_KV_TIER_F16 &&
+               idletoken_llama_kv_tier_for_weight(0) == IDLETOKEN_KV_TIER_F16,
+           "KV tier index matches the dtype rule at every weight tier");
+        {
+            int agree = 1;
+            for (int b = 0; b <= 32; b++) {
+                const char *name = idletoken_llama_kv_type_for_weight(b);
+                const int tier = idletoken_llama_kv_tier_for_weight(b);
+                if (!name && tier != IDLETOKEN_KV_TIER_F16) agree = 0;
+                if (name && strcmp(name, idletoken_llama_kv_tier_name(tier))) agree = 0;
+            }
+            ok(agree, "dtype name and tier index never disagree, 0..32 bits");
+        }
+        ok(idletoken_llama_kv_tier_of_name("f16") == IDLETOKEN_KV_TIER_F16 &&
+               idletoken_llama_kv_tier_of_name("q8_0") == IDLETOKEN_KV_TIER_Q8_0 &&
+               idletoken_llama_kv_tier_of_name("q4_0") == IDLETOKEN_KV_TIER_Q4_0 &&
+               idletoken_llama_kv_tier_of_name("") == IDLETOKEN_KV_TIER_F16 &&
+               idletoken_llama_kv_tier_of_name(NULL) == IDLETOKEN_KV_TIER_F16 &&
+               idletoken_llama_kv_tier_of_name("bf16") == IDLETOKEN_KV_TIER_F16,
+           "dtype name -> tier, with the engine default mapping to f16");
+        ok(idletoken_llama_kv_tier_of_name("q5_1") < 0 &&
+               idletoken_llama_kv_tier_of_name("iq4_nl") < 0,
+           "an escape-hatch dtype we never measured reports -1, not a neighbour");
+
+        /* ---- context tiers (2026-09-02, docs/ctx-tiers-2026-09.md) -------- */
+        ok(idletoken_llama_ctx_tier_of(131072) == IDLETOKEN_CTX_TIER_128K &&
+               idletoken_llama_ctx_tier_of(262144) == IDLETOKEN_CTX_TIER_256K &&
+               idletoken_llama_ctx_tier_of(1048576) == IDLETOKEN_CTX_TIER_1M,
+           "ctx tier: the three product windows map to their own slots");
+        /* A model whose ceiling falls between tiers launches AT its ceiling and
+         * must read the slot above it — the sweep put the measurement there
+         * (qwen3-8b tops out at 163840 and its 256K slot holds that window). */
+        ok(idletoken_llama_ctx_tier_of(8192) == IDLETOKEN_CTX_TIER_128K &&
+               idletoken_llama_ctx_tier_of(65536) == IDLETOKEN_CTX_TIER_128K &&
+               idletoken_llama_ctx_tier_of(163840) == IDLETOKEN_CTX_TIER_256K,
+           "ctx tier: a between-tiers ceiling reads the slot above it");
+        /* Above 256K only exactly 1M is offered. Rounding 500000 up to the 1M
+         * slot would charge a workspace nobody measured for that window;
+         * rounding it DOWN would under-charge by 4 GiB on CUDA. Refuse. */
+        /* Caller-facing membership is EXACT, unlike the slot lookup below.
+         * Found on a real node 2026-09-02: validating an argument with
+         * ctx_tier_of() let `--ctx-size 100000` through (it maps onto the 128K
+         * slot) and, above a model's ceiling, let 500000 through as a clamped
+         * 256K start. Both served a window the caller never asked for. */
+        ok(idletoken_llama_is_ctx_tier(131072) &&
+               idletoken_llama_is_ctx_tier(262144) &&
+               idletoken_llama_is_ctx_tier(1048576),
+           "exact tier membership accepts the three product windows");
+        ok(!idletoken_llama_is_ctx_tier(100000) &&
+               !idletoken_llama_is_ctx_tier(8192) &&
+               !idletoken_llama_is_ctx_tier(163840) &&
+               !idletoken_llama_is_ctx_tier(500000) &&
+               !idletoken_llama_is_ctx_tier(0),
+           "...and rejects everything else, including a below-tier window");
+        /* The two must not be conflated: a between-tiers ceiling is a legal
+         * LAUNCH (it reads the slot above it) but never a legal REQUEST. */
+        ok(idletoken_llama_ctx_tier_of(163840) == IDLETOKEN_CTX_TIER_256K &&
+               !idletoken_llama_is_ctx_tier(163840),
+           "a between-tiers ceiling has a slot but is not a requestable window");
+        ok(idletoken_llama_ctx_tier_of(300000) == 0 &&
+               idletoken_llama_ctx_tier_of(524288) == 0 &&
+               idletoken_llama_ctx_tier_of(2097152) == 0 &&
+               idletoken_llama_ctx_tier_of(0) == 0,
+           "ctx tier: a window between 256K and 1M has no slot and refuses");
+        {
+            /* End to end: an unmeasured window must reach the planner as a
+             * refusal, not as a free workspace. */
+            idletoken_llm_model_size m3 = {
+                .total_bytes = g(8), .n_layers = 32, .kv_bytes_per_token = 65536,
+                .compute_bytes_128k_cuda = g(1), .compute_bytes_256k_cuda = g(1),
+                .compute_bytes_1m_cuda = g(2),
+                .compute_bytes_128k_metal = g(1), .compute_bytes_256k_metal = g(1),
+                .compute_bytes_1m_metal = g(2),
+            };
+            ok(idletoken_llama_compute_bytes(&m3, 131072,
+                   IDLETOKEN_NODE_BACKEND_CUDA) == g(1) &&
+                   idletoken_llama_compute_bytes(&m3, 1048576,
+                       IDLETOKEN_NODE_BACKEND_CUDA) == g(2),
+               "compute bytes read the slot for the requested tier");
+            ok(idletoken_llama_compute_bytes(&m3, 524288,
+                   IDLETOKEN_NODE_BACKEND_CUDA) == 0,
+               "compute bytes for an off-tier window are 0, which the planner refuses");
+            idletoken_node_mem big1[] = { NM(g(400), g(400), 1) };
+            idletoken_llama_plan p3;
+            ok(idletoken_plan_llamacpp(&m3, big1, 1, 0, 524288, 0, &p3) == 0 &&
+                   p3.kind == IDLETOKEN_LLPLAN_REFUSE,
+               "...and a machine with plenty of memory still refuses that window");
+        }
+        /* End to end: the precision must select the workspace, because the two
+         * differ by 4 GiB on CUDA at 1M for this very model. A resolve that
+         * ignored the quant would price Q8_K_XL against the f16 graph. */
+        {
+            const idletoken_model_spec *q38 = idletoken_model_get("qwen3.8-27b");
+            idletoken_llm_model_size f16s, q8s, q4s;
+            ok(q38 &&
+                   idletoken_model_size_resolve(q38, "BF16", NULL, &f16s, NULL, 0) == 0 &&
+                   idletoken_model_size_resolve(q38, "Q8_K_XL", NULL, &q8s, NULL, 0) == 0 &&
+                   idletoken_model_size_resolve(q38, "IQ1_S", NULL, &q4s, NULL, 0) == 0,
+               "qwen3.8-27b resolves at an unquantized, a q8_0 and a q4_0 tier");
+            ok(f16s.kv_tier == IDLETOKEN_KV_TIER_F16 &&
+                   q8s.kv_tier == IDLETOKEN_KV_TIER_Q8_0 &&
+                   q4s.kv_tier == IDLETOKEN_KV_TIER_Q4_0,
+               "...and each records the KV tier it was priced for");
+            ok(q8s.compute_bytes_1m_cuda != f16s.compute_bytes_1m_cuda &&
+                   q8s.compute_bytes_1m_cuda ==
+                       q38->compute_bytes_1m_cuda[IDLETOKEN_KV_TIER_Q8_0] &&
+                   f16s.compute_bytes_1m_cuda ==
+                       q38->compute_bytes_1m_cuda[IDLETOKEN_KV_TIER_F16],
+               "...reading the manifest entry for that tier, not the f16 one");
+            /* The escape hatch: an unmeasured dtype charges the largest tier,
+             * never the cheapest, and says the budget is an upper bound. */
+            idletoken_llm_model_size forced = q8s;
+            idletoken_model_size_set_kv_tier(q38, &forced, -1);
+            uint64_t biggest = 0;
+            for (int t = 0; t < IDLETOKEN_KV_TIER_COUNT; t++)
+                if (q38->compute_bytes_1m_cuda[t] > biggest)
+                    biggest = q38->compute_bytes_1m_cuda[t];
+            ok(forced.compute_bytes_1m_cuda == biggest,
+               "an unmeasured forced dtype charges the LARGEST measured tier");
+        }
         /* Filename variant — the client's real launch shape passes only a
          * GGUF path. "Qwen3"/"V4"/"Flash" must not read as quants. */
         ok(idletoken_quant_bits_from_path("D:\\gguf\\Qwen3.8-27B-UD-IQ2_XXS.gguf") == 2 &&
@@ -1010,8 +1153,10 @@ int main(void) {
         idletoken_llm_model_size dsv4 = {
             .total_bytes = (uint64_t)(80.76 * (double)GiB),
             .n_layers = 43, .kv_bytes_per_token = 65536,
-            .compute_bytes_256k_cuda = g(1), .compute_bytes_1m_cuda = g(2),
-            .compute_bytes_256k_metal = g(1), .compute_bytes_1m_metal = g(2),
+            .compute_bytes_128k_cuda = g(1), .compute_bytes_256k_cuda = g(1),
+            .compute_bytes_1m_cuda = g(2),
+            .compute_bytes_128k_metal = g(1), .compute_bytes_256k_metal = g(1),
+            .compute_bytes_1m_metal = g(2),
         };
         idletoken_node_mem cell[] = {
             NM(g(107.61), g(107.61), 1),                 /* unified memory    */

@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Build the installable macOS client (.dmg + updater .app.tar.gz/.sig) — WS-E E3.
+# Build the installable macOS client (.dmg) — WS-E E3.
 #
 # One command on the Mac: build the engine sidecars, stage them, bundle with
-# Tauri, sign the updater artifact with the NON-REGENERABLE minisign key, and
-# then verify what actually shipped (sidecars + engine pin inside the mounted
-# dmg, signature against the pubkey compiled into the client). Verification is
-# part of the contract, not a courtesy: a dmg that carries a stale idletoken-server
-# or an unverifiable signature looks identical to a good one from the outside.
+# Tauri, and then verify what actually shipped (sidecars + engine pin inside the
+# mounted dmg). Verification is part of the contract, not a courtesy: a dmg that
+# carries a stale idletoken-server looks identical to a good one from the
+# outside.
+#
+# There is no update artifact and no signing step since 2026-09-02: the product
+# has no in-app updater, so a release is just the installer.
 #
 # Usage:  scripts/package_client_mac.sh
-# Env:    TAURI_SIGNING_PRIVATE_KEY_PATH   (default ~/.idletoken/updater.key)
-#         TAURI_SIGNING_PRIVATE_KEY_PASSWORD (default empty)
-#         IDLETOKEN_MAC_BUNDLES            (default "app,dmg")
+# Env:    IDLETOKEN_MAC_BUNDLES            (default "dmg")
 #
 # Contract: last line is CLIENT_MAC_OK (artifacts listed above it) or
 # CLIENT_MAC_FAIL: <reason>. Idempotent: safe to re-run; every step either
@@ -77,27 +77,14 @@ cp -f "$ROOT/vendor/llama.cpp/LICENSE" "$LIC/llamacpp-MIT.txt" \
     || fail "could not stage the llama.cpp licence"
 
 # --- the signing key: READ-ONLY, NON-REGENERABLE ----------------------------
-# `createUpdaterArtifacts` is on, so `tauri build` refuses to run without the
-# private key — wanted: an unsigned release is a dead update channel. The key
-# is used strictly in place. NEVER generate a new one here: installed clients
-# trust exactly one pubkey, and a fresh key would permanently orphan them.
-KEY_PATH="${TAURI_SIGNING_PRIVATE_KEY_PATH:-$HOME/.idletoken/updater.key}"
-if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
-    [ -f "$KEY_PATH" ] || fail "no updater signing key at $KEY_PATH — RESTORE YOUR BACKUP (password manager / encrypted disk). Do NOT generate a new key: already-installed clients only trust the existing pubkey (28F23C3CE24BFDE9)"
-    # Tauri v2 reads TAURI_SIGNING_PRIVATE_KEY (path or key material); the
-    # _PATH spelling is our repo convention only. Pass the PATH so the key
-    # material never enters the environment.
-    export TAURI_SIGNING_PRIVATE_KEY="$KEY_PATH"
-fi
-export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}"
+# No signing key (2026-09-02, user ruling): `createUpdaterArtifacts` is false,
+# so `tauri build` produces only the .dmg and needs no minisign key. Updating
+# means downloading the current installer.
 
 # --- release preflight ------------------------------------------------------
-# The check above proves a key FILE exists. This one proves it is the RIGHT
-# key, by signing a nonce and verifying it against the pubkey compiled into the
-# client — signing with a valid-but-wrong key succeeds at every step and is
-# only discovered by users whose updater rejects the release. It also refuses a
-# dirty tree, so the provenance record below cannot name a commit that is not
-# what was built.
+# Refuses a dirty tree, so the provenance record below cannot name a commit
+# that is not what was built. (It used to also prove the signing key was the
+# RIGHT key; there is no signing key any more.)
 # shellcheck disable=SC1091
 . "$ROOT/scripts/release-provenance-lib.sh"
 rp_preflight "macos" || fail "release preflight refused this build (see above)"
@@ -105,7 +92,7 @@ rp_preflight "macos" || fail "release preflight refused this build (see above)"
 # --- build ------------------------------------------------------------------
 cd client || fail "no client/ directory"
 pnpm install >/tmp/client-mac-install.log 2>&1 || fail "pnpm install failed (see /tmp/client-mac-install.log)"
-BUNDLES="${IDLETOKEN_MAC_BUNDLES:-app,dmg}"
+BUNDLES="${IDLETOKEN_MAC_BUNDLES:-dmg}"
 # `tauri build` runs beforeBuildCommand (pnpm build:release) itself — that is
 # what injects the production platform URL into the shipped frontend.
 pnpm tauri build --bundles "$BUNDLES" 2>&1 | tail -25 || fail "tauri build failed"
@@ -113,10 +100,6 @@ pnpm tauri build --bundles "$BUNDLES" 2>&1 | tail -25 || fail "tauri build faile
 BDIR=src-tauri/target/release/bundle
 DMG=$(ls -t "$BDIR"/dmg/IdleToken_*.dmg 2>/dev/null | head -1)
 [ -n "$DMG" ] || fail "no dmg produced under $BDIR/dmg"
-APPTAR=$(ls -t "$BDIR"/macos/IdleToken.app.tar.gz 2>/dev/null | head -1)
-[ -n "$APPTAR" ] || fail "no updater artifact IdleToken.app.tar.gz under $BDIR/macos"
-SIG="$APPTAR.sig"
-[ -f "$SIG" ] || fail "no signature next to $APPTAR"
 
 # --- verify 1: sidecars + engine pin INSIDE the dmg -------------------------
 # Verify the artifact users get, not the intermediate .app in the build tree.
@@ -150,45 +133,14 @@ hdiutil detach "$MNT" >/dev/null 2>&1
 rmdir "$MNT" 2>/dev/null
 trap - EXIT
 
-# --- verify 2: updater signature against the pubkey the client trusts -------
-# The .sig is base64 of a minisign signature; the pubkey in tauri.conf.json is
-# base64 of a minisign public-key file. Verify with the real tool so this
-# cannot drift from what installed clients will do.
-command -v minisign >/dev/null 2>&1 \
-    || fail "minisign not installed (brew install minisign) — refusing to ship an unverified updater artifact"
-VTMP=$(mktemp -d /tmp/idletoken-sigverify.XXXXXX)
-python3 - "$ROOT/client/src-tauri/tauri.conf.json" > "$VTMP/updater.pub" <<'EOF' || fail "could not extract the updater pubkey from tauri.conf.json"
-import base64, json, sys
-conf = json.load(open(sys.argv[1]))
-sys.stdout.write(base64.b64decode(conf["plugins"]["updater"]["pubkey"]).decode())
-EOF
-grep -q "28F23C3CE24BFDE9" "$VTMP/updater.pub" \
-    || fail "extracted pubkey is not the known 28F23C3CE24BFDE9 — tauri.conf.json changed keys?"
-base64 -D -i "$SIG" -o "$VTMP/apptar.minisig" 2>/dev/null \
-    || base64 -d < "$SIG" > "$VTMP/apptar.minisig" \
-    || fail "could not decode $SIG"
-if minisign -Vm "$APPTAR" -x "$VTMP/apptar.minisig" -p "$VTMP/updater.pub" > "$VTMP/verify.out" 2>&1; then
-    echo "  updater signature: $(head -1 "$VTMP/verify.out") (pubkey 28F23C3CE24BFDE9)"
-else
-    cat "$VTMP/verify.out"
-    rm -rf "$VTMP"
-    fail "updater signature does NOT verify against the client pubkey — the update channel would be dead"
-fi
-rm -rf "$VTMP"
-
 # --- report artifacts -------------------------------------------------------
 echo "--- artifacts ---"
-for f in "$DMG" "$APPTAR" "$SIG"; do
+for f in "$DMG"; do
     printf '%s  %s  %s\n' "$(shasum -a 256 "$f" | cut -c1-16)" "$(du -h "$f" | cut -f1)" "$ROOT/client/$f"
 done
 
-# --- provenance -------------------------------------------------------------
-# See build_client_release.sh for the reasoning; non-fatal for the same reason
-# (the artifacts are already built and signed, so a hard stop here would leave
-# a half-published release with no way to retry the record).
-rp_emit "$(python3 -c "import json;print(json.load(open('$ROOT/client/src-tauri/tauri.conf.json'))['version'])")" \
-        "darwin-$(uname -m)" "$ROOT/client/$DMG" "$ROOT/client/$APPTAR" \
-    || echo "  !! PROVENANCE NOT WRITTEN — do not publish these artifacts until it is"
+# No automatic provenance, signature, updater archive or feed is emitted here.
+# The GitHub release contains the .dmg installer only.
 
 # --- restore the non-release client/dist ------------------------------------
 # `tauri build` ran beforeBuildCommand = `pnpm build:release`, which leaves a

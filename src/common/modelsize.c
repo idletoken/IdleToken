@@ -137,6 +137,40 @@ static void app(char *buf, size_t cap, const char *fmt, ...) {
     va_end(ap);
 }
 
+/* Re-point the workspace at a DIFFERENT KV tier than the weight quantization
+ * implies. The only caller is the coordinator, when IDLETOKEN_KV_CACHE_TYPE
+ * overrides the automatic rule: without this the budget would price the cache
+ * the override selected against the workspace of the cache it replaced, and on
+ * CUDA that gap reaches 4 GiB (qwen3.8-27b at 1M: 1146 MiB f16 vs 5200 MiB
+ * quantized). `tier` < 0 means the forced dtype has no measurement of its own
+ * (q5_1, iq4_nl, ...): charge the LARGEST measured tier, because the escape
+ * hatch is a measurement tool and the one thing it must not do is quietly make
+ * a configuration look cheaper than any we have ever measured. */
+void idletoken_model_size_set_kv_tier(const idletoken_model_spec *spec,
+                                      idletoken_llm_model_size *out, int tier) {
+    if (!spec || !out) return;
+    struct { uint64_t *dst; const uint64_t *src; } f[] = {
+        { &out->compute_bytes_128k_cuda,  spec->compute_bytes_128k_cuda  },
+        { &out->compute_bytes_256k_cuda,  spec->compute_bytes_256k_cuda  },
+        { &out->compute_bytes_1m_cuda,    spec->compute_bytes_1m_cuda    },
+        { &out->compute_bytes_128k_metal, spec->compute_bytes_128k_metal },
+        { &out->compute_bytes_256k_metal, spec->compute_bytes_256k_metal },
+        { &out->compute_bytes_1m_metal,   spec->compute_bytes_1m_metal   },
+    };
+    for (size_t i = 0; i < sizeof(f) / sizeof(f[0]); i++) {
+        if (tier >= 0 && tier < IDLETOKEN_KV_TIER_COUNT) {
+            *f[i].dst = f[i].src[tier];
+            continue;
+        }
+        uint64_t max = 0;
+        for (int t = 0; t < IDLETOKEN_KV_TIER_COUNT; t++)
+            if (f[i].src[t] > max) max = f[i].src[t];
+        *f[i].dst = max;
+    }
+    out->kv_tier = (uint8_t)(tier >= 0 && tier < IDLETOKEN_KV_TIER_COUNT
+                                 ? tier : IDLETOKEN_KV_TIER_COUNT);
+}
+
 int idletoken_model_size_resolve(const idletoken_model_spec *spec,
                                  const char *quant,
                                  const char *gguf_path,
@@ -155,16 +189,38 @@ int idletoken_model_size_resolve(const idletoken_model_spec *spec,
     out->n_layers = spec->n_layers;
     out->n_expert = spec->n_expert;
     out->n_expert_used = spec->n_expert_used;
-    /* Measured graph workspace, carried straight through from the manifest.
-     * Like the KV geometry above this is a property of the SHAPE, not of the
-     * weight quantization — verified 2026-09-01: Q4_K_M through BF16 all
-     * report 489.00 MiB on Qwen3.5-0.8B at 256K. Zero means "not measured for
-     * this model", which the planner treats as a refusal rather than as free.
-     * See results/memory-need-measured-20260901.md. */
-    out->compute_bytes_256k_cuda  = spec->compute_bytes_256k_cuda;
-    out->compute_bytes_1m_cuda    = spec->compute_bytes_1m_cuda;
-    out->compute_bytes_256k_metal = spec->compute_bytes_256k_metal;
-    out->compute_bytes_1m_metal   = spec->compute_bytes_1m_metal;
+    /* Measured graph workspace, carried through from the manifest for the KV
+     * cache dtype this precision will actually be launched with.
+     *
+     * The workspace does not vary with the WEIGHT quantization — verified
+     * 2026-09-01: Q4_K_M through BF16 all report 489.00 MiB on Qwen3.5-0.8B at
+     * 256K. It DOES vary with the KV cache dtype on some architectures (the
+     * same model measures 745.28 MiB at 256K once the cache is quantized), and
+     * the coordinator picks that dtype FROM the weight quantization. So the
+     * quant does select a workspace here — indirectly, through the KV tier, not
+     * because the weights themselves cost graph memory.
+     *
+     * The tier is resolved once, here, so every downstream caller keeps its
+     * signature and cannot disagree with the engine about which cache is
+     * running. Zero means "not measured for this model+tier", which the planner
+     * treats as a refusal rather than as free.
+     * See results/memory-need-measured-20260901.md and the 09-02 addendum. */
+    {
+        /* Name first, path second — the same order the coordinator resolves
+         * weight bits in, so a `--llama-gguf`-only launch (the client's real
+         * shape) reads the tier off the filename exactly as coord does. */
+        int wbits = (quant && quant[0]) ? idletoken_quant_weight_bits(quant) : 0;
+        if (!wbits && gguf_path && gguf_path[0])
+            wbits = idletoken_quant_bits_from_path(gguf_path);
+        const int tier = idletoken_llama_kv_tier_for_weight(wbits);
+        out->kv_tier = (uint8_t)tier;
+        out->compute_bytes_128k_cuda  = spec->compute_bytes_128k_cuda[tier];
+        out->compute_bytes_256k_cuda  = spec->compute_bytes_256k_cuda[tier];
+        out->compute_bytes_1m_cuda    = spec->compute_bytes_1m_cuda[tier];
+        out->compute_bytes_128k_metal = spec->compute_bytes_128k_metal[tier];
+        out->compute_bytes_256k_metal = spec->compute_bytes_256k_metal[tier];
+        out->compute_bytes_1m_metal   = spec->compute_bytes_1m_metal[tier];
+    }
     if (spec->kv_kind == IDLETOKEN_KV_HYBRID) {
         const uint32_t iv = spec->full_attn_interval ? spec->full_attn_interval : 1;
         const uint64_t n_full = ((uint64_t)spec->n_layers + iv - 1) / iv;

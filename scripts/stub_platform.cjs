@@ -52,6 +52,14 @@ const recordDir = arg('record', '/tmp/idletoken-stub-platform');
 // What the platform claims it charged. The gate sets this above the
 // coordinator's daily cap so one borrowed request is enough to reach it.
 const chargeMilli = Number(arg('charge-milli', '1'));
+// Which success code sealed/chat answers with. Default 200 = what the real
+// gateway pins (@HttpCode(200) on SealedIntakeController.sealedChat).
+//
+// It is settable because this fixture answering 200 while the REAL gateway
+// answered NestJS's default 201 is precisely how overflow shipped broken and
+// stayed green: the gate proved the coordinator handles the platform it
+// imagined. G_OVERFLOW claim 12 now drives 201 and a non-2xx through here.
+const chatStatus = Number(arg('chat-status', '200'));
 
 fs.mkdirSync(recordDir, { recursive: true });
 const connLog = path.join(recordDir, 'conn.log');
@@ -135,13 +143,25 @@ const srv = http.createServer((req, res) => {
       fs.appendFileSync(path.join(recordDir, 'opened.log'),
                         JSON.stringify(inner) + '\n');
       const answer = {
-        text: `borrowed-answer for ${inner.messages?.[inner.messages.length - 1]?.content ?? '?'}`,
+        text: inner.tools?.length
+          ? ''
+          : `borrowed-answer for ${inner.messages?.[inner.messages.length - 1]?.content ?? '?'}`,
         model: inner.model,
+        ...(inner.tools?.length ? {
+          tool_calls: [{
+            id: 'call_overflow_gate', type: 'function',
+            function: {
+              name: inner.tools[0]?.function?.name ?? 'read_file',
+              arguments: '{"path":".agent"}',
+            },
+          }],
+          finish_reason: 'tool_calls',
+        } : { finish_reason: 'stop' }),
         usage: { input_tokens: 11, output_tokens: 7 },
         credits: { charged_milli: chargeMilli, balance_after_milli: 1_000_000 },
       };
       const sealed = b64(_sodium.crypto_box_seal(Buffer.from(JSON.stringify(answer)), replyTo));
-      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.writeHead(chatStatus, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ sealed_response: sealed }));
       return;
     }

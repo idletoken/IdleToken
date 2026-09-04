@@ -9,7 +9,6 @@ mod engine;
 mod pairing;
 mod secrets;
 mod tray;
-mod update;
 mod weights;
 mod window;
 
@@ -1061,7 +1060,6 @@ fn main() {
         // text box handed unchecked strings to the engine (see settings.ts v4
         // migration note), and the webview's <input type=file> hides real paths.
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
         // No launch arguments: the app is started at login the same way the
         // user starts it, and "start minimized" is a setting rather than a
         // second startup mode (see window.rs).
@@ -1073,7 +1071,6 @@ fn main() {
         .manage(pairing::Pairing::default())
         .manage(window::SysPrefs::default())
         .manage(tray::TrayState::default())
-        .manage(update::Updates::default())
         .manage(secrets::Secrets::default())
         .setup(|app| {
             // One line about how the shell came up. It is the first thing
@@ -1180,10 +1177,6 @@ fn main() {
             tray::tray_sync,
             window::window_prefs_set,
             window::window_prefs_get,
-            update::update_check,
-            update::update_download,
-            update::update_install,
-            update::update_state,
             secrets::secrets_load,
             secrets::secrets_set,
             secrets::secrets_clear,

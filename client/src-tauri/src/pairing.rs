@@ -210,7 +210,7 @@ impl Default for Tuning {
             discovery_port: DISCOVERY_PORT,
             model_id: "deepseek-v4-flash".into(),
             quant: String::new(),
-            ctx_size: 262144,
+            ctx_size: 131072,
             kv_cache_k: String::new(),
             kv_cache_v: String::new(),
             max_decode: default_max_decode(),
@@ -697,55 +697,30 @@ struct Challenge {
 
 /// Windows only: allow the pairing traffic *inbound* before we start listening.
 ///
-/// The engine self-provisions its own ports (`idletoken_win_ensure_firewall_rule`),
-/// but the client's two ports are opened by this process, so nothing was
-/// provisioning them. On a freshly installed Windows machine the joiner then
-/// never sees the creator's UDP beacon and reports "no cluster found for that
-/// code on this LAN" — a silent dead end that looks like a discovery bug.
+/// The client's two pairing ports need to be reachable, or a joiner never sees
+/// the creator's UDP beacon and reports "no cluster found for that code on this
+/// LAN" — a silent dead end that looks like a discovery bug.
 ///
-/// Idempotent: `show rule` exits 0 when the rule already exists. Adding needs
-/// elevation; when we are not elevated we print the exact command instead of
-/// pretending it worked (the user can run it once, or install elevated).
+/// This used to shell out to `netsh advfirewall firewall add rule` from here.
+/// That was removed on 2026-09-02 along with the engine's copy of it, for the
+/// reasons written up in src/platform/win/win_compat.c: the app installs and
+/// runs unelevated, so the ADD never actually succeeded, and an unsigned binary
+/// modifying the firewall is a behaviour Defender scores against us. The
+/// installer now provisions a PROGRAM rule for idletoken-client.exe, which
+/// covers both of these ports without naming either.
+///
+/// What is left is the diagnostic, printed once per start, so a developer
+/// running a dev build (which the installer has never touched) still learns
+/// exactly what to allow.
 #[cfg(windows)]
 fn ensure_pairing_firewall(discovery_port: u16) {
-    use std::os::windows::process::CommandExt;
-    use std::process::Command;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000; // no console flash on a GUI app
-
-    for (proto, port) in [("UDP", discovery_port), ("TCP", ROSTER_PORT)] {
-        let name = format!("IdleToken client {proto} {port}");
-        let exists = Command::new("netsh")
-            .args(["advfirewall", "firewall", "show", "rule", &format!("name={name}")])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if exists {
-            continue;
-        }
-        let added = Command::new("netsh")
-            .args([
-                "advfirewall", "firewall", "add", "rule",
-                &format!("name={name}"),
-                "dir=in", "action=allow",
-                &format!("protocol={proto}"),
-                &format!("localport={port}"),
-                "profile=any",
-            ])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if added {
-            eprintln!("[pairing] firewall rule added: {name}");
-        } else {
-            eprintln!(
-                "[pairing] could not add firewall rule (not elevated?). Run once as admin:\n  \
-                 netsh advfirewall firewall add rule name=\"{name}\" dir=in action=allow \
-                 protocol={proto} localport={port} profile=any"
-            );
-        }
-    }
+    eprintln!(
+        "[pairing] inbound UDP {discovery_port} and TCP {ROSTER_PORT} must be reachable for \
+         cluster discovery. The installer allows idletoken-client.exe on private networks; \
+         for a dev build run once as admin:\n  \
+         netsh advfirewall firewall add rule name=\"IdleToken app\" dir=in action=allow \
+         program=\"<path to idletoken-client.exe>\" enable=yes profile=private,domain"
+    );
 }
 
 #[cfg(not(windows))]
@@ -904,7 +879,7 @@ struct Inner {
     /// to download — is no longer available to tell it. The refusal carries the
     /// identity instead, and it is kept here so the UI can name the exact model
     /// and offer to fetch it. Cleared on every new create/join/leave.
-    required_model: Option<(String, String)>,
+    required_model: Option<(String, String, u32)>,
     /// Nonces this creator issued in `hello` replies and has not seen used yet
     /// (see pair_proof). Consumed by the matching `join`, swept by age, and
     /// quota'd per source so one sprayer cannot evict everyone else's.
@@ -1045,7 +1020,7 @@ fn snapshot_json(inner: &Inner) -> Value {
         "requiredModel": inner
             .required_model
             .as_ref()
-            .map(|(id, quant)| json!({ "modelId": id, "quant": quant })),
+            .map(|(id, quant, ctx)| json!({ "modelId": id, "quant": quant, "ctx": ctx })),
     })
 }
 
@@ -1387,8 +1362,8 @@ fn overflow_args(tuning: &Tuning) -> Vec<String> {
         "--overflow-url".into(), crate::engine::engine_platform_url(&tuning.overflow_url),
         "--overflow-wait-s".into(), tuning.overflow_wait_s.to_string(),
     ];
-    // 0 means "use the coordinator's own default", which is a real ceiling --
-    // never "no ceiling". Omitting the flag says the same thing more plainly.
+    // Zero means no additional local ceiling; a positive value remains an
+    // operator-only stop-loss. The desktop product always supplies zero.
     if tuning.overflow_daily_cap_milli > 0 {
         v.push("--overflow-daily-cap".into());
         v.push(tuning.overflow_daily_cap_milli.to_string());
@@ -1944,6 +1919,7 @@ fn roster_request(inner: &mut Inner, req: &Value, peer_ip: &str, now: Instant) -
 
             let cluster_model = inner.tuning.model_id.clone();
             let cluster_quant = inner.tuning.quant.clone();
+            let cluster_ctx = inner.tuning.ctx_size;
 
             // Admission requires the weights to ALREADY be on the joiner's disk
             // (2026-09-01). Until now a member was admitted first and
@@ -1961,12 +1937,33 @@ fn roster_request(inner: &mut Inner, req: &Value, peer_ip: &str, now: Instant) -
             let their_model = req["modelId"].as_str().unwrap_or("");
             let their_quant = req["quant"].as_str().unwrap_or("");
             let claims_ready = req["modelReady"].as_bool() == Some(true);
-            if !claims_ready || their_model != cluster_model || their_quant != cluster_quant {
+            // The context window joined this check on 2026-09-02
+            // (docs/ctx-tiers-2026-09.md). It is not cosmetic: the window is
+            // chosen by the creator and pre-allocated in full at load, so a
+            // member that set a different one draws its capacity card against a
+            // budget the cluster is not going to use — up to 8x off between the
+            // 128K and 1M tiers. Requiring all three to match is what lets the
+            // joiner's own estimate stay truthful without putting the window on
+            // the roster wire.
+            //
+            // An OLD client does not send `ctx` at all. Absent is treated as
+            // agreement rather than as a mismatch: refusing every pre-2026-09-02
+            // client would break joining for a reason the user cannot see or
+            // fix from the refusal text.
+            let their_ctx = req["ctx"].as_u64().map(|v| v as u32);
+            let ctx_ok = their_ctx.is_none_or(|c| c == cluster_ctx);
+            if !claims_ready
+                || their_model != cluster_model
+                || their_quant != cluster_quant
+                || !ctx_ok
+            {
+                let theirs = their_ctx.map(|c| c.to_string()).unwrap_or_else(|| "unset".into());
                 audit(
                     inner,
                     format!(
                         "refused a join from {peer_ip}: this cluster runs {cluster_model} \
-                         {cluster_quant}, and that machine reported {their_model} {their_quant} \
+                         {cluster_quant} at ctx {cluster_ctx}, and that machine reported \
+                         {their_model} {their_quant} at ctx {theirs} \
                          (weights ready: {claims_ready})"
                     ),
                 );
@@ -1975,6 +1972,7 @@ fn roster_request(inner: &mut Inner, req: &Value, peer_ip: &str, now: Instant) -
                     "err": "model not ready",
                     "modelId": cluster_model,
                     "quant": cluster_quant,
+                    "ctx": cluster_ctx,
                 });
             }
 
@@ -2477,7 +2475,7 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
         //   one that measured them, and the roster is where the cluster totals
         //   them up (pre-flight "will this model fit on all of us together").
         let join_req = |nonce: &str| {
-            let (vram_free, ram_free, unified, model_id, quant, model_ready) = {
+            let (vram_free, ram_free, unified, model_id, quant, ctx, model_ready) = {
                 let pairing = app.state::<Pairing>();
                 let inner = pairing.0.lock().unwrap();
                 (
@@ -2486,6 +2484,7 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
                     inner.self_unified,
                     inner.tuning.model_id.clone(),
                     inner.tuning.quant.clone(),
+                    inner.tuning.ctx_size,
                     model_path_ready(&inner.model_path),
                 )
             };
@@ -2497,7 +2496,10 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
                    "deviceId": self_device,
                    "prefer": prefer, "hb": poll.as_secs(),
                    "vramFree": vram_free, "ramFree": ram_free, "unifiedMemory": unified,
-                   "modelId": model_id, "quant": quant, "modelReady": model_ready})
+                   // All three of model, precision and context window must
+                   // match to be admitted (docs/ctx-tiers-2026-09.md).
+                   "modelId": model_id, "quant": quant, "ctx": ctx,
+                   "modelReady": model_ready})
         };
 
         // 3) offer the code to each candidate until one accepts. A refusal is
@@ -2511,7 +2513,7 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
         // What the cluster demanded when it refused us for missing weights.
         // Carried out of the loop so the UI can name the model to download —
         // a refused joiner never enters the roster that used to tell it.
-        let mut required_model: Option<(String, String)> = None;
+        let mut required_model: Option<(String, String, u32)> = None;
         for cand in &candidates {
             {
                 let pairing = app.state::<Pairing>();
@@ -2553,7 +2555,12 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
                     // neither is one this build cannot guide the user through,
                     // so leave it unset and fall back to the plain refusal.
                     if let (Some(m), Some(q)) = (v["modelId"].as_str(), v["quant"].as_str()) {
-                        required_model = Some((m.to_string(), q.to_string()));
+                        // `ctx` is absent from a pre-2026-09-02 creator. 0 means
+                        // "this cluster did not say", which the UI renders as the
+                        // model/precision guidance alone rather than inventing a
+                        // window the user would then be told to match.
+                        let c = v["ctx"].as_u64().unwrap_or(0) as u32;
+                        required_model = Some((m.to_string(), q.to_string(), c));
                     }
                 }
                 last_refusal = Some(err);
@@ -3449,9 +3456,7 @@ mod pairing_settings_tests {
             vec!["--overflow-url", "http://p",
                  "--overflow-wait-s", "5", "--overflow-daily-cap", "2500"]
         );
-        // A cap of 0 means "the coordinator's own default", which is a real
-        // ceiling. It must never be sent as an explicit 0, which would read as
-        // a cap of zero -- and it must never be read as "no ceiling".
+        // A cap of 0 means no additional local ceiling and needs no flag.
         let no_cap = tuning(|t| {
             t.overflow_url = "http://p".into();
             t.overflow_key = "sk".into();
@@ -3950,6 +3955,10 @@ mod pairing_settings_tests {
 
     /// A join that says whatever it likes about its local weights. Only the
     /// weight-gate tests need this; everything else goes through `do_join`.
+    ///
+    /// `ctx` is `None` here, which is deliberately the OLD-client shape: a
+    /// pre-2026-09-02 joiner sends no window at all. The context tier tests
+    /// below use `do_join_claiming_ctx` to send one.
     #[allow(clippy::too_many_arguments)]
     fn do_join_claiming(
         inner: &mut Inner,
@@ -3962,6 +3971,22 @@ mod pairing_settings_tests {
         quant: &str,
         ready: bool,
     ) -> Value {
+        do_join_claiming_ctx(inner, host, device, ip, prefer, now, model, quant, ready, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn do_join_claiming_ctx(
+        inner: &mut Inner,
+        host: &str,
+        device: &str,
+        ip: &str,
+        prefer: bool,
+        now: Instant,
+        model: &str,
+        quant: &str,
+        ready: bool,
+        ctx: Option<u32>,
+    ) -> Value {
         let mine = random_hex(16);
         let hello = ask(inner, json!({"op": "hello", "nonce": mine, "v": PAIR_PROTO_V}), ip, now);
         let nonce = hello["nonce"].as_str().unwrap_or("").to_string();
@@ -3970,6 +3995,9 @@ mod pairing_settings_tests {
                              "modelId": model, "quant": quant, "modelReady": ready});
         if !device.is_empty() {
             req["deviceId"] = json!(device);
+        }
+        if let Some(c) = ctx {
+            req["ctx"] = json!(c);
         }
         ask(
             inner,
@@ -4047,6 +4075,73 @@ mod pairing_settings_tests {
         assert_eq!(r["ok"], true, "{r}");
         assert_eq!(inner.peers.len(), 1);
         assert!(inner.peers[0].model_ready, "and it lands in the roster already ready");
+    }
+
+    /// A cluster is a model, a precision AND a context window (2026-09-02,
+    /// docs/ctx-tiers-2026-09.md). The window is pre-allocated in full at load
+    /// and cannot grow, so a member that set a different tier would size its own
+    /// capacity card against a budget the cluster is never going to use — up to
+    /// 8x off between 128K and 1M. This is the only test that watches that third
+    /// field: every other join test omits `ctx` entirely, which exercises the
+    /// old-client path, not this one.
+    #[test]
+    fn a_machine_set_to_a_different_context_window_is_refused_and_told_which() {
+        let mut inner = creator_with_code();
+        inner.tuning.model_id = "qwen3.8-27b".into();
+        inner.tuning.quant = "Q6_K".into();
+        inner.tuning.ctx_size = 262144;
+        let now = Instant::now();
+
+        let r = do_join_claiming_ctx(
+            &mut inner, "box-a", "dev-a", "192.168.1.50", false, now,
+            "qwen3.8-27b", "Q6_K", true, Some(131072),
+        );
+        assert_eq!(r["ok"], false, "the default tier is not close enough to 256K: {r}");
+        assert_eq!(r["ctx"], 262144,
+                   "the refusal must name the cluster's window — a refused machine never \
+                    reaches the roster, so this is its only way to learn it");
+        assert_eq!(r["modelId"], "qwen3.8-27b", "and it still names the model");
+        assert_eq!(r["quant"], "Q6_K");
+        assert!(inner.peers.is_empty(), "a refused machine must not appear in the roster");
+
+        // The longer window is refused too. This is not "at least as much as we
+        // need": a 1M member would advertise capacity for a window nobody is
+        // allocating, and the creator's plan would be wrong in the other
+        // direction.
+        let r = do_join_claiming_ctx(
+            &mut inner, "box-a", "dev-a", "192.168.1.50", false, now,
+            "qwen3.8-27b", "Q6_K", true, Some(1048576),
+        );
+        assert_eq!(r["ok"], false, "more is also different: {r}");
+        assert!(inner.peers.is_empty());
+
+        // And the same machine on the matching tier gets in — otherwise the two
+        // refusals above would be satisfied by a gate that refuses everyone.
+        let r = do_join_claiming_ctx(
+            &mut inner, "box-a", "dev-a", "192.168.1.50", false, now,
+            "qwen3.8-27b", "Q6_K", true, Some(262144),
+        );
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(inner.peers.len(), 1);
+    }
+
+    /// A pre-2026-09-02 client sends no `ctx` at all. Refusing it would break
+    /// joining for a reason its user cannot see in the refusal or fix in the UI,
+    /// so absent is read as agreement — deliberately, and only for absent.
+    #[test]
+    fn a_client_too_old_to_report_its_window_still_joins() {
+        let mut inner = creator_with_code();
+        inner.tuning.model_id = "qwen3.8-27b".into();
+        inner.tuning.quant = "Q6_K".into();
+        inner.tuning.ctx_size = 1048576;
+        let now = Instant::now();
+
+        let r = do_join_claiming_ctx(
+            &mut inner, "box-old", "dev-old", "192.168.1.51", false, now,
+            "qwen3.8-27b", "Q6_K", true, None,
+        );
+        assert_eq!(r["ok"], true, "an absent window is agreement, not a mismatch: {r}");
+        assert_eq!(inner.peers.len(), 1);
     }
 
     /// CLUS-06: hostname is a label, not an identity. A second machine that

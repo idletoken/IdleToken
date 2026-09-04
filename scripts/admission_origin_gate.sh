@@ -23,8 +23,8 @@
 #      local-origin marker, both 0600
 #   2  restarting rolls the channel key and KEEPS the local marker (both halves
 #      asserted: either one alone is a bug that looks like the other's fix)
-#   3  --shared selects the strict origin policy, a plain machine selects
-#      capability, and the escape hatch announces itself
+#   3  private and --shared modes both select capability so ordinary compatible
+#      API clients may borrow; strict/legacy overrides announce their trade-offs
 #   4  a sharing coordinator refuses IDLETOKEN_LOG_PROMPTS out loud, and a
 #      non-sharing one still honours it (PRIV-09 with its positive control)
 #   5  THE REAL platform-agent binary, given a real sealed job, mints a real
@@ -147,15 +147,24 @@ chan2=$(tr -d ' \r\n' < "$CHAN"); local2=$(tr -d ' \r\n' < "$LOCAL")
 note "claim 2: restart rolled the channel key and kept the local-origin marker"
 
 # ===================================================================
-# Claim 3 — the origin policy, and its escape hatch.
+# Claim 3 — the product origin policy, and its explicit overrides.
 # ===================================================================
 out=$(arm_coord "$REC/state")
 printf '%s' "$out" | grep -q "origin policy 'capability'" \
     || fail "claim 3: a machine that does not share did not select the capability policy: $(printf '%s' "$out" | head -3)"
 out=$(arm_coord "$REC/state" IDLETOKEN_SHARED=1)
-printf '%s' "$out" | grep -q "origin policy 'strict'" \
-    || fail "claim 3: a SHARING machine did not select the strict policy — an unmarked request would still be forwardable there: $(printf '%s' "$out" | head -3)"
-note "claim 3: default capability; --shared selects strict"
+printf '%s' "$out" | grep -q "origin policy 'capability'" \
+    || fail "claim 3: a SHARING machine did not select capability — ordinary OpenAI/Anthropic clients would get 429 instead of borrowing: $(printf '%s' "$out" | head -3)"
+printf '%s' "$out" | grep -q "loopback API clients may borrow" \
+    || fail "claim 3: the sharing default does not say that compatible loopback clients may borrow"
+note "claim 3: private and --shared modes default to capability for compatible loopback clients"
+
+out=$(arm_coord "$REC/state" IDLETOKEN_SHARED=1 IDLETOKEN_OVERFLOW_ORIGIN_POLICY=strict)
+printf '%s' "$out" | grep -q "OVERRIDDEN to 'strict'" \
+    || fail "claim 3: the strict override did not announce itself"
+printf '%s' "$out" | grep -q "Nimbalyst" \
+    || fail "claim 3: the strict override did not warn that ordinary third-party API clients lose overflow"
+note "claim 3: strict is explicit and warns that unmarked third-party clients cannot borrow"
 
 out=$(arm_coord "$REC/state" IDLETOKEN_OVERFLOW_ORIGIN_POLICY=legacy)
 printf '%s' "$out" | grep -q "OVERRIDDEN to 'legacy'" \

@@ -6,6 +6,7 @@
   "arch": "deepseek4",
   "available": true,
   "deployment": "cluster",
+  "min_quant": "Q4_K_M",
   "license": "MIT",
   "params_summary": "671B · 37B active",
   "release": "0813",
@@ -32,10 +33,36 @@
     "n_expert_used": 6
   },
   "overhead_base_bytes": 3221225472,
-  "compute_bytes_256k_cuda": 719679652,
-  "compute_bytes_1m_cuda": 1948610724,
-  "compute_bytes_256k_metal": 1131245732,
-  "compute_bytes_1m_metal": 2948165796,
+  "compute_bytes_128k_cuda": [
+    617181348,
+    713650340,
+    713650340
+  ],
+  "compute_bytes_256k_cuda": [
+    719679652,
+    871723172,
+    871723172
+  ],
+  "compute_bytes_1m_cuda": [
+    1948610724,
+    1959778058,
+    1816752292
+  ],
+  "compute_bytes_128k_metal": [
+    995161539,
+    911359345,
+    911327887
+  ],
+  "compute_bytes_256k_metal": [
+    1131245732,
+    1113535283,
+    1054783570
+  ],
+  "compute_bytes_1m_metal": [
+    2948165796,
+    2888260649,
+    2673050911
+  ],
   "default_gguf": "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00001-of-00037.gguf",
   "chat_template": "ds4",
   "sources": [

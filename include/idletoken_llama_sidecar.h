@@ -256,6 +256,9 @@ typedef struct {
      * behaviour (one unbounded recv). See that function for why this exists. */
     int          slice_ms;      /* per-recv ceiling, ms */
     const char  *watch;         /* endpoint to health-probe while silent */
+    int          cancel_fd;     /* downstream client; -1 = no cancellation */
+    int          cancelled;     /* downstream closed while this call waited */
+    int          idle_timeout_ms; /* 0 = no ordinary idle deadline */
     long long    silent_ms;     /* consecutive silence; any byte resets it */
     long long    probed_at_ms;  /* silence level at the last probe */
 } idletoken_llama_conn;
@@ -269,6 +272,25 @@ int idletoken_llama_http_open(const char *endpoint, const char *method,
                               const char *path,
                               const char *body, size_t body_len,
                               int timeout_ms, idletoken_llama_conn *c);
+
+/* Open a relayed inference request while observing its downstream client.
+ * Unlike calling idletoken_llama_http_watch() after open, this covers the wait
+ * for the RESPONSE HEAD too. Non-stream llama-server does not send that head
+ * until generation is complete, so post-open observation leaves exactly the
+ * expensive interval unobservable and lets a disconnected caller orphan a GPU
+ * request.
+ *
+ * `timeout_ms` keeps the ordinary per-idle-read ceiling (0 means none), while
+ * `downstream_fd` is the accepted API-client socket. A genuine peer close sets
+ * c->cancelled and returns -1; the caller must close `c` and return without
+ * trying to write an error to the departed client. While the client remains,
+ * the engine may stay silent indefinitely as long as its separate /health
+ * probe succeeds. */
+int idletoken_llama_http_open_relay(const char *endpoint, const char *method,
+                                    const char *path,
+                                    const char *body, size_t body_len,
+                                    int timeout_ms, int downstream_fd,
+                                    idletoken_llama_conn *c);
 
 /* Make reads on `c` wait BOUNDEDLY: recv in slices, and while the engine is
  * silent, check on a SEPARATE connection that it still answers GET /health.

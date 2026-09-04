@@ -180,6 +180,12 @@ export const STRINGS = {
     // complaint about an admitted member; this one is why a join was refused.
     "pairing.err.joinNeedsModel":
       "This cluster runs {model} at {quant}, and this machine does not have those weights yet. Download them to join.",
+    // Same refusal code, different cause: the weights are here but the context
+    // window disagrees. Split out because the fix is a click in the picker, not
+    // a download, and telling someone to download weights they already have is
+    // how a two-minute fix becomes an hour.
+    "pairing.err.joinNeedsCtx":
+      "This cluster serves a {want} context window and this machine is set to {have}. All machines in a cluster must use the same window — change it above and try again.",
     "pairing.err.rejected": "The cluster refused this machine: {detail}",
     "pairing.err.portBusy":
       "Could not create the cluster: port {port} on this machine is already in use, so other machines cannot register. Close the program using it (often an earlier IdleToken that is still running), or create the cluster on another machine.",
@@ -317,7 +323,7 @@ export const STRINGS = {
     "platform.overflow.name": "Request help",
     "platform.overflow.optionHint": "When the local inference slot is occupied, immediately ask another user to complete the request (spends Sparks).",
     "platform.overflow.off": "Request help when busy",
-    "platform.overflow.on": "Help active",
+    "platform.overflow.on": "Help ready",
     "platform.overflow.needLogin": "Sign in to route unfinished local requests to another user's machine.",
     "platform.overflow.needService": "Start a model before turning on Request help.",
     "platform.overflow.hint":
@@ -425,8 +431,11 @@ export const STRINGS = {
     // on an older engine that does not report one).
     "model.serving": "Answering with",
     "model.selected": "Selected",
-    "model.longContext": "1M context",
-    "model.longContextUnavailable": "This model does not support a 1M context.",
+    // The context window became a three-way choice on 2026-09-02
+    // (docs/ctx-tiers-2026-09.md). Deliberately no "recommended" marker on any
+    // tier: the default is already the signal, and labelling one option would
+    // read as advice the estimate cannot actually give for every machine.
+    "model.contextWindow": "Context window",
     "model.change": "Change",
     "chat.model.servingTitle": "Reported by the coordinator that loaded it — this is what answers you.",
     "chat.model.selectedTitle": "Your choice in Settings. The cluster has not reported which model it loaded, so this is what requests are sent for.",
@@ -501,7 +510,6 @@ export const STRINGS = {
     // Tray menu. Kept short: on Windows this is a right-click menu in the
     // notification area, not a place for sentences.
     "tray.open": "Open IdleToken",
-    "tray.checkUpdate": "Check for updates…",
     "tray.quit": "Quit IdleToken",
     "tray.statusIdle": "IdleToken — not serving",
     "tray.statusServing": "IdleToken — serving ({n} machines)",
@@ -639,6 +647,8 @@ export const STRINGS = {
     "pairing.err.subnet": "集群拒绝了本机：本机与集群不在同一子网，而该集群限制了「仅限同子网」。",
     "pairing.err.joinNeedsModel":
       "该集群运行 {model} 的 {quant} 精度，本机还没有这份权重。下载完成后即可加入。",
+    "pairing.err.joinNeedsCtx":
+      "该集群的上下文长度是 {want}，本机设置的是 {have}。同一集群内所有机器必须使用相同的上下文长度，请在上方改成一致后重试。",
     "pairing.err.rejected": "集群拒绝了本机：{detail}",
     "pairing.err.portBusy":
       "无法创建集群：本机端口 {port} 已被占用，其它机器将无法注册。请关闭占用该端口的程序（通常是尚未退出的旧 IdleToken），或换一台机器创建集群。",
@@ -764,7 +774,7 @@ export const STRINGS = {
     "platform.overflow.name": "请求外援",
     "platform.overflow.optionHint": "本地推理槽被占用时，立即交给其他用户完成（消耗火花）。",
     "platform.overflow.off": "繁忙时请求外援",
-    "platform.overflow.on": "外援中",
+    "platform.overflow.on": "外援就绪",
     "platform.overflow.needLogin": "登录后才能把本地来不及完成的请求路由给其他用户。",
     "platform.overflow.needService": "启动模型后才能开启外援",
     "platform.overflow.hint":
@@ -852,8 +862,7 @@ export const STRINGS = {
     "chat.toLive": "跟随生成",
     "model.serving": "正在回答",
     "model.selected": "已选模型",
-    "model.longContext": "1M上下文",
-    "model.longContextUnavailable": "该模型不支持 1M 上下文。",
+    "model.contextWindow": "上下文长度",
     "model.change": "更换",
     "chat.model.servingTitle": "由加载它的协调者上报——回答你的就是这个模型。",
     "chat.model.selectedTitle": "这是你在「设置」里选的模型。集群还没上报它加载的是哪个，请求就按这个发。",
@@ -908,7 +917,6 @@ export const STRINGS = {
     "update.upToDate": "已是最新版本（{current}）",
     "update.checkFailed": "无法检查更新：",
     "tray.open": "打开 IdleToken",
-    "tray.checkUpdate": "检查更新…",
     "tray.quit": "退出 IdleToken",
     "tray.statusIdle": "IdleToken — 未在服务",
     "tray.statusServing": "IdleToken — 服务中（{n} 台机器）",

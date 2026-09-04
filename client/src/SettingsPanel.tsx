@@ -47,7 +47,7 @@ interface Field {
   step?: number;
   unit?: string;
   placeholder?: string;
-  action?: "export" | "import" | "clearData" | "checkUpdate";
+  action?: "export" | "import" | "clearData";
   showIf?: (s: AppSettings) => boolean;
 }
 interface Section {
@@ -247,12 +247,6 @@ const CATEGORIES: Category[] = [
       { label: { en: "Startup", zh: "开机启动" }, fields: [
         { key: "autostart", type: "toggle", label: { en: "Launch at login", zh: "开机自动启动" } },
       ] },
-      { label: { en: "Updates", zh: "更新" }, fields: [
-        { key: "autoUpdate", type: "toggle", label: { en: "Check for updates automatically", zh: "自动检查更新" } },
-        { key: "updateChannel", type: "select", label: { en: "Update channel", zh: "更新通道" }, options: [
-          { value: "stable", label: { en: "Stable", zh: "稳定版" } }, { value: "beta", label: { en: "Beta", zh: "测试版" } } ] },
-        { type: "action", action: "checkUpdate", label: { en: "Check for updates now", zh: "立即检查更新" } },
-      ] },
     ],
   },
   {
@@ -347,7 +341,6 @@ export default function SettingsPanel(props: {
   /** Run an update check the user asked for. App owns it because every outcome
    *  — found / already current / could not check — is shown in the same
    *  dialog, and that dialog belongs above this panel. */
-  onCheckUpdate?: () => Promise<void> | void;
   // Sidebar IA: settings is a PLACE now, rendered inline in the content area.
   // (The modal wrapper remains only for potential embedded reuse.)
   asPage?: boolean;
@@ -367,7 +360,6 @@ export default function SettingsPanel(props: {
   const [query, setQuery] = useState("");
   // The button says "checking" while the feed is being asked; the ANSWER is
   // the dialog App opens, so there is nothing to report back here.
-  const [upd, setUpd] = useState<"idle" | "busy">("idle");
   const fileRef = useRef<HTMLInputElement>(null);
   const s = props.settings;
   const set = <K extends keyof AppSettings>(k: K, v: AppSettings[K]) => props.onChange({ ...s, [k]: v });
@@ -423,11 +415,7 @@ export default function SettingsPanel(props: {
       link.download = "idletoken-settings.json";
       link.click();
       URL.revokeObjectURL(url);
-    } else if (a === "checkUpdate") {
-      if (upd === "busy") return;
-      setUpd("busy");
-      void Promise.resolve(props.onCheckUpdate?.()).finally(() => setUpd("idle"));
-    } else if (a === "import") {
+        } else if (a === "import") {
       fileRef.current?.click();
     } else if (a === "clearData") {
       if (confirm(lang === "zh" ? "确定清除本机全部 IdleToken 数据？" : "Clear all IdleToken data on this machine?")) {
@@ -480,14 +468,13 @@ export default function SettingsPanel(props: {
       return <StoredModels key={i} modelDir={s.modelDir} onChanged={props.onWeightsChanged} />;
     if (f.type === "action") {
       let btnLabel = label;
-      if (f.action === "checkUpdate" && upd === "busy") btnLabel = t("update.checking");
       return (
         <div key={i} className="setting-row setting-row--inline">
           <div className="setting-row__label">
             <span className="setting-row__k">{label}</span>
             {hint ? <span className="setting-row__hint">{hint}</span> : null}
           </div>
-          <button className={`btn-secondary${f.action === "clearData" ? " btn-danger" : ""}`} disabled={f.action === "checkUpdate" && upd === "busy"} onClick={() => runAction(f.action)}>{btnLabel}</button>
+          <button className={`btn-secondary${f.action === "clearData" ? " btn-danger" : ""}`} onClick={() => runAction(f.action)}>{btnLabel}</button>
         </div>
       );
     }
@@ -594,8 +581,9 @@ export default function SettingsPanel(props: {
         <div className="setting-group__label">{L({ en: "Inference", zh: "推理" }, lang)}</div>
         {renderField({ key: "maxTokens", type: "number", label: { en: "Max tokens per reply", zh: "单次回复最大词元数" } }, 0)}
         {/* KV precision selectors REMOVED 2026-08-25 (ctx-kv-simplification):
-            the coordinator tiers KV by weight precision (1-2 bit q4_0, 3-4 bit
-            q8_0, higher precision f16-first). Escape hatch for measurements =
+            the coordinator tiers KV by weight precision (1-2 bit q4_0, every
+            other quantized tier q8_0, f16 only for unquantized BF16/F16).
+            Escape hatch for measurements =
             IDLETOKEN_KV_CACHE_TYPE env on the coordinator, deliberately not a
             setting. The cluster page reads back what actually runs
             (/idletoken/v1/stats kv_cache_k/_v). */}

@@ -2,14 +2,11 @@
 # Shared release preflight + provenance emission. Sourced by the per-platform
 # build scripts so the rules live in ONE place.
 #
-# The rules are two, and both exist because their failure is silent:
+# The current installer build has one rule whose failure is silent:
 #
 #   rp_preflight   Refuse to start a release build from a source tree nobody
-#                  can reconstruct, and refuse to start one whose signing key
-#                  is not the key installed clients trust. The second is the
-#                  nastier of the two: signing with the wrong key succeeds,
-#                  verifies against its own public key, and is only discovered
-#                  by users whose updater rejects the release (DIST-08, OPS-04).
+#                  can reconstruct. Native installers do not use an updater
+#                  signing key.
 #
 #   rp_emit        Write and sign the provenance record for what was just
 #                  built, and append it to the transparency log. Skipping this
@@ -36,6 +33,30 @@ rp_warn() { printf '  !! %s\n' "$*"; }
 
 # --- is this tree reconstructible? ------------------------------------------
 rp_check_tree() {
+    # Remote package nodes are rsync build trees, not authoritative Git
+    # checkouts. sync-to-spark.sh writes this record from the source worktree
+    # immediately before the copy. Prefer it over the node's stale .git and
+    # unrelated test logs, but accept only an explicitly clean source commit.
+    if [ -f "$RP_ROOT/provenance.json" ]; then
+        local synced_head
+        synced_head=$(python3 - "$RP_ROOT/provenance.json" <<'PY' 2>/dev/null
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    head = d.get("head", "")
+    if d.get("schema_version") == 1 and d.get("dirty") is False and len(head) == 40:
+        print(head)
+except Exception:
+    pass
+PY
+)
+        if [ -n "$synced_head" ]; then
+            rp_say "source tree: clean sync from ${synced_head%${synced_head#????????????}}"
+            return 0
+        fi
+        rp_warn "provenance.json does not describe a clean source commit"
+        [ "${IDLETOKEN_RELEASE_ALLOW_DIRTY:-0}" = "1" ] || return 1
+    fi
     if ! git -C "$RP_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
         rp_warn "not a git worktree — a release from here has no commit to point at"
         [ "${IDLETOKEN_RELEASE_ALLOW_DIRTY:-0}" = "1" ] || return 1
@@ -55,15 +76,15 @@ rp_check_tree() {
     return 0
 }
 
-# --- is the signing key the key installed clients trust? ---------------------
-# Proved by signing a nonce and verifying it against the PINNED public key from
-# tauri.conf.json, with our own verifier. Comparing key files would only prove
-# two files match; this proves the key can produce signatures an installed
-# client accepts, which is the property that matters.
+# --- is the signing key the key we published? --------------------------------
+# Proved by signing a nonce and verifying it against the PUBLISHED public key in
+# release-channels.json, with our own verifier. Comparing key files would only
+# prove two files match; this proves the key can produce signatures that
+# verify_release.sh accepts, which is the property that matters.
 rp_check_key() {
     local key="${TAURI_SIGNING_PRIVATE_KEY_PATH:-$HOME/.idletoken/updater.key}"
     local signer="$RP_ROOT/client/node_modules/.bin/tauri"
-    local conf="$RP_ROOT/client/src-tauri/tauri.conf.json"
+    local conf="$RP_ROOT/scripts/release-channels.json"
     if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ] && [ ! -f "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
         rp_say "signing key supplied as material in the environment — key-match check skipped"
         return 0
@@ -89,14 +110,19 @@ rp_check_key() {
         rp_warn "the key at $key cannot sign (wrong password, or not a signing key)"
         rm -rf "$t"; return 1
     fi
-    local pinned; pinned=$(python3 -c "import json;print(json.load(open('$conf'))['plugins']['updater']['pubkey'])" 2>/dev/null)
+    local pinned; pinned=$(python3 -c "import json;print(json.load(open('$conf'))['releaseSigningKey']['publicKey'])" 2>/dev/null)
+    if [ -z "$pinned" ]; then
+        rp_warn "release-channels.json publishes no releaseSigningKey — cannot tell whether this key is the release key"
+        rm -rf "$t"; return 1
+    fi
     if python3 "$RP_LIB_DIR/minisign_verify.py" --pubkey "$pinned" --sig "$t/nonce.sig" "$t/nonce" >/dev/null 2>&1; then
-        rp_say "signing key verified against the pinned updater trust root"
+        rp_say "signing key verified against the published release signing key"
         rm -rf "$t"; return 0
     fi
-    rp_warn "THE SIGNING KEY IS NOT THE RELEASE KEY. Artifacts signed with it would be"
-    rp_warn "rejected by every installed client. Restore the backed-up key; do not"
-    rp_warn "generate a replacement — a new key orphans every existing installation."
+    rp_warn "THE SIGNING KEY IS NOT THE RELEASE KEY. Provenance signed with it would be"
+    rp_warn "rejected by verify_release.sh for everyone who downloads this release."
+    rp_warn "Restore the backed-up key; do not generate a replacement — a new key"
+    rp_warn "invalidates every published key id users may have written down."
     rm -rf "$t"; return 1
 }
 
@@ -105,7 +131,6 @@ rp_preflight() {
     echo "== release preflight ($label) =="
     local rc=0
     rp_check_tree || rc=1
-    rp_check_key  || rc=1
     [ "$rc" = 0 ] && rp_say "preflight ok"
     return "$rc"
 }

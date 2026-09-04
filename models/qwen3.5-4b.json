@@ -6,6 +6,7 @@
   "arch": "qwen35",
   "available": true,
   "deployment": "cluster",
+  "min_quant": "Q4_K_M",
   "license": "Apache-2.0",
   "params_summary": "4B · 32 layers · hybrid linear attention (Gated DeltaNet 3:1 full)",
   "n_layers": 32,
@@ -47,10 +48,36 @@
     "boundary_multiple": 0
   },
   "overhead_base_bytes": 1288490188,
-  "compute_bytes_256k_cuda": 519045120,
-  "compute_bytes_1m_cuda": 1140871660,
-  "compute_bytes_256k_metal": 519045120,
-  "compute_bytes_1m_metal": 1157743247,
+  "compute_bytes_128k_cuda": [
+    519045120,
+    723811041,
+    723811041
+  ],
+  "compute_bytes_256k_cuda": [
+    519045120,
+    1394899681,
+    1394899681
+  ],
+  "compute_bytes_1m_cuda": [
+    1140871660,
+    5421431521,
+    5421431521
+  ],
+  "compute_bytes_128k_metal": [
+    519045120,
+    653556449,
+    653556449
+  ],
+  "compute_bytes_256k_metal": [
+    519045120,
+    787774177,
+    787774177
+  ],
+  "compute_bytes_1m_metal": [
+    1157743247,
+    1149239296,
+    1148977152
+  ],
   "chat_template": "gguf",
   "layer_weight_bytes": 1520217248,
   "shared_weight_bytes": 0,

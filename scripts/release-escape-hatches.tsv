@@ -36,8 +36,6 @@
 # truthful answer for them, not because they can be reached.
 #
 NAME	SURFACE	ENFORCEMENT	LOCATION	NOTE
-IDLETOKEN_UPDATE_URL	shipped-binary	compiled-out	client/src-tauri/src/update.rs:52	Points the updater at another feed. Compiled out of release builds (overrides_allowed()); with ENV_PUBKEY it would be a complete signed-update bypass. Asserted by the feed_url_routing test in both profiles.
-IDLETOKEN_UPDATE_PUBKEY	shipped-binary	compiled-out	client/src-tauri/src/update.rs:53	Replaces the updater trust root. Same enforcement and same test as IDLETOKEN_UPDATE_URL.
 IDLETOKEN_UI_TEST	shipped-binary	loud	client/src-tauri/src/main.rs:885	Scripts the client's UI through the same provider calls a click uses. A non-empty parsed directive list is snapshotted once at process entry and prints a fixed "*** TEST OVERRIDE ACTIVE ***" stderr disclosure before Tauri can return any directive; unset, empty and separator-only values stay silent, and directive contents are never included in this disclosure.
 IDLETOKEN_FORCE_NO_NVML	shipped-binary	loud	src/common/resource.c:97	Makes the NVML probe report no driver. On Windows it prints an explicit "*** TEST OVERRIDE ACTIVE *** ... forced by IDLETOKEN_FORCE_NO_NVML" diagnostic before returning NULL; a genuine missing driver retains the distinct "nvml.dll not found" diagnostic. Metal/Linux forced paths remain loud.
 IDLETOKEN_FAKE_CC	shipped-binary	loud	src/common/resource.c:591	Replaces the reported CUDA compute capability. Prints "*** TEST OVERRIDE ***".
@@ -58,7 +56,6 @@ IDLETOKEN_FORCE_BACKEND	shipped-binary	loud	src/coord/coord_main.c:8071	Selects 
 IDLETOKEN_FORCE_LAYERS	shipped-binary	loud	src/coord/coord_main.c:623	Pins each stage's layer range instead of using the planner. Prints "override active".
 IDLETOKEN_NO_CACHE_REPORT	shipped-binary	loud	src/tools/platform_agent.c:388	Stops the platform agent reporting cached prompt-prefix Bloom state. Announces itself on stderr and names PRIV-06; costs this machine prefix-affinity routing and cannot weaken a security verdict.
 IDLETOKEN_ALLOW_MACOS_NODE	shipped-binary	config	include/idletoken_proto.h:153	Retired hatch from the macOS seal (lifted 2026-08-14). Accepted and ignored; kept so old scripts do not fail.
-IDLETOKEN_NO_FIREWALL_RULE	shipped-binary	config	src/worker/worker_main.c	Skips creating the Windows firewall rule for operators who manage rules themselves. Cannot weaken a check; the port simply stays closed.
 IDLETOKEN_NO_CHUNKED_PREFILL	shipped-binary	config	src/coord/coord_main.c	Performance switch for chunked prefill. No security effect.
 IDLETOKEN_FULL_LOGITS	shipped-binary	config	src/coord/coord_main.c	Returns full logits for numerical comparison work. Costly, not weakening.
 IDLETOKEN_MMAP_DEBUG	shipped-binary	config	src/platform/win/win_compat.c:114	Extra tracing for the Windows mmap shim. Diagnostic only.

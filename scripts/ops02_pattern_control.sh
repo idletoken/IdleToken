@@ -9,15 +9,15 @@
 # and a `grep -P` on BSD grep counting nothing forever).
 #
 # The four patterns under test were added 2026-08-30 because the existing list
-# only recognised PEM private keys — and the updater signing key, the single
+# only recognised PEM private keys — and the release signing key, the single
 # most damaging secret in this repository, is not PEM. It is minisign/rsign,
 # and Tauri stores it base64-encoded on top. Before those patterns existed,
-# pasting the updater private key into any file destined for the public mirror
+# pasting the release private key into any file destined for the public mirror
 # passed the scan clean.
 #
 # Three assertions, because two of them are the ones people forget:
 #   1. KNOWN HIT   — each real-world shape of the secret is caught.
-#   2. KNOWN MISS  — the deliberately PUBLISHED updater public key is NOT caught.
+#   2. KNOWN MISS  — the deliberately PUBLISHED release public key is NOT caught.
 #                    It shares the "untrusted comment:" prefix; a pattern that
 #                    flagged it would red-flag every single release.
 #   3. NO FALSE POSITIVES — nothing already in the tree matches, so adding these
@@ -60,8 +60,12 @@ python3 -c "import base64,sys;open(sys.argv[2],'w').write(base64.b64encode(open(
         "$T/hit_minisign_plain.txt" "$T/hit_minisign_b64.txt"
 printf 'set "%s=%s"\n' "TAURI_SIGNING_PRIVATE_KEY" "dW50cnVzdGVkIGNvbW1lbnQ6" > "$T/hit_envvar.txt"
 
-# Known-MISS fixture: the real, deliberately published updater PUBLIC key.
-cp "$REPO/client/src-tauri/tauri.conf.json" "$T/miss_published_pubkey.json" 2>/dev/null
+# Known-MISS fixture: the real, deliberately published release signing PUBLIC
+# key. It moved out of tauri.conf.json when the updater was removed
+# (2026-09-02); pointing this at the old file would leave the control copying a
+# file with no key in it, which trips nothing for the wrong reason and reads as
+# a pass forever.
+cp "$REPO/scripts/release-channels.json" "$T/miss_published_pubkey.json" 2>/dev/null
 
 rc=0
 echo "== known HITs (each must be caught by at least one FORBIDDEN pattern) =="
@@ -80,7 +84,7 @@ done
 
 echo "== known MISS (the published PUBLIC key must trip nothing) =="
 if [ ! -f "$T/miss_published_pubkey.json" ]; then
-    echo "  [skip] no tauri.conf.json in this checkout"
+    echo "  [skip] no release-channels.json in this checkout"
 else
     hit=0
     while IFS= read -r p; do
@@ -88,7 +92,7 @@ else
         grep -rInE "$p" "$T/miss_published_pubkey.json" >/dev/null 2>&1 && {
             echo "  [BAD] tripped by: $p — this would red-flag every release"; hit=1; rc=1; }
     done <<< "$PATS"
-    [ "$hit" = 0 ] && echo "  [ok]  tauri.conf.json (published updater public key) trips nothing"
+    [ "$hit" = 0 ] && echo "  [ok]  release-channels.json (published release signing public key) trips nothing"
 fi
 
 echo "== no false positives in the current tree (the four added patterns) =="

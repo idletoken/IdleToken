@@ -15,10 +15,11 @@ a few days.
   rather than honouring it. Browser requests that carry an `Origin` header are
   refused as a CSRF control; ordinary local API clients do not carry one. This
   is not authentication against another program running on the same computer,
-  so local use is also bounded by the daily consumption limit. If an operator
-  explicitly configures the legacy API-token option, that token is still
-  enforced. To reach your own cluster from elsewhere, use the platform relay
-  rather than exposing the port.
+  so platform consumption is bounded by the account's Spark balance. A daily
+  limit applies only when a user or operator explicitly configures one. If an
+  operator explicitly configures the legacy API-token option, that token is
+  still enforced. To reach your own cluster from elsewhere, use the platform
+  relay rather than exposing the port.
 - **The LAN is trusted for discovery and pairing.** Nodes find each other over
   UDP broadcast on the local network. Cluster links between machines carry TLS
   with a pre-shared key minted by the coordinator, and a worker refuses to start
@@ -44,38 +45,18 @@ a few days.
 
 ## Verifying your download
 
-The in-app updater installs nothing whose signature does not verify against the
-key compiled into the client (`28F23C3CE24BFDE9`). That protects upgrades of an
-already-official install. It does **not** help with the first install: an
-attacker's build simply carries the attacker's own key and updates itself
-happily.
-
-So every release also publishes a signed provenance record listing the SHA-256
-of each artifact, and a verifier that needs neither IdleToken nor any extra
-tool:
-
-```
-scripts/verify_release.sh --provenance idletoken-release-<version>-<platform>.provenance.json <the-installer>
-```
-
-It refuses unless the record is signed by `28F23C3CE24BFDE9` **and** your file's
-digest is the one the record lists. `scripts/minisign_verify.py` does the
-signature check on its own — pure Python, no dependencies, deliberately a second
-implementation rather than the one the client uses, so a bug in one does not
-silently excuse the other.
+Current releases contain native installers only. There is no in-app updater,
+update feed, updater ZIP, detached signature or provenance sidecar. Download
+the installer from the official GitHub release and compare its SHA-256 with the
+digest GitHub displays for that asset before running it.
 
 Official downloads come only from
 `https://github.com/idletoken/IdleToken/releases`. Software portals, cloud-drive
 links, chat attachments and "green"/repacked builds are not ours whatever they
 are called. `scripts/release-channels.json` is the machine-readable list of
-official origins, the key fingerprint, and the things support will never ask you
-to do — notably: we never ask anyone to run a downloaded "repair tool" or
+official origins and the things support will never ask you to do — notably: we
+never ask anyone to run a downloaded "repair tool" or
 "accelerator pack", and we never ask for a key, token, pairing code or PSK.
-
-Every release is also appended to a hash-chained log in `releases/`. That does
-not prevent a release signed with a stolen key, but it means such a release is
-either absent from the log or permanently recorded in it, and rewriting the log
-breaks the chain against any older copy.
 
 ## Out of scope
 

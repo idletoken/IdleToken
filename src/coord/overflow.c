@@ -13,6 +13,7 @@
 
 #include "idletoken_overflow.h"
 #include "idletoken_admission.h"
+#include "idletoken_apiconv.h"
 #include "idletoken_b64.h"
 #include "idletoken_http.h"
 #include "idletoken_privacy.h"
@@ -28,6 +29,7 @@
  * the CLIENT's loopback SSE (Clash and friends) cannot reach this connection.
  * A TUN-mode VPN still can, and that is out of any application's hands. */
 #include "idletoken_llama_sidecar.h"
+#include "idletoken_net.h"
 
 #include "tweetnacl.h"
 
@@ -278,11 +280,11 @@ int idletoken_overflow_configure(const idletoken_overflow_cfg *cfg,
      * at this machine had to be handed a key, and an install upgraded from
      * before token minting could not switch sharing on at all.
      *
-     * What guards the balance now: the daily cap below (a real ceiling, not a
-     * door), and — for the one attacker the token DID stop, a web page in your
-     * browser firing blind requests at localhost — the coordinator's Origin
-     * check, which costs the user nothing because no API client sends that
-     * header. See api_origin_ok() in coord_main.c.
+     * What guards spending now is the account's Spark balance. An operator may
+     * additionally set a positive daily cap below. For the one attacker the
+     * token DID stop, a web page in your browser firing blind requests at
+     * localhost, the coordinator's Origin check costs the user nothing because
+     * no API client sends that header. See api_origin_ok() in coord_main.c.
      *
      * `api_token_set` stays in the struct and is still reported: an operator
      * who sets --api-token deliberately should see it reflected, and removing
@@ -346,9 +348,14 @@ int idletoken_overflow_configure(const idletoken_overflow_cfg *cfg,
     long long cap = g_ovf.daily_cap_milli, wait = g_ovf.wait_ms;
     pthread_mutex_unlock(&g_ovf_mu);
 
-    fprintf(stderr, "coord: overflow: on — platform %s, verify key %s, "
-                    "forward when the wait is >= %lldms, at most %lld "
-                    "milli-credits a day\n", cfg->url, src, wait, cap);
+    if (cap > 0)
+        fprintf(stderr, "coord: overflow: on — platform %s, verify key %s, "
+                        "forward when the wait is >= %lldms, explicit local "
+                        "cap %lld milli-credits/day\n", cfg->url, src, wait, cap);
+    else
+        fprintf(stderr, "coord: overflow: on — platform %s, verify key %s, "
+                        "forward when the wait is >= %lldms, no local daily cap "
+                        "(account balance is the spend gate)\n", cfg->url, src, wait);
     /* Said out loud, once, at the moment the setting takes effect. The envelope
      * hides a borrowed prompt from the NETWORK; it does not hide it from the
      * endpoint that opens it or from the provider that endpoint picks, and both
@@ -493,7 +500,8 @@ int idletoken_overflow_should_forward(idletoken_origin origin, int want_stream,
             reason = "off";
         } else {
             ovf_roll_day();
-            if (g_ovf.spent_milli >= g_ovf.daily_cap_milli) {
+            if (g_ovf.daily_cap_milli > 0 &&
+                g_ovf.spent_milli >= g_ovf.daily_cap_milli) {
                 reason = "daily spend cap reached";
             } else if (est_wait_ms < g_ovf.wait_ms) {
                 reason = "the estimated wait is below the threshold";
@@ -562,6 +570,38 @@ static int ovf_str_span(const char *json, size_t len, const char *key,
     return -1;
 }
 
+static int ovf_span_eq(const char *span, size_t span_len, const char *literal) {
+    const size_t literal_len = strlen(literal);
+    return span && span_len == literal_len &&
+           memcmp(span, literal, literal_len) == 0;
+}
+
+/* Convert a trusted, decrypted platform error into a deliberately small set of
+ * stable codes. The free-form message is log-only: relaying it could expose
+ * platform internals, but collapsing every refusal to "coordinator busy" made
+ * an exhausted key cap look like a scheduling failure and triggered minutes of
+ * pointless client retries. */
+static const char *ovf_platform_refusal_code(const char *json, size_t len) {
+    const char *type = NULL, *code = NULL;
+    size_t type_len = 0, code_len = 0;
+    (void)ovf_str_span(json, len, "type", &type, &type_len);
+    (void)ovf_str_span(json, len, "code", &code, &code_len);
+
+    if (ovf_span_eq(code, code_len, "api_key_daily_cap"))
+        return "api_key_daily_cap";
+    if (ovf_span_eq(code, code_len, "no_provider_online"))
+        return "no_provider_online";
+    if (ovf_span_eq(type, type_len, "insufficient_quota"))
+        return "insufficient_credits";
+    if (ovf_span_eq(type, type_len, "invalid_request_error"))
+        return "invalid_request";
+    if (ovf_span_eq(type, type_len, "rate_limit_error"))
+        return "rate_limited";
+    if (ovf_span_eq(type, type_len, "api_error"))
+        return "provider_unavailable";
+    return "platform_refused";
+}
+
 /* First integer value for `key`, or `dflt`. Reaches into nested objects by
  * design: the reply's numbers live under "usage" and "credits", and the field
  * names are unique across the whole body. */
@@ -614,7 +654,11 @@ static int ovf_ensure_key(const char *addr, int *out_unreachable,
     size_t rlen = 0;
     char *body = idletoken_llama_http_read_all(&c, &rlen, 64u * 1024u);
     idletoken_llama_http_close(&c);
-    if (status != 200 || !body) {
+    /* Any 2xx, for the reason spelled out at the sealed/chat status check: a
+     * GET is 200 under Nest today, but "which success code does the peer use"
+     * must not be the thing that decides whether this feature works. The
+     * signature check below is what actually admits this key. */
+    if (status < 200 || status >= 300 || !body) {
         free(body);
         /* 503 is the platform's specified answer when it has no signing key
          * configured. It must never answer with an unsigned one, so this is the
@@ -651,7 +695,10 @@ static int ovf_ensure_key(const char *addr, int *out_unreachable,
 void idletoken_overflow_reply_free(idletoken_overflow_reply *r) {
     if (!r) return;
     free(r->text_escaped);
+    free(r->tool_calls_json);
     r->text_escaped = NULL;
+    r->tool_calls_json = NULL;
+    r->finish_reason[0] = '\0';
 }
 
 /* A stable pseudonym for this installation. Derived from the local-origin
@@ -683,14 +730,20 @@ int idletoken_overflow_origin_id(char *out, size_t cap) {
     return 0;
 }
 
-int idletoken_overflow_exchange(const char *messages_json,
-                                const char *model, int max_tokens,
+int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
+                                const char *tools_json, size_t tools_len,
+                                const char *tool_choice_json,
+                                size_t tool_choice_len,
+                                const char *model, const char *quant,
+                                int max_tokens,
                                 int hops_in,
                                 idletoken_overflow_reply *out,
                                 char *err, size_t err_cap) {
     if (err && err_cap) err[0] = '\0';
     if (!out || !messages_json) OVF_FAIL("nothing to forward");
     memset(out, 0, sizeof(*out));
+    if (quant && quant[0] && !idletoken_peer_host_ok(quant, 64))
+        OVF_FAIL("cannot forward an invalid precision label");
 
     char url[256], api_key[192];
     pthread_mutex_lock(&g_ovf_mu);
@@ -744,23 +797,45 @@ int idletoken_overflow_exchange(const char *messages_json,
 
     /* The plaintext, and the only place it exists outside this machine's own
      * memory is nowhere: it is sealed before the socket is opened. */
-    size_t inner_cap = strlen(messages_json) + strlen(api_key) +
-                       (model ? strlen(model) : 0) + sizeof prov + 256;
+    size_t inner_cap = messages_len + tools_len + tool_choice_len +
+                       strlen(api_key) + (model ? strlen(model) : 0) +
+                       (quant ? strlen(quant) : 0) +
+                       sizeof prov + 320;
     char *inner = malloc(inner_cap);
     if (!inner) OVF_FAIL("out of memory");
     int inner_len;
     if (max_tokens > 0)
         inner_len = snprintf(inner, inner_cap,
-                             "{\"api_key\":\"%s\",\"model\":\"%s\","
-                             "\"messages\":%s,\"max_tokens\":%d,"
+                             "{\"api_key\":\"%s\",\"model\":\"%s\"%s%s%s,"
+                             "\"messages\":%.*s,\"max_tokens\":%d%s%.*s%s%.*s,"
                              "\"nonce\":\"%s\",\"issued_at\":%lld%s}",
-                             api_key, model ? model : "", messages_json, max_tokens,
+                             api_key, model ? model : "",
+                             quant && quant[0] ? ",\"quant\":\"" : "",
+                             quant && quant[0] ? quant : "",
+                             quant && quant[0] ? "\"" : "",
+                             (int)messages_len,
+                             messages_json, max_tokens,
+                             tools_json && tools_len ? ",\"tools\":" : "",
+                             (int)tools_len, tools_json && tools_len ? tools_json : "",
+                             tool_choice_json && tool_choice_len ? ",\"tool_choice\":" : "",
+                             (int)tool_choice_len,
+                             tool_choice_json && tool_choice_len ? tool_choice_json : "",
                              nonce_hex, issued_at, prov);
     else
         inner_len = snprintf(inner, inner_cap,
-                             "{\"api_key\":\"%s\",\"model\":\"%s\",\"messages\":%s,"
+                             "{\"api_key\":\"%s\",\"model\":\"%s\"%s%s%s,\"messages\":%.*s%s%.*s%s%.*s,"
                              "\"nonce\":\"%s\",\"issued_at\":%lld%s}",
-                             api_key, model ? model : "", messages_json,
+                             api_key, model ? model : "",
+                             quant && quant[0] ? ",\"quant\":\"" : "",
+                             quant && quant[0] ? quant : "",
+                             quant && quant[0] ? "\"" : "",
+                             (int)messages_len,
+                             messages_json,
+                             tools_json && tools_len ? ",\"tools\":" : "",
+                             (int)tools_len, tools_json && tools_len ? tools_json : "",
+                             tool_choice_json && tool_choice_len ? ",\"tool_choice\":" : "",
+                             (int)tool_choice_len,
+                             tool_choice_json && tool_choice_len ? tool_choice_json : "",
                              nonce_hex, issued_at, prov);
     if (inner_len < 0 || (size_t)inner_len >= inner_cap) {
         free(inner);
@@ -827,7 +902,20 @@ int idletoken_overflow_exchange(const char *messages_json,
     size_t rlen = 0;
     char *resp = idletoken_llama_http_read_all(&c, &rlen, 8u * 1024u * 1024u);
     idletoken_llama_http_close(&c);
-    if (status != 200 || !resp) {
+    /* Any 2xx. NOT `== 200`, which is what it said until 2026-09-03 and is why
+     * overflow had never once succeeded in production: NestJS answers a @Post
+     * with 201 by default, so every borrowed answer — routed, generated and
+     * BILLED — was dropped here and the caller got the ordinary busy 429
+     * (measured between two Windows providers). The platform now pins 200, but
+     * pinning it there and demanding it here are two different promises: this
+     * binary ships to users and outlives any one gateway deploy, and
+     * src/tools/platform_agent.c had already learned the same lesson (it
+     * accepts 200 or 201) without this caller being told.
+     *
+     * Widening costs nothing, because the status code is not what validates a
+     * reply: everything below has to open a sealed envelope this coordinator
+     * minted the key for. A 2xx carrying anything else fails there, loudly. */
+    if (status < 200 || status >= 300 || !resp) {
         free(resp);
         idletoken_secure_zero(&reply_kp, sizeof reply_kp);
         /* The platform's own body is deliberately not quoted: it may describe
@@ -863,34 +951,69 @@ int idletoken_overflow_exchange(const char *messages_json,
     }
 
     /* No "text" means the platform sealed an error back instead of an answer
-     * (insufficient credits, a key past its cap, moderation). That is still a
-     * failure for the local caller: it gets the ordinary 429, and only the log
-     * learns which one. Handing "insufficient credits" back as the reply to a
-     * chat request would make a billing problem look like the model talking. */
+     * (insufficient credits, an explicitly capped key, moderation). It must not
+     * become assistant text, but it is also not a local scheduling failure.
+     * Return a safe stable code so the HTTP layer can tell the caller what kind
+     * of action is needed instead of inviting pointless busy retries. */
     const char *txt = NULL;
     size_t txt_len = 0;
-    if (ovf_str_span((const char *)plain, plain_len, "text", &txt, &txt_len) != 0) {
+    const int have_text =
+        ovf_str_span((const char *)plain, plain_len, "text", &txt, &txt_len) == 0;
+    const char *tool_calls = idletoken_json_obj_get((const char *)plain, plain_len,
+                                                    "tool_calls");
+    long tool_calls_len = tool_calls
+        ? idletoken_json_value_len(tool_calls, (const char *)plain + plain_len)
+        : -1;
+    const int have_tool_calls = tool_calls_len > 2 && tool_calls[0] == '[';
+    if (!have_text && !have_tool_calls) {
         const char *etype = NULL, *emsg = NULL;
         size_t et_len = 0, em_len = 0;
         if (ovf_str_span((const char *)plain, plain_len, "type", &etype, &et_len) == 0 &&
             ovf_str_span((const char *)plain, plain_len, "message", &emsg, &em_len) == 0) {
+            const char *refusal = ovf_platform_refusal_code((const char *)plain,
+                                                            plain_len);
             fprintf(stderr, "coord: overflow: the platform refused: %.*s - %.*s\n",
                     (int)et_len, etype, (int)em_len, emsg);
             idletoken_secure_zero(plain, plain_len);
             free(plain);
-            OVF_FAIL("platform refused the request (%.*s)", (int)et_len, etype);
+            if (err && err_cap) snprintf(err, err_cap, "%s", refusal);
+            return IDLETOKEN_OVF_EXCHANGE_REFUSED;
         }
         idletoken_secure_zero(plain, plain_len);
         free(plain);
-        OVF_FAIL("the platform's answer carried neither text nor an error");
+        OVF_FAIL("the platform's answer carried neither text, tool_calls nor an error");
     }
-    out->text_escaped = malloc(txt_len + 1);
+    out->text_escaped = malloc((have_text ? txt_len : 0) + 1);
     if (!out->text_escaped) {
+        idletoken_secure_zero(plain, plain_len);
         free(plain);
         OVF_FAIL("out of memory");
     }
-    memcpy(out->text_escaped, txt, txt_len);
-    out->text_escaped[txt_len] = '\0';
+    if (have_text) memcpy(out->text_escaped, txt, txt_len);
+    out->text_escaped[have_text ? txt_len : 0] = '\0';
+    if (have_tool_calls) {
+        out->tool_calls_json = malloc((size_t)tool_calls_len + 1);
+        if (!out->tool_calls_json) {
+            idletoken_secure_zero(plain, plain_len);
+            free(plain);
+            idletoken_overflow_reply_free(out);
+            OVF_FAIL("out of memory");
+        }
+        memcpy(out->tool_calls_json, tool_calls, (size_t)tool_calls_len);
+        out->tool_calls_json[tool_calls_len] = '\0';
+    }
+    {
+        const char *fr = NULL;
+        size_t fr_len = 0;
+        if (ovf_str_span((const char *)plain, plain_len, "finish_reason",
+                         &fr, &fr_len) == 0 && fr_len < sizeof out->finish_reason) {
+            memcpy(out->finish_reason, fr, fr_len);
+            out->finish_reason[fr_len] = '\0';
+        } else {
+            snprintf(out->finish_reason, sizeof out->finish_reason, "%s",
+                     have_tool_calls ? "tool_calls" : "stop");
+        }
+    }
     out->in_tokens     = (int)ovf_int_field((const char *)plain, plain_len, "input_tokens", 0);
     out->out_tokens    = (int)ovf_int_field((const char *)plain, plain_len, "output_tokens", 0);
     out->charged_milli = ovf_int_field((const char *)plain, plain_len, "charged_milli", 0);
@@ -1057,6 +1180,36 @@ int idletoken_overflow_selftest(void) {
     OST(iso8601_utc_to_unix("tomorrow") == -1,
         "overflow: a non-date not_after is refused");
 
+    /* Trusted platform errors are classified without copying their free-form
+     * messages to the local client. Positive and negative controls keep the
+     * allowlist from collapsing either to one generic answer or to arbitrary
+     * code passthrough. */
+    {
+        const char capped[] =
+            "{\"error\":{\"type\":\"rate_limit_error\","
+            "\"code\":\"api_key_daily_cap\",\"message\":\"details\"}}";
+        OST(!strcmp(ovf_platform_refusal_code(capped, sizeof capped - 1),
+                    "api_key_daily_cap"),
+            "overflow: a configured API-key cap remains distinguishable from busy");
+    }
+    {
+        const char insufficient[] =
+            "{\"error\":{\"type\":\"insufficient_quota\","
+            "\"message\":\"private platform details\"}}";
+        OST(!strcmp(ovf_platform_refusal_code(insufficient,
+                                              sizeof insufficient - 1),
+                    "insufficient_credits"),
+            "overflow: insufficient credits remains distinguishable from busy");
+    }
+    {
+        const char unknown[] =
+            "{\"error\":{\"type\":\"made_up\",\"code\":\"secret_code\","
+            "\"message\":\"private platform details\"}}";
+        OST(!strcmp(ovf_platform_refusal_code(unknown, sizeof unknown - 1),
+                    "platform_refused"),
+            "overflow: an unknown platform code is not passed through");
+    }
+
     /* ---- RULE 2: what "fail closed" refuses ------------------------------
      * These run before the pin check inside configure(), so they hold in a
      * pinned and an unpinned build alike. */
@@ -1120,10 +1273,16 @@ int idletoken_overflow_selftest(void) {
         const idletoken_origin UNATTR  = IDLETOKEN_ORIGIN_UNATTRIBUTED;
         g_ovf.on = 1;
         g_ovf.wait_ms = 0;
-        g_ovf.daily_cap_milli = 1000;
-        g_ovf.spent_milli = 0;
+        g_ovf.daily_cap_milli = IDLETOKEN_OVF_DEFAULT_DAILY_CAP_MILLI;
+        g_ovf.spent_milli = 999999999;
         g_ovf.day = ovf_today();
         g_ovf_policy = IDLETOKEN_OVF_ORIGIN_CAPABILITY;
+
+        OST(g_ovf.daily_cap_milli == 0 &&
+            idletoken_overflow_should_forward(LOCAL, 0, 0, 0, &why) == 1,
+            "overflow: the product default adds no daily cap above the account balance");
+        g_ovf.daily_cap_milli = 1000;
+        g_ovf.spent_milli = 0;
 
         /* Positive control first: without it every "refused" below would also
          * hold on a predicate that returns 0 unconditionally — which is what a

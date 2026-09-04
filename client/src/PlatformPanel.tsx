@@ -172,7 +172,12 @@ export function OverflowToggleButton({
     try {
       const s = loadSettings();
       const key = s.overflowKey
-        || (await createApiKey({ label: "request help when local slot is busy" })).apiKey;
+        || (await createApiKey({
+          label: "request help when local slot is busy",
+          // Account balance is the spend gate. Automatic overflow must not
+          // silently add a second per-key daily ceiling.
+          dailyCapMilli: null,
+        })).apiKey;
       saveSettings({ ...loadSettings(), overflowEnabled: true, overflowKey: key, overflowWaitS: 0 });
       setOn(true);
       publishMarketplaceChange();

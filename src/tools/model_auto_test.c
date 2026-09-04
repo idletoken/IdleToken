@@ -87,22 +87,97 @@ int main(int argc, char **argv) {
         ok(idletoken_model_from_gguf(curated, &am, err, sizeof(err)) == 0,
            "a GGUF named after a curated model parses");
         ok(strcmp(am.id, "glm-5.2") == 0, "id resolves to the registry id");
-        ok(reg && am.spec.compute_bytes_256k_cuda == reg->compute_bytes_256k_cuda &&
-           am.spec.compute_bytes_1m_cuda    == reg->compute_bytes_1m_cuda &&
-           am.spec.compute_bytes_256k_metal == reg->compute_bytes_256k_metal &&
-           am.spec.compute_bytes_1m_metal   == reg->compute_bytes_1m_metal,
-           "all four measured workspaces are adopted from the registry");
+        /* memcmp over the whole KV-tier array, not `==`: these are arrays
+         * since 2026-09-02, and `==` compares the two addresses — which is
+         * never equal, so the check would fail for the wrong reason. The
+         * negative control below had the mirror bug: an array's address is
+         * never 0, so `== 0` could never hold either. */
+        ok(reg &&
+           !memcmp(am.spec.compute_bytes_256k_cuda, reg->compute_bytes_256k_cuda,
+                   sizeof reg->compute_bytes_256k_cuda) &&
+           !memcmp(am.spec.compute_bytes_1m_cuda, reg->compute_bytes_1m_cuda,
+                   sizeof reg->compute_bytes_1m_cuda) &&
+           !memcmp(am.spec.compute_bytes_256k_metal, reg->compute_bytes_256k_metal,
+                   sizeof reg->compute_bytes_256k_metal) &&
+           !memcmp(am.spec.compute_bytes_1m_metal, reg->compute_bytes_1m_metal,
+                   sizeof reg->compute_bytes_1m_metal),
+           "all four measured workspaces are adopted from the registry, every KV tier");
         remove(curated);
 
         /* The negative control: the gate must still bite for a GGUF nobody
-         * measured. `glm_dsa` is a fixture name, not a registry id. */
-        ok(idletoken_model_from_gguf(path, &am, err, sizeof(err)) == 0 &&
-           idletoken_model_get(am.id) == NULL &&
-           am.spec.compute_bytes_256k_cuda == 0 &&
-           am.spec.compute_bytes_1m_cuda == 0 &&
-           am.spec.compute_bytes_256k_metal == 0 &&
-           am.spec.compute_bytes_1m_metal == 0,
-           "an unregistered GGUF keeps zeros, so the planner still refuses it");
+         * measured. `glm_dsa` is a fixture name, not a registry id. EVERY tier
+         * has to stay zero — one populated entry is enough to let a launch
+         * through on the precision that selects it. */
+        int all_zero = 1;
+        if (idletoken_model_from_gguf(path, &am, err, sizeof(err)) != 0 ||
+            idletoken_model_get(am.id) != NULL)
+            all_zero = 0;
+        else
+            for (int t = 0; t < IDLETOKEN_KV_TIER_COUNT; t++)
+                if (am.spec.compute_bytes_256k_cuda[t] ||
+                    am.spec.compute_bytes_1m_cuda[t] ||
+                    am.spec.compute_bytes_256k_metal[t] ||
+                    am.spec.compute_bytes_1m_metal[t]) all_zero = 0;
+        ok(all_zero,
+           "an unregistered GGUF keeps zeros in every KV tier, so the planner still refuses it");
+    }
+
+    /* ---- the precision an auto-manifest is serving -------------------------
+     * An auto-generated manifest describes ONE file, so it carries no variant
+     * table (model_auto.c sets n_variants = 0) -- and resolving the served
+     * precision against that empty table always answered "". That is not a
+     * harmless blank: the marketplace reads an empty quant as "any precision"
+     * (providerServesModel in shared/models.ts), so every coordinator the
+     * client launches was published as willing to serve every precision of its
+     * model. Measured on both Windows nodes 2026-09-03
+     * (results/agent-stale-registration-20260903.md).
+     *
+     * The fix borrows the registry's table for the same id, so this asserts on
+     * BOTH: a registered id resolves, an unregistered one still cannot. */
+    {
+        const idletoken_model_spec *reg = idletoken_model_get("qwen3.8-27b");
+        ok(reg != NULL && reg->n_variants > 1,
+           "the registry carries a variant table for qwen3.8-27b");
+
+        /* Stand in for what model_auto.c produces: the registry's identity,
+         * none of its menu. */
+        idletoken_model_spec auto_spec;
+        memset(&auto_spec, 0, sizeof(auto_spec));
+        auto_spec.id = "qwen3.8-27b";
+        auto_spec.n_variants = 0;
+        auto_spec.variants = NULL;
+
+        ok(strcmp(idletoken_model_quant_from_gguf(&auto_spec,
+                      "D:\\gguf\\Qwen3.8-27B-UD-Q2_K_XL.gguf"), "Q2_K_XL") == 0,
+           "a variant-less manifest still names its precision (Windows path)");
+        ok(strcmp(idletoken_model_quant_from_gguf(&auto_spec,
+                      "/mnt/gguf/Qwen3.8-27B-UD-IQ2_XXS.gguf"), "IQ2_XXS") == 0,
+           "...and with a POSIX path and a different variant");
+        ok(strcmp(idletoken_model_quant_from_gguf(&auto_spec,
+                      "Qwen3.8-27B-UD-Q2_K_XL.gguf"), "Q2_K_XL") == 0,
+           "...and with no directory at all");
+
+        /* The registry's OWN spec must keep answering identically -- this is
+         * the path the curated cluster launch takes, and it was already right. */
+        ok(strcmp(idletoken_model_quant_from_gguf(reg,
+                      "D:\\gguf\\Qwen3.8-27B-UD-Q2_K_XL.gguf"), "Q2_K_XL") == 0,
+           "a registry spec resolves the same precision it always did");
+
+        /* Negative controls: a name nothing matches, and an id the registry
+         * has never heard of. Both must stay blank rather than borrow from
+         * some other model's menu -- a wrong precision on the wire is worse
+         * than an absent one, because it is believed. */
+        ok(idletoken_model_quant_from_gguf(&auto_spec,
+               "Qwen3.8-27B-UD-NOT_A_QUANT.gguf")[0] == '\0',
+           "an unrecognised file name resolves to no precision");
+        idletoken_model_spec unknown = auto_spec;
+        unknown.id = "not-a-registered-model";
+        ok(idletoken_model_quant_from_gguf(&unknown,
+               "Qwen3.8-27B-UD-Q2_K_XL.gguf")[0] == '\0',
+           "an unregistered id borrows no other model's variant table");
+        ok(idletoken_model_quant_from_gguf(&auto_spec, "")[0] == '\0' &&
+           idletoken_model_quant_from_gguf(NULL, "x.gguf")[0] == '\0',
+           "empty and NULL inputs answer blank instead of crashing");
     }
 
     /* ---- deepseek2 fixture: vocab via tokenizer token count, explicit

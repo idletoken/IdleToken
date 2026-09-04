@@ -159,11 +159,11 @@ case "$CMD" in
         if [ ! -f "$SIGFILE" ]; then
             fail "no signature at $SIGFILE — sign the provenance record before logging it (release_manifest.sh --sign)"
         fi
-        PINNED=$(python3 -c "import json;print(json.load(open('$ROOT/client/src-tauri/tauri.conf.json'))['plugins']['updater']['pubkey'])" 2>/dev/null)
-        [ -n "$PINNED" ] || fail "could not read the pinned updater key"
+        PINNED=$(python3 -c "import json;print(json.load(open('$ROOT/scripts/release-channels.json'))['releaseSigningKey']['publicKey'])" 2>/dev/null)
+        [ -n "$PINNED" ] || fail "could not read the published release signing key from scripts/release-channels.json"
         KEYID=$(python3 "$ROOT/scripts/minisign_verify.py" --pubkey "$PINNED" --sig "$SIGFILE" "$PROV" --json 2>/dev/null \
                 | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d['ok'] else 1) or print(d['keyId'])" 2>/dev/null) || \
-            fail "the provenance record is not signed by the pinned release key — refusing to log it"
+            fail "the provenance record is not signed by the published release key — refusing to log it"
         out=$(chain_py append "$LOG" "$PROV" "$SIGFILE" "$KEYID") || fail "could not append"
         case "$out" in
             OK*) echo "  ${out#OK$'\t'}" ;;

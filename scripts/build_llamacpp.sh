@@ -6,8 +6,9 @@
 #   vendor/llama.cpp/build/bin/ggml-rpc-server    worker-side RPC backend
 #   vendor/llama.cpp/build/bin/llama-perplexity   distribution-level numeric gate
 #
-# Platform backends: macOS = Metal, Linux = CUDA. Windows builds via its own
-# batch script (MSVC + CUDA), not this file.
+# Platform backends: macOS = Metal, Linux = CUDA. Linux arm64 defaults to the
+# DGX's sm_121; Linux x86_64 defaults to every CUDA 12.8 architecture at or
+# above the product floor. Windows builds via its own batch script.
 #
 # No silent fallback (v2 hard invariant #4): every failure here is fatal.
 # If CUDA/Metal/cmake is missing, this script exits red — it never downgrades
@@ -143,8 +144,20 @@ case "$(uname -s)" in
             export CUDACXX=/usr/local/cuda/bin/nvcc
             export PATH="/usr/local/cuda/bin:$PATH"
         fi
+        case "$(uname -m)" in
+            x86_64|amd64)
+                DEFAULT_CUDA_ARCHS="75-real;80-real;86-real;87-real;89-real;90-real;100-real;101-real;120"
+                ;;
+            aarch64|arm64)
+                DEFAULT_CUDA_ARCHS="121"
+                ;;
+            *)
+                echo "FATAL: unsupported Linux architecture $(uname -m)" >&2
+                exit 1
+                ;;
+        esac
         PLATFORM_FLAGS=(-DGGML_CUDA=ON
-                        -DCMAKE_CUDA_ARCHITECTURES="${IDLETOKEN_CUDA_ARCHS:-121}")
+                        -DCMAKE_CUDA_ARCHITECTURES="${IDLETOKEN_CUDA_ARCHS:-$DEFAULT_CUDA_ARCHS}")
         NPROC=$(nproc)
         ;;
     *)

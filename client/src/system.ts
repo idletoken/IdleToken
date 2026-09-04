@@ -52,7 +52,6 @@ export async function windowState(): Promise<ShellWindowState | null> {
 export interface TrayLabels {
   open: string;
   status: string;
-  check_update: string;
   quit: string;
 }
 

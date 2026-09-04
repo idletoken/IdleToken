@@ -13,6 +13,7 @@
  * We reuse the same needed-ranges logic as the Python `ranges` command. */
 #include "idletoken_weights.h"
 #include "idletoken_net.h"   /* idletoken_connect_tcp */
+#include "idletoken_gguf_geom.h"   /* GGUF type sizes, shared with gguf_geom_test */
 
 #include <errno.h>
 #include <limits.h>
@@ -837,14 +838,11 @@ static int idx_layer_count(const char *idx, unsigned *layers_out) {
  * self-contained — no Python at runtime. Block geometry follows the pinned
  * llama.cpp ggml_type enum; the same table drives scripts/gguf_shard.py. */
 
-static const struct { unsigned be, bb; } GGUF_GEOM[] = {
-    {1,4},{1,2},{32,18},{32,20},{0,0},{0,0},{32,22},{32,24},{32,34},{32,40},
-    {256,84},{256,110},{256,144},{256,176},{256,210},{256,292},{256,66},{256,74},
-    {256,98},{256,110},{256,50},{256,110},{256,82},{256,136},{1,1},{1,2},{1,4},
-    {1,8},{1,8},{256,56},{1,2},{0,0},{0,0},{0,0},{256,54},{256,66},{0,0},
-    {0,0},{0,0},{32,17},{64,36},{128,18},{64,18},
-};
-#define GGUF_GEOM_N (sizeof(GGUF_GEOM)/sizeof(GGUF_GEOM[0]))
+/* One copy only, shared with src/tools/gguf_geom_test.c, which re-derives
+ * every row from the engine's ggml-common.h. See the header for the
+ * 2026-09-02 incident that made that test necessary. */
+#define GGUF_GEOM   IDLETOKEN_GGUF_GEOM
+#define GGUF_GEOM_N IDLETOKEN_GGUF_GEOM_N
 
 /* GGUF metadata value type scalar sizes (0 = string/array/unknown). */
 static uint64_t gguf_scalar_size(uint32_t t) {
@@ -941,6 +939,67 @@ static const char *path_basename(const char *path) {
     return base;
 }
 
+static int gguf_off_cmp(const void *a, const void *b) {
+    const uint64_t x = ((const idx_tensor_t *)a)->off;
+    const uint64_t y = ((const idx_tensor_t *)b)->off;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+/* Does the directory we just computed describe THIS file?
+ *
+ * The sizes above come from a type table, and a wrong row produces an index
+ * that is internally consistent and completely wrong — the failure surfaces
+ * later, on another machine, as a tensor the cache "does not have".
+ *
+ * A GGUF lays its tensors out back to back, each padded up to `alignment`. So
+ * the file itself is the oracle: sorted by offset, every tensor must end at or
+ * before the next one starts, and the slack must be smaller than one pad. Too
+ * large a size overlaps its neighbour; too small leaves a hole. Either way the
+ * table is wrong and we say so here, naming the tensor, instead of shipping the
+ * claim to a worker.
+ *
+ * Checking only that the last tensor ends near EOF — which is what the Python
+ * sharder did — cannot see this: the run that broke had correct sizes for the
+ * final tensors and garbage in the middle, so its end-of-file check passed. */
+static int gguf_check_layout(const idx_tensor_t *t, size_t n, uint64_t fsz,
+                             uint64_t alignment, const char *gguf_path) {
+    if (n == 0) return 0;
+    if (alignment == 0) alignment = 32;
+    idx_tensor_t *by_off = (idx_tensor_t *)calloc(n, sizeof(*by_off));
+    if (!by_off) return -1;
+    memcpy(by_off, t, n * sizeof(*by_off));
+    qsort(by_off, n, sizeof(*by_off), gguf_off_cmp);
+    int rc = 0;
+    for (size_t i = 0; i < n && rc == 0; i++) {
+        const uint64_t end = by_off[i].off + by_off[i].bytes;
+        const uint64_t limit = (i + 1 < n) ? by_off[i + 1].off : fsz;
+        const char *what = (i + 1 < n) ? "the next tensor" : "the end of file";
+        if (end > limit) {
+            fprintf(stderr,
+                    "idletoken-weights: idx: %s claims %llu bytes at %llu, "
+                    "which runs %llu bytes past %s in %s — the GGUF type size "
+                    "table is wrong for this tensor's type\n",
+                    by_off[i].name, (unsigned long long)by_off[i].bytes,
+                    (unsigned long long)by_off[i].off,
+                    (unsigned long long)(end - limit), what, gguf_path);
+            rc = -1;
+        } else if (limit - end >= alignment) {
+            fprintf(stderr,
+                    "idletoken-weights: idx: %s claims %llu bytes at %llu, "
+                    "leaving a %llu-byte hole before %s in %s (alignment %llu) "
+                    "— the GGUF type size table is wrong for this tensor's "
+                    "type\n",
+                    by_off[i].name, (unsigned long long)by_off[i].bytes,
+                    (unsigned long long)by_off[i].off,
+                    (unsigned long long)(limit - end), what, gguf_path,
+                    (unsigned long long)alignment);
+            rc = -1;
+        }
+    }
+    free(by_off);
+    return rc;
+}
+
 static int gguf_scan_file(const char *gguf_path, gguf_scan_t *scan) {
     memset(scan, 0, sizeof(*scan));
     uint64_t fsz = file_size_of(gguf_path);
@@ -1026,6 +1085,10 @@ static int gguf_scan_file(const char *gguf_path, gguf_scan_t *scan) {
             }
             t[i].off += tdp;
         }
+        if (gguf_check_layout(t, (size_t)n_tensors, fsz, alignment,
+                              gguf_path) != 0) {
+            free(t); free(buf); fclose(f); return -1;
+        }
         scan->part.file_size = fsz;
         scan->part.tensor_data_pos = tdp;
         snprintf(scan->part.name, sizeof(scan->part.name), "%s",
@@ -1037,6 +1100,52 @@ static int gguf_scan_file(const char *gguf_path, gguf_scan_t *scan) {
     free(buf);
     fclose(f);
     return 0;
+}
+
+/* What an index CONTAINS depends on more than the file it describes: it depends
+ * on the type-size table and on how we walk the directory. `idletoken_idx_stale`
+ * used to compare only the GGUF's size, so an index written by an older build
+ * stayed "fresh" forever — which is how the 2026-09-02 IQ1_S fix changed
+ * nothing on the machines that had already built one. Fixing code that writes a
+ * cache is not enough; the cache has to know which code wrote it.
+ *
+ * The tag is a fingerprint of the geometry table plus a revision this file
+ * bumps when the walk itself changes. Sidecar file rather than a header field:
+ * the index format is parsed by peers, and a format bump would make an older
+ * worker reject a newer coordinator's index for a reason unrelated to what
+ * actually changed. */
+#define IDLETOKEN_IDX_REVISION 1u
+
+static uint64_t idx_generator_tag(void) {
+    uint64_t h = fnv1a_update(UINT64_C(0xcbf29ce484222325),
+                              IDLETOKEN_GGUF_GEOM, sizeof(IDLETOKEN_GGUF_GEOM));
+    const uint32_t rev = IDLETOKEN_IDX_REVISION;
+    return fnv1a_update(h, &rev, sizeof(rev));
+}
+
+static void idx_gen_path(const char *idx_path, char *out, size_t cap) {
+    snprintf(out, cap, "%s.gen", idx_path);
+}
+
+static void idx_write_generator_tag(const char *idx_path) {
+    char gp[1300];
+    idx_gen_path(idx_path, gp, sizeof(gp));
+    FILE *g = fopen(gp, "w");
+    if (!g) return;                 /* best effort: a missing tag reads as stale */
+    fprintf(g, "IDLETOKEN_IDX_GEN %016llx\n",
+            (unsigned long long)idx_generator_tag());
+    fclose(g);
+}
+
+static int idx_generator_tag_matches(const char *idx_path) {
+    char gp[1300];
+    idx_gen_path(idx_path, gp, sizeof(gp));
+    FILE *g = fopen(gp, "r");
+    if (!g) return 0;
+    unsigned long long got = 0;
+    const int ok = fscanf(g, "IDLETOKEN_IDX_GEN %llx", &got) == 1;
+    fclose(g);
+    return ok && (uint64_t)got == idx_generator_tag();
 }
 
 int idletoken_write_idx(const char *gguf_path, const char *idx_path) {
@@ -1117,6 +1226,7 @@ int idletoken_write_idx(const char *gguf_path, const char *idx_path) {
         remove(tmp);
         goto done;
     }
+    idx_write_generator_tag(idx_path);
     rc = 0;
     fprintf(stderr, "idletoken-weights: wrote index %s\n", idx_path);
 done:
@@ -1229,6 +1339,10 @@ static void srv_handle(int cfd, const char *dir) {
 int idletoken_idx_stale(const char *gguf_path, const char *idx_path) {
     uint64_t gsz = file_size_of(gguf_path);
     if (gsz == UINT64_MAX) return 1;
+    /* Before anything about the file: was this index written by THIS build's
+     * indexer? An index that describes the right file with the wrong tensor
+     * sizes looks perfectly fresh to every check below. */
+    if (!idx_generator_tag_matches(idx_path)) return 1;
     FILE *f = fopen(idx_path, "r");
     if (!f) return 1;
     unsigned long long isz = 0, tdp = 0, nt = 0;

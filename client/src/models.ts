@@ -87,13 +87,26 @@ export interface ModelManifest {
    *  Mirrors idletoken_model_spec.compute_bytes_* one for one; absent/0 means
    *  "not measured", which the estimate must surface rather than treat as 0 —
    *  the old closed form was 9.6x low on one curated model at 256K.
-   *  Per BACKEND: identical across GPUs and quantizations, but GLM-5.2 at 256K
-   *  is 1.50 GiB on CUDA and 33.3 GiB on Metal
-   *  (results/memory-need-measured-20260901.md). */
-  compute_bytes_256k_cuda?: number;
-  compute_bytes_1m_cuda?: number;
-  compute_bytes_256k_metal?: number;
-  compute_bytes_1m_metal?: number;
+   *
+   *  Per BACKEND: identical across GPUs and WEIGHT quantizations, but GLM-5.2
+   *  at 256K is 1.50 GiB on CUDA and 33.3 GiB on Metal
+   *  (results/memory-need-measured-20260901.md).
+   *
+   *  Per KV TIER (2026-09-02): one entry per KV cache dtype, in KV_TIERS order
+   *  [f16, q8_0, q4_0] — the same order as idletoken_kv_tier in C, because both
+   *  sides index these arrays. The workspace is not KV-dtype independent on
+   *  every architecture: Qwen3.5-0.8B at 256K on Metal measures 489.00 MiB with
+   *  an f16 cache and 745.28 MiB with a quantized one.
+   *
+   *  Per CONTEXT TIER (2026-09-02): three product windows, 128K the default
+   *  (docs/ctx-tiers-2026-09.md). NOT interpolatable — the low tiers are
+   *  dominated by an n_ubatch floor and only the high end is linear in ctx. */
+  compute_bytes_128k_cuda?: number[];
+  compute_bytes_256k_cuda?: number[];
+  compute_bytes_1m_cuda?: number[];
+  compute_bytes_128k_metal?: number[];
+  compute_bytes_256k_metal?: number[];
+  compute_bytes_1m_metal?: number[];
   split: { boundary_multiple: number };
   kv: {
     kind: string;
@@ -470,30 +483,78 @@ export function backendOfOs(os: string | undefined): NodeBackend {
   return "unknown";
 }
 
-export function computeBytesFor(
-  man: ModelManifest,
-  ctx: number,
-  backend: NodeBackend = "unknown",
-): number {
-  const oneM = ctx > 262144;
-  const cuda = (oneM ? man.compute_bytes_1m_cuda : man.compute_bytes_256k_cuda) ?? 0;
-  const metal = (oneM ? man.compute_bytes_1m_metal : man.compute_bytes_256k_metal) ?? 0;
-  if (backend === "cuda") return cuda;
-  if (backend === "metal") return metal;
-  if (cuda === 0 || metal === 0) return 0;
-  return Math.max(cuda, metal);
-}
+/** Index into every `compute_bytes_*` array. MUST match idletoken_kv_tier in
+ *  include/idletoken_model.h — both sides read these arrays positionally. */
+const KV_TIERS = ["f16", "q8_0", "q4_0"] as const;
+export type KvTier = (typeof KV_TIERS)[number];
 
 function quantBits(quant: string): number {
   const m = /(?:^|[^A-Za-z0-9])(?:MXFP|FP|I?Q|BF|F)(\d+)/i.exec(quant);
   return m ? Number(m[1]) : 0;
 }
 
-function kvGrowthScale(quant: string): number {
+/** THE boundary table, mirroring `idletoken_llama_kv_tier_for_weight`
+ *  (src/common/plan.c) EXACTLY. The coordinator applies the same rule to the
+ *  plan it launches with, so a divergence here shows up as a card that promises
+ *  a fit the engine refuses. scripts/resource_estimate_gate.sh compares the two
+ *  byte for byte over every model/precision/tier/node/backend combination.
+ *
+ *  REVISED 2026-09-02 (user decision): q8_0 covers every quantized tier, Q8
+ *  included; f16 is reserved for unquantized BF16/F16 weights and for a quant
+ *  name we could not read (never guess DOWN — that under-charges the budget). */
+export function kvTierForQuant(quant: string): number {
   const bits = quantBits(quant);
-  if (bits >= 1 && bits <= 2) return 18 / 64; // q4_0 block bytes / f16
-  if (bits >= 3 && bits <= 4) return 34 / 64; // q8_0 block bytes / f16
-  return 1; // >=5-bit and unknown use the engine's conservative f16-first rule
+  if (bits >= 1 && bits <= 2) return 2; // q4_0
+  if (bits >= 3 && bits <= 15) return 1; // q8_0
+  return 0; // unquantized (>=16 bit) and unreadable names stay f16
+}
+
+/** KV cache dtype cost relative to f16. Ratios are block bytes per 32 elements
+ *  from the engine's own dtype table (src/coord/llama_sidecar.c). */
+function kvGrowthScale(quant: string): number {
+  switch (kvTierForQuant(quant)) {
+    case 2: return 18 / 64; // q4_0 block bytes / f16
+    case 1: return 34 / 64; // q8_0 block bytes / f16
+    default: return 1;
+  }
+}
+
+/** The measured workspace for a context size on a backend, or 0 when
+ *  unmeasured. Two product tiers, two measurements — nothing in between to
+ *  interpolate, and interpolating is what this replaced.
+ *
+ *  `quant` selects the KV tier, because the workspace differs between cache
+ *  dtypes on some architectures and the coordinator picks the dtype from the
+ *  precision. Omitting it reads the f16 slot, which is only right for
+ *  unquantized weights — every caller that knows the precision must pass it. */
+export function computeBytesFor(
+  man: ModelManifest,
+  ctx: number,
+  backend: NodeBackend = "unknown",
+  quant = "",
+): number {
+  const kv = kvTierForQuant(quant);
+  const at = (a: number[] | undefined) => a?.[kv] ?? 0;
+  // Mirrors idletoken_llama_ctx_tier_of(): a model whose ceiling falls between
+  // tiers launches at its ceiling and reads the slot above it; anything past
+  // 256K that is not exactly 1M has no measurement and must refuse, not round.
+  let cuda: number, metal: number;
+  if (ctx > 0 && ctx <= 131072) {
+    cuda = at(man.compute_bytes_128k_cuda);
+    metal = at(man.compute_bytes_128k_metal);
+  } else if (ctx <= 262144) {
+    cuda = at(man.compute_bytes_256k_cuda);
+    metal = at(man.compute_bytes_256k_metal);
+  } else if (ctx === 1048576) {
+    cuda = at(man.compute_bytes_1m_cuda);
+    metal = at(man.compute_bytes_1m_metal);
+  } else {
+    return 0;
+  }
+  if (backend === "cuda") return cuda;
+  if (backend === "metal") return metal;
+  if (cuda === 0 || metal === 0) return 0;
+  return Math.max(cuda, metal);
 }
 
 function roundCells256(cells: number): number {
@@ -584,11 +645,17 @@ export function estimateClusterCapacity(
   const layerBytes = v ? v.layer_weight_bytes : man.layer_weight_bytes;
   const sharedBytes = v ? v.shared_weight_bytes : man.shared_weight_bytes;
   const weightBytes = layerBytes + sharedBytes;
-  const kvBytes = kvBytesForContext(man, ctx, quant || defaultQuant(model.id));
+  // ONE resolved precision for both KV terms below. Reading the dropdown for
+  // the cache size and the manifest default for the workspace would price two
+  // different configurations against each other.
+  const kvQuant = quant || defaultQuant(model.id);
+  const kvBytes = kvBytesForContext(man, ctx, kvQuant);
   const nodeOverhead = LLAMA_CUDA_CONTEXT_BYTES + LLAMA_NODE_MARGIN_BYTES;
   // The graph workspace is charged ONCE for the cluster, like weights and KV:
   // the tensor split divides the graph. Only the CUDA context is per-node.
-  const computeBytes = computeBytesFor(man, ctx, backend);
+  // The precision goes in because it selects the KV cache dtype, and the
+  // workspace differs between cache dtypes on some architectures.
+  const computeBytes = computeBytesFor(man, ctx, backend, kvQuant);
   const needBytes = weightBytes + kvBytes + computeBytes + n * nodeOverhead;
   // Product capacity is GPU-addressable memory only. On unified-memory
   // machines the native probe already reports the GPU working-set budget in

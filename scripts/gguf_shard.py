@@ -33,11 +33,15 @@ import struct
 import sys
 
 # (block_elems, block_bytes) per GGUF tensor type id — pinned llama.cpp.
+# Must match GGUF_GEOM in src/common/weights.c, which src/tools/gguf_geom_test.c
+# re-derives from the engine's own ggml-common.h. Three rows here were wrong
+# until 2026-09-02: IQ1_S (19) held IQ3_S's 110, IQ4_NL (20) held IQ1_S's 50
+# with the wrong block size, and Q8_1 (9) held 40 instead of 36.
 GGUF_TYPES = {
     0: (1, 4), 1: (1, 2), 2: (32, 18), 3: (32, 20), 6: (32, 22), 7: (32, 24),
-    8: (32, 34), 9: (32, 40), 10: (256, 84), 11: (256, 110), 12: (256, 144),
+    8: (32, 34), 9: (32, 36), 10: (256, 84), 11: (256, 110), 12: (256, 144),
     13: (256, 176), 14: (256, 210), 15: (256, 292), 16: (256, 66), 17: (256, 74),
-    18: (256, 98), 19: (256, 110), 20: (256, 50), 21: (256, 110), 22: (256, 82),
+    18: (256, 98), 19: (256, 50), 20: (32, 18), 21: (256, 110), 22: (256, 82),
     23: (256, 136), 24: (1, 1), 25: (1, 2), 26: (1, 4), 27: (1, 8), 28: (1, 8),
     29: (256, 56), 30: (1, 2),
     34: (256, 54), 35: (256, 66),
@@ -179,6 +183,31 @@ def _parse_from(buf, file_size):
     }
 
 
+def layout_faults(man):
+    """Tensors whose computed size does not match the gap to their neighbour.
+
+    A GGUF stores tensors back to back, each padded up to `alignment`, so the
+    file is its own oracle for the type-size table: an oversized entry overlaps
+    the next tensor and an undersized one leaves a hole. Either means GGUF_TYPES
+    is wrong for that tensor's type, which produces an index that is internally
+    consistent and describes a file that does not exist.
+    """
+    ts = sorted(man["tensors"], key=lambda t: t["offset"])
+    align = man["alignment"] or 32
+    out = []
+    for i, t in enumerate(ts):
+        end = t["offset"] + t["bytes"]
+        limit = ts[i + 1]["offset"] if i + 1 < len(ts) else man["file_size"]
+        what = "next tensor" if i + 1 < len(ts) else "EOF"
+        if end > limit:
+            out.append(f"{t['name']} (type {t['type']}) overruns the {what} "
+                       f"by {end - limit} bytes")
+        elif limit - end >= align:
+            out.append(f"{t['name']} (type {t['type']}) leaves a "
+                       f"{limit - end}-byte hole before the {what}")
+    return out
+
+
 def needed_ranges(man, lo, hi):
     """Byte ranges a worker for layers [lo,hi) must have: the whole header/
     directory region + every shared tensor + every tensor in [lo,hi)."""
@@ -208,6 +237,14 @@ def cmd_index(argv):
     # Self-check: the reconstructed directory must fit within the file, and the
     # last tensor should end at (or one alignment pad before) EOF.
     ok = end <= fsz and (fsz - end) < man["alignment"] + 1
+    # ...and every tensor must abut its neighbour. The EOF check alone cannot
+    # see a wrong type size in the middle of the file: on 2026-09-02 the IQ1_S
+    # row was 110 bytes per block instead of 50, every IQ1_S tensor overlapped
+    # the next one, and the final tensors were correct — so this validated OK
+    # and the cluster died much later with "required RPC model cache miss".
+    bad = layout_faults(man)
+    if bad:
+        ok = False
     shared = sum(t["bytes"] for t in man["tensors"] if t["layer"] == -1)
     n_layers = 1 + max((t["layer"] for t in man["tensors"]), default=-1)
     sys.stderr.write(
@@ -216,6 +253,10 @@ def cmd_index(argv):
         f"shared={shared/1e9:.2f}GB validate={'OK' if ok else 'MISMATCH'}\n")
     if not ok:
         sys.stderr.write(f"[gguf_shard] VALIDATION FAILED: recon_end {end} vs file {fsz}\n")
+        for line in bad[:5]:
+            sys.stderr.write(f"[gguf_shard]   {line}\n")
+        if len(bad) > 5:
+            sys.stderr.write(f"[gguf_shard]   ... and {len(bad) - 5} more\n")
         return 2
     text = json.dumps(man)
     if out:

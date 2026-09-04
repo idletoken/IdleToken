@@ -101,11 +101,12 @@ IdleToken 提供一份精选的 GGUF 格式文本生成模型列表。列表中�
 
 | 平台 | 计算硬件 | 另需 |
 | --- | --- | --- |
-| Windows 10/11 | NVIDIA，计算能力 ≥ 7.5（RTX 20 系及以后），显存 ≥ 4 GB | 驱动 ≥ 527.41，CUDA Toolkit 12.x |
-| Linux | NVIDIA，计算能力 ≥ 7.5（RTX 20 系及以后），显存 ≥ 4 GB | 驱动 ≥ 580.65，CUDA Toolkit 13.0；**预编译包只有 arm64**——x86_64 需从源码构建 |
+| Windows 10/11 | NVIDIA，计算能力 ≥ 7.5（RTX 20 系及以后），显存 ≥ 4 GB | 当前 NVIDIA 驱动；安装包已包含 CUDA 运行时 DLL |
+| Linux x86_64 | NVIDIA，计算能力 ≥ 7.5（RTX 20 系及以后），显存 ≥ 4 GB | 驱动 ≥ 570.26，CUDA Toolkit 12.8 |
+| Linux arm64 | NVIDIA，计算能力 ≥ 7.5，显存 ≥ 4 GB | 驱动 ≥ 580.65，CUDA Toolkit 13.0 |
 | macOS | 支持 Metal 的 Apple Silicon，统一内存足以容纳所选模型 | 不需要安装 CUDA |
 
-- Releases 页面的 Linux 安装包是 arm64 的 `.deb` 与 AppImage。x86_64 Linux 功能上完全支持，但还没有预编译包；`.rpm` 构建脚本能出，但也还没发布过——这两条都是打包的缺口，不是功能的缺口。
+- Releases 只提供原生安装包：Windows `.exe`、macOS `.dmg`，以及同时覆盖 x86_64 与 arm64 的 Linux `.deb`/`.rpm`。不再提供 AppImage 或应用内更新；升级时直接用当前安装包覆盖安装。
 - 操作系统可混合组网，各节点的 IdleToken 版本必须一致。
 - 集群机器之间需要可直连的局域网；张量流量不经过 VPN / 覆盖网络（如 Tailscale）。建议千兆有线或更快。
 - 纯 CPU 机器、AMD 显卡、Intel Mac 与手机不能参与计算，但可运行客户端登录、聊天和控制集群。

@@ -55,8 +55,13 @@ GGUF="${IDLETOKEN_GGUF_ABS:-\$HOME/work/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-
 APP_VERSION="${IDLETOKEN_APP_VERSION:-$(awk -F'"' '/"version"/ { print $4; exit }' "$REPO_ROOT/client/package.json")}"
 [ -n "$APP_VERSION" ] || { echo "INSTALL_E2E_FAIL: could not read the client version"; exit 1; }
 SETUP_WIN="$BUILD_HOME/IdleToken/client/src-tauri/target/release/bundle/nsis/IdleToken_${APP_VERSION}_x64-setup.exe"
-APPDIR="$THOME/AppData/Local/IdleToken"
+# Program Files since 2026-09-02 (installMode: perMachine). The old per-user
+# location is still swept below, because a machine that has not been migrated
+# yet has an install there and the whole point of this walkthrough is to start
+# from a clean slate.
+APPDIR="C:/Program Files/IdleToken"
 APPDIR_WIN="${APPDIR//\//\\}"
+OLD_APPDIR_WIN="${THOME//\//\\}\\AppData\\Local\\IdleToken"
 
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=10"
 SSHF="ssh -f -o BatchMode=yes -o ConnectTimeout=10"   # see acceptance.sh: backgrounding inside the remote shell hangs
@@ -95,10 +100,19 @@ echo "== [2/5] install silently on $TARGET (clean machine, driver only) =="
 # "proved" a self-contained bundle that no longer exists. A walkthrough whose
 # whole point is "what we ship works" must start from what we ship, only.
 $SSH "$TARGET" "if exist \"${APPDIR_WIN}\\uninstall.exe\" (\"${APPDIR_WIN}\\uninstall.exe\" /S)" >/dev/null 2>&1
+$SSH "$TARGET" "if exist \"${OLD_APPDIR_WIN}\\uninstall.exe\" (\"${OLD_APPDIR_WIN}\\uninstall.exe\" /S)" >/dev/null 2>&1
 sleep 5
 $SSH "$TARGET" "if exist \"${APPDIR_WIN}\" rmdir /s /q \"${APPDIR_WIN}\"" >/dev/null 2>&1
+$SSH "$TARGET" "if exist \"${OLD_APPDIR_WIN}\" rmdir /s /q \"${OLD_APPDIR_WIN}\"" >/dev/null 2>&1
 $SSH "$COORD_NODE" "scp -q -o BatchMode=yes /tmp/IdleToken-setup.exe $TARGET:\"$THOME/IdleToken-setup.exe\"" \
     || die "could not push the installer to $TARGET"
+# perMachine since 2026-09-02: the installer requests elevation, so this needs
+# an ssh session whose token is already elevated. A non-elevated session gets a
+# UAC prompt nobody can answer and the installer exits having done nothing —
+# which then shows up as a confusing "installed tree is incomplete (0/13)"
+# further down rather than as "you are not admin". Say so here instead.
+elevated=$($SSH "$TARGET" "powershell -NoProfile -Command \"([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)\"" 2>/dev/null | tr -d '\r ')
+[ "$elevated" = "True" ] || die "the ssh session on $TARGET is not elevated; a perMachine installer cannot run silently there"
 $SSH "$TARGET" "${THOME//\//\\}\\IdleToken-setup.exe /S" >/dev/null 2>&1
 # NSIS /S returns before it is done unpacking ~800 MB of DLLs, and the freshly
 # written exe stays locked for a moment after that. Wait the installer out

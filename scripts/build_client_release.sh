@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the installable desktop client on a Linux compute node (.deb + AppImage).
+# Build the installable desktop client on a Linux compute node (.deb + .rpm).
 #
 # The engine and the client are two processes (design philosophy 17), but the
 # *installer* has to carry both: Tauri ships the engine binaries as sidecars.
@@ -81,28 +81,10 @@ cp -f "$ROOT/vendor/llama.cpp/LICENSE" "$LIC/llamacpp-MIT.txt" \
     || fail "could not stage the llama.cpp licence"
 echo "  staged licences -> $LIC"
 
-# --- the signing key: READ-ONLY, NON-REGENERABLE ----------------------------
-# `createUpdaterArtifacts` is on in tauri.conf.json, so `tauri build` refuses
-# to run without the private key — wanted: an unsigned release is a dead
-# update channel and the build is the last place that can notice. Accept key
-# MATERIAL over the environment (a control machine driving this over ssh must
-# never write the key to this machine's disk) or a local key file path.
-# NEVER generate a new key here: installed clients trust exactly one pubkey
-# (28F23C3CE24BFDE9) and a fresh key would permanently orphan them.
-if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
-    KEY_PATH="${TAURI_SIGNING_PRIVATE_KEY_PATH:-$HOME/.idletoken/updater.key}"
-    [ -f "$KEY_PATH" ] || fail "no updater signing key: set TAURI_SIGNING_PRIVATE_KEY (key material, e.g. passed over ssh from the machine that holds it) or put the key at $KEY_PATH — RESTORE YOUR BACKUP, do NOT generate a new key"
-    # Tauri v2 reads TAURI_SIGNING_PRIVATE_KEY (path or key material); pass
-    # the PATH so the key material never enters the environment.
-    export TAURI_SIGNING_PRIVATE_KEY="$KEY_PATH"
-fi
-export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}"
-
 # --- release preflight ------------------------------------------------------
-# Two refusals that only this moment can make (see release-provenance-lib.sh):
-# a dirty tree means the artifacts match no commit, and a signing key that is
-# not THE key produces a release no installed client will accept — the second
-# fails silently all the way to the user's updater.
+# A refusal only this moment can make (see release-provenance-lib.sh): a dirty
+# tree means the artifacts match no commit. (It used to also verify the signing
+# key was THE key; there is no signing key since 2026-09-02.)
 # shellcheck disable=SC1091
 . "$ROOT/scripts/release-provenance-lib.sh"
 rp_preflight "linux" || fail "release preflight refused this build (see above)"
@@ -121,29 +103,14 @@ fi
 # `tauri build` runs beforeBuildCommand (pnpm build:release) itself — that is
 # what injects the production platform URL into the shipped frontend.
 #
-# All three bundles by default: the AppImage is the Linux in-app UPDATE
-# vehicle (the updater cannot swap a dpkg/rpm install), so a Linux release
-# without it has no update channel. Two real failures already hit here and
-# both have their fix baked in below:
-#   - linuxdeploy needs FUSE and the DGX has no libfuse2 — APPIMAGE_EXTRACT_AND_RUN=1
-#     makes the AppImages self-extract instead (verified 2026-08-15);
-#   - the tooling download can time out on this network — the cache at
-#     ~/.cache/tauri survives, and TAURI_BUNDLER_TOOLS_GITHUB_MIRROR works too.
-export APPIMAGE_EXTRACT_AND_RUN=1
-# The cache surviving is not enough on its own: linuxdeploy's appimage plugin
-# re-fetches the AppImage *runtime* on every run and only reads the cached copy
-# when pointed at it. On this network that download times out often enough to
-# be the single most common release failure — it took out the 0.1.19 Linux
-# build with nothing but `failed to run linuxdeploy` to go on, while a rerun
-# with the variable set below succeeded on the same tree (2026-08-23). Point it
-# at the cached runtime whenever one is there; a first-ever build still
-# downloads, and this is silent when there is nothing to reuse.
-if [ -z "${LDAI_RUNTIME_FILE:-}" ]; then
-    for _rt in "$HOME/.cache/tauri/runtime-$(uname -m)" "$HOME/.cache/tauri/runtime-aarch64" "$HOME/.cache/tauri/runtime-x86_64"; do
-        if [ -f "$_rt" ]; then export LDAI_RUNTIME_FILE="$_rt"; echo "appimage runtime: reusing $_rt"; break; fi
-    done
-fi
-BUNDLES="${IDLETOKEN_BUNDLES:-deb,rpm,appimage}"
+# Linux releases are native package-manager installers only. Keep this list
+# fail closed so a stale environment cannot quietly resurrect AppImage or an
+# updater artifact in a public release.
+BUNDLES="${IDLETOKEN_BUNDLES:-deb,rpm}"
+case ",$BUNDLES," in
+    ,deb,|,rpm,|,deb,rpm,|,rpm,deb,) ;;
+    *) fail "IDLETOKEN_BUNDLES must contain only deb and/or rpm (got '$BUNDLES')" ;;
+esac
 # ⚠ not `| tail`: the pipe exit code is tail's, and a bundler that failed
 # AFTER producing the .deb sailed through as CLIENT_RELEASE_OK (hit 2026-08-15;
 # same trap as the repo-wide "never read an exit code through a pipe" rule).
@@ -162,25 +129,8 @@ echo "--- artifacts ---"
 while IFS= read -r f; do
     found=1
     printf '%s  %s  %s\n' "$(sha256sum "$f" | cut -c1-16)" "$(du -h "$f" | cut -f1)" "$ROOT/client/$f"
-done < <(find "$BDIR" -type f \( -name '*.deb' -o -name '*.AppImage' -o -name '*.rpm' \) | sort)
-[ "$found" = 1 ] || fail "bundler produced no .deb/.AppImage"
-# The AppImage is the Linux update vehicle: when it was requested, its absence
-# is a dead update channel even if deb/rpm came out fine.
-case ",$BUNDLES," in *,appimage,*)
-    find "$BDIR" -type f -name '*.AppImage' | grep -q . \
-        || fail "appimage was requested but the bundler produced none — Linux would have no update channel" ;;
-esac
-
-# Updater signatures. This Tauri version signs the Linux packages themselves
-# (IdleToken_*.deb.sig / .rpm.sig, minisign format) — the update artifact IS
-# the package. Report every .sig so the caller can verify them against the
-# client pubkey; zero signatures means a dead update channel, fail there.
-SIGS=$(find "$BDIR" -type f -name '*.sig' | sort)
-[ -n "$SIGS" ] || fail "bundler produced no updater signatures — the update channel would be dead (signing key not applied?)"
-echo "--- updater signatures ---"
-for f in $SIGS; do
-    printf '%s  %s  %s\n' "$(sha256sum "$f" | cut -c1-16)" "$(du -h "$f" | cut -f1)" "$ROOT/client/$f"
-done
+done < <(find "$BDIR" -type f \( -name '*.deb' -o -name '*.rpm' \) | sort)
+[ "$found" = 1 ] || fail "bundler produced no Linux package"
 
 # --- verify: the engine inside the newest .deb is the pinned llama.cpp ------
 # The whole point of the bundle is the engine it carries; a stale idletoken-server
@@ -206,27 +156,9 @@ if [ -n "$NEWEST_DEB" ]; then
     rm -rf "$XTMP"
 fi
 
-# --- provenance -------------------------------------------------------------
-# The signed record a user checks a downloaded file against, plus its
-# transparency-log entry. Without it the release page carries bytes and nothing
-# that distinguishes them from a lookalike (DIST-03, DIST-06, OPS-12), and a
-# release signed with a stolen key leaves no trace anyone can notice (CHAIN-07).
-#
-# Non-fatal on purpose: the artifacts already exist and are already signed at
-# this point, so aborting would leave a half-published release and no way to
-# retry the record. It is LOUD instead, and re-runnable by hand:
-#   scripts/release_manifest.sh --version V --platform linux-x86_64 --sign ARTIFACTS...
-#   scripts/release_transparency.sh append <the provenance json>
-PROV_ARTIFACTS=()
-while IFS= read -r f; do PROV_ARTIFACTS+=("$ROOT/client/$f"); done < <(
-    find "$BDIR" -type f \( -name '*.deb' -o -name '*.AppImage' -o -name '*.rpm' \) | sort)
-REL_VERSION=$(python3 -c "import json;print(json.load(open('$ROOT/client/src-tauri/tauri.conf.json'))['version'])" 2>/dev/null)
-if [ "${#PROV_ARTIFACTS[@]}" -gt 0 ] && [ -n "$REL_VERSION" ]; then
-    rp_emit "$REL_VERSION" "linux-$(uname -m)" "${PROV_ARTIFACTS[@]}" \
-        || echo "  !! PROVENANCE NOT WRITTEN — do not publish these artifacts until it is (see the commands above)"
-else
-    echo "  !! could not determine the version or the artifact list for the provenance record"
-fi
+# No automatic provenance, signature, updater archive or feed is emitted here.
+# The release contract is the native installer files listed above, and only
+# those files are uploaded to GitHub.
 
 # Put the tree back the way the acceptance gates expect it. `tauri build` ran
 # beforeBuildCommand = `pnpm build:release`, which overwrites client/dist with a

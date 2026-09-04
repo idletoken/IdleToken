@@ -13,9 +13,13 @@
 #                  is the notification area and the installer is NSIS, neither of
 #                  which a macOS run says anything about.
 #
-# A debug build is required, not a preference: the updater plugin refuses a
-# plain-http endpoint in release builds, and the update gate serves its signed
-# test feed over http from the control machine. See build_client_win.sh --debug.
+# A debug build is used. The original reason was the updater plugin refusing a
+# plain-http endpoint in release builds while the update gate served its test
+# feed over http; the updater and that gate are both gone (2026-09-02), so that
+# reason no longer applies. It stays a debug build because a debug build is what
+# the remaining gates have been run against, and because IDLETOKEN_UI_TEST
+# driving is what is exercised here — not because a release build is known to
+# fail. Switching is a one-line change to cg_build plus a real run to prove it.
 
 # shellcheck disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]:-$0}")/testbed-lib.sh"

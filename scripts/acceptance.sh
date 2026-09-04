@@ -920,28 +920,24 @@ g_release() {
     # — with nothing in the diff to show why (2026-07-29).
     ( cd "$REPO_ROOT/client" && "$vite" build ) >/dev/null 2>&1
 
-    local before after out key_path sign_bin sign_tmp updater_zip updater_sig zip_count
+    local before after out
     before=$($SSH "$bn" "powershell -NoProfile -Command \"if(Test-Path '$nsis'){(Get-ChildItem '$nsis' -Filter *.exe | Sort-Object LastWriteTime | Select-Object -Last 1).LastWriteTime.Ticks}else{0}\"" 2>/dev/null | tr -d '\r ')
-    # The only trusted updater private key lives on the control machine. Build
-    # the installer and updater zip on Windows, then sign the zip here. The key
-    # never reaches the build node, its filesystem, environment, or process
-    # list. This also supports the existing updater key's intentionally empty
-    # password without depending on Windows' treatment of empty env variables.
-    key_path="${IDLETOKEN_UPDATER_KEY:-$HOME/.idletoken/updater.key}"
-    [ -r "$key_path" ] || { fail "$name" "updater signing key missing at $key_path — restore the existing key; do not generate a replacement"; return; }
-    sign_bin="$REPO_ROOT/client/node_modules/.bin/tauri"
-    [ -x "$sign_bin" ] || { fail "$name" "local Tauri signer missing at $sign_bin"; return; }
-    out=$($SSH "$bn" "cd /d ${bhome//\//\\} && set \"IDLETOKEN_DEFER_UPDATER_SIGNING=1\" && scripts\\build_client_release.bat" \
+    # No signing step since 2026-09-02: the product has no in-app updater, so a
+    # release is the installer alone. The deferred-signing dance this gate used
+    # to perform (build the updater zip on Windows, sign it here because the
+    # trusted key only lives on the control machine, push the .sig back) went
+    # with it, and so did its failure mode.
+    out=$($SSH "$bn" "cd /d ${bhome//\//\\} && scripts\\build_client_release.bat" \
       2>/dev/null | tr -d '\r' | tail -1)
     case "$out" in
-        CLIENT_RELEASE_DEFERRED_SIGNING) ;;
+        CLIENT_RELEASE_OK) ;;
         *) fail "$name" "$bn could not produce an installer (last line '$out'; see the tauri output under client\\src-tauri)"; return ;;
     esac
     after=$($SSH "$bn" "powershell -NoProfile -Command \"if(Test-Path '$nsis'){(Get-ChildItem '$nsis' -Filter *.exe | Sort-Object LastWriteTime | Select-Object -Last 1).LastWriteTime.Ticks}else{0}\"" 2>/dev/null | tr -d '\r ')
     # A green last line alone would let the PREVIOUS installer stand in for this
     # one — the same way dist\ certified a three-week-old binary (see G3 (3)).
     if [ "${after:-0}" -le "${before:-0}" ]; then
-        fail "$name" "CLIENT_RELEASE_DEFERRED_SIGNING but the installer timestamp did not advance -- this certifies the previous artifact"; return
+        fail "$name" "CLIENT_RELEASE_OK but the installer timestamp did not advance -- this certifies the previous artifact"; return
     fi
 
     # --- what is actually INSIDE the installer ----------------------------
@@ -972,34 +968,7 @@ g_release() {
     [ -z "$missing" ] || { fail "$name" "the installer $bn just built is missing:$missing"; return; }
     vlog "installer carries both engine binaries, their integrity digests, and every licence text"
 
-    sign_tmp=$(mktemp -d "${TMPDIR:-/tmp}/idletoken-updater-sign.XXXXXX") || {
-        fail "$name" "could not create a local updater signing directory"; return;
-    }
-    if ! scp -q "${bn}:${nsis}/*.nsis.zip" "$sign_tmp/" 2>/dev/null; then
-        rm -rf "$sign_tmp"
-        fail "$name" "failed to fetch the updater archive from $bn"; return
-    fi
-    zip_count=$(find "$sign_tmp" -maxdepth 1 -type f -name '*.nsis.zip' | wc -l | tr -d ' ')
-    if [ "$zip_count" != "1" ]; then
-        rm -rf "$sign_tmp"
-        fail "$name" "expected exactly one updater archive from $bn, found $zip_count"; return
-    fi
-    updater_zip=$(find "$sign_tmp" -maxdepth 1 -type f -name '*.nsis.zip' -print)
-    if ! "$sign_bin" signer sign -f "$key_path" -p "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" "$updater_zip" >/dev/null 2>&1; then
-        rm -rf "$sign_tmp"
-        fail "$name" "local updater signing failed with the trusted key"; return
-    fi
-    updater_sig="$updater_zip.sig"
-    if [ ! -s "$updater_sig" ] || ! scp -q "$updater_sig" "${bn}:${nsis}/$(basename "$updater_sig")" 2>/dev/null; then
-        rm -rf "$sign_tmp"
-        fail "$name" "failed to return the updater signature to $bn"; return
-    fi
-    if ! $SSH "$bn" "powershell -NoProfile -Command \"if(-not (Test-Path '$nsis/$(basename "$updater_sig")' -PathType Leaf)){exit 1}; if((Get-Item '$nsis/$(basename "$updater_sig")').Length -le 0){exit 2}\"" >/dev/null 2>&1; then
-        rm -rf "$sign_tmp"
-        fail "$name" "the updater signature is missing or empty on $bn"; return
-    fi
-    rm -rf "$sign_tmp"
-    vlog "$bn rebuilt the installer from the current tree; updater archive signed on the control machine"
+    vlog "$bn rebuilt the installer from the current tree"
     pass "$name"
 }
 
@@ -3612,13 +3581,18 @@ g_dspark() {
 }
 
 # =====================================================================
-# G_UPDATE / G_TRAY -- the two shell-level promises of the desktop client:
-# it can update itself safely, and it keeps serving when its window is closed.
+# G_TRAY -- the remaining shell-level promise of the desktop client: it keeps
+# serving when its window is closed.
 #
-# Both delegate to their own scripts (scripts/client_update_gate.sh /
-# client_tray_gate.sh) for the same reason G_SCHED does: the assertions are long
-# enough to deserve a file, and that file is runnable by hand while working on
-# the feature.
+# G_UPDATE is GONE (2026-09-02, user ruling). The client no longer updates
+# itself: there is no update feed, no signed update artifact and no updater
+# plugin, because updating means downloading the current installer. A gate that
+# exercised a channel the product does not have would only ever assert that the
+# scaffolding still compiles.
+#
+# It delegates to its own script (scripts/client_tray_gate.sh) for the same
+# reason G_SCHED does: the assertions are long enough to deserve a file, and
+# that file is runnable by hand while working on the feature.
 #
 # WHICH MACHINE. A GUI client is being driven, so it needs a machine with a
 # desktop. `IDLETOKEN_CLIENT_NODE` names it; when it is unset, the first Windows
@@ -3637,21 +3611,6 @@ client_gui_node() {
         prof="$(testbed_profile "$n")"
         case "$prof" in [A-Za-z]:/*) printf '%s' "$n"; return ;; esac
     done
-}
-
-g_update() {
-    local name="$1" node out
-    node="$(client_gui_node)"
-    [ -n "$node" ] || vlog "no Windows client node configured -- running the update gate on this machine (smoke test only)"
-    out=$(IDLETOKEN_CLIENT_NODE="$node" bash scripts/client_update_gate.sh 2>&1 | grep -E "^UPDATE_GATE_(OK|FAIL|SKIP)" | tail -1)
-    case "$out" in
-        UPDATE_GATE_OK)
-            vlog "update check/download/signature verified on ${node:-this machine} (5 cases incl. tampered artifact refused)"
-            pass "$name" ;;
-        UPDATE_GATE_SKIP*) skip "$name" "${out#UPDATE_GATE_SKIP: }" ;;
-        "") fail "$name" "scripts/client_update_gate.sh reached no conclusion" ;;
-        *) fail "$name" "${out#UPDATE_GATE_FAIL: }" ;;
-    esac
 }
 
 g_tray() {
@@ -3873,6 +3832,14 @@ g_platform_hardening() {
     command -v python3 >/dev/null 2>&1 || {
         skip "$name" "python3 is required for migration and machine-readable Jest verdicts"; return; }
 
+    # The gateway refuses to construct without a >=32-byte signing secret and
+    # refuses by calling process.exit, so an unset one makes this gate report
+    # product failure having tested nothing (measured 2026-09-03). Same seeding
+    # as scripts/scheduler_gate.sh; a real environment still wins.
+    : "${JWT_SECRET:=idletoken-gate-secret-not-for-production-0000}"
+    : "${CATALOG_CURSOR_SECRET:=idletoken-gate-cursor-secret-not-for-production}"
+    export JWT_SECRET CATALOG_CURSOR_SECRET
+
     _platform_hardening_fingerprint() {
         python3 - "$1" <<'PY'
 import hashlib, pathlib, sys
@@ -3932,7 +3899,7 @@ import json, sys
 d = json.load(open(sys.argv[1], encoding="utf-8"))
 ok = (d.get("success") is True and d.get("numTotalTestSuites") == 10
       and d.get("numPassedTestSuites") == 10 and d.get("numFailedTestSuites") == 0
-      and d.get("numTotalTests") == 87 and d.get("numPassedTests") == 85
+      and d.get("numTotalTests") == 90 and d.get("numPassedTests") == 88
       and d.get("numFailedTests") == 0 and d.get("numPendingTests") == 2
       and not d.get("wasInterrupted", False))
 print("OK" if ok else "BAD:" + ",".join(f"{k}={d.get(k)!r}" for k in (
@@ -3941,7 +3908,7 @@ print("OK" if ok else "BAD:" + ",".join(f"{k}={d.get(k)!r}" for k in (
 PY
     ) || verdict=BROKEN
     if [ "$verdict" != OK ]; then
-        fail "$name" "focused shared-hardening slice missed exact 10-suite/85-pass/2-live-skip verdict ($verdict; transcript: $jlog; JSON: $json)"
+        fail "$name" "focused shared-hardening slice missed exact 10-suite/88-pass/2-live-skip verdict ($verdict; transcript: $jlog; JSON: $json)"
         return
     fi
     after=$(_platform_hardening_fingerprint "$db") || {
@@ -3951,7 +3918,7 @@ PY
         return
     fi
     vlog "SQLite migration: fresh/adopted/repeat + 3 controls; version: source/snapshot/binary + controls"
-    vlog "shared hardening: 10/10 suites, 85 passed, exactly 2 live-Redis cases skipped; DB unchanged"
+    vlog "shared hardening: 10/10 suites, 88 passed, exactly 2 live-Redis cases skipped; DB unchanged"
     rm -f "$mlog" "$vlogf" "$jlog" "$json"
     pass "$name"
 }
@@ -4288,14 +4255,15 @@ g_budget_source() {
     esac
 }
 
-# G_OVERFLOW (docs/overflow-b2b-plan-2026-08.md §2 O5): overflow routing's six
-# claims, the first of which is the rule that may not break — a job the platform
-# dispatched is finished here or refused here, never forwarded on. That one is
-# asserted through the REAL agent binary, because the whole rule rests on the
-# agent setting X-IdleToken-Origin and a dropped header would break it in
-# silence. The script carries a control for every claim (it refuses to conclude
-# anything unless the machine really filled up, the connection log really
-# records connections, and the plaintext search really finds a planted marker).
+# G_OVERFLOW (docs/overflow-b2b-plan-2026-08.md §2 O5): overflow routing's
+# thirteen claims. The first is the rule that may not break — a job the platform
+# dispatched is finished here or refused here, never forwarded on — asserted
+# through the REAL agent binary and its body-bound admission capability. Claim
+# 13 is the compatible-client counterpart: on a busy --shared machine, ordinary
+# OpenAI and Anthropic traffic with no IdleToken-private header must borrow.
+# The script carries a control for every claim (it refuses to conclude anything
+# unless the machine really filled up, the connection log really records
+# connections, and the plaintext search really finds a planted marker).
 g_overflow() {
     local name="$1" out
     out=$(bash scripts/overflow_gate.sh 2>&1 | grep -E "^OVERFLOW_GATE_(OK|FAIL|SKIP)" | tail -1)
@@ -4573,7 +4541,6 @@ gate P6_api_exposure   p6_api_exposure
 # docs/acceptance-criteria.md as P1-P6 + G6, and quietly widening a gate that
 # owns the exit code would change what a green ladder claims. They are reported
 # on their own line, where a red one is visible.
-gate G_UPDATE          g_update
 gate G_TRAY            g_tray
 # Cluster invariants that need no cluster node. gate_always, and before
 # G_FINAL — see the helper's comment.

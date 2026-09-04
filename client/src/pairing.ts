@@ -110,7 +110,9 @@ export interface PairingSnapshot {
    *  reaches the roster, so this refusal is the only place it can learn what to
    *  fetch. Two fields, not a sentence — the UI turns them into one exact
    *  download. */
-  requiredModel?: { modelId: string; quant: string } | null;
+  /** What the cluster demanded when it refused this machine. `ctx` is 0 from a
+   *  pre-2026-09-02 creator that did not declare its window. */
+  requiredModel?: { modelId: string; quant: string; ctx?: number } | null;
   /** True only in the creator process. Missing values from an older native
    *  backend fail closed and never expose a role-approval action. */
   isCreator?: boolean;

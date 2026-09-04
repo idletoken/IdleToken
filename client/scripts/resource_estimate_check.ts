@@ -28,16 +28,21 @@ const oracle = JSON.parse(readFileSync(oraclePath, "utf8")) as { cases: OracleCa
 const models = new Map(MODELS.map((m) => [m.id, m]));
 let failures = 0;
 
+// Three product windows since 2026-09-02 (docs/ctx-tiers-2026-09.md), 128K the
+// default. qwen3-8b is the between-tiers case: its ceiling is 163840, so asking
+// for 256K clamps to the ceiling while asking for 128K does not.
 if (
   PRODUCT_CONTEXT_CAP !== 1048576 ||
-  modelCtxMax("qwen3.8-27b") !== 262144 ||
-  modelCtxMax("qwen3.8-27b", true) !== 1048576 ||
-  modelCtxMax("deepseek-v4-flash") !== 262144 ||
-  modelCtxMax("deepseek-v4-flash", true) !== 1048576 ||
-  modelCtxMax("qwen3-8b") !== 163840
+  modelCtxMax("qwen3.8-27b") !== 131072 ||
+  modelCtxMax("qwen3.8-27b", 262144) !== 262144 ||
+  modelCtxMax("qwen3.8-27b", 1048576) !== 1048576 ||
+  modelCtxMax("deepseek-v4-flash") !== 131072 ||
+  modelCtxMax("deepseek-v4-flash", 1048576) !== 1048576 ||
+  modelCtxMax("qwen3-8b") !== 131072 ||
+  modelCtxMax("qwen3-8b", 262144) !== 163840
 ) {
   console.error(
-    "RESOURCE_ESTIMATE_MISMATCH exact 256K/1M product contexts do not respect model ability",
+    "RESOURCE_ESTIMATE_MISMATCH exact 128K/256K/1M product contexts do not respect model ability",
   );
   failures++;
 }

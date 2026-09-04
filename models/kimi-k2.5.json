@@ -6,6 +6,7 @@
   "arch": "deepseek2",
   "available": true,
   "deployment": "cluster",
+  "min_quant": "Q4_K_M",
   "license": "Modified MIT",
   "params_summary": "1T · 32B active · ~1.8-bit ≈ 240 GB",
   "n_layers": 61,
@@ -28,10 +29,36 @@
     "n_expert_used": 8
   },
   "overhead_base_bytes": 3221225472,
-  "compute_bytes_256k_cuda": 532687094,
-  "compute_bytes_1m_cuda": 1337993462,
-  "compute_bytes_256k_metal": 679435305,
-  "compute_bytes_1m_metal": 1485528105,
+  "compute_bytes_128k_cuda": [
+    398469366,
+    564144374,
+    564144374
+  ],
+  "compute_bytes_256k_cuda": [
+    532687094,
+    849357046,
+    849357046
+  ],
+  "compute_bytes_1m_cuda": [
+    1337993462,
+    2560633078,
+    2560633078
+  ],
+  "compute_bytes_128k_metal": [
+    545091748,
+    545018348,
+    544976404
+  ],
+  "compute_bytes_256k_metal": [
+    679435305,
+    679372390,
+    679330447
+  ],
+  "compute_bytes_1m_metal": [
+    1485528105,
+    1485465190,
+    1485423247
+  ],
   "default_gguf": "moonshotai_Kimi-K2.5-IQ1_S/moonshotai_Kimi-K2.5-IQ1_S-00001-of-00006.gguf",
   "chat_template": "gguf",
   "sources": [

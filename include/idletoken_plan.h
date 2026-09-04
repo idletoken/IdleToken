@@ -21,12 +21,41 @@ typedef enum {
     IDLETOKEN_MODE_GPU_ONLY = 1,   /* value matches the ASSIGN_PLAN mode byte */
 } idletoken_mode;
 
-/* Product service ceiling. 256K is the client default; 1M is an explicit
- * service choice. Context never changes automatically. */
-#define IDLETOKEN_PRODUCT_CONTEXT_CAP 1048576u
+/* The product's exact context windows (docs/ctx-tiers-2026-09.md). 128K is the
+ * client default; 256K and 1M are explicit choices. Context never changes
+ * automatically — a window that does not fit is refused, never shrunk.
+ *
+ * These are the ONLY values the planner has measurements for. A ctx that is not
+ * one of them is refused rather than rounded: rounding is how a request for
+ * 100000 tokens silently got priced at the 256K workspace. */
+#define IDLETOKEN_CTX_TIER_128K  131072u
+#define IDLETOKEN_CTX_TIER_256K  262144u
+#define IDLETOKEN_CTX_TIER_1M   1048576u
+#define IDLETOKEN_PRODUCT_CONTEXT_CAP IDLETOKEN_CTX_TIER_1M
+#define IDLETOKEN_DEFAULT_CONTEXT_TOKENS IDLETOKEN_CTX_TIER_128K
 
 uint32_t idletoken_llama_product_ctx_ceiling(
     const idletoken_model_spec *model);
+
+/* The tier a context size belongs to, or 0 when it is not a product tier.
+ * A model whose ceiling falls between tiers is launched at its ceiling, so the
+ * caller passes the ceiling-clamped value and this maps it to the slot that
+ * holds its measurement: <=128K -> 128K slot, <=256K -> 256K slot, exactly 1M
+ * -> 1M slot. Anything above 256K that is not 1M has no measurement and gets 0.
+ */
+uint32_t idletoken_llama_ctx_tier_of(uint32_t ctx_size);
+
+/* Is this EXACTLY one of the three product windows?
+ *
+ * Distinct from idletoken_llama_ctx_tier_of() on purpose, and mixing them up is
+ * a silent bug. That one answers "which measurement slot does this launched
+ * window read?" and therefore maps anything at or below a tier onto it — which
+ * is required, because a model whose ceiling falls between tiers (qwen3-8b at
+ * 163840) really is launched at its ceiling. This one answers "may a CALLER ask
+ * for this?", where the only acceptable answers are the three the product
+ * offers. Using the former to validate an argument lets `--ctx-size 100000`
+ * through and serves a window nobody asked for at a price nobody measured. */
+int idletoken_llama_is_ctx_tier(uint32_t ctx_size);
 
 /* Which compute backend a node runs. Needed because the graph workspace is
  * NOT backend-independent: measured 2026-09-01, GLM-5.2 at 256K reserves
@@ -216,10 +245,11 @@ typedef struct {
      * low enough to admit a run that then OOMs after a full load. No single
      * formula covers both, so there is no formula here any more.
      *
-     * Safe to carry per (model, ctx) alone: measured byte-identical across
-     * Metal / CUDA-unified / CUDA-discrete, and across every quantization
-     * (Q4_K_M..BF16 all 489.00 MiB on Qwen3.5-0.8B at 256K). It is a property
-     * of the compute graph, not of the GPU or the weights.
+     * Independent of the WEIGHT quantization: measured byte-identical across
+     * Metal / CUDA-unified / CUDA-discrete for a given backend, and across
+     * every precision in a menu (Q4_K_M..BF16 all 489.00 MiB on Qwen3.5-0.8B
+     * at 256K). It is a property of the compute graph, not of the GPU or of
+     * the weights.
      *
      * ⚠ Re-measure when scripts/llamacpp-patches/UPSTREAM moves: the graph
      * belongs to the engine. Same rule as the perplexity baselines.
@@ -228,11 +258,26 @@ typedef struct {
      * byte-identical on Metal and CUDA, which is what made a single value look
      * safe; GLM-5.2 measures 33.3 GiB on Metal against 1.50 GiB on CUDA. Two
      * agreeing models of one architecture family are not evidence about the
-     * rest of the list. */
+     * rest of the list.
+     *
+     * ⚠ Per KV CACHE DTYPE too (2026-09-02). These are ALREADY REDUCED to the
+     * tier this model+precision will launch with — idletoken_model_size_
+     * resolve() picks the index; the spec carries all three. Qwen3.5-0.8B at
+     * 256K on Metal: 489.00 MiB f16 vs 745.28 MiB quantized.
+     *
+     * Three CONTEXT tiers since 2026-09-02 (docs/ctx-tiers-2026-09.md). Not
+     * interpolatable — see idletoken_model_spec for the measured curve. */
+    uint64_t compute_bytes_128k_cuda;
     uint64_t compute_bytes_256k_cuda;
     uint64_t compute_bytes_1m_cuda;
+    uint64_t compute_bytes_128k_metal;
     uint64_t compute_bytes_256k_metal;
     uint64_t compute_bytes_1m_metal;
+    /* Which IDLETOKEN_KV_TIER_* the four values above were taken from, i.e.
+     * the cache dtype the engine will be launched with. Diagnostic: the budget
+     * is already reduced. Kept so a log line can state the configuration it
+     * priced instead of leaving the reader to re-derive it from the quant. */
+    uint8_t kv_tier;
 } idletoken_llm_model_size;
 
 /* The measured workspace for `ctx_size` on `backend`
@@ -353,9 +398,9 @@ uint32_t idletoken_llama_fit_ctx(uint64_t usable_bytes,
 /* Leading bit count of a weight-quant name ("IQ2_XXS"→2, "Q4_K_M"→4,
  * "Q8_0"→8, "BF16"/"F16"→16, unknown/empty→0). Drives the tiered KV rule:
  * the weight noise floor bounds what KV precision can possibly matter, so
- * 1-2 bit weights take q4_0/q4_0, 3-4 bit take q8_0/q8_0, and >=5 bit keep
- * the f16-first rule. 0 = cannot tell — treated as high precision (the
- * conservative direction), never guessed low. */
+ * 1-2 bit weights take q4_0/q4_0, 3-15 bit take q8_0/q8_0, and only
+ * unquantized weights (>=16 bit) keep f16. 0 = cannot tell — treated as
+ * unquantized (the conservative direction), never guessed low. */
 int idletoken_quant_weight_bits(const char *quant);
 
 /* Same answer read from a GGUF file NAME (the client launches the coordinator
@@ -363,11 +408,32 @@ int idletoken_quant_weight_bits(const char *quant);
  * filename). Last quant-shaped token wins; no match -> 0 (conservative). */
 int idletoken_quant_bits_from_path(const char *path);
 
-/* Automatic uniform K/V cache dtype fixed by the weight tier. Returns q4_0
- * for 1-2 bit weights, q8_0 for 3-4 bit weights, and NULL when the high-
- * precision f16-first capacity rule must decide. K and V deliberately use the
- * same dtype: mixed CUDA flash-attention pairs were measured falling back to
- * CPU on the pinned engine. This rule is identical in private and shared mode. */
+/* THE boundary table for the automatic KV cache dtype: q4_0 at 1-2 bit weights,
+ * q8_0 at every other quantized tier (3-15 bit, Q8 included), f16 only for
+ * unquantized weights and for an unreadable quant name. Returns an
+ * IDLETOKEN_KV_TIER_* index, which is also how the measured `compute_bytes_*`
+ * arrays are indexed — one function decides both what the engine runs and what
+ * the planner charges for it. */
+int idletoken_llama_kv_tier_for_weight(int weight_bits);
+
+/* Engine dtype name for a tier ("f16" / "q8_0" / "q4_0"). Out-of-range is
+ * reported as f16 rather than as an error: the caller is building a log line
+ * or an env value, and the safe answer is the engine's own default. */
+const char *idletoken_llama_kv_tier_name(int tier);
+
+/* The inverse: which tier an engine dtype NAME belongs to, or -1 when it is
+ * outside the three the product measures. "" and "bf16" map to f16, the dtype
+ * the f16 workspace was measured under. -1 is not an error — it is the honest
+ * answer for a dtype reachable only through the IDLETOKEN_KV_CACHE_TYPE escape
+ * hatch, and the caller must charge the largest measured tier rather than pick
+ * a neighbour. */
+int idletoken_llama_kv_tier_of_name(const char *name);
+
+/* The dtype to pass as -ctk/-ctv, or NULL when the tier is f16 and the engine's
+ * own default is what we want. Derived from the tier above; there is no second
+ * boundary table. K and V deliberately use the same dtype: mixed CUDA
+ * flash-attention pairs were measured falling back to CPU on the pinned engine.
+ * This rule is identical in private and shared mode. */
 const char *idletoken_llama_kv_type_for_weight(int weight_bits);
 
 /* Legacy diagnostic rounding helper. Product startup uses the exact selected

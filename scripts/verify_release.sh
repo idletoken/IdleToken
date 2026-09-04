@@ -2,12 +2,13 @@
 # Verify a downloaded IdleToken artifact against the project's signed release
 # provenance — WITHOUT installing anything.
 #
-# This is the check that covers the gap the in-app updater cannot: the FIRST
-# install. An updater signature protects an already-official client's upgrades;
-# it says nothing about the installer someone just downloaded from a mirror, a
-# cloud-drive link or a search advertisement (threat register DIST-02, DIST-03,
-# DIST-05). Until that installer runs, the only thing the user has is bytes —
-# so the check has to work on bytes alone, with tools they already have.
+# Since the in-app updater was retired (2026-09-02) this is the ONLY check
+# standing between a user and a repacked installer, on both the first install
+# and every upgrade: an installer downloaded from a mirror, a cloud-drive link
+# or a search advertisement (threat register DIST-02, DIST-03, DIST-05) is
+# indistinguishable from the official one until this runs. Until that installer
+# runs, the only thing the user has is bytes — so the check has to work on bytes
+# alone, with tools they already have.
 #
 # Requirements: python3 and one of shasum/sha256sum. Nothing else. In
 # particular it does not require IdleToken, minisign, node, or network access.
@@ -143,16 +144,20 @@ for a in "${ARTIFACTS[@]}"; do [ -f "$a" ] || fail "no such file: $a"; done
 
 [ -n "$SIG" ] || SIG="$PROV.sig"
 
-# The default trust root is the key compiled into official clients, read from
-# the repo's tauri.conf.json when this runs from a checkout and from
-# release-channels.json otherwise. Both are the same value; two sources so this
-# script still works when copied out of the tree next to the JSON.
+# The default trust root is the project's release signing key, published in
+# release-channels.json. Reading it from the file next to this script is a
+# convenience, not the security property: someone who fetched both from the same
+# fake page has verified nothing. The value of the published key id is that it
+# can be compared against a copy obtained some other way — the source
+# repository, an older download, a note somebody wrote down last month.
 if [ -z "$PUBKEY" ]; then
     PUBKEY=$(python3 - "$ROOT" <<'PY'
 import json, os, sys
 root = sys.argv[1]
 for path, keys in (
-    (os.path.join(root, "client/src-tauri/tauri.conf.json"), ("plugins", "updater", "pubkey")),
+    (os.path.join(root, "scripts/release-channels.json"), ("releaseSigningKey", "publicKey")),
+    # Pre-2026-09-02 name for the same key material, for a copy of this script
+    # sitting next to an older channel record.
     (os.path.join(root, "scripts/release-channels.json"), ("updaterTrustRoot", "publicKey")),
 ):
     try:

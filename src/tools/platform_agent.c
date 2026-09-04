@@ -40,6 +40,7 @@
 #include "idletoken_net.h"
 #include "idletoken_http.h"
 #include "idletoken_b64.h"
+#include "idletoken_apiconv.h"
 #include "idletoken_admission.h"   /* prove to the coordinator that this job is
                                     * platform work (threat register PROV-28) */
 
@@ -730,6 +731,26 @@ static int url_to_addr(const char *url, char *out, size_t cap) {
  * platform registration + heartbeat (control plane, JWT bearer)
  * ====================================================================== */
 
+/**
+ * The SERVICE IDENTITY this machine publishes: base model + precision +
+ * per-slot context (decision 13b, docs/ctx-tiers-2026-09.md). The platform
+ * lists one service per triple, so this struct is exactly what a buyer sees
+ * and exactly what the matcher filters on.
+ *
+ * It is read from the running coordinator, never from this process's own
+ * arguments -- see coord_identity() for why that distinction is the whole
+ * point.
+ */
+typedef struct {
+    char model[128];
+    char quant[64];
+    /* Stable coordinator pseudonym used only to prevent overflow from being
+     * routed straight back to its busy origin.  It is routing metadata, not
+     * part of the public service identity below. */
+    char origin_id[24];
+    int  ctx;          /* per-slot context; 0 = the coordinator did not say */
+} agent_identity;
+
 /* Minimal JSON string escaper for values WE emit (name, model). */
 static void json_escape_into(char *dst, size_t cap, const char *src) {
     size_t o = 0;
@@ -748,12 +769,11 @@ static void json_escape_into(char *dst, size_t cap, const char *src) {
 static char *platform_register(const char *platform_addr, const char *jwt,
                                const char *name, const char *pubkey_b64,
                                const char *endpoint, int relay,
-                               const char *model, const char *quant,
-                               int ctx_per_slot) {
+                               const agent_identity *want) {
     char name_esc[256], ep_esc[512], model_esc[128], quant_esc[64];
     json_escape_into(name_esc, sizeof(name_esc), name);
-    json_escape_into(model_esc, sizeof(model_esc), model);
-    json_escape_into(quant_esc, sizeof(quant_esc), quant ? quant : "");
+    json_escape_into(model_esc, sizeof(model_esc), want->model);
+    json_escape_into(quant_esc, sizeof(quant_esc), want->quant);
     /* Precision-aware capability (small-model-design §6.3): a loaded quant is
      * advertised so the platform only routes matching-precision requests here;
      * an entry without quant means "any precision".
@@ -766,17 +786,22 @@ static char *platform_register(const char *platform_addr, const char *jwt,
      * "undeclared", not a guess. */
     char ctx_part[48];
     ctx_part[0] = '\0';
-    if (ctx_per_slot > 0)
-        snprintf(ctx_part, sizeof(ctx_part), ",\"ctx\":%d", ctx_per_slot);
-    char cap[320];
-    if (quant && quant[0])
+    if (want->ctx > 0)
+        snprintf(ctx_part, sizeof(ctx_part), ",\"ctx\":%d", want->ctx);
+    char origin_part[64];
+    origin_part[0] = '\0';
+    if (want->origin_id[0])
+        snprintf(origin_part, sizeof(origin_part),
+                 ",\"origin_id\":\"%s\"", want->origin_id);
+    char cap[384];
+    if (want->quant[0])
         snprintf(cap, sizeof(cap),
-                 "\"capacity\":{\"models\":[{\"model\":\"%s\",\"quant\":\"%s\"%s}],\"tiers\":[1]}",
-                 model_esc, quant_esc, ctx_part);
+                 "\"capacity\":{\"models\":[{\"model\":\"%s\",\"quant\":\"%s\"%s}],\"tiers\":[1]%s}",
+                 model_esc, quant_esc, ctx_part, origin_part);
     else
         snprintf(cap, sizeof(cap),
-                 "\"capacity\":{\"models\":[{\"model\":\"%s\"%s}],\"tiers\":[1]}",
-                 model_esc, ctx_part);
+                 "\"capacity\":{\"models\":[{\"model\":\"%s\"%s}],\"tiers\":[1]%s}",
+                 model_esc, ctx_part, origin_part);
     char body[1024];
     int bl;
     if (relay) {
@@ -1088,23 +1113,66 @@ static uint8_t *http_get_json(const char *addr, const char *path,
 #define AGENT_MIN_LIST_CTX 8192
 
 /**
- * The coordinator's per-slot context, or -1 if it cannot be read.
+ * Read the service identity from the coordinator's /idletoken/v1/stats.
+ * Returns 0 on success, -1 when the coordinator could not be reached or did
+ * not report a usable `ctx_size`.
  *
- * -1 means "we could not check", NOT "the machine is fine": the caller has to
- * say which one it is out loud. `ctx_size` is the context of ONE slot
- * (llama_sidecar.c) -- the number a single conversation actually gets, which
- * is the number this floor is about. `-np N` divides `-c`, so a machine with a
- * large `-c` and many slots can still be under the floor per slot.
+ * The COORDINATOR is the only honest source for these three fields. The
+ * agent's `--model` / `--quant` arguments are a snapshot of what the launcher
+ * believed at the moment the agent started, and the client deliberately lets
+ * the agent outlive a coordinator restart
+ * (client/src-tauri/src/engine.rs::stop_engine) -- so changing model,
+ * precision or context and restarting only the coordinator used to leave the
+ * marketplace advertising the old triple forever. Measured 2026-09-03 on both
+ * Windows nodes: one ran Q2_K_XL@128K while selling IQ2_XXS@256K, the other
+ * ran IQ2_XXS@256K while selling @128K -- each was advertising the other
+ * machine's configuration (results/agent-stale-registration-20260903.md).
+ *
+ * -1 means "we could not check", NOT "the machine is fine": every caller has
+ * to say which one it is out loud, and none of them may treat it as a reason
+ * to change what is already published.
+ *
+ * `ctx_size` is the context of ONE slot (llama_sidecar.c) -- the number a
+ * single conversation actually gets, which is both the number the listing
+ * floor is about and the third element of the service identity. `-np N`
+ * divides `-c`, so a machine with a large `-c` and many slots can still be
+ * under the floor per slot.
  */
-static int coord_ctx_size(const char *coord_addr) {
+static int coord_identity(const char *coord_addr, agent_identity *out) {
+    memset(out, 0, sizeof(*out));
     if (!coord_addr || !coord_addr[0]) return -1;
     int status = 0; size_t rlen = 0;
     uint8_t *resp = http_get_json(coord_addr, IDLETOKEN_PATH_STATS, &status, &rlen, 5);
     if (!resp) return -1;
     if (status < 200 || status >= 300) { free(resp); return -1; }
-    int ctx = json_int_field((const char *)resp, rlen, "ctx_size", 0);
+    const char *j = (const char *)resp;
+    int ctx = json_int_field(j, rlen, "ctx_size", 0);
+    char *model = json_str_dup(j, rlen, "model");
+    char *quant = json_str_dup(j, rlen, "quant");
+    char *origin_id = json_str_dup(j, rlen, "overflow_origin_id");
     free(resp);
-    return ctx > 0 ? ctx : -1;
+    if (model) snprintf(out->model, sizeof(out->model), "%s", model);
+    if (quant) snprintf(out->quant, sizeof(out->quant), "%s", quant);
+    if (origin_id) snprintf(out->origin_id, sizeof(out->origin_id), "%s", origin_id);
+    free(model); free(quant); free(origin_id);
+    out->ctx = ctx > 0 ? ctx : 0;
+    return out->ctx > 0 ? 0 : -1;
+}
+
+/* Do two declarations name the same service? All three fields, because all
+ * three are the identity -- a changed context is as much a different product
+ * as a changed precision (a buyer may be here precisely for the long window). */
+static int identity_same(const agent_identity *a, const agent_identity *b) {
+    return a->ctx == b->ctx &&
+           !strcmp(a->model, b->model) &&
+           !strcmp(a->quant, b->quant);
+}
+
+static void identity_print(const agent_identity *id, char *out, size_t cap) {
+    snprintf(out, cap, "%s%s%s @ %d tokens/slot",
+             id->model[0] ? id->model : "(no model)",
+             id->quant[0] ? ":" : "", id->quant[0] ? id->quant : "",
+             id->ctx);
 }
 
 /**
@@ -1122,18 +1190,19 @@ static int coord_ctx_size(const char *coord_addr) {
  * not established, which is its own kind of dishonesty -- but silence is not an
  * option either, so the operator gets told the check did not happen.
  */
-static int assert_listable_ctx(const char *coord_addr, int *ctx_out) {
-    int ctx = -1;
+static int assert_listable_ctx(const char *coord_addr, agent_identity *id_out) {
+    agent_identity live;
+    int have = -1;
     for (int attempt = 0; attempt < 5; attempt++) {
-        ctx = coord_ctx_size(coord_addr);
-        if (ctx > 0) break;
+        have = coord_identity(coord_addr, &live);
+        if (have == 0) break;
         if (attempt == 0)
             fprintf(stderr, "platform-agent: coordinator at %s is not answering "
                             "/idletoken/v1/stats yet; waiting for it before listing\n",
                     coord_addr);
         sleep(2);
     }
-    if (ctx < 0) {
+    if (have != 0) {
         fprintf(stderr, "platform-agent: WARNING: could not read the coordinator's "
                         "ctx_size, so the %d-token listing floor was NOT checked. "
                         "If this cluster serves less than %d tokens per slot it will "
@@ -1142,6 +1211,7 @@ static int assert_listable_ctx(const char *coord_addr, int *ctx_out) {
                 AGENT_MIN_LIST_CTX, AGENT_MIN_LIST_CTX, AGENT_MIN_LIST_CTX);
         return 0;
     }
+    const int ctx = live.ctx;
     if (ctx < AGENT_MIN_LIST_CTX) {
         fprintf(stderr,
                 "platform-agent: refuse: this coordinator serves %d tokens per slot, "
@@ -1159,8 +1229,124 @@ static int assert_listable_ctx(const char *coord_addr, int *ctx_out) {
                 ctx, AGENT_MIN_LIST_CTX, AGENT_MIN_LIST_CTX, AGENT_MIN_LIST_CTX);
         return 4;
     }
-    if (ctx_out) *ctx_out = ctx; /* only a VERIFIED per-slot context is reported */
+    if (id_out) *id_out = live;  /* only a VERIFIED declaration is reported */
     return 0;
+}
+
+/* ----------------------------------------------------------------------
+ * Keeping the published declaration equal to what is actually running.
+ *
+ * Registration is a one-shot at startup, but a coordinator is not: the client
+ * restarts it whenever the user changes model, precision or context window,
+ * and deliberately leaves this agent alive across that restart. So the triple
+ * has to be re-checked for as long as the agent runs, and re-published the
+ * moment it moves.
+ *
+ * Re-publishing means POST /providers again -- the SAME entrance a first
+ * registration uses, deliberately, because that is the entrance that mints
+ * service identities. The heartbeat cannot do this job: it whitelists load
+ * fields only, on purpose, so that a cheap high-frequency request can never
+ * silently promote a machine to selling a different model (providers.controller.ts,
+ * mergeLiveCapacity). Going through registration also means decision 13b is
+ * honoured for free: a changed triple becomes a NEW ProviderService with a new
+ * id, STANDARD pricing and statistics from zero, while the old one is archived
+ * -- and an unchanged triple hits the live row and costs nothing at all, which
+ * is what makes it safe to call on every beat.
+ * ---------------------------------------------------------------------- */
+
+/* Everything a re-declaration needs, so the two transports' loops can each
+ * call one function instead of threading nine arguments through. */
+typedef struct {
+    const char *platform_addr, *jwt, *name, *pubkey_b64, *endpoint, *coord_addr;
+    int         relay;
+    int         pinned;         /* --provider-id: the operator owns the row, not us */
+    char       *provider_id;    /* owned here; re-registration may return a new one */
+    agent_identity declared;    /* what the platform currently has from this machine */
+    time_t      retry_after;    /* backoff after a refused re-registration */
+    int         backoff_s;
+} agent_registration;
+
+#define AGENT_REDECLARE_BACKOFF_MIN_S  60
+#define AGENT_REDECLARE_BACKOFF_MAX_S  900
+
+/**
+ * Re-read the coordinator's triple and, if it moved, publish it.
+ *
+ * Deliberately does nothing on a failed read: "the coordinator is restarting"
+ * must not be mistaken for "this machine now serves something else". The
+ * declaration only ever changes on a reading we actually got.
+ */
+static void reconcile_identity(agent_registration *reg) {
+    if (!reg->provider_id || !reg->jwt) return;
+    agent_identity live;
+    if (coord_identity(reg->coord_addr, &live) != 0) return;   /* nothing established */
+    if (identity_same(&live, &reg->declared)) return;          /* the common case */
+
+    char was[224], now[224];
+    identity_print(&reg->declared, was, sizeof(was));
+    identity_print(&live, now, sizeof(now));
+
+    /* The listing floor applies to a re-declaration exactly as it does to the
+     * first one, and the only way to stop selling is to stop being online: a
+     * process that keeps polling keeps the old declaration sellable, which is
+     * the very fault this function exists to fix. */
+    if (live.ctx < AGENT_MIN_LIST_CTX) {
+        fprintf(stderr,
+                "platform-agent: refuse: the coordinator restarted as '%s', which is "
+                "below the %d-token listing floor (was '%s').\n"
+                "  Stopping, because staying up would keep selling '%s' -- a service "
+                "this machine no longer runs.\n"
+                "  Fix: restart the coordinator with -c per-slot >= %d (remember -np "
+                "divides -c), then turn sharing back on. Using the cluster yourself is "
+                "unaffected.\n",
+                now, AGENT_MIN_LIST_CTX, was, was, AGENT_MIN_LIST_CTX);
+        exit(4);
+    }
+
+    if (reg->pinned) {
+        /* --provider-id says an operator is driving the row by hand. Re-running
+         * registration would resolve the row by machine key instead and could
+         * land somewhere they did not choose, so say it and leave it alone. */
+        fprintf(stderr,
+                "platform-agent: WARNING: the coordinator now serves '%s' but the "
+                "marketplace still advertises '%s'. Not re-registering, because "
+                "--provider-id pins this row; re-register it yourself or restart "
+                "this agent without --provider-id.\n", now, was);
+        reg->declared = live;   /* said once, not once per beat */
+        return;
+    }
+
+    const time_t t = time(NULL);
+    if (reg->retry_after && t < reg->retry_after) return;
+
+    fprintf(stderr, "platform-agent: the coordinator now serves '%s' (was '%s'); "
+                    "re-registering so the marketplace stops advertising the old one\n",
+            now, was);
+    char *id = platform_register(reg->platform_addr, reg->jwt, reg->name,
+                                 reg->pubkey_b64, reg->endpoint, reg->relay, &live);
+    if (!id) {
+        reg->backoff_s = reg->backoff_s ? reg->backoff_s * 2 : AGENT_REDECLARE_BACKOFF_MIN_S;
+        if (reg->backoff_s > AGENT_REDECLARE_BACKOFF_MAX_S)
+            reg->backoff_s = AGENT_REDECLARE_BACKOFF_MAX_S;
+        reg->retry_after = t + reg->backoff_s;
+        /* Loud, and it keeps saying it: until this succeeds the machine is
+         * selling something it is not running, and the operator is the only
+         * one who can act on the reason (a churn limit, an expired JWT). */
+        fprintf(stderr, "platform-agent: WARNING: re-registration failed; the "
+                        "marketplace still advertises '%s' while this machine runs "
+                        "'%s'. Retrying in %ds.\n", was, now, reg->backoff_s);
+        return;
+    }
+    if (strcmp(id, reg->provider_id) != 0)
+        fprintf(stderr, "platform-agent: provider id changed %s -> %s\n",
+                reg->provider_id, id);
+    free(reg->provider_id);
+    reg->provider_id = id;
+    reg->declared    = live;
+    reg->retry_after = 0;
+    reg->backoff_s   = 0;
+    fprintf(stderr, "platform-agent: now advertising '%s' (provider %s)\n",
+            now, reg->provider_id);
 }
 
 /**
@@ -1214,6 +1400,7 @@ static int coord_stats_json(const char *coord_addr, char *out, size_t out_cap) {
      * queueing alone. That is more honest than substituting service time, which
      * would reject every real machine. */
     int ttft_ms = json_int_field(j, rlen, "avg_ttft_ms", 0);
+    char *origin_id = json_str_dup(j, rlen, "overflow_origin_id");
     /* Shared-mode posture (P1-6). Relayed as the coordinator states it —
      * three facts, not one "trusted" flag. This is NOT proof: the node runs
      * this code and could report whatever it likes. Its value is that a node
@@ -1236,15 +1423,20 @@ static int coord_stats_json(const char *coord_addr, char *out, size_t out_cap) {
         }
     }
     free(resp);
-    if (ctx <= 0 || qdepth < 0) return -1;   /* older coordinator lacks these fields: report nothing rather than guess */
+    if (ctx <= 0 || qdepth < 0) { free(origin_id); return -1; }   /* older coordinator lacks these fields: report nothing rather than guess */
     char ttft_field[64] = "";
     if (ttft_ms > 0)
         snprintf(ttft_field, sizeof(ttft_field), "\"avg_ttft_ms\":{\"%d\":%d},", ctx, ttft_ms);
+    char origin_field[64] = "";
+    if (origin_id && origin_id[0])
+        snprintf(origin_field, sizeof(origin_field),
+                 "\"origin_id\":\"%s\",", origin_id);
+    free(origin_id);
     int n = snprintf(out, out_cap,
         "{\"seq_slots_by_ctx\":{\"%d\":%d},\"avg_service_ms\":{\"%d\":%d},%s%s"
-        "\"queue_depth\":%d,\"max_ctx_tokens\":%d}",
+        "%s\"queue_depth\":%d,\"max_ctx_tokens\":%d}",
         ctx, slots > 0 ? slots : 1, ctx, svc_ms > 0 ? svc_ms : 0, ttft_field,
-        shared_field, qdepth, ctx);
+        shared_field, origin_field, qdepth, ctx);
     if (n < 0 || (size_t)n >= out_cap) { out[0] = '\0'; return -1; }
     return 0;
 }
@@ -1337,14 +1529,24 @@ static int relay_post_result(const char *platform_addr, const char *jwt,
 /* The relay main loop: long-poll → process job → post result → repeat.
  * Never returns. Network/HTTP failures back off 1/2/4/8/30s and reconnect —
  * that retry ladder IS the robustness of the reverse connection. */
-static void relay_loop(const idletoken_keypair *node, const char *coord_addr,
-                       const char *platform_addr, const char *jwt,
-                       const char *provider_id) {
-    char path[256];
-    snprintf(path, sizeof(path), "/providers/%s/relay/poll", provider_id);
+static void relay_loop(const idletoken_keypair *node, agent_registration *reg) {
+    const char *coord_addr    = reg->coord_addr;
+    const char *platform_addr = reg->platform_addr;
+    const char *jwt           = reg->jwt;
     int backoff = 1;
 
     for (;;) {
+        /* The poll is this transport's heartbeat, so it is also where the
+         * declaration gets checked against what the coordinator is actually
+         * running. Before the poll, not after: a poll accepts work for the
+         * triple the platform believes is here. */
+        reconcile_identity(reg);
+        /* Rebuilt from the (possibly re-registered) id every iteration —
+         * a provider id that moved and a path that did not is a poll that
+         * silently stops receiving work. */
+        char path[256];
+        snprintf(path, sizeof(path), "/providers/%s/relay/poll", reg->provider_id);
+
         /* The poll IS the heartbeat on this transport, so the live load has to
          * ride along with it — rebuilt every iteration because that is the
          * point of it (queue depth and service time change between polls).
@@ -1402,7 +1604,7 @@ static void relay_loop(const idletoken_keypair *node, const char *coord_addr,
         fprintf(stderr, "platform-agent: relay infer job=%s -> %s\n",
                 job_id, rc == 0 ? "sealed ok" : err_msg);
 
-        if (relay_post_result(platform_addr, jwt, provider_id, job_id,
+        if (relay_post_result(platform_addr, jwt, reg->provider_id, job_id,
                               rc == 0 ? sealed_b64 : NULL, err_msg, err_status) != 0)
             fprintf(stderr, "platform-agent: relay result post failed for job=%s "
                             "(job will expire platform-side)\n", job_id);
@@ -1416,7 +1618,7 @@ static void relay_loop(const idletoken_keypair *node, const char *coord_addr,
         pthread_mutex_lock(&g_prefix_mu);
         const int pfx_dirty = g_prefix.dirty, pfx_n = g_prefix.n;
         pthread_mutex_unlock(&g_prefix_mu);
-        if (pfx_dirty && platform_post_cache_state(platform_addr, jwt, provider_id) == 0)
+        if (pfx_dirty && platform_post_cache_state(platform_addr, jwt, reg->provider_id) == 0)
             fprintf(stderr, "platform-agent: cache-state posted (%d blocks)\n", pfx_n);
     }
 }
@@ -1483,9 +1685,9 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
      * {model, messages, maxTokens?, tools?} → {model, messages, max_tokens?,
      * tools?}. The messages and tools arrays are re-embedded verbatim (raw
      * tokens), so nested content — including tool_calls / tool_call_id on
-     * individual messages — survives untouched. tool_choice is deliberately
-     * not forwarded: the engine defaults to "auto" whenever tools are present,
-     * and that is the only mode the platform offers today. */
+     * individual messages — survives untouched. tool_choice also survives:
+     * agent clients use "required" to force a structured call, and silently
+     * turning that into "auto" changes the request. */
     const char *model_tok = "dsv4-flash"; size_t model_len = 10;
     json_str_token((const char *)plain, plain_len, "model", &model_tok, &model_len);
     const char *msgs_tok; size_t msgs_len;
@@ -1506,6 +1708,12 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
     const char *tools_tok = NULL; size_t tools_len = 0;
     int have_req_tools = json_array_token((const char *)plain, plain_len, "tools",
                                           &tools_tok, &tools_len) == 0 && tools_len > 2;
+    const char *choice_tok = idletoken_json_obj_get((const char *)plain, plain_len,
+                                                    "tool_choice");
+    long choice_len_raw = choice_tok
+        ? idletoken_json_value_len(choice_tok, (const char *)plain + plain_len)
+        : -1;
+    size_t choice_len = choice_len_raw > 0 ? (size_t)choice_len_raw : 0;
 
     /* Contract hashes for the KV prefix: they must be computed into a staging
      * buffer while `plain` still exists (it is wiped moments from now), and are
@@ -1514,7 +1722,7 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
     static char staged[PFX_MAX_BLOCKS][65];
     int staged_n = prefix_hash_messages(msgs_tok, msgs_len, staged, PFX_MAX_BLOCKS);
 
-    size_t creq_cap = msgs_len + model_len + tools_len + 128;
+    size_t creq_cap = msgs_len + model_len + tools_len + choice_len + 160;
     char *creq = malloc(creq_cap);
     if (!creq) {
         idletoken_secure_zero(plain, plain_cap);
@@ -1527,10 +1735,13 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
     mt_frag[0] = '\0';
     if (max_tokens > 0)
         snprintf(mt_frag, sizeof mt_frag, ",\"max_tokens\":%d", max_tokens);
-    int cl = snprintf(creq, creq_cap, "{\"model\":\"%.*s\",\"messages\":%.*s%s%s%.*s}",
+    int cl = snprintf(creq, creq_cap,
+                      "{\"model\":\"%.*s\",\"messages\":%.*s%s%s%.*s%s%.*s}",
                       (int)model_len, model_tok, (int)msgs_len, msgs_tok, mt_frag,
                       have_req_tools ? ",\"tools\":" : "",
-                      (int)tools_len, have_req_tools ? tools_tok : "");
+                      (int)tools_len, have_req_tools ? tools_tok : "",
+                      choice_len ? ",\"tool_choice\":" : "",
+                      (int)choice_len, choice_len ? choice_tok : "");
 
     /* -- forward plaintext to coord over loopback ------------------------- *
      * Deliberately NO "stream":true here: the sealed envelope is a one-shot
@@ -2122,30 +2333,64 @@ int main(int argc, char **argv) {
     fflush(stdout);
 
     /* Register with the platform (unless an existing provider id was given). */
-    char *provider_id = NULL;
+    agent_registration reg;
+    memset(&reg, 0, sizeof(reg));
+    reg.platform_addr = platform_addr; reg.jwt = jwt; reg.name = name;
+    reg.pubkey_b64 = pubkey_b64; reg.endpoint = endpoint; reg.coord_addr = coord_addr;
+    reg.relay = relay; reg.pinned = provider_id_in != NULL;
     if (platform_url) {
         /* The listing floor, checked before anything is registered or beaten:
          * a machine that cannot serve 8192 tokens per slot should never appear
          * on the market at all, not appear and then disappoint. Gated on
          * platform_url because without it this agent is not listing anything.
          * Escape hatch on purpose absent -- see §A3 in the cleanup plan; the
-         * decision is that such a machine is not a provider. */
-        int list_ctx = 0; /* stays 0 (= undeclared) when the floor check could not read it */
-        int floor_rc = assert_listable_ctx(coord_addr, &list_ctx);
+         * decision is that such a machine is not a provider.
+         *
+         * It also hands back the coordinator's model and precision, because
+         * this one probe is where the whole declaration comes from. */
+        agent_identity live;  /* all-zero (= undeclared) if it could not be read */
+        memset(&live, 0, sizeof(live));
+        int floor_rc = assert_listable_ctx(coord_addr, &live);
         if (floor_rc != 0) { free(pubkey_b64); return floor_rc; }
+        /* The COORDINATOR decides; --model/--quant only fill in what it did not
+         * say. Anything else re-creates the bug this reconciliation exists to
+         * fix, one restart later. A disagreement is worth a line of its own:
+         * on the machine that produced this fix, `--quant IQ2_XXS` had been
+         * true when the agent started and had been wrong ever since. */
+        if (!live.model[0]) snprintf(live.model, sizeof(live.model), "%s", model);
+        else if (strcmp(live.model, model) != 0 && strcmp(model, "dsv4-flash") != 0)
+            fprintf(stderr, "platform-agent: the coordinator serves model '%s', not the "
+                            "'%s' this agent was started with; declaring the coordinator's\n",
+                    live.model, model);
+        if (!live.quant[0]) {
+            snprintf(live.quant, sizeof(live.quant), "%s", quant);
+            if (quant[0])
+                fprintf(stderr, "platform-agent: the coordinator does not report a "
+                                "precision; declaring '%s' from --quant, which nothing "
+                                "cross-checked\n", quant);
+        } else if (quant[0] && strcmp(live.quant, quant) != 0) {
+            fprintf(stderr, "platform-agent: the coordinator serves precision '%s', not "
+                            "the '%s' this agent was started with; declaring the "
+                            "coordinator's\n", live.quant, quant);
+        }
         if (provider_id_in) {
-            provider_id = strdup(provider_id_in);
+            reg.provider_id = strdup(provider_id_in);
         } else {
-            provider_id = platform_register(platform_addr, jwt, name, pubkey_b64, endpoint, relay, model, quant, list_ctx);
-            if (!provider_id) {
+            reg.provider_id = platform_register(platform_addr, jwt, name, pubkey_b64,
+                                                endpoint, relay, &live);
+            if (!reg.provider_id) {
                 fprintf(stderr, "platform-agent: registration failed; refusing to start\n");
                 return 1;
             }
         }
+        reg.declared = live;
+        char what[224];
+        identity_print(&live, what, sizeof(what));
+        printf("  serving          : %s\n", what);
         if (relay)
-            printf("  provider id      : %s  (poll = heartbeat)\n", provider_id);
+            printf("  provider id      : %s  (poll = heartbeat)\n", reg.provider_id);
         else
-            printf("  provider id      : %s  (heartbeat every %ds)\n", provider_id, beat_secs);
+            printf("  provider id      : %s  (heartbeat every %ds)\n", reg.provider_id, beat_secs);
         fflush(stdout);
     } else {
         printf("  provider id      : (not registered; pass --platform to register)\n");
@@ -2161,9 +2406,9 @@ int main(int argc, char **argv) {
          * it reconnects with backoff forever (the process is the connection). */
         fprintf(stderr, "platform-agent: relay mode; polling %s. Ctrl-C to stop.\n",
                 platform_addr);
-        relay_loop(&node, coord_addr, platform_addr, jwt, provider_id);
+        relay_loop(&node, &reg);
         /* unreachable */
-        free(provider_id);
+        free(reg.provider_id);
         free(pubkey_b64);
         return 0;
     }
@@ -2180,10 +2425,14 @@ int main(int argc, char **argv) {
      * single thread (no threads needed — beats are cheap and infrequent). */
     time_t last_beat = 0;   /* 0 → beat immediately (puts us ONLINE at once) */
     for (;;) {
-        if (provider_id && jwt) {
+        if (reg.provider_id && jwt) {
             time_t now = time(NULL);
             if (now - last_beat >= (time_t)beat_secs) {
-                if (platform_heartbeat(platform_addr, jwt, provider_id, coord_addr) != 0)
+                /* Before the beat, not after: a beat republishes the load of a
+                 * machine the platform still believes is serving the old
+                 * triple, and the whole point is that the two agree. */
+                reconcile_identity(&reg);
+                if (platform_heartbeat(platform_addr, jwt, reg.provider_id, coord_addr) != 0)
                     fprintf(stderr, "platform-agent: heartbeat failed (will retry)\n");
                 last_beat = now;
             }
@@ -2195,7 +2444,7 @@ int main(int argc, char **argv) {
             pthread_mutex_lock(&g_prefix_mu);
             const int pfx_dirty = g_prefix.dirty, pfx_n = g_prefix.n;
             pthread_mutex_unlock(&g_prefix_mu);
-            if (pfx_dirty && platform_post_cache_state(platform_addr, jwt, provider_id) == 0)
+            if (pfx_dirty && platform_post_cache_state(platform_addr, jwt, reg.provider_id) == 0)
                 fprintf(stderr, "platform-agent: cache-state posted (%d blocks)\n", pfx_n);
         }
 
@@ -2243,7 +2492,7 @@ int main(int argc, char **argv) {
     }
 
     idletoken_close_fd(lfd);
-    free(provider_id);
+    free(reg.provider_id);
     free(pubkey_b64);
     idletoken_secure_zero(node.sk, sizeof(node.sk));
     idletoken_munlock(node.sk, sizeof(node.sk));

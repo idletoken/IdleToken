@@ -1,6 +1,6 @@
 {
   "schema": "idletoken-release-channels/1",
-  "updatedAt": "2026-08-30",
+  "updatedAt": "2026-09-04",
   "_readme": [
     "The machine-readable answer to 'is this the official IdleToken build, and where",
     "did it legitimately come from?' (threat register DIST-01..DIST-07, DIST-11..14,",
@@ -11,7 +11,8 @@
     "a user, a mirror operator or a journalist can fetch from the official origin",
     "over a channel we do not control the copy of, and compare against the bytes",
     "they actually downloaded. scripts/verify_release.sh does exactly that",
-    "comparison, and it needs no IdleToken installation to run.",
+    "comparison for historical signed records. Current installer-only releases",
+    "instead expose GitHub's SHA-256 asset digest on the official release page.",
     "",
     "Everything here is either public by nature (a repository URL, a public key) or",
     "a statement we want copied widely. Nothing here is a secret, and nothing here",
@@ -26,7 +27,7 @@
       "The source is Apache-2.0. A licence to use the code is not a licence to use",
       "the name. Forks and redistributions must not present themselves as IdleToken",
       "or as an official build: change the product name, the bundle identifier, the",
-      "icon and the updater key before publishing (DIST-01, DIST-14).",
+      "icon and the release signing key before publishing (DIST-01, DIST-14).",
       "A fork that keeps the name while changing privacy, billing or model behaviour",
       "is the specific case this asks people not to create — users cannot tell, and",
       "the resulting incident lands on the official project."
@@ -47,9 +48,24 @@
     ]
   },
 
-  "updateFeeds": {
-    "stable": "https://github.com/idletoken/IdleToken/releases/latest/download/latest.json",
-    "beta": "https://github.com/idletoken/IdleToken/releases/download/beta/latest.json"
+  "downloads": {
+    "stable": "https://github.com/idletoken/IdleToken/releases/latest",
+    "_note": [
+      "Updating means downloading the current installer from this page and running",
+      "it over the old one. There is no in-app update: the client does not fetch,",
+      "verify or install anything by itself, and it never will without this file",
+      "saying so first (retired 2026-09-02).",
+      "Read that as a narrowing, not as a loss. What an in-app updater bought was",
+      "one signed hop for people who ALREADY had an official client; the first",
+      "install — the hop an attacker actually attacks — was never covered by it.",
+      "Now both hops are the same installer-only path from the official release",
+      "page, with GitHub's asset digest available for comparison. One path to audit, and",
+      "no code path in the client that can be talked into installing something.",
+      "The cost is real and is stated here rather than hidden: nobody is pushed a",
+      "security fix. That is what 'minimumSupportedVersion' is for — the platform",
+      "enforces the floor server-side, where a stale or forked client cannot lie",
+      "its way past it."
+    ]
   },
 
   "minimumSupportedVersion": "0.1.30",
@@ -67,18 +83,25 @@
     "a patch-adoption lever, not an authentication mechanism."
   ],
 
-  "updaterTrustRoot": {
+  "releaseSigningKey": {
     "algorithm": "minisign-ed25519",
     "keyId": "28F23C3CE24BFDE9",
     "publicKey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI4RjIzQzNDRTI0QkZERTkKUldUcC9VdmlQRHp5S0tTWFN4MzQwSnlZOUFvN0ZtU1pmK0h2TGtuT2Y2azJhZVR2Y3dwNVQ3MXYK",
     "_note": [
-      "An installed official client accepts an update only if its signature verifies",
-      "against this key. The key id is short enough to read out over the phone and is",
-      "the value to compare when someone claims to be shipping an IdleToken update.",
-      "This protects the update path of an already-official install. It says nothing",
-      "about a first install — an attacker's build simply carries the attacker's own",
-      "key and updates itself happily (DIST-05). That is what the artifact digests",
-      "below are for."
+      "This historical key signed provenance records for older releases. Current",
+      "installer-only releases do not publish detached signatures or provenance",
+      "sidecars. 'verify_release.sh' remains for checking those historical records, and",
+      "the key id is short enough to read out over the phone when someone claims to",
+      "be shipping IdleToken.",
+      "Until 2026-09-02 the same key was also the in-app updater's trust root and",
+      "was named that way here. The updater is gone; the key is not. Anyone holding",
+      "a copy of the old field name is holding the same key material.",
+      "The honest limit is unchanged: a key published next to the download proves",
+      "nothing on its own to someone who reached a fake page, because an attacker's",
+      "page carries an attacker's key (DIST-05). It is worth something when the two",
+      "are fetched over channels an attacker does not control together — this file",
+      "from the source repository, the artifact from the release page — and when a",
+      "key id somebody wrote down last month still matches today."
     ]
   },
 
@@ -91,7 +114,7 @@
         "installer is signed, a user who sees the blue box would conclude their",
         "download is fake, and a user trained to expect the box clicks through the",
         "attacker's box too (DIST-04). Until a certificate exists, the SHA-256",
-        "comparison below is the check that actually distinguishes the two."
+        "digest displayed by the official GitHub release is the available byte check."
       ]
     },
     "macos": {
@@ -99,19 +122,21 @@
       "notarized": false,
       "expectedUserExperience": "Gatekeeper refuses the first launch; the app must be opened from the context menu."
     },
-    "linux": { "packagesSigned": false, "updaterArtifactsSigned": true }
+    "linux": { "packagesSigned": false },
+    "_allPlatforms": [
+      "No platform's installer carries an OS-level signature. Download only from",
+      "the official GitHub release and compare the asset digest before installing."
+    ]
   },
 
   "verification": {
-    "tool": "scripts/verify_release.sh",
-    "independentVerifier": "scripts/minisign_verify.py",
-    "provenanceArtifact": "idletoken-release-<version>-<platform>.provenance.json",
-    "signatureArtifact": "idletoken-release-<version>-<platform>.provenance.json.sig",
+    "method": "official-origin-and-github-asset-digest",
+    "releaseAssets": "native installers only",
+    "retiredDetachedArtifacts": ["updater archives", "update feeds", "signatures", "provenance sidecars"],
     "steps": [
-      "1. Download the installer AND the provenance json + .sig from the official release page.",
-      "2. Run: scripts/verify_release.sh --provenance <json> <installer>",
-      "3. It refuses unless the provenance signature verifies against key 28F23C3CE24BFDE9 and the installer's SHA-256 is listed in it.",
-      "The verifier is pure Python plus shasum. It does not need IdleToken installed, so it works before a first install — the moment the update signature cannot help."
+      "1. Download the native installer from the official release page.",
+      "2. Compute its SHA-256 and compare it with the digest GitHub displays for that asset.",
+      "3. Refuse the file if the origin or digest does not match."
     ]
   },
 
@@ -122,8 +147,9 @@
     ],
     "weWillNeverAskYouTo": [
       "run a 'repair tool', 'accelerator pack', 'driver fixer' or 'updater' downloaded from a link",
-      "send an updater private key, a platform JWT, an API key, a pairing code or a cluster PSK",
-      "disable the signature check or install an update from outside the app",
+      "send a release signing key, a platform JWT, an API key, a pairing code or a cluster PSK",
+      "install a build you did not download yourself from the official release page",
+      "ignore the release asset digest, or accept an installer sent to you in a message",
       "paste a command into a terminal to 'fix' a support case"
     ],
     "_note": [

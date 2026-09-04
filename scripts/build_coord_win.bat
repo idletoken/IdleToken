@@ -10,7 +10,9 @@ REM
 REM The coord is the easy half of the port: no CUDA, no pthreads, no mmap of the
 REM 80GB model — just sockets, the planner, the HTTP server and the GGUF
 REM tokenizer. Built with the same MinGW toolchain as the worker and with
-REM -DDS4_NO_GPU, mirroring the Makefile's CFLAGS_COORD.
+REM -DDS4_NO_GPU, mirroring the Makefile's CFLAGS_COORD. The legacy ds4/ds4x
+REM implementation is shelved: this build links the refusing ABI stub and never
+REM compiles the historical backend into the shipping coordinator.
 REM
 REM Run from the repo root:  scripts\build_coord_win.bat
 REM Contract: prints COORD_WIN_OK or COORD_WIN_FAIL (details in coord_build.log).
@@ -53,11 +55,7 @@ if defined IDLETOKEN_PLATFORM_VERIFY_KEY_B64 (
     set CF=%CF% -include vk_pin.h
 )
 
-echo === vendor ===> coord_build.log
-gcc -c vendor/ds4/ds4.c %CF% -o c_ds4.o >> coord_build.log 2>&1
-if errorlevel 1 goto :fail
-gcc -c vendor/ds4/rax.c -Ivendor/ds4 -std=gnu11 -O2 -o c_rax.o >> coord_build.log 2>&1
-if errorlevel 1 goto :fail
+echo === platform ===> coord_build.log
 gcc -c src/platform/win/win_compat.c -Isrc/platform/win -std=gnu11 -O2 -o c_win_compat.o >> coord_build.log 2>&1
 if errorlevel 1 goto :fail
 windres -I src/platform/win src/platform/win/idletoken_utf8.rc -O coff -o c_utf8_manifest.o >> coord_build.log 2>&1
@@ -90,8 +88,8 @@ REM TweetNaCl is third-party: -w for the same reason the Makefile gives.
 gcc -c vendor/tweetnacl/tweetnacl.c -Ivendor/tweetnacl -std=gnu11 -O2 -w -o c_tweetnacl.o >> coord_build.log 2>&1
 if errorlevel 1 goto :fail
 
-echo === ds4x tokenizer ===>> coord_build.log
-gcc -c src/ds4x/ds4x_tokenizer.c %CF% -o c_ds4x_tokenizer.o >> coord_build.log 2>&1
+echo === shelved legacy backend stub ===>> coord_build.log
+gcc -c src/common/ds4_stub.c %CF% -o c_ds4_stub.o >> coord_build.log 2>&1
 if errorlevel 1 goto :fail
 
 REM Overflow (B2B forwarding) and its crypto: sealed envelopes ride on
@@ -118,7 +116,7 @@ if errorlevel 1 goto :fail
 echo === link ===>> coord_build.log
 REM -static-libgcc + static winpthread: the exe must run on a machine with only
 REM the NVIDIA driver and no MinGW on PATH (same reason as the worker link).
-gcc -static-libgcc -o idletoken-coord.exe c_coord_main.o c_llama_sidecar.o c_overflow.o c_net.o c_discovery.o c_model.o c_modelsize.o c_http.o c_plan.o c_gguf.o c_weights.o c_advise.o c_enginever.o c_resource.o c_model_auto.o c_apiconv.o c_admission.o c_b64.o c_sodium_seal.o c_blake2b.o c_nodecrypt.o c_privacy.o c_tweetnacl.o c_ds4x_tokenizer.o c_ds4.o c_rax.o c_win_compat.o c_utf8_manifest.o -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic -lws2_32 -lbcrypt >> coord_build.log 2>&1
+gcc -static-libgcc -o idletoken-coord.exe c_coord_main.o c_llama_sidecar.o c_overflow.o c_net.o c_discovery.o c_model.o c_modelsize.o c_http.o c_plan.o c_gguf.o c_weights.o c_advise.o c_enginever.o c_resource.o c_model_auto.o c_apiconv.o c_admission.o c_b64.o c_sodium_seal.o c_blake2b.o c_nodecrypt.o c_privacy.o c_tweetnacl.o c_ds4_stub.o c_win_compat.o c_utf8_manifest.o -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic -lws2_32 -lbcrypt >> coord_build.log 2>&1
 if errorlevel 1 goto :fail
 
 echo COORD_WIN_OK

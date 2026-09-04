@@ -115,18 +115,22 @@ RUSTC_V=$(tool_ver rustc --version)
 NODE_V=$(tool_ver node --version)
 PNPM_V=$(tool_ver pnpm --version)
 
-# --- the trust root this build's updater artifacts are signed with -----------
-UPDATER_KEYID=$(python3 - "$ROOT/client/src-tauri/tauri.conf.json" <<'PY'
+# --- the release identity this record is signed under ------------------------
+# Read from the PUBLISHED key (release-channels.json), which since 2026-09-02 is
+# where the project's signing identity lives: the in-app updater that used to
+# pin a copy in tauri.conf.json is gone, the key is not.
+UPDATER_KEYID=$(python3 - "$ROOT/scripts/release-channels.json" <<'PY'
 import base64, json, sys
 try:
-    pk = json.load(open(sys.argv[1]))["plugins"]["updater"]["pubkey"]
+    d = json.load(open(sys.argv[1]))
+    pk = (d.get("releaseSigningKey") or d["updaterTrustRoot"])["publicKey"]
     raw = base64.b64decode(base64.b64decode(pk).decode().splitlines()[1])
     print(raw[2:10][::-1].hex().upper())
 except Exception:
     print("")
 PY
 )
-[ -n "$UPDATER_KEYID" ] || fail "could not read the updater public key from tauri.conf.json"
+[ -n "$UPDATER_KEYID" ] || fail "could not read the release signing key from scripts/release-channels.json"
 
 # --- artifact digests --------------------------------------------------------
 sha256_of() {
@@ -138,9 +142,13 @@ ART_JSON=""
 for a in "${ARTIFACTS[@]}"; do
     d=$(sha256_of "$a") || fail "no shasum/sha256sum available to digest $a"
     sz=$(wc -c < "$a" | tr -d ' ')
-    # An updater signature sitting next to the artifact is recorded by NAME, so
+    # A detached signature sitting next to the artifact is recorded by NAME, so
     # a verifier can tell which file is supposed to carry one. Its presence is
     # not evidence of anything on its own; verify_release.sh checks it.
+    # Since the updater was removed no artifact ships one, so this is null in
+    # practice. The field keeps its name (and stays in schema /1) because
+    # records 0.1.30..0.1.35 carry it and provenance is meant to be diffed
+    # across releases, not reshaped under the same schema id.
     sig="null"
     [ -f "$a.sig" ] && sig="\"$(basename "$a.sig")\""
     ART_JSON="$ART_JSON{\"name\":\"$(basename "$a")\",\"sha256\":\"$d\",\"bytes\":$sz,\"updaterSignature\":$sig},"
@@ -202,13 +210,13 @@ for a in d['artifacts']:
 "
 
 # --- sign it -----------------------------------------------------------------
-# Signed with the SAME key installed clients already trust, so a user has one
-# fingerprint to know (28F23C3CE24BFDE9), not two. The signer is the Tauri CLI
+# Signed with the project's single published key, so a user has one fingerprint
+# to know (28F23C3CE24BFDE9) across every release. The signer is the Tauri CLI
 # because that is the tool that already exists here; the VERIFIER is our own
 # independent implementation, on purpose (see minisign_verify.py).
 if [ "$SIGN" = 1 ]; then
     KEY_PATH="${TAURI_SIGNING_PRIVATE_KEY_PATH:-$HOME/.idletoken/updater.key}"
-    [ -r "$KEY_PATH" ] || fail "no signing key at $KEY_PATH — restore your backup; do NOT generate a replacement (installed clients trust exactly one key)"
+    [ -r "$KEY_PATH" ] || fail "no signing key at $KEY_PATH — restore your backup; do NOT generate a replacement (the published key id is the one users compare against)"
     SIGNER="$ROOT/client/node_modules/.bin/tauri"
     [ -x "$SIGNER" ] || fail "no Tauri signer at $SIGNER (run pnpm install in client/)"
     # Bundle scripts export the same path through TAURI_SIGNING_PRIVATE_KEY for
@@ -220,11 +228,11 @@ if [ "$SIGN" = 1 ]; then
     [ -s "$OUT.sig" ] || fail "the signer produced no signature for $OUT"
     # Verify what we just signed, with the independent verifier and against the
     # PINNED public key rather than the private key's own pubkey file. Signing
-    # with the wrong key produces a perfectly valid signature that no installed
-    # client will accept — this is the step that notices.
-    PINNED=$(python3 -c "import json;print(json.load(open('$ROOT/client/src-tauri/tauri.conf.json'))['plugins']['updater']['pubkey'])")
+    # with the wrong key produces a perfectly valid signature that no downloader
+    # could verify — this is the step that notices.
+    PINNED=$(python3 -c "import json;print(json.load(open('$ROOT/scripts/release-channels.json'))['releaseSigningKey']['publicKey'])")
     python3 "$ROOT/scripts/minisign_verify.py" --pubkey "$PINNED" --sig "$OUT.sig" "$OUT" \
-        || fail "the signature we just wrote does not verify against the pinned updater key $UPDATER_KEYID — the signing key on this machine is NOT the release key"
+        || fail "the signature we just wrote does not verify against the published release key $UPDATER_KEYID — the signing key on this machine is NOT the release key"
     echo "  signed and independently verified: $OUT.sig"
 fi
 

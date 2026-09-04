@@ -7,7 +7,7 @@ import type { NodeSnapshot, ClusterState } from "./types";
 import { HW_OK, HW_NO_GPU, HW_CC_TOO_LOW, HW_DRIVER_TOO_OLD, HW_VRAM_TOO_SMALL, HW_GPU_UNSUPPORTED, HW_MACOS_SEALED } from "./types";
 import { getModel, getManifest, defaultQuant, estimateClusterCapacity, poolVram, pickBestFittingModel, backendOfOs, type ModelSpec } from "./models";
 import { resolveLocalWeights, fetchWeights, onFetchProgress, defaultModelDir, cancelFetch, resolveDownload, weightsState, verifyWeights, isWeightsCancelled, type DownloadTarget } from "./weights";
-import { loadSettings, saveSettings, settingsWerePersisted, effectiveCaps, effectiveCtx, engineTuning, overflowTuning, autoUiScale, modelSupportsLongContext, type AppSettings, type Tier } from "./settings";
+import { loadSettings, saveSettings, settingsWerePersisted, effectiveCaps, effectiveCtx, engineTuning, overflowTuning, autoUiScale, contextTiersFor, type AppSettings, type ContextTier, type Tier } from "./settings";
 import { buildDiagnosticsBundle } from "./diagnostics";
 import { getAuthProvider, type Session } from "./auth";
 import SettingsPanel from "./SettingsPanel";
@@ -23,9 +23,7 @@ import { identityFrom, type UserIdentity } from "./Avatar";
 import { accountPairSecret, getPairingProvider, type PairingSnapshot, type ClusterApi, type PeerNode } from "./pairing";
 import { recordProblem } from "./problems";
 import { useClusterStats, servedModelOf, type ClusterStats } from "./clusterStats";
-import { floorGiB1, fmtGiB, pct } from "./format";
-import UpdateDialog, { type UpdateResult } from "./UpdateDialog";
-import { getUpdateProvider } from "./provider/update";
+import { compactCount, ctxLabel, floorGiB1, fmtGiB, pct } from "./format";
 import { quitApp, setAutostart, syncTray, syncWindowPrefs, windowState } from "./system";
 
 type Theme = "dark" | "light";
@@ -430,9 +428,11 @@ function FixtureBanner() {
 // decode speed, uptime. The poll itself lives in ./clusterStats — the chat page
 // needs the served model out of the same endpoint.
 function ActivityRow(props: { stats: ClusterStats | null }) {
-  const { t } = useI18n();
+  const { t, lang } = useI18n();
   const stats = props.stats;
   if (!stats) return null;
+  const totalTokens = stats.input_tokens + stats.output_tokens;
+  const exact = (value: number) => value.toLocaleString(lang === "zh" ? "zh-CN" : "en-US");
   const up = stats.uptime_s;
   const uptimeLabel =
     up >= 86400
@@ -442,11 +442,11 @@ function ActivityRow(props: { stats: ClusterStats | null }) {
         : t("stats.mins", { n: Math.max(1, Math.floor(up / 60)) });
   return (
     <div className="activity">
-      <span className="activity__item">
-        <b>{stats.requests.toLocaleString()}</b> {t("stats.requests")}
+      <span className="activity__item" title={exact(stats.requests)}>
+        <b>{compactCount(stats.requests, lang)}</b> {t("stats.requests")}
       </span>
-      <span className="activity__item">
-        <b>{(stats.input_tokens + stats.output_tokens).toLocaleString()}</b> {t("stats.tokens")}
+      <span className="activity__item" title={exact(totalTokens)}>
+        <b>{compactCount(totalTokens, lang)}</b> {t("stats.tokens")}
       </span>
       {stats.last_tok_per_s > 0 ? (
         <span className="activity__item">
@@ -454,8 +454,11 @@ function ActivityRow(props: { stats: ClusterStats | null }) {
         </span>
       ) : null}
       {(stats.cached_tokens ?? 0) > 0 ? (
-        <span className="activity__item" title={t("stats.cacheTitle")}>
-          {t("stats.cache")} <b>{stats.cached_tokens!.toLocaleString()}</b> tok
+        <span
+          className="activity__item"
+          title={`${t("stats.cacheTitle")}: ${exact(stats.cached_tokens!)}`}
+        >
+          {t("stats.cache")} <b>{compactCount(stats.cached_tokens!, lang)}</b> tok
         </span>
       ) : null}
       {/* The granted window + KV dtype, straight from the engine: context and
@@ -527,9 +530,8 @@ function ClusterCard(props: {
   settingModelId: string;
   settingModelLabel: string;
   settingQuant: string;
-  longContext: boolean;
-  longContextAvailable: boolean;
-  onLongContextChange: (enabled: boolean) => void;
+  ctxTokens: ContextTier;
+  onCtxTokensChange: (ctx: ContextTier) => void;
   // Save a pick before any cluster is running.
   onSwitchModel: (modelId: string, quant: string) => void;
 }) {
@@ -590,23 +592,6 @@ function ClusterCard(props: {
           <span className="cluster-model__label">{t("model.selected")}</span>
           <span className="cluster-model__name">{props.settingModelLabel}</span>
           {props.settingQuant ? <span className="cluster-model__quant">{props.settingQuant}</span> : null}
-          {/* Both knobs that define what will be served — the window and the
-              model — sit together at the right end of the row. The checkbox was
-              on its own bordered line below, which read as a third setting
-              unrelated to the model above it. The disabled reason moves to the
-              tooltip so this stays one line. */}
-          <label
-            className={`cluster-model__longctx${props.longContextAvailable ? "" : " is-disabled"}`}
-            title={props.longContextAvailable ? undefined : t("model.longContextUnavailable")}
-          >
-            <input
-              type="checkbox"
-              checked={props.longContext}
-              disabled={!props.longContextAvailable}
-              onChange={(e) => props.onLongContextChange(e.target.checked)}
-            />
-            <span>{t("model.longContext")}</span>
-          </label>
           {/* Nothing is running yet, so this pick is free: it writes the
               setting and the two options below re-read it. */}
           <button className="linkbtn cluster-model__change" onClick={() => setPickOpen((v) => !v)}>
@@ -627,6 +612,36 @@ function ClusterCard(props: {
           {props.weights && (props.weights.needs || props.weights.dl) ? (
             <WeightsRow w={props.weights} idle="show" />
           ) : null}
+        </div>
+
+        {/* Context window (2026-09-02, docs/ctx-tiers-2026-09.md). Its own row
+            under the model because it is the third thing that defines what will
+            be served, and because it is the one with a cost the user cannot see
+            otherwise: llama.cpp allocates the whole window at load, so this is
+            pre-paid VRAM whether a session uses it or not. It replaced a "1M"
+            checkbox — a checkbox could only say "long or not" and could not show
+            that the default had moved from 256K to 128K.
+
+            Tiers above the model's ceiling are not rendered at all rather than
+            rendered-and-clamped: an option that silently becomes a different
+            number is worse than an absent one. */}
+        <div className="cluster-model cluster-model--ctx" role="radiogroup"
+             aria-label={t("model.contextWindow")}>
+          <span className="cluster-model__label">{t("model.contextWindow")}</span>
+          {contextTiersFor(props.settingModelId).map((tier) => (
+            <label
+              key={tier}
+              className={`ctxtier${props.ctxTokens === tier ? " is-on" : ""}`}
+            >
+              <input
+                type="radio"
+                name="ctx-tier"
+                checked={props.ctxTokens === tier}
+                onChange={() => props.onCtxTokensChange(tier)}
+              />
+              <span>{ctxLabel(tier)}</span>
+            </label>
+          ))}
         </div>
 
         {/* Two ways to deploy, always both on screen. They used to be one
@@ -1084,8 +1099,8 @@ function Dashboard(props: {
   model: ModelSpec;
   quant: string;
   tier: { id: number; ctx: number };
-  longContext: boolean;
-  onLongContextChange: (enabled: boolean) => void;
+  ctxTokens: ContextTier;
+  onCtxTokensChange: (ctx: ContextTier) => void;
   pair: PairingSnapshot | null;
   /** Local llama.cpp engine (open-GGUF serving) — replaces the cluster card
    *  while it runs; this machine IS the whole deployment. */
@@ -1162,9 +1177,8 @@ function Dashboard(props: {
             settingModelId={props.model.id}
             settingModelLabel={props.model.label}
             settingQuant={props.quant}
-            longContext={props.longContext}
-            longContextAvailable={modelSupportsLongContext(props.model.id)}
-            onLongContextChange={props.onLongContextChange}
+            ctxTokens={props.ctxTokens}
+            onCtxTokensChange={props.onCtxTokensChange}
             onSwitchModel={props.onSwitchModel}
           />
           )}
@@ -1735,7 +1749,12 @@ export default function App() {
         ...settings,
         modelId,
         quant,
-        longContext: settings.longContext && modelSupportsLongContext(modelId),
+        // A model with a lower ceiling cannot honour the stored tier; snap the
+        // selection down to the largest window this model really offers rather
+        // than sending one the planner has no measurement for.
+        ctxTokens: contextTiersFor(modelId).includes(settings.ctxTokens)
+          ? settings.ctxTokens
+          : contextTiersFor(modelId)[contextTiersFor(modelId).length - 1],
       });
       return queueRebuild(async () => {
         // Switching away from a running local llama.cpp engine: stop it, then
@@ -1907,47 +1926,6 @@ export default function App() {
             .catch((e) => reportTest("diagnostics", { error: String(e) }))
             // The test sentinel token is not left behind in the user's settings.
             .finally(() => { if (dg[1]) saveSettings(original); });
-        }
-        // ---- update (gate G-UPDATE) ------------------------------------
-        // `update-check` asks the real feed through the real provider; the
-        // gate points IDLETOKEN_UPDATE_URL/PUBKEY at a manifest it signed
-        // itself, so what runs here is the production path, not a copy of it.
-        if (d === "update-check") {
-          const provider = getUpdateProvider();
-          provider
-            .check(loadSettings().updateChannel)
-            .then(async (info) => {
-              const st = await provider.state(loadSettings().updateChannel);
-              reportTest("update", {
-                found: info !== null,
-                version: info?.version ?? null,
-                current: st.currentVersion,
-                feed: st.feed,
-                feedOverridden: st.feedOverridden,
-                error: null,
-              });
-            })
-            // The distinction the gate exists to protect: a check that could
-            // not run reports an error, never "up to date".
-            .catch((e) => reportTest("update", { found: null, error: String(e) }));
-        }
-        // Download + verify WITHOUT installing (installing would replace the
-        // binary the harness is running). The signature check happens inside
-        // the download, so this is the assertion that a tampered artifact is
-        // refused — the gate runs it both ways.
-        if (d === "update-download") {
-          const provider = getUpdateProvider();
-          provider
-            .check(loadSettings().updateChannel)
-            .then(async (info) => {
-              if (!info) {
-                reportTest("update-download", { ok: false, reason: "no update offered by the feed" });
-                return;
-              }
-              const bytes = await provider.download();
-              reportTest("update-download", { ok: true, version: info.version, bytes });
-            })
-            .catch((e) => reportTest("update-download", { ok: false, reason: String(e) }));
         }
         // ---- tray / background residency (gate G-TRAY) -------------------
         // What the shell believes about the tray and the window, straight from
@@ -2449,7 +2427,6 @@ export default function App() {
     void syncTray({
       open: t2("tray.open", lang),
       status,
-      check_update: t2("tray.checkUpdate", lang),
       quit: t2("tray.quit", lang),
     });
   }, [lang, cluster, trayMachines, settings.trayIcon]);
@@ -2499,59 +2476,6 @@ export default function App() {
     };
   }, [trayToast]);
 
-  // ---- update ------------------------------------------------------------
-  const [update, setUpdate] = useState<UpdateResult | null>(null);
-
-  /**
-   * One check, two ways of reporting it.
-   *
-   * `announce: "always"` is a check the user asked for (Settings button, tray
-   * menu): every outcome opens the dialog, including "you are current" and
-   * "could not reach the feed" — a button that answers nothing reads as
-   * broken, and the two answers are not the same fact.
-   *
-   * `announce: "found"` is the automatic check at startup: it interrupts only
-   * when there is something to install. A failed check there is deliberately
-   * silent — an unreachable feed four seconds after launch is not worth a
-   * modal — which is exactly why the manual path must never be.
-   */
-  const checkUpdate = useCallback(
-    async (announce: "always" | "found") => {
-      try {
-        const info = await getUpdateProvider().check(settings.updateChannel);
-        if (info) setUpdate({ kind: "found", info });
-        else if (announce === "always") {
-          const st = await getUpdateProvider().state(settings.updateChannel);
-          setUpdate({ kind: "upToDate", current: st.currentVersion });
-        }
-      } catch (e) {
-        if (announce === "always") setUpdate({ kind: "error", message: String(e) });
-      }
-    },
-    [settings.updateChannel]
-  );
-
-  // Automatic check: once per launch, a few seconds in so it never competes
-  // with the probe and the cluster rejoin.
-  useEffect(() => {
-    if (!settings.autoUpdate) return;
-    const timer = setTimeout(() => void checkUpdate("found"), 4000);
-    return () => clearTimeout(timer);
-    // Once per launch: re-running it on every settings edit would nag.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // "Check for updates…" from the tray menu, through the same path as the
-  // Settings button.
-  useEffect(() => {
-    if (!inTauri()) return;
-    const un = import("@tauri-apps/api/event").then(({ listen }) =>
-      listen("tray-check-update", () => void checkUpdate("always"))
-    );
-    return () => {
-      un.then((f) => f());
-    };
-  }, [checkUpdate]);
 
   return (
     <LangContext.Provider value={{ lang, setLang }}>
@@ -2617,7 +2541,6 @@ export default function App() {
                 session={session}
                 onSignIn={() => setShowAuth(true)}
                 onWeightsChanged={bumpWeights}
-                onCheckUpdate={() => checkUpdate("always")}
                 onClose={() => setView("cluster")}
               />
             ) : view === "cluster" ? (
@@ -2626,8 +2549,8 @@ export default function App() {
                 model={model}
                 quant={settings.quant}
                 tier={{ id: settings.tier || 2, ctx: effectiveCtx(settings) } as Tier}
-                longContext={settings.longContext}
-                onLongContextChange={(enabled) => updateSettings({ ...settings, longContext: enabled })}
+                ctxTokens={settings.ctxTokens}
+                onCtxTokensChange={(ctx) => updateSettings({ ...settings, ctxTokens: ctx })}
                 pair={pairSnap}
                 localEngine={localEngine}
                 localApi={localApi}
@@ -2688,13 +2611,6 @@ export default function App() {
             setShowAuth(true);
           }}
           onClose={() => setShowPairing(false)}
-        />
-      ) : null}
-      {update ? (
-        <UpdateDialog
-          result={update}
-          onClose={() => setUpdate(null)}
-          onOutcome={(o) => reportTest("update-install", o)}
         />
       ) : null}
       {trayToast ? (

@@ -261,17 +261,47 @@ int idletoken_plan_layers(const idletoken_model_spec *model,
     ((void)(model_bytes), \
      IDLETOKEN_LLAMA_CUDA_CONTEXT_BYTES + IDLETOKEN_LLAMA_NODE_MARGIN_BYTES)
 
+uint32_t idletoken_llama_ctx_tier_of(uint32_t ctx_size) {
+    if (ctx_size == 0) return 0;
+    if (ctx_size <= IDLETOKEN_CTX_TIER_128K) return IDLETOKEN_CTX_TIER_128K;
+    if (ctx_size <= IDLETOKEN_CTX_TIER_256K) return IDLETOKEN_CTX_TIER_256K;
+    if (ctx_size == IDLETOKEN_CTX_TIER_1M)   return IDLETOKEN_CTX_TIER_1M;
+    /* Between 256K and 1M there is nothing measured and nothing offered.
+     * Returning the 1M slot would be a guess; returning 0 makes the planner
+     * refuse, which is the documented treatment of an unmeasured window. */
+    return 0;
+}
+
+int idletoken_llama_is_ctx_tier(uint32_t ctx_size) {
+    return ctx_size == IDLETOKEN_CTX_TIER_128K ||
+           ctx_size == IDLETOKEN_CTX_TIER_256K ||
+           ctx_size == IDLETOKEN_CTX_TIER_1M;
+}
+
 uint64_t idletoken_llama_compute_bytes(const idletoken_llm_model_size *model,
                                        uint32_t ctx_size, uint8_t backend) {
     if (!model) return 0;
-    /* Two product tiers, two measurements (hard constraint #13). Anything above
-     * the 256K tier is the 1M tier; there is nothing in between to interpolate
-     * and interpolating is what this change exists to stop. */
-    const int one_m = ctx_size > 262144u;
-    const uint64_t cuda  = one_m ? model->compute_bytes_1m_cuda
-                                 : model->compute_bytes_256k_cuda;
-    const uint64_t metal = one_m ? model->compute_bytes_1m_metal
-                                 : model->compute_bytes_256k_metal;
+    /* Three product tiers, three measurements (docs/ctx-tiers-2026-09.md).
+     * Nothing is interpolated between them: the low tiers are dominated by an
+     * n_ubatch floor and only the high end is linear in ctx, so a midpoint
+     * would be wrong in both directions depending on where you stood. */
+    uint64_t cuda = 0, metal = 0;
+    switch (idletoken_llama_ctx_tier_of(ctx_size)) {
+        case IDLETOKEN_CTX_TIER_128K:
+            cuda  = model->compute_bytes_128k_cuda;
+            metal = model->compute_bytes_128k_metal;
+            break;
+        case IDLETOKEN_CTX_TIER_256K:
+            cuda  = model->compute_bytes_256k_cuda;
+            metal = model->compute_bytes_256k_metal;
+            break;
+        case IDLETOKEN_CTX_TIER_1M:
+            cuda  = model->compute_bytes_1m_cuda;
+            metal = model->compute_bytes_1m_metal;
+            break;
+        default:
+            return 0;   /* not a product tier — refuse, never round */
+    }
     switch (backend) {
         case IDLETOKEN_NODE_BACKEND_CUDA:  return cuda;
         case IDLETOKEN_NODE_BACKEND_METAL: return metal;
@@ -485,10 +515,60 @@ int idletoken_quant_weight_bits(const char *quant) {
     return idletoken_quant_bits_from_path(quant);
 }
 
+/* REVISED 2026-09-02 (user decision), replacing the 08-26 three-tier rule:
+ * q8_0 now covers EVERY quantized weight tier, 3 bit through 15, so Q5/Q6/Q8
+ * no longer keep an f16 cache. f16 is left to BF16/F16 weights alone — an
+ * unquantized model is the one case where a quantized cache would be the only
+ * lossy thing in the pipeline. The 1-2 bit tier keeps q4_0.
+ *
+ * What this buys: on qwen3.8-27b Q8_K_XL @256K the growing KV drops 16.00 ->
+ * 8.50 GiB, and the whole-cluster requirement 46.9 -> 39.4 GiB.
+ *
+ * ⚠ Not yet ppl-gated at the newly-covered tiers (5-15 bit). The 1-2 bit tier's
+ * q4_0 has weak field evidence only (cluster-5 served weeks on it), and the
+ * 3-4 bit tier's q8_0 likewise. Treat "q8_0 KV costs nothing measurable next to
+ * Q8 weights" as an assumption on record, not a measurement.
+ *
+ * ⚠ Setting a type also makes the sidecar pass `-fa on` (a quantized V cache
+ * requires flash attention), so that now applies to Q5-Q8 as well, where the
+ * engine previously chose FA itself. */
+int idletoken_llama_kv_tier_for_weight(int weight_bits) {
+    if (weight_bits >= 1 && weight_bits <= 2) return IDLETOKEN_KV_TIER_Q4_0;
+    if (weight_bits >= 3 && weight_bits <= 15) return IDLETOKEN_KV_TIER_Q8_0;
+    /* 0 = unknown and >=16 = unquantized both keep f16. Unknown must not be
+     * guessed DOWN: the planner and the engine agree only because both fall
+     * back to f16 here, and a cheaper guess would under-charge the budget. */
+    return IDLETOKEN_KV_TIER_F16;
+}
+
+const char *idletoken_llama_kv_tier_name(int tier) {
+    switch (tier) {
+        case IDLETOKEN_KV_TIER_F16:  return "f16";
+        case IDLETOKEN_KV_TIER_Q8_0: return "q8_0";
+        case IDLETOKEN_KV_TIER_Q4_0: return "q4_0";
+        default: return "f16";
+    }
+}
+
+int idletoken_llama_kv_tier_of_name(const char *name) {
+    /* "" and bf16 both mean "the engine's default cache", which is what the
+     * f16 slot was measured under. Everything else the escape hatch allows
+     * (q5_1, q5_0, iq4_nl, q4_1) has NO measured workspace, and -1 says so
+     * rather than letting a caller round it to a neighbour. */
+    if (!name || !name[0]) return IDLETOKEN_KV_TIER_F16;
+    for (int t = 0; t < IDLETOKEN_KV_TIER_COUNT; t++)
+        if (strcmp(name, idletoken_llama_kv_tier_name(t)) == 0) return t;
+    if (strcmp(name, "bf16") == 0) return IDLETOKEN_KV_TIER_F16;
+    return -1;
+}
+
 const char *idletoken_llama_kv_type_for_weight(int weight_bits) {
-    if (weight_bits >= 1 && weight_bits <= 2) return "q4_0";
-    if (weight_bits >= 3 && weight_bits <= 4) return "q8_0";
-    return NULL;
+    /* Derived, never a second boundary table: the f16 tier returns NULL so the
+     * coordinator passes no -ctk/-ctv and the engine uses its own default,
+     * which is the configuration the f16 workspace was measured under. */
+    const int tier = idletoken_llama_kv_tier_for_weight(weight_bits);
+    return tier == IDLETOKEN_KV_TIER_F16 ? NULL
+                                         : idletoken_llama_kv_tier_name(tier);
 }
 
 /* Display rounding is retained for diagnostics. Product starts use the exact

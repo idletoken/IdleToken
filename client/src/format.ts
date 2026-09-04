@@ -26,6 +26,25 @@ export function fmtGiB(b: number): { value: string; unit: string } {
   return { value: floorGiB1(b).toFixed(1), unit: "GiB" };
 }
 
+/** Short context-window label: 131072 -> "128K", 1048576 -> "1M".
+ *  Mirrors ctxShort() in packages/shared-ui so the client and the portal name
+ *  the same window the same way — the portal labels every service with its
+ *  window since 2026-09-02, and two spellings would read as two products. */
+export function ctxLabel(tokens: number): string {
+  return tokens >= 1_048_576 ? "1M" : `${Math.round(tokens / 1024)}K`;
+}
+
+/** Compact a cumulative counter before it becomes wide enough to reflow the
+ * cluster activity row. The exact value remains available to callers for a
+ * tooltip; this function is only the bounded-width visual label. */
+export function compactCount(value: number, lang: "en" | "zh"): string {
+  const safe = Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : 0;
+  return new Intl.NumberFormat(lang === "zh" ? "zh-CN" : "en-US", {
+    notation: safe >= 10_000 ? "compact" : "standard",
+    maximumFractionDigits: safe >= 10_000 ? 1 : 0,
+  }).format(safe);
+}
+
 export function pct(part: number, whole: number): number {
   if (whole <= 0) return 0;
   return Math.max(0, Math.min(100, (part / whole) * 100));

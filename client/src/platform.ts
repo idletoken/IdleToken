@@ -118,11 +118,11 @@ export function getProviders(): Promise<ProviderInfo[]> {
   return req<ProviderInfo[]>("/providers");
 }
 
-export function createApiKey(opts?: { label?: string; dailyCapMilli?: number }): Promise<CreatedApiKey> {
+export function createApiKey(opts?: { label?: string; dailyCapMilli?: number | null }): Promise<CreatedApiKey> {
   // The plaintext key comes back exactly once, so whoever calls this owns
   // keeping it. `label` matters more than it looks: without one, a revoke page
   // shows a list of prefixes and no way to tell which is which.
-  const body = opts && (opts.label || opts.dailyCapMilli) ? JSON.stringify(opts) : undefined;
+  const body = opts ? JSON.stringify(opts) : undefined;
   return req<CreatedApiKey>("/me/api-keys", { method: "POST", ...(body ? { body } : {}) });
 }
 

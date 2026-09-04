@@ -41,16 +41,24 @@ SCALARS = [
     ("context_max", "context_max"),
     ("context_yarn_max", "context_yarn_max"),
     ("overhead_base_bytes", "overhead_base_bytes"),
-    # The measured graph workspace. Compared here because it is the number that
-    # decides whether a configuration is admitted or OOMs, and the two copies
-    # (models/*.json for the client, the C registry for the engine) have no
-    # other thing keeping them equal.
-    ("compute_bytes_256k_cuda", "compute_bytes_256k_cuda"),
-    ("compute_bytes_1m_cuda", "compute_bytes_1m_cuda"),
-    ("compute_bytes_256k_metal", "compute_bytes_256k_metal"),
-    ("compute_bytes_1m_metal", "compute_bytes_1m_metal"),
     ("default_gguf", "default_gguf"),
 ]
+# The measured graph workspace, one entry per KV cache tier (f16, q8_0, q4_0 --
+# idletoken_kv_tier order). Compared here because it is the number that decides
+# whether a configuration is admitted or OOMs, and the two copies
+# (models/*.json for the client, the C registry for the engine) have no other
+# thing keeping them equal. Unlike SCALARS these are REQUIRED and must be
+# lists: a manifest still carrying the pre-2026-09-02 scalar would otherwise be
+# skipped as "absent" while the engine reads a zero-filled array.
+COMPUTE = [
+    "compute_bytes_128k_cuda",
+    "compute_bytes_256k_cuda",
+    "compute_bytes_1m_cuda",
+    "compute_bytes_128k_metal",
+    "compute_bytes_256k_metal",
+    "compute_bytes_1m_metal",
+]
+KV_TIER_NAMES = ("f16", "q8_0", "q4_0")
 KV = [
     ("kind", "kv_kind"),
     ("bytes_per_token_per_layer", "kv_bytes_per_token_per_layer"),
@@ -88,6 +96,22 @@ def main(argv):
                 continue
             if man[mk] != r[rk]:
                 problems.append("%s: %s manifest=%r registry=%r" % (mid, mk, man[mk], r[rk]))
+        for key in COMPUTE:
+            mv, rv = man.get(key), r.get(key)
+            if not isinstance(mv, list):
+                problems.append(
+                    "%s: %s must be a %d-entry list [%s], got %r -- re-run "
+                    "scripts/measure_all_models.sh + apply_measured_memory.py"
+                    % (mid, key, len(KV_TIER_NAMES), ", ".join(KV_TIER_NAMES), mv))
+                continue
+            if len(mv) != len(KV_TIER_NAMES):
+                problems.append("%s: %s has %d entries, expected %d (%s)"
+                                % (mid, key, len(mv), len(KV_TIER_NAMES),
+                                   ", ".join(KV_TIER_NAMES)))
+                continue
+            if mv != rv:
+                problems.append("%s: %s manifest=%r registry=%r"
+                                % (mid, key, mv, rv))
         for mk, rk in KV:
             if mk in man.get("kv", {}) and man["kv"][mk] != r[rk]:
                 problems.append("%s: kv.%s manifest=%r registry=%r"

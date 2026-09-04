@@ -2009,12 +2009,11 @@ int main(int argc, char **argv) {
     return IDLETOKEN_EXIT_JOIN_REFUSED;
 
 #ifdef _WIN32
-    /* Self-provision inbound firewall rules (architecture §9, productization).
-     * Pairing on real machines failed twice on silently filtered inbound ports
-     * (the UDP beacon on 14097, the HC ports 14322/14323), and until now the fix
-     * was a manual netsh invocation. The rule name carries the port, so changing
-     * ports adds a new rule automatically; without elevation we print the exact
-     * command instead. Set IDLETOKEN_NO_FIREWALL_RULE=1 to skip. */
+    /* Report the inbound ports this worker needs. Pairing on real machines
+     * failed twice on silently filtered ports (the UDP beacon on 14097, the HC
+     * ports 14322/14323), so the requirement is worth stating out loud. The
+     * engine no longer provisions the rules itself — the installer does, while
+     * elevated (2026-09-02, see win_compat.c). */
     {
         const char *colon = strrchr(bind_addr, ':');
         int bind_port = colon ? atoi(colon + 1) : 0;

@@ -5,4 +5,7 @@
  * (CreateProcessA, FindFirstFileA, CreateFileA, ...) consume the same bytes.
  * Without this resource a non-ASCII Windows profile path is irreversibly
  * replaced with '?' before main() sees it. */
-1 RT_MANIFEST "idletoken_utf8.manifest"
+/* windres resolves the resource file name from its process working directory,
+ * not from this .rc file's directory. Both native Windows build scripts run
+ * from the repository root, so keep the path root-relative. */
+1 RT_MANIFEST "src/platform/win/idletoken_utf8.manifest"

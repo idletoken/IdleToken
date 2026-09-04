@@ -16,7 +16,7 @@
     },
     "windows": {
       "nsis": {
-        "installMode": "currentUser",
+        "installMode": "perMachine",
         "languages": ["English", "SimpChinese"],
         "installerIcon": "icons/icon.ico",
         "installerHooks": "windows/installer-hooks.nsh"

@@ -16,6 +16,7 @@ import type { Session } from "./auth";
 import { platformGate } from "./platform";
 import { useDialog } from "./useDialog";
 import { loadSettings, overflowTuning, type EngineTuning } from "./settings";
+import { ctxLabel } from "./format";
 
 type View = "choose" | "join" | "active";
 
@@ -166,11 +167,25 @@ export default function PairingPanel(props: {
       // The Rust-side refusal code; the message key is `joinNeedsModel` because
       // `pairing.err.modelNotReady` already names a different failure (a member
       // that is in the cluster but not finished preparing, raised at start).
-      case "modelNotReady":
+      case "modelNotReady": {
+        // One wire code, two causes (2026-09-02): the weights are missing, or
+        // the context window disagrees. The creator does not distinguish them —
+        // it only reports what it requires — so decide here, where this
+        // machine's own setting is known. Telling someone to download weights
+        // they already have is how a one-click fix becomes an hour.
+        const need = snap?.requiredModel;
+        const localCtx = loadSettings().ctxTokens;
+        if (need?.ctx && need.ctx !== localCtx) {
+          return t("pairing.err.joinNeedsCtx", {
+            want: ctxLabel(need.ctx),
+            have: ctxLabel(localCtx),
+          });
+        }
         return t("pairing.err.joinNeedsModel", {
-          model: snap?.requiredModel?.modelId ?? "?",
-          quant: snap?.requiredModel?.quant ?? "?",
+          model: need?.modelId ?? "?",
+          quant: need?.quant ?? "?",
         });
+      }
       case "rejected":
         return t("pairing.err.rejected", { detail: e.detail });
       case "portBusy":

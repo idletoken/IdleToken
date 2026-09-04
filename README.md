@@ -101,11 +101,12 @@ These apply to machines that run inference; using the platform requires no GPU a
 
 | Platform | Compute hardware | Also needs |
 | --- | --- | --- |
-| Windows 10/11 | NVIDIA, compute capability ≥ 7.5 (RTX 20-series or newer), ≥ 4 GB VRAM | driver ≥ 527.41 and CUDA Toolkit 12.x |
-| Linux | NVIDIA, compute capability ≥ 7.5 (RTX 20-series or newer), ≥ 4 GB VRAM | driver ≥ 580.65 and CUDA Toolkit 13.0; **prebuilt packages are arm64 only** — on x86_64, build from source |
+| Windows 10/11 | NVIDIA, compute capability ≥ 7.5 (RTX 20-series or newer), ≥ 4 GB VRAM | current NVIDIA driver; CUDA runtime DLLs are included |
+| Linux x86_64 | NVIDIA, compute capability ≥ 7.5 (RTX 20-series or newer), ≥ 4 GB VRAM | driver ≥ 570.26 and CUDA Toolkit 12.8 |
+| Linux arm64 | NVIDIA, compute capability ≥ 7.5, ≥ 4 GB VRAM | driver ≥ 580.65 and CUDA Toolkit 13.0 |
 | macOS | Apple Silicon with Metal and enough unified memory for the selected model | no CUDA installation |
 
-- The Linux packages on the Releases page are arm64 `.deb` and AppImage. x86_64 Linux is fully supported but has no prebuilt package yet, and no `.rpm` has been published even though the build script can produce one — both are a packaging gap, not a functional one.
+- Releases contain native installers only: Windows `.exe`, macOS `.dmg`, and Linux `.deb`/`.rpm` packages for both x86_64 and arm64. There is no AppImage or in-app updater; upgrade by installing the current package over the existing version.
 - Operating systems can mix in one cluster; the IdleToken version must match on every node.
 - Cluster machines need a direct LAN route to each other; tensor traffic does not go through VPN or overlay networks such as Tailscale. Wired gigabit or faster is recommended.
 - CPU-only machines, AMD GPUs, Intel Macs and phones cannot compute, but can run the client to sign in, chat and control a cluster.

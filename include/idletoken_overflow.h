@@ -111,31 +111,17 @@ int idletoken_overflow_key_verify(const uint8_t verify_pk[IDLETOKEN_OVF_PK_BYTES
  * that must hold before this coordinator is allowed to spend money by itself is
  * checked once, here, rather than at the moment of the first burst. */
 
-/* Requests are refused past this many milli-credits of platform spend in one
- * UTC day. A daily ceiling is NOT optional (api-surface §5.4): "forward to the
- * platform when busy" means "spend money without being asked", and one runaway
- * benchmark overnight would empty the balance before anyone looked.
- *
- * 50 credits/day, raised from 5 on 2026-08-19 once there were measured prices
- * to judge it against (platform/pricing/anchor-proposal-v1.md, decision D2).
- * The old 5 was picked when nothing could say how much a credit buys; against
- * the measured rate card it bought ONE 27B-class conversation and not even half
- * a Claude Code turn, i.e. a user who switched overflow on got a feature that
- * looked broken. 50 buys roughly ten 27B-class conversations or 3-5 Claude Code
- * turns and is still a guardrail: a machine that shares for a day earns ~5800.
- *
- * Prices are set per deployment, so no number here is universal — this one is
- * anchored to OUR rate card. It stays deliberately finite: the switch shows it
- * and the user can raise it, and a default that surprises someone by refusing
- * is recoverable in a way that a default which surprises them by spending
- * is not. */
-#define IDLETOKEN_OVF_DEFAULT_DAILY_CAP_MILLI 50000
+/* No coordinator-side daily ceiling by default. The account's Spark balance is
+ * the product's spend gate: while it is positive, an eligible busy request may
+ * keep borrowing. Operators can still set a positive --overflow-daily-cap as
+ * an explicit local stop-loss; zero means no additional local ceiling. */
+#define IDLETOKEN_OVF_DEFAULT_DAILY_CAP_MILLI 0
 
 typedef struct {
     const char *url;              /* platform base URL or host:port */
     const char *api_key;          /* the account's overflow key; sealed, never a header */
     long long   wait_ms;          /* forward only when the estimated wait is at least this */
-    long long   daily_cap_milli;  /* <= 0 means the default above; there is no "off" */
+    long long   daily_cap_milli;  /* > 0 explicit stop-loss; <= 0 means no local cap */
     int         api_token_set;    /* retained config field; tokenless loopback is supported */
 } idletoken_overflow_cfg;
 
@@ -211,12 +197,16 @@ const char *idletoken_origin_name(idletoken_origin o);
  * run against an older build is an oracle nobody runs.
  *
  * CAPABILITY recognises and consumes capabilities but still forwards
- * unattributed work; it is the right setting for a machine that borrows and
- * never lends, where "unattributed" has no second meaning.
+ * unattributed loopback work. It is the product default in both private and
+ * shared mode: OpenAI/Anthropic compatibility means third-party local clients
+ * cannot be required to read an IdleToken state file and add a private header.
+ * Proven platform work, legacy-marked platform work, a platform job already in
+ * flight, and a spent hop budget remain independently non-forwardable.
  *
- * STRICT additionally refuses to forward unattributed work. Default while
- * --shared is on, because that is the only configuration in which an
- * unattributed request might be somebody else's prompt. */
+ * STRICT additionally refuses to forward unattributed work. It is an explicit
+ * operator opt-in for a provider that accepts the trade-off: ordinary Claude
+ * Code, Codex, Nimbalyst and curl requests receive 429 instead of borrowing
+ * while the local slot is busy. */
 typedef enum {
     IDLETOKEN_OVF_ORIGIN_LEGACY = 0,
     IDLETOKEN_OVF_ORIGIN_CAPABILITY,
@@ -245,15 +235,14 @@ const char *idletoken_overflow_policy_name(idletoken_ovf_policy p);
  * what. The order of the checks is the order of the rules:
  *
  *   RULE 1  platform work        -> never. Not a threshold, not a setting.
- *   RULE 1b unattributed, strict  -> never, for the same reason: on a machine
- *                                    that serves the platform, "no marker" is
- *                                    indistinguishable from a stripped one.
+ *   RULE 1b unattributed, strict  -> never. This opt-in also disables overflow
+ *                                    for ordinary third-party API clients.
  *   RULE 1c a platform job is in flight -> never: a machine in the middle of
  *                                    somebody else's paid job must not pay a
  *                                    third machine for what may be the same
  *                                    prompt (fee expansion, CHAIN-05).
  *   hops    already forwarded once -> never; the chain ends here.
- *   §5.4    daily cap reached      -> never, until the UTC day turns over.
+ *   §5.4    explicit cap reached   -> never, until the UTC day turns over.
  *   §4      est_wait < wait_ms     -> not yet: the user asked to wait this long
  *                                    before paying someone else.
  *
@@ -298,6 +287,12 @@ typedef struct {
      * to re-escape it there would be two chances to disagree about \uXXXX for
      * no gain. malloc'd; free with idletoken_overflow_reply_free. */
     char     *text_escaped;
+    /* Optional OpenAI tool_calls array, brackets included, copied verbatim
+     * from the sealed reply. NULL means this was a text-only turn. */
+    char     *tool_calls_json;
+    /* OpenAI finish_reason. Empty only for an old platform response; callers
+     * then derive the historical default from tool_calls/text. */
+    char      finish_reason[24];
     int       in_tokens;
     int       out_tokens;
     long long charged_milli;
@@ -308,17 +303,23 @@ void idletoken_overflow_reply_free(idletoken_overflow_reply *r);
 /* Seal one request to the platform and open its answer.
  *
  * `messages_json` is a complete JSON array — `[{"role":"user","content":"..."}]`
- * with the content already escaped — because building it means understanding
- * OpenAI and Anthropic request bodies, which is the coordinator's job, not this
- * module's. Here it is transport and crypto only.
+ * with the content already escaped. `tools_json` and `tool_choice_json` are
+ * optional complete JSON values from the same normalized OpenAI request.
+ * `model` and `quant` are the exact service identity this coordinator is
+ * running; carrying both prevents the platform from applying the public
+ * bare-name quality floor to a user's explicitly selected lower precision.
+ * The explicit lengths let callers pass spans without copying them. Building
+ * these values means understanding API request bodies, which is the
+ * coordinator's job, not this module's; here they are transport and crypto
+ * only.
  *
- * Returns 0 with `*out` filled, or -1 with a one-line reason in `err`. EVERY
- * failure lands here: a platform 4xx/5xx, an unreachable host, an envelope that
- * will not open, an error the platform sealed back. The caller answers the
- * local client with its ordinary 429 in all of those cases — "this machine is
- * busy and could not borrow one" is the honest local meaning, and the
- * platform's own error text is never passed through, since it may describe the
- * platform's insides rather than anything the caller did.
+ * Returns IDLETOKEN_OVF_EXCHANGE_OK with `*out` filled,
+ * IDLETOKEN_OVF_EXCHANGE_REFUSED when the trusted platform sealed back a
+ * caller-actionable refusal, or IDLETOKEN_OVF_EXCHANGE_ERROR for transport,
+ * crypto and malformed-response failures. On REFUSED, `err` contains one of a
+ * small allowlisted set of stable reason codes, never the platform's free-form
+ * message. That lets the caller report quota/request failures honestly without
+ * leaking platform internals; ERROR still becomes the ordinary local busy 429.
  *
  * On success the charge the platform REPORTED is added to the day's spend, so
  * the local ceiling counts the same currency the platform bills in.
@@ -340,8 +341,16 @@ void idletoken_overflow_reply_free(idletoken_overflow_reply *r);
  * results/security-hardening-overflow-privacy-20260830.md. Emitting them before
  * anyone reads them is deliberate: an unread field costs bytes, while a field
  * added later means every deployed coordinator is exempt from the rule. */
-int idletoken_overflow_exchange(const char *messages_json,
-                                const char *model, int max_tokens,
+#define IDLETOKEN_OVF_EXCHANGE_OK       0
+#define IDLETOKEN_OVF_EXCHANGE_ERROR   -1
+#define IDLETOKEN_OVF_EXCHANGE_REFUSED -2
+
+int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
+                                const char *tools_json, size_t tools_len,
+                                const char *tool_choice_json,
+                                size_t tool_choice_len,
+                                const char *model, const char *quant,
+                                int max_tokens,
                                 int hops_in,
                                 idletoken_overflow_reply *out,
                                 char *err, size_t err_cap);

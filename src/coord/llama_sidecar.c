@@ -52,6 +52,9 @@
  * idletoken_llama_http_watch). The slice only bounds how often we get to look
  * around; it is NOT a deadline for the engine. */
 #define LLAMA_READ_SLICE_MS     5000
+/* A departed caller should release the single local inference slot promptly.
+ * This is only the socket wake-up cadence; it is not an engine deadline. */
+#define LLAMA_CANCEL_SLICE_MS    250
 /* Silence shorter than this is ordinary prefill on a large model — do not go
  * knocking. Past it, ask the engine whether it is still there, no more often
  * than LLAMA_PROBE_EVERY_MS. */
@@ -181,12 +184,21 @@ static const char *hdr_find(const char *hay, size_t hay_len, const char *needle)
     return NULL;
 }
 
-int idletoken_llama_http_open(const char *endpoint, const char *method,
-                              const char *path,
-                              const char *body, size_t body_len,
-                              int timeout_ms, idletoken_llama_conn *c) {
+static ssize_t conn_recv_watched(idletoken_llama_conn *c, void *dst, size_t cap);
+
+static int llama_http_open_impl(const char *endpoint, const char *method,
+                                const char *path,
+                                const char *body, size_t body_len,
+                                int timeout_ms, int downstream_fd,
+                                const char *watch_endpoint,
+                                idletoken_llama_conn *c) {
     memset(c, 0, sizeof(*c));
     c->fd = -1;
+    c->cancel_fd = downstream_fd;
+    c->idle_timeout_ms = timeout_ms;
+    c->watch = watch_endpoint;
+    c->slice_ms = downstream_fd >= 0 ? LLAMA_CANCEL_SLICE_MS
+                                     : (watch_endpoint ? LLAMA_READ_SLICE_MS : 0);
     c->content_left = -1;
 
     if (!endpoint || !endpoint[0]) return -1;
@@ -198,6 +210,9 @@ int idletoken_llama_http_open(const char *endpoint, const char *method,
     int fd = is_unix ? idletoken_connect_unix(endpoint + 5)
                      : idletoken_connect_tcp(endpoint);
     if (fd < 0) return -1;
+    /* Keep the caller's ordinary timeout while sending. The short cancellation
+     * slice is installed only after the complete request is on loopback; using
+     * it for send would reject a legitimate large prompt after 250 ms. */
     conn_set_timeout(fd, timeout_ms);
 
     char head[512];
@@ -214,13 +229,27 @@ int idletoken_llama_http_open(const char *endpoint, const char *method,
         idletoken_close_fd(fd);
         return -1;
     }
+    c->fd = fd;
+    if (c->slice_ms > 0) conn_set_timeout(fd, c->slice_ms);
 
     /* Read until the header terminator; whatever follows it stays buffered. */
     size_t hdr_end = 0;
     for (;;) {
-        if (c->blen + 1 >= sizeof(c->buf)) { idletoken_close_fd(fd); return -1; }
-        ssize_t r = conn_recv(fd, c->buf + c->blen, sizeof(c->buf) - 1 - c->blen);
-        if (r <= 0) { idletoken_close_fd(fd); return -1; }
+        if (c->blen + 1 >= sizeof(c->buf)) {
+            idletoken_close_fd(fd);
+            c->fd = -1;
+            return -1;
+        }
+        ssize_t r = c->slice_ms > 0
+            ? conn_recv_watched(c, c->buf + c->blen,
+                                sizeof(c->buf) - 1 - c->blen)
+            : conn_recv(fd, c->buf + c->blen,
+                        sizeof(c->buf) - 1 - c->blen);
+        if (r <= 0) {
+            idletoken_close_fd(fd);
+            c->fd = -1;
+            return -1;
+        }
         c->blen += (size_t)r;
         c->buf[c->blen] = '\0';
         char *sep = strstr(c->buf, "\r\n\r\n");
@@ -230,6 +259,7 @@ int idletoken_llama_http_open(const char *endpoint, const char *method,
     /* Status line: "HTTP/1.1 200 OK". */
     if (c->blen < 12 || strncmp(c->buf, "HTTP/1.", 7) != 0) {
         idletoken_close_fd(fd);
+        c->fd = -1;
         return -1;
     }
     c->status = atoi(c->buf + 9);
@@ -244,9 +274,25 @@ int idletoken_llama_http_open(const char *endpoint, const char *method,
         c->content_left = atoll(cl);
     }
 
-    c->fd = fd;
     c->boff = hdr_end;   /* leftover payload bytes start here */
     return 0;
+}
+
+int idletoken_llama_http_open(const char *endpoint, const char *method,
+                              const char *path,
+                              const char *body, size_t body_len,
+                              int timeout_ms, idletoken_llama_conn *c) {
+    return llama_http_open_impl(endpoint, method, path, body, body_len,
+                                timeout_ms, -1, NULL, c);
+}
+
+int idletoken_llama_http_open_relay(const char *endpoint, const char *method,
+                                    const char *path,
+                                    const char *body, size_t body_len,
+                                    int timeout_ms, int downstream_fd,
+                                    idletoken_llama_conn *c) {
+    return llama_http_open_impl(endpoint, method, path, body, body_len,
+                                timeout_ms, downstream_fd, endpoint, c);
 }
 
 /* Did that recv fail only because the slice expired, or for a real reason? */
@@ -272,6 +318,14 @@ static int llama_health_ok(const char *endpoint);   /* defined below */
  * after 5s and the liveness check never ran at all. */
 static ssize_t conn_recv_watched(idletoken_llama_conn *c, void *dst, size_t cap) {
     for (;;) {
+        if (c->cancel_fd >= 0 && idletoken_peer_closed(c->cancel_fd)) {
+            c->cancelled = 1;
+            c->eof = 1;
+            fprintf(stderr,
+                    "coord: llama-sidecar: downstream client disconnected — "
+                    "cancelling its engine request\n");
+            return -1;
+        }
         ssize_t r = conn_recv(c->fd, dst, cap);
         if (r >= 0) {                      /* any byte means the engine is there */
             c->silent_ms = 0;
@@ -281,6 +335,18 @@ static ssize_t conn_recv_watched(idletoken_llama_conn *c, void *dst, size_t cap)
         /* Not watching, or a genuine socket error: unchanged behaviour. */
         if (c->slice_ms <= 0 || !conn_recv_timed_out()) return r;
         c->silent_ms += c->slice_ms;
+        if (c->cancel_fd >= 0 && idletoken_peer_closed(c->cancel_fd)) {
+            c->cancelled = 1;
+            c->eof = 1;
+            fprintf(stderr,
+                    "coord: llama-sidecar: downstream client disconnected — "
+                    "cancelling its engine request\n");
+            return -1;
+        }
+        if (c->idle_timeout_ms > 0 && c->silent_ms >= c->idle_timeout_ms) {
+            c->eof = 1;
+            return -1;
+        }
         if (!c->watch || c->silent_ms < LLAMA_SILENCE_GRACE_MS ||
             c->silent_ms - c->probed_at_ms < LLAMA_PROBE_EVERY_MS)
             continue;                      /* still plausibly just a long prefill */
@@ -331,6 +397,7 @@ void idletoken_llama_http_watch(idletoken_llama_conn *c, const char *endpoint) {
     if (!c || c->fd < 0) return;
     c->slice_ms     = LLAMA_READ_SLICE_MS;
     c->watch        = endpoint;
+    c->cancel_fd    = -1;
     c->silent_ms    = 0;
     c->probed_at_ms = 0;
     conn_set_timeout(c->fd, LLAMA_READ_SLICE_MS);

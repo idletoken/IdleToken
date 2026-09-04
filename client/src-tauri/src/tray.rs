@@ -17,7 +17,7 @@ use std::sync::Mutex;
 use serde::Deserialize;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
 const TRAY_ID: &str = "main";
 
@@ -28,7 +28,6 @@ pub struct TrayLabels {
     /// One line of state, e.g. "Cluster ready · 4 machines". Shown as a
     /// disabled item at the top of the menu and as the icon's tooltip.
     pub status: String,
-    pub check_update: String,
     pub quit: String,
 }
 
@@ -37,7 +36,6 @@ impl Default for TrayLabels {
         Self {
             open: "Open IdleToken".into(),
             status: "IdleToken".into(),
-            check_update: "Check for updates…".into(),
             quit: "Quit IdleToken".into(),
         }
     }
@@ -52,7 +50,6 @@ fn build_menu(app: &AppHandle, labels: &TrayLabels) -> tauri::Result<Menu<tauri:
     // already open when you are looking for it.
     let status = MenuItem::with_id(app, "status", &labels.status, false, None::<&str>)?;
     let open = MenuItem::with_id(app, "open", &labels.open, true, None::<&str>)?;
-    let update = MenuItem::with_id(app, "update", &labels.check_update, true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", &labels.quit, true, None::<&str>)?;
     Menu::with_items(
         app,
@@ -60,7 +57,6 @@ fn build_menu(app: &AppHandle, labels: &TrayLabels) -> tauri::Result<Menu<tauri:
             &status,
             &PredefinedMenuItem::separator(app)?,
             &open,
-            &update,
             &PredefinedMenuItem::separator(app)?,
             &quit,
         ],
@@ -124,12 +120,6 @@ pub fn remove(app: &AppHandle) {
 fn on_menu(app: &AppHandle, id: &str) {
     match id {
         "open" => crate::window::show_main(app),
-        "update" => {
-            // Show the window first: the update dialog is drawn by the front
-            // end, and a prompt nobody can see is not a prompt.
-            crate::window::show_main(app);
-            let _ = app.emit("tray-check-update", ());
-        }
         "quit" => crate::quit(app),
         _ => {}
     }

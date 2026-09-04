@@ -333,8 +333,9 @@ static void usage(FILE *out) {
 "  --num-workers N     wait for N workers, then plan (default: 1)\n"
 "  --force-cluster     honor an explicit multi-machine choice even when the\n"
 "                      selected model and precision also fit locally\n"
-"  --ctx-size N        exact context window (product default: 262144; the\n"
-"                      client passes 1048576 after explicit 1M opt-in)\n"
+"  --ctx-size N        exact context window. Exactly one of 131072 (default),\n"
+"                      262144 or 1048576; any other value is refused rather\n"
+"                      than rounded, because only these are measured\n"
 "  --model-id ID       model to serve, from the model registry\n"
 "                      (default: deepseek-v4-flash; other registered models\n"
 "                      need their backend implemented first)\n"
@@ -390,9 +391,7 @@ static void usage(FILE *out) {
 "                      IDLETOKEN_API_TOKEN. (default: no auth — acceptable\n"
 "                      because the API answers only its own machine)\n"
 "\n");
-    /* Split out so the default cap is printed FROM the constant. A number typed
-     * into the help text is a number that drifts from the one in force, and the
-     * only person who finds out is whoever hits a ceiling the help denies. */
+    /* Split out so the no-cap default is printed FROM the constant. */
     fprintf(out,
 "Overflow: borrow another machine when this one is full (docs/api-surface §5):\n"
 "  --overflow-url URL  platform base URL. Enables overflow; without it nothing\n"
@@ -407,14 +406,11 @@ static void usage(FILE *out) {
 "                      full). Requests from the platform are NEVER forwarded,\n"
 "                      whatever this says.\n"
 "  --overflow-daily-cap N  stop forwarding past N milli-credits of platform\n"
-"                      spend in one UTC day (default %d). There is no way to\n"
-"                      switch this off: \"forward when busy\" means \"spend\n"
-"                      without being asked\", and one runaway benchmark would\n"
-"                      empty the balance overnight.\n"
-"                      Overflow REQUIRES --api-token: an open local API plus\n"
-"                      automatic spending means anyone on this network can\n"
-"                      drain the account, so the coordinator refuses to start\n"
-"                      rather than warn.\n"
+"                      spend in one UTC day (default %d = no local cap). This\n"
+"                      is an operator stop-loss; the account Spark balance is\n"
+"                      the product's default spend gate.\n"
+"                      --api-token is optional because the API is loopback-only;\n"
+"                      browser Origin requests are rejected independently.\n"
 "\n", IDLETOKEN_OVF_DEFAULT_DAILY_CAP_MILLI);
     fprintf(out,
 "Single-machine engine mode (v2; give BOTH paths to enable):\n"
@@ -3026,8 +3022,15 @@ static int coord_selftest(void) {
         idletoken_llm_model_size dsv4 = {
             .total_bytes = (uint64_t)(80.76 * 1073741824.0),
             .n_layers = 43, .kv_bytes_per_token = 65536,
+            /* ctx 32768 below reads the 128K slot (idletoken_llama_ctx_tier_of),
+             * so that is the one this fixture must populate. Leaving it 0 made
+             * the planner refuse for "unmeasured workspace" and both assertions
+             * failed — caught by the Windows gate running --selftest, which is a
+             * different binary from plan_test and exercises the shipped plan.c. */
+            .compute_bytes_128k_cuda = 1ull << 30,
             .compute_bytes_256k_cuda = 1ull << 30,
             .compute_bytes_1m_cuda   = 2ull << 30,
+            .compute_bytes_128k_metal = 1ull << 30,
             .compute_bytes_256k_metal = 1ull << 30,
             .compute_bytes_1m_metal   = 2ull << 30,
         };
@@ -3042,7 +3045,7 @@ static int coord_selftest(void) {
         idletoken_llama_plan lp;
         const double slice = (double)dsv4.total_bytes +
                              (double)dsv4.kv_bytes_per_token * 32768.0 +
-                             (double)dsv4.compute_bytes_256k_cuda;
+                             (double)dsv4.compute_bytes_128k_cuda;
         const int planned = idletoken_plan_llamacpp(&dsv4, cell, 2, 0, 32768,
                                                     1, &lp);
         ST(planned == 0 && lp.kind == IDLETOKEN_LLPLAN_CLUSTER,
@@ -3202,45 +3205,102 @@ static size_t json_escape_text(char *dst, size_t cap,
  * the policy, the envelope and the wire.
  *
  * Returns 0 when the local client has been fully answered, -1 when it has not
- * (and the caller must send its ordinary 429 — see RULE 3: every failure here
- * is loud in the log and honest on the wire, never a quiet degradation). */
-
-/* Collect messages into a JSON array the sealed intake understands. Content
- * comes back from for_each_chat_message unescaped, so it is escaped again on
- * the way in; the array is what the platform's ChatMessage[] expects. */
-typedef struct { char *buf; size_t len, cap; int n, oom; } coord_ovf_msgs;
+ * (and the caller must send its ordinary busy 429). A trusted platform refusal
+ * is a completed answer: this layer emits a sanitized protocol-native error so
+ * a quota or request problem is not mislabeled as local contention. */
 
 /* Implemented next to the SSE emitters below. Overflow waits for the complete
  * sealed cloud reply before opening the client's stream, then emits that whole
  * answer as a legal OpenAI/Anthropic SSE sequence. Therefore an upstream
  * failure still becomes an ordinary 429; no half-stream ambiguity is created. */
 static void coord_overflow_stream_reply(int conn_fd, int is_anthropic,
-                                        uint64_t req_id, const char *text_escaped,
-                                        int n_input, int n_output);
+                                        uint64_t req_id,
+                                        const idletoken_overflow_reply *rep);
 
-static int coord_ovf_msg_cb(void *ud, const char *role, const char *content) {
-    coord_ovf_msgs *m = (coord_ovf_msgs *)ud;
-    if (m->oom) return 0;
-    size_t clen = strlen(content);
-    /* Worst case for the escaper is 6 bytes out per byte in (\u00XX). */
-    size_t need = m->len + clen * 6 + strlen(role) + 48;
-    if (need > m->cap) {
-        size_t ncap = need * 2;
-        char *nb = (char *)realloc(m->buf, ncap);
-        if (!nb) { m->oom = 1; return 0; }
-        m->buf = nb;
-        m->cap = ncap;
+static int coord_json_top_int(const char *json, size_t len,
+                              const char *key, int dflt) {
+    const char *v = idletoken_json_obj_get(json, len, key);
+    if (!v) return dflt;
+    char tmp[32];
+    long vl = idletoken_json_value_len(v, json + len);
+    if (vl <= 0 || (size_t)vl >= sizeof tmp) return dflt;
+    memcpy(tmp, v, (size_t)vl);
+    tmp[vl] = '\0';
+    char *tail = NULL;
+    long n = strtol(tmp, &tail, 10);
+    return tail && *tail == '\0' && n >= 0 && n <= INT_MAX ? (int)n : dflt;
+}
+
+/* The platform's free-form message never crosses this boundary. Only stable
+ * allowlisted codes from overflow.c reach here, and each maps to a fixed body.
+ * In particular, api_key_daily_cap used to be collapsed to "coordinator busy";
+ * retrying clients then waited for a slot that was never the problem. */
+static void coord_send_overflow_refusal(int conn_fd, int is_anthropic,
+                                        const char *reason) {
+    int status = 503;
+    const char *openai =
+        "{\"error\":{\"message\":\"the platform refused the borrowed request\","
+        "\"type\":\"api_error\",\"code\":\"platform_refused\"}}";
+    const char *anthropic =
+        "{\"type\":\"error\",\"error\":{\"type\":\"api_error\","
+        "\"message\":\"the platform refused the borrowed request\","
+        "\"code\":\"platform_refused\"}}";
+
+    if (!strcmp(reason, "api_key_daily_cap")) {
+        status = 429;
+        openai =
+            "{\"error\":{\"message\":\"the overflow API key reached its configured daily spend cap\","
+            "\"type\":\"rate_limit_error\",\"code\":\"api_key_daily_cap\"}}";
+        anthropic =
+            "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\","
+            "\"message\":\"the overflow API key reached its configured daily spend cap\","
+            "\"code\":\"api_key_daily_cap\"}}";
+    } else if (!strcmp(reason, "insufficient_credits")) {
+        status = 402;
+        openai =
+            "{\"error\":{\"message\":\"insufficient credits\","
+            "\"type\":\"insufficient_quota\",\"code\":\"insufficient_credits\"}}";
+        anthropic =
+            "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\","
+            "\"message\":\"insufficient credits\",\"code\":\"insufficient_credits\"}}";
+    } else if (!strcmp(reason, "invalid_request")) {
+        status = 400;
+        openai =
+            "{\"error\":{\"message\":\"the platform rejected the borrowed request\","
+            "\"type\":\"invalid_request_error\",\"code\":\"invalid_request\"}}";
+        anthropic =
+            "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\","
+            "\"message\":\"the platform rejected the borrowed request\","
+            "\"code\":\"invalid_request\"}}";
+    } else if (!strcmp(reason, "no_provider_online")) {
+        openai =
+            "{\"error\":{\"message\":\"no compatible provider is online\","
+            "\"type\":\"api_error\",\"code\":\"no_provider_online\"}}";
+        anthropic =
+            "{\"type\":\"error\",\"error\":{\"type\":\"api_error\","
+            "\"message\":\"no compatible provider is online\","
+            "\"code\":\"no_provider_online\"}}";
+    } else if (!strcmp(reason, "rate_limited")) {
+        status = 429;
+        openai =
+            "{\"error\":{\"message\":\"the platform is temporarily rate limited\","
+            "\"type\":\"rate_limit_error\",\"code\":\"platform_rate_limited\"}}";
+        anthropic =
+            "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\","
+            "\"message\":\"the platform is temporarily rate limited\","
+            "\"code\":\"platform_rate_limited\"}}";
+    } else if (!strcmp(reason, "provider_unavailable")) {
+        openai =
+            "{\"error\":{\"message\":\"the selected provider could not complete the request\","
+            "\"type\":\"api_error\",\"code\":\"provider_unavailable\"}}";
+        anthropic =
+            "{\"type\":\"error\",\"error\":{\"type\":\"api_error\","
+            "\"message\":\"the selected provider could not complete the request\","
+            "\"code\":\"provider_unavailable\"}}";
     }
-    char *esc = (char *)malloc(clen * 6 + 8);
-    if (!esc) { m->oom = 1; return 0; }
-    json_escape_text(esc, clen * 6 + 8, content, clen);
-    int w = snprintf(m->buf + m->len, m->cap - m->len, "%s{\"role\":\"%s\",\"content\":\"%s\"}",
-                     m->n ? "," : "[", role, esc);
-    free(esc);
-    if (w < 0 || (size_t)w >= m->cap - m->len) { m->oom = 1; return 0; }
-    m->len += (size_t)w;
-    m->n++;
-    return 0;
+
+    const char *body = is_anthropic ? anthropic : openai;
+    (void)idletoken_http_send_json(conn_fd, status, body, strlen(body));
 }
 
 /* `hops_in` is how many machines this request has already been handed through
@@ -3250,60 +3310,75 @@ static int coord_ovf_msg_cb(void *ud, const char *role, const char *content) {
  * loop that no single coordinator can (PRIV-04 / CHAIN-05). */
 static int coord_overflow_relay(int conn_fd, const idletoken_http_req *req,
                                 int is_anthropic, int want_stream,
-                                uint64_t req_id, int hops_in) {
-    coord_ovf_msgs m = { NULL, 0, 0, 0, 0 };
-    /* Anthropic keeps the system prompt out of `messages`; the platform's
-     * intake has one list, so it goes in first. Dropping it would send a
-     * different question than the one that was asked. */
-    if (is_anthropic && req->body && req->body_len > 0) {
-        char *sys = (char *)malloc(req->body_len + 1);
-        if (sys) {
-            sys[0] = '\0';
-            idletoken_http_json_extract_str((const char *)req->body, req->body_len,
-                                            "system", sys, req->body_len + 1);
-            if (sys[0]) coord_ovf_msg_cb(&m, "system", sys);
-            free(sys);
+                                uint64_t req_id, int hops_in,
+                                const char *normalized_openai,
+                                size_t normalized_openai_len) {
+    char *owned_openai = NULL;
+    const char *openai = normalized_openai;
+    size_t openai_len = normalized_openai_len;
+    if (!openai || openai_len == 0) {
+        if (is_anthropic) {
+            owned_openai = idletoken_anthropic_to_openai(
+                (const char *)req->body, req->body ? req->body_len : 0,
+                0, g_max_decode > 0 ? g_max_decode : 0, &openai_len);
+            openai = owned_openai;
+        } else {
+            openai = (const char *)req->body;
+            openai_len = req->body ? req->body_len : 0;
         }
     }
-    for_each_chat_message((const char *)req->body, req->body ? req->body_len : 0,
-                          coord_ovf_msg_cb, &m);
-    if (m.oom || m.n == 0) {
-        free(m.buf);
+
+    const char *messages = openai
+        ? idletoken_json_obj_get(openai, openai_len, "messages") : NULL;
+    long messages_len = messages
+        ? idletoken_json_value_len(messages, openai + openai_len) : -1;
+    if (messages_len <= 2 || messages[0] != '[') {
+        if (owned_openai) {
+            idletoken_secure_zero(owned_openai, openai_len);
+            free(owned_openai);
+        }
         fprintf(stderr, "coord: overflow: could not read the request's messages — "
                         "not forwarding\n");
         return -1;
     }
-    if (m.len + 2 > m.cap) {
-        char *nb = (char *)realloc(m.buf, m.len + 2);
-        if (!nb) { free(m.buf); return -1; }
-        m.buf = nb; m.cap = m.len + 2;
-    }
-    m.buf[m.len++] = ']';
-    m.buf[m.len] = '\0';
 
-    int max_tokens = extract_int_field((const char *)req->body,
-                                       req->body ? req->body_len : 0,
-                                       "max_tokens", -1);
+    const char *tools = idletoken_json_obj_get(openai, openai_len, "tools");
+    long tools_len = tools ? idletoken_json_value_len(tools, openai + openai_len) : 0;
+    if (tools_len <= 2 || tools[0] != '[') { tools = NULL; tools_len = 0; }
+    const char *tool_choice = idletoken_json_obj_get(openai, openai_len, "tool_choice");
+    long tool_choice_len = tool_choice
+        ? idletoken_json_value_len(tool_choice, openai + openai_len) : 0;
+    if (tool_choice_len <= 0) { tool_choice = NULL; tool_choice_len = 0; }
+
+    int max_tokens = coord_json_top_int(openai, openai_len, "max_tokens", -1);
     if (max_tokens < 0) max_tokens = g_max_decode > 0 ? g_max_decode : 0;
 
     idletoken_overflow_reply rep;
     char err[256];
-    int rc = idletoken_overflow_exchange(m.buf, coord_model()->id, max_tokens,
+    int rc = idletoken_overflow_exchange(messages, (size_t)messages_len,
+                                         tools, (size_t)tools_len,
+                                         tool_choice, (size_t)tool_choice_len,
+                                         coord_model()->id, coord_quant(),
+                                         max_tokens,
                                          hops_in, &rep, err, sizeof err);
-    idletoken_secure_zero(m.buf, m.len);   /* the prompt, in the clear, in our heap */
-    free(m.buf);
-    if (rc != 0) {
-        /* RULE 3. The reason is printed; the caller answers 429, which is the
-         * true local meaning ("busy here, and could not borrow"). The
-         * platform's own words are never relayed to the client. */
+    if (owned_openai) {
+        idletoken_secure_zero(owned_openai, openai_len);
+        free(owned_openai);
+    }
+    if (rc == IDLETOKEN_OVF_EXCHANGE_REFUSED) {
+        fprintf(stderr, "coord: overflow: platform refusal code=%s\n", err);
+        coord_send_overflow_refusal(conn_fd, is_anthropic, err);
+        return 0;
+    }
+    if (rc != IDLETOKEN_OVF_EXCHANGE_OK) {
+        /* Transport/crypto/malformed response failures remain the ordinary
+         * local busy 429. They say nothing actionable about the caller. */
         fprintf(stderr, "coord: overflow: could not borrow — %s\n", err);
         return -1;
     }
 
     if (want_stream) {
-        coord_overflow_stream_reply(conn_fd, is_anthropic, req_id,
-                                    rep.text_escaped,
-                                    rep.in_tokens, rep.out_tokens);
+        coord_overflow_stream_reply(conn_fd, is_anthropic, req_id, &rep);
         idletoken_overflow_reply_free(&rep);
         return 0;
     }
@@ -3313,32 +3388,65 @@ static int coord_overflow_relay(int conn_fd, const idletoken_http_req *req,
      * with the model id it would have served locally: from the caller's side
      * this was one ordinary request that happened to take a little longer.
      * rep.text_escaped is already JSON-escaped and is spliced in as-is. */
-    size_t cap = strlen(rep.text_escaped) + 512;
+    const size_t tc_len = rep.tool_calls_json ? strlen(rep.tool_calls_json) : 0;
+    size_t cap = strlen(rep.text_escaped) + tc_len + 768;
     char *body = (char *)malloc(cap);
     int bl = -1;
     if (body) {
-        if (is_anthropic)
-            bl = snprintf(body, cap,
+        if (is_anthropic) {
+            char stop_reason[16] = "max_tokens";
+            size_t oai_cap = strlen(rep.text_escaped) + tc_len + 384;
+            char *oai = (char *)malloc(oai_cap);
+            char *content = NULL;
+            size_t content_len = 0;
+            if (oai) {
+                int ol = snprintf(oai, oai_cap,
+                    "{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                    "\"content\":%s%s%s%s%s},\"finish_reason\":\"%s\"}]}",
+                    rep.tool_calls_json && !rep.text_escaped[0] ? "null" : "\"",
+                    rep.tool_calls_json && !rep.text_escaped[0] ? "" : rep.text_escaped,
+                    rep.tool_calls_json && !rep.text_escaped[0] ? "" : "\"",
+                    rep.tool_calls_json ? ",\"tool_calls\":" : "",
+                    rep.tool_calls_json ? rep.tool_calls_json : "",
+                    rep.finish_reason[0] ? rep.finish_reason
+                                         : (rep.tool_calls_json ? "tool_calls" : "stop"));
+                if (ol > 0 && (size_t)ol < oai_cap)
+                    content = idletoken_oai_resp_to_anthropic_content(
+                        oai, (size_t)ol, stop_reason, sizeof stop_reason,
+                        &content_len);
+            }
+            free(oai);
+            if (content)
+                bl = snprintf(body, cap,
                           "{\"id\":\"msg_idletoken_%llu\",\"type\":\"message\","
                           "\"role\":\"assistant\",\"model\":\"%s\","
-                          "\"content\":[{\"type\":\"text\",\"text\":\"%s\"}],"
-                          "\"stop_reason\":\"end_turn\","
+                          "\"content\":%.*s,\"stop_reason\":\"%s\","
                           "\"usage\":{\"input_tokens\":%d,\"output_tokens\":%d},"
                           "\"cache_hit\":false,\"cached_tokens\":0}",
                           (unsigned long long)req_id, coord_model()->id,
-                          rep.text_escaped, rep.in_tokens, rep.out_tokens);
-        else
+                          (int)content_len, content, stop_reason,
+                          rep.in_tokens, rep.out_tokens);
+            free(content);
+        } else {
             bl = snprintf(body, cap,
                           "{\"id\":\"chatcmpl_idletoken_%llu\",\"object\":\"chat.completion\","
                           "\"created\":%lld,\"model\":\"%s\","
                           "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
-                          "\"content\":\"%s\"},\"finish_reason\":\"stop\"}],"
+                          "\"content\":%s%s%s%s%s},\"finish_reason\":\"%s\"}],"
                           "\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,"
                           "\"total_tokens\":%d},\"cache_hit\":false,\"cached_tokens\":0}",
                           (unsigned long long)req_id, (long long)time(NULL),
-                          coord_model()->id, rep.text_escaped,
+                          coord_model()->id,
+                          rep.tool_calls_json && !rep.text_escaped[0] ? "null" : "\"",
+                          rep.tool_calls_json && !rep.text_escaped[0] ? "" : rep.text_escaped,
+                          rep.tool_calls_json && !rep.text_escaped[0] ? "" : "\"",
+                          rep.tool_calls_json ? ",\"tool_calls\":" : "",
+                          rep.tool_calls_json ? rep.tool_calls_json : "",
+                          rep.finish_reason[0] ? rep.finish_reason
+                                               : (rep.tool_calls_json ? "tool_calls" : "stop"),
                           rep.in_tokens, rep.out_tokens,
                           rep.in_tokens + rep.out_tokens);
+        }
     }
     idletoken_overflow_reply_free(&rep);
     if (!body || bl < 0 || (size_t)bl >= cap) {
@@ -3792,20 +3900,27 @@ static int llama_gate_ready(int conn_fd) {
  * construction (gate G_API_MODELS claim 2).
  * Returns the count, or -1 with err filled; *bad_request set = the engine
  * judged the body malformed (caller answers 400, not 503). */
-static int llama_prompt_token_count(const char *oai_body, size_t len,
+static int llama_prompt_token_count(int conn_fd,
+                                    const char *oai_body, size_t len,
                                     int *bad_request, char *err, size_t err_cap) {
     *bad_request = 0;
     const char *engine = idletoken_llama_endpoint_of(g_llama);
     idletoken_llama_conn c;
-    if (idletoken_llama_http_open(engine, "POST", "/apply-template", oai_body, len,
-                                  30000, &c) != 0) {
+    if (idletoken_llama_http_open_relay(engine, "POST", "/apply-template",
+                                        oai_body, len, 30000, conn_fd, &c) != 0) {
+        if (c.cancelled) return -2;
         snprintf(err, err_cap, "engine unreachable (apply-template)");
         return -1;
     }
     size_t rlen = 0;
     char *resp = idletoken_llama_http_read_all(&c, &rlen, 16u << 20);
     int status = c.status;
+    int cancelled = c.cancelled;
     idletoken_llama_http_close(&c);
+    if (cancelled) {
+        free(resp);
+        return -2;
+    }
     if (!resp) {
         snprintf(err, err_cap, "engine connection failed (apply-template)");
         return -1;
@@ -3851,16 +3966,22 @@ static int llama_prompt_token_count(const char *oai_body, size_t len,
     sb_cstr(&tb, "\",\"add_special\":true,\"parse_special\":true}");
     free(resp);
     if (tb.oom) { free(tb.p); snprintf(err, err_cap, "out of memory"); return -1; }
-    if (idletoken_llama_http_open(engine, "POST", "/tokenize", tb.p, tb.len,
-                                  30000, &c) != 0) {
+    if (idletoken_llama_http_open_relay(engine, "POST", "/tokenize",
+                                        tb.p, tb.len, 30000, conn_fd, &c) != 0) {
         free(tb.p);
+        if (c.cancelled) return -2;
         snprintf(err, err_cap, "engine unreachable (tokenize)");
         return -1;
     }
     free(tb.p);
     resp = idletoken_llama_http_read_all(&c, &rlen, 16u << 20);
     status = c.status;
+    cancelled = c.cancelled;
     idletoken_llama_http_close(&c);
+    if (cancelled) {
+        free(resp);
+        return -2;
+    }
     if (!resp || status != 200) {
         free(resp);
         snprintf(err, err_cap, "tokenize failed (engine HTTP %d)", status);
@@ -3899,9 +4020,11 @@ static void llama_tokenize_route(int conn_fd, const idletoken_http_req *req) {
         return;
     }
     idletoken_llama_conn c;
-    if (idletoken_llama_http_open(idletoken_llama_endpoint_of(g_llama), "POST",
-                                  "/tokenize", tb.p, tb.len, 30000, &c) != 0) {
+    if (idletoken_llama_http_open_relay(idletoken_llama_endpoint_of(g_llama),
+                                        "POST", "/tokenize", tb.p, tb.len,
+                                        30000, conn_fd, &c) != 0) {
         free(tb.p);
+        if (c.cancelled) return;
         llama_error_json(conn_fd, 503, "api_error", "engine unreachable (tokenize)");
         return;
     }
@@ -3909,7 +4032,12 @@ static void llama_tokenize_route(int conn_fd, const idletoken_http_req *req) {
     size_t rlen = 0;
     char *resp = idletoken_llama_http_read_all(&c, &rlen, 16u << 20);
     int status = c.status;
+    int cancelled = c.cancelled;
     idletoken_llama_http_close(&c);
+    if (cancelled) {
+        free(resp);
+        return;
+    }
     int n = (resp && status == 200) ? llama_tokens_count(resp, rlen) : -1;
     free(resp);
     if (n < 0) {
@@ -3936,8 +4064,9 @@ static void llama_count_tokens_route(int conn_fd, const idletoken_http_req *req)
     }
     char err[200];
     int bad = 0;
-    int n = llama_prompt_token_count(up, uplen, &bad, err, sizeof(err));
+    int n = llama_prompt_token_count(conn_fd, up, uplen, &bad, err, sizeof(err));
     free(up);
+    if (n == -2) return;
     if (n < 0) {
         llama_error_json(conn_fd, bad ? 400 : 503, "api_error", err);
         return;
@@ -4054,20 +4183,25 @@ static void llama_chat_nonstream(int conn_fd, int is_anthropic,
                                  const char *up, size_t uplen,
                                  int n_input, uint64_t req_id, long long t0) {
     idletoken_llama_conn c;
-    if (idletoken_llama_http_open(idletoken_llama_endpoint_of(g_llama), "POST",
-                                  IDLETOKEN_PATH_OPENAI, up, uplen, 0, &c) != 0) {
+    if (idletoken_llama_http_open_relay(idletoken_llama_endpoint_of(g_llama),
+                                        "POST", IDLETOKEN_PATH_OPENAI,
+                                        up, uplen, 0, conn_fd, &c) != 0) {
+        if (c.cancelled) return;
         llama_error_json(conn_fd, 503, "api_error", "inference engine connection failed");
         return;
     }
-    /* Inference opens with no socket timeout on purpose (a big model's prefill
-     * is legitimately silent for minutes). Watching makes that wait BOUNDED by
-     * the engine still answering, rather than unbounded full stop — see
-     * idletoken_llama_http_watch and results/coord-wedge-20260817.md. */
-    idletoken_llama_http_watch(&c, idletoken_llama_endpoint_of(g_llama));
+    /* open_relay started both liveness and downstream-disconnect observation
+     * before waiting for the response head. A non-stream engine returns that
+     * head only after decode, so starting either watch here would be too late. */
     size_t rlen = 0;
     char *resp = idletoken_llama_http_read_all(&c, &rlen, 64u << 20);
     int status = c.status;
+    int cancelled = c.cancelled;
     idletoken_llama_http_close(&c);
+    if (cancelled) {
+        free(resp);
+        return;
+    }
     if (!resp) {
         llama_error_json(conn_fd, 503, "api_error",
                          "inference engine connection lost mid-response");
@@ -4204,22 +4338,24 @@ static void llama_chat_stream(int conn_fd, int is_anthropic,
                               const char *up, size_t uplen,
                               int n_input, uint64_t req_id, long long t0) {
     idletoken_llama_conn c;
-    if (idletoken_llama_http_open(idletoken_llama_endpoint_of(g_llama), "POST",
-                                  IDLETOKEN_PATH_OPENAI, up, uplen, 0, &c) != 0) {
+    if (idletoken_llama_http_open_relay(idletoken_llama_endpoint_of(g_llama),
+                                        "POST", IDLETOKEN_PATH_OPENAI,
+                                        up, uplen, 0, conn_fd, &c) != 0) {
+        if (c.cancelled) return;
         llama_error_json(conn_fd, 503, "api_error", "inference engine connection failed");
         return;
     }
-    /* Inference opens with no socket timeout on purpose (a big model's prefill
-     * is legitimately silent for minutes). Watching makes that wait BOUNDED by
-     * the engine still answering, rather than unbounded full stop — see
-     * idletoken_llama_http_watch and results/coord-wedge-20260817.md. */
-    idletoken_llama_http_watch(&c, idletoken_llama_endpoint_of(g_llama));
     if (c.status != 200) {
         /* our stream has not started: a real HTTP status is still possible */
         size_t rlen = 0;
         char *resp = idletoken_llama_http_read_all(&c, &rlen, 1u << 20);
         int status = c.status;
+        int cancelled = c.cancelled;
         idletoken_llama_http_close(&c);
+        if (cancelled) {
+            free(resp);
+            return;
+        }
         if (resp && rlen)
             idletoken_http_send_json(conn_fd, status, resp, rlen);
         else
@@ -4313,9 +4449,11 @@ static void llama_chat_stream(int conn_fd, int is_anthropic,
     }
 stream_end:
     free(line);
+    int cancelled = c.cancelled;
     /* Closing the upstream connection is also how a hung-up client cancels
      * generation: idletoken-server aborts the slot when its client disconnects. */
     idletoken_llama_http_close(&c);
+    if (cancelled) return;
     int n_out = up_out >= 0 ? up_out : n_deltas;
     int n_in  = up_in  >= 0 ? up_in  : n_input;
     /* A stream the client cut short never reached the usage frame, so "no
@@ -4355,25 +4493,140 @@ static size_t esc_chunk_len(const char *esc, size_t len, size_t max) {
 }
 
 static void coord_overflow_stream_reply(int conn_fd, int is_anthropic,
-                                        uint64_t req_id, const char *text_escaped,
-                                        int n_input, int n_output) {
+                                        uint64_t req_id,
+                                        const idletoken_overflow_reply *rep) {
     idletoken_sse s = {
         .fd = conn_fd,
         .anthropic = is_anthropic,
         .created = (long long)time(NULL),
     };
     snprintf(s.id, sizeof(s.id), "%llu", (unsigned long long)req_id);
-    sse_begin(&s, n_input);
-    const size_t len = text_escaped ? strlen(text_escaped) : 0;
-    for (size_t i = 0; i < len && !s.failed; ) {
-        const size_t n = esc_chunk_len(text_escaped + i, len - i, 2048);
-        char frame[2049];
-        memcpy(frame, text_escaped + i, n);
-        frame[n] = '\0';
-        sse_delta(&s, frame);
-        i += n;
+    const char *text = rep->text_escaped ? rep->text_escaped : "";
+    const size_t text_len = strlen(text);
+    if (!rep->tool_calls_json) {
+        sse_begin(&s, rep->in_tokens);
+        for (size_t i = 0; i < text_len && !s.failed; ) {
+            const size_t n = esc_chunk_len(text + i, text_len - i, 2048);
+            char frame[2049];
+            memcpy(frame, text + i, n);
+            frame[n] = '\0';
+            sse_delta(&s, frame);
+            i += n;
+        }
+        sse_finish(&s, rep->in_tokens, rep->out_tokens,
+                   strcmp(rep->finish_reason, "length") != 0, 0);
+        return;
     }
-    sse_finish(&s, n_input, n_output, 1, 0);
+
+    const size_t tc_len = strlen(rep->tool_calls_json);
+    char *msg = (char *)malloc(tc_len + 32);
+    if (!msg) {
+        idletoken_http_send_error(conn_fd, 500, "borrowed tool reply did not fit");
+        return;
+    }
+    const int ml = snprintf(msg, tc_len + 32, "{\"tool_calls\":%s}",
+                            rep->tool_calls_json);
+    if (ml <= 0 || (size_t)ml >= tc_len + 32) {
+        free(msg);
+        idletoken_http_send_error(conn_fd, 500, "borrowed tool reply did not fit");
+        return;
+    }
+
+    if (is_anthropic) {
+        if (idletoken_http_send_sse_head(s.fd) != 0) { free(msg); return; }
+        sse_emitf(&s, "message_start",
+            "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_idletoken_%s\","
+             "\"type\":\"message\",\"role\":\"assistant\",\"model\":\"%s\","
+             "\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,"
+             "\"usage\":{\"input_tokens\":%d,\"output_tokens\":0}}}",
+            s.id, coord_model()->id, rep->in_tokens);
+        int idx = 0;
+        if (text_len > 0) {
+            sse_emitf(&s, "content_block_start",
+                "{\"type\":\"content_block_start\",\"index\":%d,"
+                 "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}", idx);
+            for (size_t i = 0; i < text_len && !s.failed; ) {
+                size_t n = esc_chunk_len(text + i, text_len - i, 2048);
+                sse_emitf(&s, "content_block_delta",
+                    "{\"type\":\"content_block_delta\",\"index\":%d,"
+                     "\"delta\":{\"type\":\"text_delta\",\"text\":\"%.*s\"}}",
+                    idx, (int)n, text + i);
+                i += n;
+            }
+            sse_emitf(&s, "content_block_stop",
+                "{\"type\":\"content_block_stop\",\"index\":%d}", idx++);
+        }
+        size_t it = 0;
+        idletoken_tool_call tc;
+        while (idletoken_oai_next_tool_call(msg, (size_t)ml, &it, &tc)) {
+            sse_emitf(&s, "content_block_start",
+                "{\"type\":\"content_block_start\",\"index\":%d,"
+                 "\"content_block\":{\"type\":\"tool_use\",\"id\":\"%.*s\","
+                 "\"name\":\"%.*s\",\"input\":{}}}",
+                idx, (int)tc.id_len, tc.id, (int)tc.name_len, tc.name);
+            for (size_t i = 0; i < tc.args_len && !s.failed; ) {
+                size_t n = esc_chunk_len(tc.args + i, tc.args_len - i, 2048);
+                sse_emitf(&s, "content_block_delta",
+                    "{\"type\":\"content_block_delta\",\"index\":%d,"
+                     "\"delta\":{\"type\":\"input_json_delta\","
+                     "\"partial_json\":\"%.*s\"}}",
+                    idx, (int)n, tc.args + i);
+                i += n;
+            }
+            sse_emitf(&s, "content_block_stop",
+                "{\"type\":\"content_block_stop\",\"index\":%d}", idx++);
+        }
+        sse_emitf(&s, "message_delta",
+            "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\","
+             "\"stop_sequence\":null},\"usage\":{\"output_tokens\":%d},"
+             "\"cache_hit\":false,\"cached_tokens\":0}", rep->out_tokens);
+        sse_emitf(&s, "message_stop", "{\"type\":\"message_stop\"}");
+    } else {
+        sse_begin(&s, rep->in_tokens);
+        for (size_t i = 0; i < text_len && !s.failed; ) {
+            size_t n = esc_chunk_len(text + i, text_len - i, 2048);
+            char frame[2049];
+            memcpy(frame, text + i, n);
+            frame[n] = '\0';
+            sse_delta(&s, frame);
+            i += n;
+        }
+        size_t it = 0;
+        idletoken_tool_call tc;
+        int call_idx = 0;
+        while (idletoken_oai_next_tool_call(msg, (size_t)ml, &it, &tc)) {
+            sse_emitf(&s, NULL,
+                "{\"id\":\"chatcmpl_idletoken_%s\",\"object\":\"chat.completion.chunk\","
+                 "\"created\":%lld,\"model\":\"%s\",\"choices\":[{\"index\":0,"
+                 "\"delta\":{\"tool_calls\":[{\"index\":%d,\"id\":\"%.*s\","
+                 "\"type\":\"function\",\"function\":{\"name\":\"%.*s\","
+                 "\"arguments\":\"\"}}]},\"finish_reason\":null}]}",
+                s.id, s.created, coord_model()->id, call_idx,
+                (int)tc.id_len, tc.id, (int)tc.name_len, tc.name);
+            for (size_t i = 0; i < tc.args_len && !s.failed; ) {
+                size_t n = esc_chunk_len(tc.args + i, tc.args_len - i, 2048);
+                sse_emitf(&s, NULL,
+                    "{\"id\":\"chatcmpl_idletoken_%s\",\"object\":\"chat.completion.chunk\","
+                     "\"created\":%lld,\"model\":\"%s\",\"choices\":[{\"index\":0,"
+                     "\"delta\":{\"tool_calls\":[{\"index\":%d,\"function\":{"
+                     "\"arguments\":\"%.*s\"}}]},\"finish_reason\":null}]}",
+                    s.id, s.created, coord_model()->id, call_idx,
+                    (int)n, tc.args + i);
+                i += n;
+            }
+            call_idx++;
+        }
+        sse_emitf(&s, NULL,
+            "{\"id\":\"chatcmpl_idletoken_%s\",\"object\":\"chat.completion.chunk\","
+             "\"created\":%lld,\"model\":\"%s\",\"choices\":[{\"index\":0,"
+             "\"delta\":{},\"finish_reason\":\"tool_calls\"}],"
+             "\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,"
+             "\"total_tokens\":%d},\"cache_hit\":false,\"cached_tokens\":0}",
+            s.id, s.created, coord_model()->id, rep->in_tokens, rep->out_tokens,
+            rep->in_tokens + rep->out_tokens);
+        sse_emitf(&s, NULL, "[DONE]");
+    }
+    free(msg);
 }
 
 /* Streaming chat WITH tools declared. Streaming idletoken-server's OpenAI
@@ -4385,22 +4638,24 @@ static void coord_overflow_stream_reply(int conn_fd, int is_anthropic,
  * latency — tools are never silently dropped. */
 static void llama_chat_stream_tools(int conn_fd, int is_anthropic,
                                     const char *up, size_t uplen,
-                                    int n_input, uint64_t req_id, long long t0) {
+    int n_input, uint64_t req_id, long long t0) {
     idletoken_llama_conn c;
-    if (idletoken_llama_http_open(idletoken_llama_endpoint_of(g_llama), "POST",
-                                  IDLETOKEN_PATH_OPENAI, up, uplen, 0, &c) != 0) {
+    if (idletoken_llama_http_open_relay(idletoken_llama_endpoint_of(g_llama),
+                                        "POST", IDLETOKEN_PATH_OPENAI,
+                                        up, uplen, 0, conn_fd, &c) != 0) {
+        if (c.cancelled) return;
         llama_error_json(conn_fd, 503, "api_error", "inference engine connection failed");
         return;
     }
-    /* Inference opens with no socket timeout on purpose (a big model's prefill
-     * is legitimately silent for minutes). Watching makes that wait BOUNDED by
-     * the engine still answering, rather than unbounded full stop — see
-     * idletoken_llama_http_watch and results/coord-wedge-20260817.md. */
-    idletoken_llama_http_watch(&c, idletoken_llama_endpoint_of(g_llama));
     size_t rlen = 0;
     char *resp = idletoken_llama_http_read_all(&c, &rlen, 64u << 20);
     int status = c.status;
+    int cancelled = c.cancelled;
     idletoken_llama_http_close(&c);
+    if (cancelled) {
+        free(resp);
+        return;
+    }
     if (!resp) {
         llama_error_json(conn_fd, 503, "api_error",
                          "inference engine connection lost mid-response");
@@ -4618,7 +4873,11 @@ static void llama_chat_route(int conn_fd, const idletoken_http_req *req,
      * deliberately not logged (same invariant as the cluster path). */
     char terr[200];
     int bad = 0;
-    int n_input = llama_prompt_token_count(up, uplen, &bad, terr, sizeof(terr));
+    int n_input = llama_prompt_token_count(conn_fd, up, uplen, &bad, terr, sizeof(terr));
+    if (n_input == -2) {
+        free(up);
+        return;
+    }
     if (n_input < 0) {
         llama_error_json(conn_fd, bad ? 400 : 503, "api_error", terr);
         free(up);
@@ -4677,7 +4936,8 @@ static void llama_chat_route(int conn_fd, const idletoken_http_req *req,
         const char *why = "off";
         if (idletoken_overflow_should_forward(origin, want_stream, est, hops_in, &why)) {
             if (coord_overflow_relay(conn_fd, req, is_anthropic, want_stream,
-                                     coord_next_req_id(), hops_in) == 0) {
+                                     coord_next_req_id(), hops_in,
+                                     up, uplen) == 0) {
                 free(up);
                 return;
             }
@@ -4728,7 +4988,8 @@ static void llama_chat_route(int conn_fd, const idletoken_http_req *req,
  * ⚠ It is CSRF protection, not authentication. It does not pretend to stop a
  * program running on this machine — nothing at this layer can, since such a
  * program can read the settings file, the platform JWT and the overflow key.
- * The daily spend cap is what bounds that case.
+ * Platform spending is bounded by the account balance; an operator may add an
+ * explicit coordinator cap or per-key cap as a stop-loss.
  *
  * IDLETOKEN_API_ALLOW_ORIGIN=1 turns it off for anyone genuinely building a
  * browser UI against this API; it prints on startup, because a machine that
@@ -5559,7 +5820,14 @@ static void handle_http_request(int conn_fd,
             }
         }
         if (!stats_kvv[0]) snprintf(stats_kvv, sizeof stats_kvv, "%s", stats_kvk);
-        char body[1184];  /* grew for the concurrency / model / engine / shared / kv fields */
+        /* The overflow origin is the stable, pseudonymous installation id that
+         * the platform must use to avoid dispatching a borrowed request back
+         * to the coordinator that just declared itself busy.  It is not a
+         * hostname, account id or credential; overflow.c derives it from the
+         * local admission marker under a separate SHA-256 domain. */
+        char overflow_origin[24] = "";
+        idletoken_overflow_origin_id(overflow_origin, sizeof overflow_origin);
+        char body[1232];  /* grew for overflow_origin_id */
         pthread_mutex_lock(&g_stats_mu);
         int bl = snprintf(body, sizeof(body),
             "{\"model\":\"%s\",\"model_label\":\"%s\",\"quant\":\"%s\","
@@ -5576,6 +5844,7 @@ static void handle_http_request(int conn_fd,
               * it, so it must never change at runtime. */
              "\"ctx_size\":%u,\"ctx_now\":%u,"
              "\"kv_cache_k\":\"%s\",\"kv_cache_v\":\"%s\","
+             "\"overflow_origin_id\":\"%s\","
              "\"uptime_s\":%lld,\"last_request_unix\":%lld,"
              "\"last_tok_per_s\":%.2f%s%s}",
             coord_model()->id, coord_model()->label, coord_quant(),
@@ -5589,7 +5858,7 @@ static void handle_http_request(int conn_fd,
             rep_qdepth, rep_qcap, g_stats.service_ms_ewma,
             g_stats.ttft_ms_ewma,
             g_ctx_display ? g_ctx_display : ctx_size, ctx_size,
-            stats_kvk, stats_kvv,
+            stats_kvk, stats_kvv, overflow_origin,
             g_stats.started_at ? now - g_stats.started_at : 0,
             g_stats.last_request_at,
             g_stats.last_tok_per_s,
@@ -6169,7 +6438,8 @@ static void handle_http_request(int conn_fd,
         const char *ovf_why = "off";
         if (idletoken_overflow_should_forward(origin, want_stream, est, hops_in, &ovf_why)) {
             if (coord_overflow_relay(conn_fd, &req, is_anthropic, want_stream,
-                                     coord_next_req_id(), hops_in) == 0) {
+                                     coord_next_req_id(), hops_in,
+                                     NULL, 0) == 0) {
                 ds4_tokens_free(&prompt);
                 free(req.body);
                 return;
@@ -6688,36 +6958,63 @@ static int llama_pool_push(int cfd) {
  * The cluster/ds4 path resolves the precision from the variant menu far below,
  * but every llamacpp path returns before it -- so /idletoken/v1/stats reported
  * `"quant":""` for every single-machine run. A served precision of "" is not a
- * small cosmetic gap: it is the field the platform's catalogue lists, and the
- * field the pricing calibration compares against the SKU it claims to be
- * measuring. Q4_K_M and Q8_0 of one model are different products at different
- * speeds, and blank cannot be told from either.
+ * small cosmetic gap: it is the field the platform's catalogue lists, the field
+ * the pricing calibration compares against the SKU it claims to be measuring,
+ * and — since it means "any precision" to the marketplace's routing filter —
+ * the difference between selling one product and offering to sell all of them.
+ * Q4_K_M and Q8_0 of one model are different products at different speeds, and
+ * blank cannot be told from either.
  *
- * The FILE decides, not the flag (T8's lesson: what matters is the GGUF the
- * engine really opens, never the manifest's idea of a default). Matching is by
- * leaf name against the model's variant table, which is where the quant<->file
- * mapping already lives.
+ * The matching itself lives in model.c (idletoken_model_quant_from_gguf, which
+ * also states the file-name limit it accepts) so that the auto-generated
+ * manifests this path actually runs on can borrow the registry's variant
+ * table; the private copy that used to live here is what left the client's own
+ * launch line reporting "". */
+
+/* Point the measured graph workspace at the KV cache dtype this run will
+ * ACTUALLY launch with.
  *
- * LIMIT, stated rather than papered over: this reads the file NAME, not the
- * GGUF header's tensor types. A file renamed to look like another variant is
- * believed. That is a weaker claim than the byte-level budget T8 built, and a
- * stronger one than the blank string it replaces; upgrading it means teaching
- * gguf.c to report a precision, which is its own piece of work. */
-static const char *llama_quant_from_gguf(const idletoken_model_spec *m, const char *gguf) {
-    if (!m || !gguf || !gguf[0] || m->n_variants == 0) return "";
-    const char *base = gguf, *p;
-    for (p = gguf; *p; p++) if (*p == '/' || *p == '\\') base = p + 1;
-    for (uint8_t i = 0; i < m->n_variants; i++) {
-        const char *vb = m->variants[i].gguf;
-        for (p = m->variants[i].gguf; *p; p++) if (*p == '/' || *p == '\\') vb = p + 1;
-        if (!strcmp(vb, base)) return m->variants[i].quant;
-    }
-    return "";
+ * idletoken_model_size_resolve() already priced the tier the automatic rule
+ * implies, so this is a no-op on every normal start. It exists for
+ * IDLETOKEN_KV_CACHE_TYPE, which can name a dtype the rule would not have
+ * chosen: the workspace is not the same between cache dtypes, and on CUDA the
+ * gap reaches 4 GiB (qwen3.8-27b at 1M measures 1146 MiB with an f16 cache and
+ * 5200 MiB with a quantized one). Pricing one cache's graph against another's
+ * is how an admitted configuration OOMs after the user waited through a load.
+ *
+ * A K/V pair with different dtypes, or a dtype outside the three we measure,
+ * has no measurement of its own — say so and charge the largest measured tier.
+ * Loud, because whoever set the variable is running a measurement and needs to
+ * know the budget is now an upper bound rather than a reading. */
+static void llama_align_workspace_to_kv(const idletoken_model_spec *m,
+                                        idletoken_llm_model_size *size,
+                                        const char *kvk, const char *kvv) {
+    if (!m || !size) return;
+    const char *k = (kvk && kvk[0]) ? kvk : "f16";
+    const char *v = (kvv && kvv[0]) ? kvv : k;
+    int tier = idletoken_llama_kv_tier_of_name(k);
+    if (strcmp(k, v) != 0) tier = -1;
+    if (tier == (int)size->kv_tier) return;          /* the common case */
+    idletoken_model_size_set_kv_tier(m, size, tier);
+    if (tier < 0)
+        fprintf(stderr,
+                "coord: WARNING: KV cache K=%s V=%s has no measured graph "
+                "workspace; charging the largest measured tier (%.2f GiB at "
+                "256K on CUDA). This budget is an upper bound, not a "
+                "measurement.\n",
+                k, v, (double)size->compute_bytes_256k_cuda / (1024.0 * 1024 * 1024));
+    else
+        fprintf(stderr,
+                "coord: workspace re-priced for the %s KV cache "
+                "(%.2f GiB at 256K on CUDA, %.2f GiB on Metal)\n",
+                idletoken_llama_kv_tier_name(tier),
+                (double)size->compute_bytes_256k_cuda / (1024.0 * 1024 * 1024),
+                (double)size->compute_bytes_256k_metal / (1024.0 * 1024 * 1024));
 }
 
 /* Resolve g_quant for the llamacpp paths. Returns 0, or non-zero to refuse. */
 static int llama_resolve_quant(const char *quant, const char *llama_gguf) {
-    const char *from_file = llama_quant_from_gguf(g_model, llama_gguf);
+    const char *from_file = idletoken_model_quant_from_gguf(g_model, llama_gguf);
     if (quant && quant[0] && from_file[0] && strcmp(quant, from_file) != 0) {
         /* One of the two is wrong and guessing which would put a precision on
          * the wire that nobody is serving. Stop instead. */
@@ -6736,6 +7033,22 @@ static int llama_resolve_quant(const char *quant, const char *llama_gguf) {
                         "the file name %s is not in %s's variant table, so nothing "
                         "cross-checked it\n", quant, llama_gguf, g_model->id);
     }
+    /* Say it out loud. The cluster path announces "serving model X @ Q" and the
+     * llamacpp path announced nothing at all, so the only way to learn what
+     * precision a machine was actually selling was to curl /idletoken/v1/stats
+     * -- which is exactly the field that was silently blank
+     * (results/agent-stale-registration-20260903.md). A blank one is worth a
+     * WARNING rather than a shrug: the marketplace reads it as "any precision",
+     * so it widens what this machine is offered rather than narrowing it. */
+    if (g_quant[0])
+        fprintf(stderr, "coord: serving %s @ %s (from %s)\n",
+                g_model->id, g_quant, llama_gguf);
+    else
+        fprintf(stderr, "coord: WARNING: serving %s at an UNKNOWN precision -- "
+                        "%s is not in its variant table and no --quant was given. "
+                        "Anything downstream that filters by precision (the "
+                        "marketplace reads a blank one as 'any') cannot tell what "
+                        "this machine is running.\n", g_model->id, llama_gguf);
     return 0;
 }
 
@@ -8367,7 +8680,7 @@ int main(int argc, char **argv) {
     const char *ovf_url = getenv("IDLETOKEN_OVERFLOW_URL");
     const char *ovf_key = getenv("IDLETOKEN_OVERFLOW_KEY");
     long        ovf_wait_s = 0;
-    long        ovf_daily_cap = 0;   /* 0 = the module's default; never "no cap" */
+    long        ovf_daily_cap = 0;   /* module default: no coordinator-side cap */
     /* Per-machine usage caps (the client's "this machine's usage" sliders,
      * wire-to-B2): cap what the probe reports before planning, same contract
      * as the worker's --max-vram-mb/--max-ram-mb. 0 = uncapped. */
@@ -8476,7 +8789,10 @@ int main(int argc, char **argv) {
      *
      * The two files (0600, next to the rest of our state) are the whole
      * interface to the platform agent: it reads the channel key to mint, and
-     * the client reads the local-origin marker to attribute its own traffic.
+     * first-party clients may read the local-origin marker to attribute their
+     * own traffic. Third-party OpenAI/Anthropic clients cannot be required to
+     * know about that private header: Claude Code, Codex, Nimbalyst and plain
+     * curl are core API consumers, not modified IdleToken clients.
      * Publishing them is not fatal on its own — a machine with no writable
      * state directory still runs, it just cannot PROVE anything about origin —
      * so this warns and continues rather than refusing to start. What would be
@@ -8485,23 +8801,27 @@ int main(int argc, char **argv) {
      * work", which points nowhere near here.
      *
      * The policy:
-     *   --shared            -> STRICT. This machine serves strangers, so a
-     *                          request with no marker might be one of theirs
-     *                          with the marker removed (PROV-28), and the safe
-     *                          reading of an ambiguous request is "serve it, do
-     *                          not forward it".
-     *   otherwise           -> CAPABILITY. Nothing here is anybody else's, so
-     *                          "no marker" has exactly one meaning and the
-     *                          feature keeps working for plain curl.
+     *   default             -> CAPABILITY, including with --shared. The public
+     *                          API is loopback-only and ordinary compatible API
+     *                          clients send no IdleToken-private header. Their
+     *                          second simultaneous request must remain eligible
+     *                          for overflow (product contract #11). Platform
+     *                          jobs from the official agent carry a single-use
+     *                          capability and the legacy platform marker; either
+     *                          makes them non-forwardable, and the in-flight
+     *                          interlock is a second independent stop.
      *   env override        -> whatever was asked for, printed every time.
      *                          `legacy` is the pre-2026-08-30 behaviour and
      *                          exists so the gate can demonstrate the attack on
-     *                          the same binary that stops it. */
+     *                          the same binary that stops it. `strict` is an
+     *                          operator opt-in which refuses every unmarked
+     *                          request on a provider machine; that also disables
+     *                          overflow for ordinary third-party API clients and
+     *                          is therefore not the product default. */
     {
         char adm_chan[400] = "", adm_local[400] = "", aerr[320] = "";
         const char *pol_env = getenv("IDLETOKEN_OVERFLOW_ORIGIN_POLICY");
-        idletoken_ovf_policy pol = g_shared_mode ? IDLETOKEN_OVF_ORIGIN_STRICT
-                                                 : IDLETOKEN_OVF_ORIGIN_CAPABILITY;
+        idletoken_ovf_policy pol = IDLETOKEN_OVF_ORIGIN_CAPABILITY;
         if (idletoken_admission_default_paths(adm_chan, sizeof adm_chan,
                                               adm_local, sizeof adm_local) != 0) {
             adm_chan[0] = adm_local[0] = '\0';
@@ -8512,9 +8832,10 @@ int main(int argc, char **argv) {
         }
         if (idletoken_admission_init(adm_chan, adm_local, aerr, sizeof aerr) != 0)
             fprintf(stderr, "coord: admission: could not publish the capability "
-                            "channel — %s. Platform jobs will arrive unattributed; "
-                            "on a --shared machine they are still served and still "
-                            "not forwarded.\n", aerr[0] ? aerr : "unknown error");
+                            "channel — %s. The official platform agent will fall "
+                            "back to X-IdleToken-Origin: platform; those jobs are "
+                            "still served and never forwarded.\n",
+                            aerr[0] ? aerr : "unknown error");
         else if (adm_chan[0])
             fprintf(stderr, "coord: admission: capability channel published to %s "
                             "(0600); local-origin marker at %s\n", adm_chan, adm_local);
@@ -8536,18 +8857,20 @@ int main(int argc, char **argv) {
                             "IDLETOKEN_OVERFLOW_ORIGIN_POLICY%s\n",
                     idletoken_overflow_policy_name(pol),
                     pol == IDLETOKEN_OVF_ORIGIN_LEGACY
-                        ? " — this is the pre-hardening behaviour in which a "
-                          "request with no origin marker is forwardable, i.e. a "
-                          "modified platform agent can make this machine pay a "
-                          "third machine for a job it was already paid for "
+                        ? " — this is the pre-hardening behaviour: it also ignores "
+                          "the hop budget and the proven in-flight interlock "
                           "(threat register PROV-28). For attack reproduction only."
+                        : pol == IDLETOKEN_OVF_ORIGIN_STRICT
+                        ? " — unmarked loopback API clients cannot borrow under "
+                          "this policy; Claude Code, Codex, Nimbalyst and plain "
+                          "curl will receive 429 while the local slot is busy."
                         : "");
         } else {
-            fprintf(stderr, "coord: overflow: origin policy '%s' (%s)\n",
+            fprintf(stderr, "coord: overflow: origin policy '%s' (loopback API "
+                            "clients may borrow; admitted or marked platform work "
+                            "is never forwarded%s)\n",
                     idletoken_overflow_policy_name(pol),
-                    g_shared_mode ? "this machine serves platform work, so an "
-                                    "unattributed request is not forwardable"
-                                  : "this machine does not serve platform work");
+                    g_shared_mode ? "; this machine also serves platform work" : "");
         }
         idletoken_overflow_set_policy(pol);
         if (g_shared_mode) g_is_provider = 1;
@@ -8638,6 +8961,31 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "idletoken-coord: --llama-port must be 1..65535\n");
                 return 2;
             }
+            /* The REQUESTED window must be one of the three product tiers, and
+             * this has to happen BEFORE the model-ceiling clamp below.
+             *
+             * Order matters and the reverse order is a silent bug: the clamp
+             * turns anything above the model's ceiling into the ceiling, so
+             * `--ctx-size 500000` on a 262144-token model became a perfectly
+             * ordinary 256K start — the caller asked for a window nobody
+             * measured and got a different one without being told. Found on a
+             * real node 2026-09-02, which is how this was noticed.
+             *
+             * The clamp itself stays and is still correct: a model whose
+             * ceiling sits between tiers (qwen3-8b at 163840) launches at its
+             * ceiling, and idletoken_llama_ctx_tier_of() maps that back to the
+             * slot holding its measurement. What is refused here is only an
+             * off-tier value the CALLER chose. */
+            if (ctx_size && !idletoken_llama_is_ctx_tier(ctx_size)) {
+                fprintf(stderr,
+                        "idletoken-coord: --ctx-size %u is not a product context "
+                        "window. Exactly one of %u, %u or %u is served; those are "
+                        "the windows whose memory cost is measured, and rounding "
+                        "to a neighbour would price a configuration nobody ran.\n",
+                        ctx_size, IDLETOKEN_CTX_TIER_128K,
+                        IDLETOKEN_CTX_TIER_256K, IDLETOKEN_CTX_TIER_1M);
+                return 2;
+            }
 
             /* --- open model intake (v2 WS-B4) --------------------------------
              * Without an explicit --model-id, the GGUF header is the source of
@@ -8714,6 +9062,11 @@ int main(int argc, char **argv) {
                             kvs * 100.0,
                             (double)msize.kv_bytes_per_token / 1024.0);
                 }
+                /* The cache dtype also selects the measured WORKSPACE, and an
+                 * explicit override can point at a different tier than the
+                 * precision implies. Re-point it, or the plan prices one
+                 * cache's graph against another's — 4 GiB apart on CUDA. */
+                llama_align_workspace_to_kv(g_model, &msize, kvk, kvv);
             }
 
             idletoken_node_mem me;
@@ -8764,12 +9117,12 @@ int main(int argc, char **argv) {
              * to be settled here or it stays blank for the whole run. */
             if (llama_resolve_quant(quant, llama_gguf) != 0) return 2;
 
-            /* Low-bit weight tiers have a fixed, uniform KV dtype independent
-             * of available capacity. Apply it BEFORE the cluster branch so
-             * single and multi-machine planners price the same bytes the
-             * engine will allocate. High/unknown weight tiers stay f16 here;
-             * the single-machine path may select q8_0 below only when it makes
-             * the complete exact context fit. */
+            /* The weight tier fixes a uniform KV dtype, independent of
+             * available capacity. Apply it BEFORE the cluster branch so single
+             * and multi-machine planners price the same bytes the engine will
+             * allocate. Since 2026-09-02 only unquantized weights stay f16, and
+             * nothing downstream ever re-picks the dtype to make a window fit —
+             * hard constraint #7 says a shortfall is refused, not shrunk. */
             {
                 char kvk[12], kvv[12], kverr[128];
                 if (idletoken_llama_kv_types(kvk, kvv, kverr, sizeof kverr) != 0) {
@@ -8794,7 +9147,13 @@ int main(int argc, char **argv) {
                                 wbits, fixed, fixed,
                                 (double)msize.kv_bytes_per_token / 1024.0);
                     }
+                    snprintf(kvk, sizeof kvk, "%s", fixed ? fixed : "");
+                    snprintf(kvv, sizeof kvv, "%s", fixed ? fixed : "");
                 }
+                /* msize already carries the workspace for the tier the rule
+                 * picks; this only matters when an override disagrees. Called
+                 * unconditionally so the two paths cannot drift. */
+                llama_align_workspace_to_kv(g_model, &msize, kvk, kvv);
             }
 
             /* --- WS-C cluster path: remote RPC GPUs requested --------------
@@ -8804,7 +9163,7 @@ int main(int argc, char **argv) {
              * The exact context is checked after every worker reports its GPU
              * budget inside run_llamacpp_cluster_mode(). */
             if (num_workers_set && num_workers >= 1) {
-                uint32_t cctx = ctx_size ? ctx_size : 262144u;
+                uint32_t cctx = ctx_size ? ctx_size : IDLETOKEN_DEFAULT_CONTEXT_TOKENS;
                 if (cctx > model_ctx_ceiling(g_model)) {
                     fprintf(stderr, "idletoken-coord: ctx-size %u clamped to %s "
                                     "max %u\n", cctx, g_model->id,
@@ -8826,7 +9185,7 @@ int main(int argc, char **argv) {
             /* Runtime serves one exact product context. 256K is the default;
              * an explicit 1M request stays 1M. The planner either admits that
              * exact window or refuses it, with no context ladder. */
-            const uint32_t ctx_ask = ctx_size ? ctx_size : 262144u;
+            const uint32_t ctx_ask = ctx_size ? ctx_size : IDLETOKEN_DEFAULT_CONTEXT_TOKENS;
             uint32_t ctx_capped = ctx_ask;
             if (ctx_capped > model_ctx_ceiling(g_model)) {
                 fprintf(stderr, "idletoken-coord: ctx-size %u clamped to %s max %u\n",

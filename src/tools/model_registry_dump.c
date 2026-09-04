@@ -29,6 +29,14 @@ static void jstr(const char *k, const char *v, int last) {
 static void jnum(const char *k, unsigned long long v, int last) {
     printf("    \"%s\": %llu%s\n", k, v, last ? "" : ",");
 }
+/* KV-tier-indexed arrays, emitted in IDLETOKEN_KV_TIER_* order so the manifest
+ * checker can compare them to the JSON list literally, index by index. */
+static void jnums(const char *k, const uint64_t *v, size_t n, int last) {
+    printf("    \"%s\": [", k);
+    for (size_t i = 0; i < n; i++)
+        printf("%s%llu", i ? ", " : "", (unsigned long long)v[i]);
+    printf("]%s\n", last ? "" : ",");
+}
 
 int main(void) {
     printf("{\n");
@@ -70,10 +78,18 @@ int main(void) {
         jnum("dsv4_hca_bytes_per_cell", m->dsv4_hca_bytes_per_cell, 0);
         jnum("dsv4_fixed_bytes_per_seq", m->dsv4_fixed_bytes_per_seq, 0);
         jnum("overhead_base_bytes", m->overhead_base_bytes, 0);
-        jnum("compute_bytes_256k_cuda", m->compute_bytes_256k_cuda, 0);
-        jnum("compute_bytes_1m_cuda", m->compute_bytes_1m_cuda, 0);
-        jnum("compute_bytes_256k_metal", m->compute_bytes_256k_metal, 0);
-        jnum("compute_bytes_1m_metal", m->compute_bytes_1m_metal, 0);
+        jnums("compute_bytes_128k_cuda", m->compute_bytes_128k_cuda,
+              IDLETOKEN_KV_TIER_COUNT, 0);
+        jnums("compute_bytes_256k_cuda", m->compute_bytes_256k_cuda,
+              IDLETOKEN_KV_TIER_COUNT, 0);
+        jnums("compute_bytes_1m_cuda", m->compute_bytes_1m_cuda,
+              IDLETOKEN_KV_TIER_COUNT, 0);
+        jnums("compute_bytes_128k_metal", m->compute_bytes_128k_metal,
+              IDLETOKEN_KV_TIER_COUNT, 0);
+        jnums("compute_bytes_256k_metal", m->compute_bytes_256k_metal,
+              IDLETOKEN_KV_TIER_COUNT, 0);
+        jnums("compute_bytes_1m_metal", m->compute_bytes_1m_metal,
+              IDLETOKEN_KV_TIER_COUNT, 0);
         jstr("default_gguf", m->default_gguf, 0);
         printf("    \"variants\": [");
         for (uint8_t v = 0; v < m->n_variants; v++)

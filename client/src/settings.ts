@@ -22,30 +22,63 @@ export const TIERS: Tier[] = [
   { id: 5, ctx: 262144 },
 ];
 
-/** The two product contexts. 256K is the default; 1M is an explicit opt-in
- * that changes estimation, runtime admission and marketplace service identity
- * together. There is no automatic down-sizing between them. */
-export const DEFAULT_CONTEXT_TOKENS = 262144;
-export const LONG_CONTEXT_TOKENS = 1048576;
+/** The three product contexts (docs/ctx-tiers-2026-09.md). 128K is the default;
+ * 256K and 1M are explicit choices that change estimation, runtime admission
+ * and marketplace service identity together. There is no automatic down-sizing
+ * between them — a window that does not fit is refused, never shrunk.
+ *
+ * Why 128K and not 256K (2026-09-02): llama.cpp allocates the whole `-c` block
+ * at load and cannot grow it, so the window is PRE-PAID whether a session uses
+ * it or not. Claude Code's own window is 200K and it auto-compacts around
+ * 150-165K, so the core scenario never reaches 256K; the average agentic prompt
+ * is single-digit thousands of tokens. 256K remains one click away for the
+ * sessions that genuinely need it.
+ *
+ * MUST match IDLETOKEN_CTX_TIER_* in include/idletoken_plan.h: the planner has
+ * measurements for exactly these windows and refuses anything else. */
+export const CONTEXT_TIERS = [131072, 262144, 1048576] as const;
+export type ContextTier = (typeof CONTEXT_TIERS)[number];
+export const DEFAULT_CONTEXT_TOKENS: ContextTier = 131072;
+export const LONG_CONTEXT_TOKENS: ContextTier = 1048576;
 export const PRODUCT_CONTEXT_CAP = LONG_CONTEXT_TOKENS;
+
+/** A stored/queried value snapped to a real tier. Anything unrecognised falls
+ * back to the default rather than reaching the engine, which would refuse it —
+ * the picker is the only place a window is chosen, so a bad stored value is a
+ * corrupted setting, not a user intent to honour. */
+export function asContextTier(v: unknown): ContextTier {
+  return (CONTEXT_TIERS as readonly number[]).includes(Number(v))
+    ? (Number(v) as ContextTier)
+    : DEFAULT_CONTEXT_TOKENS;
+}
 
 // ---- context bounded by the model -----------------------------------------
 // `tier` is stored-schema compatibility only. Runtime context is now exactly
 // 256K or the explicit 1M opt-in; the coordinator never silently sizes down.
 export const MODEL_DEFAULT_TIER = 0;
 
-/** The largest window this model may ask for. The coordinator then computes
- * the actual promise from the selected precision and current hardware. */
-export function modelCtxMax(modelId: string, longContext = false): number {
+/** The window this model would really launch for the requested tier: the tier
+ * itself, or the model's own ceiling when that is lower. The planner's
+ * `idletoken_llama_ctx_tier_of()` maps a below-tier ceiling back to the slot
+ * holding its measurement, so a clamped value is still budgeted correctly. */
+export function modelCtxMax(modelId: string, want: number = DEFAULT_CONTEXT_TOKENS): number {
   try {
     const m = getManifest(modelId || DEFAULT_MODEL_ID);
-    return Math.min(
-      longContext ? LONG_CONTEXT_TOKENS : DEFAULT_CONTEXT_TOKENS,
-      Math.max(m.context_max || 8192, m.context_yarn_max || 0),
-    );
+    return Math.min(want, Math.max(m.context_max || 8192, m.context_yarn_max || 0));
   } catch {
     return 8192;
   }
+}
+
+/** Which tiers this model can actually be asked for. A tier above the model's
+ * ceiling is not offered — the picker hides it rather than showing an option
+ * that silently clamps to something else. */
+export function contextTiersFor(modelId: string): ContextTier[] {
+  const ceil = modelCtxCeil(modelId);
+  const usable = CONTEXT_TIERS.filter((t) => t <= ceil);
+  // Every model reaches at least the smallest tier in practice, but a manifest
+  // with a tiny ceiling must still offer one choice rather than an empty row.
+  return usable.length ? [...usable] : [CONTEXT_TIERS[0]];
 }
 
 /** Alias used by explicit legacy tiers; mirrors modelCtxMax(). */
@@ -65,18 +98,19 @@ export function modelSupportsLongContext(modelId: string): boolean {
   return modelCtxCeil(modelId) >= LONG_CONTEXT_TOKENS;
 }
 
-/** The exact context sent to the engine. The caller chooses 256K or 1M; model
- * metadata is a safety ceiling, never a reason to invent an intermediate
- * runtime window. */
-export function effectiveCtx(s: Pick<AppSettings, "modelId" | "longContext">): number {
-  return modelCtxMax(s.modelId, !!s.longContext);
+/** The exact context sent to the engine. The caller picks one of the three
+ * tiers; model metadata is a safety ceiling, never a reason to invent an
+ * intermediate runtime window. */
+export function effectiveCtx(s: Pick<AppSettings, "modelId" | "ctxTokens">): number {
+  return modelCtxMax(s.modelId, asContextTier(s.ctxTokens));
 }
 
 // ---- KV cache precision ----------------------------------------------------
 // Retired from the UI on 2026-08-25 (docs/ctx-kv-simplification-2026-08.md):
 // the KV dtype is the COORDINATOR's automatic rule now — q4_0 for 1-2 bit
-// weights, q8_0 for 3-4 bit, and f16-first for higher/unknown precision. The
-// client passes nothing; the escape hatch
+// weights, q8_0 for every other quantized tier (3-15 bit, Q8 included since
+// 2026-09-02), f16 only for unquantized BF16/F16 and unreadable quant names.
+// The client passes nothing; the escape hatch
 // for measurements is the coordinator's IDLETOKEN_KV_CACHE_TYPE env, on
 // purpose not a setting. The dtype table, the per-token estimator and
 // recommendKvCache() that used to live here duplicated the coordinator's
@@ -104,10 +138,12 @@ export interface AppSettings {
   // registry is the whole selectable set, and a stored "local-gguf" selection
   // migrates back to the default model below.
   /** Retired context-tier schema field. Runtime context comes exclusively from
-   *  `longContext`: exact 256K by default, exact 1M when explicitly enabled. */
+   *  `ctxTokens`. */
   tier: Tier["id"] | 0;
-  /** Explicit 1M service. False = the exact 256K default. */
-  longContext: boolean;
+  /** The chosen context window, one of CONTEXT_TIERS. Default 131072.
+   *  Replaced the `longContext` boolean on 2026-09-02 when the product went
+   *  from two windows to three (docs/ctx-tiers-2026-09.md). */
+  ctxTokens: ContextTier;
   resourcePreset: ResourcePreset;
   // ---- advanced: resources (precise; used when resourcePreset === "custom") ----
   maxVramMb: number; // 0 = no cap
@@ -136,12 +172,8 @@ export interface AppSettings {
   // for help without accepting other people's prompts.
   providerEnabled: boolean;
   overflowEnabled: boolean;
-  /** What borrowing may cost in one UTC day, in milli-credits. NOT a user
-   *  setting any more (owner's call, 2026-08-21): borrowing may spend the
-   *  whole balance, and the balance itself is the ceiling — the platform
-   *  refuses past zero. The field stays because the coordinator's flag needs
-   *  a positive number (it reads 0 as "use my own default"); it is pinned to
-   *  OVERFLOW_UNCAPPED_MILLI by the v6 migration and no UI edits it. */
+  /** Stored-schema compatibility for the coordinator's optional operator cap.
+   *  The product always sends 0: the account balance is the spend gate. */
   overflowDailyCapMilli: number;
   /** Internal coordinator compatibility field. The public product policy is
    *  fixed at 0: when the one local inference slot is occupied, an eligible
@@ -306,21 +338,15 @@ export interface AppSettings {
 const BUILT_IN_PLATFORM_URL: string =
   (typeof import.meta !== "undefined" && (import.meta as any).env?.VITE_PLATFORM_URL) || "";
 
-/** The daily borrow cap as shipped: effectively NONE (owner's call,
- * 2026-08-21) — borrowing may spend the whole account balance, and the real
- * ceiling is the balance itself (the platform refuses past zero). The value is
- * not 0 because the coordinator reads 0 as "use my own 50-credit default" and
- * has no spelling for "no ceiling" at all; and it stays under 2^31 because the
- * flag is parsed with atol(), which is 32-bit on Windows. 2e9 milli = 2M
- * credits, orders of magnitude past any real balance. */
-export const OVERFLOW_UNCAPPED_MILLI = 2_000_000_000;
+/** Zero is the coordinator's explicit spelling for no additional local cap. */
+export const OVERFLOW_UNCAPPED_MILLI = 0;
 
 export const DEFAULT_SETTINGS: AppSettings = {
   modelId: DEFAULT_MODEL_ID,
   quant: defaultQuant(DEFAULT_MODEL_ID),
   // Exact 256K by default. Long context is a separate explicit service choice.
   tier: MODEL_DEFAULT_TIER,
-  longContext: false,
+  ctxTokens: DEFAULT_CONTEXT_TOKENS,
   // Full power by default (2026-08-15, was "balanced"): the product's whole
   // promise is using this machine's idle capacity, and a fresh install that
   // silently keeps 25% back both underuses the hardware and misreports what
@@ -336,13 +362,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   // Both directions are explicit, independent opt-ins.
   providerEnabled: false,
   overflowEnabled: false,
-  // 50 credits/day. Matches the coordinator's own default
-  // (IDLETOKEN_OVF_DEFAULT_DAILY_CAP_MILLI) so the number shown here is the
-  // number in force. Raised from 5 on 2026-08-19 against the measured rate card
-  // (anchor-proposal-v1, D2): 5 credits bought one 27B-class conversation, so
-  // the feature looked broken to anyone who switched it on. 50 is still a
-  // guardrail — a default that surprises someone by refusing is recoverable in
-  // a way that one which surprises them by spending is not.
+  // No hidden local spend ceiling. The platform balance is the hard gate.
   overflowDailyCapMilli: OVERFLOW_UNCAPPED_MILLI,
   overflowWaitS: 0,
   overflowKey: "",
@@ -363,7 +383,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   maxTokens: 0,
   // Literal, not SCHEMA_VERSION: that const is declared further down and this
   // object is built at module init. Keep the two in step by hand.
-  schemaVersion: 11,
+  schemaVersion: 12,
   kvOffload: false,
   kvDir: "",
   kvCacheK: "",
@@ -452,7 +472,7 @@ const KEY = "idletoken.settings";
 
 // Bump when a stored value must be discarded rather than merged. Absent in
 // blobs written before versioning existed, which reads as 0.
-const SCHEMA_VERSION = 11;
+const SCHEMA_VERSION = 13;
 
 // ---- UI scale --------------------------------------------------------------
 // The fixed factors the panel offers. `0` means auto; anything else must be one
@@ -646,9 +666,34 @@ export function loadSettings(): AppSettings {
     }
     // v10 → v11: context became an explicit two-state product choice. Existing
     // installs stay on the safe/default 256K service until the user checks 1M.
-    if ((parsed.schemaVersion ?? 0) < 11) merged.longContext = false;
+    // v11 → v12: two windows became three and the default dropped to 128K
+    // (docs/ctx-tiers-2026-09.md). The boolean is translated, not discarded: a
+    // user who explicitly asked for 1M keeps 1M. Everyone else lands on the new
+    // 128K default rather than the old 256K one — a SILENT REDUCTION, which is
+    // why the picker shows the current window instead of hiding it behind a
+    // checkbox that only says "long".
+    const legacyLongCtx = parsed as Partial<AppSettings> & { longContext?: unknown };
+    if ((parsed.schemaVersion ?? 0) < 12) {
+      merged.ctxTokens =
+        legacyLongCtx.longContext === true ? LONG_CONTEXT_TOKENS : DEFAULT_CONTEXT_TOKENS;
+    }
+    // v12 → v13: remove the compatibility-era pseudo-unlimited value
+    // (2,000,000,000 milli-credits). The coordinator now represents the
+    // product rule exactly: zero means no local cap; the Spark balance is the
+    // only default spend gate. This field never had a UI, so no user choice is
+    // overwritten.
+    if ((parsed.schemaVersion ?? 0) < 13) {
+      merged.overflowDailyCapMilli = OVERFLOW_UNCAPPED_MILLI;
+    }
+    // Unconditional: a hand-edited or imported file can carry any number, and
+    // a window the engine has no measurement for is refused at launch.
+    merged.ctxTokens = asContextTier(merged.ctxTokens);
+    delete (merged as AppSettings & { longContext?: unknown }).longContext;
     merged.overflowWaitS = 0;
     delete (merged as AppSettings & { sharingEnabled?: unknown }).sharingEnabled;
+    // The local cap is not a product setting. Keep imported/current-schema
+    // values from silently restoring the retired shadow limit.
+    merged.overflowDailyCapMilli = OVERFLOW_UNCAPPED_MILLI;
     // Long context stopped being a separate model SKU on 2026-08-29. Preserve
     // the selected weights/precision while folding stored `*-1m` ids back into
     // the one real model. This is unconditional because users may already have
@@ -680,8 +725,8 @@ export function loadSettings(): AppSettings {
     // nothing mints a token at all (see the block above), so this is not a
     // migration exception, it is the same open-by-default posture reached from
     // the other direction. What guards the port is api_origin_ok() in the
-    // coordinator; what bounds a local program is the daily spend cap
-    // (docs/api-surface.md §5.3).
+    // coordinator; platform spending is bounded by the account balance, with
+    // an optional per-key cap only when the user explicitly configures one.
     merged.schemaVersion = SCHEMA_VERSION;
     return merged;
   } catch {
@@ -729,9 +774,10 @@ export interface EngineTuning {
   quant: string;
   ctxSize: number;
   /** KV cache dtypes → coord env IDLETOKEN_KV_CACHE_TYPE / _V. Always "" since
-   *  2026-08-25: the coordinator decides from the weight tier, with f16-first
-   *  sizing for high/unknown precision (docs/ctx-kv-simplification-2026-08.md). The
-   *  fields stay so the Rust Tuning struct keeps its shape. */
+   *  2026-08-25: the coordinator decides from the weight tier — q4_0 at 1-2 bit,
+   *  q8_0 at every other quantized tier, f16 only for unquantized/unknown
+   *  (docs/ctx-kv-simplification-2026-08.md). The fields stay so the Rust
+   *  Tuning struct keeps its shape. */
   kvCacheK: string;
   kvCacheV: string;
   /** Per-request generation ceiling → coord `--max-decode`. 0 = context-bound. */
@@ -799,7 +845,7 @@ export function overflowTuning(s: AppSettings): OverflowTuning {
     overflowKey: enabled ? s.overflowKey : "",
     // Fixed product policy: the occupied local slot never creates a queue.
     overflowWaitS: 0,
-    overflowDailyCapMilli: Math.max(1, s.overflowDailyCapMilli || OVERFLOW_UNCAPPED_MILLI),
+    overflowDailyCapMilli: OVERFLOW_UNCAPPED_MILLI,
   };
 }
 
