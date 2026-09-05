@@ -5,114 +5,78 @@
   </picture>
 </p>
 
-**Share when idle. Scale when busy.**
+<h1 align="center">Share your idle Token.</h1>
 
-Put your idle compute to work, then tap into more Tokens when demand spikes.
+<p align="center">
+  Run large models locally. Share yours when idle; call someone else's when busy.
+</p>
 
-[中文](README.zh-CN.md)
-
-<!-- The screenshot that used to sit here was the marketing site, not the app:
-     it carried an "IN BETA" ribbon and a "get 100 Sparks" signup offer that no
-     longer exists. Rather than show visitors a picture of something else,
-     there is no image until a real client screenshot is taken on a machine
-     that is serving (model picker + running state). Drop it in at
-     docs/images/screenshot.png and restore the <img> block. -->
-
----
+<p align="center">
+  <a href="https://github.com/idletoken/IdleToken/releases">Download the desktop app</a>
+  · <a href="https://idletoken.ai">Open the marketplace</a>
+  · <a href="README.zh-CN.md">中文</a>
+</p>
 
 ## Why IdleToken
 
-Agent workloads are peaky by nature. Most of the time only one or two inference tasks are running; then a complex job arrives, several agents start working at once, and a burst of parallel requests drives the demand for compute straight up.
+Agent workloads arrive in bursts, while home GPUs spend much of their time unused. IdleToken lets those machines back each other up: share idle compute to earn Sparks, then spend Sparks on models shared by others when your own machines are busy.
 
-Machines deployed at home are peaky in the same way — busy sometimes, idle most of the time. Nobody runs a model around the clock, so a machine spends most of its life with capacity to spare, and then turns out to be short of it exactly when a lot of inference is needed.
+## Two ways to start
 
-What IdleToken sets out to do is connect one person's idle hours to another's busy ones: **share your compute when you are not using it and earn Sparks; spend Sparks to use someone else's idle machine when you need more.**
+### Deploy and share your own model
 
-## Getting started
+1. Install the desktop app on Windows or Linux with an NVIDIA GPU, or on an Apple Silicon Mac.
+2. Choose a curated model, quantization, and context, then run it on one computer or a mixed-OS LAN cluster.
+3. Turn on sharing to earn Sparks. Turn on backup when you want IdleToken to draw on shared capacity.
 
-There are two ways to use IdleToken, depending on whether you have a machine with a supported GPU.
+### Call a model shared by someone else
 
-### No machine: use the platform
+1. Create an account at [idletoken.ai](https://idletoken.ai).
+2. Open **Sparks → API keys** and create a key.
+3. Connect any Anthropic- or OpenAI-compatible client. No GPU or desktop installation is required.
 
-Sign up at [idletoken.ai](https://idletoken.ai) and create an API key, then use it like any third-party model provider:
+New accounts start with zero Sparks. Earn them by sharing compute or use a redemption code; purchasing Sparks is not currently supported.
 
-```sh
-export ANTHROPIC_BASE_URL=https://api.idletoken.ai
-export ANTHROPIC_API_KEY='<your platform API key>'
-claude
-```
+## Connect your tools
 
-The OpenAI-compatible endpoint works at the same base URL. Requests run on clusters other people share and are billed in Sparks. A new account starts at a zero balance; Sparks come from sharing your own machine, from a redemption code, or from a transfer.
+| Use | Base URL | API key |
+| --- | --- | --- |
+| Your local model | `http://127.0.0.1:8000` | Any non-empty value |
+| Shared marketplace | `https://api.idletoken.ai` | A key created in the portal |
 
-### Your own machine: deploy IdleToken
-
-IdleToken is a desktop app; normal use needs no command line. Installers for Windows, Linux and macOS are on the [Releases](https://github.com/idletoken/IdleToken/releases) page.
-
-1. **Pick a model and context** — from the built-in list. Context is exactly 256K by default; models that support it offer an explicit 1M checkbox. The app estimates the selected service against GPU memory only.
-2. **Start serving** — missing weights download automatically. The API listens on `127.0.0.1:8000`, this machine only; the app shows the address. It needs no key: a loopback-only port cannot be reached from anywhere else, and a key stored on the machine would not stop a program already running on it. (Requests carrying an `Origin` header are refused, which keeps a web page in your browser from firing at the port; set `--api-token` on the coordinator if you want a key anyway.)
-
-Weights are fetched from Hugging Face. If `huggingface.co` cannot be reached, the client retries the same file from the `hf-mirror.com` mirror rather than failing — a fallback worth knowing about if your network policy cares where bytes come from. Either way the finished file is checked against the SHA-256 recorded in the model manifest before it is used, and a file that does not match is discarded.
-
-Connect Claude Code:
+For Claude Code:
 
 ```sh
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8000
-export ANTHROPIC_API_KEY=idletoken   # any value; the local API does not check it
+export ANTHROPIC_API_KEY=idletoken
 claude
 ```
 
-Or use the OpenAI-compatible endpoint:
+Use the same base URL with the OpenAI-compatible API. `GET /v1/models` returns the model IDs available at that endpoint.
 
-```sh
-curl http://127.0.0.1:8000/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{"model":"qwen3-8b","messages":[{"role":"user","content":"Hello"}]}'
-```
+## What you get
 
-`GET /v1/models` reports the one model this machine currently serves — the id to
-put in any client's configuration.
-
-Machines on the same LAN can serve a model together. Cluster deployment is the default choice; local-only deployment remains available explicitly. IdleToken compares the exact selected model, precision and 256K/1M context with usable GPU memory and refuses startup if the complete service does not fit—there is no CPU/RAM offload or automatic context reduction. Windows, Linux and macOS nodes can mix in one cluster; every node must run the same IdleToken version. Workers receive their model shards from the API machine over an encrypted connection, and prompts do not cross the cluster in plain text.
-
-To earn Sparks, turn on sharing while your cluster is idle — it is off by default.
+- **One app, one machine or many.** Single-machine inference talks directly to llama.cpp; clusters split the model across Windows, Linux, and macOS computers on the same LAN.
+- **Two familiar APIs.** OpenAI and Anthropic compatibility includes Claude Code as a first-class use case.
+- **Local-first boundaries.** The local API listens only on `127.0.0.1`; cluster tensor traffic stays on the direct LAN and is protected with PSK-TLS.
+- **Explicit resource choices.** Pick 256K or, where supported, 1M context. IdleToken refuses insufficient configurations instead of silently shrinking the window or changing deployment mode.
 
 ## Models
 
-IdleToken serves a curated list of text-generation models in GGUF format. Every listed model is verified on our real hardware before it ships — that is what keeps shared endpoints trustworthy, so the list is deliberately not an "open any file" box. Missing a model you need? [Open an issue](https://github.com/idletoken/IdleToken/issues) and we will evaluate it for the next list update. Multimodal input is not supported.
+IdleToken offers a curated list of GGUF text-generation models from Qwen, OpenAI, and DeepSeek. The versioned manifests live in [`models/`](models/); the client handles downloads, integrity checks, resource estimates, and supported quantizations.
 
-The built-in models:
+Every listed model can run on one machine when it fits or across a cluster when you choose that deployment. Multimodal input and arbitrary local GGUF files are outside the current scope. To request another model, [open an issue](https://github.com/idletoken/IdleToken/issues).
 
-| Model                  |   Default weights | Default quant | Notes                  |
-| ---------------------- | ----------------: | ------------- | ---------------------- |
-| Qwen3.5-0.8B           |          0.31 GiB | IQ2_XXS       |                        |
-| Qwen3.5-4B             |          1.42 GiB | IQ2_XXS       |                        |
-| Qwen3-8B               |          4.68 GiB | Q4_K_M        |                        |
-| Qwen3.5-9B             |          2.97 GiB | IQ2_XXS       |                        |
-| Qwen3.8-27B            |          5.77 GiB | IQ1_S         | the perplexity gate ran on Q4_K_M, not on this default |
-| Qwen3.5-27B            |          7.98 GiB | IQ2_XXS       |                        |
-| Qwen3.5-35B-A3B        |          9.93 GiB | IQ2_XXS       | 3B active parameters   |
-| DeepSeek-V4-Flash-0731 |         76.87 GiB | IQ1_S         | 304B total, 13B active |
+## Hardware
 
-The default is the smallest published precision, so that each model reaches as many machines as possible; the app offers the larger ones (up to Q8 and BF16 for several of the Qwen models) whenever the machine has room. Qwen3.8-27B is the exception worth stating plainly: its perplexity band was measured at Q4_K_M (16.46 GiB), and IQ1_S — the default — has not been through that gate. DeepSeek-V4-Flash can be distributed across a cluster; the other built-in models run on a single machine.
+- Windows 10/11: NVIDIA GPU with compute capability 7.5 or newer, at least 4 GB VRAM, and a current driver; CUDA runtime DLLs are included.
+- Linux: the same GPU requirement, plus driver 570.26 or newer / CUDA 12.8 on x86_64, or driver 580.65 or newer / CUDA 13.0 on arm64.
+- macOS: Apple Silicon with enough unified memory for the selected model.
+- CPU-only computers, AMD or Intel GPUs, Intel Macs, and phones can control a cluster but do not run inference.
+- Cluster nodes need the same IdleToken version and a direct LAN route; tensor traffic does not use VPN or overlay networks such as Tailscale.
 
-## Requirements
-
-These apply to machines that run inference; using the platform requires no GPU and no install.
-
-| Platform | Compute hardware | Also needs |
-| --- | --- | --- |
-| Windows 10/11 | NVIDIA, compute capability ≥ 7.5 (RTX 20-series or newer), ≥ 4 GB VRAM | current NVIDIA driver; CUDA runtime DLLs are included |
-| Linux x86_64 | NVIDIA, compute capability ≥ 7.5 (RTX 20-series or newer), ≥ 4 GB VRAM | driver ≥ 570.26 and CUDA Toolkit 12.8 |
-| Linux arm64 | NVIDIA, compute capability ≥ 7.5, ≥ 4 GB VRAM | driver ≥ 580.65 and CUDA Toolkit 13.0 |
-| macOS | Apple Silicon with Metal and enough unified memory for the selected model | no CUDA installation |
-
-- Releases contain native installers only: Windows `.exe`, macOS `.dmg`, and Linux `.deb`/`.rpm` packages for both x86_64 and arm64. There is no AppImage or in-app updater; upgrade by installing the current package over the existing version.
-- Operating systems can mix in one cluster; the IdleToken version must match on every node.
-- Cluster machines need a direct LAN route to each other; tensor traffic does not go through VPN or overlay networks such as Tailscale. Wired gigabit or faster is recommended.
-- CPU-only machines, AMD GPUs, Intel Macs and phones cannot compute, but can run the client to sign in, chat and control a cluster.
-- Every compute node stores the complete selected GGUF on disk. At startup a worker copies and loads only its assigned tensors, so RAM/VRAM usage follows the assigned slice rather than the full file.
-
-## Building from source
+<details>
+<summary><strong>Build from source</strong></summary>
 
 On Linux or macOS:
 
@@ -121,38 +85,22 @@ On Linux or macOS:
 make
 make -f Makefile.platform
 ./scripts/stage_sidecars.sh
-cd client && pnpm install && pnpm build
-cd src-tauri && cargo build --release
+cd client
+pnpm install && pnpm build
+cd src-tauri
+cargo build --release
 ```
 
-On Windows, build the engine with `scripts\build_llamacpp_win.bat`, build the coordinator, worker and platform agent, then run `scripts\build_client_release.bat`.
+On Windows, build the engine with `scripts\build_llamacpp_win.bat`, then build the coordinator, worker, platform agent, and client with the scripts under `scripts\`.
 
-Packaging: `scripts\build_client_release.bat` (Windows NSIS installer), `scripts/build_client_release.sh` (Linux `.deb` / `.rpm`), `scripts/package_client_mac.sh` (macOS `.dmg`).
+</details>
 
-## Troubleshooting
+## Help
 
-**Installer warnings (SmartScreen / Gatekeeper).** The Windows installer is not Authenticode-signed and the macOS dmg is not notarized yet. Windows: choose **More info → Run anyway**. macOS: right-click the app and choose **Open**, or run `xattr -d com.apple.quarantine /Applications/IdleToken.app`.
+For installation, pairing, or API problems, search the [existing issues](https://github.com/idletoken/IdleToken/issues) or open one with your OS, IdleToken version, hardware, and the relevant error or log excerpt.
 
-**Chat streams hang while a local HTTP proxy is running.** Proxies such as Clash can swallow loopback SSE streams. Set `NO_PROXY=127.0.0.1,localhost` in the terminal running `claude` or `curl`, or add a direct-connection rule for `127.0.0.1` to the proxy.
+## Project links
 
-**Windows Firewall blocks pairing or cluster traffic.** Run IdleToken elevated once, or run the `netsh` command printed in the log as administrator. Ports: UDP 14097 and 14099 (discovery and pairing), TCP 14100 and 14101 (cluster control), TCP 50052 (worker rpc-server, configurable). The API port 8000 is deliberately **not** on that list: it is bound to 127.0.0.1 and is not reachable from another machine, so there is nothing to allow through. To use your cluster from another device, go through the platform relay rather than opening a port.
+[Releases](https://github.com/idletoken/IdleToken/releases) · [Issues](https://github.com/idletoken/IdleToken/issues) · [Security](SECURITY.md) · [Contributing](CONTRIBUTING.md) · [Apache-2.0 license](LICENSE)
 
-**Linux client opens a blank window.** Launch with `WEBKIT_DISABLE_DMABUF_RENDERER=1 idletoken-client`.
-
-## License
-
-[Apache-2.0](LICENSE)
-
-## Acknowledgements
-
-IdleToken would not exist without a number of excellent open-source projects. Particular thanks to:
-
-* [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) — the inference engine IdleToken runs on
-* [Tauri](https://github.com/tauri-apps/tauri)
-* [TweetNaCl](https://tweetnacl.cr.yp.to/)
-* [BLAKE2](https://github.com/BLAKE2/BLAKE2)
-* [DeepSeek](https://github.com/deepseek-ai)
-* [Qwen](https://github.com/QwenLM)
-* [ds4](https://github.com/antirez/ds4) — the engine of IdleToken's early prototype, before the project settled on llama.cpp
-
-and to every open-source project IdleToken depends on, and everyone who contributes to them.
+Built on [llama.cpp](https://github.com/ggml-org/llama.cpp) and [Tauri](https://github.com/tauri-apps/tauri). See [NOTICE](NOTICE) for third-party acknowledgements.
