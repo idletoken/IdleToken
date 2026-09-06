@@ -5,112 +5,75 @@
   </picture>
 </p>
 
-**闲时分享，忙时扩容。**
+<h1 align="center">分享你的空闲 Token。</h1>
 
-让闲置的算力动起来，需求高峰时再取用更多 Token。
+<p align="center">
+  本地运行大模型，闲时分享给别人，忙时调用别人的。
+</p>
 
-[English](README.md)
-
-<!-- The screenshot that used to sit here was the marketing site, not the app:
-     it carried an "IN BETA" ribbon and a "get 100 Sparks" signup offer that no
-     longer exists. Rather than show visitors a picture of something else,
-     there is no image until a real client screenshot is taken on a machine
-     that is serving (model picker + running state). Drop it in at
-     docs/images/screenshot.png and restore the <img> block. -->
-
----
+<p align="center">
+  <a href="https://github.com/idletoken/IdleToken/releases">下载桌面客户端</a>
+  · <a href="https://idletoken.ai">进入市场</a>
+  · <a href="README.md">English</a>
+</p>
 
 ## 为什么做 IdleToken
 
-智能体的工作负载天然是有峰谷的。大多数时候，可能只有一两个推理任务在运行；但遇到复杂任务时，多个智能体会同时展开工作，短时间内产生大量并行请求，算力需求会迅速上升。
+智能体对算力的需求有明显峰谷，家里的 GPU 却在大部分时间里处于闲置状态。IdleToken 让不同机器的算力彼此补位：闲时分享算力赚取火花，需要时再用火花调用别人分享的模型服务。
 
-而本地部署的机器，恰好也是有时很忙、有时很闲。人不会时时刻刻都在跑模型，所以一台机器可能在大部分时间里都有富余算力，却偏偏在真正需要大量推理时显得不够用。
+## 两种开始方式
 
-IdleToken 想做的，就是把不同人的这些闲时和忙时连接起来：**不用的时候，把算力分享出去赚取火花；需要更多算力的时候，再用火花使用别人此刻闲置的资源。** 让平时闲着的算力，在需要的时候流动到真正有需求的地方。
+### 部署并分享自己的模型
 
-## 快速上手
+1. 在带 NVIDIA 显卡的 Windows / Linux 电脑，或 Apple Silicon Mac 上安装桌面客户端。
+2. 选择精选模型、量化精度和上下文，在一台电脑或异构系统组成的局域网集群上运行。
+3. 打开共享赚取火花；需要更多算力时打开外援，调用他人分享的资源。
 
-IdleToken 有两种用法，取决于你有没有一台带受支持 GPU 的机器。
+### 调用别人分享的模型
 
-### 没有机器：直接用平台
+1. 在 [idletoken.ai](https://idletoken.ai) 注册账号。
+2. 进入**火花 → API 密钥**并创建密钥。
+3. 接入任意兼容 Anthropic 或 OpenAI 的客户端。无需显卡，也无需安装桌面客户端。
 
-在 [idletoken.ai](https://idletoken.ai) 注册并创建 API key，然后像使用其它第三方模型服务一样接入：
+新账号的火花余额为零。你可以通过分享算力赚取，或使用兑换码；目前暂不支持购买火花。
 
-```sh
-export ANTHROPIC_BASE_URL=https://api.idletoken.ai
-export ANTHROPIC_API_KEY='<你的平台 API key>'
-claude
-```
+## 接入现有工具
 
-OpenAI 兼容接口使用同一地址。请求运行在他人分享的集群上，按火花计费。新账户余额为 0；火花来自分享自己的机器、兑换码或他人转赠。
+| 用途 | Base URL | API key |
+| --- | --- | --- |
+| 自己的本地模型 | `http://127.0.0.1:8000` | 任意非空值 |
+| 共享算力市场 | `https://api.idletoken.ai` | 在门户创建的密钥 |
 
-### 有机器：自己部署
-
-IdleToken 是一个桌面客户端，日常使用不需要命令行。Windows、Linux 和 macOS 安装包见 [Releases](https://github.com/idletoken/IdleToken/releases) 页面。
-
-1. **选择模型和上下文**——从内置列表中选择。上下文默认精确为 256K；支持长上下文的模型可显式勾选 1M。客户端只用可用显存估算所选服务。
-2. **启动服务**——缺少的权重自动下载。API 监听 `127.0.0.1:8000`，仅本机可达；客户端会显示这个地址。它不需要密钥：只绑 loopback 的端口本来就没有外部可达性，而存在本机上的密钥挡不住已经跑在本机上的程序。（带 `Origin` 头的请求会被拒绝，浏览器里的网页因此打不了这个端口；确实想要密钥就给协调器设 `--api-token`。）
-
-权重从 Hugging Face 获取。若 `huggingface.co` 连不上，客户端不会直接失败，而是改从镜像 `hf-mirror.com` 重试同一个文件——如果你在意字节来自哪里，这条兜底值得知道。两种来源下，下载完成的文件都会先与 manifest 里记录的 SHA-256 比对，对不上就丢弃。
-
-Claude Code 接入：
+Claude Code 示例：
 
 ```sh
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8000
-export ANTHROPIC_API_KEY=idletoken   # 填任意值即可，本机 API 不校验
+export ANTHROPIC_API_KEY=idletoken
 claude
 ```
 
-或使用 OpenAI 兼容接口：
+OpenAI 兼容 API 使用同一个 Base URL。`GET /v1/models` 会返回当前 endpoint 可用的模型 ID。
 
-```sh
-curl http://127.0.0.1:8000/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{"model":"qwen3-8b","messages":[{"role":"user","content":"你好"}]}'
-```
+## 你会得到什么
 
-`GET /v1/models` 会报出本机此刻正在服务的那一个模型——它的 id 就是各类客户端配置里
-要填的模型名。
-
-同一局域网内的多台机器可共同运行模型。联机部署是默认选择，用户仍可显式强制仅在本机运行。IdleToken 会用各节点可用显存校验精确的模型、精度与 256K/1M 上下文；完整服务放不下就拒绝启动，不使用 CPU/内存卸载，也不会自动缩短上下文。Windows、Linux、macOS 节点可混合组网，所有节点须运行相同版本的 IdleToken。工作节点经加密连接从 API 所在机器获取模型分片，prompt 不会以明文跨节点传输。
-
-集群闲置时可打开共享赚取火花；共享默认关闭。
+- **一套客户端，单机和集群都能用。** 单机直接调用 llama.cpp；集群可在同一局域网内混合使用 Windows、Linux 和 macOS 电脑并切分模型。
+- **两套熟悉的 API。** 同时兼容 OpenAI 与 Anthropic，Claude Code 是核心使用场景。
+- **本地优先的边界。** 本机 API 只监听 `127.0.0.1`；集群张量流量只走可直连的局域网，并使用 PSK-TLS 保护。
+- **明确的资源选择。** 可选择 256K，或在模型支持时选择 1M 上下文；资源不足会明确拒绝，不会静默缩短窗口或改变部署方式。
 
 ## 模型
 
-IdleToken 提供一份精选的 GGUF 格式文本生成模型列表。列表中的每个模型都先在我们的真机上验证过才会上架——这是共享 endpoint 质量可信的前提，所以客户端有意不提供"打开任意文件"的入口。需要列表之外的模型？欢迎[提一个 issue](https://github.com/idletoken/IdleToken/issues)，我们会评估并纳入下次列表更新。暂不支持多模态输入。
+IdleToken 提供精选的 Qwen、OpenAI 与 DeepSeek GGUF 文本生成模型。版本化清单位于 [`models/`](models/)；客户端下载权重并完成完整性校验、资源估算和量化精度选择。
 
-内置模型：
+每个入列模型都可在装得下时单机运行，也可由用户选择集群部署。当前不支持多模态输入或任意本地 GGUF 文件。需要其它模型？欢迎[提交 issue](https://github.com/idletoken/IdleToken/issues)。
 
-| 模型 | 默认权重大小 | 默认量化 | 说明 |
-| --- | --- | --- | --- |
-| Qwen3.5-0.8B | 0.31 GiB | IQ2_XXS |  |
-| Qwen3.5-4B | 1.42 GiB | IQ2_XXS |  |
-| Qwen3-8B | 4.68 GiB | Q4_K_M |  |
-| Qwen3.5-9B | 2.97 GiB | IQ2_XXS |  |
-| Qwen3.8-27B | 5.77 GiB | IQ1_S | 困惑度门跑的是 Q4_K_M，不是这个默认档 |
-| Qwen3.5-27B | 7.98 GiB | IQ2_XXS |  |
-| Qwen3.5-35B-A3B | 9.93 GiB | IQ2_XXS | 3B 激活参数 |
-| DeepSeek-V4-Flash-0731 | 76.87 GiB | IQ1_S | 304B 总参数、13B 激活参数 |
+## 硬件
 
-默认档取的是已发布的最小精度，为的是让每个模型覆盖尽量多的机器；机器装得下时，客户端也提供更高的档位（多款 Qwen 模型最高到 Q8 与 BF16）。Qwen3.8-27B 这一条要说清楚：它的困惑度带是在 Q4_K_M（16.46 GiB）上测的，而默认的 IQ1_S 没有过那道门。DeepSeek-V4-Flash 支持集群运行，其余内置模型为单机运行。
-
-## 硬件要求
-
-以下要求针对运行推理的机器；通过平台调用无需显卡、无需安装。
-
-| 平台 | 计算硬件 | 另需 |
-| --- | --- | --- |
-| Windows 10/11 | NVIDIA，计算能力 ≥ 7.5（RTX 20 系及以后），显存 ≥ 4 GB | 当前 NVIDIA 驱动；安装包已包含 CUDA 运行时 DLL |
-| Linux x86_64 | NVIDIA，计算能力 ≥ 7.5（RTX 20 系及以后），显存 ≥ 4 GB | 驱动 ≥ 570.26，CUDA Toolkit 12.8 |
-| Linux arm64 | NVIDIA，计算能力 ≥ 7.5，显存 ≥ 4 GB | 驱动 ≥ 580.65，CUDA Toolkit 13.0 |
-| macOS | 支持 Metal 的 Apple Silicon，统一内存足以容纳所选模型 | 不需要安装 CUDA |
-
-- Releases 只提供原生安装包：Windows `.exe`、macOS `.dmg`，以及同时覆盖 x86_64 与 arm64 的 Linux `.deb`/`.rpm`。不再提供 AppImage 或应用内更新；升级时直接用当前安装包覆盖安装。
-- 操作系统可混合组网，各节点的 IdleToken 版本必须一致。
-- 集群机器之间需要可直连的局域网；张量流量不经过 VPN / 覆盖网络（如 Tailscale）。建议千兆有线或更快。
-- 纯 CPU 机器、AMD 显卡、Intel Mac 与手机不能参与计算，但可运行客户端登录、聊天和控制集群。
-- API 所在机器需保存完整 GGUF；工作节点只需容纳分配给它的分片。
+- Windows 10/11：NVIDIA GPU，计算能力不低于 7.5、显存至少 4 GB，并安装当前驱动；安装包已包含 CUDA 运行时 DLL。
+- Linux：显卡要求相同；x86_64 需要不低于 570.26 的驱动与 CUDA 12.8，arm64 需要不低于 580.65 的驱动与 CUDA 13.0。
+- macOS：Apple Silicon，统一内存足以容纳所选模型。
+- 纯 CPU 电脑、AMD / Intel GPU、Intel Mac 与手机只能控制集群，不参与推理。
+- 集群节点必须运行同一版本的 IdleToken，并能通过局域网直连；张量流量不走 Tailscale 等 VPN 或覆盖网络。
 
 ## 从源码构建
 
@@ -195,30 +158,12 @@ cd client && npx tsc --noEmit
 
 完整验收阶梯由 [`scripts/acceptance.sh`](scripts/acceptance.sh) 实现。需要硬件的门可参考 [`scripts/testbed.env.example`](scripts/testbed.env.example) 配置自己的机器。
 
-## 疑难排查
+## 获取帮助
 
-**安装时的 SmartScreen / Gatekeeper 警告。** Windows 安装包尚未做 Authenticode 签名，macOS dmg 尚未公证。Windows：点击**更多信息 → 仍要运行**；macOS：右键应用选择**打开**，或执行 `xattr -d com.apple.quarantine /Applications/IdleToken.app`。
+遇到安装、组网或 API 问题时，请先搜索[已有 issue](https://github.com/idletoken/IdleToken/issues)；若需新建 issue，请附上操作系统、IdleToken 版本、硬件信息与相关报错或日志片段。
 
-**本机开着 HTTP 代理时聊天流卡住。** Clash 等代理可能吞掉 loopback 的 SSE 流。在运行 `claude` 或 `curl` 的终端设置 `NO_PROXY=127.0.0.1,localhost`，或在代理中为 `127.0.0.1` 添加直连规则。
+## 项目链接
 
-**Windows 防火墙拦截组网或集群流量。** 以管理员身份运行一次 IdleToken，或以管理员身份执行日志中打印的 `netsh` 命令。端口：UDP 14097、14099（发现与组网），TCP 14100、14101（集群控制），TCP 50052（工作节点 rpc-server，可配置）。API 的 8000 口**有意不在这个列表里**：它绑定在 127.0.0.1，本来就不对其它机器可达，没有需要放行的东西。想从别的设备用自己的集群，走平台中继，而不是开端口。
+[版本发布](https://github.com/idletoken/IdleToken/releases) · [问题反馈](https://github.com/idletoken/IdleToken/issues) · [安全政策](SECURITY.md) · [参与贡献](CONTRIBUTING.md) · [Apache-2.0 许可](LICENSE)
 
-**Linux 客户端白屏。** 启动时加 `WEBKIT_DISABLE_DMABUF_RENDERER=1 idletoken-client`。
-
-## 许可
-
-[Apache-2.0](LICENSE)
-
-## 致谢
-
-IdleToken 的实现离不开许多优秀的开源项目，特别感谢：
-
-- [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)——IdleToken 运行所依赖的推理引擎
-- [Tauri](https://github.com/tauri-apps/tauri)
-- [TweetNaCl](https://tweetnacl.cr.yp.to/)
-- [BLAKE2](https://github.com/BLAKE2/BLAKE2)
-- [DeepSeek](https://github.com/deepseek-ai)
-- [Qwen](https://github.com/QwenLM)
-- [ds4](https://github.com/antirez/ds4)——IdleToken 早期原型的引擎，项目后来改用 llama.cpp
-
-以及所有 IdleToken 所依赖的开源项目和它们的贡献者。
+项目基于 [llama.cpp](https://github.com/ggml-org/llama.cpp) 与 [Tauri](https://github.com/tauri-apps/tauri) 构建；第三方项目致谢见 [NOTICE](NOTICE)。
