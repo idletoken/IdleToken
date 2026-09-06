@@ -13,7 +13,7 @@
 
 <p align="center">
   <a href="https://github.com/idletoken/IdleToken/releases">下载桌面客户端</a>
-  · <a href="https://idletoken.ai">进入市场</a>
+  · <a href="https://idletoken.ai">项目主页</a>
   · <a href="README.md">English</a>
 </p>
 
@@ -21,21 +21,37 @@
 
 智能体对算力的需求有明显峰谷，家里的 GPU 却在大部分时间里处于闲置状态。IdleToken 让不同机器的算力彼此补位：闲时分享算力赚取火花，需要时再用火花调用别人分享的模型服务。
 
+<p align="center">
+  <img src="docs/images/why-idle.svg" alt="空闲 GPU 分享富余算力" width="360">
+  &nbsp;&nbsp;
+  <img src="docs/images/why-busy.svg" alt="繁忙 GPU 获得共享算力" width="360">
+</p>
+
+<p align="center"><sub>闲时分享富余算力 · 忙时调用共享算力</sub></p>
+
 ## 两种开始方式
 
-### 部署并分享自己的模型
-
-1. 在带 NVIDIA 显卡的 Windows / Linux 电脑，或 Apple Silicon Mac 上安装桌面客户端。
-2. 选择精选模型、量化精度和上下文，在一台电脑或异构系统组成的局域网集群上运行。
-3. 打开共享赚取火花；需要更多算力时打开外援，调用他人分享的资源。
-
-### 调用别人分享的模型
-
-1. 在 [idletoken.ai](https://idletoken.ai) 注册账号。
-2. 进入**火花 → API 密钥**并创建密钥。
-3. 接入任意兼容 Anthropic 或 OpenAI 的客户端。无需显卡，也无需安装桌面客户端。
-
-新账号的火花余额为零。你可以通过分享算力赚取，或使用兑换码；目前暂不支持购买火花。
+<table>
+<tr>
+<td width="50%" valign="top">
+<h3>部署并分享自己的模型</h3>
+<ol>
+<li>在带 NVIDIA 显卡的 Windows / Linux 电脑，或 Apple Silicon Mac 上安装桌面客户端。</li>
+<li>选择精选模型、量化精度和上下文，在一台电脑或异构系统组成的局域网集群上运行。</li>
+<li>打开共享赚取火花；需要更多算力时打开外援，调用他人分享的资源。</li>
+</ol>
+</td>
+<td width="50%" valign="top">
+<h3>调用别人分享的模型</h3>
+<ol>
+<li>在 <a href="https://idletoken.ai">idletoken.ai</a> 注册账号。</li>
+<li>进入<strong>火花 → API 密钥</strong>并创建密钥。</li>
+<li>接入任意兼容 Anthropic 或 OpenAI 的客户端。无需显卡，也无需安装桌面客户端。</li>
+</ol>
+<p>新账号的火花余额为零。你可以通过分享算力赚取。</p>
+</td>
+</tr>
+</table>
 
 ## 接入现有工具
 
@@ -47,19 +63,12 @@
 Claude Code 示例：
 
 ```sh
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8000
-export ANTHROPIC_API_KEY=idletoken
+export ANTHROPIC_BASE_URL=https://api.idletoken.ai
+export ANTHROPIC_API_KEY='sk-idletoken-********************************'
 claude
 ```
 
-OpenAI 兼容 API 使用同一个 Base URL。`GET /v1/models` 会返回当前 endpoint 可用的模型 ID。
-
-## 你会得到什么
-
-- **一套客户端，单机和集群都能用。** 单机直接调用 llama.cpp；集群可在同一局域网内混合使用 Windows、Linux 和 macOS 电脑并切分模型。
-- **两套熟悉的 API。** 同时兼容 OpenAI 与 Anthropic，Claude Code 是核心使用场景。
-- **本地优先的边界。** 本机 API 只监听 `127.0.0.1`；集群张量流量只走可直连的局域网，并使用 PSK-TLS 保护。
-- **明确的资源选择。** 可选择 256K，或在模型支持时选择 1M 上下文；资源不足会明确拒绝，不会静默缩短窗口或改变部署方式。
+`GET /v1/models` 会返回当前 endpoint 可用的模型 ID。
 
 ## 模型
 
@@ -77,65 +86,52 @@ IdleToken 提供精选的 Qwen、OpenAI 与 DeepSeek GGUF 文本生成模型。�
 
 ## 从源码构建
 
-仓库包含 Tauri 客户端及其所需的全部原生 sidecar：coordinator、worker supervisor、platform agent，以及钉住版本的 llama.cpp server 与 RPC server。以下命令均从仓库根目录开始执行。
+公开源码只有一个用途：构建完整的 IdleToken 桌面客户端。各平台的构建都会生成对应的原生安装包，并将客户端界面、必需的原生进程和钉住版本的 llama.cpp 引擎一并打包。
+
+请在目标操作系统上直接构建；当前不支持交叉编译。
 
 ### 前置依赖
 
-只调试前端需要 Node.js 与 pnpm。完整原生构建还需要 Git、CMake、Rust 1.77 或更新版本，以及目标操作系统对应的 [Tauri v2 系统依赖](https://tauri.app/start/prerequisites/)。
+所有平台都需要 Git、CMake、Node.js 18 或更新版本、pnpm、Rust 1.77 或更新版本，以及目标操作系统对应的 [Tauri v2 系统依赖](https://tauri.app/start/prerequisites/)。请从干净的代码仓库开始，并在仓库根目录执行以下命令。
 
 - **Linux：** C 编译器，以及“硬件”一节中对应架构的 CUDA Toolkit。
-- **macOS：** Apple Silicon 与 Xcode Command Line Tools。
+- **macOS：** Apple Silicon Mac 与 Xcode Command Line Tools。
 - **Windows：** Visual Studio 2022 Build Tools（勾选 **Desktop development with C++**）、Windows SDK、带 Visual Studio Integration 的 CUDA Toolkit 12.8，以及提供 `gcc` 和 `windres` 的 WinLibs/MinGW。若这些工具不在 `PATH`，请设置 `IDLETOKEN_MINGW_BIN`。
 
-### 只调试前端
+llama.cpp 的传输层补丁会在 CMake 配置阶段获取 mbedTLS。若构建机器无法从 GitHub 下载，请将 `IDLETOKEN_MBEDTLS_SRC` 指向已有的 mbedTLS 3.6.7 源码目录。
 
-这种方式不会启动原生引擎；浏览器界面会使用明确标记的开发夹具。
+### 获取源码
 
 ```sh
-cd client
-pnpm install
-pnpm dev
+git clone https://github.com/idletoken/IdleToken.git
+cd IdleToken
 ```
 
-浏览器访问 `http://localhost:1420`。
+引擎构建脚本会读取 `scripts/llamacpp-patches/UPSTREAM` 中钉住的 llama.cpp commit，应用仓库内的补丁，并编译客户端使用的两个引擎 sidecar。
 
-### 在 Linux 或 macOS 上运行完整桌面开发版
+### Linux
 
 ```sh
 ./scripts/build_llamacpp.sh
-make
-make -f Makefile.platform
-./scripts/stage_sidecars.sh
-cd client
-pnpm install
-pnpm tauri dev
-```
-
-Linux 构建 CUDA 后端，macOS 构建 Metal 后端。缺少 GPU 工具链时会明确失败，不会退回 CPU。
-
-### 构建可安装包
-
-打包脚本会验证所有 sidecar 是否齐全，并确认安装包中的引擎与钉住的 llama.cpp revision 一致。Linux 与 macOS 发布打包要求 Git 工作树干净，使产物能够对应到一个精确的源码 commit。
-
-Linux（`.deb` 与 `.rpm`）：
-
-```sh
-./scripts/build_llamacpp.sh
-make IDLETOKEN_PLATFORM_VERIFY_KEY_B64="$(tr -d '\r\n' < scripts/platform-verify-key.b64)"
+make all IDLETOKEN_PLATFORM_VERIFY_KEY_B64="$(tr -d '\r\n' < scripts/platform-verify-key.b64)"
 make -f Makefile.platform
 ./scripts/build_client_release.sh
 ```
 
-产物位于 `client/src-tauri/target/release/bundle/`。
+安装包位于 `client/src-tauri/target/release/bundle/deb/` 和 `client/src-tauri/target/release/bundle/rpm/`。
 
-macOS（`.dmg`）：
+### macOS
 
 ```sh
 ./scripts/build_llamacpp.sh
 ./scripts/package_client_mac.sh
 ```
 
-Windows（`.exe`，请在 x64 Native Tools Command Prompt 中执行）：
+安装包位于 `client/src-tauri/target/release/bundle/dmg/`。
+
+### Windows
+
+请在 x64 Native Tools Command Prompt 中执行：
 
 ```bat
 scripts\build_llamacpp_win.bat
@@ -146,24 +142,16 @@ cd ..
 scripts\build_client_release.bat
 ```
 
-Windows 安装包位于 `client\src-tauri\target\release\bundle\nsis\`。发布脚本会重新构建 coordinator、worker 与 platform agent，暂存钉住版本的 llama.cpp sidecar 和运行时 DLL，最后调用 NSIS bundler。
+安装包位于 `client\src-tauri\target\release\bundle\nsis\`。
 
-### 无需推理硬件的检查
-
-```sh
-scripts/acceptance.sh --gate G_MODEL
-python3 scripts/model_manifest_check.py
-cd client && npx tsc --noEmit
-```
-
-完整验收阶梯由 [`scripts/acceptance.sh`](scripts/acceptance.sh) 实现。需要硬件的门可参考 [`scripts/testbed.env.example`](scripts/testbed.env.example) 配置自己的机器。
+若 CUDA 安装在非标准目录，请将 `IDLETOKEN_CUDA_RUNTIME_DIR` 指向包含 `cudart64_12.dll`、`cublas64_12.dll` 与 `cublasLt64_12.dll` 的目录。
 
 ## 获取帮助
 
-遇到安装、组网或 API 问题时，请先搜索[已有 issue](https://github.com/idletoken/IdleToken/issues)；若需新建 issue，请附上操作系统、IdleToken 版本、硬件信息与相关报错或日志片段。
+遇到安装、组网、API 或源码构建问题时，请先搜索[已有 issue](https://github.com/idletoken/IdleToken/issues)；若需新建 issue，请附上操作系统、IdleToken 版本、硬件信息、失败命令与相关报错或日志片段。
 
 ## 项目链接
 
-[版本发布](https://github.com/idletoken/IdleToken/releases) · [问题反馈](https://github.com/idletoken/IdleToken/issues) · [安全政策](SECURITY.md) · [参与贡献](CONTRIBUTING.md) · [Apache-2.0 许可](LICENSE)
+[项目主页](https://idletoken.ai) · [版本发布](https://github.com/idletoken/IdleToken/releases) · [问题反馈](https://github.com/idletoken/IdleToken/issues) · [Apache-2.0 许可](LICENSE)
 
 项目基于 [llama.cpp](https://github.com/ggml-org/llama.cpp) 与 [Tauri](https://github.com/tauri-apps/tauri) 构建；第三方项目致谢见 [NOTICE](NOTICE)。

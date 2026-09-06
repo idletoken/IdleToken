@@ -2,7 +2,7 @@
   "id": "qwen3.5-35b-a3b",
   "label": "Qwen3.5 35B-A3B",
   "family": "qwen3.5",
-  "backend": "ds4x",
+  "backend": "llamacpp",
   "arch": "qwen35moe",
   "available": true,
   "deployment": "cluster",

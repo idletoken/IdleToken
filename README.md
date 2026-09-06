@@ -13,7 +13,7 @@
 
 <p align="center">
   <a href="https://github.com/idletoken/IdleToken/releases">Download the desktop app</a>
-  · <a href="https://idletoken.ai">Open the marketplace</a>
+  · <a href="https://idletoken.ai">Project website</a>
   · <a href="README.zh-CN.md">中文</a>
 </p>
 
@@ -21,21 +21,37 @@
 
 Agent workloads arrive in bursts, while home GPUs spend much of their time unused. IdleToken lets those machines back each other up: share idle compute to earn Sparks, then spend Sparks on models shared by others when your own machines are busy.
 
+<p align="center">
+  <img src="docs/images/why-idle.svg" alt="An idle GPU sharing spare compute" width="360">
+  &nbsp;&nbsp;
+  <img src="docs/images/why-busy.svg" alt="A busy GPU receiving shared compute" width="360">
+</p>
+
+<p align="center"><sub>Share spare compute when idle · Draw on shared compute when busy</sub></p>
+
 ## Two ways to start
 
-### Deploy and share your own model
-
-1. Install the desktop app on Windows or Linux with an NVIDIA GPU, or on an Apple Silicon Mac.
-2. Choose a curated model, quantization, and context, then run it on one computer or a mixed-OS LAN cluster.
-3. Turn on sharing to earn Sparks. Turn on backup when you want IdleToken to draw on shared capacity.
-
-### Call a model shared by someone else
-
-1. Create an account at [idletoken.ai](https://idletoken.ai).
-2. Open **Sparks → API keys** and create a key.
-3. Connect any Anthropic- or OpenAI-compatible client. No GPU or desktop installation is required.
-
-New accounts start with zero Sparks. Earn them by sharing compute or use a redemption code; purchasing Sparks is not currently supported.
+<table>
+<tr>
+<td width="50%" valign="top">
+<h3>Deploy and share your own model</h3>
+<ol>
+<li>Install the desktop app on Windows or Linux with an NVIDIA GPU, or on an Apple Silicon Mac.</li>
+<li>Choose a curated model, quantization, and context, then run it on one computer or a mixed-OS LAN cluster.</li>
+<li>Turn on sharing to earn Sparks. Turn on backup when you want IdleToken to draw on shared capacity.</li>
+</ol>
+</td>
+<td width="50%" valign="top">
+<h3>Call a model shared by someone else</h3>
+<ol>
+<li>Create an account at <a href="https://idletoken.ai">idletoken.ai</a>.</li>
+<li>Open <strong>Sparks → API keys</strong> and create a key.</li>
+<li>Connect any Anthropic- or OpenAI-compatible client. No GPU or desktop installation is required.</li>
+</ol>
+<p>New accounts start with zero Sparks. Earn them by sharing compute.</p>
+</td>
+</tr>
+</table>
 
 ## Connect your tools
 
@@ -47,19 +63,12 @@ New accounts start with zero Sparks. Earn them by sharing compute or use a redem
 For Claude Code:
 
 ```sh
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8000
-export ANTHROPIC_API_KEY=idletoken
+export ANTHROPIC_BASE_URL=https://api.idletoken.ai
+export ANTHROPIC_API_KEY='sk-idletoken-********************************'
 claude
 ```
 
-Use the same base URL with the OpenAI-compatible API. `GET /v1/models` returns the model IDs available at that endpoint.
-
-## What you get
-
-- **One app, one machine or many.** Single-machine inference talks directly to llama.cpp; clusters split the model across Windows, Linux, and macOS computers on the same LAN.
-- **Two familiar APIs.** OpenAI and Anthropic compatibility includes Claude Code as a first-class use case.
-- **Local-first boundaries.** The local API listens only on `127.0.0.1`; cluster tensor traffic stays on the direct LAN and is protected with PSK-TLS.
-- **Explicit resource choices.** Pick 256K or, where supported, 1M context. IdleToken refuses insufficient configurations instead of silently shrinking the window or changing deployment mode.
+`GET /v1/models` returns the model IDs available at that endpoint.
 
 ## Models
 
@@ -77,65 +86,52 @@ Every listed model can run on one machine when it fits or across a cluster when 
 
 ## Build from source
 
-The repository contains the Tauri client and every native sidecar it needs: the coordinator, worker supervisor, platform agent, and the pinned llama.cpp server and RPC server. Build commands below run from the repository root.
+The public source tree has one purpose: build the complete IdleToken desktop client. Each platform build produces its native installer with the interface, required native processes, and the pinned llama.cpp engine bundled together.
+
+Build on the operating system you are targeting. Cross-compilation is not supported.
 
 ### Prerequisites
 
-Frontend-only development needs Node.js and pnpm. A full native build also needs Git, CMake, Rust 1.77 or newer, and the [Tauri v2 system prerequisites](https://tauri.app/start/prerequisites/) for the target operating system.
+All platforms need Git, CMake, Node.js 18 or newer, pnpm, Rust 1.77 or newer, and the [Tauri v2 system prerequisites](https://tauri.app/start/prerequisites/). Start from a clean checkout and run the commands from the repository root.
 
-- **Linux:** a C compiler and the CUDA toolkit listed in the hardware section.
-- **macOS:** Apple Silicon and Xcode Command Line Tools.
+- **Linux:** a C compiler and the CUDA Toolkit listed in the hardware section.
+- **macOS:** an Apple Silicon Mac and Xcode Command Line Tools.
 - **Windows:** Visual Studio 2022 Build Tools with **Desktop development with C++**, Windows SDK, CUDA Toolkit 12.8 with Visual Studio Integration, and WinLibs/MinGW tools providing `gcc` and `windres`. Set `IDLETOKEN_MINGW_BIN` if those tools are not on `PATH`.
 
-### Frontend-only development
+The llama.cpp transport patch fetches mbedTLS during configuration. Set `IDLETOKEN_MBEDTLS_SRC` to an existing mbedTLS 3.6.7 source tree when the build machine cannot fetch it from GitHub.
 
-This path does not start a native engine. The browser UI uses a clearly marked development fixture.
+### Clone
 
 ```sh
-cd client
-pnpm install
-pnpm dev
+git clone https://github.com/idletoken/IdleToken.git
+cd IdleToken
 ```
 
-Open `http://localhost:1420`.
+The engine scripts fetch the llama.cpp commit recorded in `scripts/llamacpp-patches/UPSTREAM`, apply the included patches, and compile the two engine sidecars used by the client.
 
-### Full desktop development on Linux or macOS
+### Linux
 
 ```sh
 ./scripts/build_llamacpp.sh
-make
-make -f Makefile.platform
-./scripts/stage_sidecars.sh
-cd client
-pnpm install
-pnpm tauri dev
-```
-
-Linux builds the CUDA backend; macOS builds the Metal backend. A missing GPU toolchain is a hard error—there is no CPU fallback.
-
-### Installable packages
-
-The packaging scripts verify that all sidecars are present and that the bundled engine matches the pinned llama.cpp revision. Linux and macOS release packaging requires a clean Git worktree so the artifact maps to an exact source commit.
-
-Linux (`.deb` and `.rpm`):
-
-```sh
-./scripts/build_llamacpp.sh
-make IDLETOKEN_PLATFORM_VERIFY_KEY_B64="$(tr -d '\r\n' < scripts/platform-verify-key.b64)"
+make all IDLETOKEN_PLATFORM_VERIFY_KEY_B64="$(tr -d '\r\n' < scripts/platform-verify-key.b64)"
 make -f Makefile.platform
 ./scripts/build_client_release.sh
 ```
 
-Artifacts are written below `client/src-tauri/target/release/bundle/`.
+The installers are written below `client/src-tauri/target/release/bundle/deb/` and `client/src-tauri/target/release/bundle/rpm/`.
 
-macOS (`.dmg`):
+### macOS
 
 ```sh
 ./scripts/build_llamacpp.sh
 ./scripts/package_client_mac.sh
 ```
 
-Windows (`.exe`, from an x64 Native Tools Command Prompt):
+The installer is written below `client/src-tauri/target/release/bundle/dmg/`.
+
+### Windows
+
+Run from an x64 Native Tools Command Prompt:
 
 ```bat
 scripts\build_llamacpp_win.bat
@@ -146,24 +142,16 @@ cd ..
 scripts\build_client_release.bat
 ```
 
-The Windows installer is written below `client\src-tauri\target\release\bundle\nsis\`. The release script rebuilds the coordinator, worker, and platform agent; stages the pinned llama.cpp sidecars and runtime DLLs; and runs the NSIS bundler.
+The installer is written below `client\src-tauri\target\release\bundle\nsis\`.
 
-### Checks without inference hardware
-
-```sh
-scripts/acceptance.sh --gate G_MODEL
-python3 scripts/model_manifest_check.py
-cd client && npx tsc --noEmit
-```
-
-The complete acceptance ladder is implemented by [`scripts/acceptance.sh`](scripts/acceptance.sh). Hardware gates use the machine definitions shown in [`scripts/testbed.env.example`](scripts/testbed.env.example).
+If CUDA is installed in a nonstandard location, set `IDLETOKEN_CUDA_RUNTIME_DIR` to the directory containing `cudart64_12.dll`, `cublas64_12.dll`, and `cublasLt64_12.dll`.
 
 ## Help
 
-For installation, pairing, or API problems, search the [existing issues](https://github.com/idletoken/IdleToken/issues) or open one with your OS, IdleToken version, hardware, and the relevant error or log excerpt.
+For installation, pairing, API, or source-build problems, search the [existing issues](https://github.com/idletoken/IdleToken/issues) or open one with your OS, IdleToken version, hardware, the command that failed, and the relevant error or log excerpt.
 
 ## Project links
 
-[Releases](https://github.com/idletoken/IdleToken/releases) · [Issues](https://github.com/idletoken/IdleToken/issues) · [Security](SECURITY.md) · [Contributing](CONTRIBUTING.md) · [Apache-2.0 license](LICENSE)
+[Project website](https://idletoken.ai) · [Releases](https://github.com/idletoken/IdleToken/releases) · [Issues](https://github.com/idletoken/IdleToken/issues) · [Apache-2.0 license](LICENSE)
 
 Built on [llama.cpp](https://github.com/ggml-org/llama.cpp) and [Tauri](https://github.com/tauri-apps/tauri). See [NOTICE](NOTICE) for third-party acknowledgements.

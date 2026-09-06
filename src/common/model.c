@@ -31,10 +31,34 @@
  * one command, so "we have not measured it" is no longer a reason to ship a
  * short menu, and estimating is not a shortcut anyone needs to take.
  *
- * A quant appears here only if the repo really publishes it AND ds4x can
- * dequantize it (src/ds4x/ds4x_quant.c: F32/F16/BF16/Q8_0/Q4_0/Q2_K/Q4_K/Q5_K/
- * Q6_K/IQ2_XXS) -- which is why the IQ4_XS and Q3_K files upstream ships are
- * absent, and why three repos have no BF16 row. */
+ * A quant appears here only if the repository really publishes it. Qwen3.5 is
+ * served by the pinned llama.cpp backend; the retired ds4x quant allow-list no
+ * longer limits the public precision menu. */
+static const idletoken_model_variant QWEN35_2B_VARIANTS[] = {
+    { .quant = "IQ2_XXS", .layer_weight_bytes = 768270592ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-2B-UD-IQ2_XXS.gguf" },
+    { .quant = "IQ2_M", .layer_weight_bytes = 859857152ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-2B-UD-IQ2_M.gguf" },
+    { .quant = "IQ3_XXS", .layer_weight_bytes = 931823872ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-2B-UD-IQ3_XXS.gguf" },
+    { .quant = "Q2_K_XL", .layer_weight_bytes = 966533376ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-2B-UD-Q2_K_XL.gguf" },
+    { .quant = "Q3_K_S", .layer_weight_bytes = 1030947072ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-2B-Q3_K_S.gguf" },
+    { .quant = "Q3_K_M", .layer_weight_bytes = 1107149056ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-2B-Q3_K_M.gguf" },
+    { .quant = "Q3_K_XL", .layer_weight_bytes = 1159274752ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-2B-UD-Q3_K_XL.gguf" },
+    { .quant = "IQ4_XS", .layer_weight_bytes = 1172996352ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-2B-IQ4_XS.gguf" },
+    { .quant = "IQ4_NL", .layer_weight_bytes = 1213300992ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-2B-IQ4_NL.gguf" },
+    { .quant = "Q4_0", .layer_weight_bytes = 1214873856ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-2B-Q4_0.gguf" },
+    { .quant = "Q4_K_S", .layer_weight_bytes = 1217757440ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-2B-Q4_K_S.gguf" },
+    { .quant = "Q4_K_M", .layer_weight_bytes = 1280835840ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-2B-Q4_K_M.gguf" },
+    { .quant = "Q4_1", .layer_weight_bytes = 1293517056ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-2B-Q4_1.gguf" },
+    { .quant = "Q4_K_XL", .layer_weight_bytes = 1339752704ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-2B-UD-Q4_K_XL.gguf" },
+    { .quant = "Q5_K_S", .layer_weight_bytes = 1384546560ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-2B-Q5_K_S.gguf" },
+    { .quant = "Q5_K_M", .layer_weight_bytes = 1435238656ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-2B-Q5_K_M.gguf" },
+    { .quant = "Q5_K_XL", .layer_weight_bytes = 1466687744ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-2B-UD-Q5_K_XL.gguf" },
+    { .quant = "Q6_K", .layer_weight_bytes = 1574961408ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-2B-Q6_K.gguf" },
+    { .quant = "Q6_K_XL", .layer_weight_bytes = 1864483072ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-2B-UD-Q6_K_XL.gguf" },
+    { .quant = "Q8_0", .layer_weight_bytes = 2012012800ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-2B-Q8_0.gguf" },
+    { .quant = "Q8_K_XL", .layer_weight_bytes = 2834940160ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-2B-UD-Q8_K_XL.gguf" },
+    { .quant = "BF16", .layer_weight_bytes = 3775709216ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-2B-BF16.gguf" },
+};
+
 static const idletoken_model_variant QWEN35_4B_VARIANTS[] = {
     { .quant = "IQ2_XXS", .layer_weight_bytes = 1520217248ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-4B-UD-IQ2_XXS.gguf" },
     { .quant = "IQ2_M", .layer_weight_bytes = 1759997088ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-4B-UD-IQ2_M.gguf" },
@@ -164,6 +188,55 @@ static const idletoken_model_variant QWEN35_35B_A3B_VARIANTS[] = {
     { .quant = "Q8_0", .layer_weight_bytes = 36903139968ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-35B-A3B-Q8_0.gguf" },
     { .quant = "Q8_K_XL", .layer_weight_bytes = 48688560768ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-35B-A3B-UD-Q8_K_XL.gguf" },
     { .quant = "BF16", .layer_weight_bytes = 69376637824ull, .shared_weight_bytes = 0ull, .gguf = "BF16/Qwen3.5-35B-A3B-BF16-00001-of-00002.gguf" },
+};
+
+static const idletoken_model_variant QWEN35_122B_A10B_VARIANTS[] = {
+    { .quant = "IQ2_XXS", .layer_weight_bytes = 36637668544ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-122B-A10B-UD-IQ2_XXS.gguf" },
+    { .quant = "IQ2_M", .layer_weight_bytes = 39148942528ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-122B-A10B-UD-IQ2_M.gguf" },
+    { .quant = "Q2_K_XL", .layer_weight_bytes = 41845347520ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-122B-A10B-UD-Q2_K_XL.gguf" },
+    { .quant = "IQ3_XXS", .layer_weight_bytes = 44745020608ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-122B-A10B-UD-IQ3_XXS.gguf" },
+    { .quant = "IQ3_S", .layer_weight_bytes = 46556959936ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-122B-A10B-UD-IQ3_S.gguf" },
+    { .quant = "Q3_K_S", .layer_weight_bytes = 52495013376ull, .shared_weight_bytes = 0ull, .gguf = "Q3_K_S/Qwen3.5-122B-A10B-Q3_K_S-00001-of-00003.gguf" },
+    { .quant = "Q3_K_M", .layer_weight_bytes = 56420881952ull, .shared_weight_bytes = 0ull, .gguf = "Q3_K_M/Qwen3.5-122B-A10B-Q3_K_M-00001-of-00003.gguf" },
+    { .quant = "Q3_K_XL", .layer_weight_bytes = 56970536480ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q3_K_XL/Qwen3.5-122B-A10B-UD-Q3_K_XL-00001-of-00003.gguf" },
+    { .quant = "IQ4_XS", .layer_weight_bytes = 60229510656ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ4_XS/Qwen3.5-122B-A10B-UD-IQ4_XS-00001-of-00003.gguf" },
+    { .quant = "IQ4_NL", .layer_weight_bytes = 61437470208ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ4_NL/Qwen3.5-122B-A10B-UD-IQ4_NL-00001-of-00003.gguf" },
+    { .quant = "Q4_K_S", .layer_weight_bytes = 71705126400ull, .shared_weight_bytes = 0ull, .gguf = "Q4_K_S/Qwen3.5-122B-A10B-Q4_K_S-00001-of-00003.gguf" },
+    { .quant = "MXFP4_MOE", .layer_weight_bytes = 74664408608ull, .shared_weight_bytes = 0ull, .gguf = "MXFP4_MOE/Qwen3.5-122B-A10B-MXFP4_MOE-00001-of-00003.gguf" },
+    { .quant = "Q4_K_M", .layer_weight_bytes = 76536964608ull, .shared_weight_bytes = 0ull, .gguf = "Q4_K_M/Qwen3.5-122B-A10B-Q4_K_M-00001-of-00003.gguf" },
+    { .quant = "Q4_K_XL", .layer_weight_bytes = 77029996032ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q4_K_XL/Qwen3.5-122B-A10B-UD-Q4_K_XL-00001-of-00003.gguf" },
+    { .quant = "Q5_K_S", .layer_weight_bytes = 86385391136ull, .shared_weight_bytes = 0ull, .gguf = "Q5_K_S/Qwen3.5-122B-A10B-Q5_K_S-00001-of-00003.gguf" },
+    { .quant = "Q5_K_M", .layer_weight_bytes = 91519219200ull, .shared_weight_bytes = 0ull, .gguf = "Q5_K_M/Qwen3.5-122B-A10B-Q5_K_M-00001-of-00003.gguf" },
+    { .quant = "Q5_K_XL", .layer_weight_bytes = 91928163840ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q5_K_XL/Qwen3.5-122B-A10B-UD-Q5_K_XL-00001-of-00003.gguf" },
+    { .quant = "Q6_K", .layer_weight_bytes = 101009782432ull, .shared_weight_bytes = 0ull, .gguf = "Q6_K/Qwen3.5-122B-A10B-Q6_K-00001-of-00004.gguf" },
+    { .quant = "Q6_K_XL", .layer_weight_bytes = 112401249920ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q6_K_XL/Qwen3.5-122B-A10B-UD-Q6_K_XL-00001-of-00004.gguf" },
+    { .quant = "Q8_0", .layer_weight_bytes = 129871935104ull, .shared_weight_bytes = 0ull, .gguf = "Q8_0/Qwen3.5-122B-A10B-Q8_0-00001-of-00004.gguf" },
+    { .quant = "Q8_K_XL", .layer_weight_bytes = 170838161152ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q8_K_XL/Qwen3.5-122B-A10B-UD-Q8_K_XL-00001-of-00005.gguf" },
+    { .quant = "BF16", .layer_weight_bytes = 244314011488ull, .shared_weight_bytes = 0ull, .gguf = "BF16/Qwen3.5-122B-A10B-BF16-00001-of-00005.gguf" },
+};
+
+static const idletoken_model_variant QWEN35_397B_A17B_VARIANTS[] = {
+    { .quant = "IQ2_XXS", .layer_weight_bytes = 114872940736ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ2_XXS/Qwen3.5-397B-A17B-UD-IQ2_XXS-00001-of-00004.gguf" },
+    { .quant = "IQ2_M", .layer_weight_bytes = 123053144288ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ2_M/Qwen3.5-397B-A17B-UD-IQ2_M-00001-of-00004.gguf" },
+    { .quant = "IQ3_XXS", .layer_weight_bytes = 140333676736ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ3_XXS/Qwen3.5-397B-A17B-UD-IQ3_XXS-00001-of-00004.gguf" },
+    { .quant = "IQ3_S", .layer_weight_bytes = 146373474496ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ3_S/Qwen3.5-397B-A17B-UD-IQ3_S-00001-of-00004.gguf" },
+    { .quant = "Q3_K_S", .layer_weight_bytes = 164323293504ull, .shared_weight_bytes = 0ull, .gguf = "Q3_K_S/Qwen3.5-397B-A17B-Q3_K_S-00001-of-00005.gguf" },
+    { .quant = "Q3_K_M", .layer_weight_bytes = 177409522016ull, .shared_weight_bytes = 0ull, .gguf = "Q3_K_M/Qwen3.5-397B-A17B-Q3_K_M-00001-of-00005.gguf" },
+    { .quant = "Q3_K_XL", .layer_weight_bytes = 178739034432ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q3_K_XL/Qwen3.5-397B-A17B-UD-Q3_K_XL-00001-of-00005.gguf" },
+    { .quant = "IQ4_XS", .layer_weight_bytes = 189735450944ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ4_XS/Qwen3.5-397B-A17B-UD-IQ4_XS-00001-of-00005.gguf" },
+    { .quant = "IQ4_NL", .layer_weight_bytes = 193761982784ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ4_NL/Qwen3.5-397B-A17B-UD-IQ4_NL-00001-of-00005.gguf" },
+    { .quant = "Q4_K_S", .layer_weight_bytes = 227987503520ull, .shared_weight_bytes = 0ull, .gguf = "Q4_K_S/Qwen3.5-397B-A17B-Q4_K_S-00001-of-00006.gguf" },
+    { .quant = "MXFP4_MOE", .layer_weight_bytes = 237353302496ull, .shared_weight_bytes = 0ull, .gguf = "MXFP4_MOE/Qwen3.5-397B-A17B-MXFP4_MOE-00001-of-00006.gguf" },
+    { .quant = "Q4_K_M", .layer_weight_bytes = 244093630912ull, .shared_weight_bytes = 0ull, .gguf = "Q4_K_M/Qwen3.5-397B-A17B-Q4_K_M-00001-of-00006.gguf" },
+    { .quant = "Q4_K_XL", .layer_weight_bytes = 245272148448ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q4_K_XL/Qwen3.5-397B-A17B-UD-Q4_K_XL-00001-of-00006.gguf" },
+    { .quant = "Q5_K_S", .layer_weight_bytes = 276552219168ull, .shared_weight_bytes = 0ull, .gguf = "Q5_K_S/Qwen3.5-397B-A17B-Q5_K_S-00001-of-00007.gguf" },
+    { .quant = "Q5_K_M", .layer_weight_bytes = 293664979584ull, .shared_weight_bytes = 0ull, .gguf = "Q5_K_M/Qwen3.5-397B-A17B-Q5_K_M-00001-of-00008.gguf" },
+    { .quant = "Q5_K_XL", .layer_weight_bytes = 294865599104ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q5_K_XL/Qwen3.5-397B-A17B-UD-Q5_K_XL-00001-of-00008.gguf" },
+    { .quant = "Q6_K", .layer_weight_bytes = 326595345056ull, .shared_weight_bytes = 0ull, .gguf = "Q6_K/Qwen3.5-397B-A17B-Q6_K-00001-of-00008.gguf" },
+    { .quant = "Q6_K_XL", .layer_weight_bytes = 362328980288ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q6_K_XL/Qwen3.5-397B-A17B-UD-Q6_K_XL-00001-of-00009.gguf" },
+    { .quant = "Q8_0", .layer_weight_bytes = 421507365824ull, .shared_weight_bytes = 0ull, .gguf = "Q8_0/Qwen3.5-397B-A17B-Q8_0-00001-of-00010.gguf" },
+    { .quant = "Q8_K_XL", .layer_weight_bytes = 427726568384ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q8_K_XL/Qwen3.5-397B-A17B-UD-Q8_K_XL-00001-of-00010.gguf" },
+    { .quant = "BF16", .layer_weight_bytes = 792961318816ull, .shared_weight_bytes = 0ull, .gguf = "BF16/Qwen3.5-397B-A17B-BF16-00001-of-00017.gguf" },
 };
 
 static const idletoken_model_variant QWEN35_08B_VARIANTS[] = {
@@ -310,6 +383,21 @@ static const idletoken_model_variant DSV4_PRO_VARIANTS[] = {
     { .quant = "Q4_K_M",  .layer_weight_bytes = 950879580768ull, .shared_weight_bytes = 0ull, .gguf = "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00001-of-00076.gguf" },  /* 76 parts, 886 GiB, DevQuasar */
 };
 
+/* OpenAI's native MXFP4 releases. Tensor bytes were summed from the official
+ * ggml-org GGUF directories; graph workspaces were measured with the pinned
+ * llama-fit-params on CUDA and Metal at the model's 128K ceiling. */
+static const idletoken_model_variant GPT_OSS_20B_VARIANTS[] = {
+    { .quant = "MXFP4", .layer_weight_bytes = 10865888256ull,
+      .shared_weight_bytes = 1230670080ull,
+      .gguf = "gpt-oss-20b-MXFP4.gguf" },
+};
+
+static const idletoken_model_variant GPT_OSS_120B_VARIANTS[] = {
+    { .quant = "MXFP4", .layer_weight_bytes = 62143653888ull,
+      .shared_weight_bytes = 1230670080ull,
+      .gguf = "gpt-oss-120b-MXFP4.gguf" },
+};
+
 static const idletoken_model_spec MODELS[] = {
 
     {
@@ -396,13 +484,13 @@ static const idletoken_model_spec MODELS[] = {
         .default_variant = 0,
     },
     {
-        /* First small dense model (small-model-design.md). GQA, not MLA —
-         * runs the ds4x GQA path (Phase S-B). Scalars mirror the default
+        /* First small dense model (small-model-design.md). GQA, not MLA.
+         * The pinned llama.cpp backend serves it. Scalars mirror the default
          * variant (Q4_K_M) so quant-unaware callers see the default size.
          * KV: 2·n_head_kv(8)·head_dim(128)·2 (fp16) = 4096 B/token/layer. */
         .id      = "qwen3.5-0.8b",
         .label   = "Qwen3.5 0.8B",
-        .backend = IDLETOKEN_BACKEND_DS4X,
+        .backend = IDLETOKEN_BACKEND_LLAMACPP,
         .available = 1,            /* validated 2026-07-28 on the real
                                     * Qwen3.5-0.8B Q4_K_M GGUF (DGX): output
                                     * matches llama.cpp token-for-token on
@@ -443,7 +531,42 @@ static const idletoken_model_spec MODELS[] = {
         .default_gguf = "Qwen3.5-0.8B-UD-IQ2_XXS.gguf",
         .variants = QWEN35_08B_VARIANTS,
         .n_variants = sizeof(QWEN35_08B_VARIANTS) / sizeof(QWEN35_08B_VARIANTS[0]),
-        .default_variant = 0,      /* Q4_K_M */
+        .default_variant = 0,      /* IQ2_XXS */
+    },
+    {
+        /* Official Qwen3.5 dense 2B. Geometry comes from the official config
+         * and the published IQ2_XXS GGUF header; sub-2-bit files are excluded
+         * from the curated precision menu. */
+        .id      = "qwen3.5-2b",
+        .label   = "Qwen3.5 2B",
+        .backend = IDLETOKEN_BACKEND_LLAMACPP,
+        .available = 1,            /* metadata-onboarded 2026-09-05; qwen35 is
+                                    * already supported by the pinned engine */
+        .deployment = IDLETOKEN_DEPLOY_CLUSTER,
+        .n_layers = 24,
+        .n_embd   = 2048,
+        .hc_streams = 1,
+        .n_vocab  = 248320,
+        .layer_weight_bytes  = 768270592ull,
+        .shared_weight_bytes = 0ull,
+        .ctx_max  = 262144,
+        .ctx_yarn_max = 1048576,
+        .split_boundary_multiple = 0,
+        .kv_kind  = IDLETOKEN_KV_HYBRID,
+        .kv_bytes_per_token_layer = 2048,
+        .state_bytes_per_layer = 1122304,
+        .full_attn_interval = 4,
+        .overhead_base_bytes = 1ull * GiB,
+        .compute_bytes_128k_cuda = { 516947968ull, 516947968ull, 516947968ull },
+        .compute_bytes_256k_cuda = { 516947968ull, 834960097ull, 834960097ull },
+        .compute_bytes_1m_cuda = { 1120046940ull, 3250879201ull, 3250879201ull },
+        .compute_bytes_128k_metal = { 516947968ull, 516947968ull, 516947968ull },
+        .compute_bytes_256k_metal = { 516947968ull, 516947968ull, 516947968ull },
+        .compute_bytes_1m_metal = { 1124167844ull, 1124440474ull, 1124440474ull },
+        .default_gguf = "Qwen3.5-2B-UD-IQ2_XXS.gguf",
+        .variants = QWEN35_2B_VARIANTS,
+        .n_variants = sizeof(QWEN35_2B_VARIANTS) / sizeof(QWEN35_2B_VARIANTS[0]),
+        .default_variant = 0,
     },
     {
         /* Same qwen35 hybrid architecture as the 0.8B, but the linear path
@@ -452,7 +575,7 @@ static const idletoken_model_spec MODELS[] = {
          * branch — which is exactly why this entry is worth having. */
         .id      = "qwen3.5-4b",
         .label   = "Qwen3.5 4B",
-        .backend = IDLETOKEN_BACKEND_DS4X,
+        .backend = IDLETOKEN_BACKEND_LLAMACPP,
         .available = 1,            /* validated 2026-07-28 on the real
                                     * Qwen3.5-4B Q4_K_M GGUF (DGX): CPU and
                                     * CUDA agree token-for-token, and the
@@ -485,7 +608,7 @@ static const idletoken_model_spec MODELS[] = {
         .default_gguf = "Qwen3.5-4B-UD-IQ2_XXS.gguf",
         .variants = QWEN35_4B_VARIANTS,
         .n_variants = sizeof(QWEN35_4B_VARIANTS) / sizeof(QWEN35_4B_VARIANTS[0]),
-        .default_variant = 0,      /* Q4_K_M */
+        .default_variant = 0,      /* IQ2_XXS */
     },
     {
         /* Same shape as the 4B in every field that the forward branches on
@@ -494,7 +617,7 @@ static const idletoken_model_spec MODELS[] = {
          * needed no code at all once the 4B's k-head sharing was fixed. */
         .id      = "qwen3.5-9b",
         .label   = "Qwen3.5 9B",
-        .backend = IDLETOKEN_BACKEND_DS4X,
+        .backend = IDLETOKEN_BACKEND_LLAMACPP,
         .available = 1,            /* validated 2026-07-28 on the real
                                     * Qwen3.5-9B Q4_K_M GGUF (DGX): greedy
                                     * output matches llama.cpp word for word */
@@ -531,7 +654,7 @@ static const idletoken_model_spec MODELS[] = {
          * rather than a rule that happened to fit one model. */
         .id      = "qwen3.5-27b",
         .label   = "Qwen3.5 27B",
-        .backend = IDLETOKEN_BACKEND_DS4X,
+        .backend = IDLETOKEN_BACKEND_LLAMACPP,
         .available = 1,            /* validated 2026-07-28 on the real
                                     * Qwen3.5-27B Q4_K_M GGUF (DGX): the
                                     * counting prompt matches llama.cpp word
@@ -613,14 +736,11 @@ static const idletoken_model_spec MODELS[] = {
         .default_variant = 0,
     },
     {
-        /* qwen35moe: hybrid linear attention AND a 256-expert MoE. This is the
-         * FIRST MoE model the ds4x path has ever run on real weights — DSv4
-         * (80 GB) and GLM-5.2 (240 GB) do not fit anything we have. It also
-         * carries the one piece of new math: the shared expert is scaled by a
-         * scalar sigmoid gate. */
+        /* qwen35moe: hybrid linear attention and a 256-expert MoE. The shared
+         * expert is scaled by a scalar sigmoid gate. */
         .id      = "qwen3.5-35b-a3b",
         .label   = "Qwen3.5 35B-A3B",
-        .backend = IDLETOKEN_BACKEND_DS4X,
+        .backend = IDLETOKEN_BACKEND_LLAMACPP,
         .available = 1,            /* validated 2026-07-28 on the real
                                     * Qwen3.5-35B-A3B Q4_K_M GGUF (DGX): the
                                     * counting prompt matches llama.cpp word
@@ -651,6 +771,79 @@ static const idletoken_model_spec MODELS[] = {
         .default_gguf = "Qwen3.5-35B-A3B-UD-IQ2_XXS.gguf",
         .variants = QWEN35_35B_A3B_VARIANTS,
         .n_variants = sizeof(QWEN35_35B_A3B_VARIANTS) / sizeof(QWEN35_35B_A3B_VARIANTS[0]),
+        .default_variant = 0,
+    },
+    {
+        /* Official Qwen3.5 122B-A10B MoE. Geometry comes from the official
+         * config and published IQ2_XXS GGUF header. */
+        .id      = "qwen3.5-122b-a10b",
+        .label   = "Qwen3.5 122B-A10B",
+        .backend = IDLETOKEN_BACKEND_LLAMACPP,
+        .available = 1,            /* metadata-onboarded 2026-09-05; qwen35moe
+                                    * is already supported by the pinned engine */
+        .deployment = IDLETOKEN_DEPLOY_CLUSTER,
+        .n_layers = 48,
+        .n_embd   = 3072,
+        .hc_streams = 1,
+        .n_vocab  = 248320,
+        .n_expert = 256,
+        .n_expert_used = 8,
+        .layer_weight_bytes  = 36637668544ull,
+        .shared_weight_bytes = 0ull,
+        .ctx_max  = 262144,
+        .ctx_yarn_max = 1048576,
+        .split_boundary_multiple = 0,
+        .kv_kind  = IDLETOKEN_KV_HYBRID,
+        .kv_bytes_per_token_layer = 2048,
+        .state_bytes_per_layer = 4341760,
+        .full_attn_interval = 4,
+        .overhead_base_bytes = 3ull * GiB,
+        .compute_bytes_128k_cuda = { 629145600ull, 644874240ull, 644874240ull },
+        .compute_bytes_256k_cuda = { 521142272ull, 908360417ull, 908360417ull },
+        .compute_bytes_1m_cuda = { 1193300460ull, 3324279521ull, 3324279521ull },
+        .compute_bytes_128k_metal = { 521142272ull, 521142272ull, 521142272ull },
+        .compute_bytes_256k_metal = { 521142272ull, 521142272ull, 521142272ull },
+        .compute_bytes_1m_metal = { 1194370007ull, 1207676436ull, 1207613522ull },
+        .default_gguf = "Qwen3.5-122B-A10B-UD-IQ2_XXS.gguf",
+        .variants = QWEN35_122B_A10B_VARIANTS,
+        .n_variants = sizeof(QWEN35_122B_A10B_VARIANTS) / sizeof(QWEN35_122B_A10B_VARIANTS[0]),
+        .default_variant = 0,
+    },
+    {
+        /* Official Qwen3.5 397B-A17B MoE. The default is a four-part GGUF;
+         * all part hashes and the immutable repository revision live in the
+         * client manifest. */
+        .id      = "qwen3.5-397b-a17b",
+        .label   = "Qwen3.5 397B-A17B",
+        .backend = IDLETOKEN_BACKEND_LLAMACPP,
+        .available = 1,            /* metadata-onboarded 2026-09-05; qwen35moe
+                                    * is already supported by the pinned engine */
+        .deployment = IDLETOKEN_DEPLOY_CLUSTER,
+        .n_layers = 60,
+        .n_embd   = 4096,
+        .hc_streams = 1,
+        .n_vocab  = 248320,
+        .n_expert = 512,
+        .n_expert_used = 10,
+        .layer_weight_bytes  = 114872940736ull,
+        .shared_weight_bytes = 0ull,
+        .ctx_max  = 262144,
+        .ctx_yarn_max = 1048576,
+        .split_boundary_multiple = 0,
+        .kv_kind  = IDLETOKEN_KV_HYBRID,
+        .kv_bytes_per_token_layer = 2048,
+        .state_bytes_per_layer = 4341760,
+        .full_attn_interval = 4,
+        .overhead_base_bytes = 3ull * GiB,
+        .compute_bytes_128k_cuda = { 525336576ull, 525336576ull, 525336576ull },
+        .compute_bytes_256k_cuda = { 525336576ull, 914651873ull, 914651873ull },
+        .compute_bytes_1m_cuda = { 1245729260ull, 3330570977ull, 3330570977ull },
+        .compute_bytes_128k_metal = { 659575276ull, 659847905ull, 659847905ull },
+        .compute_bytes_256k_metal = { 793793004ull, 794065633ull, 794065633ull },
+        .compute_bytes_1m_metal = { 1247847383ull, 1248130499ull, 1248130499ull },
+        .default_gguf = "UD-IQ2_XXS/Qwen3.5-397B-A17B-UD-IQ2_XXS-00001-of-00004.gguf",
+        .variants = QWEN35_397B_A17B_VARIANTS,
+        .n_variants = sizeof(QWEN35_397B_A17B_VARIANTS) / sizeof(QWEN35_397B_A17B_VARIANTS[0]),
         .default_variant = 0,
     },
     {
@@ -752,6 +945,72 @@ static const idletoken_model_spec MODELS[] = {
         .default_gguf = "moonshotai_Kimi-K2.5-IQ1_S/moonshotai_Kimi-K2.5-IQ1_S-00001-of-00006.gguf",
         .variants = KIMI_K25_VARIANTS,
         .n_variants = sizeof(KIMI_K25_VARIANTS) / sizeof(KIMI_K25_VARIANTS[0]),
+        .default_variant = 0,
+    },
+    {
+        .id      = "gpt-oss-20b",
+        .label   = "GPT-OSS 20B",
+        .backend = IDLETOKEN_BACKEND_LLAMACPP,
+        .available = 1,
+        .deployment = IDLETOKEN_DEPLOY_CLUSTER,
+        .n_layers = 24,
+        .n_embd   = 2880,
+        .hc_streams = 1,
+        .n_vocab  = 201088,
+        .n_expert = 32,
+        .n_expert_used = 4,
+        .layer_weight_bytes  = 10865888256ull,
+        .shared_weight_bytes = 1230670080ull,
+        .ctx_max  = 131072,
+        .split_boundary_multiple = 0,
+        /* Even blocks use a 128-token sliding window; odd blocks use full
+         * attention. The bounded half is represented by its fixed KV bytes. */
+        .kv_kind  = IDLETOKEN_KV_HYBRID,
+        .kv_bytes_per_token_layer = 2048,
+        .state_bytes_per_layer = 262144,
+        .full_attn_interval = 2,
+        .overhead_base_bytes = (uint64_t)(1.5 * (double)GiB),
+        .compute_bytes_128k_cuda = { 423624704ull, 432097198ull, 432097198ull },
+        .compute_bytes_256k_cuda = { 0ull, 0ull, 0ull },
+        .compute_bytes_1m_cuda = { 0ull, 0ull, 0ull },
+        .compute_bytes_128k_metal = { 423624704ull, 423624704ull, 423624704ull },
+        .compute_bytes_256k_metal = { 0ull, 0ull, 0ull },
+        .compute_bytes_1m_metal = { 0ull, 0ull, 0ull },
+        .default_gguf = "gpt-oss-20b-MXFP4.gguf",
+        .variants = GPT_OSS_20B_VARIANTS,
+        .n_variants = sizeof(GPT_OSS_20B_VARIANTS) / sizeof(GPT_OSS_20B_VARIANTS[0]),
+        .default_variant = 0,
+    },
+    {
+        .id      = "gpt-oss-120b",
+        .label   = "GPT-OSS 120B",
+        .backend = IDLETOKEN_BACKEND_LLAMACPP,
+        .available = 1,
+        .deployment = IDLETOKEN_DEPLOY_CLUSTER,
+        .n_layers = 36,
+        .n_embd   = 2880,
+        .hc_streams = 1,
+        .n_vocab  = 201088,
+        .n_expert = 128,
+        .n_expert_used = 4,
+        .layer_weight_bytes  = 62143653888ull,
+        .shared_weight_bytes = 1230670080ull,
+        .ctx_max  = 131072,
+        .split_boundary_multiple = 0,
+        .kv_kind  = IDLETOKEN_KV_HYBRID,
+        .kv_bytes_per_token_layer = 2048,
+        .state_bytes_per_layer = 262144,
+        .full_attn_interval = 2,
+        .overhead_base_bytes = (uint64_t)(1.5 * (double)GiB),
+        .compute_bytes_128k_cuda = { 423624704ull, 432097198ull, 432097198ull },
+        .compute_bytes_256k_cuda = { 0ull, 0ull, 0ull },
+        .compute_bytes_1m_cuda = { 0ull, 0ull, 0ull },
+        .compute_bytes_128k_metal = { 423624704ull, 423624704ull, 423624704ull },
+        .compute_bytes_256k_metal = { 0ull, 0ull, 0ull },
+        .compute_bytes_1m_metal = { 0ull, 0ull, 0ull },
+        .default_gguf = "gpt-oss-120b-MXFP4.gguf",
+        .variants = GPT_OSS_120B_VARIANTS,
+        .n_variants = sizeof(GPT_OSS_120B_VARIANTS) / sizeof(GPT_OSS_120B_VARIANTS[0]),
         .default_variant = 0,
     },
 };

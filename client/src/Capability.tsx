@@ -12,7 +12,7 @@ import { useEffect, useState } from "react";
 import { useI18n } from "./i18n";
 import { fmtBytes } from "./format";
 
-export type CapabilityMode = "gpu_only" | "no" | "unavailable";
+export type CapabilityMode = "gpu_only" | "hybrid" | "no" | "unavailable";
 
 export interface CapabilityRow {
   id: string;
@@ -101,7 +101,7 @@ export default function Capability(props: { apiBaseUrl?: string | null }) {
   // order a user scans when deciding what to try.
   const rows = [...rep.models].sort((a, b) => {
     const rank = (r: CapabilityRow) =>
-      r.mode === "gpu_only" ? 0 : r.mode === "no" ? 1 : 2;
+      r.mode === "gpu_only" ? 0 : r.mode === "hybrid" ? 1 : r.mode === "no" ? 2 : 3;
     return rank(a) - rank(b) || a.shortfall_bytes - b.shortfall_bytes;
   });
 

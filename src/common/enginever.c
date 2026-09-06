@@ -85,3 +85,35 @@ int idletoken_engine_version(const char *llama_server_bin,
     return found;
 #endif
 }
+
+int idletoken_engine_has_node_local_moe(const char *engine_bin) {
+    if (!engine_bin || !engine_bin[0]) return -1;
+    FILE *f = fopen(engine_bin, "rb");
+    if (!f) return -1;
+    /* The marker is a log format string compiled into both llama-server and
+     * ggml-rpc-server by patch 0005; it is absent from every earlier series.
+     * Overlap the chunks by the needle length so a match straddling a chunk
+     * boundary is not missed. */
+    static const char needle[] = "selected-expert ranges";
+    const size_t nlen = sizeof(needle) - 1;
+    enum { CHUNK = 1 << 20 };
+    unsigned char *buf = (unsigned char *)malloc(CHUNK + nlen);
+    if (!buf) { fclose(f); return -1; }
+    size_t carry = 0;
+    int found = 0;
+    for (;;) {
+        size_t got = fread(buf + carry, 1, CHUNK, f);
+        if (got == 0) break;
+        size_t have = carry + got;
+        for (size_t i = 0; i + nlen <= have; i++) {
+            if (buf[i] == (unsigned char)needle[0] &&
+                memcmp(buf + i, needle, nlen) == 0) { found = 1; break; }
+        }
+        if (found) break;
+        carry = have >= nlen ? nlen - 1 : have;
+        memmove(buf, buf + have - carry, carry);
+    }
+    free(buf);
+    fclose(f);
+    return found;
+}

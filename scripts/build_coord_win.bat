@@ -2,7 +2,7 @@
 REM Native Windows build of the COORDINATOR (idletoken-coord.exe).
 REM
 REM Why this exists: the product promise is "any machine can be the
-REM coordinator" (acceptance §1 — the user picks the role in the client). Until
+REM coordinator" (the user picks the role in the client). Until
 REM now only the worker had a Windows build, so an all-Windows household had no
 REM machine that could run the cluster — the client shipped a copy of the worker
 REM under the coord's name, which fails at spawn time.

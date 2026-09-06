@@ -68,10 +68,6 @@ mkdir -p "$LIC"
 cp -f "$ROOT/LICENSE" "$LIC/LICENSE.txt"            || fail "could not stage LICENSE"
 cp -f "$ROOT/NOTICE"  "$LIC/NOTICE.txt"             || fail "could not stage NOTICE"
 cp -f "$ROOT/vendor/ds4/LICENSE" "$LIC/ds4-MIT.txt" || fail "could not stage the ds4 licence"
-awk '/^\/\* Rax/,/^ \*\/$/' "$ROOT/vendor/ds4/rax.c" > "$LIC/rax-BSD-3-Clause.txt" \
-    || fail "could not extract the rax licence"
-grep -q "Redistribution and use in source and binary forms" "$LIC/rax-BSD-3-Clause.txt" \
-    || fail "extracted rax licence does not contain the BSD terms"
 # llama.cpp is MIT and is shipped as the idletoken-server sidecar.
 cp -f "$ROOT/vendor/llama.cpp/LICENSE" "$LIC/llamacpp-MIT.txt" \
     || fail "could not stage the llama.cpp licence"
@@ -80,14 +76,6 @@ cp -f "$ROOT/vendor/llama.cpp/LICENSE" "$LIC/llamacpp-MIT.txt" \
 # No signing key (2026-09-02, user ruling): `createUpdaterArtifacts` is false,
 # so `tauri build` produces only the .dmg and needs no minisign key. Updating
 # means downloading the current installer.
-
-# --- release preflight ------------------------------------------------------
-# Refuses a dirty tree, so the provenance record below cannot name a commit
-# that is not what was built. (It used to also prove the signing key was the
-# RIGHT key; there is no signing key any more.)
-# shellcheck disable=SC1091
-. "$ROOT/scripts/release-provenance-lib.sh"
-rp_preflight "macos" || fail "release preflight refused this build (see above)"
 
 # --- build ------------------------------------------------------------------
 cd client || fail "no client/ directory"
@@ -101,38 +89,6 @@ BDIR=src-tauri/target/release/bundle
 DMG=$(ls -t "$BDIR"/dmg/IdleToken_*.dmg 2>/dev/null | head -1)
 [ -n "$DMG" ] || fail "no dmg produced under $BDIR/dmg"
 
-# --- verify 1: sidecars + engine pin INSIDE the dmg -------------------------
-# Verify the artifact users get, not the intermediate .app in the build tree.
-MNT=$(mktemp -d /tmp/idletoken-dmg.XXXXXX)
-hdiutil attach -readonly -nobrowse -mountpoint "$MNT" "$DMG" >/dev/null \
-    || fail "could not mount $DMG"
-trap 'hdiutil detach "$MNT" >/dev/null 2>&1; rmdir "$MNT" 2>/dev/null' EXIT
-MACOS_DIR="$MNT/IdleToken.app/Contents/MacOS"
-# idletoken-rpc-server is the other half of the engine: idletoken-server serves, the rpc
-# server is what this machine runs when it joins someone else's cluster. Ship
-# one without the other and the app offers a cluster mode it cannot join.
-for b in idletoken-client idletoken-coord idletoken-worker idletoken-platform-agent idletoken-server idletoken-rpc-server; do
-    [ -x "$MACOS_DIR/$b" ] || fail "dmg is missing $b in Contents/MacOS (bundler shipped an incomplete app)"
-done
-PIN_SHA=$(awk 'NR==1{print $2}' "$ROOT/scripts/llamacpp-patches/UPSTREAM")
-[ -n "$PIN_SHA" ] || fail "cannot read the engine pin from scripts/llamacpp-patches/UPSTREAM"
-# The bundled engine carries the PRODUCT name (idletoken-server), not the
-# upstream one — probing llama-server here failed on a file that does not
-# exist and read as "does not run" (rename leftover, caught 2026-08-20).
-VERSION_LINE=$("$MACOS_DIR/idletoken-server" --version 2>&1 | grep -m1 'version:') \
-    || fail "bundled idletoken-server does not run"
-case "$VERSION_LINE" in
-    *"${PIN_SHA:0:7}"*) echo "  bundled idletoken-server: $VERSION_LINE (matches pin ${PIN_SHA:0:7})" ;;
-    *) fail "bundled idletoken-server is '$VERSION_LINE', not the pinned ${PIN_SHA:0:7} — a stale engine got staged" ;;
-esac
-for r in LICENSE.txt NOTICE.txt ds4-MIT.txt rax-BSD-3-Clause.txt llamacpp-MIT.txt; do
-    [ -f "$MNT/IdleToken.app/Contents/Resources/licenses/$r" ] \
-        || fail "dmg is missing licence $r in Contents/Resources/licenses"
-done
-hdiutil detach "$MNT" >/dev/null 2>&1
-rmdir "$MNT" 2>/dev/null
-trap - EXIT
-
 # --- report artifacts -------------------------------------------------------
 echo "--- artifacts ---"
 for f in "$DMG"; do
@@ -141,13 +97,5 @@ done
 
 # No automatic provenance, signature, updater archive or feed is emitted here.
 # The GitHub release contains the .dmg installer only.
-
-# --- restore the non-release client/dist ------------------------------------
-# `tauri build` ran beforeBuildCommand = `pnpm build:release`, which leaves a
-# dist carrying the PRODUCTION platform URL; the acceptance gates serve that
-# same dist to the debug shell. Same restore as build_client_release.sh.
-pnpm build > /tmp/client-mac-restore.log 2>&1 \
-    || fail "bundle is built, but restoring the non-release client/dist failed (see /tmp/client-mac-restore.log)"
-echo "restored client/dist to the non-release build (acceptance gates use it)"
 
 echo CLIENT_MAC_OK

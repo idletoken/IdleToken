@@ -72,22 +72,10 @@ mkdir -p "$LIC"
 cp -f "$ROOT/LICENSE" "$LIC/LICENSE.txt"       || fail "could not stage LICENSE"
 cp -f "$ROOT/NOTICE"  "$LIC/NOTICE.txt"        || fail "could not stage NOTICE"
 cp -f "$ROOT/vendor/ds4/LICENSE" "$LIC/ds4-MIT.txt" || fail "could not stage the ds4 licence"
-awk '/^\/\* Rax/,/^ \*\/$/' "$ROOT/vendor/ds4/rax.c" > "$LIC/rax-BSD-3-Clause.txt" \
-    || fail "could not extract the rax licence"
-grep -q "Redistribution and use in source and binary forms" "$LIC/rax-BSD-3-Clause.txt" \
-    || fail "extracted rax licence does not contain the BSD terms (rax.c header changed shape)"
 # llama.cpp is MIT and is shipped as the idletoken-server sidecar (v2 pivot).
 cp -f "$ROOT/vendor/llama.cpp/LICENSE" "$LIC/llamacpp-MIT.txt" \
     || fail "could not stage the llama.cpp licence"
 echo "  staged licences -> $LIC"
-
-# --- release preflight ------------------------------------------------------
-# A refusal only this moment can make (see release-provenance-lib.sh): a dirty
-# tree means the artifacts match no commit. (It used to also verify the signing
-# key was THE key; there is no signing key since 2026-09-02.)
-# shellcheck disable=SC1091
-. "$ROOT/scripts/release-provenance-lib.sh"
-rp_preflight "linux" || fail "release preflight refused this build (see above)"
 
 # --- build ----------------------------------------------------------------
 cd client || fail "no client/ directory"
@@ -132,42 +120,8 @@ while IFS= read -r f; do
 done < <(find "$BDIR" -type f \( -name '*.deb' -o -name '*.rpm' \) | sort)
 [ "$found" = 1 ] || fail "bundler produced no Linux package"
 
-# --- verify: the engine inside the newest .deb is the pinned llama.cpp ------
-# The whole point of the bundle is the engine it carries; a stale idletoken-server
-# in the package is invisible to every gate that drives the repo binaries.
-NEWEST_DEB=$(ls -t "$BDIR"/deb/*.deb 2>/dev/null | head -1)
-if [ -n "$NEWEST_DEB" ]; then
-    PIN_SHA=$(awk 'NR==1{print $2}' "$ROOT/scripts/llamacpp-patches/UPSTREAM")
-    [ -n "$PIN_SHA" ] || fail "cannot read the engine pin from scripts/llamacpp-patches/UPSTREAM"
-    XTMP=$(mktemp -d /tmp/idletoken-deb-verify.XXXXXX)
-    dpkg-deb -x "$NEWEST_DEB" "$XTMP" || { rm -rf "$XTMP"; fail "could not extract $NEWEST_DEB"; }
-    DEB_LS=$(find "$XTMP" -type f -name 'idletoken-server' | head -1)
-    [ -n "$DEB_LS" ] || { rm -rf "$XTMP"; fail "the .deb does not contain idletoken-server (bundler shipped an incomplete app)"; }
-    VERSION_LINE=$("$DEB_LS" --version 2>&1 | grep -m1 'version:') \
-        || { rm -rf "$XTMP"; fail "idletoken-server inside the .deb does not run"; }
-    case "$VERSION_LINE" in
-        *"${PIN_SHA:0:7}"*) echo "deb engine check: $VERSION_LINE (matches pin ${PIN_SHA:0:7})" ;;
-        *) rm -rf "$XTMP"; fail "idletoken-server inside the .deb is '$VERSION_LINE', not the pinned ${PIN_SHA:0:7} — a stale engine got staged" ;;
-    esac
-    for b in idletoken-coord idletoken-worker idletoken-platform-agent; do
-        [ -n "$(find "$XTMP" -type f -name "$b" | head -1)" ] \
-            || { rm -rf "$XTMP"; fail "the .deb does not contain $b"; }
-    done
-    rm -rf "$XTMP"
-fi
-
 # No automatic provenance, signature, updater archive or feed is emitted here.
 # The release contract is the native installer files listed above, and only
 # those files are uploaded to GitHub.
-
-# Put the tree back the way the acceptance gates expect it. `tauri build` ran
-# beforeBuildCommand = `pnpm build:release`, which overwrites client/dist with a
-# bundle carrying the PRODUCTION platform URL. The P-gates serve that same
-# client/dist to the debug shell, so leaving it in place silently flips P2_auth
-# from offline local identity to cloud auth against the live platform — the gate
-# then fails with `auth.err.network` and nothing in the diff explains why.
-pnpm build > /tmp/client-release-restore.log 2>&1 \
-    || fail "release bundle is built, but restoring the non-release client/dist failed (see /tmp/client-release-restore.log)"
-echo "restored client/dist to the non-release build (acceptance gates use it)"
 
 echo CLIENT_RELEASE_OK

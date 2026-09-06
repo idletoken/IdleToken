@@ -2271,8 +2271,21 @@ int idletoken_rpc_cache_fetch(const char *base_url,
         if (!cache_activate_name(cache_dir, hashes[i], idx_hash,
                                  name_hashes[i],
                                  selected[i].bytes)) {
-            fprintf(stderr, "idletoken-weights: cannot activate local tensor %s\n",
-                    selected[i].name);
+            /* Activation is a hard link from the content file to the name;
+             * name the directory and the OS error, because a filesystem
+             * without hard links (exFAT on an external SSD, 2026-09-05)
+             * fails here after a successful fetch and the bare message
+             * reads like a download problem. */
+#ifdef _WIN32
+            fprintf(stderr, "idletoken-weights: cannot activate local tensor %s "
+                            "in %s (hard link failed, winerr %lu; exFAT/FAT "
+                            "volumes have no hard links)\n",
+                    selected[i].name, cache_dir, (unsigned long)GetLastError());
+#else
+            fprintf(stderr, "idletoken-weights: cannot activate local tensor %s "
+                            "in %s (hard link failed: %s)\n",
+                    selected[i].name, cache_dir, strerror(errno));
+#endif
             free(name_hashes); free(hashes); free(selected); return -1;
         }
     }

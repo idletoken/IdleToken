@@ -1,0 +1,533 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 0766087..20fea93 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1126,7 +1126,15 @@ static std::vector<ggml_backend_dev_t> parse_device_list(const std::string & val
+         ggml_backend_load_all();
+         for (const auto & device : dev_names) {
+             auto * dev = ggml_backend_dev_by_name(device.c_str());
+-            if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
++            const char * node_local_moe = std::getenv("GGML_RPC_NODE_LOCAL_MOE");
++            const bool is_rpc_cpu = node_local_moe && std::strcmp(node_local_moe, "1") == 0 && dev &&
++                ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU &&
++                strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "RPC") == 0;
++            // A remote RPC CPU may be named explicitly as a zero-share backing store for
++            // node-local MoE experts. Local CPU devices remain invalid here: --device is
++            // still the accelerator placement list, and ordinary CPU offload uses the
++            // existing CPU backend path.
++            if (!dev || (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && !is_rpc_cpu)) {
+                 throw std::invalid_argument(string_format("invalid device: %s", device.c_str()));
+             }
+             devices.push_back(dev);
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index cc3f8cd..bcb4db1 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -224,6 +224,16 @@ extern "C" {
+     };
+     typedef struct ggml_backend_feature * (*ggml_backend_get_features_t)(ggml_backend_reg_t reg);
+ 
++    // Optional RPC fast path used by the scheduler for node-local MoE weights.
++    // The source remains in CPU memory on an RPC server and only the selected
++    // expert byte ranges are copied to a GPU on that same RPC endpoint.
++    typedef bool (*ggml_backend_rpc_can_stream_moe_t)(ggml_backend_buffer_t src_buffer, ggml_backend_t dst_backend);
++    typedef bool (*ggml_backend_rpc_copy_moe_ranges_t)(const struct ggml_tensor * src,
++                                                       struct ggml_tensor * dst,
++                                                       const size_t * offsets,
++                                                       const size_t * sizes,
++                                                       size_t n_ranges);
++
+     //
+     // Backend registry
+     //
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index f6fb917..5ccac67 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -27,6 +27,50 @@
+ #include <sys/sysctl.h>
+ #endif
+ 
++static ggml_backend_rpc_can_stream_moe_t get_rpc_can_stream_moe(ggml_backend_buffer_t src_buffer) {
++    if (src_buffer == nullptr) {
++        return nullptr;
++    }
++    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(src_buffer));
++    if (dev == nullptr) {
++        return nullptr;
++    }
++    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
++    return (ggml_backend_rpc_can_stream_moe_t)
++        ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_can_stream_moe");
++}
++
++static bool rpc_can_stream_moe(ggml_backend_buffer_t src_buffer, ggml_backend_t dst_backend) {
++    auto fn = get_rpc_can_stream_moe(src_buffer);
++    return fn != nullptr && fn(src_buffer, dst_backend);
++}
++
++static bool rpc_is_node_local_moe_source(ggml_backend_buffer_t src_buffer) {
++    const char * enabled = getenv("GGML_RPC_NODE_LOCAL_MOE");
++    if (enabled == nullptr || strcmp(enabled, "1") != 0 ||
++        get_rpc_can_stream_moe(src_buffer) == nullptr) {
++        return false;
++    }
++    ggml_backend_dev_t dev = ggml_backend_buft_get_device(
++        ggml_backend_buffer_get_type(src_buffer));
++    return dev != nullptr &&
++           ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
++}
++
++static bool rpc_copy_moe_ranges(const ggml_tensor * src, ggml_tensor * dst,
++                                const size_t * offsets, const size_t * sizes, size_t n_ranges) {
++    if (src == nullptr || src->buffer == nullptr) {
++        return false;
++    }
++    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(src->buffer));
++    if (dev == nullptr) {
++        return false;
++    }
++    auto fn = (ggml_backend_rpc_copy_moe_ranges_t) ggml_backend_reg_get_proc_address(
++        ggml_backend_dev_backend_reg(dev), "ggml_backend_rpc_copy_moe_ranges");
++    return fn != nullptr && fn(src, dst, offsets, sizes, n_ranges);
++}
++
+ 
+ // backend buffer type
+ 
+@@ -964,6 +1008,22 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
+                         }
+                     }
+                 }
++                if (sched->op_offload && tensor->op == GGML_OP_MUL_MAT_ID) {
++                    const bool node_local_moe_source =
++                        rpc_is_node_local_moe_source(src->buffer);
++                    for (int b = 0; b < sched->n_backends; ++b) {
++                        if (b != src_backend_id &&
++                            ggml_backend_supports_op(sched->backends[b], tensor) &&
++                            rpc_can_stream_moe(src->buffer, sched->backends[b])) {
++                            SET_CAUSE(tensor, "1.rpc-moe");
++                            return b;
++                        }
++                    }
++                    if (node_local_moe_source) {
++                        GGML_ABORT("node-local RPC MoE tensor '%s' has no GPU "
++                                   "on the same RPC endpoint", src->name);
++                    }
++                }
+                 SET_CAUSE(tensor, "1.wgt%d", i);
+                 return src_backend_id;
+             }
+@@ -1628,9 +1688,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+ 
+                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
+                 ggml_tensor * node = split->graph.nodes[0];
++                const bool node_local_rpc_moe = rpc_can_stream_moe(input->buffer, split_backend);
+                 if (split->graph.n_nodes > 0 &&
+                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+-                    ggml_backend_buffer_is_host(input->buffer) && (
++                    (ggml_backend_buffer_is_host(input->buffer) || node_local_rpc_moe) && (
+                     (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
+                     //|| (node->src[1] == input_cpy && node->op == GGML_OP_ADD_ID) /* GGML_OP_ADD_ID weights are small and not worth splitting */
+                     )) {
+@@ -1673,6 +1734,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         prev_ids_tensor = ids_tensor;
+                     }
+ 
++                    std::vector<size_t> expert_offsets;
++                    std::vector<size_t> expert_sizes;
++
+                     // group consecutive experts and copy them together
+                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                         const size_t expert_offset = first_id * expert_size;
+@@ -1680,12 +1744,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         const size_t padding = std::min<size_t>(expert_size, 512);
+                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+ 
+-                        ggml_backend_tensor_set_async(split_backend,
+-                            input_cpy,
+-                            (const uint8_t *)input->data + expert_offset, expert_offset,
+-                            // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
+-                            // this is necessary for MMQ in the CUDA backend
+-                            expert_size_copy + padding_end);
++                        const size_t size = expert_size_copy + padding_end;
++                        if (node_local_rpc_moe) {
++                            expert_offsets.push_back(expert_offset);
++                            expert_sizes.push_back(size);
++                        } else {
++                            ggml_backend_tensor_set_async(split_backend,
++                                input_cpy,
++                                (const uint8_t *)input->data + expert_offset, expert_offset,
++                                // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
++                                // this is necessary for MMQ in the CUDA backend
++                                size);
++                        }
+                     };
+ 
+                     int id = 0;
+@@ -1711,6 +1781,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         last_id = id;
+                     }
+                     copy_experts(first_id, last_id);
++                    if (node_local_rpc_moe && !rpc_copy_moe_ranges(
++                            input, input_cpy, expert_offsets.data(), expert_sizes.data(), expert_offsets.size())) {
++                        GGML_ABORT("failed node-local RPC MoE expert copy for tensor '%s'", input->name);
++                    }
+                 } else {
+                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
+                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 36b9c71..c9c11f0 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -80,6 +80,8 @@ enum rpc_cmd {
+     RPC_CMD_DEVICE_COUNT,
+     RPC_CMD_GRAPH_RECOMPUTE,
+     RPC_CMD_MEMSET_TENSOR,
++    RPC_CMD_GET_DEVICE_TYPE,
++    RPC_CMD_COPY_TENSOR_RANGES,
+     RPC_CMD_COUNT,
+ };
+ 
+@@ -204,6 +206,26 @@ struct rpc_msg_get_device_memory_rsp {
+     uint64_t total_mem;
+ };
+ 
++struct rpc_msg_get_device_type_req {
++    uint32_t device;
++};
++
++struct rpc_msg_get_device_type_rsp {
++    uint32_t type;
++};
++
++struct rpc_msg_copy_tensor_ranges_req {
++    rpc_tensor src;
++    rpc_tensor dst;
++    uint32_t n_ranges;
++    uint32_t reserved;
++};
++
++struct rpc_tensor_range {
++    uint64_t offset;
++    uint64_t size;
++};
++
+ struct rpc_msg_graph_recompute_req {
+     uint32_t device;
+ };
+@@ -222,6 +244,7 @@ struct ggml_backend_rpc_device_context {
+     uint32_t    device;
+     std::string name;
+     std::string description;
++    enum ggml_backend_dev_type type;
+     uint64_t    last_graph_uid;
+ };
+ 
+@@ -855,6 +878,82 @@ bool ggml_backend_is_rpc(ggml_backend_t backend) {
+     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_rpc_guid());
+ }
+ 
++static bool ggml_backend_rpc_can_stream_moe(ggml_backend_buffer_t src_buffer, ggml_backend_t dst_backend) {
++    const char * enabled = std::getenv("GGML_RPC_NODE_LOCAL_MOE");
++    if (enabled == nullptr || std::strcmp(enabled, "1") != 0 ||
++        src_buffer == nullptr || dst_backend == nullptr ||
++        !ggml_backend_buffer_is_rpc(src_buffer) || !ggml_backend_is_rpc(dst_backend)) {
++        return false;
++    }
++
++    auto * src_buft_ctx = (ggml_backend_rpc_buffer_type_context *) src_buffer->buft->context;
++    auto * dst_ctx = (ggml_backend_rpc_context *) dst_backend->context;
++    ggml_backend_dev_t src_dev = ggml_backend_buft_get_device(src_buffer->buft);
++    ggml_backend_dev_t dst_dev = ggml_backend_get_device(dst_backend);
++    return src_buft_ctx != nullptr && dst_ctx != nullptr &&
++           src_buft_ctx->endpoint == dst_ctx->endpoint &&
++           ggml_backend_dev_type(src_dev) == GGML_BACKEND_DEVICE_TYPE_CPU &&
++           (ggml_backend_dev_type(dst_dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
++            ggml_backend_dev_type(dst_dev) == GGML_BACKEND_DEVICE_TYPE_IGPU);
++}
++
++static bool ggml_backend_rpc_copy_moe_ranges(const ggml_tensor * src, ggml_tensor * dst,
++                                               const size_t * offsets, const size_t * sizes,
++                                               size_t n_ranges) {
++    if (src == nullptr || dst == nullptr || offsets == nullptr || sizes == nullptr ||
++        src->buffer == nullptr || dst->buffer == nullptr ||
++        n_ranges == 0 || n_ranges > UINT32_MAX ||
++        !ggml_backend_buffer_is_rpc(src->buffer) || !ggml_backend_buffer_is_rpc(dst->buffer)) {
++        return false;
++    }
++
++    auto * src_buft_ctx = (ggml_backend_rpc_buffer_type_context *) src->buffer->buft->context;
++    auto * dst_buft_ctx = (ggml_backend_rpc_buffer_type_context *) dst->buffer->buft->context;
++    ggml_backend_dev_t src_dev = ggml_backend_buft_get_device(src->buffer->buft);
++    ggml_backend_dev_t dst_dev = ggml_backend_buft_get_device(dst->buffer->buft);
++    const char * enabled = std::getenv("GGML_RPC_NODE_LOCAL_MOE");
++    if (enabled == nullptr || std::strcmp(enabled, "1") != 0 ||
++        src_buft_ctx == nullptr || dst_buft_ctx == nullptr ||
++        src_buft_ctx->endpoint != dst_buft_ctx->endpoint ||
++        ggml_backend_dev_type(src_dev) != GGML_BACKEND_DEVICE_TYPE_CPU ||
++        (ggml_backend_dev_type(dst_dev) != GGML_BACKEND_DEVICE_TYPE_GPU &&
++         ggml_backend_dev_type(dst_dev) != GGML_BACKEND_DEVICE_TYPE_IGPU)) {
++        return false;
++    }
++
++    auto * src_ctx = (ggml_backend_rpc_buffer_context *) src->buffer->context;
++    auto * dst_ctx = (ggml_backend_rpc_buffer_context *) dst->buffer->context;
++    if (src_ctx == nullptr || dst_ctx == nullptr || src_ctx->sock != dst_ctx->sock) {
++        return false;
++    }
++
++    const size_t src_bytes = ggml_nbytes(src);
++    const size_t dst_bytes = ggml_nbytes(dst);
++    for (size_t i = 0; i < n_ranges; ++i) {
++        if (offsets[i] > src_bytes || sizes[i] > src_bytes - offsets[i] ||
++            offsets[i] > dst_bytes || sizes[i] > dst_bytes - offsets[i]) {
++            return false;
++        }
++    }
++
++    rpc_msg_copy_tensor_ranges_req request = {
++        /* .src       = */ serialize_tensor(src),
++        /* .dst       = */ serialize_tensor(dst),
++        /* .n_ranges  = */ (uint32_t) n_ranges,
++        /* .reserved  = */ 0,
++    };
++    std::vector<uint8_t> input(sizeof(request) + n_ranges * sizeof(rpc_tensor_range));
++    memcpy(input.data(), &request, sizeof(request));
++    auto * ranges = (rpc_tensor_range *) (input.data() + sizeof(request));
++    for (size_t i = 0; i < n_ranges; ++i) {
++        ranges[i].offset = offsets[i];
++        ranges[i].size = sizes[i];
++    }
++    bool status = send_rpc_cmd(src_ctx->sock, RPC_CMD_COPY_TENSOR_RANGES, input.data(), input.size());
++    RPC_STATUS_ASSERT(status);
++    return status;
++}
++
+ static void get_device_memory(const std::shared_ptr<socket_t> & sock, uint32_t device, size_t * free, size_t * total) {
+     rpc_msg_get_device_memory_req request;
+     request.device = device;
+@@ -902,6 +1001,8 @@ public:
+     bool init_tensor(const rpc_msg_init_tensor_req & request);
+     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
+     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
++    bool get_device_type(const rpc_msg_get_device_type_req & request, rpc_msg_get_device_type_rsp & response);
++    bool copy_tensor_ranges(const std::vector<uint8_t> & input);
+ 
+     struct stored_graph {
+         std::vector<uint8_t>   buffer;
+@@ -920,7 +1021,11 @@ private:
+ 
+     std::vector<ggml_backend_t> backends;
+     const char * cache_dir;
+-    std::unordered_set<ggml_backend_buffer_t> buffers;
++    /* Device ownership is needed for node-local CPU-to-GPU range copies.
++     * Some CPU buffer types are legacy singletons with no device pointer, so
++     * deriving ownership from buffer->buft would turn a valid CPU source into
++     * an untyped buffer. */
++    std::unordered_map<ggml_backend_buffer_t, uint32_t> buffers;
+     // store the last computed graph for each backend
+     std::vector<stored_graph> stored_graphs;
+ };
+@@ -986,7 +1091,7 @@ bool rpc_server::alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_
+         response.remote_size = buffer->size;
+         LOG_DBG("[%s] device: %d, size: %" PRIu64 " -> remote_ptr: %" PRIx64 ", remote_size: %" PRIu64 "\n",
+             __func__, dev_id, request.size, response.remote_ptr, response.remote_size);
+-        buffers.insert(buffer);
++        buffers.emplace(buffer, dev_id);
+     } else {
+         LOG_DBG("[%s] device: %d, size: %" PRIu64 " -> failed\n", __func__, dev_id, request.size);
+     }
+@@ -1454,6 +1559,76 @@ bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_co
+     return true;
+ }
+ 
++bool rpc_server::copy_tensor_ranges(const std::vector<uint8_t> & input) {
++    if (input.size() < sizeof(rpc_msg_copy_tensor_ranges_req)) {
++        return false;
++    }
++    const auto * request = (const rpc_msg_copy_tensor_ranges_req *) input.data();
++    if (request->n_ranges == 0 || request->reserved != 0 ||
++        input.size() != sizeof(*request) + request->n_ranges * sizeof(rpc_tensor_range)) {
++        return false;
++    }
++
++    struct ggml_init_params params {
++        /*.mem_size   =*/ 2 * ggml_tensor_overhead(),
++        /*.mem_buffer =*/ NULL,
++        /*.no_alloc   =*/ true,
++    };
++    ggml_context_ptr ctx_ptr { ggml_init(params) };
++    GGML_ASSERT(ctx_ptr != nullptr);
++    ggml_context * ctx = ctx_ptr.get();
++    ggml_tensor * src = deserialize_tensor(ctx, &request->src);
++    ggml_tensor * dst = deserialize_tensor(ctx, &request->dst);
++    if (src == nullptr || dst == nullptr || src->buffer == nullptr || dst->buffer == nullptr ||
++        !ggml_backend_buffer_is_host(src->buffer)) {
++        GGML_LOG_ERROR("[%s] source must be a host buffer and destination must be valid\n", __func__);
++        return false;
++    }
++    const auto src_owner = buffers.find(src->buffer);
++    const auto dst_owner = buffers.find(dst->buffer);
++    if (src_owner == buffers.end() || dst_owner == buffers.end() ||
++        src_owner->second >= backends.size() || dst_owner->second >= backends.size()) {
++        GGML_LOG_ERROR("[%s] source or destination buffer is not owned by this client\n", __func__);
++        return false;
++    }
++    ggml_backend_dev_t src_dev = ggml_backend_get_device(backends[src_owner->second]);
++    ggml_backend_dev_t dst_dev = ggml_backend_get_device(backends[dst_owner->second]);
++    if (src_dev == nullptr || dst_dev == nullptr || src_owner->second == dst_owner->second ||
++        ggml_backend_dev_type(src_dev) != GGML_BACKEND_DEVICE_TYPE_CPU ||
++        (ggml_backend_dev_type(dst_dev) != GGML_BACKEND_DEVICE_TYPE_GPU &&
++         ggml_backend_dev_type(dst_dev) != GGML_BACKEND_DEVICE_TYPE_IGPU)) {
++        GGML_LOG_ERROR("[%s] only same-server CPU-to-GPU copies are allowed "
++                       "(src=%s/%d dst=%s/%d)\n", __func__,
++                       src_dev ? ggml_backend_dev_name(src_dev) : "none",
++                       src_dev ? (int)ggml_backend_dev_type(src_dev) : -1,
++                       dst_dev ? ggml_backend_dev_name(dst_dev) : "none",
++                       dst_dev ? (int)ggml_backend_dev_type(dst_dev) : -1);
++        return false;
++    }
++
++    const size_t src_bytes = ggml_nbytes(src);
++    const size_t dst_bytes = ggml_nbytes(dst);
++    const auto * ranges = (const rpc_tensor_range *) (input.data() + sizeof(*request));
++    for (uint32_t i = 0; i < request->n_ranges; ++i) {
++        const size_t offset = ranges[i].offset;
++        const size_t size = ranges[i].size;
++        if (offset > src_bytes || size > src_bytes - offset ||
++            offset > dst_bytes || size > dst_bytes - offset) {
++            GGML_LOG_ERROR("[%s] range %u is outside the tensor\n", __func__, i);
++            return false;
++        }
++        /* Mirror the scheduler's local host-offload path: enqueue the H2D copy
++         * on the destination backend and let the following graph command keep
++         * stream order. A synchronous copy here would add a network-visible
++         * round trip and serialize every selected expert range. */
++        ggml_backend_tensor_set_async(backends[dst_owner->second], dst,
++                                      (const uint8_t *) src->data + offset,
++                                      offset, size);
++    }
++    LOG_DBG("[%s] copied %u selected-expert ranges locally\n", __func__, request->n_ranges);
++    return true;
++}
++
+ ggml_tensor * rpc_server::create_node(uint64_t id,
+                                       struct ggml_context * ctx,
+                                       const std::unordered_map<uint64_t, const rpc_tensor*> & tensor_ptrs,
+@@ -1613,9 +1788,17 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
+     return true;
+ }
+ 
++bool rpc_server::get_device_type(const rpc_msg_get_device_type_req & request, rpc_msg_get_device_type_rsp & response) {
++    if (request.device >= backends.size()) {
++        return false;
++    }
++    response.type = (uint32_t) ggml_backend_dev_type(ggml_backend_get_device(backends[request.device]));
++    return true;
++}
++
+ rpc_server::~rpc_server() {
+-    for (auto buffer : buffers) {
+-        ggml_backend_buffer_free(buffer);
++    for (const auto & item : buffers) {
++        ggml_backend_buffer_free(item.first);
+     }
+ }
+ 
+@@ -1891,6 +2074,25 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+                 }
+                 break;
+             }
++            case RPC_CMD_GET_DEVICE_TYPE: {
++                rpc_msg_get_device_type_req request;
++                if (!recv_msg(sock, &request, sizeof(request))) {
++                    return;
++                }
++                rpc_msg_get_device_type_rsp response;
++                if (!server.get_device_type(request, response) ||
++                    !send_msg(sock, &response, sizeof(response))) {
++                    return;
++                }
++                break;
++            }
++            case RPC_CMD_COPY_TENSOR_RANGES: {
++                std::vector<uint8_t> input;
++                if (!recv_msg(sock, input) || !server.copy_tensor_ranges(input)) {
++                    return;
++                }
++                break;
++            }
+             default: {
+                 GGML_LOG_ERROR("Unknown command: %d\n", cmd);
+                 return;
+@@ -1991,10 +2193,8 @@ static void ggml_backend_rpc_device_get_memory(ggml_backend_dev_t dev, size_t *
+ }
+ 
+ static enum ggml_backend_dev_type ggml_backend_rpc_device_get_type(ggml_backend_dev_t dev) {
+-    // TODO: obtain value from the server
+-    return GGML_BACKEND_DEVICE_TYPE_GPU;
+-
+-    GGML_UNUSED(dev);
++    ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *) dev->context;
++    return ctx->type;
+ }
+ 
+ static void ggml_backend_rpc_device_get_props(ggml_backend_dev_t dev, struct ggml_backend_dev_props * props) {
+@@ -2095,6 +2295,12 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
+     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
+         return (void *)ggml_backend_rpc_start_server;
+     }
++    if (std::strcmp(name, "ggml_backend_rpc_can_stream_moe") == 0) {
++        return (void *)ggml_backend_rpc_can_stream_moe;
++    }
++    if (std::strcmp(name, "ggml_backend_rpc_copy_moe_ranges") == 0) {
++        return (void *)ggml_backend_rpc_copy_moe_ranges;
++    }
+     return NULL;
+ 
+     GGML_UNUSED(reg);
+@@ -2129,6 +2335,20 @@ static uint32_t ggml_backend_rpc_get_device_count(const char * endpoint) {
+     return response.device_count;
+ }
+ 
++static enum ggml_backend_dev_type ggml_backend_rpc_get_device_type(const char * endpoint, uint32_t device) {
++    auto sock = get_socket(endpoint);
++    rpc_msg_get_device_type_req request = {device};
++    rpc_msg_get_device_type_rsp response = {};
++    bool status = sock != nullptr && send_rpc_cmd(sock, RPC_CMD_GET_DEVICE_TYPE,
++                                                  &request, sizeof(request),
++                                                  &response, sizeof(response));
++    RPC_STATUS_ASSERT(status);
++    if (response.type > GGML_BACKEND_DEVICE_TYPE_META) {
++        GGML_ABORT("RPC server returned invalid device type %u", response.type);
++    }
++    return (enum ggml_backend_dev_type) response.type;
++}
++
+ static const ggml_backend_reg_i ggml_backend_rpc_reg_interface = {
+     /* .get_name          = */ ggml_backend_rpc_reg_get_name,
+     /* .get_device_count  = */ ggml_backend_rpc_reg_get_device_count,
+@@ -2158,6 +2378,7 @@ ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
+             /* .device      = */    ind,
+             /* .name        = */    dev_name,
+             /* .description = */    dev_desc,
++            /* .type        = */    ggml_backend_rpc_get_device_type(endpoint, ind),
+             /* .last_graph_uid = */ 0,
+         };
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 52f8d53..e5915e8 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -405,9 +405,8 @@ llama_context::llama_context(
+ 
+         for (auto & backend : backends) {
+             auto * buft = ggml_backend_get_default_buffer_type(backend.get());
+-            auto backend_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
+ 
+-            if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {
++            if (backend.get() == backend_cpu && !model.devices.empty()) {
+                 // use the host buffer of the first device CPU for faster transfer of the intermediate state
+                 const auto & dev = model.devices[0];
+                 auto * host_buft = ggml_backend_dev_host_buffer_type(dev.dev);

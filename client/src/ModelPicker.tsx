@@ -22,7 +22,14 @@
 // quality we can vouch for. Model requests go through GitHub issues.
 import { useEffect, useState } from "react";
 import { useI18n } from "./i18n";
-import { AVAILABLE_MODELS, defaultQuant, hasQuantChoice, quantOptions } from "./models";
+import {
+  AVAILABLE_MODELS,
+  MODEL_BRANDS,
+  defaultQuant,
+  hasQuantChoice,
+  quantOptions,
+  shortModelLabel,
+} from "./models";
 import { fmtBytes } from "./format";
 import { useDialog } from "./useDialog";
 import { loadLocalCapability, type CapabilityMode, type CapabilityRow } from "./Capability";
@@ -45,12 +52,14 @@ export interface RunningModel {
  *  a cluster may still run a model that this one machine cannot. "unavailable"
  *  (an old engine's "backend not implemented") collapses into "won't run",
  *  same as it does there. */
-function fitKey(mode: CapabilityMode): "cap.yesGpu" | "cap.no" {
+function fitKey(mode: CapabilityMode): "cap.yesGpu" | "cap.yesHybrid" | "cap.no" {
   if (mode === "gpu_only") return "cap.yesGpu";
+  if (mode === "hybrid") return "cap.yesHybrid";
   return "cap.no";
 }
 function fitClass(mode: CapabilityMode): string {
   if (mode === "gpu_only") return "is-fast";
+  if (mode === "hybrid") return "is-slow";
   return "is-no";
 }
 
@@ -177,6 +186,9 @@ export default function ModelPicker(props: {
   // could even reach the precision dropdown. Now the row and the dropdown
   // only edit this draft; the Apply button is the one thing that acts.
   const [sel, setSel] = useState({ modelId: cur.modelId, quant: curQuant });
+  const initialBrand = MODEL_BRANDS.find((b) => b.models.some((m) => m.id === cur.modelId));
+  const [brandId, setBrandId] = useState(initialBrand?.id ?? MODEL_BRANDS[0]?.id ?? "");
+  const [level, setLevel] = useState<"families" | "models">("families");
 
   // Usage rank (or manifest order) is the base sequence; runnable models then
   // come first. "Unknown" sits between runnable and won't-run so a row does
@@ -187,10 +199,15 @@ export default function ModelPicker(props: {
   const runRank = (m: (typeof AVAILABLE_MODELS)[number]): number => {
     const mode = fitOf(m.id, m.id === sel.modelId ? sel.quant : defaultQuant(m.id));
     if (mode === "gpu_only") return 0;
-    return mode ? 2 : 1;
+    if (mode === "hybrid") return 1;
+    return mode ? 3 : 2;
   };
   // Array.prototype.sort is stable: equal ranks keep the usage/manifest order.
   const ordered = [...ranked].sort((a, b) => runRank(a) - runRank(b));
+  const activeBrand = MODEL_BRANDS.find((b) => b.id === brandId) ?? MODEL_BRANDS[0];
+  const familyModels = activeBrand
+    ? ordered.filter((m) => activeBrand.models.some((candidate) => candidate.id === m.id))
+    : [];
 
   return (
     <div className="modelpick" ref={ref} role="dialog" aria-label={t("model.pick.title")}>
@@ -218,18 +235,56 @@ export default function ModelPicker(props: {
         </div>
       ) : (
         <>
-          {/* No "ordered by usage" caption (cut 2026-08-26 with the token
-              chips): the ranking still drives the order, silently. */}
+          <div className="modelpick__nav">
+            {level === "models" ? (
+              <button
+                type="button"
+                className="modelpick__back"
+                onClick={() => setLevel("families")}
+                aria-label={t("model.pick.back")}
+              >
+                <span aria-hidden="true">←</span>
+                {t("model.pick.back")}
+              </button>
+            ) : null}
+            <span className="modelpick__nav-title">
+              {level === "families" ? t("model.pick.family") : activeBrand?.label}
+            </span>
+          </div>
           <div className="modelpick__list">
-            {ordered.map((m) => {
+            {level === "families" ? MODEL_BRANDS.map((brand) => {
+              const selected = brand.models.find((m) => m.id === sel.modelId);
+              return (
+                <button
+                  type="button"
+                  key={brand.id}
+                  className={`modelpick__item modelpick__family${selected ? " is-on" : ""}`}
+                  onClick={() => {
+                    setBrandId(brand.id);
+                    setLevel("models");
+                  }}
+                >
+                  <span className="modelpick__name">{brand.label}</span>
+                  <span className="modelpick__family-meta">
+                    {selected
+                      ? shortModelLabel(selected.label, brand.label)
+                      : t("model.pick.modelCount", { n: brand.models.length })}
+                  </span>
+                  <span className="modelpick__chevron" aria-hidden="true">›</span>
+                </button>
+              );
+            }) : familyModels.map((m) => {
               const mode = fitOf(m.id, m.id === sel.modelId ? sel.quant : defaultQuant(m.id));
               return (
                 <button
+                  type="button"
                   key={m.id}
                   className={`modelpick__item${m.id === sel.modelId ? " is-on" : ""}`}
                   onClick={() => setSel({ modelId: m.id, quant: defaultQuant(m.id) })}
                 >
-                  <span className="modelpick__name">{m.label}</span>
+                  <span className="modelpick__name">
+                    {activeBrand ? shortModelLabel(m.label, activeBrand.label) : m.label}
+                  </span>
                   <span className="modelpick__meta">
                     {/* Parameter counts cut 2026-08-26 (owner's call): "1T ·
                         32B active" does not help the pick; the name and the
@@ -249,7 +304,7 @@ export default function ModelPicker(props: {
           </div>
           {/* Precision belongs to the selected model, so it stays a separate row
               rather than multiplying the list by five. */}
-          {hasQuantChoice(sel.modelId) ? (
+          {level === "models" && hasQuantChoice(sel.modelId) ? (
             <div className="modelpick__quant">
               <span className="modelpick__quant-label">{t("settings.precision")}</span>
               <select
@@ -265,18 +320,20 @@ export default function ModelPicker(props: {
               </select>
             </div>
           ) : null}
-          <div className="modelpick__actions">
+          <div className={`modelpick__actions${level === "families" ? " modelpick__actions--families" : ""}`}>
             {/* A-P2-6: "Keep current" belongs to the CONFIRM step above, where
                 the alternative really is keeping the running model. Here
                 nothing has been changed yet, so the button that closes the
                 list is just Cancel — "Keep current" read as a second choice
                 and made people look for the one that says "don't apply". */}
-            <button className="btn-secondary" onClick={props.onClose}>
+            <button type="button" className="btn-secondary" onClick={props.onClose}>
               {t("weights.cancel")}
             </button>
-            <button className="btn-primary" onClick={() => choose(sel.modelId, sel.quant)}>
-              {t("model.pick.apply")}
-            </button>
+            {level === "models" ? (
+              <button type="button" className="btn-primary" onClick={() => choose(sel.modelId, sel.quant)}>
+                {t("model.pick.apply")}
+              </button>
+            ) : null}
           </div>
         </>
       )}

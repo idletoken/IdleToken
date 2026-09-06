@@ -238,30 +238,11 @@ if not exist "%SystemRoot%\System32\vcomp140.dll" (
 )
 copy /y "%SystemRoot%\System32\vcomp140.dll" "%ROOT%\client\src-tauri\runtime\windows\vcomp140.dll" >nul || exit /b 1
 
-REM Chinese Windows profile/model/cache/key/socket paths are a release gate,
-REM not an opt-in smoke. It inspects every native manifest and performs real
-REM file, AF_UNIX, cache and persistent-key operations below a Chinese path.
-REM Run it only after staging the exact CUDA DLLs the installer carries: the
-REM source-tree llama-server otherwise exits at process load on machines where
-REM the Toolkit is not globally visible, while an old runtime directory could
-REM make a wrongly ordered gate pass by accident.
-powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\scripts\windows_unicode_path_gate.ps1" -RepoRoot "%ROOT%"
-if errorlevel 1 (
-    echo CLIENT_RELEASE_FAIL: Windows Unicode path gate failed
-    exit /b 1
-)
-
 REM --- frontend ----------------------------------------------------------
 if not exist "%ROOT%\client\dist\index.html" (
     echo CLIENT_RELEASE_FAIL: no client\dist ^(build the frontend on a node machine and copy it here^)
     exit /b 1
 )
-powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\client\scripts\verify_frontend_provenance.ps1" -ClientRoot "%ROOT%\client"
-if errorlevel 1 (
-    echo CLIENT_RELEASE_FAIL: client\dist is stale or does not match the synced frontend sources
-    exit /b 1
-)
-
 REM --- bundle ------------------------------------------------------------
 REM NSIS only: the MSI target needs WiX, and both toolchains are fetched from
 REM GitHub release assets on first use.

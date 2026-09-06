@@ -7,3 +7,5 @@
 051715d179dda32270e64e6ed8903c488b517e19a5ea57a4bc847c1a180b5740  0002-server-yarn-ctx-cap.patch
 2d27aba860c33835e71eb3f94c6f51e4d70e4e5d88739c92af0631ac2f54dd10  0003-rpc-cache-all-tensors.patch
 0e7acbf8f7d2e13cad2e27873fa0b05e254975229b50f6c81b7805a3f55dc655  0004-prefetch-local-mmap-tensors.patch
+a3abb10dba190b789ee2c46e7a76fec91701dc9ac4812f884ebd9002779f7b5e  0005-rpc-node-local-moe.patch
+8c9b68a2dc3f986a04b7296c9b1f524502e74c2f629feb2f0b6feddcdd54dad9  0006-moe-expert-pool.patch

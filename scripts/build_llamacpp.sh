@@ -4,7 +4,6 @@
 # Products (static, self-contained — no dylib/DLL soup next to them):
 #   vendor/llama.cpp/build/bin/llama-server       inference + OpenAI API
 #   vendor/llama.cpp/build/bin/ggml-rpc-server    worker-side RPC backend
-#   vendor/llama.cpp/build/bin/llama-perplexity   distribution-level numeric gate
 #
 # Platform backends: macOS = Metal, Linux = CUDA. Linux arm64 defaults to the
 # DGX's sm_121; Linux x86_64 defaults to every CUDA 12.8 architecture at or
@@ -128,7 +127,7 @@ COMMON_FLAGS=(
 #
 # Written as `if`, not `[ -n ... ] && COMMON_FLAGS+=(...)`: under `set -e` the
 # latter exits the whole script when the variable is unset, i.e. on every
-# ordinary build (the trap already documented in scripts/testbed-lib.sh).
+# ordinary build (an explicit if keeps the unset case valid under set -e).
 if [ -n "${IDLETOKEN_MBEDTLS_SRC:-}" ]; then
     COMMON_FLAGS+=(-DIDLETOKEN_MBEDTLS_SRC="$IDLETOKEN_MBEDTLS_SRC")
 fi
@@ -168,13 +167,13 @@ esac
 
 cmake -S "$SRC_DIR" -B "$BUILD_DIR" "${COMMON_FLAGS[@]}" "${PLATFORM_FLAGS[@]}"
 cmake --build "$BUILD_DIR" -j "$NPROC" \
-      --target llama-server ggml-rpc-server llama-perplexity llama-fit-params
+      --target llama-server ggml-rpc-server
 
 # --- verify -----------------------------------------------------------------
 # Stale artifacts from earlier shared-lib builds caused a broken-but-present
 # llama-server once (dyld missing-symbol at startup). Actually execute each
 # product; existence alone proves nothing.
-for bin in llama-server ggml-rpc-server llama-perplexity llama-fit-params; do
+for bin in llama-server ggml-rpc-server; do
     [ -x "$BUILD_DIR/bin/$bin" ] || { echo "FATAL: $bin not built" >&2; exit 1; }
 done
 VERSION_LINE=$("$BUILD_DIR/bin/llama-server" --version 2>&1 | grep -m1 'version:') \

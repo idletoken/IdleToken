@@ -4,7 +4,9 @@
  * should I pick", it is "can my computer run any of this at all". This module
  * answers it: given the memory of one machine (or of a whole cluster), it walks
  * every registered model × every shipped precision and reports whether exact
- * 256K and 1M GPU-only services fit — and, when not, how much VRAM is missing.
+ * 256K and 1M services fit. Discrete CUDA machines may report MoE Hybrid,
+ * including a cluster candidate whose exact per-owner-node placement is
+ * verified later from the selected GGUF; dense models remain GPU-only-or-refuse.
  *
  * Every verdict comes from the planner (`idletoken_mode_decide_quant`), never from
  * a second estimate written here. A capability table that disagrees with the
@@ -33,7 +35,7 @@ typedef struct {
     const char *model_id;
     const char *label;      /* human name from the manifest */
     const char *quant;      /* "" when the model ships a single precision */
-    idletoken_mode mode;       /* GPU_ONLY / REFUSE */
+    idletoken_mode mode;       /* GPU_ONLY / MoE HYBRID candidate / REFUSE */
     uint32_t    max_ctx;    /* exact product context that fits; 0 when REFUSE */
     uint64_t    weight_bytes;   /* download size at this precision */
     /* Memory the whole cluster must have to serve this (model, precision):

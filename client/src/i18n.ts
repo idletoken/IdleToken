@@ -76,6 +76,7 @@ export const STRINGS = {
     "node.cpu": "CPU",
     "node.threads": "{n} threads",
     "node.unified": "unified memory",
+    "pairing.moeResources": "GPU {gpu} · RAM {ram}",
     // Hardware floor (engine `idletoken_hw_check`). The engine also returns an
     // English sentence; these are the localized headline + fix so a
     // non-technical user knows what to do without reading engine logs.
@@ -103,13 +104,19 @@ export const STRINGS = {
     // (2026-08-21) but still the ModelPicker's fit chip, which is the
     // only place a verdict is shown at all now.
     "cap.yesGpu": "Runs locally at full speed",
+    "cap.yesHybrid": "Runs locally with GPU + RAM",
     "cap.no": "Cannot run locally",
     "spine.fits": "This machine can hold the whole model.",
     "spine.no": "Available VRAM may fall short.",
+    "spine.hybrid": "MoE Hybrid can use this GPU together with system RAM.",
     "spine.clusterFits": "These {n} machines can hold the whole model.",
     // A member that does not report its memory makes the total a lower bound;
     // only a shortfall can be wrong that way, so only a shortfall says this.
     "spine.unknown": "Cannot tell yet — a machine has not reported its memory.",
+    "capacity.moeHybrid": "MoE Hybrid is available: up to {ram} GB of free RAM can hold routed experts. The exact prefix is checked when the GGUF starts.",
+    "capacity.moeGpuFirst": "MoE runs GPU-first; {ram} GB of free RAM is available for expert overflow if VRAM becomes short.",
+    "capacity.moeCluster": "Cluster MoE keeps each complete layer and its experts on one machine's GPU. Holding a machine's routed experts in its own RAM ({ram} GB across eligible machines) is an opt-in path that stays off until its real-LAN performance check passes; that RAM is not counted here.",
+    "capacity.moeUnified": "This machine has one unified memory pool; CPU expert placement does not add capacity and stays disabled.",
     "auth.title": "Sign in to IdleToken",
     "auth.subtitle": "Your email groups your machines into one cluster.",
     "auth.tabSignIn": "Sign in",
@@ -197,7 +204,8 @@ export const STRINGS = {
     "pairing.err.noMember": "That machine is no longer in the cluster.",
     "pairing.err.modelMismatch": "This machine prepared a different model than the cluster ({detail}).",
     "pairing.err.modelNotReady": "A cluster member has not finished preparing the selected model ({detail}).",
-    "pairing.createNeedsModel": "Download and verify the selected model on this machine before creating a cluster.",
+    "pairing.needsModel":
+      "Download and verify the selected model on this machine before creating or joining a cluster.",
     "pairing.yourCode": "Share this code to add machines:",
     "pairing.addMachine": "Add another machine…",
     "pairing.copy": "Copy",
@@ -438,6 +446,9 @@ export const STRINGS = {
     // Switching. The engine has no hot swap, so a switch while something is
     // running is a restart — say what it will do BEFORE doing it.
     "model.pick.title": "Choose a model",
+    "model.pick.family": "Choose a family",
+    "model.pick.back": "Families",
+    "model.pick.modelCount": "{n} models",
     "model.switch.title": "Switch to {model}?",
     "model.switch.solo": "This restarts this machine's engine: serving stops for as long as the new model takes to load, and any reply being generated is lost. Weights not yet in the model folder download first.",
     "model.switch.cluster": "This restarts the whole cluster. Serving stops, and the other {n} machine(s) rejoin automatically using the same join code — you press Start once they are back. Any reply being generated is lost.",
@@ -566,6 +577,7 @@ export const STRINGS = {
     "node.cpu": "CPU",
     "node.threads": "{n} 线程",
     "node.unified": "统一内存",
+    "pairing.moeResources": "GPU {gpu} · 内存 {ram}",
     "node.hw.blocked": "这台机器无法参与计算",
     "node.hw.noGpu": "没有检测到 NVIDIA 显卡。请先安装 NVIDIA 驱动，或使用一台配备 NVIDIA 显卡的机器。",
     "node.hw.ccLow": "这张显卡型号过旧。IdleToken 需要 RTX 20 系列或更新的显卡。",
@@ -582,11 +594,17 @@ export const STRINGS = {
     "cap.size": "下载体积",
     "cap.need": "预估显存需求",
     "cap.yesGpu": "本机全速运行",
+    "cap.yesHybrid": "本机 GPU + 内存运行",
     "cap.no": "本机无法运行",
     "spine.fits": "本机能放下全部。",
     "spine.no": "可用显存可能不足。",
+    "spine.hybrid": "MoE Hybrid 可以让这张 GPU 与系统内存共同运行模型。",
     "spine.clusterFits": "这 {n} 台机器能放下全部。",
     "spine.unknown": "暂时无法判断——有机器还没上报可用显存。",
+    "capacity.moeHybrid": "可使用 MoE Hybrid：最多可用 {ram} GB 空闲内存保存路由专家；启动 GGUF 时会按真实张量精确复核。",
+    "capacity.moeGpuFirst": "MoE 默认全量放入 GPU；显存不足时可使用 {ram} GB 空闲内存承接专家权重。",
+    "capacity.moeCluster": "联机 MoE 会把每一完整层及其专家都留在负责该层机器的 GPU 上。把某台机器的路由专家放进它自己的内存（合格机器共 {ram} GB）是一条可选路径，在真实局域网性能检查通过前默认关闭；这里不把这部分内存计入容量。",
+    "capacity.moeUnified": "这台机器使用统一内存池；把专家切到 CPU 不会增加容量，因此不会启用 Hybrid。",
     "auth.title": "登录 IdleToken",
     "auth.subtitle": "用邮箱把你的机器组成一个集群。",
     "auth.tabSignIn": "登录",
@@ -656,7 +674,7 @@ export const STRINGS = {
     "pairing.err.noMember": "这台机器已不在集群成员名单里。",
     "pairing.err.modelMismatch": "本机准备的模型与集群不一致（{detail}）。",
     "pairing.err.modelNotReady": "还有集群成员未完成所选模型的准备（{detail}）。",
-    "pairing.createNeedsModel": "请先在本机下载并校验所选模型，就绪后才能创建集群。",
+    "pairing.needsModel": "请先在本机下载并校验所选模型，就绪后才能创建或加入集群。",
     "pairing.yourCode": "分享此组网码以添加机器：",
     "pairing.addMachine": "添加机器…",
     "pairing.copy": "复制",
@@ -861,6 +879,9 @@ export const STRINGS = {
     "chat.model.servingTitle": "由加载它的协调者上报——回答你的就是这个模型。",
     "chat.model.selectedTitle": "这是你在「设置」里选的模型。集群还没上报它加载的是哪个，请求就按这个发。",
     "model.pick.title": "选择模型",
+    "model.pick.family": "选择模型系列",
+    "model.pick.back": "返回系列",
+    "model.pick.modelCount": "{n} 个模型",
     "model.switch.title": "切换到 {model}？",
     "model.switch.solo": "这会重启本机引擎：新模型加载完成之前无法服务，正在生成的回复会丢失。模型目录下缺少的权重会先下载。",
     "model.switch.cluster": "这会重启整个集群。服务会中断，另外 {n} 台机器用同一个组网码自动重新加入——它们回来后再按「启动」。正在生成的回复会丢失。",

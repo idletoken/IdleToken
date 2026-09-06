@@ -1,0 +1,1025 @@
+{
+  "id": "qwen3.5-397b-a17b",
+  "label": "Qwen3.5 397B-A17B",
+  "family": "qwen3.5",
+  "backend": "llamacpp",
+  "arch": "qwen35moe",
+  "available": true,
+  "deployment": "cluster",
+  "min_quant": "Q4_K_M",
+  "license": "Apache-2.0",
+  "params_summary": "397B total / 17B active · 60 layers · hybrid linear attention + 512-expert MoE",
+  "n_layers": 60,
+  "n_embd": 4096,
+  "hc_streams": 1,
+  "n_vocab": 248320,
+  "context_max": 262144,
+  "context_yarn_max": 1048576,
+  "attn": {
+    "kind": "hybrid",
+    "full_attention_interval": 4,
+    "full": {
+      "kind": "gqa",
+      "n_head": 32,
+      "n_head_kv": 2,
+      "head_dim": 256,
+      "qk_norm": true,
+      "rope_dim_partial": 64,
+      "out_gate": "sigmoid"
+    },
+    "linear": {
+      "kind": "gated_deltanet",
+      "k_heads": 16,
+      "k_dim": 128,
+      "v_heads": 64,
+      "v_dim": 128,
+      "conv_kernel": 4,
+      "z_gate": "silu"
+    }
+  },
+  "kv": {
+    "kind": "hybrid",
+    "bytes_per_token_per_layer": 2048,
+    "state_bytes_per_layer": 4341760,
+    "full_attention_interval": 4
+  },
+  "moe": {
+    "n_expert": 512,
+    "n_expert_used": 10,
+    "n_expert_shared": 1,
+    "expert_ff": 1024,
+    "shared_expert_ff": 1024,
+    "gating": "softmax",
+    "weights_norm": true,
+    "shared_expert_gate": "sigmoid"
+  },
+  "rope_theta": 10000000,
+  "split": {
+    "boundary_multiple": 0
+  },
+  "overhead_base_bytes": 3221225472,
+  "compute_bytes_128k_cuda": [
+    525336576,
+    525336576,
+    525336576
+  ],
+  "compute_bytes_256k_cuda": [
+    525336576,
+    914651873,
+    914651873
+  ],
+  "compute_bytes_1m_cuda": [
+    1245729260,
+    3330570977,
+    3330570977
+  ],
+  "compute_bytes_128k_metal": [
+    659575276,
+    659847905,
+    659847905
+  ],
+  "compute_bytes_256k_metal": [
+    793793004,
+    794065633,
+    794065633
+  ],
+  "compute_bytes_1m_metal": [
+    1247847383,
+    1248130499,
+    1248130499
+  ],
+  "chat_template": "gguf",
+  "notes": [
+    "Architecture and cache geometry were read from the official Qwen config and the published split-GGUF header; the pinned llama.cpp identifies it as qwen35moe with 60 blocks.",
+    "The default is the smallest supported 2-bit-class quantization, IQ2_XXS. The published IQ1_M artifact is intentionally excluded from the curated menu.",
+    "Onboarded from pinned official config and split-GGUF metadata under the repeated-architecture policy: qwen35moe is already supported by the pinned llama.cpp; no full-weight download is required for this additional size."
+  ],
+  "variants": [
+    {
+      "quant": "IQ2_XXS",
+      "layer_weight_bytes": 114872940736,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "gguf": "UD-IQ2_XXS/Qwen3.5-397B-A17B-UD-IQ2_XXS-00001-of-00004.gguf",
+      "sha256": "fa09e3634c3a4ce7b852a6fd3c2881a9fe6a9d65136b8aa47329b3c852c59986",
+      "revision": "da33c16fa4440f831149fcf53b98a22bc07785e5",
+      "parts": [
+        {
+          "file": "UD-IQ2_XXS/Qwen3.5-397B-A17B-UD-IQ2_XXS-00002-of-00004.gguf",
+          "bytes": 49844056032,
+          "sha256": "40a0dc8137b01a02ee03ead3e200168101f281fddefa6a65be1154d99ff8697c"
+        },
+        {
+          "file": "UD-IQ2_XXS/Qwen3.5-397B-A17B-UD-IQ2_XXS-00003-of-00004.gguf",
+          "bytes": 49913266368,
+          "sha256": "f94e6f24875b81e2743ee52676df4916be91c0118bb98c3c71d260a3ff0b19a1"
+        },
+        {
+          "file": "UD-IQ2_XXS/Qwen3.5-397B-A17B-UD-IQ2_XXS-00004-of-00004.gguf",
+          "bytes": 15104674784,
+          "sha256": "3c88fd4339745b7753548689b13c2bf2bbe12a352a1b1e680bbb18e8f5a25880"
+        }
+      ]
+    },
+    {
+      "quant": "IQ2_M",
+      "layer_weight_bytes": 123053144288,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "gguf": "UD-IQ2_M/Qwen3.5-397B-A17B-UD-IQ2_M-00001-of-00004.gguf",
+      "sha256": "72fe0a30ea6a52cccd0596ed203c5d7b6b1bdb6ea1399738cbaa7b59e7aa3758",
+      "revision": "da33c16fa4440f831149fcf53b98a22bc07785e5",
+      "parts": [
+        {
+          "file": "UD-IQ2_M/Qwen3.5-397B-A17B-UD-IQ2_M-00002-of-00004.gguf",
+          "bytes": 49979729120,
+          "sha256": "65b7585b5f5c5ad61552df433b53af1176f1d8148e4f4cc962eed32a4f85aac9"
+        },
+        {
+          "file": "UD-IQ2_M/Qwen3.5-397B-A17B-UD-IQ2_M-00003-of-00004.gguf",
+          "bytes": 49591526976,
+          "sha256": "de67f547382c020d1c93905dba92be5d88050e656e2725bb89d9fd55221811eb"
+        },
+        {
+          "file": "UD-IQ2_M/Qwen3.5-397B-A17B-UD-IQ2_M-00004-of-00004.gguf",
+          "bytes": 23470944640,
+          "sha256": "81facb9989d46c9f179d9491de9988a63a70ee3207b93b562eb73a70ef7d3938"
+        }
+      ]
+    },
+    {
+      "quant": "IQ3_XXS",
+      "layer_weight_bytes": 140333676736,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "gguf": "UD-IQ3_XXS/Qwen3.5-397B-A17B-UD-IQ3_XXS-00001-of-00004.gguf",
+      "sha256": "71a51f7c1ee40c823cae32009f9d9d562e85355e2892d8de03c0fd024e1e0a76",
+      "revision": "da33c16fa4440f831149fcf53b98a22bc07785e5",
+      "parts": [
+        {
+          "file": "UD-IQ3_XXS/Qwen3.5-397B-A17B-UD-IQ3_XXS-00002-of-00004.gguf",
+          "bytes": 49480794400,
+          "sha256": "a66adebd6aa341d0be5d26b7ff23090de1ad2d6ce1a83b6d2438bfe9f5992065"
+        },
+        {
+          "file": "UD-IQ3_XXS/Qwen3.5-397B-A17B-UD-IQ3_XXS-00003-of-00004.gguf",
+          "bytes": 49320103584,
+          "sha256": "1fbb7229a7680ff4230d5180dae404457f015832d825b2f4ef64cf5309e3c999"
+        },
+        {
+          "file": "UD-IQ3_XXS/Qwen3.5-397B-A17B-UD-IQ3_XXS-00004-of-00004.gguf",
+          "bytes": 41521835200,
+          "sha256": "5ae2a4a994810f90fce832a9b8f147f936b2012984027cd0a0145eae83a82b18"
+        }
+      ]
+    },
+    {
+      "quant": "IQ3_S",
+      "layer_weight_bytes": 146373474496,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "gguf": "UD-IQ3_S/Qwen3.5-397B-A17B-UD-IQ3_S-00001-of-00004.gguf",
+      "sha256": "faf89c2c3ddca9909836370920b46c519f30dd8a0ccf3e81a65b8d2eed7bd42e",
+      "revision": "da33c16fa4440f831149fcf53b98a22bc07785e5",
+      "parts": [
+        {
+          "file": "UD-IQ3_S/Qwen3.5-397B-A17B-UD-IQ3_S-00002-of-00004.gguf",
+          "bytes": 49968824192,
+          "sha256": "412922c0c9b3c8a0b335bfc5ed627b0acdd832536e5a555cb3ff2041608fa111"
+        },
+        {
+          "file": "UD-IQ3_S/Qwen3.5-397B-A17B-UD-IQ3_S-00003-of-00004.gguf",
+          "bytes": 49857167488,
+          "sha256": "fffbe6fd0b908287d81b592a7c9cd832af0f4147162f7832292279cbd9dba4d4"
+        },
+        {
+          "file": "UD-IQ3_S/Qwen3.5-397B-A17B-UD-IQ3_S-00004-of-00004.gguf",
+          "bytes": 46536539264,
+          "sha256": "39f1936428ed4d4c5520829e15b0c6d7e89bda39f0974cbd4789732a24ef0b63"
+        }
+      ]
+    },
+    {
+      "quant": "Q3_K_S",
+      "layer_weight_bytes": 164323293504,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "gguf": "Q3_K_S/Qwen3.5-397B-A17B-Q3_K_S-00001-of-00005.gguf",
+      "sha256": "a6a771036c802e7b51c8d54ede810fb3565f92c2f66473bfb96b75c49e552c46",
+      "revision": "da33c16fa4440f831149fcf53b98a22bc07785e5",
+      "parts": [
+        {
+          "file": "Q3_K_S/Qwen3.5-397B-A17B-Q3_K_S-00002-of-00005.gguf",
+          "bytes": 49605911488,
+          "sha256": "0e8870ed6e030f4e2cc5edb63c4ca2521a3eaae796393e928f75ddd21ef2abdd"
+        },
+        {
+          "file": "Q3_K_S/Qwen3.5-397B-A17B-Q3_K_S-00003-of-00005.gguf",
+          "bytes": 49738134656,
+          "sha256": "4863b559ed79107060f36a5d7df616becc7749f827bd200f84b4c3c18baf1081"
+        },
+        {
+          "file": "Q3_K_S/Qwen3.5-397B-A17B-Q3_K_S-00004-of-00005.gguf",
+          "bytes": 49727351488,
+          "sha256": "43519e2238d4bd1744f87712c1b53384f7d7f19510d869fb70c5ad8b6ac15b6f"
+        },
+        {
+          "file": "Q3_K_S/Qwen3.5-397B-A17B-Q3_K_S-00005-of-00005.gguf",
+          "bytes": 15240952320,
+          "sha256": "7d886078b4301a3fa48eac06d76810d715635c7da2c6273ba53a25025f64132d"
+        }
+      ]
+    },
+    {
+      "quant": "Q3_K_M",
+      "layer_weight_bytes": 177409522016,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "gguf": "Q3_K_M/Qwen3.5-397B-A17B-Q3_K_M-00001-of-00005.gguf",
+      "sha256": "82e632e5e24d5b7097b8631e31ae50c85b905046e13d111ba44d9a712270d5ea",
+      "revision": "da33c16fa4440f831149fcf53b98a22bc07785e5",
+      "parts": [
+        {
+          "file": "Q3_K_M/Qwen3.5-397B-A17B-Q3_K_M-00002-of-00005.gguf",
+          "bytes": 49764473344,
+          "sha256": "3a2c22fbbce1a1f65b3a0de72027e4bd3a2eb6ab7a387d44f652c2e92d459d03"
+        },
+        {
+          "file": "Q3_K_M/Qwen3.5-397B-A17B-Q3_K_M-00003-of-00005.gguf",
+          "bytes": 49793655168,
+          "sha256": "88716aa5e1ffeaf99447f07dd578a50a17f4188801c9d827af5e8749a89a41f2"
+        },
+        {
+          "file": "Q3_K_M/Qwen3.5-397B-A17B-Q3_K_M-00004-of-00005.gguf",
+          "bytes": 49793655168,
+          "sha256": "f2465f633134442f9785284717189565f5924ceb6ce9d5e067fde2e71c0402be"
+        },
+        {
+          "file": "Q3_K_M/Qwen3.5-397B-A17B-Q3_K_M-00005-of-00005.gguf",
+          "bytes": 28046794784,
+          "sha256": "81884da3958656eaa1fd78c676d843e6293fc3e6cdbaec07e47cf01fadf2b67b"
+        }
+      ]
+    },
+    {
+      "quant": "Q3_K_XL",
+      "layer_weight_bytes": 178739034432,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "gguf": "UD-Q3_K_XL/Qwen3.5-397B-A17B-UD-Q3_K_XL-00001-of-00005.gguf",
+      "sha256": "82e632e5e24d5b7097b8631e31ae50c85b905046e13d111ba44d9a712270d5ea",
+      "revision": "da33c16fa4440f831149fcf53b98a22bc07785e5",
+      "parts": [
+        {
+          "file": "UD-Q3_K_XL/Qwen3.5-397B-A17B-UD-Q3_K_XL-00002-of-00005.gguf",
+          "bytes": 48865499488,
+          "sha256": "3e9cf4eb3633cb0b4662c55f361acd0916282351cebb0c19c9072b7fedd26a41"
+        },
+        {
+          "file": "UD-Q3_K_XL/Qwen3.5-397B-A17B-UD-Q3_K_XL-00003-of-00005.gguf",
+          "bytes": 49924725344,
+          "sha256": "d508413f2f8314d620628009449e0211cfd723cd0751f95e605bc1ec725ebd9e"
+        },
+        {
+          "file": "UD-Q3_K_XL/Qwen3.5-397B-A17B-UD-Q3_K_XL-00004-of-00005.gguf",
+          "bytes": 49793655168,
+          "sha256": "5863ad961f581e4cd1450621959fd39359cf6158ec6fe64e90b1ebe9dff7eb13"
+        },
+        {
+          "file": "UD-Q3_K_XL/Qwen3.5-397B-A17B-UD-Q3_K_XL-00005-of-00005.gguf",
+          "bytes": 30144210880,
+          "sha256": "3194dd0b39ee0cc8e8364643a497235639b466968bc83d3a63102ba566f4fefe"
+        }
+      ]
+    },
+    {
+      "quant": "IQ4_XS",
+      "layer_weight_bytes": 189735450944,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "gguf": "UD-IQ4_XS/Qwen3.5-397B-A17B-UD-IQ4_XS-00001-of-00005.gguf",
+      "sha256": "404e569f59789d74159ec152dc85cfbec1a5cb8ab608bd77f8f598d46f7653c0",
+      "revision": "da33c16fa4440f831149fcf53b98a22bc07785e5",
+      "parts": [
+        {
+          "file": "UD-IQ4_XS/Qwen3.5-397B-A17B-UD-IQ4_XS-00002-of-00005.gguf",
+          "bytes": 48989443648,
+          "sha256": "6949311b811b994474c0322ddbdbc4c7b46ffe54dd4c4266d7fb1decb11313aa"
+        },
+        {
+          "file": "UD-IQ4_XS/Qwen3.5-397B-A17B-UD-IQ4_XS-00003-of-00005.gguf",
+          "bytes": 49973335008,
+          "sha256": "85898ba25d612fe282b79a155a69527788842ee20d77f7b09cea65d57337fbf5"
+        },
+        {
+          "file": "UD-IQ4_XS/Qwen3.5-397B-A17B-UD-IQ4_XS-00004-of-00005.gguf",
+          "bytes": 49116646848,
+          "sha256": "515508eb5135963d8150515ee90e69d855be28e70ee8903804f662f5cdab351e"
+        },
+        {
+          "file": "UD-IQ4_XS/Qwen3.5-397B-A17B-UD-IQ4_XS-00005-of-00005.gguf",
+          "bytes": 41645081888,
+          "sha256": "b68ee186931ae5d6541757a45bfdcfbacfc89034553d2d39246251faa14fc3b0"
+        }
+      ]
+    },
+    {
+      "quant": "IQ4_NL",
+      "layer_weight_bytes": 193761982784,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "gguf": "UD-IQ4_NL/Qwen3.5-397B-A17B-UD-IQ4_NL-00001-of-00005.gguf",
+      "sha256": "e3d3cdd65e8db63318891567c81ade930132675c014915cf1f742bd3546941c7",
+      "revision": "da33c16fa4440f831149fcf53b98a22bc07785e5",
+      "parts": [
+        {
+          "file": "UD-IQ4_NL/Qwen3.5-397B-A17B-UD-IQ4_NL-00002-of-00005.gguf",
+          "bytes": 49996076608,
+          "sha256": "f6c376a92252f3743d1beacd0455cad658acacbae74e51f6f410c5996135db8a"
+        },
+        {
+          "file": "UD-IQ4_NL/Qwen3.5-397B-A17B-UD-IQ4_NL-00003-of-00005.gguf",
+          "bytes": 49145595840,
+          "sha256": "50712991ba726c0101e688145bc8dbef84901d0143c7d7f804e9b8e2efa86f72"
+        },
+        {
+          "file": "UD-IQ4_NL/Qwen3.5-397B-A17B-UD-IQ4_NL-00004-of-00005.gguf",
+          "bytes": 49943844928,
+          "sha256": "320b156d31a2fac4f048d4745185263eda4e60ca29321833b978494b196ce135"
+        },
+        {
+          "file": "UD-IQ4_NL/Qwen3.5-397B-A17B-UD-IQ4_NL-00005-of-00005.gguf",
+          "bytes": 44665521856,
+          "sha256": "9a45aff2abe50991cb60fd29cf972c40816bdc66ceef253839a6efb35c617220"
+        }
+      ]
+    },
+    {
+      "quant": "Q4_K_S",
+      "layer_weight_bytes": 227987503520,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "gguf": "Q4_K_S/Qwen3.5-397B-A17B-Q4_K_S-00001-of-00006.gguf",
+      "sha256": "0c281dd4cc77769c0945704f770dbf950950e23c45680c64caa8e680b76fc0cc",
+      "revision": "da33c16fa4440f831149fcf53b98a22bc07785e5",
+      "parts": [
+        {
+          "file": "Q4_K_S/Qwen3.5-397B-A17B-Q4_K_S-00002-of-00006.gguf",
+          "bytes": 49649743104,
+          "sha256": "817bc274bbc50b0b093e6a7c7f4a236304de9b5e572b1a20f74ce2aece58f292"
+        },
+        {
+          "file": "Q4_K_S/Qwen3.5-397B-A17B-Q4_K_S-00003-of-00006.gguf",
+          "bytes": 48983522144,
+          "sha256": "05f99ad3a60c3afc69911ddcdc36494bc50f26ba8825db66f64a0880ce3c05f0"
+        },
+        {
+          "file": "Q4_K_S/Qwen3.5-397B-A17B-Q4_K_S-00004-of-00006.gguf",
+          "bytes": 48983522144,
+          "sha256": "b3af6efac978262e7242f0ebfdf9dc438697e1dfd1b61c35dec848613ea4ba4e"
+        },
+        {
+          "file": "Q4_K_S/Qwen3.5-397B-A17B-Q4_K_S-00005-of-00006.gguf",
+          "bytes": 49005806656,
+          "sha256": "b2519d7617f8c8d350c07d37ae2fa46b56157fa11d197ea5d939e6f443418de5"
+        },
+        {
+          "file": "Q4_K_S/Qwen3.5-397B-A17B-Q4_K_S-00006-of-00006.gguf",
+          "bytes": 31353965920,
+          "sha256": "fce891e71cd1752a9ceca9400fca5bd68fd1294953ebed3f31c22d955d366041"
+        }
+      ]
+    },
+    {
+      "quant": "MXFP4_MOE",
+      "layer_weight_bytes": 237353302496,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "gguf": "MXFP4_MOE/Qwen3.5-397B-A17B-MXFP4_MOE-00001-of-00006.gguf",
+      "sha256": "bedb113ad6420283c06bf2b56edd1b2b7541c9d088629836deada76df5f25a72",
+      "revision": "da33c16fa4440f831149fcf53b98a22bc07785e5",
+      "parts": [
+        {
+          "file": "MXFP4_MOE/Qwen3.5-397B-A17B-MXFP4_MOE-00002-of-00006.gguf",
+          "bytes": 49073451872,
+          "sha256": "9f44b9daef484b9b32a2fd0874269245d9269f03df19bdf76183ecd19577f4af"
+        },
+        {
+          "file": "MXFP4_MOE/Qwen3.5-397B-A17B-MXFP4_MOE-00003-of-00006.gguf",
+          "bytes": 49457476704,
+          "sha256": "1107b6a3992171c3441ff29664989adbd9d7f2d4fa1d470d7e801057ff8cdea6"
+        },
+        {
+          "file": "MXFP4_MOE/Qwen3.5-397B-A17B-MXFP4_MOE-00004-of-00006.gguf",
+          "bytes": 49160190400,
+          "sha256": "dd13fcebce0e8fd493dd91be601e529bad278c14f3c735e10a47ae561774db52"
+        },
+        {
+          "file": "MXFP4_MOE/Qwen3.5-397B-A17B-MXFP4_MOE-00005-of-00006.gguf",
+          "bytes": 49457476704,
+          "sha256": "35d15bed3e011b2f0b476b6325c946289c9bcebff3ad8c3cbbb24f5acb625961"
+        },
+        {
+          "file": "MXFP4_MOE/Qwen3.5-397B-A17B-MXFP4_MOE-00006-of-00006.gguf",
+          "bytes": 40193763264,
+          "sha256": "8822ead204281c6e3fbfa84059a7246fbf877a899a29860e56b5a37cde78038c"
+        }
+      ]
+    },
+    {
+      "quant": "Q4_K_M",
+      "layer_weight_bytes": 244093630912,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "gguf": "Q4_K_M/Qwen3.5-397B-A17B-Q4_K_M-00001-of-00006.gguf",
+      "sha256": "63c290c9be83e1b4dd41833d81bd933afd535d65657579b9f92f5c3f76e0218d",
+      "revision": "da33c16fa4440f831149fcf53b98a22bc07785e5",
+      "parts": [
+        {
+          "file": "Q4_K_M/Qwen3.5-397B-A17B-Q4_K_M-00002-of-00006.gguf",
+          "bytes": 49136153056,
+          "sha256": "dc94995a3605f3130700e96df51ee56cf93bd9340fe891918403450556453ed7"
+        },
+        {
+          "file": "Q4_K_M/Qwen3.5-397B-A17B-Q4_K_M-00003-of-00006.gguf",
+          "bytes": 49735103552,
+          "sha256": "2952dadb60137f413d5f70f6ca3c06007e24198e712c882a094432f58f76c230"
+        },
+        {
+          "file": "Q4_K_M/Qwen3.5-397B-A17B-Q4_K_M-00004-of-00006.gguf",
+          "bytes": 49914377024,
+          "sha256": "c7b99959e8fb78c8cfc9b71f3da07a2b4a6d39bf377dfa226f0a7b730c8cf3ba"
+        },
+        {
+          "file": "Q4_K_M/Qwen3.5-397B-A17B-Q4_K_M-00005-of-00006.gguf",
+          "bytes": 49654346688,
+          "sha256": "eeea4540f7289ab3baad2b3f2b4b6798e70a1802b9b4b269799a1f04d75b0af0"
+        },
+        {
+          "file": "Q4_K_M/Qwen3.5-397B-A17B-Q4_K_M-00006-of-00006.gguf",
+          "bytes": 45642707040,
+          "sha256": "d3bf93bb9fe007910ae9c0fd130d7776d7c6149635c9e7f158312308beb9b754"
+        }
+      ]
+    },
+    {
+      "quant": "Q4_K_XL",
+      "layer_weight_bytes": 245272148448,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "gguf": "UD-Q4_K_XL/Qwen3.5-397B-A17B-UD-Q4_K_XL-00001-of-00006.gguf",
+      "sha256": "63c290c9be83e1b4dd41833d81bd933afd535d65657579b9f92f5c3f76e0218d",
+      "revision": "da33c16fa4440f831149fcf53b98a22bc07785e5",
+      "parts": [
+        {
+          "file": "UD-Q4_K_XL/Qwen3.5-397B-A17B-UD-Q4_K_XL-00002-of-00006.gguf",
+          "bytes": 49382486496,
+          "sha256": "bb5c4cf617ece5726008fcd07f4b12e5e44297d7279f031d31bb8e1f8c9f8e87"
+        },
+        {
+          "file": "UD-Q4_K_XL/Qwen3.5-397B-A17B-UD-Q4_K_XL-00003-of-00006.gguf",
+          "bytes": 49735103552,
+          "sha256": "2952dadb60137f413d5f70f6ca3c06007e24198e712c882a094432f58f76c230"
+        },
+        {
+          "file": "UD-Q4_K_XL/Qwen3.5-397B-A17B-UD-Q4_K_XL-00004-of-00006.gguf",
+          "bytes": 49365709504,
+          "sha256": "5146f7db59fc6ba3eedf55e1f30259d4ed38b4caffdb1b694fe4de1ef272505f"
+        },
+        {
+          "file": "UD-Q4_K_XL/Qwen3.5-397B-A17B-UD-Q4_K_XL-00005-of-00006.gguf",
+          "bytes": 49914377024,
+          "sha256": "1401908545cd15bc68aae2bce8757b944bebdb14b13e5e3a721f09ba7f428205"
+        },
+        {
+          "file": "UD-Q4_K_XL/Qwen3.5-397B-A17B-UD-Q4_K_XL-00006-of-00006.gguf",
+          "bytes": 46863528320,
+          "sha256": "dde51f1fa49600ad9168a99fa6d72fcc3537a60df09972af07ffae94b0328edf"
+        }
+      ]
+    },
+    {
+      "quant": "Q5_K_S",
+      "layer_weight_bytes": 276552219168,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "gguf": "Q5_K_S/Qwen3.5-397B-A17B-Q5_K_S-00001-of-00007.gguf",
+      "sha256": "27c8b892a53507665e08d101e65cece62546dcb4babd851aae8d18aa3a369417",
+      "revision": "da33c16fa4440f831149fcf53b98a22bc07785e5",
+      "parts": [
+        {
+          "file": "Q5_K_S/Qwen3.5-397B-A17B-Q5_K_S-00002-of-00007.gguf",
+          "bytes": 49468432160,
+          "sha256": "68e26bae50ff9594199f513cde6a66271809898daed20f0108a5f440f703035b"
+        },
+        {
+          "file": "Q5_K_S/Qwen3.5-397B-A17B-Q5_K_S-00003-of-00007.gguf",
+          "bytes": 48818596224,
+          "sha256": "2a24f08ec3f1b2061e61a7341b92481fb97d03fed83eb394b848e33914a018b6"
+        },
+        {
+          "file": "Q5_K_S/Qwen3.5-397B-A17B-Q5_K_S-00004-of-00007.gguf",
+          "bytes": 48729434240,
+          "sha256": "22b4c44135277d3ec4789a1c1e490f7d520f1a9b626af32581803099e355c1c9"
+        },
+        {
+          "file": "Q5_K_S/Qwen3.5-397B-A17B-Q5_K_S-00005-of-00007.gguf",
+          "bytes": 48787906560,
+          "sha256": "4a003a82803dde00244ea551617a08e86892786861f1887d774ff4ddb928ca79"
+        },
+        {
+          "file": "Q5_K_S/Qwen3.5-397B-A17B-Q5_K_S-00006-of-00007.gguf",
+          "bytes": 48818596224,
+          "sha256": "2df9d263069942da687792445583621425b05a47d35b53c7478fb3c802fd3305"
+        },
+        {
+          "file": "Q5_K_S/Qwen3.5-397B-A17B-Q5_K_S-00007-of-00007.gguf",
+          "bytes": 31918310208,
+          "sha256": "0b67c6c06cbf0227ffe9ab8d3453808fe5ecb17676bb2a6e48a9a156e48da357"
+        }
+      ]
+    },
+    {
+      "quant": "Q5_K_M",
+      "layer_weight_bytes": 293664979584,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "gguf": "Q5_K_M/Qwen3.5-397B-A17B-Q5_K_M-00001-of-00008.gguf",
+      "sha256": "c82146df8eca3ee9611f9ed1925a19ab7ec32f69c4695ed66e1ed87233cd6a79",
+      "revision": "da33c16fa4440f831149fcf53b98a22bc07785e5",
+      "parts": [
+        {
+          "file": "Q5_K_M/Qwen3.5-397B-A17B-Q5_K_M-00002-of-00008.gguf",
+          "bytes": 49233287072,
+          "sha256": "ed30d3bf537c22dd834f7eeeebc8d6214404c3d56445616c55fdd66e0a21a988"
+        },
+        {
+          "file": "Q5_K_M/Qwen3.5-397B-A17B-Q5_K_M-00003-of-00008.gguf",
+          "bytes": 48611452640,
+          "sha256": "612ed2bc62562b096ffec5ba25a51c46a575043c01a33597064b438a38a935a1"
+        },
+        {
+          "file": "Q5_K_M/Qwen3.5-397B-A17B-Q5_K_M-00004-of-00008.gguf",
+          "bytes": 48552761440,
+          "sha256": "0ca4284becec14270378130904989f09b385de73c196fc225803a0a7b1ac44fc"
+        },
+        {
+          "file": "Q5_K_M/Qwen3.5-397B-A17B-Q5_K_M-00005-of-00008.gguf",
+          "bytes": 48611452640,
+          "sha256": "f46a18407d0b17ed48758af4cd765ea2d5a6931a6384dc5b1417a2ca293c07a6"
+        },
+        {
+          "file": "Q5_K_M/Qwen3.5-397B-A17B-Q5_K_M-00006-of-00008.gguf",
+          "bytes": 48552761440,
+          "sha256": "dd7b94ac3fd1e7a7de01abad02fd3767062d41f3ec7c08ad67c3f1d61c9c7262"
+        },
+        {
+          "file": "Q5_K_M/Qwen3.5-397B-A17B-Q5_K_M-00007-of-00008.gguf",
+          "bytes": 48611452640,
+          "sha256": "29c6d01ef67357fc085a8b812a5730f2d0a046b295752501ea1bc44cb419ef33"
+        },
+        {
+          "file": "Q5_K_M/Qwen3.5-397B-A17B-Q5_K_M-00008-of-00008.gguf",
+          "bytes": 1480868160,
+          "sha256": "4bbade915bb05436822b36a088710a90d9da5a7b0f2a5621a978b79a366be35f"
+        }
+      ]
+    },
+    {
+      "quant": "Q5_K_XL",
+      "layer_weight_bytes": 294865599104,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "gguf": "UD-Q5_K_XL/Qwen3.5-397B-A17B-UD-Q5_K_XL-00001-of-00008.gguf",
+      "sha256": "c82146df8eca3ee9611f9ed1925a19ab7ec32f69c4695ed66e1ed87233cd6a79",
+      "revision": "da33c16fa4440f831149fcf53b98a22bc07785e5",
+      "parts": [
+        {
+          "file": "UD-Q5_K_XL/Qwen3.5-397B-A17B-UD-Q5_K_XL-00002-of-00008.gguf",
+          "bytes": 49233287072,
+          "sha256": "ed30d3bf537c22dd834f7eeeebc8d6214404c3d56445616c55fdd66e0a21a988"
+        },
+        {
+          "file": "UD-Q5_K_XL/Qwen3.5-397B-A17B-UD-Q5_K_XL-00003-of-00008.gguf",
+          "bytes": 48611452640,
+          "sha256": "612ed2bc62562b096ffec5ba25a51c46a575043c01a33597064b438a38a935a1"
+        },
+        {
+          "file": "UD-Q5_K_XL/Qwen3.5-397B-A17B-UD-Q5_K_XL-00004-of-00008.gguf",
+          "bytes": 49753380960,
+          "sha256": "c5444e6177855f5297d4e25f94e465ffcc2d8aa01d355230723e5e66a35b91b1"
+        },
+        {
+          "file": "UD-Q5_K_XL/Qwen3.5-397B-A17B-UD-Q5_K_XL-00005-of-00008.gguf",
+          "bytes": 48611452640,
+          "sha256": "f46a18407d0b17ed48758af4cd765ea2d5a6931a6384dc5b1417a2ca293c07a6"
+        },
+        {
+          "file": "UD-Q5_K_XL/Qwen3.5-397B-A17B-UD-Q5_K_XL-00006-of-00008.gguf",
+          "bytes": 48552761440,
+          "sha256": "dd7b94ac3fd1e7a7de01abad02fd3767062d41f3ec7c08ad67c3f1d61c9c7262"
+        },
+        {
+          "file": "UD-Q5_K_XL/Qwen3.5-397B-A17B-UD-Q5_K_XL-00007-of-00008.gguf",
+          "bytes": 48611452640,
+          "sha256": "29c6d01ef67357fc085a8b812a5730f2d0a046b295752501ea1bc44cb419ef33"
+        },
+        {
+          "file": "UD-Q5_K_XL/Qwen3.5-397B-A17B-UD-Q5_K_XL-00008-of-00008.gguf",
+          "bytes": 1480868160,
+          "sha256": "4bbade915bb05436822b36a088710a90d9da5a7b0f2a5621a978b79a366be35f"
+        }
+      ]
+    },
+    {
+      "quant": "Q6_K",
+      "layer_weight_bytes": 326595345056,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "gguf": "Q6_K/Qwen3.5-397B-A17B-Q6_K-00001-of-00008.gguf",
+      "sha256": "0a409159a8b206ef81bdd5736ae6bcc300445ed1adcb7e3faaf9167a8fb79f07",
+      "revision": "da33c16fa4440f831149fcf53b98a22bc07785e5",
+      "parts": [
+        {
+          "file": "Q6_K/Qwen3.5-397B-A17B-Q6_K-00002-of-00008.gguf",
+          "bytes": 49027157760,
+          "sha256": "63aa2ef1048a36faaba2ebb7d320c6bab88eaf9635e20c30964d2b15315cfc09"
+        },
+        {
+          "file": "Q6_K/Qwen3.5-397B-A17B-Q6_K-00003-of-00008.gguf",
+          "bytes": 48668251456,
+          "sha256": "c874919cd6ba194d3b259e173faad5e41f989168492477d783c3594d3994f7ba"
+        },
+        {
+          "file": "Q6_K/Qwen3.5-397B-A17B-Q6_K-00004-of-00008.gguf",
+          "bytes": 48668251456,
+          "sha256": "8a21d496e0b16e85eb74ea679053055a4579a658ffc3e6c00f7875e76b88c4ce"
+        },
+        {
+          "file": "Q6_K/Qwen3.5-397B-A17B-Q6_K-00005-of-00008.gguf",
+          "bytes": 48685456960,
+          "sha256": "e327fdc4663890a488858d142af6c477f1c060bbbeb4268c8db6e49983cd41d4"
+        },
+        {
+          "file": "Q6_K/Qwen3.5-397B-A17B-Q6_K-00006-of-00008.gguf",
+          "bytes": 48631844800,
+          "sha256": "ef68b262459a4304d371bd503016de9cf3277eb971e18a073203c4fe10345a45"
+        },
+        {
+          "file": "Q6_K/Qwen3.5-397B-A17B-Q6_K-00007-of-00008.gguf",
+          "bytes": 48668251456,
+          "sha256": "4f28a8907d17a21aa670c0a78403d24a3e52a5d5ee5a65987e54a6742b63bbc0"
+        },
+        {
+          "file": "Q6_K/Qwen3.5-397B-A17B-Q6_K-00008-of-00008.gguf",
+          "bytes": 34235187616,
+          "sha256": "2092241676533c799862ec78d4035af4402907df5822fac13f4109584336a214"
+        }
+      ]
+    },
+    {
+      "quant": "Q6_K_XL",
+      "layer_weight_bytes": 362328980288,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "gguf": "UD-Q6_K_XL/Qwen3.5-397B-A17B-UD-Q6_K_XL-00001-of-00009.gguf",
+      "sha256": "7a43f55accd11f00458ae299266fe71467800ff44e8f6737f88730d247d6f688",
+      "revision": "da33c16fa4440f831149fcf53b98a22bc07785e5",
+      "parts": [
+        {
+          "file": "UD-Q6_K_XL/Qwen3.5-397B-A17B-UD-Q6_K_XL-00002-of-00009.gguf",
+          "bytes": 49849617760,
+          "sha256": "6fac2ecdccb2f5d33a8e4e685f779f33ef5c511f821d63e957f9692ed1e99504"
+        },
+        {
+          "file": "UD-Q6_K_XL/Qwen3.5-397B-A17B-UD-Q6_K_XL-00003-of-00009.gguf",
+          "bytes": 49885236480,
+          "sha256": "1377c722f67b31071065a79b1b4974c0495bf9c4b680077cf59e64e582105260"
+        },
+        {
+          "file": "UD-Q6_K_XL/Qwen3.5-397B-A17B-UD-Q6_K_XL-00004-of-00009.gguf",
+          "bytes": 49373547968,
+          "sha256": "df6e595342804c2d2a3209bc25d342e7a325c407d93f1a390a1fc8d52ec522a8"
+        },
+        {
+          "file": "UD-Q6_K_XL/Qwen3.5-397B-A17B-UD-Q6_K_XL-00005-of-00009.gguf",
+          "bytes": 48988162976,
+          "sha256": "0cbee928a3760c44d584fe1c88e9310ed132e3b52e13fdeaec2d2e3c3b764ad9"
+        },
+        {
+          "file": "UD-Q6_K_XL/Qwen3.5-397B-A17B-UD-Q6_K_XL-00006-of-00009.gguf",
+          "bytes": 49373547968,
+          "sha256": "5750dea38ee359d0b465c6c1c59a2137c7e0e42d5d0a713074ea8da4fc56c059"
+        },
+        {
+          "file": "UD-Q6_K_XL/Qwen3.5-397B-A17B-UD-Q6_K_XL-00007-of-00009.gguf",
+          "bytes": 49492251552,
+          "sha256": "ff566b82c86a356284cd6863bb28617656454a86901ce675de4438dd9f18bf2e"
+        },
+        {
+          "file": "UD-Q6_K_XL/Qwen3.5-397B-A17B-UD-Q6_K_XL-00008-of-00009.gguf",
+          "bytes": 49885236544,
+          "sha256": "aa81fa77ef35532c556d5ea00397ed943505c993b87b7846d2d4586bc1246e0f"
+        },
+        {
+          "file": "UD-Q6_K_XL/Qwen3.5-397B-A17B-UD-Q6_K_XL-00009-of-00009.gguf",
+          "bytes": 15470435488,
+          "sha256": "d3bda566119958dafead0c385a5499d4af8da0a4080a4a9887c830b71f475530"
+        }
+      ]
+    },
+    {
+      "quant": "Q8_0",
+      "layer_weight_bytes": 421507365824,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "gguf": "Q8_0/Qwen3.5-397B-A17B-Q8_0-00001-of-00010.gguf",
+      "sha256": "ba984516e0fb4000dc2d097bed53add6ecf615930ac4a3da89e351fc23abf17a",
+      "revision": "da33c16fa4440f831149fcf53b98a22bc07785e5",
+      "parts": [
+        {
+          "file": "Q8_0/Qwen3.5-397B-A17B-Q8_0-00002-of-00010.gguf",
+          "bytes": 48771824224,
+          "sha256": "c74a4a3bfe49116cf66cf045b0dfec5c93adaf8a99d84dae44b308f95340bfb6"
+        },
+        {
+          "file": "Q8_0/Qwen3.5-397B-A17B-Q8_0-00003-of-00010.gguf",
+          "bytes": 48918889408,
+          "sha256": "dc18c45c75bef79daaca68003ff5919bc85be016554aa5e2d5a1fd3251c6f7ab"
+        },
+        {
+          "file": "Q8_0/Qwen3.5-397B-A17B-Q8_0-00004-of-00010.gguf",
+          "bytes": 48918889472,
+          "sha256": "589ad641d7ca911ad0fc3a378b90e6f07c716d1b1a53d820688cb819441790c0"
+        },
+        {
+          "file": "Q8_0/Qwen3.5-397B-A17B-Q8_0-00005-of-00010.gguf",
+          "bytes": 48955296128,
+          "sha256": "c1eb590fc786457447bee156ca32cb1f0cac540c963d121534a899fb0d87b149"
+        },
+        {
+          "file": "Q8_0/Qwen3.5-397B-A17B-Q8_0-00006-of-00010.gguf",
+          "bytes": 48896604928,
+          "sha256": "33708a36679b514f1f2413a1dda5d831d6547ddb84a9735221604f5e9a069357"
+        },
+        {
+          "file": "Q8_0/Qwen3.5-397B-A17B-Q8_0-00007-of-00010.gguf",
+          "bytes": 48918889472,
+          "sha256": "ef911df6baa00777ba842c6ed5c45c9c0a3642b8017ebb2c6023ae55fc20c34b"
+        },
+        {
+          "file": "Q8_0/Qwen3.5-397B-A17B-Q8_0-00008-of-00010.gguf",
+          "bytes": 48918889472,
+          "sha256": "f840797f800bacddceda674f6f56c2dd7e63152b1afeec935cfaf959f1afcf0a"
+        },
+        {
+          "file": "Q8_0/Qwen3.5-397B-A17B-Q8_0-00009-of-00010.gguf",
+          "bytes": 48955296128,
+          "sha256": "ccc0d89d361bd21ac0db4a54fc30cb811803d8389f598370dc1ff121875caa61"
+        },
+        {
+          "file": "Q8_0/Qwen3.5-397B-A17B-Q8_0-00010-of-00010.gguf",
+          "bytes": 30241843040,
+          "sha256": "a0aaf48579fcef07f8e12f97c7378553c0ba77149ac6bcf60cb663ffcfa27ca1"
+        }
+      ]
+    },
+    {
+      "quant": "Q8_K_XL",
+      "layer_weight_bytes": 427726568384,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "gguf": "UD-Q8_K_XL/Qwen3.5-397B-A17B-UD-Q8_K_XL-00001-of-00010.gguf",
+      "sha256": "ba984516e0fb4000dc2d097bed53add6ecf615930ac4a3da89e351fc23abf17a",
+      "revision": "da33c16fa4440f831149fcf53b98a22bc07785e5",
+      "parts": [
+        {
+          "file": "UD-Q8_K_XL/Qwen3.5-397B-A17B-UD-Q8_K_XL-00002-of-00010.gguf",
+          "bytes": 48779524704,
+          "sha256": "df4b2afb37fa08b1b02bf73d07a249348c3f22f46b9adab84c35cab9501c4233"
+        },
+        {
+          "file": "UD-Q8_K_XL/Qwen3.5-397B-A17B-UD-Q8_K_XL-00003-of-00010.gguf",
+          "bytes": 48926589888,
+          "sha256": "73aadfcaeec39742911ed32db1e03b0134bf6ddb3e9694d9492f6ce99b01c8a6"
+        },
+        {
+          "file": "UD-Q8_K_XL/Qwen3.5-397B-A17B-UD-Q8_K_XL-00004-of-00010.gguf",
+          "bytes": 48926589952,
+          "sha256": "edd92efb11a60eb76c4b856811064576f4631a37b8b0359c5f38d12a5f02791b"
+        },
+        {
+          "file": "UD-Q8_K_XL/Qwen3.5-397B-A17B-UD-Q8_K_XL-00005-of-00010.gguf",
+          "bytes": 48785475712,
+          "sha256": "28fc8da8fae64ee5e78859aa208922ed141c4093711cb6a3f43227753b28ca91"
+        },
+        {
+          "file": "UD-Q8_K_XL/Qwen3.5-397B-A17B-UD-Q8_K_XL-00006-of-00010.gguf",
+          "bytes": 48239276896,
+          "sha256": "920ddb1a4fa37a5338f77885a11c3a4d1b7a970052c6c43d323d4fd246ef1ff0"
+        },
+        {
+          "file": "UD-Q8_K_XL/Qwen3.5-397B-A17B-UD-Q8_K_XL-00007-of-00010.gguf",
+          "bytes": 48926589952,
+          "sha256": "6cc49fd77ef7fa88e26820eca0c1e6c5b46ece6068784365853606512764210d"
+        },
+        {
+          "file": "UD-Q8_K_XL/Qwen3.5-397B-A17B-UD-Q8_K_XL-00008-of-00010.gguf",
+          "bytes": 48964536704,
+          "sha256": "7655b605b2ca5bd6f8c32274f48abcdce830789170eff80c48ac00113f7ad13a"
+        },
+        {
+          "file": "UD-Q8_K_XL/Qwen3.5-397B-A17B-UD-Q8_K_XL-00009-of-00010.gguf",
+          "bytes": 48904305408,
+          "sha256": "eb606a18985361adb9f7fa3e54d87be01d53525a34414edc41353595d8e24f97"
+        },
+        {
+          "file": "UD-Q8_K_XL/Qwen3.5-397B-A17B-UD-Q8_K_XL-00010-of-00010.gguf",
+          "bytes": 37262735616,
+          "sha256": "b4ecbbec353c6b6bba6d04d18bac218e832937d9cb833c1c06faa20a09649ef9"
+        }
+      ]
+    },
+    {
+      "quant": "BF16",
+      "layer_weight_bytes": 792961318816,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "gguf": "BF16/Qwen3.5-397B-A17B-BF16-00001-of-00017.gguf",
+      "sha256": "137f36054aef51dc58e6e90f098ecb816bde098a6b053c90c79b188bc938211e",
+      "revision": "da33c16fa4440f831149fcf53b98a22bc07785e5",
+      "parts": [
+        {
+          "file": "BF16/Qwen3.5-397B-A17B-BF16-00002-of-00017.gguf",
+          "bytes": 47244641184,
+          "sha256": "76a0d946b543f269202694d62af7a2276b4dc76285be72d91c9ac18fb0697e00"
+        },
+        {
+          "file": "BF16/Qwen3.5-397B-A17B-BF16-00003-of-00017.gguf",
+          "bytes": 47244641184,
+          "sha256": "03fd7f23b847ceda4520e12ac4c20d0f0fabb72e397d5d1131cd5e21399cc9c7"
+        },
+        {
+          "file": "BF16/Qwen3.5-397B-A17B-BF16-00004-of-00017.gguf",
+          "bytes": 47244641184,
+          "sha256": "cf57e0da666ab64b74f81903857f32efae4f7dc918a87092f3691256accdf451"
+        },
+        {
+          "file": "BF16/Qwen3.5-397B-A17B-BF16-00005-of-00017.gguf",
+          "bytes": 47244641184,
+          "sha256": "0a90c0eed2cb7695e2d7390ead2d5cae8d642e439a65712d5cee0551ba009cd6"
+        },
+        {
+          "file": "BF16/Qwen3.5-397B-A17B-BF16-00006-of-00017.gguf",
+          "bytes": 47244641184,
+          "sha256": "dd313c4936ff102e5b035f686dc8b741f1fa3f6eb3d80192ed758e8290e19300"
+        },
+        {
+          "file": "BF16/Qwen3.5-397B-A17B-BF16-00007-of-00017.gguf",
+          "bytes": 47244641184,
+          "sha256": "b771c22485b73240cb9e83f79142bbe9b66c0dd6f75d81a3e7cb28ad1d0fc624"
+        },
+        {
+          "file": "BF16/Qwen3.5-397B-A17B-BF16-00008-of-00017.gguf",
+          "bytes": 47244641184,
+          "sha256": "a57c6dd4e9236141eb82119a170a4b457b554434ca677802f24e13eba4080f04"
+        },
+        {
+          "file": "BF16/Qwen3.5-397B-A17B-BF16-00009-of-00017.gguf",
+          "bytes": 47244641184,
+          "sha256": "10f44e0c91be77abe8ec404f71267704f4ba5be6af607bc629a69f7b70a26581"
+        },
+        {
+          "file": "BF16/Qwen3.5-397B-A17B-BF16-00010-of-00017.gguf",
+          "bytes": 47244641184,
+          "sha256": "9bf4e4662ea23e22947c28ebae4cf4e3e8ddecf29dc9b1966bb8f76de53a6ded"
+        },
+        {
+          "file": "BF16/Qwen3.5-397B-A17B-BF16-00011-of-00017.gguf",
+          "bytes": 47244641184,
+          "sha256": "6f46f37e46689b92f9198d4428372562e4f147f0a52fcccfdbec4c6b6d50134c"
+        },
+        {
+          "file": "BF16/Qwen3.5-397B-A17B-BF16-00012-of-00017.gguf",
+          "bytes": 47244641216,
+          "sha256": "cba9626d2754b5c0220e900698e0250999c676c85128a420ff71ac3e68801967"
+        },
+        {
+          "file": "BF16/Qwen3.5-397B-A17B-BF16-00013-of-00017.gguf",
+          "bytes": 47244641184,
+          "sha256": "406d9a6896c1a0ba8bd03f3ee9315d796d1493d1d046c0a94f540c22ffee28a2"
+        },
+        {
+          "file": "BF16/Qwen3.5-397B-A17B-BF16-00014-of-00017.gguf",
+          "bytes": 47244641184,
+          "sha256": "7e4604637a13fa04bf9c536916613564076caa3a8c94d894fbdbb34767d79b12"
+        },
+        {
+          "file": "BF16/Qwen3.5-397B-A17B-BF16-00015-of-00017.gguf",
+          "bytes": 47244641216,
+          "sha256": "bb468655d4dbaf8c7f99a1eb2fec8d764c8e97a13589afe4bd67f60f654ab193"
+        },
+        {
+          "file": "BF16/Qwen3.5-397B-A17B-BF16-00016-of-00017.gguf",
+          "bytes": 47244641216,
+          "sha256": "3aaf00396730d6daa0b82fb17851dbb66c55b7da137657fcd2eb716f64a3392c"
+        },
+        {
+          "file": "BF16/Qwen3.5-397B-A17B-BF16-00017-of-00017.gguf",
+          "bytes": 37036116608,
+          "sha256": "28fdfe3cfb5efe93c0feba3324b4b5bf62663cb8a4c5b13f7a9e933d4e7e8519"
+        }
+      ]
+    }
+  ],
+  "default_quant": "IQ2_XXS",
+  "layer_weight_bytes": 114872940736,
+  "shared_weight_bytes": 0,
+  "default_gguf": "UD-IQ2_XXS/Qwen3.5-397B-A17B-UD-IQ2_XXS-00001-of-00004.gguf",
+  "sources": [
+    {
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "quant": "IQ2_XXS"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "quant": "IQ2_M"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "quant": "IQ3_XXS"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "quant": "IQ3_S"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "quant": "Q3_K_S"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "quant": "Q3_K_M"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "quant": "Q3_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "quant": "IQ4_XS"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "quant": "IQ4_NL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "quant": "Q4_K_S"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "quant": "MXFP4_MOE"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "quant": "Q4_K_M"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "quant": "Q4_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "quant": "Q5_K_S"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "quant": "Q5_K_M"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "quant": "Q5_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "quant": "Q6_K"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "quant": "Q6_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "quant": "Q8_0"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "quant": "Q8_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+      "quant": "BF16"
+    }
+  ]
+}

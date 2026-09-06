@@ -855,87 +855,6 @@ fn find_seq(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-const UI_TEST_DISCLOSURE: &str =
-    "idletoken-client: *** TEST OVERRIDE ACTIVE *** IDLETOKEN_UI_TEST directives enabled";
-static UI_TEST_DIRECTIVES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-
-fn initialize_ui_test_directives(raw: Option<&str>, disclose: impl FnOnce(&str)) -> Vec<String> {
-    let directives: Vec<String> = raw
-        .map(|value| {
-            value
-                .split(',')
-                .map(|item| item.trim().to_string())
-                .filter(|item| !item.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    if !directives.is_empty() {
-        // Deliberately fixed text: directives can contain API tokens, model
-        // paths and pairing material, none of which belongs in this banner.
-        disclose(UI_TEST_DISCLOSURE);
-    }
-    directives
-}
-
-fn configured_ui_test_directives() -> &'static [String] {
-    UI_TEST_DIRECTIVES
-        .get_or_init(|| {
-            let raw = std::env::var("IDLETOKEN_UI_TEST").ok();
-            initialize_ui_test_directives(raw.as_deref(), |line| eprintln!("{line}"))
-        })
-        .as_slice()
-}
-
-/// UI-test channel (acceptance §8): expose the launcher's IDLETOKEN_UI_TEST
-/// directive list to the frontend, which executes them through the same
-/// provider paths user actions take. The list is snapshotted and, when non-empty,
-/// disclosed at process entry before Tauri can return any directive. Unset or
-/// empty = no output and no effect.
-#[tauri::command]
-fn ui_test_directives() -> Vec<String> {
-    configured_ui_test_directives().to_vec()
-}
-
-#[cfg(test)]
-mod ui_test_disclosure_tests {
-    use super::{initialize_ui_test_directives, UI_TEST_DISCLOSURE};
-
-    #[test]
-    fn unset_empty_and_separator_only_directives_stay_silent() {
-        for raw in [None, Some(""), Some("   "), Some(" , , ")] {
-            let mut disclosures = Vec::new();
-            let directives =
-                initialize_ui_test_directives(raw, |line| disclosures.push(line.to_string()));
-            assert!(directives.is_empty());
-            assert!(disclosures.is_empty());
-        }
-    }
-
-    #[test]
-    fn non_empty_directives_are_disclosed_once_without_their_contents() {
-        let secret = "pairing-create:ABC234:apiToken=do-not-log,quit:10";
-        let mut disclosures = Vec::new();
-        let directives =
-            initialize_ui_test_directives(Some(secret), |line| disclosures.push(line.to_string()));
-
-        assert_eq!(disclosures, [UI_TEST_DISCLOSURE]);
-        assert_eq!(
-            directives,
-            ["pairing-create:ABC234:apiToken=do-not-log", "quit:10"]
-        );
-        assert!(!disclosures[0].contains("ABC234"));
-        assert!(!disclosures[0].contains("do-not-log"));
-    }
-}
-
-/// Sink for UI-test assertions: the frontend reports structured results here
-/// and they land on the client's stderr, where acceptance.sh can grep them.
-/// Print-only, no side effects; unused outside IDLETOKEN_UI_TEST runs.
-#[tauri::command]
-fn ui_test_report(tag: String, data: String) {
-    eprintln!("UI_TEST_REPORT {tag} {data}");
-}
-
 /// One-click diagnostics bundle (for support): everything needed to debug an
 /// incident, collected into a single JSON the user can simply send over.
 ///
@@ -1028,7 +947,6 @@ async fn http_get_json(url: &str) -> Result<Value, String> {
 }
 
 fn main() {
-    let _ = configured_ui_test_directives();
     // NVIDIA Linux (DGX, and any GTX/RTX desktop): WebKitGTK's DMA-BUF
     // renderer produces a fully blank window — no error, no log, just white.
     // Documented workaround is this env var; setting it here means installing
@@ -1142,8 +1060,6 @@ fn main() {
             api_capability,
             api_chat_cancel,
             platform_http,
-            ui_test_directives,
-            ui_test_report,
             collect_diagnostics,
             engine::engine_start,
             engine::engine_stop,

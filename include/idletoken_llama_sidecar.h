@@ -96,9 +96,15 @@ typedef struct idletoken_llama idletoken_llama;   /* opaque; one per sidecar */
  * --rope-scaling yarn with the matching scale. 0 = no scaling (ctx_size is
  * within the trained window).
  *
- * `gpu_only`: the sole product mode. The spawn adds `--poll 0`; fully-offloaded
- * engine CPU threads otherwise busy-wait between GPU kernels (measured: 11.9
- * spinning cores on a 5060 Ti at 12 threads).
+ * `gpu_only`: true for the normal full-device path. The spawn adds `--poll 0`;
+ * fully-offloaded engine CPU threads otherwise busy-wait between GPU kernels
+ * (measured: 11.9 spinning cores on a 5060 Ti at 12 threads). False is valid
+ * only with `n_cpu_moe > 0`, the single-machine MoE Hybrid path.
+ *
+ * `n_cpu_moe`: 0 for GPU-only and every cluster launch; otherwise the exact
+ * leading block count selected from the local GGUF tensor directory. Spawn
+ * adds `--n-cpu-moe N --load-mode none` (the pinned engine's faster loading
+ * path for CPU tensor overrides). Generic CPU layer offload is never enabled.
  *
  * `ngl_arg`: optional coordinator-computed -ngl value. NULL/empty resolves to
  * 99. Both spawn implementations also force `--fit off`, so neither single nor
@@ -113,16 +119,16 @@ idletoken_llama *idletoken_llama_start(const char *bin, const char *gguf,
                                        int port, const char *engine_sock,
                                        uint32_t ctx_size, uint32_t yarn_orig_ctx,
                                        int n_parallel, int gpu_only,
+                                       uint32_t n_cpu_moe,
                                        const char *ngl_arg,
                                        const char *cluster_args,
                                        const char *log_path, int shared,
                                        const char *grow_dir,
                                        char *err, size_t err_cap);
 
-/* Restart the engine with a LARGER per-slot context — the GPU_ONLY -> HYBRID
- * mode switch (docs/ctx-ladder-handoff-2026-08.md §3.2). Not a crash: the
- * child is stopped and respawned with `-c new_ctx * n_parallel` (gpu_only
- * cleared, so the respawn polls normally) without touching the quick-crash
+/* Restart the engine with a LARGER per-slot context. Not a crash: the child is
+ * stopped and respawned with `-c new_ctx * n_parallel`, preserving the
+ * existing GPU-only or MoE-expert placement, without touching the quick-crash
  * counter or the restart backoff, then this call waits (boundedly) for the
  * respawned engine to answer {"status":"ok"}.
  *

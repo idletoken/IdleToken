@@ -26,7 +26,8 @@ static int tiers_for(const idletoken_model_spec *m, uint32_t *out) {
     return n;
 }
 
-/* Best GPU-only verdict for one (model, quant). */
+/* Best product verdict for one (model, quant). On one discrete machine an MoE
+ * row may be HYBRID; cluster and dense rows remain GPU-only-or-no. */
 static void judge(const idletoken_model_spec *m, const char *quant,
                   const idletoken_node_mem *nodes, int n_nodes,
                   idletoken_advice_row *row) {
@@ -41,7 +42,7 @@ static void judge(const idletoken_model_spec *m, const char *quant,
     for (int i = 0; i < nt; i++) {
         const idletoken_mode got = idletoken_mode_decide_quant(
             m, quant, nodes, n_nodes, tiers[i], NULL, NULL, 0);
-        if (got == IDLETOKEN_MODE_GPU_ONLY) {
+        if (got == IDLETOKEN_MODE_GPU_ONLY || got == IDLETOKEN_MODE_HYBRID) {
             row->mode = got;
             row->max_ctx = tiers[i];
             row->need_bytes = idletoken_needed_bytes_quant(
@@ -131,6 +132,7 @@ static void size_word(uint64_t bytes, char out[16]) {
 static const char *mode_word(const idletoken_advice_row *r) {
     if (r->unavailable)                  return "not in this build";
     if (r->mode == IDLETOKEN_MODE_GPU_ONLY) return "yes (GPU only)";
+    if (r->mode == IDLETOKEN_MODE_HYBRID)   return "yes (MoE Hybrid)";
     return "no";
 }
 
@@ -172,6 +174,8 @@ void idletoken_advise_print(const idletoken_advice_row *rows, int n,
                mode_word(r), ctx, note);
     }
     printf("\n  \"yes (GPU only)\" means the full service fits in GPU memory.\n"
+           "  \"yes (MoE Hybrid)\" is single-machine only: routed experts may\n"
+           "  use system RAM after the GGUF tensor layout is checked at startup.\n"
            "  \"no\" tells you how much GPU memory is missing — for a cluster\n"
            "  model, adding another machine adds its memory to the pool.\n"
            "  Models marked \"runs on one machine\" are served by a single node:\n"
@@ -200,6 +204,7 @@ int idletoken_advise_json(const idletoken_advice_row *rows, int n, int n_nodes,
              i ? "," : "", r->model_id, r->label, r->quant,
              r->unavailable ? "unavailable"
                : r->mode == IDLETOKEN_MODE_GPU_ONLY ? "gpu_only"
+               : r->mode == IDLETOKEN_MODE_HYBRID ? "hybrid"
                : "no",
              r->max_ctx,
              (unsigned long long)r->weight_bytes,

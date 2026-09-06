@@ -233,17 +233,20 @@ typedef struct {
     uint64_t ram_total;
     uint64_t ram_used_other;     /* MemTotal - MemAvailable */
     uint64_t ram_usable;         /* ram_total - ram_used_other - safety */
-    /* Measured ceiling on pinned (cudaHostAlloc) host memory; 0 = unknown.
+    /* Legacy measured ceiling on pinned (cudaHostAlloc) host memory; 0 =
+     * unknown. The retired generic layer-spill backend used this field. The
+     * llama.cpp MoE-only Hybrid path mmaps expert weights and is bounded by
+     * ram_usable instead; clusters never add either host pool to GPU capacity.
+     * It is retained on the wire for compatibility and historical diagnostics.
      *
-     * HYBRID spills every layer that will not fit in VRAM into pinned memory,
-     * so THIS, not ram_usable, is what bounds a node's host-side share. It is
+     * The old path showed why physical RAM cannot stand in for pinned RAM: it is
      * far below physical RAM and not derivable from it: measured 47616 MiB on a
      * 65190 MiB box (73.0%) and 23552 MiB on a 48897 MiB box (48.2%), same GPU
      * model, each exactly reproducible across runs. Neither physical memory
      * (the smaller box still had 22 GiB free when it failed), nor the commit
      * limit, nor pagefile size predicts it.
      *
-     * Measuring means allocating until failure, so it is done once and cached
+     * Measuring means allocating until failure, so legacy builds cache it
      * (see worker_main.c). 0 means "not measured" and callers must treat the
      * host side as unconstrained — the behaviour before this field existed. */
     uint64_t ram_pinnable;

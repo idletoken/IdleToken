@@ -1,0 +1,382 @@
+{
+  "id": "qwen3.5-2b",
+  "label": "Qwen3.5 2B",
+  "family": "qwen3.5",
+  "backend": "llamacpp",
+  "arch": "qwen35",
+  "available": true,
+  "deployment": "cluster",
+  "min_quant": "Q4_K_M",
+  "license": "Apache-2.0",
+  "params_summary": "2B · 24 layers · hybrid linear attention (Gated DeltaNet 3:1 full)",
+  "n_layers": 24,
+  "n_embd": 2048,
+  "hc_streams": 1,
+  "n_vocab": 248320,
+  "context_max": 262144,
+  "context_yarn_max": 1048576,
+  "attn": {
+    "kind": "hybrid",
+    "full_attention_interval": 4,
+    "full": {
+      "kind": "gqa",
+      "n_head": 8,
+      "n_head_kv": 2,
+      "head_dim": 256,
+      "qk_norm": true,
+      "rope_dim_partial": 64,
+      "out_gate": "sigmoid"
+    },
+    "linear": {
+      "kind": "gated_deltanet",
+      "k_heads": 16,
+      "k_dim": 128,
+      "v_heads": 16,
+      "v_dim": 128,
+      "conv_kernel": 4,
+      "z_gate": "silu"
+    }
+  },
+  "kv": {
+    "kind": "hybrid",
+    "bytes_per_token_per_layer": 2048,
+    "state_bytes_per_layer": 1122304,
+    "full_attention_interval": 4
+  },
+  "moe": null,
+  "rope_theta": 10000000,
+  "split": {
+    "boundary_multiple": 0
+  },
+  "overhead_base_bytes": 1073741824,
+  "compute_bytes_128k_cuda": [
+    516947968,
+    516947968,
+    516947968
+  ],
+  "compute_bytes_256k_cuda": [
+    516947968,
+    834960097,
+    834960097
+  ],
+  "compute_bytes_1m_cuda": [
+    1120046940,
+    3250879201,
+    3250879201
+  ],
+  "compute_bytes_128k_metal": [
+    516947968,
+    516947968,
+    516947968
+  ],
+  "compute_bytes_256k_metal": [
+    516947968,
+    516947968,
+    516947968
+  ],
+  "compute_bytes_1m_metal": [
+    1124167844,
+    1124440474,
+    1124440474
+  ],
+  "chat_template": "gguf",
+  "notes": [
+    "Architecture and cache geometry were read from the official Qwen config and the published GGUF header; the pinned llama.cpp identifies it as qwen35 with 24 blocks.",
+    "The default is the smallest supported 2-bit-class quantization, IQ2_XXS. Sub-2-bit variants are intentionally excluded from the curated menu.",
+    "Onboarded from pinned official config and GGUF metadata under the repeated-architecture policy: qwen35 is already supported by the pinned llama.cpp; no full-weight download is required for this additional size."
+  ],
+  "variants": [
+    {
+      "quant": "IQ2_XXS",
+      "layer_weight_bytes": 768270592,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "gguf": "Qwen3.5-2B-UD-IQ2_XXS.gguf",
+      "sha256": "43aedbd2b03a3c2cc39f49ccf74fcd3c394ed0b2a1ede8a30ee652ee9cfc27ef",
+      "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae"
+    },
+    {
+      "quant": "IQ2_M",
+      "layer_weight_bytes": 859857152,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "gguf": "Qwen3.5-2B-UD-IQ2_M.gguf",
+      "sha256": "7df5673b6c1a8efb3b5f5988a506d991ab936b3e00ad29f94e0f75cfbf8599da",
+      "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae"
+    },
+    {
+      "quant": "IQ3_XXS",
+      "layer_weight_bytes": 931823872,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "gguf": "Qwen3.5-2B-UD-IQ3_XXS.gguf",
+      "sha256": "36347f47f9eab7d433c7c37be1f87ac2253378c3d530da3cb25fb5f71f8f1a58",
+      "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae"
+    },
+    {
+      "quant": "Q2_K_XL",
+      "layer_weight_bytes": 966533376,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "gguf": "Qwen3.5-2B-UD-Q2_K_XL.gguf",
+      "sha256": "dbcf28421dece9c86884f9da5a2291c8214be7920623f1fcb663ed8f58b38ccb",
+      "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae"
+    },
+    {
+      "quant": "Q3_K_S",
+      "layer_weight_bytes": 1030947072,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "gguf": "Qwen3.5-2B-Q3_K_S.gguf",
+      "sha256": "21026bce70a757887bce861047c26966109206ebe2adeb7b662de9a179952d28",
+      "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae"
+    },
+    {
+      "quant": "Q3_K_M",
+      "layer_weight_bytes": 1107149056,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "gguf": "Qwen3.5-2B-Q3_K_M.gguf",
+      "sha256": "8b049f98461020b7e15797e13413fc63b9b500ffa883c74618b618ecbc2bfccf",
+      "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae"
+    },
+    {
+      "quant": "Q3_K_XL",
+      "layer_weight_bytes": 1159274752,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "gguf": "Qwen3.5-2B-UD-Q3_K_XL.gguf",
+      "sha256": "d34e1271b7ca784d739b2b7e804bac391d7b6471e695d88e8c79eae0df032263",
+      "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae"
+    },
+    {
+      "quant": "IQ4_XS",
+      "layer_weight_bytes": 1172996352,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "gguf": "Qwen3.5-2B-IQ4_XS.gguf",
+      "sha256": "3639f34b5ca22aa1c51f3616566eae8c355111554f6924ad97ee2652ed11c1cd",
+      "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae"
+    },
+    {
+      "quant": "IQ4_NL",
+      "layer_weight_bytes": 1213300992,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "gguf": "Qwen3.5-2B-IQ4_NL.gguf",
+      "sha256": "e430d87ebc5abbb269c2e2461f1a49b9c5dc79847c13c786dc3615d0b116c4ba",
+      "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae"
+    },
+    {
+      "quant": "Q4_0",
+      "layer_weight_bytes": 1214873856,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "gguf": "Qwen3.5-2B-Q4_0.gguf",
+      "sha256": "cd70221bebaee0503e0f6717e174250cd7825aa88438b3aabec9ad55731d9bb1",
+      "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae"
+    },
+    {
+      "quant": "Q4_K_S",
+      "layer_weight_bytes": 1217757440,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "gguf": "Qwen3.5-2B-Q4_K_S.gguf",
+      "sha256": "56eee7b85a2023ba393c5f9a5a5e372e3645e7925a13adb4d13723fc5bc14124",
+      "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae"
+    },
+    {
+      "quant": "Q4_K_M",
+      "layer_weight_bytes": 1280835840,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "gguf": "Qwen3.5-2B-Q4_K_M.gguf",
+      "sha256": "aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223",
+      "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae"
+    },
+    {
+      "quant": "Q4_1",
+      "layer_weight_bytes": 1293517056,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "gguf": "Qwen3.5-2B-Q4_1.gguf",
+      "sha256": "93a49bfdb0619305584b81608a2d8c931fdcfc0bd4b0d75f25ac2d8988199278",
+      "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae"
+    },
+    {
+      "quant": "Q4_K_XL",
+      "layer_weight_bytes": 1339752704,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "gguf": "Qwen3.5-2B-UD-Q4_K_XL.gguf",
+      "sha256": "0af96165ea615bea39a04118d63f0b6d35908aea850ee4a51aa6151d851b8b35",
+      "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae"
+    },
+    {
+      "quant": "Q5_K_S",
+      "layer_weight_bytes": 1384546560,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "gguf": "Qwen3.5-2B-Q5_K_S.gguf",
+      "sha256": "5503c57f038bd201e0583d64d50d4aebba2f628004834cb4d32abb141eb1bfda",
+      "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae"
+    },
+    {
+      "quant": "Q5_K_M",
+      "layer_weight_bytes": 1435238656,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "gguf": "Qwen3.5-2B-Q5_K_M.gguf",
+      "sha256": "1885b3a9195f8cc09da9a7a7a75afdc1e8d5cbf9fc4a499c3961dddea37098ac",
+      "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae"
+    },
+    {
+      "quant": "Q5_K_XL",
+      "layer_weight_bytes": 1466687744,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "gguf": "Qwen3.5-2B-UD-Q5_K_XL.gguf",
+      "sha256": "67bff9774bc55e44af2eee3c448dc054478b45c0607858fc6df5b336b55f36f4",
+      "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae"
+    },
+    {
+      "quant": "Q6_K",
+      "layer_weight_bytes": 1574961408,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "gguf": "Qwen3.5-2B-Q6_K.gguf",
+      "sha256": "fc90339420b4298887aafb307a4291c55440b730133bbffe6ba9630503dcb548",
+      "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae"
+    },
+    {
+      "quant": "Q6_K_XL",
+      "layer_weight_bytes": 1864483072,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "gguf": "Qwen3.5-2B-UD-Q6_K_XL.gguf",
+      "sha256": "2f956e57c27b3f257916825d9d3bc174269f3df9c6fcf87a64da666c0e7a518a",
+      "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae"
+    },
+    {
+      "quant": "Q8_0",
+      "layer_weight_bytes": 2012012800,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "gguf": "Qwen3.5-2B-Q8_0.gguf",
+      "sha256": "1b04acba824817554f4ce23639bc8495ff70453b8fcb047900c731521021f2c1",
+      "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae"
+    },
+    {
+      "quant": "Q8_K_XL",
+      "layer_weight_bytes": 2834940160,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "gguf": "Qwen3.5-2B-UD-Q8_K_XL.gguf",
+      "sha256": "a53988df91157d78acaf3c95e22db179d13f6236061bdb86576494dc99b1bc3b",
+      "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae"
+    },
+    {
+      "quant": "BF16",
+      "layer_weight_bytes": 3775709216,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "gguf": "Qwen3.5-2B-BF16.gguf",
+      "sha256": "dc11be2ca4519954a3e4b013ef59497b5522209987d67891851113eda89619f1",
+      "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae"
+    }
+  ],
+  "default_quant": "IQ2_XXS",
+  "layer_weight_bytes": 768270592,
+  "shared_weight_bytes": 0,
+  "default_gguf": "Qwen3.5-2B-UD-IQ2_XXS.gguf",
+  "sources": [
+    {
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "quant": "IQ2_XXS"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "quant": "IQ2_M"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "quant": "IQ3_XXS"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "quant": "Q2_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "quant": "Q3_K_S"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "quant": "Q3_K_M"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "quant": "Q3_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "quant": "IQ4_XS"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "quant": "IQ4_NL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "quant": "Q4_0"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "quant": "Q4_K_S"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "quant": "Q4_K_M"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "quant": "Q4_1"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "quant": "Q4_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "quant": "Q5_K_S"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "quant": "Q5_K_M"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "quant": "Q5_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "quant": "Q6_K"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "quant": "Q6_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "quant": "Q8_0"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "quant": "Q8_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "quant": "BF16"
+    }
+  ]
+}

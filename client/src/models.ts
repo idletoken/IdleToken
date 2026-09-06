@@ -9,13 +9,18 @@ import dsv4 from "../../models/deepseek-v4-flash.json";
 import dsv4pro from "../../models/deepseek-v4-pro.json";
 import qwen38b from "../../models/qwen3-8b.json";
 import qwen3508b from "../../models/qwen3.5-0.8b.json";
+import qwen352b from "../../models/qwen3.5-2b.json";
 import qwen354b from "../../models/qwen3.5-4b.json";
 import qwen359b from "../../models/qwen3.5-9b.json";
 import qwen3527b from "../../models/qwen3.5-27b.json";
 import qwen3827b from "../../models/qwen3.8-27b.json";
 import qwen3535ba3b from "../../models/qwen3.5-35b-a3b.json";
+import qwen35122ba10b from "../../models/qwen3.5-122b-a10b.json";
+import qwen35397ba17b from "../../models/qwen3.5-397b-a17b.json";
 import glm52 from "../../models/glm-5.2.json";
 import kimiK25 from "../../models/kimi-k2.5.json";
+import gptOss20b from "../../models/gpt-oss-20b.json";
+import gptOss120b from "../../models/gpt-oss-120b.json";
 
 // One selectable precision of a model (small-model-design.md §3.1). The
 // top-level layer_weight_bytes/shared_weight_bytes mirror the default variant,
@@ -148,7 +153,7 @@ export interface ModelSpec {
   params: string; // human summary, e.g. "304B · 13B active"
   totalLayers: number;
   approxWeightsBytes: number;
-  available: boolean; // false = shown greyed out, backend not implemented yet
+  available: boolean; // false = shown greyed out; backend or validation is not ready
   backend: "ds4" | "ds4x" | "llamacpp";
   contextMax: number;
   note?: string;
@@ -164,8 +169,9 @@ export interface ModelSpec {
 // cover this file).
 const MANIFESTS = [
   dsv4, dsv4pro,
-  qwen3508b, qwen354b, qwen38b, qwen359b, qwen3527b, qwen3827b, qwen3535ba3b,
-  glm52, kimiK25,
+  qwen3508b, qwen352b, qwen354b, qwen359b, qwen3527b, qwen3535ba3b,
+  qwen35122ba10b, qwen35397ba17b, qwen38b, qwen3827b,
+  glm52, kimiK25, gptOss20b, gptOss120b,
 ] as ModelManifest[];
 
 /** Parameter counts only — "304B · 13B active", nothing else. The manifest's
@@ -222,9 +228,8 @@ export const MODELS: ModelSpec[] = MANIFESTS.map(toSpec);
 
 /**
  * Families withdrawn from the client (product decision). 2026-08-25: the
- * original Qwen3 generation. 2026-09-02: the whole qwen3.5 generation as well —
- * little of it gets used for agent work, which is the case these endpoints are
- * for. Only qwen3.8 remains offered.
+ * original Qwen3 generation. Qwen3.5 was briefly withdrawn on 2026-09-02 and
+ * restored on 2026-09-05; the complete eight-model family is selectable.
  *
  * Delisted, NOT deleted: the manifests stay imported and the engine registry is
  * untouched, so these can come back by removing a string from the set below.
@@ -236,7 +241,7 @@ export const MODELS: ModelSpec[] = MANIFESTS.map(toSpec);
  * settings loader migrate a stored selection of a delisted model back to the
  * default model.
  */
-const DELISTED_FAMILIES = new Set(["qwen3", "qwen3.5"]);
+const DELISTED_FAMILIES = new Set(["qwen3"]);
 
 /**
  * The models a user can actually pick.
@@ -256,7 +261,7 @@ export const AVAILABLE_MODELS: ModelSpec[] = MODELS.filter(
 /**
  * Models grouped into picker cards (2026-08-15; regrouped 2026-08-21).
  *
- * Flat, the catalogue is now ~10 models × up to 26 precisions — a single list
+ * Flat, the catalogue is now 16 models × up to 26 precisions — a single list
  * ran off the screen and buried the choice that actually matters first ("which
  * model?"), then second ("how big?"), then last ("how precise?").
  *
@@ -298,7 +303,8 @@ export interface ModelBrand {
 const BRAND_OF: { family: string; id: string; label: string }[] = [
   { family: "qwen3.8", id: "qwen3.8", label: "Qwen3.8" },
   { family: "qwen3.5", id: "qwen3.5", label: "Qwen3.5" },
-  { family: "deepseek", id: "deepseek", label: "DeepSeek" },
+  { family: "deepseek", id: "deepseek-v4", label: "DeepSeek V4" },
+  { family: "gpt-oss", id: "gpt-oss", label: "GPT-OSS" },
   { family: "kimi", id: "kimi", label: "Kimi" },
   { family: "glm", id: "glm", label: "GLM" },
 ];
@@ -358,6 +364,12 @@ export function getModel(id: string): ModelSpec {
 
 export function getManifest(id: string): ModelManifest {
   return MANIFESTS.find((m) => m.id === id) ?? MANIFESTS[0];
+}
+
+/** Exact-id MoE check for placement/resource UI. Unlike getManifest(), an
+ * unknown id must not inherit the default model's architecture. */
+export function isMoeModel(id: string): boolean {
+  return MANIFESTS.some((m) => m.id === id && (m.moe?.n_expert ?? 0) > 0);
 }
 
 /**
@@ -595,6 +607,8 @@ export interface CapacityEstimate {
  * fields may still carry RAM for wire compatibility; estimation ignores it. */
 export interface NodeMemory {
   vramFree?: number;
+  ramFree?: number;
+  unifiedMemory?: boolean;
 }
 
 /**
@@ -619,6 +633,35 @@ export function poolVram(nodes: NodeMemory[]): { bytes: number; complete: boolea
       continue;
     }
     bytes += v;
+  }
+  return { bytes, complete };
+}
+
+/**
+ * Cluster MoE Hybrid (routed experts in each owner node's RAM) is OPT-IN until
+ * its real-LAN performance gate passes; the coordinator refuses the placement
+ * unless IDLETOKEN_CLUSTER_MOE_HYBRID=1 is set on the machine that runs it.
+ * This mirrors IDLETOKEN_CLUSTER_MOE_HYBRID_DEFAULT in include/idletoken_plan.h
+ * so the resource card never offers a placement the runtime would refuse;
+ * scripts/moe_local_gate.sh fails when the two values disagree. Flip both in
+ * one commit, together with the evidence in results/.
+ */
+export const CLUSTER_MOE_HYBRID_ENABLED = false;
+
+/** Potential node-local MoE expert pool. Unified-memory members contribute no
+ * second pool; the runtime also filters out older workers that do not advertise
+ * rpc-cpu-v1 and scans the exact GGUF tensor layout before admitting Hybrid. */
+export function poolRam(nodes: NodeMemory[]): { bytes: number; complete: boolean } {
+  let bytes = 0;
+  let complete = nodes.length > 0;
+  for (const n of nodes) {
+    if (n.unifiedMemory) continue;
+    const r = n.ramFree ?? 0;
+    if (r === 0) {
+      complete = false;
+      continue;
+    }
+    bytes += r;
   }
   return { bytes, complete };
 }

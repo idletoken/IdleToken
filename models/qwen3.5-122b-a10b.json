@@ -1,0 +1,630 @@
+{
+  "id": "qwen3.5-122b-a10b",
+  "label": "Qwen3.5 122B-A10B",
+  "family": "qwen3.5",
+  "backend": "llamacpp",
+  "arch": "qwen35moe",
+  "available": true,
+  "deployment": "cluster",
+  "min_quant": "Q4_K_M",
+  "license": "Apache-2.0",
+  "params_summary": "122B total / 10B active · 48 layers · hybrid linear attention + 256-expert MoE",
+  "n_layers": 48,
+  "n_embd": 3072,
+  "hc_streams": 1,
+  "n_vocab": 248320,
+  "context_max": 262144,
+  "context_yarn_max": 1048576,
+  "attn": {
+    "kind": "hybrid",
+    "full_attention_interval": 4,
+    "full": {
+      "kind": "gqa",
+      "n_head": 32,
+      "n_head_kv": 2,
+      "head_dim": 256,
+      "qk_norm": true,
+      "rope_dim_partial": 64,
+      "out_gate": "sigmoid"
+    },
+    "linear": {
+      "kind": "gated_deltanet",
+      "k_heads": 16,
+      "k_dim": 128,
+      "v_heads": 64,
+      "v_dim": 128,
+      "conv_kernel": 4,
+      "z_gate": "silu"
+    }
+  },
+  "kv": {
+    "kind": "hybrid",
+    "bytes_per_token_per_layer": 2048,
+    "state_bytes_per_layer": 4341760,
+    "full_attention_interval": 4
+  },
+  "moe": {
+    "n_expert": 256,
+    "n_expert_used": 8,
+    "n_expert_shared": 1,
+    "expert_ff": 1024,
+    "shared_expert_ff": 1024,
+    "gating": "softmax",
+    "weights_norm": true,
+    "shared_expert_gate": "sigmoid"
+  },
+  "rope_theta": 10000000,
+  "split": {
+    "boundary_multiple": 0
+  },
+  "overhead_base_bytes": 3221225472,
+  "compute_bytes_128k_cuda": [
+    629145600,
+    644874240,
+    644874240
+  ],
+  "compute_bytes_256k_cuda": [
+    521142272,
+    908360417,
+    908360417
+  ],
+  "compute_bytes_1m_cuda": [
+    1193300460,
+    3324279521,
+    3324279521
+  ],
+  "compute_bytes_128k_metal": [
+    521142272,
+    521142272,
+    521142272
+  ],
+  "compute_bytes_256k_metal": [
+    521142272,
+    521142272,
+    521142272
+  ],
+  "compute_bytes_1m_metal": [
+    1194370007,
+    1207676436,
+    1207613522
+  ],
+  "chat_template": "gguf",
+  "notes": [
+    "Architecture and cache geometry were read from the official Qwen config and the published GGUF header; the pinned llama.cpp identifies it as qwen35moe with 48 blocks.",
+    "The default is the smallest supported 2-bit-class quantization, IQ2_XXS. The published IQ1_M artifact is intentionally excluded from the curated menu.",
+    "Onboarded from pinned official config and GGUF metadata under the repeated-architecture policy: qwen35moe is already supported by the pinned llama.cpp; no full-weight download is required for this additional size."
+  ],
+  "variants": [
+    {
+      "quant": "IQ2_XXS",
+      "layer_weight_bytes": 36637668544,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "gguf": "Qwen3.5-122B-A10B-UD-IQ2_XXS.gguf",
+      "sha256": "3a67140a6be1e51716ef28d32f52e3190295557c3ed04c8444a3a38eb82b756c",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b"
+    },
+    {
+      "quant": "IQ2_M",
+      "layer_weight_bytes": 39148942528,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "gguf": "Qwen3.5-122B-A10B-UD-IQ2_M.gguf",
+      "sha256": "5466fa1ac7d2dc7c213db5f3030190af5a7107ca85e9ab28b39fe7cd9c97446e",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b"
+    },
+    {
+      "quant": "Q2_K_XL",
+      "layer_weight_bytes": 41845347520,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "gguf": "Qwen3.5-122B-A10B-UD-Q2_K_XL.gguf",
+      "sha256": "be44a62acb10d79f501d75ef3faee0219b50b305352f3db4bad13f76591121bd",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b"
+    },
+    {
+      "quant": "IQ3_XXS",
+      "layer_weight_bytes": 44745020608,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "gguf": "Qwen3.5-122B-A10B-UD-IQ3_XXS.gguf",
+      "sha256": "a40f83c53128a739814132f30a442b029d02ff3224e32d0f52946427d48efe3c",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b"
+    },
+    {
+      "quant": "IQ3_S",
+      "layer_weight_bytes": 46556959936,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "gguf": "Qwen3.5-122B-A10B-UD-IQ3_S.gguf",
+      "sha256": "5e810f890244ce3e3699f1e9a3611fa6567a8f50123523a9fcf9bf4175d89947",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b"
+    },
+    {
+      "quant": "Q3_K_S",
+      "layer_weight_bytes": 52495013376,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "gguf": "Q3_K_S/Qwen3.5-122B-A10B-Q3_K_S-00001-of-00003.gguf",
+      "sha256": "6a03e7a53875ad49d03d893b55db4c2341077d3ca1ded2653ff219cac4a2ef86",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "parts": [
+        {
+          "file": "Q3_K_S/Qwen3.5-122B-A10B-Q3_K_S-00002-of-00003.gguf",
+          "bytes": 49700928800,
+          "sha256": "829930ef628eb0e5704d7b140eb5b8e01d32936e1aa4096c6b99f038f00e4c9a"
+        },
+        {
+          "file": "Q3_K_S/Qwen3.5-122B-A10B-Q3_K_S-00003-of-00003.gguf",
+          "bytes": 2783141024,
+          "sha256": "5b81241abeaa770cd7cc3f546dcd8efbb7dae5c6828fbd8f3e76977fce4ca9ac"
+        }
+      ]
+    },
+    {
+      "quant": "Q3_K_M",
+      "layer_weight_bytes": 56420881952,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "gguf": "Q3_K_M/Qwen3.5-122B-A10B-Q3_K_M-00001-of-00003.gguf",
+      "sha256": "e70ec702564603c9b24b03d7b456fb6ed7b9b18fc32867e350a29961c45fd3ed",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "parts": [
+        {
+          "file": "Q3_K_M/Qwen3.5-122B-A10B-Q3_K_M-00002-of-00003.gguf",
+          "bytes": 49587318592,
+          "sha256": "f8c42a060c826b8526dd72e363b87ac23e9753f622b641af2d4ae037e435fa8b"
+        },
+        {
+          "file": "Q3_K_M/Qwen3.5-122B-A10B-Q3_K_M-00003-of-00003.gguf",
+          "bytes": 6822619808,
+          "sha256": "419e7efab336499ae3a6fc25924fdf65b3954ed301f3b227bae1f83f88049bbf"
+        }
+      ]
+    },
+    {
+      "quant": "Q3_K_XL",
+      "layer_weight_bytes": 56970536480,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "gguf": "UD-Q3_K_XL/Qwen3.5-122B-A10B-UD-Q3_K_XL-00001-of-00003.gguf",
+      "sha256": "e70ec702564603c9b24b03d7b456fb6ed7b9b18fc32867e350a29961c45fd3ed",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "parts": [
+        {
+          "file": "UD-Q3_K_XL/Qwen3.5-122B-A10B-UD-Q3_K_XL-00002-of-00003.gguf",
+          "bytes": 49772068672,
+          "sha256": "94e50d2d9e65e216dc3ced9cd8cae8a5036e9c27b651c8f63ad7eb785a421f01"
+        },
+        {
+          "file": "UD-Q3_K_XL/Qwen3.5-122B-A10B-UD-Q3_K_XL-00003-of-00003.gguf",
+          "bytes": 7187524256,
+          "sha256": "fd42cf1f8bae5ce0b4d4d3f39cc066745c41dfd7311785c72745887700377b06"
+        }
+      ]
+    },
+    {
+      "quant": "IQ4_XS",
+      "layer_weight_bytes": 60229510656,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "gguf": "UD-IQ4_XS/Qwen3.5-122B-A10B-UD-IQ4_XS-00001-of-00003.gguf",
+      "sha256": "1bd4c860d2300566087683d8b971830eaea466eec8f8c5ee69f9ddc2bcea3613",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "parts": [
+        {
+          "file": "UD-IQ4_XS/Qwen3.5-122B-A10B-UD-IQ4_XS-00002-of-00003.gguf",
+          "bytes": 49719606080,
+          "sha256": "1f77e62d600cb255e327e76ffa058755d1de2b8a1872dd58c89eeb5f8c90e7e8"
+        },
+        {
+          "file": "UD-IQ4_XS/Qwen3.5-122B-A10B-UD-IQ4_XS-00003-of-00003.gguf",
+          "bytes": 10498961024,
+          "sha256": "c644a84cedb93cb85aaedc9bf711d6a388d8205a59566638a9eb1f5c8afd04f2"
+        }
+      ]
+    },
+    {
+      "quant": "IQ4_NL",
+      "layer_weight_bytes": 61437470208,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "gguf": "UD-IQ4_NL/Qwen3.5-122B-A10B-UD-IQ4_NL-00001-of-00003.gguf",
+      "sha256": "fc335f1c4e1ea2979f61c5258094e4d1c30908396b210c2680450f859bce4015",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "parts": [
+        {
+          "file": "UD-IQ4_NL/Qwen3.5-122B-A10B-UD-IQ4_NL-00002-of-00003.gguf",
+          "bytes": 49809599168,
+          "sha256": "8f2a1eb4d6cc73187e94926be9fa9d39d74ac05159814be0395943a223e141dc"
+        },
+        {
+          "file": "UD-IQ4_NL/Qwen3.5-122B-A10B-UD-IQ4_NL-00003-of-00003.gguf",
+          "bytes": 11616927488,
+          "sha256": "4f29b916cc5c31d1123fee0ed4ffa1afe7e3f98314cdaf75aa2d5d7fe14c0dd7"
+        }
+      ]
+    },
+    {
+      "quant": "Q4_K_S",
+      "layer_weight_bytes": 71705126400,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "gguf": "Q4_K_S/Qwen3.5-122B-A10B-Q4_K_S-00001-of-00003.gguf",
+      "sha256": "7ce20cdf3b3becc14f5e3db79c3f9200c2e98c80cb7a5811a8f1caf90163e24d",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "parts": [
+        {
+          "file": "Q4_K_S/Qwen3.5-122B-A10B-Q4_K_S-00002-of-00003.gguf",
+          "bytes": 49808112224,
+          "sha256": "d44186dad0237821aec4ef172f009abce34a67c7cfc7aeb340f46d580e6fa876"
+        },
+        {
+          "file": "Q4_K_S/Qwen3.5-122B-A10B-Q4_K_S-00003-of-00003.gguf",
+          "bytes": 21886070624,
+          "sha256": "d8056a5b30681878dd7aa805290b67114d838660d14523bcb56f4bb1cc1aaab3"
+        }
+      ]
+    },
+    {
+      "quant": "MXFP4_MOE",
+      "layer_weight_bytes": 74664408608,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "gguf": "MXFP4_MOE/Qwen3.5-122B-A10B-MXFP4_MOE-00001-of-00003.gguf",
+      "sha256": "467c9bd92ea518539cf75bf5a5fbfbd35e9a0b40d766ccaa67bf120e12041df3",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "parts": [
+        {
+          "file": "MXFP4_MOE/Qwen3.5-122B-A10B-MXFP4_MOE-00002-of-00003.gguf",
+          "bytes": 49639075904,
+          "sha256": "96826e65ea619e50311763d56332ecf13f274b4d383fa3981b2c842d5c7a41fd"
+        },
+        {
+          "file": "MXFP4_MOE/Qwen3.5-122B-A10B-MXFP4_MOE-00003-of-00003.gguf",
+          "bytes": 25014389152,
+          "sha256": "e3d0c53a236f6628928918ff3db806ab410b2b337d5e041076f57d9296ce47f5"
+        }
+      ]
+    },
+    {
+      "quant": "Q4_K_M",
+      "layer_weight_bytes": 76536964608,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "gguf": "Q4_K_M/Qwen3.5-122B-A10B-Q4_K_M-00001-of-00003.gguf",
+      "sha256": "467c9bd92ea518539cf75bf5a5fbfbd35e9a0b40d766ccaa67bf120e12041df3",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "parts": [
+        {
+          "file": "Q4_K_M/Qwen3.5-122B-A10B-Q4_K_M-00002-of-00003.gguf",
+          "bytes": 49968146912,
+          "sha256": "90db14846413aebdac365b57206441437cac5f7e5037d94b325f0167f902e6e7"
+        },
+        {
+          "file": "Q4_K_M/Qwen3.5-122B-A10B-Q4_K_M-00003-of-00003.gguf",
+          "bytes": 26557874144,
+          "sha256": "e3c24b8ebec070bb4f69ea0aca25a16531da7440cd515529953e046882901f97"
+        }
+      ]
+    },
+    {
+      "quant": "Q4_K_XL",
+      "layer_weight_bytes": 77029996032,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "gguf": "UD-Q4_K_XL/Qwen3.5-122B-A10B-UD-Q4_K_XL-00001-of-00003.gguf",
+      "sha256": "467c9bd92ea518539cf75bf5a5fbfbd35e9a0b40d766ccaa67bf120e12041df3",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "parts": [
+        {
+          "file": "UD-Q4_K_XL/Qwen3.5-122B-A10B-UD-Q4_K_XL-00002-of-00003.gguf",
+          "bytes": 49640779424,
+          "sha256": "ecdbd42d43b0df9fa0ef9a584e09e95a43966ef03a122aba0b87a99d44d9ad98"
+        },
+        {
+          "file": "UD-Q4_K_XL/Qwen3.5-122B-A10B-UD-Q4_K_XL-00003-of-00003.gguf",
+          "bytes": 27378273056,
+          "sha256": "13300e0f059e6fa21aa0fabde2a554f9deea366c0e54f268045769b214b28c97"
+        }
+      ]
+    },
+    {
+      "quant": "Q5_K_S",
+      "layer_weight_bytes": 86385391136,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "gguf": "Q5_K_S/Qwen3.5-122B-A10B-Q5_K_S-00001-of-00003.gguf",
+      "sha256": "05d04b7960379f0e7fefe6322440170f5c642e374c50528618fed11b91508e59",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "parts": [
+        {
+          "file": "Q5_K_S/Qwen3.5-122B-A10B-Q5_K_S-00002-of-00003.gguf",
+          "bytes": 49943378208,
+          "sha256": "ea48fef91f5688ffa2af298f65490939fe1b69c7f478a3dd9d982c0cf5bb75e7"
+        },
+        {
+          "file": "Q5_K_S/Qwen3.5-122B-A10B-Q5_K_S-00003-of-00003.gguf",
+          "bytes": 36431069376,
+          "sha256": "71882fc100f60a7b184c2b16a6fb6ef701f87a6dc2d33202995eb72ae2005f49"
+        }
+      ]
+    },
+    {
+      "quant": "Q5_K_M",
+      "layer_weight_bytes": 91519219200,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "gguf": "Q5_K_M/Qwen3.5-122B-A10B-Q5_K_M-00001-of-00003.gguf",
+      "sha256": "aaddf5fad610b8d681b41547f3e9a30988ce4419438e44e089cafb83843dc6e8",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "parts": [
+        {
+          "file": "Q5_K_M/Qwen3.5-122B-A10B-Q5_K_M-00002-of-00003.gguf",
+          "bytes": 49730924512,
+          "sha256": "fc8f3008ec634667f1f931b8537154e7b25b683e5e1a99987e5388612dc5117c"
+        },
+        {
+          "file": "Q5_K_M/Qwen3.5-122B-A10B-Q5_K_M-00003-of-00003.gguf",
+          "bytes": 41777351136,
+          "sha256": "ec7e3d620d8c4e926c48f7c2d3690fe7361fd3d298e99c04d1aef02feeda8d85"
+        }
+      ]
+    },
+    {
+      "quant": "Q5_K_XL",
+      "layer_weight_bytes": 91928163840,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "gguf": "UD-Q5_K_XL/Qwen3.5-122B-A10B-UD-Q5_K_XL-00001-of-00003.gguf",
+      "sha256": "aaddf5fad610b8d681b41547f3e9a30988ce4419438e44e089cafb83843dc6e8",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "parts": [
+        {
+          "file": "UD-Q5_K_XL/Qwen3.5-122B-A10B-UD-Q5_K_XL-00002-of-00003.gguf",
+          "bytes": 49730924512,
+          "sha256": "fc8f3008ec634667f1f931b8537154e7b25b683e5e1a99987e5388612dc5117c"
+        },
+        {
+          "file": "UD-Q5_K_XL/Qwen3.5-122B-A10B-UD-Q5_K_XL-00003-of-00003.gguf",
+          "bytes": 42186295776,
+          "sha256": "d2d333a474b940936d58f81aafa64c48ae19b07abdf7294f5c98f51d6fa3d13d"
+        }
+      ]
+    },
+    {
+      "quant": "Q6_K",
+      "layer_weight_bytes": 101009782432,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "gguf": "Q6_K/Qwen3.5-122B-A10B-Q6_K-00001-of-00004.gguf",
+      "sha256": "72b6bd33099fc33de1bc0e1ca512ac438e76718ad454ff7162e522720d8001c8",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "parts": [
+        {
+          "file": "Q6_K/Qwen3.5-122B-A10B-Q6_K-00002-of-00004.gguf",
+          "bytes": 49978880768,
+          "sha256": "5e71fbfa73f7c9ffc4d4346581e355c1c3d86674c3d19647d075b6749348be04"
+        },
+        {
+          "file": "Q6_K/Qwen3.5-122B-A10B-Q6_K-00003-of-00004.gguf",
+          "bytes": 49688896768,
+          "sha256": "c8b2bb81a19e4642f194abc8c00b23491ae01e29bba879008f15380122c119fb"
+        },
+        {
+          "file": "Q6_K/Qwen3.5-122B-A10B-Q6_K-00004-of-00004.gguf",
+          "bytes": 1331061344,
+          "sha256": "a8902ddcfee5a906ae0be7d55b2f58a2b306b2c6b62197f3edde8e3852f9b8ab"
+        }
+      ]
+    },
+    {
+      "quant": "Q6_K_XL",
+      "layer_weight_bytes": 112401249920,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "gguf": "UD-Q6_K_XL/Qwen3.5-122B-A10B-UD-Q6_K_XL-00001-of-00004.gguf",
+      "sha256": "72b6bd33099fc33de1bc0e1ca512ac438e76718ad454ff7162e522720d8001c8",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "parts": [
+        {
+          "file": "UD-Q6_K_XL/Qwen3.5-122B-A10B-UD-Q6_K_XL-00002-of-00004.gguf",
+          "bytes": 49987450912,
+          "sha256": "a77ad76dfbd31565e6bc6fe7b380ae0b1092fdd04410ea016acd2c4f7d006670"
+        },
+        {
+          "file": "UD-Q6_K_XL/Qwen3.5-122B-A10B-UD-Q6_K_XL-00003-of-00004.gguf",
+          "bytes": 49825630496,
+          "sha256": "3b751ddbc1e662fab8dfea10d06d35e8aa4d480a294ee7c1db2115fbd1dfdaae"
+        },
+        {
+          "file": "UD-Q6_K_XL/Qwen3.5-122B-A10B-UD-Q6_K_XL-00004-of-00004.gguf",
+          "bytes": 12577224960,
+          "sha256": "8583d095c8d0289a893265a53f953bce21682adbd9b0e9656cfcadd5776ca7a1"
+        }
+      ]
+    },
+    {
+      "quant": "Q8_0",
+      "layer_weight_bytes": 129871935104,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "gguf": "Q8_0/Qwen3.5-122B-A10B-Q8_0-00001-of-00004.gguf",
+      "sha256": "a6cc4bf06d44a96739a200841d2335fc437fa2d790d0975baba9da8af9e228e1",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "parts": [
+        {
+          "file": "Q8_0/Qwen3.5-122B-A10B-Q8_0-00002-of-00004.gguf",
+          "bytes": 49783204544,
+          "sha256": "81d470090559e5d87459fce8943ccdc9723b7f1b0c643f8289b7d0541ac62a1c"
+        },
+        {
+          "file": "Q8_0/Qwen3.5-122B-A10B-Q8_0-00003-of-00004.gguf",
+          "bytes": 49805778720,
+          "sha256": "824422fa8fe3208b6de2c04d96e1240661b07b74f71ee69f0df1dd48360f66b9"
+        },
+        {
+          "file": "Q8_0/Qwen3.5-122B-A10B-Q8_0-00004-of-00004.gguf",
+          "bytes": 30272008288,
+          "sha256": "be1ed51c1248c7accc053dca8e7f24d1b831fe1e87747c0104da4006123d68ae"
+        }
+      ]
+    },
+    {
+      "quant": "Q8_K_XL",
+      "layer_weight_bytes": 170838161152,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "gguf": "UD-Q8_K_XL/Qwen3.5-122B-A10B-UD-Q8_K_XL-00001-of-00005.gguf",
+      "sha256": "7912a946792c2fcdb5c63596c97aefe680fa0bb2eae6c0c60ffa76f7f41c2479",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "parts": [
+        {
+          "file": "UD-Q8_K_XL/Qwen3.5-122B-A10B-UD-Q8_K_XL-00002-of-00005.gguf",
+          "bytes": 49716898944,
+          "sha256": "59ad6ec60382613e8c0bf692002cfe301057e9b4d938416943cd2ea28d1ec647"
+        },
+        {
+          "file": "UD-Q8_K_XL/Qwen3.5-122B-A10B-UD-Q8_K_XL-00003-of-00005.gguf",
+          "bytes": 49184599296,
+          "sha256": "89c4c27ffa0a478a0de72199ce0a0611361ee24791e93a674678bd6372483b57"
+        },
+        {
+          "file": "UD-Q8_K_XL/Qwen3.5-122B-A10B-UD-Q8_K_XL-00004-of-00005.gguf",
+          "bytes": 49963962272,
+          "sha256": "b74d5bc0a2bad0f8b0cb7a027fc80922860770d3d78361592393d33972b312d3"
+        },
+        {
+          "file": "UD-Q8_K_XL/Qwen3.5-122B-A10B-UD-Q8_K_XL-00005-of-00005.gguf",
+          "bytes": 21961757088,
+          "sha256": "a1dd0addf37701b3089f234d48e777ac92b8f4c6f3e14dd819b915888138c913"
+        }
+      ]
+    },
+    {
+      "quant": "BF16",
+      "layer_weight_bytes": 244314011488,
+      "shared_weight_bytes": 0,
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "gguf": "BF16/Qwen3.5-122B-A10B-BF16-00001-of-00005.gguf",
+      "sha256": "2a8fdc91973d2508123a9a06165d555e0777ce801fc025aa8e6aca23b77da05e",
+      "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+      "parts": [
+        {
+          "file": "BF16/Qwen3.5-122B-A10B-BF16-00002-of-00005.gguf",
+          "bytes": 49928997216,
+          "sha256": "40897a98681b225d693d16b8dce68c355fec3644db3c0001304b503bdcf40b19"
+        },
+        {
+          "file": "BF16/Qwen3.5-122B-A10B-BF16-00003-of-00005.gguf",
+          "bytes": 49928997216,
+          "sha256": "c7cc8c586f4efc74ae72e97687e2d72c08507ac5acb259aeae7b4ef86b347b28"
+        },
+        {
+          "file": "BF16/Qwen3.5-122B-A10B-BF16-00004-of-00005.gguf",
+          "bytes": 49928997248,
+          "sha256": "ea5397eece106f5008d4da9c2c73527c2ff56beed55088183d42461874312a5c"
+        },
+        {
+          "file": "BF16/Qwen3.5-122B-A10B-BF16-00005-of-00005.gguf",
+          "bytes": 44587079424,
+          "sha256": "57730067fe02558dae082c932a11147345375e46c12c24830436e7a20eb9d547"
+        }
+      ]
+    }
+  ],
+  "default_quant": "IQ2_XXS",
+  "layer_weight_bytes": 36637668544,
+  "shared_weight_bytes": 0,
+  "default_gguf": "Qwen3.5-122B-A10B-UD-IQ2_XXS.gguf",
+  "sources": [
+    {
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "quant": "IQ2_XXS"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "quant": "IQ2_M"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "quant": "Q2_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "quant": "IQ3_XXS"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "quant": "IQ3_S"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "quant": "Q3_K_S"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "quant": "Q3_K_M"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "quant": "Q3_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "quant": "IQ4_XS"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "quant": "IQ4_NL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "quant": "Q4_K_S"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "quant": "MXFP4_MOE"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "quant": "Q4_K_M"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "quant": "Q4_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "quant": "Q5_K_S"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "quant": "Q5_K_M"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "quant": "Q5_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "quant": "Q6_K"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "quant": "Q6_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "quant": "Q8_0"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "quant": "Q8_K_XL"
+    },
+    {
+      "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+      "quant": "BF16"
+    }
+  ]
+}

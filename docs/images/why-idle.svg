@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="460" height="600" viewBox="0 0 460 600">
+  <title>Idle GPU sharing compute</title>
+  <rect x="1" y="1" width="458" height="598" rx="28" fill="#F8F9FC" stroke="#E0E4EC" stroke-width="2"/>
+
+  <g>
+    <rect x="72" y="28" width="316" height="120" rx="12" fill="#F2F5F9"/>
+    <g fill="none" stroke="#DDE4EC" stroke-width="1">
+      <path d="M88 64H372M88 86H372M88 108H372"/>
+      <path d="M145 42V128M202 42V128M259 42V128M316 42V128"/>
+    </g>
+    <path d="M88 128H372M88 42V128" fill="none" stroke="#B9C5D3" stroke-width="2" stroke-linecap="round"/>
+    <path d="M108 57C153 57 173 75 201 92C235 112 276 113 352 113" fill="none" stroke="#27867D" stroke-width="4.5" stroke-linecap="round"/>
+    <circle cx="352" cy="113" r="6" fill="#54C6D9"/>
+  </g>
+
+  <g>
+    <rect x="112" y="190" width="236" height="136" rx="16" fill="#FFFFFF" stroke="#24263A" stroke-width="4"/>
+    <rect x="126" y="204" width="208" height="108" rx="9" fill="#F0F2F7"/>
+    <path d="M230 326V352M191 353H269" fill="none" stroke="#24263A" stroke-width="4" stroke-linecap="round"/>
+
+    <g transform="translate(3 12)">
+    <rect x="145" y="226" width="74" height="58" rx="19" fill="#65C7B9" stroke="#287D74" stroke-width="3"/>
+    <rect x="138" y="244" width="8" height="22" rx="3" fill="#263247"/>
+    <rect x="218" y="244" width="8" height="22" rx="3" fill="#263247"/>
+    <path d="M160 226V215M204 226V215" fill="none" stroke="#287D74" stroke-width="3" stroke-linecap="round"/>
+    <circle cx="160" cy="212" r="4.3" fill="#287D74"/>
+    <circle cx="204" cy="212" r="4.3" fill="#287D74"/>
+    <circle cx="164" cy="250" r="9.5" fill="#FBFDFC"/>
+    <circle cx="200" cy="250" r="9.5" fill="#FBFDFC"/>
+    <circle cx="164" cy="250" r="3.6" fill="#263247"/>
+    <circle cx="200" cy="250" r="3.6" fill="#263247"/>
+    <path d="M166 267C174 276 190 276 198 267" fill="none" stroke="#263247" stroke-width="2.5" stroke-linecap="round"/>
+
+    <g id="idle-melody" stroke-linecap="round" stroke-linejoin="round">
+      <g id="idle-note-primary" fill="#596BD8" stroke="#596BD8" transform="translate(22.6 22.7) scale(.9)">
+        <ellipse cx="214" cy="241" rx="5.8" ry="4.3" transform="rotate(-15 214 241)" stroke="none"/>
+        <ellipse cx="234" cy="237" rx="5.8" ry="4.3" transform="rotate(-15 234 237)" stroke="none"/>
+        <path d="M219 239V218L239 214V235M219 222L239 218" fill="none" stroke-width="3.4"/>
+      </g>
+      <g id="idle-note-medium" fill="#7867D9" stroke="#7867D9" opacity=".9">
+        <ellipse cx="249" cy="227" rx="4.5" ry="3.4" transform="rotate(-15 249 227)" stroke="none"/>
+        <path d="M253 225V208L263 206V212" fill="none" stroke-width="3"/>
+      </g>
+      <g id="idle-note-small" fill="#52A6D8" stroke="#52A6D8" opacity=".82">
+        <ellipse cx="235" cy="208" rx="3.5" ry="2.7" transform="rotate(-15 235 208)" stroke="none"/>
+        <path d="M238 206V195L245 193V198" fill="none" stroke-width="2.4"/>
+      </g>
+    </g>
+
+    <rect x="277" y="237" width="38" height="38" rx="9" fill="#EEF0FF" stroke="#C9D0FA" stroke-width="1.4"/>
+    <path d="M287 245H298L305 252V267H287Z" fill="#FFFFFF" stroke="#596BD8" stroke-width="2.2" stroke-linejoin="round"/>
+    <path d="M298 245V252H305M291 258H301M291 263H300" fill="none" stroke="#596BD8" stroke-width="2" stroke-linecap="round"/>
+    </g>
+  </g>
+
+  <g fill="none" stroke="#27867D" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M110 430C92 430 80 430 66 430"/>
+    <path d="M54 430L66 423L66 437Z" fill="#27867D" stroke="none"/>
+    <circle cx="38" cy="430" r="14" fill="#F8F9FC"/>
+  </g>
+
+  <g>
+    <path d="M115 395H345V465H115Z" fill="#FFFFFF" stroke="#24263A" stroke-width="3" stroke-linejoin="round"/>
+    <path d="M346 413H357M346 441H357M138 466V476M155 466V476M172 466V476M189 466V476M206 466V476M223 466V476M240 466V476M257 466V476" fill="none" stroke="#24263A" stroke-width="2.5" stroke-linecap="round"/>
+    <g fill="#E4F8FC" stroke="#54BDD2" stroke-width="2.7">
+      <circle cx="169" cy="430" r="20"/>
+      <circle cx="247" cy="430" r="20"/>
+    </g>
+    <g fill="#54BDD2">
+      <circle cx="169" cy="430" r="4"/><circle cx="247" cy="430" r="4"/>
+      <path d="M169 425C159 419 159 412 167 413C173 413 174 420 169 425ZM174 432C182 426 188 430 183 438C180 443 174 439 174 432ZM164 432C165 442 158 445 155 437C153 432 159 428 164 432Z"/>
+      <path d="M247 425C237 419 237 412 245 413C251 413 252 420 247 425ZM252 432C260 426 266 430 261 438C258 443 252 439 252 432ZM242 432C243 442 236 445 233 437C231 432 237 428 242 432Z"/>
+    </g>
+    <path d="M284 413H325M284 424H325M284 435H325M284 446H316" fill="none" stroke="#909AAA" stroke-width="2.5" stroke-linecap="round"/>
+
+    <circle cx="326" cy="388" r="23" fill="#E4F8FC" stroke="#BDEAF3" stroke-width="2"/>
+    <g fill="none" stroke="#41B5CF" stroke-width="3" stroke-linecap="round">
+      <path d="M326 373V403M313 380L339 396M313 396L339 380"/>
+      <path d="M326 373L322 378M326 373L330 378M326 403L322 398M326 403L330 398M313 380L320 381M313 380L316 387M339 396L332 395M339 396L336 389M313 396L320 395M313 396L316 389M339 380L332 381M339 380L336 387"/>
+    </g>
+  </g>
+
+</svg>

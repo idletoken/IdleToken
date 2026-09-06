@@ -61,6 +61,7 @@
 #define LLAMA_SILENCE_GRACE_MS 15000
 #define LLAMA_PROBE_EVERY_MS   10000
 #define LLAMA_ARGV_MAX 64
+#define LLAMA_CLUSTER_ARGS_MAX 8192
 
 struct idletoken_llama {
     /* config (immutable in product; the legacy sidecar grow test rewrites
@@ -68,17 +69,18 @@ struct idletoken_llama {
     char bin[512];
     char gguf[1024];
     char log_path[512];
-    char cluster_args[1024];  /* WS-C cluster flags (--rpc/--device/--tensor-split) */
+    char cluster_args[LLAMA_CLUSTER_ARGS_MAX]; /* RPC placement + optional MoE overrides */
     char ngl_arg[16];         /* coordinator override, or auto/99 policy result */
     char extra_args[1024];    /* IDLETOKEN_LLAMA_ARGS copy, split at spawn */
     char kv_type[12];         /* IDLETOKEN_KV_CACHE_TYPE (validated); "" = f16 default */
     char kv_type_v[12];       /* IDLETOKEN_KV_CACHE_TYPE_V; "" = follow kv_type */
     int  shared;              /* serving OTHER people's requests — see below */
-    int  gpu_only;            /* sole product mode: every layer and KV allocation
-                               * fits the GPU working-set budget;
+    int  gpu_only;            /* every layer and KV allocation fits the GPU
+                               * working-set budget (Hybrid sets this false);
                                * spawn with --poll 0 (the CPU threads would
                                * only busy-wait — measured 11.9 spinning cores
                                * on a fully-offloaded 5060 Ti). */
+    uint32_t n_cpu_moe;       /* single-machine MoE Hybrid: --n-cpu-moe N */
     char grow_dir[300];       /* legacy sidecar-test hook; product passes "" */
     char sock_path[256];      /* AF_UNIX path, or "" for TCP loopback */
     char endpoint[300];       /* "127.0.0.1:<port>" | "unix:<sock_path>" */
@@ -543,16 +545,23 @@ static int llama_health_ok(const char *endpoint) {
  *
  * So shared mode does to the environment what it already does to argv: an
  * allow-list whose allowed set is (almost) empty. Everything in the engine's
- * own namespaces goes, and exactly two coordinator-owned variables come back:
+ * own namespaces goes, and the coordinator-owned RPC variables come back:
  * GGML_RPC_PSK, which the cluster TLS link cannot work without, and
  * GGML_RPC_REQUIRE_MODEL_CACHE, which prevents a sparse cluster GGUF from
- * falling back to weight transfer and disables whole-file mmap prefetch.
+ * falling back to weight transfer and disables whole-file mmap prefetch, and
+ * GGML_RPC_NODE_LOCAL_MOE, which enables only the same-endpoint CPU-to-GPU
+ * selected-expert copy path for a scheduler-approved Hybrid plan.
  * Note this still drops GGML_RPC_ALLOW_PLAINTEXT, which is right:
  * "testing only" is not a thing to honour while holding someone else's prompt.
  *
  * Deliberately NOT applied in local mode — LLAMA_ARG_* is how you experiment
  * with your own engine. */
 static int llama_env_is_engine_namespace(const char *name) {
+    /* GGML_MOE_* is ours: the expert pool and pre-gate prefetch of patch 0006
+     * (GGML_MOE_POOL_EXPERTS, GGML_MOE_PREGATE, GGML_MOE_PREGATE_EXTRA,
+     * GGML_MOE_POOL_DEBUG). They change where expert bytes live, never what
+     * is computed, and the coordinator is the one that sets them. */
+    if (strncmp(name, "GGML_MOE_", 9) == 0) return 0;
     return strncmp(name, "LLAMA_", 6) == 0 ||
            strncmp(name, "GGML_", 5) == 0 ||
            strncmp(name, "HF_", 3) == 0;
@@ -572,6 +581,11 @@ static void llama_scrub_env(void) {
     if (require_cache)
         snprintf(keep_require_cache, sizeof(keep_require_cache), "%s",
                  require_cache);
+    char keep_node_local_moe[16] = "";
+    const char *node_local_moe = getenv("GGML_RPC_NODE_LOCAL_MOE");
+    if (node_local_moe)
+        snprintf(keep_node_local_moe, sizeof(keep_node_local_moe), "%s",
+                 node_local_moe);
 
     char names[128][64];
     int n = 0;
@@ -588,6 +602,8 @@ static void llama_scrub_env(void) {
     if (keep_psk[0]) setenv("GGML_RPC_PSK", keep_psk, 1);
     if (keep_require_cache[0])
         setenv("GGML_RPC_REQUIRE_MODEL_CACHE", keep_require_cache, 1);
+    if (keep_node_local_moe[0])
+        setenv("GGML_RPC_NODE_LOCAL_MOE", keep_node_local_moe, 1);
 }
 #endif
 
@@ -734,7 +750,7 @@ static int llama_spawn(idletoken_llama *lc) {
     const uint64_t ctx_total = (uint64_t)lc->ctx_size * (uint64_t)npar;
 
 #ifdef _WIN32
-    char portstr[16], ctxstr[24], nparstr[16], cmd[4096], listen_args[320];
+    char portstr[16], ctxstr[24], nparstr[16], cmd[16384], listen_args[320];
     snprintf(portstr, sizeof(portstr), "%d", lc->port);
     snprintf(ctxstr, sizeof(ctxstr), "%llu", (unsigned long long)ctx_total);
     snprintf(nparstr, sizeof(nparstr), "%d", npar);
@@ -766,6 +782,14 @@ static int llama_spawn(idletoken_llama *lc) {
                  " --rope-scaling yarn --rope-scale %.6g --yarn-orig-ctx %u",
                  (double)lc->ctx_size / (double)lc->yarn_orig_ctx,
                  lc->yarn_orig_ctx);
+    char moe_frag[72];
+    moe_frag[0] = '\0';
+    if (lc->n_cpu_moe > 0)
+        /* Upstream warns that CPU tensor overrides with mmap lose
+         * performance. On a 5060 Ti + Qwen3.5-35B-A3B this raised prefill
+         * 31.66 -> 53.12 tok/s and decode 34.19 -> 39.40 tok/s. */
+        snprintf(moe_frag, sizeof(moe_frag),
+                 " --n-cpu-moe %u --load-mode none", lc->n_cpu_moe);
     /* Slot save/restore across a context-ladder restart. PRIVATE mode only:
      * shared mode keeps --no-slots (above), and a buyer's KV must never land
      * on the provider's disk — the grow there re-prefills instead. Same
@@ -777,7 +801,7 @@ static int llama_spawn(idletoken_llama *lc) {
                  " --slot-save-path \"%s\"", lc->grow_dir);
     int n = snprintf(cmd, sizeof(cmd),
                      "\"%s\" -m \"%s\" %s%s%s%s "
-                     "-ngl %s --fit off --reasoning off%s%s%s -np %s%s%s%s",
+                     "-ngl %s --fit off%s --reasoning off%s%s%s -np %s%s%s%s",
                      lc->bin, lc->gguf, listen_args,
                      lc->shared ? " --no-slots" : "",
                      /* --poll 0 rides with GPU_ONLY (see the struct field);
@@ -785,6 +809,7 @@ static int llama_spawn(idletoken_llama *lc) {
                      lc->gpu_only ? " --poll 0" : "",
                      slotsave_frag,
                      lc->ngl_arg,
+                     moe_frag,
                      lc->ctx_size > 0 ? " -c " : "",
                      lc->ctx_size > 0 ? ctxstr : "",
                      yarn_frag,
@@ -831,7 +856,8 @@ static int llama_spawn(idletoken_llama *lc) {
              * keeps, e.g. "=C:=C:\path"); those are not ours to judge. */
             if (p[0] != '=' && llama_env_is_engine_namespace(p) &&
                 strncmp(p, "GGML_RPC_PSK=", 13) != 0 &&
-                strncmp(p, "GGML_RPC_REQUIRE_MODEL_CACHE=", 29) != 0)
+                strncmp(p, "GGML_RPC_REQUIRE_MODEL_CACHE=", 29) != 0 &&
+                strncmp(p, "GGML_RPC_NODE_LOCAL_MOE=", 24) != 0)
                 continue;
             size_t n2 = strlen(p) + 1;
             memcpy(child_env + off, p, n2);
@@ -934,6 +960,14 @@ static int llama_spawn(idletoken_llama *lc) {
     argv[argc++] = lc->ngl_arg;
     argv[argc++] = "--fit";
     argv[argc++] = "off";
+    if (lc->n_cpu_moe > 0) {
+        static char nmoestr[16];
+        snprintf(nmoestr, sizeof nmoestr, "%u", lc->n_cpu_moe);
+        argv[argc++] = "--n-cpu-moe";
+        argv[argc++] = nmoestr;
+        argv[argc++] = "--load-mode";
+        argv[argc++] = "none";
+    }
     /* Reasoning off by default: thinking models (Qwen3.5 etc.) otherwise burn
      * the whole token budget inside <think> and the visible answer comes back
      * EMPTY with finish_reason "length" — measured with Qwen3.5-0.8B at
@@ -1033,7 +1067,10 @@ const char *idletoken_llama_placement_flag(const char *args) {
      * long form alone would be a doorway, not a guard. */
     static const char *placement[] = { "--device", "-dev", "--rpc",
                                        "--tensor-split", "-ts", "-ngl",
-                                       "--n-gpu-layers", "--fit" };
+                                       "--n-gpu-layers", "--fit",
+                                       "--cpu-moe", "-cmoe",
+                                       "--n-cpu-moe", "-ncmoe",
+                                       "--override-tensor", "-ot" };
     if (!args || !args[0]) return NULL;
 
     /* Walk token by token rather than substring-searching the whole string:
@@ -1410,10 +1447,9 @@ int idletoken_llama_grow(idletoken_llama *lc, uint32_t new_ctx,
             n_saved_slots ? "carrying saved KV" : "re-prefill");
     llama_kill_child(lc);
     lc->ctx_size = new_ctx;
-    /* The grow target is by construction a window the KV pool could NOT hold
-     * fully (else no growth was armed): the respawn is HYBRID, where the CPU
-     * threads do real work — back to the engine's default polling. */
-    lc->gpu_only = 0;
+    /* Context growth never changes placement. In particular, it must not turn
+     * a dense GPU-only service into the retired generic CPU-offload path. */
+    lc->gpu_only = lc->n_cpu_moe == 0;
     /* Same guard as at start: scaling only when the new window truly exceeds
      * the trained one. The CALLER must have passed do_save=0 when this
      * changes the RoPE frequencies (see the header). */
@@ -1490,6 +1526,7 @@ idletoken_llama *idletoken_llama_start(const char *bin, const char *gguf,
                                        int port, const char *engine_sock,
                                        uint32_t ctx_size, uint32_t yarn_orig_ctx,
                                        int n_parallel, int gpu_only,
+                                       uint32_t n_cpu_moe,
                                        const char *ngl_arg,
                                        const char *cluster_args,
                                        const char *log_path, int shared,
@@ -1524,6 +1561,7 @@ idletoken_llama *idletoken_llama_start(const char *bin, const char *gguf,
     }
     lc->port = port;
     lc->gpu_only = gpu_only;
+    lc->n_cpu_moe = n_cpu_moe;
     lc->ctx_size = ctx_size;
     /* Only meaningful when the granted window actually exceeds the trained
      * one — a yarn_orig_ctx at or above ctx_size would ask the engine for a

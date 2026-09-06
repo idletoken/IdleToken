@@ -6,6 +6,7 @@
 #include "idletoken_modelsize.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define GiB (1024ull * 1024 * 1024)
@@ -56,6 +57,15 @@ uint64_t idletoken_needed_bytes(const idletoken_model_spec *model,
     return idletoken_needed_bytes_quant(model, NULL, ctx_size, n_nodes, backend);
 }
 
+int idletoken_cluster_moe_hybrid_enabled(void) {
+    /* Re-read on every call on purpose: it is one getenv on a decision that
+     * happens a handful of times per launch, and the unit tests toggle it. */
+    const char *v = getenv(IDLETOKEN_CLUSTER_MOE_HYBRID_ENV);
+    if (v && v[0] == '1' && v[1] == '\0') return 1;
+    if (v && v[0] == '0' && v[1] == '\0') return 0;
+    return IDLETOKEN_CLUSTER_MOE_HYBRID_DEFAULT;
+}
+
 idletoken_mode idletoken_mode_decide_quant(const idletoken_model_spec *model,
                                      const char *quant,
                                      const idletoken_node_mem *nodes, int n,
@@ -87,15 +97,81 @@ idletoken_mode idletoken_mode_decide_quant(const idletoken_model_spec *model,
                           (double)needed   / (double)GiB, model->id);
         return IDLETOKEN_MODE_GPU_ONLY;
     }
+    /* Client/advisor estimate for the MoE-only Hybrid shapes. The runtime
+     * planner below is stricter: it reads the selected GGUF's tensor directory
+     * and proves an exact prefix for every owning node. The manifest-level
+     * advisor has no file yet, so this is only the coarse question "is Hybrid
+     * worth offering?" RAM is counted only on discrete CUDA nodes; it is never
+     * pooled across nodes by the runtime admission check. */
+    if (model->n_expert > 0) {
+        uint64_t ram = 0;
+        int hybrid_hw_ok = 1;
+        for (int i = 0; i < n; ++i) {
+            if (nodes[i].backend == IDLETOKEN_NODE_BACKEND_CUDA &&
+                nodes[i].vram_usable < 4 * GiB) {
+                hybrid_hw_ok = 0;
+            }
+            if (!nodes[i].unified &&
+                nodes[i].backend == IDLETOKEN_NODE_BACKEND_CUDA) {
+                ram = UINT64_MAX - ram < nodes[i].ram_usable
+                    ? UINT64_MAX : ram + nodes[i].ram_usable;
+            }
+        }
+        const uint64_t gap = needed - sum_vram;
+        /* One machine's `--n-cpu-moe` is shipped; the cluster shape is the
+         * opt-in path (see idletoken_cluster_moe_hybrid_enabled). */
+        const int cluster_gate_ok = n == 1 || idletoken_cluster_moe_hybrid_enabled();
+        if (hybrid_hw_ok && !cluster_gate_ok && ram >= gap) {
+            if (shortfall_out) *shortfall_out = gap;
+            if (why) snprintf(why, whylen,
+                              "[RESOURCE_INSUFFICIENT] %s needs %.1f GiB of GPU "
+                              "memory for ctx=%u on %d node(s); only %.1f GiB is "
+                              "available. Node-local MoE Hybrid could hold the "
+                              "missing %.1f GiB of routed experts in RAM, but it "
+                              "is opt-in (" IDLETOKEN_CLUSTER_MOE_HYBRID_ENV "=1) "
+                              "until its real-LAN performance gate passes. Free "
+                              "GPU memory, choose a smaller quantization, or add "
+                              "nodes.",
+                              model->id, (double)needed / (double)GiB, ctx_size,
+                              n, (double)sum_vram / (double)GiB,
+                              (double)gap / (double)GiB);
+            return IDLETOKEN_MODE_REFUSE;
+        }
+        if (hybrid_hw_ok && ram >= gap) {
+            if (why && n == 1) {
+                snprintf(why, whylen,
+                         "HYBRID candidate: MoE model is %.1f GiB short in "
+                         "VRAM; this machine has %.1f GiB usable RAM. The "
+                         "selected GGUF's exact --n-cpu-moe prefix is checked "
+                         "at load time (%s)",
+                         (double)gap / (double)GiB,
+                         (double)ram / (double)GiB, model->id);
+            } else if (why) {
+                snprintf(why, whylen,
+                         "CLUSTER HYBRID candidate: MoE model is %.1f GiB "
+                         "short in aggregate VRAM; discrete CUDA nodes expose "
+                         "%.1f GiB usable RAM. Exact expert tensors, owner-node "
+                         "VRAM/RAM and worker capability are checked at load "
+                         "time; RAM is never pooled across nodes (%s)",
+                         (double)gap / (double)GiB,
+                         (double)ram / (double)GiB, model->id);
+            }
+            return IDLETOKEN_MODE_HYBRID;
+        }
+        if (shortfall_out) {
+            *shortfall_out = hybrid_hw_ok && gap > ram ? gap - ram : gap;
+        }
+    } else if (shortfall_out) {
+        *shortfall_out = needed - sum_vram;
+    }
     if (why) snprintf(why, whylen,
                       "[RESOURCE_INSUFFICIENT] %s needs %.1f GiB of GPU memory "
-                      "for ctx=%u on %d node(s); only %.1f GiB is available. "
+                      "for ctx=%u on %d node(s); only %.1f GiB is available.%s "
                       "Free GPU memory, choose a smaller quantization, or add "
                       "nodes.",
                       model->id,
                       (double)needed   / (double)GiB, ctx_size, n,
-                      (double)sum_vram / (double)GiB);
-    if (shortfall_out) *shortfall_out = needed - sum_vram;
+                      (double)sum_vram / (double)GiB, "");
     return IDLETOKEN_MODE_REFUSE;
 }
 
@@ -623,6 +699,282 @@ int idletoken_llama_seq_slots(const idletoken_node_mem *node,
     return (int)slots;
 }
 
+static uint64_t mul_div_ceil_u64(uint64_t value, uint32_t num, uint32_t den) {
+    if (den == 0) return UINT64_MAX;
+    const uint64_t q = value / den;
+    const uint64_t r = value % den;
+    const uint64_t whole = sat_mul_u64(q, num);
+    const uint64_t tail = (r * num + den - 1) / den;
+    return sat_add_u64(whole, tail);
+}
+
+/* The exact per-layer expert buckets come from the selected GGUF's tensor
+ * directory. A real parse is self-consistent by construction; a synthetic or
+ * corrupt size table might not be, and a planner that trusted it would move
+ * bytes that do not exist (and admit a node that then OOMs). Both Hybrid
+ * shapes refuse to plan from a table that does not add up. */
+static int expert_buckets_consistent(const idletoken_llm_model_size *model) {
+    if (!model->expert_bytes_complete || model->expert_bytes_total == 0 ||
+        model->expert_bytes_total > model->total_bytes ||
+        model->n_layers > IDLETOKEN_LLPLAN_MAX_LAYERS) {
+        return 0;
+    }
+    uint64_t sum = 0;
+    for (uint32_t i = 0; i < model->n_layers; i++)
+        sum = sat_add_u64(sum, model->expert_bytes_per_layer[i]);
+    return sum == model->expert_bytes_total;
+}
+
+/* Appended to a cluster refusal when the opt-in node-local path might have
+ * changed the answer, so the operator learns the switch exists from the
+ * refusal itself rather than from a document. */
+static void cluster_moe_optin_hint(const idletoken_llm_model_size *model,
+                                   int n, char *why, size_t cap) {
+    if (n < 2 || model->n_expert == 0 || idletoken_cluster_moe_hybrid_enabled())
+        return;
+    const size_t used = strlen(why);
+    if (used >= cap) return;
+    snprintf(why + used, cap - used,
+             " Cluster MoE Hybrid (routed experts in each owner node's RAM) is "
+             "opt-in until its real-LAN performance gate passes: set "
+             IDLETOKEN_CLUSTER_MOE_HYBRID_ENV "=1 to allow it.");
+}
+
+/* Find a contiguous per-node layer placement for cluster MoE Hybrid.
+ *
+ * This is deliberately separate from the GPU-only water-fill below. The old
+ * plan remains byte-for-byte the first choice; this search runs only when that
+ * plan cannot fit. A candidate node keeps the full layer, attention, KV and
+ * workspace share on its GPU, then moves the smallest prefix of that node's
+ * own routed-expert tensors to the same machine's RAM. Dynamic programming
+ * picks the feasible set of boundaries with the fewest total RAM bytes.
+ *
+ * tensor_split includes llama.cpp's extra output-layer slice on the final
+ * device. Expressing shares as count/(L+1), with the final node receiving
+ * (count+1)/(L+1), makes idletoken_llama_device_layer_range() reproduce these
+ * exact integer boundaries instead of relying on floating-point luck. */
+/* Host memory the engine needs on top of the expert bytes it keeps in RAM:
+ * staging for the tensors it loads, its own allocations, the page cache of
+ * the shard files it reads, and the room Windows needs to stay responsive.
+ * Two calibration points, both from the DSv4-Flash pair on 2026-09-06:
+ *   - a worker advertising 37.0 GiB usable took 35 GB of experts and its
+ *     rpc-server died twice while loading (exit -1, then 0xC0000409);
+ *   - a coordinator with 64 GB installed took 44.9 GiB of experts (the
+ *     planner then charged 2 GiB + spill/8 = 7.6 GiB) and the machine froze
+ *     during load; 28.75 GiB on the same machine had served for hours.
+ * 8 GiB + spill/4 keeps both cases out: 33.6 GiB on that coordinator,
+ * 23.9 GiB on that worker. Tighten or loosen it with measurements only. */
+static uint64_t ram_expert_overhead(uint64_t spill) {
+    return sat_add_u64(8ull * GiB, spill / 4);
+}
+
+static int try_cluster_moe_hybrid(const idletoken_llm_model_size *model,
+                                  const idletoken_node_mem *nodes,
+                                  int n, uint32_t ctx_size, uint8_t backend,
+                                  idletoken_llama_plan *out) {
+    if (!model || !nodes || !out || n < 2 ||
+        model->n_expert == 0 || !expert_buckets_consistent(model) ||
+        model->n_layers < (uint32_t)n ||
+        !idletoken_cluster_moe_hybrid_enabled()) {
+        return 0;
+    }
+
+    int has_ram_node = 0;
+    for (int i = 0; i < n; ++i) {
+        const idletoken_node_mem * nd = &nodes[out->order[i]];
+        if (!nd->unified && nd->backend == IDLETOKEN_NODE_BACKEND_CUDA &&
+            nd->ram_usable > 0) {
+            has_ram_node = 1;
+            break;
+        }
+    }
+    if (!has_ram_node) return 0;
+
+    const uint32_t layers = model->n_layers;
+    const uint32_t denom = layers + 1;
+    const uint64_t slice_all = sat_add_u64(model->total_bytes,
+        sat_add_u64(idletoken_llama_kv_bytes(model, ctx_size),
+                    idletoken_llama_compute_bytes(model, ctx_size, backend)));
+    const uint64_t overhead = idletoken_llama_node_overhead(model->total_bytes);
+    const uint64_t inf = UINT64_MAX;
+    uint64_t dp[IDLETOKEN_LLPLAN_MAX_NODES + 1][IDLETOKEN_LLPLAN_MAX_LAYERS + 1];
+    int16_t prev[IDLETOKEN_LLPLAN_MAX_NODES + 1][IDLETOKEN_LLPLAN_MAX_LAYERS + 1];
+    uint16_t spill_hi[IDLETOKEN_LLPLAN_MAX_NODES + 1][IDLETOKEN_LLPLAN_MAX_LAYERS + 1];
+    uint64_t spill_at[IDLETOKEN_LLPLAN_MAX_NODES + 1][IDLETOKEN_LLPLAN_MAX_LAYERS + 1];
+    uint64_t gpu_at[IDLETOKEN_LLPLAN_MAX_NODES + 1][IDLETOKEN_LLPLAN_MAX_LAYERS + 1];
+    uint64_t gpu_max_at[IDLETOKEN_LLPLAN_MAX_NODES + 1][IDLETOKEN_LLPLAN_MAX_LAYERS + 1];
+
+    for (int i = 0; i <= n; ++i) {
+        for (uint32_t l = 0; l <= layers; ++l) {
+            dp[i][l] = inf;
+            prev[i][l] = -1;
+            spill_hi[i][l] = 0;
+            spill_at[i][l] = 0;
+            gpu_at[i][l] = 0;
+            gpu_max_at[i][l] = 0;
+        }
+    }
+    dp[0][0] = 0;
+
+    for (int used = 1; used <= n; ++used) {
+        const int slot = used - 1;
+        const idletoken_node_mem * nd = &nodes[out->order[slot]];
+        const uint32_t min_hi = (uint32_t)used;
+        const uint32_t max_hi = layers - (uint32_t)(n - used);
+        for (uint32_t hi = min_hi; hi <= max_hi; ++hi) {
+            for (uint32_t lo = (uint32_t)(used - 1); lo < hi; ++lo) {
+                if (dp[used - 1][lo] == inf) continue;
+                const uint32_t count = hi - lo;
+                const uint32_t numerator = count + (slot == n - 1 ? 1u : 0u);
+                uint64_t gpu = sat_add_u64(overhead,
+                    mul_div_ceil_u64(slice_all, numerator, denom));
+                uint64_t spill = 0;
+                uint32_t cpu_hi = lo;
+                if (gpu > nd->vram_usable) {
+                    if (nd->unified || nd->backend != IDLETOKEN_NODE_BACKEND_CUDA ||
+                        nd->ram_usable == 0) {
+                        continue;
+                    }
+                    /* Move this node's routed experts to its RAM one layer at
+                     * a time until the GPU share fits. The subtraction is of
+                     * THIS layer's experts and saturates at zero. The previous
+                     * form compared the CUMULATIVE spill with the remaining
+                     * GPU need and zeroed the need once the two crossed:
+                     * on 2026-09-06 that admitted DeepSeek-V4-Flash [0,35) on
+                     * a 15.7 GiB card with 20 of 35 layers spilled (35.9 GiB)
+                     * while the other 15 layers' experts (29 GB) were deemed
+                     * to fit a GPU with no room — Windows paged them to host
+                     * memory and the pair decoded at 1.9 tok/s. */
+                    while (cpu_hi < hi && gpu > nd->vram_usable) {
+                        const uint64_t e = model->expert_bytes_per_layer[cpu_hi];
+                        spill = sat_add_u64(spill, e);
+                        gpu = e < gpu ? gpu - e : 0;
+                        cpu_hi++;
+                    }
+                    /* The RAM gate charges the engine's own working memory on
+                     * top of the expert bytes: host staging for the tensors it
+                     * loads, its CUDA host allocations, the page cache of the
+                     * shard files it reads. 2026-09-06: a worker advertising
+                     * 37.0 GiB usable took 35 GB of experts and its rpc-server
+                     * died twice while loading (exit -1, then 0xC0000409).
+                     * 2 GiB + spill/8 is the first calibration from that one
+                     * data point; tighten it with measurements, do not drop it. */
+                    const uint64_t ram_overhead =
+                        ram_expert_overhead(spill);
+                    if (gpu > nd->vram_usable ||
+                        sat_add_u64(spill, ram_overhead) > nd->ram_usable) continue;
+                }
+                /* Then keep spilling for as long as this node's RAM allows:
+                 * every layer moved frees its experts' bytes on the device
+                 * for the LRU pool, which keeps more of what a token needs
+                 * than whole resident layers do (measured 2026-09-06). What
+                 * the DP minimises is therefore the experts that MUST stay
+                 * resident, not the spill — so layers drift toward the node
+                 * whose RAM can take them. Ties (same resident bytes) go to
+                 * the layout with the smaller largest GPU need, which is the
+                 * one that leaves pool room on every card. */
+                if (!nd->unified && nd->backend == IDLETOKEN_NODE_BACKEND_CUDA &&
+                    nd->ram_usable > 0) {
+                    while (cpu_hi < hi) {
+                        const uint64_t next = sat_add_u64(spill, model->expert_bytes_per_layer[cpu_hi]);
+                        const uint64_t next_overhead = ram_expert_overhead(next);
+                        if (sat_add_u64(next, next_overhead) > nd->ram_usable) break;
+                        const uint64_t e = model->expert_bytes_per_layer[cpu_hi];
+                        spill = next;
+                        gpu = e < gpu ? gpu - e : 0;
+                        cpu_hi++;
+                    }
+                }
+                uint64_t resident = 0;
+                for (uint32_t l = cpu_hi; l < hi; ++l)
+                    resident = sat_add_u64(resident, model->expert_bytes_per_layer[l]);
+                const uint64_t cost = sat_add_u64(dp[used - 1][lo], resident);
+                const uint64_t gpu_max = gpu > gpu_max_at[used - 1][lo] ? gpu : gpu_max_at[used - 1][lo];
+                if (cost < dp[used][hi] || (cost == dp[used][hi] && gpu_max < gpu_max_at[used][hi])) {
+                    dp[used][hi] = cost;
+                    prev[used][hi] = (int16_t)lo;
+                    spill_hi[used][hi] = (uint16_t)cpu_hi;
+                    spill_at[used][hi] = spill;
+                    gpu_at[used][hi] = gpu;
+                    gpu_max_at[used][hi] = gpu_max;
+                }
+            }
+        }
+    }
+    if (dp[n][layers] == inf) return 0;
+
+    uint32_t cursor = layers;
+    uint64_t total_gpu = 0;
+    for (int used = n; used >= 1; --used) {
+        const int slot = used - 1;
+        const int lo = prev[used][cursor];
+        if (lo < 0) return 0;
+        const idletoken_node_mem * nd = &nodes[out->order[slot]];
+        out->layer_lo[slot] = (uint32_t)lo;
+        out->layer_hi[slot] = cursor;
+        out->cpu_moe_layer_hi[slot] = spill_hi[used][cursor];
+        out->cpu_moe_bytes_per_node[slot] = spill_at[used][cursor];
+        out->gpu_need_bytes_per_node[slot] = gpu_at[used][cursor];
+        /* Spill as much as the RAM can take and hand the freed device memory
+         * to the expert pool. The DP above only decided the layer boundaries
+         * (minimal spill balances the shares); how much of a node's experts
+         * stay resident as whole layers versus flow through an LRU pool is
+         * this node's own choice, and the pool wins layer by layer for as
+         * long as RAM (with the engine's working-memory charge) allows. An
+         * all-or-nothing rule left both 16 GiB cards of the DSv4 pair with
+         * 0.07 GiB of pool room, below the pool's one-batch floor. */
+        {
+            const uint32_t count = cursor - (uint32_t)lo;
+            const uint32_t numerator = count + (slot == n - 1 ? 1u : 0u);
+            const uint64_t share = sat_add_u64(overhead,
+                mul_div_ceil_u64(slice_all, numerator, denom));
+            if (!nd->unified && nd->backend == IDLETOKEN_NODE_BACKEND_CUDA &&
+                nd->ram_usable > 0) {
+                uint32_t hi = out->cpu_moe_layer_hi[slot];
+                uint64_t bytes = out->cpu_moe_bytes_per_node[slot];
+                while (hi < cursor) {
+                    const uint64_t next = sat_add_u64(bytes, model->expert_bytes_per_layer[hi]);
+                    const uint64_t next_overhead = ram_expert_overhead(next);
+                    if (sat_add_u64(next, next_overhead) > nd->ram_usable) break;
+                    bytes = next;
+                    hi++;
+                }
+                if (hi > out->cpu_moe_layer_hi[slot]) {
+                    out->cpu_moe_layer_hi[slot] = hi;
+                    out->cpu_moe_bytes_per_node[slot] = bytes;
+                    out->gpu_need_bytes_per_node[slot] = bytes < share ? share - bytes : 0;
+                }
+            }
+            out->moe_pool_bytes_per_node[slot] =
+                out->gpu_need_bytes_per_node[slot] < nd->vram_usable
+                    ? nd->vram_usable - out->gpu_need_bytes_per_node[slot] : 0;
+        }
+        total_gpu = sat_add_u64(total_gpu, out->gpu_need_bytes_per_node[slot]);
+        const uint32_t numerator = cursor - (uint32_t)lo + (slot == n - 1 ? 1u : 0u);
+        out->tensor_split[slot] = (double)numerator / (double)denom;
+        cursor = (uint32_t)lo;
+    }
+    if (cursor != 0) return 0;
+
+    out->kind = IDLETOKEN_LLPLAN_CLUSTER;
+    out->mode = IDLETOKEN_MODE_HYBRID;
+    out->cluster_moe_hybrid = 1;
+    out->cpu_moe_bytes = 0;
+    for (int slot = 0; slot < n; ++slot)
+        out->cpu_moe_bytes = sat_add_u64(out->cpu_moe_bytes, out->cpu_moe_bytes_per_node[slot]);
+    out->ram_need_bytes = out->cpu_moe_bytes;
+    out->gpu_need_bytes = total_gpu;
+    out->working_set_fits = 1;
+    snprintf(out->why, sizeof(out->why),
+             "CLUSTER HYBRID (node-local MoE): %.2f GiB of routed-expert "
+             "tensors stay in RAM on the same machines that own their layers; "
+             "only selected expert ranges move over each machine's local PCIe "
+             "link. Expert weights never cross the LAN; only layer-boundary "
+             "hidden states do.",
+             (double)out->cpu_moe_bytes / (double)GiB);
+    return 1;
+}
+
 int idletoken_plan_llamacpp(const idletoken_llm_model_size *model,
                             const idletoken_node_mem *nodes, int n,
                             int coordinator, uint32_t ctx_size,
@@ -660,6 +1012,7 @@ int idletoken_plan_llamacpp(const idletoken_llm_model_size *model,
 
     const uint64_t need1 = llplan_needed(model, ctx_size, 1, backend);
     const uint64_t coord_usable = idletoken_llama_node_usable(&nodes[coordinator]);
+    out->gpu_need_bytes = need1;
 
     /* ---- hard invariant #1 first: layer 0 + the embedding lookup stay with
      * the coordinator. That rules out BOTH "cluster around a memoryless
@@ -685,6 +1038,7 @@ int idletoken_plan_llamacpp(const idletoken_llm_model_size *model,
      * This is a default, not a veto: an explicit multi-machine choice wins. */
     if (coord_usable >= need1 && !(force_cluster && n > 1)) {
         out->kind = IDLETOKEN_LLPLAN_SINGLE;
+        out->mode = IDLETOKEN_MODE_GPU_ONLY;
         out->single_node = coordinator;
         out->layer0_node = coordinator;
         snprintf(out->why, sizeof(out->why),
@@ -697,10 +1051,107 @@ int idletoken_plan_llamacpp(const idletoken_llm_model_size *model,
         return 0;
     }
 
-    /* A forced single-machine launch is allowed to reach the planner, but it
-     * is not allowed to spill weights or cache to host RAM. Refuse the exact
-     * selected window here; never silently shrink it. */
+    /* Single-machine MoE Hybrid: keep complete layers, attention, KV and graph
+     * on the GPU; move only the routed-expert tensors of the smallest leading
+     * block prefix that closes the shortfall. This is exactly what the pinned
+     * engine's `--n-cpu-moe N` means. Dense models never get a generic layer
+     * spill, which is the slow Qwen3.8-27B failure mode that retired the old
+     * product-wide Hybrid switch.
+     *
+     * Unified-memory machines have no second capacity pool to unlock: CPU and
+     * GPU allocations spend the same physical budget, so offloading experts
+     * there can only change execution placement, not make a model fit. */
     if (n == 1) {
+        if (model->n_expert > 0 && !nodes[coordinator].unified) {
+            if (!expert_buckets_consistent(model)) {
+                out->kind = IDLETOKEN_LLPLAN_REFUSE;
+                snprintf(out->why, sizeof(out->why),
+                         "[RESOURCE_INSUFFICIENT] this MoE model is %.2f GiB "
+                         "short in GPU memory, but the selected GGUF's exact "
+                         "expert tensor layout is unavailable or does not add "
+                         "up. Hybrid will not "
+                         "guess from expert counts; verify the complete GGUF "
+                         "download and start again.",
+                         (double)(need1 - coord_usable) / (double)GiB);
+                return 0;
+            }
+            uint64_t prefix = 0;
+            uint32_t selected = 0;
+            for (uint32_t i = 0; i < model->n_layers; i++) {
+                prefix = sat_add_u64(prefix, model->expert_bytes_per_layer[i]);
+                const uint64_t gpu_need = prefix < need1 ? need1 - prefix : 0;
+                if (gpu_need <= coord_usable) {
+                    selected = i + 1;
+                    break;
+                }
+            }
+            if (selected > 0 && prefix <= nodes[coordinator].ram_usable) {
+                out->kind = IDLETOKEN_LLPLAN_SINGLE;
+                out->mode = IDLETOKEN_MODE_HYBRID;
+                out->single_node = coordinator;
+                out->layer0_node = coordinator;
+                out->n_cpu_moe = selected;
+                out->cpu_moe_bytes = prefix;
+                /* Same policy as the cluster planner: spill layer by layer
+                 * for as long as RAM (with the engine's working-memory
+                 * charge) allows and let the freed device memory be the
+                 * expert pool; whole resident layers keep less of what a
+                 * token needs than an LRU over all layers does. */
+                {
+                    uint32_t hi = out->n_cpu_moe;
+                    uint64_t bytes = out->cpu_moe_bytes;
+                    while (hi < model->n_layers) {
+                        const uint64_t next = sat_add_u64(bytes, model->expert_bytes_per_layer[hi]);
+                        const uint64_t next_overhead = ram_expert_overhead(next);
+                        if (sat_add_u64(next, next_overhead) > nodes[coordinator].ram_usable) break;
+                        bytes = next;
+                        hi++;
+                    }
+                    if (hi > out->n_cpu_moe) {
+                        out->n_cpu_moe = hi;
+                        out->cpu_moe_bytes = bytes;
+                    }
+                }
+                out->ram_need_bytes = out->cpu_moe_bytes;
+                out->gpu_need_bytes = need1 > out->cpu_moe_bytes ? need1 - out->cpu_moe_bytes : 0;
+                out->moe_pool_bytes = out->gpu_need_bytes < coord_usable
+                    ? coord_usable - out->gpu_need_bytes : 0;
+                out->hard_need_bytes = idletoken_llama_hard_need(
+                    model, ctx_size, 1, backend);
+                out->working_set_bytes = idletoken_llama_working_set(model);
+                out->working_set_fits = 1;
+                snprintf(out->why, sizeof(out->why),
+                         "SINGLE HYBRID (MoE only): GPU needs %.2f GiB and has "
+                         "%.2f GiB; the first %u block(s) contribute %.2f GiB "
+                         "of expert tensors to usable RAM (%.2f GiB). Every "
+                         "complete layer and the KV cache stay GPU-offloaded.",
+                         (double)out->gpu_need_bytes / (double)GiB,
+                         (double)coord_usable / (double)GiB, selected,
+                         (double)prefix / (double)GiB,
+                         (double)nodes[coordinator].ram_usable / (double)GiB);
+                return 0;
+            }
+            if (selected > 0) {
+                out->kind = IDLETOKEN_LLPLAN_REFUSE;
+                snprintf(out->why, sizeof(out->why),
+                         "[RESOURCE_INSUFFICIENT] MoE Hybrid can close the GPU "
+                         "shortfall by placing %.2f GiB of expert tensors in "
+                         "RAM, but only %.2f GiB of usable RAM is available. "
+                         "Free system memory or choose a smaller quantization.",
+                         (double)prefix / (double)GiB,
+                         (double)nodes[coordinator].ram_usable / (double)GiB);
+                return 0;
+            }
+            out->kind = IDLETOKEN_LLPLAN_REFUSE;
+            snprintf(out->why, sizeof(out->why),
+                     "[RESOURCE_INSUFFICIENT] even moving all %.2f GiB of this "
+                     "MoE model's expert tensors to RAM leaves more than the "
+                     "available %.2f GiB of GPU memory in use. Choose a smaller "
+                     "quantization or add cluster nodes.",
+                     (double)model->expert_bytes_total / (double)GiB,
+                     (double)coord_usable / (double)GiB);
+            return 0;
+        }
         out->kind = IDLETOKEN_LLPLAN_REFUSE;
         snprintf(out->why, sizeof(out->why),
                  "[RESOURCE_INSUFFICIENT] this model needs %.2f GiB of GPU "
@@ -722,7 +1173,23 @@ int idletoken_plan_llamacpp(const idletoken_llm_model_size *model,
     out->working_set_bytes = wset;
     out->working_set_fits  = (total_usable >= need_n);
 
+    /* Participation order is shared by both GPU-only and Hybrid plans. */
+    out->n_nodes = n;
+    out->order[0] = coordinator;
+    int k = 1;
+    for (int i = 0; i < n; i++) if (i != coordinator) out->order[k++] = i;
+    for (int i = 1; i < n - 1; i++)
+        for (int j = i + 1; j < n; j++)
+            if (idletoken_llama_kv_pool(&nodes[out->order[j]]) >
+                idletoken_llama_kv_pool(&nodes[out->order[i]])) {
+                int t = out->order[i]; out->order[i] = out->order[j]; out->order[j] = t;
+            }
+    out->layer0_node = coordinator;
+
     if (total_usable < need_n) {
+        if (try_cluster_moe_hybrid(model, nodes, n, ctx_size, backend, out)) {
+            return 0;
+        }
         out->kind = IDLETOKEN_LLPLAN_REFUSE;
         snprintf(out->why, sizeof(out->why),
                  "[RESOURCE_INSUFFICIENT] this model needs %.2f GiB of GPU "
@@ -733,6 +1200,7 @@ int idletoken_plan_llamacpp(const idletoken_llm_model_size *model,
                  (double)need_n / (double)GiB, ctx_size,
                  n, (double)total_usable / (double)GiB,
                  (double)(need_n - total_usable) / (double)GiB);
+        cluster_moe_optin_hint(model, n, out->why, sizeof(out->why));
         return 0;
     }
 
@@ -741,17 +1209,7 @@ int idletoken_plan_llamacpp(const idletoken_llm_model_size *model,
      * the pool the node can be handed layers in (below), not in what the
      * machine owns. */
     out->kind = IDLETOKEN_LLPLAN_CLUSTER;
-    out->n_nodes = n;
-    out->order[0] = coordinator;
-    int k = 1;
-    for (int i = 0; i < n; i++) if (i != coordinator) out->order[k++] = i;
-    for (int i = 1; i < n - 1; i++)          /* insertion sort, strongest first */
-        for (int j = i + 1; j < n; j++)
-            if (idletoken_llama_kv_pool(&nodes[out->order[j]]) >
-                idletoken_llama_kv_pool(&nodes[out->order[i]])) {
-                int t = out->order[i]; out->order[i] = out->order[j]; out->order[j] = t;
-            }
-    out->layer0_node = coordinator;
+    out->mode = IDLETOKEN_MODE_GPU_ONLY;
 
     /* ---- the split is proportional to the pool a node can be HANDED LAYERS
      * IN, which is not what the machine owns (2026-08-20, T16) ---------------
@@ -814,6 +1272,9 @@ int idletoken_plan_llamacpp(const idletoken_llm_model_size *model,
      * coordinator that cannot hold one layer's worth in its own pool is a
      * refusal, not a re-plan. */
     if (cap[0] < min_frac) {
+        if (try_cluster_moe_hybrid(model, nodes, n, ctx_size, backend, out)) {
+            return 0;
+        }
         out->kind = IDLETOKEN_LLPLAN_REFUSE;
         snprintf(out->why, sizeof(out->why),
                  "[RESOURCE_INSUFFICIENT] the coordinator can only hold %.2f GiB in the memory "
@@ -826,6 +1287,7 @@ int idletoken_plan_llamacpp(const idletoken_llm_model_size *model,
                  (double)pool_of[0] / (double)GiB,
                  (double)per_node_oh / (double)GiB,
                  min_frac * (double)slice_all / (double)GiB, ctx_size);
+        cluster_moe_optin_hint(model, n, out->why, sizeof(out->why));
         return 0;
     }
 
@@ -834,6 +1296,9 @@ int idletoken_plan_llamacpp(const idletoken_llm_model_size *model,
      * of — the useful sentence is "this node's card is too small", not "the
      * cluster is short". */
     if (cap_total < 1.0) {
+        if (try_cluster_moe_hybrid(model, nodes, n, ctx_size, backend, out)) {
+            return 0;
+        }
         out->kind = IDLETOKEN_LLPLAN_REFUSE;
         snprintf(out->why, sizeof(out->why),
                  "[RESOURCE_INSUFFICIENT] %.2f GiB of weights + KV at ctx %u must be split "
@@ -846,6 +1311,7 @@ int idletoken_plan_llamacpp(const idletoken_llm_model_size *model,
                  out->order[tightest], (double)pool_of[tightest] / (double)GiB,
                  cap_total * (double)slice_all / (double)GiB,
                  (1.0 - cap_total) * (double)slice_all / (double)GiB);
+        cluster_moe_optin_hint(model, n, out->why, sizeof(out->why));
         return 0;
     }
 
@@ -907,6 +1373,9 @@ int idletoken_plan_llamacpp(const idletoken_llm_model_size *model,
     double placed = 0.0;
     for (int i = 0; i < n; i++) placed += out->tensor_split[i];
     if (placed < 0.999) {
+        if (try_cluster_moe_hybrid(model, nodes, n, ctx_size, backend, out)) {
+            return 0;
+        }
         out->kind = IDLETOKEN_LLPLAN_REFUSE;
         snprintf(out->why, sizeof(out->why),
                  "[RESOURCE_INSUFFICIENT] only %.1f%% of this model's layers could be placed in "
@@ -916,6 +1385,7 @@ int idletoken_plan_llamacpp(const idletoken_llm_model_size *model,
                  placed * 100.0, out->order[tightest],
                  cap[tightest] * (double)slice_all / (double)GiB,
                  (double)slice_all / (double)GiB, ctx_size);
+        cluster_moe_optin_hint(model, n, out->why, sizeof(out->why));
         return 0;
     }
 

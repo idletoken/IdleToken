@@ -92,41 +92,4 @@ else
     echo "  WARNING: no idletoken-platform-agent built — the Platform panel will not start it"
 fi
 
-# A DEBUG Tauri build resolves sidecars NEXT TO ITSELF (target/debug/<name>),
-# not from src-tauri/binaries/ — that path is what the BUNDLER reads. The P
-# gates and the install walkthrough all drive the debug client, so staging only
-# binaries/ leaves them on whatever engine was there before.
-#
-# That is not hypothetical: on 2026-08-04 target/debug/ still held 07-29
-# binaries, six days old and predating protocol v5. A freshly installed Windows
-# worker (v5) then met a v4 coordinator and the coordinator logged
-# `recv HELLO: Protocol error` in a loop while the joiner exited(1) silently.
-# Staging binaries/ alone did NOT fix it — the first fix aimed at the wrong
-# directory, which is exactly why both are done here now.
-DBG="client/src-tauri/target/debug"
-stage_dbg() {   # stage_dbg <src> <name-next-to-the-debug-exe>
-    cp -f "$1" "$DBG/$2" || fail "could not stage $2 into $DBG"
-    h=$(sha256_of "$DBG/$2") || fail "no sha256 tool for $2"
-    printf '%s  %s\n' "$h" "$2" > "$DBG/$2.sha256"
-    printf '  staged %-22s -> %s\n' "$2" "$DBG/"
-}
-if [ -d "$DBG" ]; then
-    for b in idletoken-worker idletoken-coord; do
-        stage_dbg "$ROOT/$b" "$b"
-    done
-    # The debug client resolves the engine next to itself too (engine.rs
-    # llama_server_bin / llama_engine_dir), under OUR names — the same ones the
-    # bundler ships. They used to land here as llama-server / ggml-rpc-server,
-    # which the 2026-08-15 rename left behind: the lookup went new-name-only and
-    # a debug client could no longer find an engine that was sitting right
-    # there. Same hard-failure rule as above.
-    stage_dbg "$LLAMA_SERVER" idletoken-server
-    stage_dbg "$GGML_RPC_SERVER" idletoken-rpc-server
-    if [ -x "$ROOT/build/idletoken-platform-agent" ]; then
-        stage_dbg "$ROOT/build/idletoken-platform-agent" idletoken-platform-agent
-    fi
-else
-    echo "  note: no $DBG yet (debug client never built here) — skipping"
-fi
-
 echo STAGE_OK

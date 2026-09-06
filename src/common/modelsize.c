@@ -3,6 +3,7 @@
  * measurement that made it necessary.
  */
 #include "idletoken_modelsize.h"
+#include "idletoken_gguf.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -97,6 +98,168 @@ uint64_t idletoken_gguf_bytes_on_disk(const char *path, char *why, size_t why_ca
     }
     return total;
 #undef BAIL
+}
+
+/* Does this tensor belong to the exact family moved by llama.cpp's
+ * `--n-cpu-moe` override? Keep this spelling aligned with the pinned engine's
+ * LLM_FFN_EXPS_REGEX in vendor/llama.cpp/common/common.h. Regex-search there
+ * also catches the bias/scale tensors after `_exps`, so a prefix test here is
+ * deliberately broader than a `.weight` suffix test. */
+static int tensor_is_moe_expert(const char *name, unsigned *layer_out) {
+    unsigned layer = 0;
+    int used = 0;
+    if (!name || sscanf(name, "blk.%u.%n", &layer, &used) != 1 || used <= 0)
+        return 0;
+    const char *tail = name + used;
+    if (strncmp(tail, "ffn_", 4) != 0) return 0;
+    tail += 4;
+    /* Pinned llama.cpp: ffn_(up|down|gate_up|gate)_(ch|)exps. Do not use a
+     * loose `_exps` substring test: a future tensor such as ffn_norm_exps
+     * would then be charged as CPU savings even though --n-cpu-moe leaves it
+     * on the GPU. Longer alternatives first so gate_up is not read as gate. */
+    static const char *roots[] = { "gate_up", "down", "gate", "up" };
+    int matched = 0;
+    for (size_t i = 0; i < sizeof roots / sizeof roots[0]; i++) {
+        const size_t n = strlen(roots[i]);
+        if (strncmp(tail, roots[i], n) != 0) continue;
+        const char *suffix = tail + n;
+        if (strncmp(suffix, "_exps", 5) == 0 ||
+            strncmp(suffix, "_chexps", 7) == 0) {
+            matched = 1;
+            break;
+        }
+    }
+    if (!matched) return 0;
+    if (layer_out) *layer_out = layer;
+    return 1;
+}
+
+/* Add one GGUF part's padded tensor spans to the per-layer expert buckets.
+ * Offsets, rather than a hand-maintained ggml dtype table, are the source of
+ * truth; this is the same byte-accounting rule model_auto.c uses for the
+ * layer/shared split. */
+static int add_expert_part(const char *path, uint32_t n_layers,
+                           uint64_t per_layer[IDLETOKEN_LLPLAN_MAX_LAYERS],
+                           uint64_t *total, char *err, size_t err_cap) {
+    char gerr[256] = "";
+    idletoken_gguf_meta *m = idletoken_gguf_meta_open(path, gerr, sizeof gerr);
+    if (!m) {
+        if (err && err_cap) snprintf(err, err_cap, "%s", gerr);
+        return -1;
+    }
+    struct stat st;
+    const uint64_t data_start = idletoken_gguf_data_offset(m);
+    if (stat(path, &st) != 0 || st.st_size <= 0 || (uint64_t)st.st_size < data_start) {
+        if (err && err_cap) snprintf(err, err_cap, "cannot size GGUF part %s", path);
+        idletoken_gguf_meta_close(m);
+        return -1;
+    }
+    const uint64_t data_bytes = (uint64_t)st.st_size - data_start;
+    const uint64_t nt = idletoken_gguf_meta_n_tensors(m);
+    typedef struct { uint64_t off; int layer; } ent;
+    ent *e = (ent *)calloc(nt ? (size_t)nt : 1, sizeof(*e));
+    if (!e) {
+        if (err && err_cap) snprintf(err, err_cap, "out of memory reading GGUF tensors");
+        idletoken_gguf_meta_close(m);
+        return -1;
+    }
+    for (uint64_t i = 0; i < nt; i++) {
+        idletoken_gguf_tensor t;
+        if (idletoken_gguf_tensor_info(m, i, &t) != 0 || t.offset > data_bytes) {
+            if (err && err_cap) snprintf(err, err_cap, "invalid tensor directory in %s", path);
+            free(e);
+            idletoken_gguf_meta_close(m);
+            return -1;
+        }
+        unsigned layer = 0;
+        e[i].off = t.offset;
+        e[i].layer = tensor_is_moe_expert(t.name, &layer) ? (int)layer : -1;
+        if (e[i].layer >= 0 &&
+            ((uint32_t)e[i].layer >= n_layers ||
+             e[i].layer >= IDLETOKEN_LLPLAN_MAX_LAYERS)) {
+            if (err && err_cap)
+                snprintf(err, err_cap, "expert tensor %s names out-of-range layer %u",
+                         t.name, layer);
+            free(e);
+            idletoken_gguf_meta_close(m);
+            return -1;
+        }
+    }
+    for (uint64_t i = 1; i < nt; i++) {
+        ent key = e[i];
+        uint64_t j = i;
+        while (j > 0 && e[j - 1].off > key.off) { e[j] = e[j - 1]; j--; }
+        e[j] = key;
+    }
+    for (uint64_t i = 0; i < nt; i++) {
+        const uint64_t end = i + 1 < nt ? e[i + 1].off : data_bytes;
+        if (end < e[i].off) {
+            if (err && err_cap) snprintf(err, err_cap, "unsorted tensor spans in %s", path);
+            free(e);
+            idletoken_gguf_meta_close(m);
+            return -1;
+        }
+        if (e[i].layer >= 0) {
+            const uint64_t bytes = end - e[i].off;
+            if (UINT64_MAX - per_layer[e[i].layer] < bytes ||
+                UINT64_MAX - *total < bytes) {
+                if (err && err_cap) snprintf(err, err_cap, "expert byte count overflow in %s", path);
+                free(e);
+                idletoken_gguf_meta_close(m);
+                return -1;
+            }
+            per_layer[e[i].layer] += bytes;
+            *total += bytes;
+        }
+    }
+    free(e);
+    idletoken_gguf_meta_close(m);
+    return 0;
+}
+
+/* Recover the exact prefix savings available to `--n-cpu-moe N` from every
+ * local GGUF part. This sits on the startup sizing path only; the header is a
+ * few MiB and no tensor payload is read. */
+static int gguf_expert_layout(const char *path, uint32_t n_layers,
+                              idletoken_llm_model_size *out,
+                              char *err, size_t err_cap) {
+    if (!path || !path[0] || !out || n_layers == 0 ||
+        n_layers > IDLETOKEN_LLPLAN_MAX_LAYERS) {
+        if (err && err_cap) snprintf(err, err_cap, "unsupported MoE layer count");
+        return -1;
+    }
+    const char *base = basename_of(path);
+    unsigned part_idx = 0, part_total = 1;
+    if (idletoken_gguf_split_parts(base, &part_idx, &part_total) && part_idx != 1) {
+        if (err && err_cap) snprintf(err, err_cap, "MoE sizing requires split part 1");
+        return -1;
+    }
+    if (part_total == 0) part_total = 1;
+    const size_t plen = strlen(path);
+    for (unsigned part = 1; part <= part_total; part++) {
+        char current[1024];
+        if (plen >= sizeof current) {
+            if (err && err_cap) snprintf(err, err_cap, "GGUF path is too long");
+            return -1;
+        }
+        memcpy(current, path, plen + 1);
+        if (part_total > 1) {
+            char *tail = current + plen - strlen(".gguf") - strlen("-00001-of-00001") + 1;
+            char idxbuf[6];
+            snprintf(idxbuf, sizeof idxbuf, "%05u", part);
+            memcpy(tail, idxbuf, 5);
+        }
+        if (add_expert_part(current, n_layers, out->expert_bytes_per_layer,
+                            &out->expert_bytes_total, err, err_cap) != 0)
+            return -1;
+    }
+    if (out->expert_bytes_total == 0) {
+        if (err && err_cap)
+            snprintf(err, err_cap, "GGUF contains no tensors matched by --n-cpu-moe");
+        return -1;
+    }
+    out->expert_bytes_complete = 1;
+    return 0;
 }
 
 /* Nearest variant to `bytes`, or NULL when the spec ships no variant menu or
@@ -253,6 +416,18 @@ int idletoken_model_size_resolve(const idletoken_model_spec *spec,
         const uint64_t bytes = idletoken_gguf_bytes_on_disk(gguf_path, ferr, sizeof(ferr));
         if (bytes > 0) {
             out->total_bytes = bytes;
+            char xerr[256] = "";
+            if (spec->n_expert > 0 &&
+                gguf_expert_layout(gguf_path, spec->n_layers, out,
+                                   xerr, sizeof xerr) != 0) {
+                /* The full-GPU budget remains valid. Only Hybrid depends on
+                 * this layout, and its planner checks `expert_bytes_complete`
+                 * before promising anything. Keep serving GPU-only while
+                 * making the missing evidence visible in this one source log. */
+                out->expert_bytes_total = 0;
+                memset(out->expert_bytes_per_layer, 0,
+                       sizeof out->expert_bytes_per_layer);
+            }
             int ambiguous = 0;
             const idletoken_model_variant *v = nearest_variant(spec, bytes, &ambiguous);
             if (why && why_cap) {
@@ -272,8 +447,12 @@ int idletoken_model_size_resolve(const idletoken_model_spec *spec,
                         " — WARNING: this size matches no quantization in the %s "
                         "manifest, so the budget uses the file's real size and the "
                         "per-quant layer data is unavailable; a layer split derived "
-                        "from it is less precise than usual", spec->id);
+                                          "from it is less precise than usual", spec->id);
                 }
+                if (spec->n_expert > 0 && !out->expert_bytes_complete)
+                    app(why, why_cap,
+                        " — WARNING: exact MoE expert placement is unavailable (%s); "
+                        "GPU-only remains usable but Hybrid will refuse", xerr);
             }
             return 0;
         }

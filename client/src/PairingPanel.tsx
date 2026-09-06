@@ -16,7 +16,8 @@ import type { Session } from "./auth";
 import { platformGate } from "./platform";
 import { useDialog } from "./useDialog";
 import { loadSettings, overflowTuning, type EngineTuning } from "./settings";
-import { ctxLabel } from "./format";
+import { ctxLabel, floorGiB1 } from "./format";
+import { isMoeModel } from "./models";
 
 type View = "choose" | "join" | "active";
 
@@ -28,6 +29,8 @@ function PeerRow(props: {
 }) {
   const { t } = useI18n();
   const p = props.peer;
+  const showMoeResources = isMoeModel(props.snapshot.modelId ?? "");
+  const mem = (bytes?: number) => bytes ? `${floorGiB1(bytes)} GB` : "—";
   const hasRange = p.layerLo !== undefined && p.layerHi !== undefined;
   // Explicit false only: older snapshots (and the dev-sim before the field)
   // omit `online`, and absence has always meant "fine".
@@ -55,6 +58,15 @@ function PeerRow(props: {
                 ? t("pairing.model.preparing")
                 : p.gpu}
           </span>
+          {showMoeResources ? (
+            <span className="peer__resources">
+              {t("pairing.moeResources", {
+                gpu: mem(p.vramFree),
+                ram: mem(p.ramFree),
+              })}
+              {p.unifiedMemory ? ` · ${t("node.unified")}` : ""}
+            </span>
+          ) : null}
         </div>
         {props.orchestrating ? (
           <span className={`peer__stage peer__stage--${p.stage}`}>{t(`pairing.stage.${p.stage}` as const)}</span>
@@ -125,6 +137,11 @@ export default function PairingPanel(props: {
   // Revealed only on request while running solo; see the active view below.
   const [showCode, setShowCode] = useState(false);
   const [snap, setSnap] = useState<PairingSnapshot | null>(null);
+  // All four entry choices operate this machine as a compute node. They share
+  // the same local-weight prerequisite; joining is not an escape hatch around
+  // the download gate. The action handlers repeat the preflight below so a
+  // file removed after render cannot bypass a disabled-button check.
+  const modelReady = !!props.self.modelPath;
   // Command failures (start refused, coordinator pick refused, …). These come
   // back as rejected invokes; without a catch they were unhandled rejections —
   // the button just did nothing on screen.
@@ -230,7 +247,7 @@ export default function PairingPanel(props: {
     setJoinKind("account");
     await guard(
       (async () => {
-        const modelPath = over?.modelPath ?? (await verifiedLocalPath());
+        const modelPath = over?.modelPath ?? (await props.prepareSelectedModel());
         await getPairingProvider().joinAccount(
           { ...props.self, modelPath, tuning: over?.tuning ?? props.self.tuning },
           secret
@@ -239,28 +256,6 @@ export default function PairingPanel(props: {
     );
   };
 
-  /**
-   * The path this machine may HONESTLY claim to hold: verified, not merely
-   * present.
-   *
-   * `props.self.modelPath` only says every part is on disk — it does NOT say
-   * they were hash-checked, and admission must not accept a file that skipped
-   * the integrity gate because its name and size happened to look right. That
-   * was the reason joins used to be sent with an empty path; the check moved
-   * here rather than being dropped when admission started requiring weights.
-   *
-   * "" means the weights are simply not on this machine. That is a normal
-   * outcome, not an error: being refused is how a joiner learns which model the
-   * cluster wants. A hash mismatch is a different matter and is re-thrown.
-   */
-  const verifiedLocalPath = async (): Promise<string> => {
-    try {
-      return await props.prepareSelectedModel();
-    } catch (e) {
-      if (String(e).includes("[WEIGHTS_NOT_DOWNLOADED]")) return "";
-      throw e;
-    }
-  };
   // `over` carries the weights this machine has JUST fetched after a
   // modelNotReady refusal. It has to be threaded through rather than read from
   // props: the download saves new settings and the join goes out in the same
@@ -276,11 +271,10 @@ export default function PairingPanel(props: {
     setJoinKind("code");
     await guard(
       (async () => {
-        // What this machine actually holds. Until 2026-09-01 this was hard-wired
-        // to "" because a joiner downloaded AFTER being admitted; admission now
-        // requires the weights, so a machine that already has them must say so
-        // and get in on the first try.
-        const modelPath = over?.modelPath ?? (await verifiedLocalPath());
+        // Admission requires verified local weights. Never send an empty path:
+        // the four entry choices are disabled while the selected model is
+        // missing, and this preflight closes the file-removal/race window.
+        const modelPath = over?.modelPath ?? (await props.prepareSelectedModel());
         await getPairingProvider().join(code, {
           ...props.self,
           modelPath,
@@ -391,32 +385,38 @@ export default function PairingPanel(props: {
 
         {view === "choose" ? (
           <>
-            <button className="choice" onClick={create} disabled={!props.self.modelPath}>
+            <button className="choice" onClick={create} disabled={!modelReady}>
               <span className="choice__title">{t("pairing.chooseCreate")}</span>
               <span className="choice__hint">
-                {props.self.modelPath ? t("pairing.chooseCreateHint") : t("pairing.createNeedsModel")}
+                {modelReady ? t("pairing.chooseCreateHint") : t("pairing.needsModel")}
               </span>
             </button>
-            <button className="choice" onClick={() => setView("join")}>
+            <button className="choice" onClick={() => setView("join")} disabled={!modelReady}>
               <span className="choice__title">{t("pairing.chooseJoin")}</span>
-              <span className="choice__hint">{t("pairing.chooseJoinHint")}</span>
+              <span className="choice__hint">
+                {modelReady ? t("pairing.chooseJoinHint") : t("pairing.needsModel")}
+              </span>
             </button>
             {accountReady ? (
               <>
                 <div className="setting-group__label" style={{ marginTop: 8 }}>
                   {t("pairing.accountTitle")}
                 </div>
-                <button className="choice" onClick={accountCreate} disabled={!props.self.modelPath}>
+                <button className="choice" onClick={accountCreate} disabled={!modelReady}>
                   <span className="choice__title">{t("pairing.accountCreate")}</span>
-                  <span className="choice__hint">{t("pairing.accountCreateHint")}</span>
+                  <span className="choice__hint">
+                    {modelReady ? t("pairing.accountCreateHint") : t("pairing.needsModel")}
+                  </span>
                 </button>
                 {/* Wrapped: accountJoin now takes an optional "weights we just
                     fetched" argument, and a bare handler would hand it the
                     click event as that argument. */}
-                <button className="choice" onClick={() => void accountJoin()}>
+                <button className="choice" onClick={() => void accountJoin()} disabled={!modelReady}>
                   <span className="choice__title">{t("pairing.accountJoin")}</span>
                   <span className="choice__hint">
-                    {t("pairing.accountJoinHint", { email: props.session?.email ?? "" })}
+                    {modelReady
+                      ? t("pairing.accountJoinHint", { email: props.session?.email ?? "" })
+                      : t("pairing.needsModel")}
                   </span>
                 </button>
               </>
@@ -442,6 +442,7 @@ export default function PairingPanel(props: {
               <span className="field__k">{t("pairing.enterCode")}</span>
               <input
                 className="field__input code-input"
+                disabled={!modelReady}
                 value={code}
                 maxLength={6}
                 autoCapitalize="characters"
@@ -482,7 +483,11 @@ export default function PairingPanel(props: {
                     })}
               </button>
             ) : (
-              <button className="btn-primary btn-block" onClick={() => void join()}>
+              <button
+                className="btn-primary btn-block"
+                disabled={!modelReady}
+                onClick={() => void join()}
+              >
                 {snap?.lastError ? t("state.retry") : t("pairing.join")}
               </button>
             )}

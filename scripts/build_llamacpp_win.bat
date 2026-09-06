@@ -6,8 +6,6 @@ REM
 REM Products (static CRT; CUDA runtime is staged by the client packager):
 REM   vendor\llama.cpp\build\bin\Release\llama-server.exe      inference + OpenAI API
 REM   vendor\llama.cpp\build\bin\Release\ggml-rpc-server.exe   worker-side RPC backend
-REM   vendor\llama.cpp\build\bin\Release\llama-perplexity.exe  numeric gate
-REM   vendor\llama.cpp\build\bin\Release\llama-fit-params.exe  memory dry-run (no_alloc)
 REM
 REM Runtime DLL note for packaging: the small-Q4 MMQ smoke once started without
 REM CUDA DLLs, but the real DSv4 cluster later failed at process load with
@@ -253,6 +251,9 @@ if not defined IDLETOKEN_MBEDTLS_SRC if exist "%ROOT%\tools\mbedtls\CMakeLists.t
 REM Flag-for-flag the COMMON_FLAGS of build_llamacpp.sh, plus:
 REM   GGML_STATIC=ON                        static cudart (cuBLAS stays a DLL,
 REM                                         see header note)
+REM   CMAKE_EXE_LINKER_FLAGS=/MAP            linker map next to each exe, so a crash
+REM                                         offset from the Windows event log can be
+REM                                         named without a debugger on the machine
 REM   CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded   /MT -- no VC redist needed on
 REM                                         a machine with only the NVIDIA driver
 echo == configuring ^(MSVC + CUDA %IDLETOKEN_CUDA_VER%, archs %IDLETOKEN_CUDA_ARCHS%^)
@@ -271,7 +272,8 @@ echo == configuring ^(MSVC + CUDA %IDLETOKEN_CUDA_VER%, archs %IDLETOKEN_CUDA_AR
     -DLLAMA_BUILD_TESTS=OFF ^
     -DLLAMA_BUILD_EXAMPLES=OFF ^
     -DLLAMA_BUILD_TOOLS=ON ^
-    -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+    -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded ^
+    -DCMAKE_EXE_LINKER_FLAGS=/MAP
 if errorlevel 1 (
     echo FATAL: cmake configure failed
     exit /b 1
@@ -279,7 +281,7 @@ if errorlevel 1 (
 
 echo == building ^(this takes 30-60+ min for the CUDA kernels^)
 "%CMAKE%" --build "%BUILD_DIR%" --config Release -j %NUMBER_OF_PROCESSORS% ^
-    --target llama-server ggml-rpc-server llama-perplexity llama-fit-params
+    --target llama-server ggml-rpc-server
 if errorlevel 1 (
     echo FATAL: build failed
     exit /b 1
@@ -290,7 +292,7 @@ REM Actually execute the product; existence alone proves nothing (a stale or
 REM half-linked exe sits there looking green). Multi-config generator puts the
 REM binaries under bin\Release, not bin\ -- consumers take note.
 set "BIN_DIR=%BUILD_DIR%\bin\Release"
-for %%B in (llama-server.exe ggml-rpc-server.exe llama-perplexity.exe llama-fit-params.exe) do (
+for %%B in (llama-server.exe ggml-rpc-server.exe) do (
     if not exist "%BIN_DIR%\%%B" (
         echo FATAL: %%B not built
         exit /b 1

@@ -276,7 +276,7 @@ static void usage(FILE *out) {
 "  --advise-peers L    judge this machine PLUS peers; L = vramGiB:ramGiB:unified,...\n"
 "  --gguf-dir DIR      directory to statvfs() for disk-avail (default: ./)\n"
 "  --max-vram-mb N     cap usable VRAM at N MiB (client setting; 0 = no cap)\n"
-"  --max-ram-mb N      retired compatibility option; serving ignores RAM\n"
+"  --max-ram-mb N      cap usable RAM for node-local MoE experts (0 = no cap)\n"
 "  --kv-clear          wipe the on-disk KV warm cache and exit\n"
 "  --kv-dir DIR        KV cache directory (default: platform cache dir)\n"
 "  -h, --help          show this help\n"
@@ -293,8 +293,9 @@ static void usage(FILE *out) {
 "                      addresses (100.64/10) are refused — tensor traffic\n"
 "                      must stay on the real LAN)  (env IDLETOKEN_RPC_HOST)\n"
 "  --rpc-port N        rpc-server port (default 50052; env IDLETOKEN_RPC_PORT)\n"
-"  --rpc-device D      GPU device for the rpc-server (-d), default\n"
-"                      CUDA0 on Windows/Linux, MTL0 on macOS; CPU is refused\n"
+"  --rpc-device D      rpc-server GPU (-d), default CUDA0 on Windows/Linux\n"
+"                      and MTL0 on macOS. On an eligible MoE plan the\n"
+"                      coordinator adds CPU as a zero-share backing store\n"
 "                      (env IDLETOKEN_RPC_DEVICE)\n"
 "\n"
 "v0.1 only runs PP (segment_id always 0). v0.2 will add SP=2.\n");
@@ -662,6 +663,25 @@ static int worker_rpc_cache_paths(const char *gguf_dir,
             if (!(mask & (1u << (d - 'A')))) continue;
             char dr[4] = { d, ':', '\\', '\0' };
             if (GetDriveTypeA(dr) != DRIVE_FIXED) continue;
+            /* The RPC cache activates a tensor by HARD-LINKING its
+             * content-addressed file to its name (weights.c,
+             * cache_activate_name). exFAT, the usual format of a large
+             * external SSD, has no hard links, and such a drive is exactly
+             * the one that wins a free-space contest: on 2026-09-05 a
+             * 1.8 TB exFAT drive was selected on the Windows build node
+             * and every cluster formation then died at "cannot activate
+             * local tensor" after fetching the first tensor. Ask the volume
+             * before considering it. */
+            char fsname[32] = "";
+            DWORD fsflags = 0;
+            if (!GetVolumeInformationA(dr, NULL, 0, NULL, NULL, &fsflags,
+                                       fsname, sizeof(fsname)) ||
+                !(fsflags & FILE_SUPPORTS_HARD_LINKS)) {
+                fprintf(stderr, "idletoken-worker: not using %c: for model "
+                                "shards (%s has no hard links)\n",
+                        d, fsname[0] ? fsname : "its filesystem");
+                continue;
+            }
             ULARGE_INTEGER avail, total, freeb;
             if (!GetDiskFreeSpaceExA(dr, &avail, &total, &freeb)) continue;
             if (avail.QuadPart > best_any) {
@@ -674,6 +694,23 @@ static int worker_rpc_cache_paths(const char *gguf_dir,
                 best_fast = avail.QuadPart;
                 best_fast_drive = d;
             }
+        }
+        /* Prefer a non-rotational drive only when it has room. The worker
+         * does not know its layer share yet (that arrives with RPC_ASSIGN),
+         * so use a floor: below 64 GiB free, a fast drive loses to the
+         * largest hard-link-capable one unless it is at least a quarter of
+         * it. On 2026-09-06 a Windows test node picked its 3.8 GiB system NVMe over a
+         * 411 GB USB SSD (USB media is reported as "unknown", so it never
+         * counts as non-rotational) and every shard fetch would have died
+         * on "No space left on device". */
+        if (best_fast_drive && best_fast < 64ULL * 1073741824ULL &&
+            best_fast * 4 < best_any) {
+            fprintf(stderr, "idletoken-worker: %c: is non-rotational but has "
+                            "only %.1f GiB free; using %c: (%.1f GiB) for "
+                            "model shards instead\n",
+                    best_fast_drive, (double)best_fast / 1073741824.0,
+                    best_any_drive, (double)best_any / 1073741824.0);
+            best_fast_drive = 0;
         }
         const char best_drive = best_fast_drive ? best_fast_drive : best_any_drive;
         const ULONGLONG best = best_fast_drive ? best_fast : best_any;
@@ -1187,8 +1224,29 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
     /* Keep capability tokens inside the coordinator's 64-byte version field.
      * The older verbose "rpc-supervisor+..." spelling pushed rpc-cache-v1
      * past the boundary and made a new worker look incapable after truncation. */
-    snprintf(worker_version, sizeof(worker_version), "%s (rpc-cache-v1)",
-             IDLETOKEN_WORKER_VERSION);
+    /* The RPC command-set capabilities describe the ENGINE that will serve
+     * (the rpc-server binary in --engine-dir), not this supervisor's build.
+     * The engine version string is a function of the upstream pin alone, so
+     * an rpc-server built without patch 0005 reports the same version as one
+     * built with it; on 2026-09-05 a freshly built worker advertised the
+     * node-local command set for a 0001-0004 rpc-server, the coordinator's
+     * 0005 llama-server sent GET_DEVICE_TYPE, and the engine died mid-load.
+     * Unreadable counts as "older": fewer capabilities, never more. */
+    const int engine_node_local = idletoken_engine_has_node_local_moe(rpc_bin);
+    if (engine_node_local < 0)
+        fprintf(stderr, "idletoken-worker: cannot read %s to learn its RPC "
+                        "command set; advertising the older set\n", rpc_bin);
+    fprintf(stderr, "idletoken-worker: engine %s %s the node-local MoE RPC "
+                    "commands (patch 0005)\n", rpc_bin,
+            engine_node_local == 1 ? "has" : "lacks");
+    const int rpc_cpu_capable =
+        engine_node_local == 1 &&
+        !rr.unified_memory && strncmp(rpc_device, "CUDA", 4) == 0 &&
+        strchr(rpc_device, ',') == NULL;
+    snprintf(worker_version, sizeof(worker_version), "%s (rpc-cache-v1%s%s)",
+             IDLETOKEN_WORKER_VERSION,
+             engine_node_local == 1 ? " rpcdt-v1" : "",
+             rpc_cpu_capable ? " rpc-cpu-v1" : "");
 
     uint8_t hello_payload[1024];
     idletoken_buf b;
@@ -1320,6 +1378,7 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
     }
 
     /* --- RPC_ASSIGN: the wrapped cluster TLS PSK (WS-C2) ------------------ */
+    int assigned_rpc_cpu = 0;
     {
         uint8_t ap[512];
         idletoken_msg_header ah;
@@ -1347,8 +1406,15 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
         idletoken_buf_get_bytes(&abuf, nonce, sizeof(nonce));
         idletoken_buf_get_bytes(&abuf, ct, sizeof(ct));
         idletoken_buf_get_bytes(&abuf, tag, sizeof(tag));
-        if (abuf.err || pver != 1) {
+        if (abuf.err || pver != 1 || z3[1] != 0 || z3[2] != 0 || (z3[0] & ~1u) != 0) {
             fprintf(stderr, "idletoken-worker: RPC_ASSIGN payload malformed\n");
+            close(fd);
+            return 1;
+        }
+        assigned_rpc_cpu = (z3[0] & 1u) != 0;
+        if (assigned_rpc_cpu && !rpc_cpu_capable) {
+            fprintf(stderr, "idletoken-worker: coordinator requested the node-local "
+                            "MoE RAM device, but this worker cannot expose it\n");
             close(fd);
             return 1;
         }
@@ -1408,6 +1474,15 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
      * (src/coord/llama_sidecar.c): backoff 2/4/8/16/30s, 5 consecutive quick
      * crashes latch FAILED. Readiness = the endpoint accepts TCP (rpc-server
      * has no /health; it serves the ggml-RPC protocol directly). */
+    char active_rpc_device[128];
+    const int adn = snprintf(active_rpc_device, sizeof(active_rpc_device), "%s%s",
+                             rpc_device, assigned_rpc_cpu ? ",CPU" : "");
+    if (adn < 0 || (size_t)adn >= sizeof(active_rpc_device)) {
+        fprintf(stderr, "idletoken-worker: assigned RPC device list is too long\n");
+        close(fd);
+        return 1;
+    }
+
     char log_path[1024];
     if (worker_rpc_log_path(log_path, sizeof(log_path), rpc_port) != 0) {
         close(fd);
@@ -1415,12 +1490,12 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
     }
 
     long long pid = 0;
-    if (rpc_spawn(rpc_bin, rpc_host, rpc_port, rpc_device, log_path, &pid) != 0) {
+    if (rpc_spawn(rpc_bin, rpc_host, rpc_port, active_rpc_device, log_path, &pid) != 0) {
         close(fd);
         return 1;
     }
     fprintf(stderr, "idletoken-worker: spawned idletoken-rpc-server (pid %lld) on %s "
-                    "(-d %s), log: %s\n", pid, endpoint, rpc_device, log_path);
+                    "(-d %s), log: %s\n", pid, endpoint, active_rpc_device, log_path);
 
     int ever_ready = 0, starting = 1, quick_restarts = 0;
     long long restart_due_ms = 0, became_ready_ms = 0;
@@ -1588,7 +1663,7 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
 
         if (pid == 0 && restart_due_ms > 0 && now >= restart_due_ms) {
             restart_due_ms = 0;
-            if (rpc_spawn(rpc_bin, rpc_host, rpc_port, rpc_device, log_path,
+            if (rpc_spawn(rpc_bin, rpc_host, rpc_port, active_rpc_device, log_path,
                           &pid) == 0) {
                 starting = 1;
                 fprintf(stderr, "idletoken-worker: respawned idletoken-rpc-server "
@@ -1851,15 +1926,16 @@ int main(int argc, char **argv) {
 #endif
         }
         if (strstr(rpc_device, "CPU") != NULL || strstr(rpc_device, "cpu") != NULL) {
-            fprintf(stderr, "idletoken-worker: CPU RPC devices are not supported; "
-                            "use a GPU device such as CUDA0 or MTL0\n");
+            fprintf(stderr, "idletoken-worker: do not add CPU to --rpc-device; "
+                            "the coordinator enables the node-local MoE RAM "
+                            "device only for an eligible MoE cluster plan\n");
             return 2;
         }
         return run_rpc_supervisor(engine_dir, rpc_host, rpc_port, rpc_device,
                                   coord_addr, pair_code, pair_acct, acct_token,
                                   rendezvous, disc_port,
                                   max_vram_mb * 1024ull * 1024ull,
-                                  0, gguf_dir,
+                                  max_ram_mb * 1024ull * 1024ull, gguf_dir,
                                   model_path,
                                   shard_repo);
     }

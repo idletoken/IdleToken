@@ -1,14 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { LangContext, STRINGS, useI18n, type Lang } from "./i18n";
 import { getResourceProvider } from "./provider";
-import { getEngineProvider, type EngineLogLine, type EngineRole, type EngineStatus } from "./provider/engine";
-import { uiTestDirectives } from "./testHooks";
+import { getEngineProvider, type EngineLogLine, type EngineStatus } from "./provider/engine";
 import type { NodeSnapshot, ClusterState } from "./types";
 import { HW_OK, HW_NO_GPU, HW_CC_TOO_LOW, HW_DRIVER_TOO_OLD, HW_VRAM_TOO_SMALL, HW_GPU_UNSUPPORTED, HW_MACOS_SEALED } from "./types";
-import { getModel, getManifest, defaultQuant, estimateClusterCapacity, poolVram, pickBestFittingModel, backendOfOs, type ModelSpec } from "./models";
-import { resolveLocalWeights, fetchWeights, onFetchProgress, defaultModelDir, cancelFetch, resolveDownload, weightsState, verifyWeights, isWeightsCancelled, type DownloadTarget } from "./weights";
+import { getModel, getManifest, estimateClusterCapacity, poolVram, poolRam, isMoeModel, pickBestFittingModel, backendOfOs, CLUSTER_MOE_HYBRID_ENABLED, type ModelSpec } from "./models";
+import { resolveLocalWeights, fetchWeights, onFetchProgress, defaultModelDir, cancelFetch, resolveDownload, verifyWeights, isWeightsCancelled, type DownloadTarget } from "./weights";
 import { loadSettings, saveSettings, settingsWerePersisted, effectiveCaps, effectiveCtx, engineTuning, overflowTuning, autoUiScale, contextTiersFor, type AppSettings, type ContextTier, type Tier } from "./settings";
-import { buildDiagnosticsBundle } from "./diagnostics";
 import { getAuthProvider, type Session } from "./auth";
 import SettingsPanel from "./SettingsPanel";
 import { OverflowToggleButton, ShareToggleButton } from "./PlatformPanel";
@@ -18,28 +16,15 @@ import PairingPanel from "./PairingPanel";
 import Chat from "./Chat";
 import ModelPicker from "./ModelPicker";
 import WeightsRow, { type WeightsInfo } from "./WeightsRow";
-import { inTauri, platformGate, getMe, resumeSharingAgent } from "./platform";
+import { inTauri, getMe, resumeSharingAgent } from "./platform";
 import { identityFrom, type UserIdentity } from "./Avatar";
-import { accountPairSecret, getPairingProvider, type PairingSnapshot, type ClusterApi, type PeerNode } from "./pairing";
+import { getPairingProvider, type PairingSnapshot, type ClusterApi, type PeerNode } from "./pairing";
 import { recordProblem } from "./problems";
 import { useClusterStats, servedModelOf, type ClusterStats } from "./clusterStats";
 import { compactCount, ctxLabel, floorGiB1, fmtGiB, pct } from "./format";
-import { quitApp, setAutostart, syncTray, syncWindowPrefs, windowState } from "./system";
+import { setAutostart, syncTray, syncWindowPrefs } from "./system";
 
 type Theme = "dark" | "light";
-
-let uiTestRan = false;
-// (uiTestCtx, the per-JS-context id for UI-test reports, left with the
-// serve-open-gguf oracle on 2026-08-15 — reintroduce it with the next
-// reporter that needs to tell two page loads apart.)
-
-// Ship a UI-test assertion result to the shell's stderr (see ui_test_report
-// in src-tauri/src/main.rs). No-op outside Tauri.
-function reportTest(tag: string, data: unknown) {
-  import("@tauri-apps/api/core").then(({ invoke }) =>
-    invoke("ui_test_report", { tag, data: JSON.stringify(data) }).catch(() => {})
-  );
-}
 
 function usePersisted<T extends string>(key: string, initial: T): [T, (v: T) => void] {
   const [v, setV] = useState<T>(() => (localStorage.getItem(key) as T) || initial);
@@ -218,7 +203,9 @@ function NodeCapacityCard(props: {
   // now the only answer came from the coordinator refusing afterwards.
   const peers = props.peers ?? [];
   const pool = useMemo(() => poolVram(peers), [peers]);
+  const ramPool = useMemo(() => poolRam(peers), [peers]);
   const clustered = peers.length > 1;
+  const isMoe = isMoeModel(props.model.id);
   // Backend matters: GLM-5.2's measured workspace is 1.50 GiB on CUDA and
   // 33.25 GiB on Metal. Passing the machine's own OS keeps this card and the
   // deploy buttons reading the same number.
@@ -228,12 +215,24 @@ function NodeCapacityCard(props: {
   // The pooled verdict reuses the same needBytes (it already accounts for the
   // node count) against the summed memory.
   const haveBytes = clustered ? pool.bytes : cap.haveBytes;
-  const short = haveBytes < cap.needBytes;
+  const gpuShort = haveBytes < cap.needBytes;
+  const vramGapBytes = Math.max(0, cap.needBytes - haveBytes);
+  // The exact expert prefix is discovered from the downloaded GGUF at launch.
+  // This UI hint is intentionally only a possibility check; the runtime
+  // planner remains the hard gate and never guesses expert tensor sizes.
+  // The cluster shape is additionally behind the opt-in switch (models.ts):
+  // the card must not promise a placement the coordinator refuses by default.
+  const hybridPossible = isMoe && gpuShort && (
+    clustered
+      ? CLUSTER_MOE_HYBRID_ENABLED && ramPool.complete && ramPool.bytes >= vramGapBytes
+      : !s.unified_memory && s.ram_usable >= vramGapBytes
+  );
+  const short = gpuShort && !hybridPossible;
   // "Cannot tell" beats a wrong "not enough": a member that reported nothing
   // makes the total a lower bound, and only a SHORTFALL can be wrong that way
   // (a total that already covers the model cannot be talked down by adding
   // more memory to it).
-  const unknown = clustered && !pool.complete && short;
+  const unknown = clustered && !pool.complete && gpuShort;
   // Never round available memory upward or required memory downward: doing so
   // can print equal-looking figures beside a real shortfall at the boundary.
   // `floorGiB1` is shared with the hardware strip's readout so the two cannot
@@ -247,6 +246,9 @@ function NodeCapacityCard(props: {
   // now reports remaining memory directly (NVML's own `free`), so read that.
   const vFree = fmtGiB(s.vram_usable);
   const vTotal = fmtGiB(s.vram_total);
+  const rFree = fmtGiB(s.ram_usable);
+  const rTotal = fmtGiB(s.ram_total);
+  const ramHave = clustered ? ramPool.bytes : s.ram_usable;
   const total = props.model.totalLayers;
   const ticks = useMemo(() => Array.from({ length: total }), [total]);
   // Hardware floor: the engine decided, the UI only renders the verdict. A
@@ -290,6 +292,19 @@ function NodeCapacityCard(props: {
             <span className="track__used" style={{ width: `${pct(s.vram_used_other, s.vram_total)}%` }} />
           </div>
         </div>
+        {isMoe ? (
+          <div className="nstat nstat--bar">
+            <span className="nstat__k">{t("node.ram")}</span>
+            <span className="nstat__v">
+              {rFree.value}
+              <span className="unit">/ {rTotal.value} {rTotal.unit}</span>
+            </span>
+            <div className="track track--mini">
+              <span className="track__usable" style={{ width: `${pct(s.ram_usable, s.ram_total)}%` }} />
+              <span className="track__used" style={{ width: `${pct(s.ram_used_other, s.ram_total)}%` }} />
+            </div>
+          </div>
+        ) : null}
       </div>
 
       {/* Two facts and a bar (2026-08-15; the explanatory sentences are gone —
@@ -299,15 +314,26 @@ function NodeCapacityCard(props: {
           which read as the graphic disappearing the moment a cluster worked. */}
       <div className="capacity">
         <div className="capacity__head">
-          <span className={`capacity__need${short ? " capacity__gap" : ""}`}>
+          <span className={`capacity__need${gpuShort ? " capacity__gap" : ""}`}>
             {t("capacity.ratio", { have: GBHave(haveBytes), need: GBNeed(cap.needBytes) })}
           </span>
         </div>
-        <div className="spine" role="img" aria-label={t(short ? "spine.no" : "spine.fits")}>
+        <div className="spine" role="img" aria-label={t(hybridPossible ? "spine.hybrid" : short ? "spine.no" : "spine.fits")}>
           {ticks.map((_, i) => (
             <span key={i} className={`tick${i < cap.hostableLayers ? " tick--on" : ""}`} />
           ))}
         </div>
+        {isMoe ? (
+          <p className="capacity__mode">
+            {clustered
+              ? t("capacity.moeCluster", { ram: ramPool.complete ? GBHave(ramHave) : "—" })
+              : s.unified_memory
+                ? t("capacity.moeUnified")
+                : hybridPossible
+                  ? t("capacity.moeHybrid", { ram: GBHave(ramHave) })
+                  : t("capacity.moeGpuFirst", { ram: GBHave(ramHave) })}
+          </p>
+        ) : null}
         {/* The bar is the only thing on this card a glance can read, and
             unlabelled it is decoration — so one short line names the outcome.
             The shortfall side no longer distinguishes one machine from a pool
@@ -317,7 +343,9 @@ function NodeCapacityCard(props: {
         <p className={`capacity__verdict${short ? " capacity__verdict--no" : ""}`}>
           {unknown
             ? t("spine.unknown")
-            : short
+            : hybridPossible
+              ? t("spine.hybrid")
+              : short
               ? t("spine.no")
               : clustered
                 ? t("spine.clusterFits", { n: peers.length })
@@ -567,6 +595,13 @@ function ClusterCard(props: {
   const engineState = snap?.phase === "ready" ? "ready" : stats?.engine_state;
   const anyError = active && snap.peers.some((p) => p.stage === "error");
   const canServe = props.canServeStandalone !== false;
+  // One readiness gate for both deployment paths. `path` matters as well as
+  // `needs`: those states start as ""/false while the first disk probe is in
+  // flight, and treating false as ready briefly enabled cluster creation on a
+  // fresh install. A missing `weights` prop is kept compatible with fixtures
+  // that do not exercise the download surface.
+  const weightsReady = !props.weights
+    || (!!props.weights.path && !props.weights.needs && !props.weights.dl);
   // Single machine leads when it can actually hold the model: it is faster (no
   // RPC hop), simpler, and strictly better for privacy since nothing leaves the
   // machine. Hard constraint #1 says single-machine users are the majority and
@@ -660,7 +695,7 @@ function ClusterCard(props: {
             // duplicating that action or its progress. Capacity is deliberately
             // NOT a client-side disable condition: the coordinator performs the
             // authoritative GPU admission for the exact selected context.
-            disabled={!canServe || !!props.weights?.dl || !!props.weights?.needs}
+            disabled={!canServe || !weightsReady}
             onClick={props.onServeStandalone}
           >
             {t("cluster.serveLocal")}
@@ -681,6 +716,8 @@ function ClusterCard(props: {
                 same dialog's other tab was noise (removed 2026-08-15). */}
             <button
               className={localLeads ? "btn-secondary" : "btn-primary"}
+              disabled={!weightsReady}
+              title={!weightsReady ? t("pairing.needsModel") : undefined}
               onClick={props.onCreate}
             >
               {t("cluster.create")}
@@ -1769,499 +1806,9 @@ export default function App() {
     [settings, pairSnap, localEngine, stopLocalEngine, serveStandalone, queueRebuild]
   );
 
-  // The UI-test effect runs once on mount, so it captures the FIRST render's
-  // closure — where snap is still null. A ref keeps the directive pointed at
-  // the current handler instead of a stale one.
-  const serveStandaloneRef = useRef(serveStandalone);
-  useEffect(() => {
-    serveStandaloneRef.current = serveStandalone;
-  });
-
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
   }, [theme]);
-
-  // UI-test channel (see testHooks.ts): execute launcher-provided directives
-  // through the same providers user actions use. No-op in normal runs.
-  useEffect(() => {
-    // StrictMode double-mounts effects in dev; directives must run once.
-    if (uiTestRan) return;
-    uiTestRan = true;
-    uiTestDirectives().then((list) => {
-      // Echo the list to the launcher's log first: whether this loop ran at
-      // all (and with what) must be observable from a headless run.
-      if (list.length) reportTest("directives", list);
-      for (const d of list) {
-        const m = d.match(/^engine-start:(worker|coordinator)$/);
-        if (m) getEngineProvider().start(m[1] as EngineRole).catch(() => {});
-        // Quit after N ms (graceful-exit tests). It goes through app_quit, not
-        // through the window's close button: with "close to tray" on — the
-        // default — closing the window HIDES it, and every gate that ends with
-        // this directive would hang waiting for a process that is still
-        // happily serving in the background.
-        const q = d.match(/^quit:(\d+)$/);
-        if (q) setTimeout(() => void quitApp(), Number(q[1]));
-
-        // Pairing flow (P3/P4/P5/P6 gates). `:as=<name>` overrides the advertised
-        // hostname so two instances on one test box get distinct roster ids;
-        // `:apiPort=<n>` / `:apiToken=<s>` override the settings-derived engine
-        // tuning (P5 settings gate); `:model=<path>` passes a real GGUF so the
-        // engines load actual weights (P6 real-reply gate) instead of the mock
-        // load (P3/P4). Token order is fixed: as, apiPort, apiToken, model.
-        const pm = d.match(
-          /^pairing-(create|join):([A-Z0-9]{6})(?::as=([^:,\s]+))?(?::apiPort=(\d+))?(?::apiToken=([^:,\s]+))?(?::model=(\S+))?$/
-        );
-        if (pm) {
-          const [, op, code, as, apiPort, apiToken, model] = pm;
-          const tuning = {
-            ...engineTuning(settings, caps),
-            ...(apiPort ? { apiPort: Number(apiPort) } : {}),
-            ...(apiToken ? { apiToken } : {}),
-          };
-          import("@tauri-apps/api/core").then(({ invoke }) =>
-            invoke(op === "create" ? "pairing_create" : "pairing_join", {
-              code,
-              hostname: as || window.location.hostname || "test-node",
-              gpu: "test",
-              modelPath: model || "",
-              tuning,
-            }).catch((e) => {
-              // Surface to the launcher's log too: a directive failure that
-              // only reaches the webview console is invisible to every
-              // headless run (cost a whole debugging round, 2026-08-15).
-              console.error("uiTest pairing:", e);
-              reportTest("pairing-invoke-error", { op, error: String(e) });
-            })
-          );
-        }
-        // Account-mode pairing (integration plan 3.3): derive the pair secret
-        // from the real signed-in platform session — no fixed test material,
-        // so an unauthenticated run reports the failure honestly instead of
-        // faking a pairing. `:as=<name>` = distinct roster id per instance.
-        const am = d.match(/^pairing-account-(create|join)(?::as=([^:,\s]+))?$/);
-        if (am) {
-          const [, op, as] = am;
-          (async () => {
-            const gate = platformGate();
-            if (!gate.ok || !gate.session.userId) {
-              reportTest("pairing-account", {
-                ok: false,
-                op,
-                reason: gate.ok ? "session-missing-user-id" : gate.reason,
-              });
-              return;
-            }
-            const secret = await accountPairSecret(
-              gate.session.userId,
-              gate.url
-            );
-            const { invoke } = await import("@tauri-apps/api/core");
-            try {
-              await invoke(op === "create" ? "pairing_create" : "pairing_join", {
-                code: secret,
-                hostname: as || window.location.hostname || "test-node",
-                gpu: "test",
-                modelPath: "",
-                tuning: engineTuning(settings, caps),
-                account: true,
-              });
-              reportTest("pairing-account", { ok: true, op, email: gate.session.email });
-            } catch (e) {
-              reportTest("pairing-account", { ok: false, op, reason: String(e) });
-            }
-          })();
-        }
-        // Platform panel state report (integration plan 3.1/3.2 acceptance
-        // hook): what the panel would render for the current auth/platform
-        // config — connection gate, agent start params, Tauri availability.
-        // Reads live settings/session (not the mount-time closure) and does
-        // NOT start a real agent.
-        if (d === "report-platform-panel") {
-          const s = loadSettings();
-          const sess = getAuthProvider().currentSession();
-          const gate = platformGate();
-          reportTest("platform", {
-            platformUrl: s.platformUrl || null,
-            signedIn: sess !== null,
-            sessionProvider: sess?.provider ?? null,
-            gate: gate.ok ? "ok" : gate.reason,
-            agentName: s.providerName || null,
-            coordApiPort: s.apiPort || 8000,
-            tauri: inTauri(),
-          });
-        }
-        // Self-check for the diagnostics bundle (support): produce a report
-        // through the **real** provider path and assert two things -- that it
-        // contains hardware facts, and that it contains **no token whatsoever**.
-        // Redaction cannot be watched by eye; it needs a gate.
-        const dg = d.match(/^report-diagnostics(?::token=([^,\s]+))?$/);
-        if (dg) {
-          // With :token=<sentinel>, write it into settings before producing the
-          // report -- only then is "the report contains no token" a statement that
-          // was actually verified. Without a sentinel, tokenChecked below honestly
-          // records false.
-          const original = loadSettings();
-          if (dg[1]) saveSettings({ ...original, apiToken: dg[1] });
-          const s = dg[1] ? { ...original, apiToken: dg[1] } : original;
-          getEngineProvider()
-            .diagnostics(undefined)
-            .then((rep) => {
-              const bundle = buildDiagnosticsBundle(rep, s);
-              const r = bundle as any;
-              // The redaction assertion is verified with a sentinel **known to be
-              // present in settings**: with no token available to leak, "nothing
-              // leaked" says nothing. tokenChecked records honestly whether this
-              // cell was actually tested (not covered is not the same as passed).
-              const token = s.apiToken || "";
-              const text = JSON.stringify(bundle);
-              reportTest("diagnostics", {
-                schema: r.schema ?? null,
-                probeGpu: r.probe?.gpu_name ?? null,
-                probeError: r.probe?.error ?? null,
-                hasAdvise: Boolean(r.advise && !r.advise.error),
-                tokenChecked: token.length > 0,
-                leaksApiToken: token.length > 0 && text.includes(token),
-              });
-            })
-            .catch((e) => reportTest("diagnostics", { error: String(e) }))
-            // The test sentinel token is not left behind in the user's settings.
-            .finally(() => { if (dg[1]) saveSettings(original); });
-        }
-        // ---- tray / background residency (gate G-TRAY) -------------------
-        // What the shell believes about the tray and the window, straight from
-        // Rust: whether an icon actually exists (it can fail to on Linux) and
-        // therefore whether hiding the window is allowed at all.
-        if (d === "report-shell-window") {
-          windowState()
-            .then((st) => reportTest("shell-window", st ?? { error: "not running in the shell" }))
-            .catch((e) => reportTest("shell-window", { error: String(e) }));
-        }
-        // Close the window the way the X button does and report what happened.
-        // The report arriving at all is half the assertion: it is printed by a
-        // process that closing the window did not kill.
-        const ct = d.match(/^close-to-tray:(\d+)$/);
-        if (ct) {
-          (async () => {
-            // Directives run before the settings-sync effect below, so the
-            // shell is told explicitly rather than tested against whatever
-            // window.json happened to be left behind by an earlier run.
-            await syncWindowPrefs(loadSettings());
-            const before = await windowState();
-            const { getCurrentWindow } = await import("@tauri-apps/api/window");
-            await getCurrentWindow().close();
-            await new Promise((r) => setTimeout(r, Number(ct[1])));
-            const after = await windowState();
-            reportTest("close-to-tray", {
-              hideAllowed: before?.hideAllowed ?? null,
-              trayAlive: before?.trayAlive ?? null,
-              visibleBefore: before?.visible ?? null,
-              visibleAfter: after?.visible ?? null,
-              stillRunning: after !== null,
-            });
-          })().catch((e) => reportTest("close-to-tray", { error: String(e) }));
-        }
-        // Report a fresh probe through the real provider path so acceptance
-        // can diff it against `--probe-json` (P1: no fake data in the UI).
-        // An executable oracle for weight downloading (B1). The product gate
-        // cannot run it -- that needs a desktop capable of drawing -- while the
-        // download itself needs no window. It runs a real download of the smallest
-        // model (0.8B / 0.49 GiB): endpoint probing, Range resumption, size
-        // validation and rename, all through the same production path.
-        //   weights-fetch:<modelId>[:dir=<path>]
-        const wf = d.match(/^weights-fetch:([a-z0-9.\-]+)(?::dir=(\S+))?$/);
-        if (wf) {
-          (async () => {
-            const t0 = Date.now();
-            try {
-              const man = getManifest(wf[1]);
-              const target = resolveDownload(man, defaultQuant(wf[1]));
-              if (!target) { reportTest("weightsFetch", { error: "manifest has no repo/gguf" }); return; }
-              const dir = wf[2] || (await defaultModelDir());
-              await fetchWeights({ id: "uitest", target, destDir: dir });
-              const st = await weightsState(dir, target.file, target.expectBytes, target.sha256);
-              reportTest("weightsFetch", {
-                model: wf[1], file: target.file, dir,
-                complete: st.complete, haveBytes: st.have_bytes,
-                expectBytes: target.expectBytes, seconds: Math.round((Date.now() - t0) / 1000),
-              });
-            } catch (e) {
-              reportTest("weightsFetch", { model: wf[1], error: String(e) });
-            }
-          })();
-        }
-        // Cancel oracle (2026-08-10). "Press cancel, then see what the client
-        // says" is a timing question, and timing is exactly what reading the
-        // code cannot settle: the engine notices the cancel flag only between
-        // reads, so the wrong version stayed on screen for seconds and then
-        // announced a failure. This starts a real download, cancels it through
-        // the SAME handler the button calls, and reports what arrived after.
-        //   weights-cancel:<modelId>:<ms-before-cancel>
-        const wc = d.match(/^weights-cancel:([a-z0-9.\-]+):(\d+)$/);
-        if (wc) {
-          (async () => {
-            const seen: string[] = [];
-            const un = await onFetchProgress((p) => {
-              if (p.kind !== "progress") seen.push(p.kind);
-            });
-            try {
-              const man = getManifest(wc[1]);
-              const target = resolveDownload(man, defaultQuant(wc[1]));
-              if (!target) { reportTest("weightsCancel", { error: "manifest has no repo/gguf" }); return; }
-              const dir = await defaultModelDir();
-              // Route the rejection the way a user's click does. Swallowing it
-              // here (`.catch(() => {})`) is what let the bug hide: the command
-              // rejects on a cancel too, and in the app that rejection landed
-              // in a catch that painted "Download failed — cancelled …".
-              void fetchWeights({ id: target.file, target, destDir: dir }).catch(reportWeightsError);
-              await new Promise((r) => setTimeout(r, Number(wc[2])));
-              const tCancel = Date.now();
-              cancelDownloadFor(target.file);
-              const uiClearedMs = Date.now() - tCancel; // the click-to-UI latency
-              await new Promise((r) => setTimeout(r, 15000)); // let the engine wind down
-              reportTest("weightsCancel", {
-                uiClearedMs,
-                kindsAfterStart: seen,
-                sawError: seen.includes("error"),
-                sawCancelled: seen.includes("cancelled"),
-                // What the user is left looking at. The event stream had been
-                // right about this for a while and the screen still said
-                // "Download failed — cancelled (...)", because the failure came
-                // in on the command's rejection instead. An oracle that only
-                // watches the events cannot see that; this one asks the UI.
-                errorShownAfterCancel: errRef.current,
-              });
-            } catch (e) {
-              reportTest("weightsCancel", { error: String(e) });
-            } finally {
-              un();
-            }
-          })();
-        }
-        // Concurrency oracle (2026-08-10). Two fetches for one id used to both
-        // run, appending to the same .part until it was longer than the source
-        // — which the resume path then renamed and called a finished download.
-        // The second call must be refused, and the file must never exceed total.
-        //   weights-double:<modelId>
-        const wd = d.match(/^weights-double:([a-z0-9.\-]+)$/);
-        if (wd) {
-          (async () => {
-            try {
-              const man = getManifest(wd[1]);
-              const target = resolveDownload(man, defaultQuant(wd[1]));
-              if (!target) { reportTest("weightsDouble", { error: "manifest has no repo/gguf" }); return; }
-              const dir = await defaultModelDir();
-              const first = fetchWeights({ id: target.file, target, destDir: dir }).catch((e) => `ERR:${e}`);
-              await new Promise((r) => setTimeout(r, 3000)); // let it get past register()
-              let secondRefused = false;
-              let secondMsg = "";
-              try {
-                await fetchWeights({ id: target.file, target, destDir: dir });
-              } catch (e) {
-                secondRefused = true;
-                secondMsg = String(e);
-              }
-              cancelDownloadFor(target.file);
-              await new Promise((r) => setTimeout(r, 8000));
-              const st = await weightsState(dir, target.file, target.expectBytes, target.sha256);
-              reportTest("weightsDouble", {
-                secondRefused, secondMsg,
-                haveBytes: st.have_bytes, expectBytes: target.expectBytes,
-                overshoot: st.have_bytes > target.expectBytes,
-              });
-              void first;
-            } catch (e) {
-              reportTest("weightsDouble", { error: String(e) });
-            }
-          })();
-        }
-        // "Does finishing the download actually start the service?" — driven
-        // through the SAME callback the button uses, then it reports what the
-        // cluster and its API did. headless_pair's create() is not a substitute:
-        // it waits for a second peer before starting, which is the opposite of
-        // what this path is for.
-        if (d === "serve-standalone") {
-          (async () => {
-            const t0 = Date.now();
-            try {
-              // There is no snapshot() on the provider — state arrives by
-              // subscription, so latch the latest and watch that. Held in an
-              // object because a plain `let` assigned only inside the callback
-              // gets narrowed to `never` by control-flow analysis.
-              const box: { s: PairingSnapshot | null } = { s: null };
-              const un = getPairingProvider().subscribe((v) => { box.s = v; });
-              // Wait for the probe before pressing: on mount there is no snap.
-              let pressed = false;
-              for (let i = 0; i < 30 && !pressed; i++) {
-                pressed = await serveStandaloneRef.current();
-                if (!pressed) await new Promise((r) => setTimeout(r, 1000));
-              }
-              if (!pressed) { reportTest("serveStandalone", { error: "probe never landed; never pressed" }); un(); return; }
-              for (let i = 0; i < 120; i++) {
-                await new Promise((r) => setTimeout(r, 2000));
-                if (box.s && (box.s.phase === "ready" || box.s.peers.some((p) => p.stage === "error"))) break;
-              }
-              un();
-              const s = box.s;
-              reportTest("serveStandalone", {
-                seconds: Math.round((Date.now() - t0) / 1000),
-                phase: s?.phase ?? null,
-                peers: s?.peers.map((p) => ({ stage: p.stage, layers: `${p.layerLo}-${p.layerHi}` })) ?? [],
-                api: s?.api ?? null,
-              });
-            } catch (e) {
-              reportTest("serveStandalone", { error: String(e), seconds: Math.round((Date.now() - t0) / 1000) });
-            }
-          })();
-        }
-        // The open-model oracle ("serve-open-gguf:<path>") retired 2026-08-15
-        // with the open intake: the curated registry is the whole selectable
-        // set, so there is no arbitrary-GGUF path left to prove.
-        // Stop-generation oracle (2026-08-11). Two claims worth proving on real
-        // hardware: deltas stop arriving when the user presses Stop, and the
-        // partial text survives. Timing again — unprovable by reading code.
-        //   chat-stop:<ms-before-stop>
-        const cs = d.match(/^chat-stop:(\d+)$/);
-        if (cs) {
-          (async () => {
-            try {
-              const { listen } = await import("@tauri-apps/api/event");
-              const { invoke } = await import("@tauri-apps/api/core");
-              // Wait for the cluster this test needs.
-              let api: ClusterApi | null = null;
-              const box: { s: PairingSnapshot | null } = { s: null };
-              const un = getPairingProvider().subscribe((v) => { box.s = v; });
-              for (let i = 0; i < 120; i++) {
-                await new Promise((r) => setTimeout(r, 2000));
-                if (box.s?.api?.status === "online") { api = box.s.api; break; }
-              }
-              un();
-              if (!api) { reportTest("chatStop", { error: "cluster never came online" }); return; }
-
-              const reqId = `stoptest-${Date.now()}`;
-              let deltas = 0;
-              let chars = 0;
-              let deltasAfterStop = 0;
-              let stopped = false;
-              const unl = await listen<{ id: string; kind: string; text?: string }>("api-chat", (ev) => {
-                if (ev.payload.id !== reqId) return;
-                if (ev.payload.kind === "delta") {
-                  deltas++;
-                  chars += ev.payload.text?.length ?? 0;
-                  if (stopped) deltasAfterStop++;
-                }
-              });
-              void invoke("api_chat_stream", {
-                id: reqId,
-                baseUrl: api.baseUrl,
-                messages: [{ role: "user", content: "Write a very long, detailed 2000-word essay about distributed systems." }],
-                token: "",
-                model: settings.modelId,
-                maxTokens: 4096,
-              }).catch(() => {});
-              await new Promise((r) => setTimeout(r, Number(cs[1])));
-              const atStop = deltas;
-              const tStop = Date.now();
-              stopped = true;
-              const wasRunning = await invoke<boolean>("api_chat_cancel", { id: reqId });
-              await new Promise((r) => setTimeout(r, 8000)); // watch for stragglers
-              unl();
-              reportTest("chatStop", {
-                wasRunning,
-                deltasBeforeStop: atStop,
-                charsKept: chars,
-                deltasAfterStop,
-                msWatchedAfterStop: Date.now() - tStop,
-              });
-            } catch (e) {
-              reportTest("chatStop", { error: String(e) });
-            }
-          })();
-        }
-        if (d === "report-probe") {
-          getResourceProvider()
-            .probe({})
-            .then((s) => reportTest("probe", s))
-            .catch((e) => reportTest("probe", { error: String(e) }));
-        }
-        // Drive the auth lifecycle end to end (P2): fresh signup, signout,
-        // wrong-password rejection, re-signin — all through the provider.
-        if (d === "auth-flow") {
-          (async () => {
-            const em = `t${Date.now()}@test.local`;
-            const pw = "test-pass-123";
-            const auth = getAuthProvider();
-            const r: Record<string, unknown> = {};
-            try {
-              await auth.signUp(em, pw);
-              r.signup = "ok";
-            } catch (e) {
-              r.signup = String(e);
-            }
-            auth.signOut();
-            r.signedOutNull = auth.currentSession() === null;
-            try {
-              await auth.signIn(em, "wrong-pass-000");
-              r.wrongPwRejected = false;
-            } catch {
-              r.wrongPwRejected = true;
-            }
-            try {
-              const s = await auth.signIn(em, pw);
-              r.reSignin = s.email === em ? "ok" : "email-mismatch";
-            } catch (e) {
-              r.reSignin = String(e);
-            }
-            reportTest("auth", r);
-          })();
-        }
-        if (d === "pairing-auto-start") {
-          // creator: fire start exactly once, as soon as the roster allows it
-          import("./pairing").then(({ getPairingProvider }) => {
-            let fired = false;
-            const un = getPairingProvider().subscribe((s) => {
-              if (s.canStart && !fired) {
-                fired = true;
-                getPairingProvider().start().catch((e) => console.error("uiTest start:", e));
-                un();
-              }
-            });
-          });
-        }
-        // Record the live pairing:status trace from idle to ready (P4/P6). Proves
-        // auto-orchestration progresses without any further user action and that
-        // the API address comes online in the snapshot. Per-node layer display
-        // needs matched hostnames (a real 2-machine LAN); here we assert the
-        // orchestration + API-exposure signals achievable on one test box.
-        if (d === "report-pairing-phases") {
-          import("./pairing").then(({ getPairingProvider }) => {
-            const phases: string[] = [];
-            let reported = false;
-            const un = getPairingProvider().subscribe((s) => {
-              if (phases[phases.length - 1] !== s.phase) phases.push(s.phase);
-              if (s.phase === "ready" && !reported) {
-                reported = true;
-                const coordPeer = s.peers.find((p) => p.role === "coordinator");
-                reportTest("pairing-phases", {
-                  phases,
-                  sawStarting: phases.includes("starting"),
-                  endedReady: s.phase === "ready",
-                  apiBaseUrl: s.api?.baseUrl ?? null,
-                  apiOnline: s.api?.status === "online",
-                  coordinatorReady: coordPeer?.stage === "ready",
-                  peersReady: s.peers.length > 0 && s.peers.every((p) => p.stage === "ready"),
-                  // true only when the engine layer plan is attributed to a UI
-                  // peer (needs a matched real hostname); informational here.
-                  anyLayered: s.peers.some((p) => p.layerLo !== undefined && p.layerHi !== undefined),
-                  peerStages: s.peers.map((p) => p.stage),
-                });
-                un();
-              }
-            });
-          });
-        }
-      }
-    });
-  }, []);
 
   // Client-side UI settings that take effect immediately.
   useEffect(() => {
@@ -2319,7 +1866,7 @@ export default function App() {
             .then(({ invoke }) =>
               invoke("pairing_report_memory", {
                 vramFree: s.vram_usable,
-                ramFree: 0,
+                ramFree: s.ram_usable,
                 unifiedMemory: s.unified_memory,
               })
             )
@@ -2343,7 +1890,6 @@ export default function App() {
             const next = { ...settings, modelId: pick.modelId, quant: pick.quant };
             setSettings(next);
             saveSettings(next);
-            reportTest("firstRunModel", { picked: pick.modelId, quant: pick.quant });
           }
         }
       })

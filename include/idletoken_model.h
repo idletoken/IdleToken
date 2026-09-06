@@ -51,9 +51,11 @@ typedef enum {
                           * bytes/token/layer — same overhead formula as MLA,
                           * only the per-token-layer constant differs
                           * (small-model-design.md §5) */
-    IDLETOKEN_KV_HYBRID = 4, /* linear-attention hybrid (Qwen3.5): a fixed-size
-                          * recurrent state on linear layers (INDEPENDENT of
-                          * ctx) + a normal GQA cache on the 1-in-N full layers.
+    IDLETOKEN_KV_HYBRID = 4, /* mixed full + bounded attention. Qwen3.5 has a
+                          * fixed recurrent state on linear layers; GPT-OSS has
+                          * a fixed sliding-window KV allocation. Both are
+                          * independent of ctx on the bounded layers, plus a
+                          * normal GQA cache on the 1-in-N full layers.
                           * needed = state_bytes_per_layer·n_linear_on_node
                           *        + kv_bytes_per_token_layer·ctx·n_full_on_node
                           * This is why long ctx costs far less than pure GQA —

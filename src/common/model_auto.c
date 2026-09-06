@@ -316,6 +316,20 @@ int idletoken_model_from_gguf(const char *path, idletoken_auto_model *out,
                         (uint64_t)(conv > 0 ? conv - 1 : 0) *
                             (inner + 2ull * groups * state)) * 4ull);
                 kv_kind = IDLETOKEN_KV_HYBRID;
+            } else if (!strcmp(out->arch, "gpt-oss")) {
+                /* GPT-OSS alternates sliding-window and full attention. The
+                 * GGUF carries the window but not the interval because the
+                 * 1:1 alternation is part of this architecture. Treat the
+                 * bounded layer as a fixed KV state so a 128K run is not
+                 * charged as though all layers were full attention. */
+                uint32_t sliding_window = 0;
+                if (arch_u32(m, out->arch, "attention.sliding_window",
+                             &sliding_window) == 0 && sliding_window > 0) {
+                    full_attn_interval = 2;
+                    state_per_linear_layer = (uint32_t)
+                        ((uint64_t)kv_per_attn_layer * sliding_window);
+                    kv_kind = IDLETOKEN_KV_HYBRID;
+                }
             }
         }
     }

@@ -32,4 +32,19 @@
 int idletoken_engine_version(const char *llama_server_bin,
                              char *out, size_t cap);
 
+/* Does this engine binary carry the node-local MoE RPC command set (patch
+ * 0005-rpc-node-local-moe.patch)? The version string above is a function of
+ * the upstream pin only, so two builds of the same pin with different patch
+ * series report the SAME version; and a 0005 llama-server sends
+ * GET_DEVICE_TYPE to every rpc-server it registers, which an older
+ * rpc-server answers by dropping the connection mid-load. Capabilities must
+ * therefore be read from the ENGINE binary that will run, not from the build
+ * of the supervisor around it (2026-09-05: a new worker advertised the new
+ * command set for an old rpc-server and the cluster died in the engine).
+ *
+ * The probe scans the binary for a string that exists only in the patched
+ * sources ("selected-expert ranges"). Returns 1 when present, 0 when absent,
+ * -1 when the file cannot be read. Cheap: one sequential read, no execution. */
+int idletoken_engine_has_node_local_moe(const char *engine_bin);
+
 #endif /* IDLETOKEN_ENGINEVER_H */

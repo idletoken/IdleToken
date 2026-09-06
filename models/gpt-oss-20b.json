@@ -1,0 +1,69 @@
+{
+  "id": "gpt-oss-20b",
+  "label": "GPT-OSS 20B",
+  "family": "gpt-oss",
+  "backend": "llamacpp",
+  "arch": "gpt-oss",
+  "available": true,
+  "deployment": "cluster",
+  "min_quant": "MXFP4",
+  "license": "Apache-2.0",
+  "marketplace_allowed": true,
+  "params_summary": "20.9B total / 3.6B active · 24 layers · 32-expert MoE",
+  "n_layers": 24,
+  "n_embd": 2880,
+  "hc_streams": 1,
+  "n_vocab": 201088,
+  "context_max": 131072,
+  "attn": {
+    "kind": "sliding_full_hybrid",
+    "n_head": 64,
+    "n_head_kv": 8,
+    "head_dim": 64,
+    "qk_norm": false
+  },
+  "kv": {
+    "kind": "hybrid",
+    "bytes_per_token_per_layer": 2048,
+    "state_bytes_per_layer": 262144,
+    "full_attention_interval": 2
+  },
+  "moe": {
+    "n_expert": 32,
+    "n_expert_used": 4
+  },
+  "rope_theta": 150000,
+  "split": {
+    "boundary_multiple": 0
+  },
+  "overhead_base_bytes": 1610612736,
+  "compute_bytes_128k_cuda": [423624704, 432097198, 432097198],
+  "compute_bytes_256k_cuda": [0, 0, 0],
+  "compute_bytes_1m_cuda": [0, 0, 0],
+  "compute_bytes_128k_metal": [423624704, 423624704, 423624704],
+  "compute_bytes_256k_metal": [0, 0, 0],
+  "compute_bytes_1m_metal": [0, 0, 0],
+  "chat_template": "gguf",
+  "layer_weight_bytes": 10865888256,
+  "shared_weight_bytes": 1230670080,
+  "default_gguf": "gpt-oss-20b-MXFP4.gguf",
+  "sources": [
+    {
+      "repo": "ggml-org/gpt-oss-20b-GGUF",
+      "quant": "MXFP4"
+    }
+  ],
+  "default_quant": "MXFP4",
+  "variants": [
+    {
+      "quant": "MXFP4",
+      "layer_weight_bytes": 10865888256,
+      "shared_weight_bytes": 1230670080,
+      "repo": "ggml-org/gpt-oss-20b-GGUF",
+      "gguf": "gpt-oss-20b-MXFP4.gguf",
+      "sha256": "27cd6c432c7672cb812a92f611cf3ba7bbc35928262bb1e1253ff4ee6ae35901",
+      "revision": "ef9b12f2ff56c69cf32153a02784e7a3c88bf524"
+    }
+  ],
+  "note": "Native MXFP4 MoE weights. Alternating 128-token sliding attention and full attention."
+}

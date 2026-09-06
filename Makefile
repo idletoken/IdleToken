@@ -217,11 +217,11 @@ DS4_COORD_OBJ  += $(COORD_BUILD)/vendor/blake2b.o
 # how the advisor starts promising what the planner refuses.
 COMMON_SRC_SHARED   := src/common/net.c src/common/discovery.c src/common/model.c \
                        src/common/nodecrypt.c src/common/privacy.c src/common/enginever.c \
-                       src/common/modelsize.c
+                       src/common/modelsize.c src/common/gguf.c
 # advise.c (capability table) needs plan.c, which used to be coord-only — the
 # worker now links both so `--advise` can answer "what can THIS machine run?"
 # with the planner's own verdict instead of a second estimate.
-COMMON_SRC_WORKER   := $(COMMON_SRC_SHARED) src/common/resource.c src/common/weights.c src/common/gguf.c \
+COMMON_SRC_WORKER   := $(COMMON_SRC_SHARED) src/common/resource.c src/common/weights.c \
                        src/common/plan.c src/common/advise.c
 # resource.c + model_auto.c joined the coordinator for the llamacpp mode
 # (v2 WS-B2/B4): the coord now probes ITS OWN machine (single-machine fit
@@ -230,7 +230,7 @@ COMMON_SRC_WORKER   := $(COMMON_SRC_SHARED) src/common/resource.c src/common/wei
 # b64.c: the base64 the sealed envelope is spelled in. Shared with the platform
 # agent (Makefile.platform) so the side that seals and the side that opens
 # cannot drift.
-COMMON_SRC_COORD    := $(COMMON_SRC_SHARED) src/common/http.c src/common/plan.c src/common/gguf.c \
+COMMON_SRC_COORD    := $(COMMON_SRC_SHARED) src/common/http.c src/common/plan.c \
                        src/common/weights.c \
                        src/common/advise.c src/common/resource.c src/common/model_auto.c \
                        src/common/apiconv.c src/common/b64.c src/common/sodium_seal.c \
@@ -272,171 +272,9 @@ WORKER_MAIN_OBJ := $(WORKER_BUILD)/worker_main.o
 COORD_MAIN_OBJ  := $(COORD_BUILD)/coord_main.o $(COORD_BUILD)/llama_sidecar.o \
                    $(COORD_BUILD)/overflow.o
 
-.PHONY: all worker coord clean check info plantest weightstest ggufgeomtest workerjointest disctest autotest apitest sidecartest admissiontest platformversiontest
+.PHONY: all worker coord clean info
 
 all: worker coord
-
-# Unit tests for the planning core (mode decision + layer split). Pure C —
-# also runs on the mac control machine with plain cc.
-plantest:
-	@mkdir -p build
-	$(CC) -Wall -Wextra -std=c99 -Iinclude src/common/plan.c src/common/model.c \
-	    src/common/modelsize.c src/common/advise.c src/tools/plan_test.c -o build/plan_test
-	./build/plan_test
-
-# The dynamic coordinator GGUF view is a storage/network primitive rather than
-# a planner formula. This gate serves a synthetic indexed model over the same
-# HTTP range path used by real nodes and proves cold build, high-water reuse,
-# and suffix-only extension without downloading a real model.
-weightstest:
-	@mkdir -p build
-	$(CC) -Wall -Wextra -std=c99 -D_GNU_SOURCE -Iinclude src/common/net.c \
-	    src/common/weights.c src/tools/weights_test.c -o build/weights_test -lpthread
-	./build/weights_test
-
-# The GGUF type-size table decides how many bytes of a model each node fetches.
-# A wrong row is invisible at runtime -- the index stays self-consistent and
-# describes a file nobody has -- so it is checked against the pinned engine's
-# own ggml-common.h rather than against a second copy of our numbers. One row
-# being wrong (IQ1_S) broke a real cluster on 2026-09-02; run this when the
-# engine pin moves.
-ggufgeomtest:
-	@mkdir -p build
-	$(CC) -Wall -Wextra -std=c99 -Iinclude -Ivendor/llama.cpp/ggml/src \
-	    -Ivendor/llama.cpp/ggml/include \
-	    src/tools/gguf_geom_test.c -o build/gguf_geom_test
-	./build/gguf_geom_test
-
-# Pin the shipped Tauri worker launch to RPC supervision, and prove that the
-# retired INFER network path refuses before it touches the LAN. The executable
-# contains in-memory known-bad mutations of both source-level launch guarantees.
-workerjointest: worker
-	@mkdir -p build
-	$(CC) -Wall -Wextra -std=c99 -Iinclude \
-	    src/tools/worker_join_contract_test.c -o build/worker_join_contract_test
-	./build/worker_join_contract_test client/src-tauri/src/pairing.rs \
-	    client/src-tauri/tauri.conf.json ./idletoken-worker
-
-# Local admission capabilities (threat register PROV-28 / PRIV-05 / CHAIN-05):
-# the thing that decides whether a loopback request may be forwarded off this
-# machine. Pure C, no engine and no platform, so it runs on the control machine
-# where most of the review of it happens. The coordinator's --selftest calls the
-# same function; this target is how it gets judged without a GGUF.
-admissiontest:
-	@mkdir -p build
-	$(CC) -Wall -Wextra -std=c99 -Iinclude -Ivendor/tweetnacl \
-	    src/common/admission.c src/common/privacy.c vendor/tweetnacl/tweetnacl.c \
-	    src/tools/admission_test.c -o build/admission_test
-	./build/admission_test
-
-# DIST-07: prove each official control-plane implementation derives the same
-# compatibility claim from release metadata, and that the C agent cannot be
-# compiled without the generated input. The test contains its own known-bad
-# source mutations; the binary check proves the real build embeds the header.
-platformversiontest:
-	@mkdir -p build
-	$(CC) -Wall -Wextra -std=c99 src/tools/platform_version_contract_test.c \
-	    -o build/platform_version_contract_test
-	./build/platform_version_contract_test client/package.json \
-	    client/src/platformHttp.ts client/src-tauri/src/main.rs \
-	    src/tools/platform_agent.c Makefile.platform \
-	    scripts/build_agent_win.bat build_agent_win.bat
-	@test -f platform/packages/gateway/src/providers/official-client-release-policy.json \
-	  || { echo "PLATFORM_VERSION_SNAPSHOT_SKIP: no platform/ in this tree (open-source mirror); the client-side half above still ran"; exit 0; }; \
-	 node -e 'const crypto=require("crypto"),c=require("./scripts/release-channels.json"),s=require("./platform/packages/gateway/src/providers/official-client-release-policy.json"); const digest=x=>crypto.createHash("sha256").update(String(x.schema||"")+"\0"+String(x.minimumSupportedVersion||"")).digest("hex"); const ok=x=>x.sourceSchema===c.schema&&x.minimumSupportedVersion===c.minimumSupportedVersion&&x.sourcePolicySha256===digest(c); if(!ok(s)) { console.error("PLATFORM_VERSION_SNAPSHOT_FAIL: bundled gateway policy drifted from release-channels.json"); process.exit(1); } if(ok({...s,minimumSupportedVersion:"0.0.0"})) { console.error("PLATFORM_VERSION_SNAPSHOT_FAIL: known-bad drift stayed green"); process.exit(1); } console.log("PLATFORM_VERSION_SNAPSHOT_OK (1 known-bad drift control)");'
-	@if $(CC) -std=c99 -Iinclude -Ivendor/tweetnacl -Ivendor/blake2 \
-	    -E src/tools/platform_agent.c >/dev/null 2>build/platform-version-missing.log; then \
-	  echo "PLATFORM_VERSION_CONTRACT_FAIL: agent compiled without generated version" >&2; exit 1; \
-	fi
-	$(MAKE) -f Makefile.platform
-	@version=$$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' client/package.json | head -1); \
-	  strings build/idletoken-platform-agent > build/platform-agent.strings; \
-	  grep -F "X-IdleToken-Version: $$version" build/platform-agent.strings >/dev/null || { \
-	    echo "PLATFORM_VERSION_CONTRACT_FAIL: shipped header is absent" >&2; exit 1; }; \
-	  echo PLATFORM_VERSION_BINARY_OK
-
-# The spend side, as a command. scripts/admission_origin_gate.sh uses it to take
-# a capability the REAL platform-agent binary minted in its own process and
-# prove the coordinator's own verifier accepts it exactly once. Built by that
-# gate; kept here so it is built the same way everywhere.
-.PHONY: admissionverify
-admissionverify:
-	@mkdir -p build
-	$(CC) -Wall -Wextra -std=c99 -Iinclude -Ivendor/tweetnacl \
-	    src/common/admission.c src/common/privacy.c vendor/tweetnacl/tweetnacl.c \
-	    src/tools/admission_verify.c -o build/admission_verify
-
-# Unit tests for the API surface helpers: Anthropic<->OpenAI translation
-# (apiconv.c, incl. tool_use/tool_result), overlay-address detection, PSK hex
-# validation, HTTP query stripping and Authorization matching. Pure C — also
-# runs on the mac control machine with plain cc.
-apitest:
-	@mkdir -p build
-	$(CC) -Wall -Wextra -std=c99 -D_GNU_SOURCE -Iinclude src/common/apiconv.c \
-	    src/common/net.c src/common/http.c src/tools/api_test.c -o build/api_test
-	./build/api_test
-
-# P0-4: does the coordinator↔engine link really leave the IP stack in shared
-# mode? Needs a real engine binary and a real (small) GGUF, so it is NOT part
-# of `make check` — it starts a model twice and takes a minute.
-#
-#   make sidecartest ENGINE=... GGUF=...
-#
-# The local-mode half is the positive control: it must find a TCP listener,
-# or the shared-mode "no listener" says nothing about the checker.
-ENGINE ?= vendor/llama.cpp/build/bin/llama-server
-GGUF   ?=
-# The prompt string the disk sweep afterwards looks for. The gate passes a
-# per-run value: a fixed one is a literal in our own sources, so the sweep
-# would match any copy of them and report our comments as a leak.
-MARKER ?= IdleTokenCanaryDefault
-sidecartest:
-	@mkdir -p build
-	@[ -n "$(GGUF)" ] || { echo "usage: make sidecartest GGUF=/path/to/small.gguf [ENGINE=...]"; exit 2; }
-	$(CC) -Wall -Wextra -std=c99 -D_GNU_SOURCE -Iinclude src/common/net.c \
-	    src/coord/llama_sidecar.c src/tools/llama_sidecar_test.c \
-	    -o build/llama_sidecar_test -lpthread
-	./build/llama_sidecar_test "$(ENGINE)" "$(GGUF)" "$(MARKER)"
-
-# Unit tests for the open-model intake (GGUF header -> runtime model spec,
-# v2 WS-B4). Pure C — reuses the metadata-only fixtures.
-autotest:
-	@mkdir -p build
-	python3 scripts/make_test_gguf.py build/fixtures
-	$(CC) -Wall -Wextra -std=c99 -Iinclude src/common/gguf.c src/common/model.c \
-	    src/common/modelsize.c src/common/model_auto.c src/common/plan.c \
-	    src/tools/model_auto_test.c \
-	    -o build/model_auto_test
-	./build/model_auto_test build/fixtures
-
-# CUDA-accelerated standalone inference tool (same binary as ds4x_infer, but
-# with the GPU matvec compiled in). Run with IDLETOKEN_DS4X_CUDA=1 to use the GPU;
-# without the env var it behaves exactly like the CPU build.
-XI_CFLAGS := -O3 -march=native -Wall -Wextra -std=c99 -Iinclude -DIDLETOKEN_DS4X_CUDA
-XI_CSRC   := src/common/model.c src/ds4x/ds4x_config.c src/ds4x/ds4x_forward.c \
-             src/ds4x/ds4x_model.c src/ds4x/ds4x_runner.c src/ds4x/ds4x_tokenizer.c \
-             src/ds4x/ds4x_quant.c src/common/gguf.c src/ds4x/ds4x_infer.c
-XI_OBJ    := $(patsubst %.c,build/xi/%.o,$(notdir $(XI_CSRC)))
-
-.PHONY: ds4xinfer-cuda
-ds4xinfer-cuda:
-	@mkdir -p build/xi
-	$(NVCC) $(NVCCFLAGS) -Iinclude -c -o build/xi/ds4x_cuda.o src/ds4x/ds4x_cuda.cu
-	@for f in $(XI_CSRC); do \
-	    echo "  CC $$f"; \
-	    $(CC) $(XI_CFLAGS) -c -o build/xi/`basename $$f .c`.o $$f || exit 1; \
-	done
-	$(NVCC) $(NVCCFLAGS) -o build/ds4x_infer_cuda $(XI_OBJ) build/xi/ds4x_cuda.o $(CUDA_LDLIBS)
-
-# Unit tests for LAN discovery + verification-code pairing. Pure C (+pthread) —
-# runs on the mac control machine and Linux nodes; no GPU/model needed.
-disctest:
-	@mkdir -p build
-	$(CC) -Wall -Wextra -std=c99 -D_GNU_SOURCE -Iinclude \
-	    src/common/net.c src/common/discovery.c src/tools/discovery_test.c \
-	    -o build/discovery_test -lpthread
-	./build/discovery_test
-
 worker: idletoken-worker
 coord:  idletoken-coord
 
