@@ -12,29 +12,48 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/idletoken/IdleToken/releases">Download the desktop app</a>
-  · <a href="https://idletoken.ai">Project website</a>
-  · <a href="README.zh-CN.md">中文</a>
+  <a href="https://github.com/idletoken/IdleToken/releases">⬇️ Download</a>
+  · <a href="https://idletoken.ai">🏠 Project website</a>
+  · <a href="README.zh-CN.md">🌐 中文</a>
 </p>
 
-## Why IdleToken
+<p align="center">
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-2563eb?style=flat-square" alt="Windows, Linux, and macOS">
+  <img src="https://img.shields.io/badge/API-OpenAI%20%2B%20Anthropic-7c3aed?style=flat-square" alt="OpenAI and Anthropic compatible APIs">
+  <img src="https://img.shields.io/badge/engine-llama.cpp-111827?style=flat-square" alt="llama.cpp engine">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-0f766e?style=flat-square" alt="Apache-2.0 license"></a>
+</p>
+
+---
+
+## ✨ Why IdleToken
 
 Agent workloads arrive in bursts, while home GPUs spend much of their time unused. IdleToken lets those machines back each other up: share idle compute to earn Sparks, then spend Sparks on models shared by others when your own machines are busy.
 
-<p align="center">
-  <img src="docs/images/why-idle.svg" alt="An idle GPU sharing spare compute" width="360">
-  &nbsp;&nbsp;
-  <img src="docs/images/why-busy.svg" alt="A busy GPU receiving shared compute" width="360">
-</p>
+<table>
+<tr>
+<td width="50%" align="center">
+<img src="docs/images/why-idle.svg" alt="An idle GPU sharing spare compute" width="320"><br>
+<strong>🌿 When your machines are idle</strong><br>
+<sub>Share spare compute and earn Sparks.</sub>
+</td>
+<td width="50%" align="center">
+<img src="docs/images/why-busy.svg" alt="A busy GPU receiving shared compute" width="320"><br>
+<strong>⚡ When your machines are busy</strong><br>
+<sub>Draw on models shared by the community.</sub>
+</td>
+</tr>
+</table>
 
-<p align="center"><sub>Share spare compute when idle · Draw on shared compute when busy</sub></p>
-
-## Two ways to start
+## 🚀 Two ways to start
 
 <table>
 <tr>
+<th width="50%" align="center">🖥️ Deploy and share your own model</th>
+<th width="50%" align="center">☁️ Call a model shared by someone else</th>
+</tr>
+<tr>
 <td width="50%" valign="top">
-<h3>Deploy and share your own model</h3>
 <ol>
 <li>Install the desktop app on Windows or Linux with an NVIDIA GPU, or on an Apple Silicon Mac.</li>
 <li>Choose a curated model, quantization, and context, then run it on one computer or a mixed-OS LAN cluster.</li>
@@ -42,7 +61,6 @@ Agent workloads arrive in bursts, while home GPUs spend much of their time unuse
 </ol>
 </td>
 <td width="50%" valign="top">
-<h3>Call a model shared by someone else</h3>
 <ol>
 <li>Create an account at <a href="https://idletoken.ai">idletoken.ai</a>.</li>
 <li>Open <strong>Sparks → API keys</strong> and create a key.</li>
@@ -53,12 +71,12 @@ Agent workloads arrive in bursts, while home GPUs spend much of their time unuse
 </tr>
 </table>
 
-## Connect your tools
+## 🔌 Connect your tools
 
 | Use | Base URL | API key |
 | --- | --- | --- |
-| Your local model | `http://127.0.0.1:8000` | Any non-empty value |
-| Shared marketplace | `https://api.idletoken.ai` | A key created in the portal |
+| 🖥️ Your local model | `http://127.0.0.1:8000` | Any non-empty value |
+| ☁️ Shared marketplace | `https://api.idletoken.ai` | A key created in the portal |
 
 For Claude Code:
 
@@ -70,23 +88,30 @@ claude
 
 `GET /v1/models` returns the model IDs available at that endpoint.
 
-## Models
+## 🧠 Models
 
 IdleToken offers a curated list of GGUF text-generation models from Qwen, OpenAI, and DeepSeek. The versioned manifests live in [`models/`](models/); the client handles downloads, integrity checks, resource estimates, and supported quantizations.
 
 Every listed model can run on one machine when it fits or across a cluster when you choose that deployment. Multimodal input and arbitrary local GGUF files are outside the current scope. To request another model, [open an issue](https://github.com/idletoken/IdleToken/issues).
 
-## Hardware
+## 💻 Hardware
 
-- Windows 10/11: NVIDIA GPU with compute capability 7.5 or newer, at least 4 GB VRAM, and a current driver; CUDA runtime DLLs are included.
-- Linux: the same GPU requirement, plus driver 570.26 or newer / CUDA 12.8 on x86_64, or driver 580.65 or newer / CUDA 13.0 on arm64.
-- macOS: Apple Silicon with enough unified memory for the selected model.
-- CPU-only computers, AMD or Intel GPUs, Intel Macs, and phones can control a cluster but do not run inference.
-- Cluster nodes need the same IdleToken version and a direct LAN route; tensor traffic does not use VPN or overlay networks such as Tailscale.
+| Platform | Compute requirements |
+| --- | --- |
+| 🪟 **Windows 10/11** | NVIDIA GPU with compute capability 7.5 or newer, at least 4 GB VRAM, and a current driver. CUDA runtime DLLs are included. |
+| 🐧 **Linux** | The same GPU requirement; x86_64 needs driver 570.26+ / CUDA 12.8, while arm64 needs driver 580.65+ / CUDA 13.0. |
+| 🍎 **macOS** | Apple Silicon with enough unified memory for the selected model. |
+| 🎛️ **Control only** | CPU-only computers, AMD or Intel GPUs, Intel Macs, and phones can control a cluster but do not run inference. |
 
-## Build from source
+> [!NOTE]
+> Cluster nodes need the same IdleToken version and a direct LAN route. Tensor traffic does not use VPN or overlay networks such as Tailscale.
 
-The public source tree has one purpose: build the complete IdleToken desktop client. Each platform build produces its native installer with the interface, required native processes, and the pinned llama.cpp engine bundled together.
+---
+
+## 🛠️ Build from source
+
+> [!IMPORTANT]
+> The public source tree has one purpose: build the complete IdleToken desktop client. Each platform build produces its native installer with the interface, required native processes, and the pinned llama.cpp engine bundled together.
 
 Build on the operating system you are targeting. Cross-compilation is not supported.
 
@@ -146,12 +171,17 @@ The installer is written below `client\src-tauri\target\release\bundle\nsis\`.
 
 If CUDA is installed in a nonstandard location, set `IDLETOKEN_CUDA_RUNTIME_DIR` to the directory containing `cudart64_12.dll`, `cublas64_12.dll`, and `cublasLt64_12.dll`.
 
-## Help
+## 💬 Help
 
 For installation, pairing, API, or source-build problems, search the [existing issues](https://github.com/idletoken/IdleToken/issues) or open one with your OS, IdleToken version, hardware, the command that failed, and the relevant error or log excerpt.
 
-## Project links
+---
 
-[Project website](https://idletoken.ai) · [Releases](https://github.com/idletoken/IdleToken/releases) · [Issues](https://github.com/idletoken/IdleToken/issues) · [Apache-2.0 license](LICENSE)
+<p align="center">
+  <a href="https://idletoken.ai">Project website</a>
+  · <a href="https://github.com/idletoken/IdleToken/releases">Releases</a>
+  · <a href="https://github.com/idletoken/IdleToken/issues">Issues</a>
+  · <a href="LICENSE">Apache-2.0 license</a>
+</p>
 
-Built on [llama.cpp](https://github.com/ggml-org/llama.cpp) and [Tauri](https://github.com/tauri-apps/tauri). See [NOTICE](NOTICE) for third-party acknowledgements.
+<p align="center"><sub>Built on <a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a> and <a href="https://github.com/tauri-apps/tauri">Tauri</a>. See <a href="NOTICE">NOTICE</a> for third-party acknowledgements.</sub></p>

@@ -12,29 +12,48 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/idletoken/IdleToken/releases">下载桌面客户端</a>
-  · <a href="https://idletoken.ai">项目主页</a>
-  · <a href="README.md">English</a>
+  <a href="https://github.com/idletoken/IdleToken/releases">⬇️ 下载客户端</a>
+  · <a href="https://idletoken.ai">🏠 项目主页</a>
+  · <a href="README.md">🌐 English</a>
 </p>
 
-## 为什么做 IdleToken
+<p align="center">
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-2563eb?style=flat-square" alt="支持 Windows、Linux 与 macOS">
+  <img src="https://img.shields.io/badge/API-OpenAI%20%2B%20Anthropic-7c3aed?style=flat-square" alt="兼容 OpenAI 与 Anthropic API">
+  <img src="https://img.shields.io/badge/engine-llama.cpp-111827?style=flat-square" alt="使用 llama.cpp 引擎">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-0f766e?style=flat-square" alt="Apache-2.0 许可"></a>
+</p>
+
+---
+
+## ✨ 为什么做 IdleToken
 
 智能体对算力的需求有明显峰谷，家里的 GPU 却在大部分时间里处于闲置状态。IdleToken 让不同机器的算力彼此补位：闲时分享算力赚取火花，需要时再用火花调用别人分享的模型服务。
 
-<p align="center">
-  <img src="docs/images/why-idle.svg" alt="空闲 GPU 分享富余算力" width="360">
-  &nbsp;&nbsp;
-  <img src="docs/images/why-busy.svg" alt="繁忙 GPU 获得共享算力" width="360">
-</p>
+<table>
+<tr>
+<td width="50%" align="center">
+<img src="docs/images/why-idle.svg" alt="空闲 GPU 分享富余算力" width="320"><br>
+<strong>🌿 机器空闲时</strong><br>
+<sub>分享富余算力，赚取火花。</sub>
+</td>
+<td width="50%" align="center">
+<img src="docs/images/why-busy.svg" alt="繁忙 GPU 获得共享算力" width="320"><br>
+<strong>⚡ 机器繁忙时</strong><br>
+<sub>调用社区分享的模型服务。</sub>
+</td>
+</tr>
+</table>
 
-<p align="center"><sub>闲时分享富余算力 · 忙时调用共享算力</sub></p>
-
-## 两种开始方式
+## 🚀 两种开始方式
 
 <table>
 <tr>
+<th width="50%" align="center">🖥️ 部署并分享自己的模型</th>
+<th width="50%" align="center">☁️ 调用别人分享的模型</th>
+</tr>
+<tr>
 <td width="50%" valign="top">
-<h3>部署并分享自己的模型</h3>
 <ol>
 <li>在带 NVIDIA 显卡的 Windows / Linux 电脑，或 Apple Silicon Mac 上安装桌面客户端。</li>
 <li>选择精选模型、量化精度和上下文，在一台电脑或异构系统组成的局域网集群上运行。</li>
@@ -42,7 +61,6 @@
 </ol>
 </td>
 <td width="50%" valign="top">
-<h3>调用别人分享的模型</h3>
 <ol>
 <li>在 <a href="https://idletoken.ai">idletoken.ai</a> 注册账号。</li>
 <li>进入<strong>火花 → API 密钥</strong>并创建密钥。</li>
@@ -53,12 +71,12 @@
 </tr>
 </table>
 
-## 接入现有工具
+## 🔌 接入现有工具
 
 | 用途 | Base URL | API key |
 | --- | --- | --- |
-| 自己的本地模型 | `http://127.0.0.1:8000` | 任意非空值 |
-| 共享算力市场 | `https://api.idletoken.ai` | 在门户创建的密钥 |
+| 🖥️ 自己的本地模型 | `http://127.0.0.1:8000` | 任意非空值 |
+| ☁️ 共享算力市场 | `https://api.idletoken.ai` | 在门户创建的密钥 |
 
 Claude Code 示例：
 
@@ -70,23 +88,30 @@ claude
 
 `GET /v1/models` 会返回当前 endpoint 可用的模型 ID。
 
-## 模型
+## 🧠 模型
 
 IdleToken 提供精选的 Qwen、OpenAI 与 DeepSeek GGUF 文本生成模型。版本化清单位于 [`models/`](models/)；客户端下载权重并完成完整性校验、资源估算和量化精度选择。
 
 每个入列模型都可在装得下时单机运行，也可由用户选择集群部署。当前不支持多模态输入或任意本地 GGUF 文件。需要其它模型？欢迎[提交 issue](https://github.com/idletoken/IdleToken/issues)。
 
-## 硬件
+## 💻 硬件
 
-- Windows 10/11：NVIDIA GPU，计算能力不低于 7.5、显存至少 4 GB，并安装当前驱动；安装包已包含 CUDA 运行时 DLL。
-- Linux：显卡要求相同；x86_64 需要不低于 570.26 的驱动与 CUDA 12.8，arm64 需要不低于 580.65 的驱动与 CUDA 13.0。
-- macOS：Apple Silicon，统一内存足以容纳所选模型。
-- 纯 CPU 电脑、AMD / Intel GPU、Intel Mac 与手机只能控制集群，不参与推理。
-- 集群节点必须运行同一版本的 IdleToken，并能通过局域网直连；张量流量不走 Tailscale 等 VPN 或覆盖网络。
+| 平台 | 计算要求 |
+| --- | --- |
+| 🪟 **Windows 10/11** | NVIDIA GPU，计算能力不低于 7.5、显存至少 4 GB，并安装当前驱动。安装包已包含 CUDA 运行时 DLL。 |
+| 🐧 **Linux** | 显卡要求相同；x86_64 需要 570.26+ 驱动与 CUDA 12.8，arm64 需要 580.65+ 驱动与 CUDA 13.0。 |
+| 🍎 **macOS** | Apple Silicon，统一内存足以容纳所选模型。 |
+| 🎛️ **仅作控制端** | 纯 CPU 电脑、AMD / Intel GPU、Intel Mac 与手机可以控制集群，但不参与推理。 |
 
-## 从源码构建
+> [!NOTE]
+> 集群节点必须运行同一版本的 IdleToken，并能通过局域网直连。张量流量不走 Tailscale 等 VPN 或覆盖网络。
 
-公开源码只有一个用途：构建完整的 IdleToken 桌面客户端。各平台的构建都会生成对应的原生安装包，并将客户端界面、必需的原生进程和钉住版本的 llama.cpp 引擎一并打包。
+---
+
+## 🛠️ 从源码构建
+
+> [!IMPORTANT]
+> 公开源码只有一个用途：构建完整的 IdleToken 桌面客户端。各平台的构建都会生成对应的原生安装包，并将客户端界面、必需的原生进程和钉住版本的 llama.cpp 引擎一并打包。
 
 请在目标操作系统上直接构建；当前不支持交叉编译。
 
@@ -146,12 +171,17 @@ scripts\build_client_release.bat
 
 若 CUDA 安装在非标准目录，请将 `IDLETOKEN_CUDA_RUNTIME_DIR` 指向包含 `cudart64_12.dll`、`cublas64_12.dll` 与 `cublasLt64_12.dll` 的目录。
 
-## 获取帮助
+## 💬 获取帮助
 
 遇到安装、组网、API 或源码构建问题时，请先搜索[已有 issue](https://github.com/idletoken/IdleToken/issues)；若需新建 issue，请附上操作系统、IdleToken 版本、硬件信息、失败命令与相关报错或日志片段。
 
-## 项目链接
+---
 
-[项目主页](https://idletoken.ai) · [版本发布](https://github.com/idletoken/IdleToken/releases) · [问题反馈](https://github.com/idletoken/IdleToken/issues) · [Apache-2.0 许可](LICENSE)
+<p align="center">
+  <a href="https://idletoken.ai">项目主页</a>
+  · <a href="https://github.com/idletoken/IdleToken/releases">版本发布</a>
+  · <a href="https://github.com/idletoken/IdleToken/issues">问题反馈</a>
+  · <a href="LICENSE">Apache-2.0 许可</a>
+</p>
 
-项目基于 [llama.cpp](https://github.com/ggml-org/llama.cpp) 与 [Tauri](https://github.com/tauri-apps/tauri) 构建；第三方项目致谢见 [NOTICE](NOTICE)。
+<p align="center"><sub>项目基于 <a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a> 与 <a href="https://github.com/tauri-apps/tauri">Tauri</a> 构建；第三方项目致谢见 <a href="NOTICE">NOTICE</a>。</sub></p>
