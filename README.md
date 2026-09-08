@@ -12,61 +12,71 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/idletoken/IdleToken/releases">Download</a>
-  · <a href="https://idletoken.ai">Project website</a>
-  · <a href="README.zh-CN.md">中文</a>
+  <a href="https://github.com/idletoken/IdleToken/releases">⬇️ Download</a>
+  · <a href="https://idletoken.ai">🏠 Project website</a>
+  · <a href="README.zh-CN.md">🌐 中文</a>
 </p>
 
 ---
 
-## Why IdleToken
+## ✨ Why IdleToken
 
-Agent workloads have their own peaks and valleys. There may be only one or two tasks running most of the time, but a complex job can start several agents at once, concentrate inference requests into a short burst, and leave local tasks waiting in a queue.
+Agent workloads are bursty by nature. Most of the time, only one or two inference tasks may be running. Then a complex job starts several agents at once, and a batch of parallel requests drives compute demand sharply upward.
 
-Home computers follow a separate cycle. They are usually sized for peak demand but rarely run at full capacity all day, leaving GPUs and memory unused for long periods. Machine idle time is not caused by fluctuations in agent workloads, but these two independent patterns can complement each other.
+Home machines have their own rhythm: busy sometimes, idle most of the time. Few people run models around the clock, so a machine sized for peak demand often has GPU and memory to spare; in a home with several computers, those idle hours are spread across different machines.
 
-IdleToken connects those machines. Run models on your own computers day to day; ask models shared by others to complete queued tasks when your machines are busy; and share spare capacity with others when your machines are idle. One computer can run independently, while several computers can form a LAN cluster to run a model that does not fit on a single machine.
+IdleToken connects one person's idle hours to another's busy ones: share spare compute when you are not using it, and call a model shared by someone else when local tasks begin to queue.
 
 <table>
 <tr>
 <td width="50%" align="center">
 <img src="docs/images/why-idle.svg" alt="An idle GPU sharing spare compute" width="320"><br>
-<strong>When your machines are idle</strong><br>
+<strong>🌿 When your machines are idle</strong><br>
 <sub>Share spare compute with others.</sub>
 </td>
 <td width="50%" align="center">
 <img src="docs/images/why-busy.svg" alt="A busy machine asking another machine for help" width="320"><br>
-<strong>When your machines are busy</strong><br>
+<strong>⚡ When your machines are busy</strong><br>
 <sub>Ask others to complete queued tasks.</sub>
 </td>
 </tr>
 </table>
 
-IdleToken uses Sparks to settle the Tokens actually completed.
+IdleToken uses Sparks to settle Tokens.
 
-## Two ways to start
+## 🚀 Two ways to start
 
-### Deploy your own model
+<table>
+<tr>
+<th width="50%" align="center">🖥️ Deploy and share your own model</th>
+<th width="50%" align="center">☁️ Call a model shared by someone else</th>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<ol>
+<li>Download and install the client. It currently supports Windows 10/11 and Linux x86_64/arm64 with an NVIDIA GPU, plus Apple Silicon Macs.</li>
+<li>Start the client and choose a model, quantization, and context from the built-in list. The client downloads any missing model weights.</li>
+<li>Turn on <strong>Request help</strong> to ask someone else to complete a task waiting locally. Turn on <strong>Share compute</strong> to help others complete their tasks.</li>
+</ol>
+</td>
+<td width="50%" valign="top">
+<p>If you do not want to deploy a model yourself—for example, if you want to use IdleToken from a phone, tablet, or computer without a supported GPU—you can call a model shared by someone else.</p>
+<ol>
+<li>Create an account at <a href="https://idletoken.ai">idletoken.ai</a>.</li>
+<li>Create an API key in your account.</li>
+<li>Enter the API address and key in any Anthropic- or OpenAI-compatible client. No desktop installation is required.</li>
+</ol>
+</td>
+</tr>
+</table>
 
-1. Download and install the client from [Releases](https://github.com/idletoken/IdleToken/releases). It currently supports Windows 10/11 and Linux x86_64/arm64 with an NVIDIA GPU, plus Apple Silicon Macs.
-2. Start the client, choose a supported Qwen, GPT-OSS, DeepSeek, GLM, or Kimi model, then select its quantization and context. The client prepares the model weights.
-3. Turn on **Request help** to ask someone else to complete a task waiting locally. Turn on **Share compute** to let an idle machine help others.
-
-### Call a model shared by someone else
-
-If you do not want to deploy a model yourself—for example, if you want to use IdleToken from a phone, tablet, or computer without a supported GPU—you can call a model shared by someone else:
-
-1. Create an account at [idletoken.ai](https://idletoken.ai).
-2. Create an API key in your account.
-3. Enter the API address and key in any Anthropic- or OpenAI-compatible client. No desktop installation is required.
-
-## Join the community
+## 💬 Join the community
 
 Join the IdleToken Discord community to discuss model deployment, LAN clustering, client integrations, and project development, or to share feedback and ask for help.
 
-## Connect existing tools
+## 🔌 Connect existing tools
 
-Both paths above expose the same OpenAI- and Anthropic-compatible APIs. Tools connect to a local address when you deploy your own model, or to the IdleToken API when you call a model shared by someone else:
+Both paths above work with existing tools. Connect to the local address when you deploy your own model, or to the IdleToken API when you call a model shared by someone else. Both are compatible with the OpenAI and Anthropic APIs.
 
 | Usage | Base URL | API key |
 | --- | --- | --- |
@@ -83,15 +93,15 @@ claude
 
 `GET /v1/models` returns the model IDs currently available at that address.
 
-## Supported models
+## 🧠 Models
 
 IdleToken currently supports Qwen3 8B; Qwen3.5 0.8B, 2B, 4B, 9B, 27B, 35B-A3B, 122B-A10B, and 397B-A17B; Qwen3.8 27B; GPT-OSS 20B and 120B; DeepSeek V4 Flash and Pro; GLM-5.2; and Kimi K2.5.
 
 Need another model? [Open an issue](https://github.com/idletoken/IdleToken/issues).
 
-## Hardware requirements
+## 💻 Hardware
 
-Resource requirements depend on the selected model, quantization, and context length. The client estimates them from the usable GPU or unified memory of the current machine or cluster, including required runtime overhead. The exact configuration selected by the user is checked again when the model starts.
+Resource requirements depend on the selected model, quantization, and context length. The client estimates them from the resources available on the current machine or cluster and checks the selected configuration when the model starts.
 
 | Platform | Compute requirements |
 | --- | --- |
@@ -100,25 +110,22 @@ Resource requirements depend on the selected model, quantization, and context le
 | **Linux arm64** | NVIDIA GPU with compute capability 7.5 or newer and at least 4 GB VRAM; driver 580.65+ and CUDA 13.0. |
 | **macOS** | Apple Silicon with enough available unified memory for the selected model, quantization, and context. |
 
-The 4 GB figure is the minimum hardware threshold for a compute node; it does not mean every model can run in 4 GB of VRAM.
+## 🖧 Single-machine and cluster deployment
 
-## Single-machine and cluster deployment
+For a single-machine deployment, select a model, quantization, and context, then start it on that computer.
 
-The same IdleToken client supports both deployment modes:
+For a cluster deployment:
 
-- **Single machine:** select a model, quantization, and context, then start it in single-machine mode. The model runs directly on that computer without RPC.
-- **Cluster:** Windows, Linux, and macOS compute nodes can form a mixed-OS LAN cluster and run one model together.
-
-To start a cluster:
-
-1. Install the same IdleToken version on every participating computer and make sure they can reach each other over real LAN addresses.
+1. Install the same IdleToken version on every participating computer and make sure they can reach each other over the LAN.
 2. Create a cluster on one computer. Join from the others with the same account or a verification code.
-3. Select the exact same model, quantization, and context on every computer. Wait until the model weights are downloaded and every node reports ready.
-4. On the creator, choose cluster deployment and start the model. IdleToken detects each node's resources and assigns model layers automatically. The local API remains at `http://127.0.0.1:8000`.
+3. Select the same model, quantization, and context on every computer, and finish downloading the model weights.
+4. When every node reports ready, choose cluster deployment on the creator and start the model. IdleToken detects each node's resources and assigns model layers automatically.
 
-Cluster compute traffic does not use VPN or overlay networks such as Tailscale. Every node must run the same IdleToken version.
+Windows, Linux, and macOS nodes can be mixed in one cluster. Cluster compute traffic does not use VPN or overlay networks such as Tailscale.
 
-## Build from source
+---
+
+## 🛠️ Build from source
 
 ### Prerequisites
 
@@ -172,7 +179,7 @@ The installer is written below `client\src-tauri\target\release\bundle\nsis\`.
 
 Set `IDLETOKEN_MINGW_BIN`, `IDLETOKEN_CUDA_RUNTIME_DIR`, or `IDLETOKEN_MBEDTLS_SRC` when the corresponding build tools are not in their default locations.
 
-## Help
+## 💬 Help
 
 For installation, pairing, API, or source-build problems, search the [existing issues](https://github.com/idletoken/IdleToken/issues). When opening a new issue, include your operating system, IdleToken version, hardware, the command that failed, and the relevant error or log excerpt.
 
