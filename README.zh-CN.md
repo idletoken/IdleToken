@@ -12,73 +12,68 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/idletoken/IdleToken/releases">⬇️ 下载客户端</a>
-  · <a href="https://idletoken.ai">🏠 项目主页</a>
-  · <a href="README.md">🌐 English</a>
-</p>
-
-<p align="center">
-  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-2563eb?style=flat-square" alt="支持 Windows、Linux 与 macOS">
-  <img src="https://img.shields.io/badge/API-OpenAI%20%2B%20Anthropic-7c3aed?style=flat-square" alt="兼容 OpenAI 与 Anthropic API">
-  <img src="https://img.shields.io/badge/engine-llama.cpp-111827?style=flat-square" alt="使用 llama.cpp 引擎">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-0f766e?style=flat-square" alt="Apache-2.0 许可"></a>
+  <a href="https://github.com/idletoken/IdleToken/releases">下载客户端</a>
+  · <a href="https://idletoken.ai">项目主页</a>
+  · <a href="README.md">English</a>
 </p>
 
 ---
 
-## ✨ 为什么做 IdleToken
+## 为什么做 IdleToken
 
-智能体对算力的需求有明显峰谷，家里的 GPU 却在大部分时间里处于闲置状态。IdleToken 让不同机器的算力彼此补位：闲时分享算力赚取火花，需要时再用火花调用别人分享的模型服务。
+智能体的算力需求有自己的峰谷：日常可能只有一两个任务，复杂任务到来时，多个智能体会同时工作，推理请求在短时间内集中，本地任务因此开始排队。
+
+家用电脑也有另一套独立的峰谷：机器通常按高峰需求配置，却不会全天满载，GPU 和内存在许多时段没有被使用。机器的空闲不是智能体负载波动造成的，但这两种独立的波动恰好可以互补。
+
+IdleToken 把这些机器连接起来。平时在自己的电脑上运行模型；本机繁忙时，请求别人分享的模型完成排队中的任务；自己的机器空闲时，也可以把富余算力分享给别人。它既支持一台电脑独立运行，也支持多台电脑组成局域网集群，共同运行单机装不下的大模型。
 
 <table>
 <tr>
 <td width="50%" align="center">
 <img src="docs/images/why-idle.svg" alt="空闲 GPU 分享富余算力" width="320"><br>
-<strong>🌿 机器空闲时</strong><br>
-<sub>分享富余算力，赚取火花。</sub>
+<strong>机器空闲时</strong><br>
+<sub>把富余算力分享给别人。</sub>
 </td>
 <td width="50%" align="center">
-<img src="docs/images/why-busy.svg" alt="繁忙 GPU 获得共享算力" width="320"><br>
-<strong>⚡ 机器繁忙时</strong><br>
-<sub>调用社区分享的模型服务。</sub>
+<img src="docs/images/why-busy.svg" alt="繁忙机器请求其他机器协助" width="320"><br>
+<strong>本机繁忙时</strong><br>
+<sub>请求别人完成排队中的任务。</sub>
 </td>
 </tr>
 </table>
 
-## 🚀 两种开始方式
+我们使用“火花”来结算实际完成的 Token。
 
-<table>
-<tr>
-<th width="50%" align="center">🖥️ 部署并分享自己的模型</th>
-<th width="50%" align="center">☁️ 调用别人分享的模型</th>
-</tr>
-<tr>
-<td width="50%" valign="top">
-<ol>
-<li>在带 NVIDIA 显卡的 Windows / Linux 电脑，或 Apple Silicon Mac 上安装桌面客户端。</li>
-<li>选择精选模型、量化精度和上下文，在一台电脑或异构系统组成的局域网集群上运行。</li>
-<li>打开共享赚取火花；需要更多算力时打开外援，调用他人分享的资源。</li>
-</ol>
-</td>
-<td width="50%" valign="top">
-<ol>
-<li>在 <a href="https://idletoken.ai">idletoken.ai</a> 注册账号。</li>
-<li>进入<strong>火花 → API 密钥</strong>并创建密钥。</li>
-<li>接入任意兼容 Anthropic 或 OpenAI 的客户端。无需显卡，也无需安装桌面客户端。</li>
-</ol>
-<p>新账号的火花余额为零。你可以通过分享算力赚取。</p>
-</td>
-</tr>
-</table>
+## 两种开始方式
 
-## 🔌 接入现有工具
+### 部署自己的模型
 
-| 用途 | Base URL | API key |
+1. 从 [Releases](https://github.com/idletoken/IdleToken/releases) 下载并安装客户端。当前支持带 NVIDIA GPU 的 Windows 10/11、Linux x86_64 / arm64，以及 Apple Silicon Mac。
+2. 启动客户端，选择当前支持的 Qwen、GPT-OSS、DeepSeek、GLM 或 Kimi 模型，并选择量化精度与上下文。模型参数会由客户端准备。
+3. 打开“外援”按钮，可在本地任务排队时请求别人完成；打开“共享”按钮，可让空闲机器帮助别人完成任务。
+
+### 直接调用别人分享的模型
+
+如果你不想自己部署，例如希望在手机、平板或没有受支持 GPU 的电脑上使用 IdleToken，可以直接调用别人分享的模型：
+
+1. 在 [idletoken.ai](https://idletoken.ai) 注册账号。
+2. 在账户中创建 API 密钥。
+3. 将 API 地址和密钥填入任意兼容 Anthropic 或 OpenAI API 的客户端。无需安装桌面客户端。
+
+## 加入社区
+
+欢迎加入 IdleToken Discord 社区，交流模型部署、局域网组网、客户端接入与项目开发，也可以直接反馈使用中遇到的问题。
+
+## 接入现有工具
+
+上面的两种使用方式最终都提供 OpenAI 与 Anthropic 兼容 API。部署自己的模型时，工具连接本机地址；不自行部署、直接调用别人分享的模型时，工具连接 IdleToken API：
+
+| 使用方式 | Base URL | API key |
 | --- | --- | --- |
-| 🖥️ 自己的本地模型 | `http://127.0.0.1:8000` | 任意非空值 |
-| ☁️ 共享算力市场 | `https://api.idletoken.ai` | 在门户创建的密钥 |
+| 自己部署的模型 | `http://127.0.0.1:8000` | 任意非空值；若自行设置了本地 token，则使用该 token |
+| 别人分享的模型 | `https://api.idletoken.ai` | 在账户中创建的 API 密钥 |
 
-Claude Code 示例：
+以 Claude Code 直接调用别人分享的模型为例：
 
 ```sh
 export ANTHROPIC_BASE_URL=https://api.idletoken.ai
@@ -86,44 +81,52 @@ export ANTHROPIC_API_KEY='sk-idletoken-********************************'
 claude
 ```
 
-`GET /v1/models` 会返回当前 endpoint 可用的模型 ID。
+`GET /v1/models` 返回对应地址当前可用的模型 ID。
 
-## 🧠 模型
+## 当前支持的模型
 
-IdleToken 提供精选的 Qwen、OpenAI 与 DeepSeek GGUF 文本生成模型。版本化清单位于 [`models/`](models/)；客户端下载权重并完成完整性校验、资源估算和量化精度选择。
+当前支持 Qwen3 8B、Qwen3.5（0.8B、2B、4B、9B、27B、35B-A3B、122B-A10B、397B-A17B）、Qwen3.8 27B、GPT-OSS（20B、120B）、DeepSeek V4（Flash、Pro）、GLM-5.2 和 Kimi K2.5。
 
-每个入列模型都可在装得下时单机运行，也可由用户选择集群部署。当前不支持多模态输入或任意本地 GGUF 文件。需要其它模型？欢迎[提交 issue](https://github.com/idletoken/IdleToken/issues)。
+需要其它模型？请[提交 issue](https://github.com/idletoken/IdleToken/issues)。
 
-## 💻 硬件
+## 硬件要求
+
+实际资源需求取决于所选模型、量化精度和上下文长度。客户端会根据当前机器或集群的可用显存、统一内存和必要运行开销给出估算；运行时仍会按用户选择的精确配置检查资源。
 
 | 平台 | 计算要求 |
 | --- | --- |
-| 🪟 **Windows 10/11** | NVIDIA GPU，计算能力不低于 7.5、显存至少 4 GB，并安装当前驱动。安装包已包含 CUDA 运行时 DLL。 |
-| 🐧 **Linux** | 显卡要求相同；x86_64 需要 570.26+ 驱动与 CUDA 12.8，arm64 需要 580.65+ 驱动与 CUDA 13.0。 |
-| 🍎 **macOS** | Apple Silicon，统一内存足以容纳所选模型。 |
-| 🎛️ **仅作控制端** | 纯 CPU 电脑、AMD / Intel GPU、Intel Mac 与手机可以控制集群，但不参与推理。 |
+| **Windows 10/11** | NVIDIA GPU，计算能力不低于 7.5，显存至少 4 GB，并安装当前驱动。安装包已包含 CUDA 运行时 DLL。 |
+| **Linux x86_64** | NVIDIA GPU，计算能力不低于 7.5，显存至少 4 GB；驱动 570.26+，CUDA 12.8。 |
+| **Linux arm64** | NVIDIA GPU，计算能力不低于 7.5，显存至少 4 GB；驱动 580.65+，CUDA 13.0。 |
+| **macOS** | Apple Silicon；可用统一内存需满足所选模型、精度和上下文的资源需求。 |
 
-> [!NOTE]
-> 集群节点必须运行同一版本的 IdleToken，并能通过局域网直连。张量流量不走 Tailscale 等 VPN 或覆盖网络。
+4 GB 是计算节点的最低硬件门槛，并不代表所有模型都能在 4 GB 显存上运行。
 
----
+## 单机与联机运行
 
-## 🛠️ 从源码构建
+IdleToken 使用同一套客户端支持两种部署方式：
 
-> [!IMPORTANT]
-> 公开源码只有一个用途：构建完整的 IdleToken 桌面客户端。各平台的构建都会生成对应的原生安装包，并将客户端界面、必需的原生进程和钉住版本的 llama.cpp 引擎一并打包。
+- **单机运行：**选择模型、量化精度和上下文后，选择单机启动。模型直接在本机运行，不经过 RPC。
+- **联机运行：**Windows、Linux 和 macOS 计算节点可以在同一局域网内混合组网，共同运行一个模型。
 
-请在目标操作系统上直接构建；当前不支持交叉编译。
+联机流程：
 
-### 前置依赖
+1. 在所有参与计算的机器上安装同一版本的 IdleToken，并确保它们可以通过真实局域网地址互相直连。
+2. 在一台机器上创建集群，其余机器登录同一账号或使用验证码加入。
+3. 每台机器选择完全相同的模型、量化精度和上下文，并等待模型参数下载完成、节点显示就绪。
+4. 由创建者选择联机并启动。IdleToken 探测各节点资源后自动分配模型层；启动后，本机 API 仍使用 `http://127.0.0.1:8000`。
 
-所有平台都需要 Git、CMake、Node.js 18 或更新版本、pnpm、Rust 1.77 或更新版本，以及目标操作系统对应的 [Tauri v2 系统依赖](https://tauri.app/start/prerequisites/)。请从干净的代码仓库开始，并在仓库根目录执行以下命令。
+联机计算流量不走 Tailscale 等 VPN 或覆盖网络。所有节点必须使用同一 IdleToken 版本。
 
-- **Linux：** C 编译器，以及“硬件”一节中对应架构的 CUDA Toolkit。
-- **macOS：** Apple Silicon Mac 与 Xcode Command Line Tools。
-- **Windows：** Visual Studio 2022 Build Tools（勾选 **Desktop development with C++**）、Windows SDK、带 Visual Studio Integration 的 CUDA Toolkit 12.8，以及提供 `gcc` 和 `windres` 的 WinLibs/MinGW。若这些工具不在 `PATH`，请设置 `IDLETOKEN_MINGW_BIN`。
+## 从源码构建
 
-llama.cpp 的传输层补丁会在 CMake 配置阶段获取 mbedTLS。若构建机器无法从 GitHub 下载，请将 `IDLETOKEN_MBEDTLS_SRC` 指向已有的 mbedTLS 3.6.7 源码目录。
+### 依赖
+
+- Git、CMake、Node.js 18+、pnpm、Rust 1.77+
+- [Tauri v2 系统依赖](https://tauri.app/start/prerequisites/)
+- Linux：C 编译器与对应架构的 CUDA Toolkit
+- macOS：Apple Silicon Mac 与 Xcode Command Line Tools
+- Windows：Visual Studio 2022 Build Tools（Desktop development with C++）、Windows SDK、CUDA Toolkit 12.8（含 Visual Studio Integration）以及提供 `gcc`、`windres` 的 WinLibs/MinGW
 
 ### 获取源码
 
@@ -131,8 +134,6 @@ llama.cpp 的传输层补丁会在 CMake 配置阶段获取 mbedTLS。若构建�
 git clone https://github.com/idletoken/IdleToken.git
 cd IdleToken
 ```
-
-引擎构建脚本会读取 `scripts/llamacpp-patches/UPSTREAM` 中钉住的 llama.cpp commit，应用仓库内的补丁，并编译客户端使用的两个引擎 sidecar。
 
 ### Linux
 
@@ -156,7 +157,7 @@ make -f Makefile.platform
 
 ### Windows
 
-请在 x64 Native Tools Command Prompt 中执行：
+在 x64 Native Tools Command Prompt 中执行：
 
 ```bat
 scripts\build_llamacpp_win.bat
@@ -169,9 +170,9 @@ scripts\build_client_release.bat
 
 安装包位于 `client\src-tauri\target\release\bundle\nsis\`。
 
-若 CUDA 安装在非标准目录，请将 `IDLETOKEN_CUDA_RUNTIME_DIR` 指向包含 `cudart64_12.dll`、`cublas64_12.dll` 与 `cublasLt64_12.dll` 的目录。
+若构建工具不在默认位置，可设置 `IDLETOKEN_MINGW_BIN`、`IDLETOKEN_CUDA_RUNTIME_DIR` 或 `IDLETOKEN_MBEDTLS_SRC`。
 
-## 💬 获取帮助
+## 获取帮助
 
 遇到安装、组网、API 或源码构建问题时，请先搜索[已有 issue](https://github.com/idletoken/IdleToken/issues)；若需新建 issue，请附上操作系统、IdleToken 版本、硬件信息、失败命令与相关报错或日志片段。
 
