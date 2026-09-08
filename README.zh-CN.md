@@ -95,9 +95,9 @@ claude
 
 ## 🧠 模型
 
-当前支持 Qwen3 8B、Qwen3.5（0.8B、2B、4B、9B、27B、35B-A3B、122B-A10B、397B-A17B）、Qwen3.8 27B、GPT-OSS（20B、120B）、DeepSeek V4（Flash、Pro）、GLM-5.2 和 Kimi K2.5。
+IdleToken 提供精选的 Qwen、OpenAI 与 DeepSeek GGUF 文本生成模型。版本化清单位于 [`models/`](models/)；客户端下载权重并完成完整性校验、资源估算和量化精度选择。
 
-需要其它模型？请[提交 issue](https://github.com/idletoken/IdleToken/issues)。
+每个入列模型都可在装得下时单机运行，也可由用户选择集群部署。当前不支持多模态输入或任意本地 GGUF 文件。需要其它模型？欢迎[提交 issue](https://github.com/idletoken/IdleToken/issues)。
 
 ## 💻 硬件
 

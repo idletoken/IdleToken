@@ -95,9 +95,9 @@ claude
 
 ## 🧠 Models
 
-IdleToken currently supports Qwen3 8B; Qwen3.5 0.8B, 2B, 4B, 9B, 27B, 35B-A3B, 122B-A10B, and 397B-A17B; Qwen3.8 27B; GPT-OSS 20B and 120B; DeepSeek V4 Flash and Pro; GLM-5.2; and Kimi K2.5.
+IdleToken offers a curated list of GGUF text-generation models from Qwen, OpenAI, and DeepSeek. The versioned manifests live in [`models/`](models/); the client handles downloads, integrity checks, resource estimates, and supported quantizations.
 
-Need another model? [Open an issue](https://github.com/idletoken/IdleToken/issues).
+Every listed model can run on one machine when it fits or across a cluster when you choose that deployment. Multimodal input and arbitrary local GGUF files are outside the current scope. To request another model, [open an issue](https://github.com/idletoken/IdleToken/issues).
 
 ## 💻 Hardware
 
