@@ -21,11 +21,11 @@
 
 ## ✨ Why IdleToken
 
-Agent workloads are bursty by nature. Most of the time, only one or two inference tasks may be running. Then a complex job starts several agents at once, and a batch of parallel requests drives compute demand sharply upward.
+Agent workloads naturally rise and fall. Most of the time, only one or two inference tasks are running. When a complex job arrives, several agents start working at once and compute demand rises sharply in a short period.
 
-Home machines have their own rhythm: busy sometimes, idle most of the time. Few people run models around the clock, so a machine sized for peak demand often has GPU and memory to spare; in a home with several computers, those idle hours are spread across different machines.
+Device usage has peaks and valleys too: a machine may be busy running a large game, then sit idle when the user steps away or stops using it for the night.
 
-IdleToken connects one person's idle hours to another's busy ones: share spare compute when you are not using it, and call a model shared by someone else when local tasks begin to queue.
+IdleToken connects these offset peaks and valleys, letting idle machines supply compute to agents at peak demand.
 
 <table>
 <tr>
@@ -73,6 +73,8 @@ IdleToken uses Sparks to settle Tokens.
 ## 💬 Join the community
 
 Join the IdleToken Discord community to discuss model deployment, LAN clustering, client integrations, and project development, or to share feedback and ask for help.
+
+[Join Discord](https://discord.gg/XbaWCH4t2J)
 
 ## 🔌 Connect existing tools
 
