@@ -54,9 +54,10 @@ IdleToken 想做的，就是把这些错开的峰谷连接起来：让闲置的�
 <tr>
 <td width="50%" valign="top">
 <ol>
-<li>下载并安装客户端。当前支持带 NVIDIA GPU 的 Windows 10/11、Linux x86_64 / arm64，以及 Apple Silicon Mac。</li>
-<li>启动客户端，在内置列表中选择模型、量化精度和上下文；缺少模型参数时，客户端会自动下载。</li>
-<li>打开“外援”按钮，可请求别人完成本地排队的任务；打开“共享”按钮，可帮助别人完成任务。</li>
+<li><a href="https://github.com/idletoken/IdleToken/releases">下载并安装客户端</a>。</li>
+<li>启动客户端，下载并部署模型。</li>
+<li>打开“外援”按钮，请求别人完成本地排队的任务。</li>
+<li>打开“共享”按钮，帮助别人完成任务。</li>
 </ol>
 </td>
 <td width="50%" valign="top">
