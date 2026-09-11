@@ -21,3 +21,8 @@
 # on the same machines and mixed endings in one directory invite the next
 # person to "fix" one of them.
 *.ps1 text eol=crlf
+
+# Patch context is byte-sensitive. Windows Git commonly enables
+# core.autocrlf, which otherwise rewrites these files to CRLF and makes every
+# `git apply` against the LF-only upstream llama.cpp checkout fail.
+*.patch text eol=lf
