@@ -67,16 +67,14 @@ IdleToken 想做的，就是把这些错开的峰谷连接起来：让闲置的�
 2. 在账户中创建 API 密钥。
 3. 使用 API 调用别人分享的模型。
 
-## 🔌 接入现有工具
+## 🔌 接入第三方
 
-上面的两种方式都可以接入现有工具：部署自己的模型时连接本机地址；直接调用别人分享的模型时连接 IdleToken API。两者都兼容 OpenAI 与 Anthropic API。
+| Base URL | API 密钥 |
+| --- | --- |
+| `http://127.0.0.1:8000` | — |
+| `https://api.idletoken.ai` | 登录后，点击右上角用户头像，进入「火花」→「API 密钥」，点击「新建密钥」。 |
 
-| 使用方式 | Base URL | API key |
-| --- | --- | --- |
-| 自己部署的模型 | `http://127.0.0.1:8000` | 任意非空值；若自行设置了本地 token，则使用该 token |
-| 别人分享的模型 | `https://api.idletoken.ai` | 在账户中创建的 API 密钥 |
-
-以 Claude Code 直接调用别人分享的模型为例：
+### 接入 Claude Code
 
 ```sh
 export ANTHROPIC_BASE_URL=https://api.idletoken.ai
@@ -85,6 +83,37 @@ claude
 ```
 
 `GET /v1/models` 返回对应地址当前可用的模型 ID。
+
+### 接入 OpenCode
+
+在项目根目录创建 `opencode.json`，将 `MODEL_ID` 替换为 `GET /v1/models` 返回的模型 ID：
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "idletoken/MODEL_ID",
+  "provider": {
+    "idletoken": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "IdleToken",
+      "options": {
+        "baseURL": "https://api.idletoken.ai/v1",
+        "apiKey": "{env:IDLETOKEN_API_KEY}"
+      },
+      "models": {
+        "MODEL_ID": {
+          "name": "IdleToken"
+        }
+      }
+    }
+  }
+}
+```
+
+```sh
+export IDLETOKEN_API_KEY='sk-idletoken-********************************'
+opencode
+```
 
 ## 🧠 模型
 
