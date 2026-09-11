@@ -263,6 +263,11 @@ REM should not be signed and shipped.
 if not defined TAURI_BUNDLER_TOOLS_GITHUB_MIRROR set "TAURI_BUNDLER_TOOLS_GITHUB_MIRROR=https://github.com"
 set "BUNDLE=%ROOT%\client\src-tauri\target\release\bundle\nsis"
 cd /d "%ROOT%\client"
+REM rustc otherwise records the absolute Cargo registry path in panic/source
+REM metadata, including the Windows account name of the build machine. Map the
+REM users-root prefix to a neutral path before compiling anything that ships.
+for %%I in ("%USERPROFILE%\..") do set "IDLETOKEN_BUILD_USERS_ROOT=%%~fI"
+set "RUSTFLAGS=%RUSTFLAGS% --remap-path-prefix=%IDLETOKEN_BUILD_USERS_ROOT%=C:\build-users"
 cargo %RUST_TOOLCHAIN% tauri build --bundles nsis --config "{\"build\":{\"beforeBuildCommand\":\"\"}}"
 if errorlevel 1 (
     echo CLIENT_RELEASE_FAIL: tauri build failed

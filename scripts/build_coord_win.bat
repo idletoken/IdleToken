@@ -94,9 +94,31 @@ REM TweetNaCl is third-party: -w for the same reason the Makefile gives.
 gcc -c vendor/tweetnacl/tweetnacl.c -Ivendor/tweetnacl -std=gnu11 -O2 -w -o c_tweetnacl.o >> coord_build.log 2>&1
 if errorlevel 1 goto :fail
 
+REM The private tree keeps ds4_stub.c so its signatures are checked against the
+REM frozen historical headers. The public mirror deliberately ships neither of
+REM those, so make the same script buildable there with the neutral, refusal-
+REM only ABI that the public Makefile uses.
+if not exist src/common/ds4_stub.c goto :public_legacy_refusal
 echo === shelved legacy backend stub ===>> coord_build.log
 gcc -c src/common/ds4_stub.c %CF% -o c_ds4_stub.o >> coord_build.log 2>&1
 if errorlevel 1 goto :fail
+set LEGACY_BACKEND_OBJ=c_ds4_stub.o
+goto :legacy_backend_ready
+
+:public_legacy_refusal
+set "COMPAT=build\public-compat"
+if not exist "%COMPAT%" mkdir "%COMPAT%"
+>"%COMPAT%\ds4.h" echo #include "idletoken_legacy_backend_refusal.h"
+>"%COMPAT%\idletoken_ds4x.h" echo #include "idletoken_legacy_backend_refusal.h"
+>"%COMPAT%\idletoken_ds4x_tok.h" echo #include "idletoken_legacy_backend_refusal.h"
+>"%COMPAT%\idletoken_ds4x_cuda.h" echo #include "idletoken_legacy_backend_refusal.h"
+set CF=-Ibuild/public-compat %CF%
+echo === retired legacy backend refusal ===>> coord_build.log
+gcc -c src/common/legacy_backend_refusal.c %CF% -o c_legacy_refusal.o >> coord_build.log 2>&1
+if errorlevel 1 goto :fail
+set LEGACY_BACKEND_OBJ=c_legacy_refusal.o
+
+:legacy_backend_ready
 
 REM Overflow (B2B forwarding) and its crypto: sealed envelopes ride on
 REM sodium_seal + b64 + blake2b, exactly the objects the Makefile's coord link
@@ -122,7 +144,7 @@ if errorlevel 1 goto :fail
 echo === link ===>> coord_build.log
 REM -static-libgcc + static winpthread: the exe must run on a machine with only
 REM the NVIDIA driver and no MinGW on PATH (same reason as the worker link).
-gcc -static-libgcc -o idletoken-coord.exe c_coord_main.o c_llama_sidecar.o c_overflow.o c_net.o c_discovery.o c_model.o c_modelsize.o c_http.o c_plan.o c_gguf.o c_weights.o c_advise.o c_enginever.o c_resource.o c_model_auto.o c_apiconv.o c_admission.o c_b64.o c_sodium_seal.o c_blake2b.o c_nodecrypt.o c_privacy.o c_tweetnacl.o c_ds4_stub.o c_win_compat.o c_utf8_manifest.o -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic -lws2_32 -lbcrypt >> coord_build.log 2>&1
+gcc -static-libgcc -o idletoken-coord.exe c_coord_main.o c_llama_sidecar.o c_overflow.o c_net.o c_discovery.o c_model.o c_modelsize.o c_http.o c_plan.o c_gguf.o c_weights.o c_advise.o c_enginever.o c_resource.o c_model_auto.o c_apiconv.o c_admission.o c_b64.o c_sodium_seal.o c_blake2b.o c_nodecrypt.o c_privacy.o c_tweetnacl.o %LEGACY_BACKEND_OBJ% c_win_compat.o c_utf8_manifest.o -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic -lws2_32 -lbcrypt >> coord_build.log 2>&1
 if errorlevel 1 goto :fail
 
 echo COORD_WIN_OK
