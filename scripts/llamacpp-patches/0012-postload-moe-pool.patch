@@ -1,0 +1,277 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 0f2b64d..538c334 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -888,6 +888,11 @@ struct ggml_backend_sched {
+ 
+     // expert pools for host-resident MoE weights (GGML_MOE_POOL_EXPERTS), NULL when off
+     struct sched_moe_state * moe;
++    // If no explicit pool setting was supplied, collect one complete Hybrid
++    // graph and size the optional cache from memory left after its mandatory
++    // allocations. Kept separate from `moe`: a non-null moe state changes the
++    // graph split immediately.
++    struct sched_moe_auto_state * moe_auto;
+     // per-graph timing of the split loop (GGML_MOE_PROFILE=N), NULL when off
+     struct sched_prof * prof;
+ };
+@@ -976,6 +981,35 @@ struct sched_moe_state {
+     uint64_t graph_seq = 0;
+ };
+ 
++struct sched_moe_auto_state {
++    struct backend_budget {
++        size_t expert_bytes = 0;
++        size_t staging_bytes = 0;
++        size_t n_weights = 0;
++    };
++    bool ready = false;
++    bool invalid = false;
++    uint64_t expected_weight_count = 0;
++    uint64_t expected_weight_hash = 0;
++    uint64_t weight_hash = 0;
++    uint64_t expert_bytes = 0;     // one slot across every unique expert tensor
++    int64_t n_expert = INT64_MAX;
++    int64_t n_expert_used = 0;     // widest routed-id row observed in the graph
++    std::unordered_set<std::string> weights;
++    std::unordered_map<int, backend_budget> backends;
++};
++
++static uint64_t sched_moe_name_fnv1a(const char * name) {
++    uint64_t h = UINT64_C(14695981039346656037);
++    for (const unsigned char * p = (const unsigned char *) name; p && *p; ++p) {
++        h ^= *p;
++        h *= UINT64_C(1099511628211);
++    }
++    return h;
++}
++
++static struct sched_moe_state * sched_moe_state_new_with(int cap, uint64_t bytes);
++
+ // "blk.12.ffn_up_exps.weight" -> 12, else -1
+ static int sched_moe_layer_of(const char * name) {
+     if (name == nullptr || strncmp(name, "blk.", 4) != 0) {
+@@ -986,6 +1019,117 @@ static int sched_moe_layer_of(const char * name) {
+     return (end != name + 4 && *end == '.' && v >= 0) ? (int) v : -1;
+ }
+ 
++static void sched_moe_auto_reset(struct sched_moe_auto_state * st) {
++    if (st == nullptr) {
++        return;
++    }
++    st->ready = false;
++    st->invalid = false;
++    st->weight_hash = 0;
++    st->expert_bytes = 0;
++    st->n_expert = INT64_MAX;
++    st->n_expert_used = 0;
++    st->weights.clear();
++    st->backends.clear();
++}
++
++static void sched_moe_auto_record(ggml_backend_sched_t sched, const struct ggml_tensor * weight,
++                                  const struct ggml_tensor * node, int backend_id) {
++    sched_moe_auto_state * st = sched->moe_auto;
++    if (st == nullptr) {
++        return;
++    }
++    const struct ggml_tensor * ids = node != nullptr ? node->src[2] : nullptr;
++    if (weight == nullptr || weight->ne[2] <= 0 || weight->nb[2] == 0 ||
++        ids == nullptr || ids->ne[0] <= 0 || ids->ne[0] > weight->ne[2]) {
++        st->invalid = true;
++        return;
++    }
++    st->n_expert_used = std::max(st->n_expert_used, ids->ne[0]);
++    if (!st->weights.emplace(weight->name).second) {
++        return;
++    }
++    auto & budget = st->backends[backend_id];
++    if (UINT64_MAX - st->expert_bytes < weight->nb[2] ||
++        SIZE_MAX - budget.expert_bytes < weight->nb[2] ||
++        SIZE_MAX - budget.n_weights < 1) {
++        st->invalid = true;
++        return;
++    }
++    st->expert_bytes += weight->nb[2];
++    st->weight_hash += sched_moe_name_fnv1a(weight->name);
++    st->n_expert = std::min(st->n_expert, weight->ne[2]);
++    budget.expert_bytes += weight->nb[2];
++    budget.staging_bytes = std::max(budget.staging_bytes, ggml_nbytes(weight) + 512);
++    budget.n_weights++;
++}
++
++static bool sched_moe_auto_complete(const struct sched_moe_auto_state * st) {
++    return st != nullptr && !st->invalid && st->expected_weight_count > 0 &&
++           st->n_expert > 0 && st->n_expert_used > 0 && st->n_expert_used <= st->n_expert &&
++           !st->backends.empty() && st->weights.size() == st->expected_weight_count &&
++           st->weight_hash == st->expected_weight_hash;
++}
++
++static void sched_moe_auto_enable(ggml_backend_sched_t sched) {
++    sched_moe_auto_state * st = sched->moe_auto;
++    if (st == nullptr || !st->ready) {
++        return;
++    }
++    // The graph allocator has already reserved the real weights, KV/workspace,
++    // and upstream full-tensor staging. The pool owns one separate full-tensor
++    // staging buffer on each target device; leave another 1 GiB per device
++    // uncommitted for backend/runtime variance, and include the 512-byte tail
++    // on every per-weight allocation. A scheduler spanning multiple local GPUs
++    // uses the smallest safe slot count instead of assuming one particular card.
++    const size_t reserve = 1ull << 30;
++    int cap = INT_MAX;
++    double free_gib = 0;
++    double staging_gib = 0;
++    for (const auto & kv : st->backends) {
++        const int backend_id = kv.first;
++        const sched_moe_auto_state::backend_budget & budget = kv.second;
++        size_t free = 0, total = 0;
++        ggml_backend_dev_t dev = backend_id >= 0 && backend_id < sched->n_backends
++            ? ggml_backend_get_device(sched->backends[backend_id]) : nullptr;
++        if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
++            ggml_backend_dev_memory(dev, &free, &total);
++        }
++        const size_t tails = budget.n_weights > SIZE_MAX / 512
++            ? SIZE_MAX : budget.n_weights * 512;
++        size_t fixed = reserve;
++        fixed = SIZE_MAX - fixed < budget.staging_bytes
++            ? SIZE_MAX : fixed + budget.staging_bytes;
++        fixed = SIZE_MAX - fixed < tails ? SIZE_MAX : fixed + tails;
++        const size_t room = free > fixed ? free - fixed : 0;
++        const uint64_t raw_cap = budget.expert_bytes > 0 ? room / budget.expert_bytes : 0;
++        const int backend_cap = raw_cap > INT_MAX ? INT_MAX : (int) raw_cap;
++        cap = std::min(cap, backend_cap);
++        free_gib += (double) free / 1073741824.0;
++        staging_gib += (double) budget.staging_bytes / 1073741824.0;
++    }
++    if (cap == INT_MAX) {
++        cap = 0;
++    }
++    cap = (int) std::min<int64_t>(cap, st->n_expert);
++    if (cap >= st->n_expert_used) {
++        sched->moe = sched_moe_state_new_with(cap, 0);
++    }
++    if (sched->moe != nullptr) {
++        GGML_LOG_INFO("moe-pool: adaptive cache enabled after the first complete graph: "
++                      "%d slots/tensor, %zu expert tensors on %zu device(s), %.2f GiB total free, "
++                      "%.2f GiB staging, 1.00 GiB/device reserve; active from the next graph\n",
++                      cap, st->weights.size(), st->backends.size(), free_gib, staging_gib);
++    } else {
++        GGML_LOG_INFO("moe-pool: adaptive cache not enabled after the first complete graph: "
++                      "%zu target device(s) leave %d slots/tensor after staging and the "
++                      "1.00 GiB/device reserve (this model needs at least %lld active experts)\n",
++                      st->backends.size(), cap, (long long) st->n_expert_used);
++    }
++    delete st;
++    sched->moe_auto = nullptr;
++}
++
+ // "8G", "512M", "1000000" -> bytes
+ static uint64_t sched_moe_parse_bytes(const char * s) {
+     char * end = nullptr;
+@@ -1000,11 +1132,7 @@ static uint64_t sched_moe_parse_bytes(const char * s) {
+     return (uint64_t) (v * mul);
+ }
+ 
+-static struct sched_moe_state * sched_moe_state_new(void) {
+-    const char * env = getenv("GGML_MOE_POOL_EXPERTS");
+-    const char * env_bytes = getenv("GGML_MOE_POOL_BYTES");
+-    const int cap = env ? atoi(env) : 0;
+-    const uint64_t bytes = env_bytes ? sched_moe_parse_bytes(env_bytes) : 0;
++static struct sched_moe_state * sched_moe_state_new_with(int cap, uint64_t bytes) {
+     if (cap <= 0 && bytes == 0) {
+         return nullptr;
+     }
+@@ -1021,6 +1149,14 @@ static struct sched_moe_state * sched_moe_state_new(void) {
+     return st;
+ }
+ 
++static struct sched_moe_state * sched_moe_state_new(void) {
++    const char * env = getenv("GGML_MOE_POOL_EXPERTS");
++    const char * env_bytes = getenv("GGML_MOE_POOL_BYTES");
++    const int cap = env ? atoi(env) : 0;
++    const uint64_t bytes = env_bytes ? sched_moe_parse_bytes(env_bytes) : 0;
++    return sched_moe_state_new_with(cap, bytes);
++}
++
+ static void sched_moe_state_free(struct sched_moe_state * st) {
+     if (st == nullptr) {
+         return;
+@@ -1944,6 +2080,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+     sched->n_splits = 0;
+     sched->n_graph_inputs = 0;
+     sched->is_reset = false;
++    sched_moe_auto_reset(sched->moe_auto);
+ 
+     struct ggml_init_params params = {
+         /* .mem_size =   */ sched->context_buffer_size,
+@@ -2317,6 +2454,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                         // (or the shared staging view) replaces it at compute time
+                         const bool pool_served = sched->moe && sched->n_copies == 1 &&
+                                                  sched_moe_is_expert_weight(node, src) && j == 0;
++                        if (sched->moe_auto && sched->n_copies == 1 &&
++                            sched_moe_is_expert_weight(node, src) && j == 0) {
++                            sched_moe_auto_record(sched, src, node, cur_backend_id);
++                        }
+                         if (pool_served) {
+                             sched->moe->weights[src->name] = src;
+                             sched->moe->max_weight_bytes = std::max(sched->moe->max_weight_bytes, ggml_nbytes(src));
+@@ -3090,6 +3231,20 @@ ggml_backend_sched_t ggml_backend_sched_new(
+ 
+     sched->n_backends = n_backends;
+     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
++    const char * auto_count = getenv("GGML_MOE_AUTO_WEIGHT_COUNT");
++    const char * auto_hash = getenv("GGML_MOE_AUTO_WEIGHT_HASH");
++    char * count_end = nullptr;
++    char * hash_end = nullptr;
++    const uint64_t expected_auto_count = auto_count ? strtoull(auto_count, &count_end, 10) : 0;
++    const uint64_t expected_auto_hash = auto_hash ? strtoull(auto_hash, &hash_end, 10) : 0;
++    if (sched->moe == nullptr && getenv("GGML_MOE_POOL_EXPERTS") == nullptr &&
++        getenv("GGML_MOE_POOL_BYTES") == nullptr && sched->n_copies == 1 &&
++        expected_auto_count > 0 && count_end != auto_count && *count_end == '\0' &&
++        hash_end != auto_hash && *hash_end == '\0') {
++        sched->moe_auto = new sched_moe_auto_state();
++        sched->moe_auto->expected_weight_count = expected_auto_count;
++        sched->moe_auto->expected_weight_hash = expected_auto_hash;
++    }
+ 
+     // initialize hash table
+     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
+@@ -3166,6 +3321,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+     free(sched->graph.nodes);
+     free(sched->graph.leafs);
+     sched_moe_state_free(sched->moe);
++    delete sched->moe_auto;
+     sched_prof_free(sched->prof);
+     free(sched);
+ }
+@@ -3250,7 +3406,21 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
+         }
+     }
+ 
+-    return ggml_backend_sched_compute_splits(sched);
++    const enum ggml_status status = ggml_backend_sched_compute_splits(sched);
++    if (status == GGML_STATUS_SUCCESS && sched->moe_auto && sched_moe_auto_complete(sched->moe_auto)) {
++        sched->moe_auto->ready = true;
++    } else if (status == GGML_STATUS_SUCCESS && sched->moe_auto) {
++        GGML_LOG_WARN("moe-pool: adaptive cache disabled: graph expert-weight identity "
++                      "did not match the GGUF plan (observed %zu/%016llx, planned %llu/%016llx%s)\n",
++                      sched->moe_auto->weights.size(),
++                      (unsigned long long) sched->moe_auto->weight_hash,
++                      (unsigned long long) sched->moe_auto->expected_weight_count,
++                      (unsigned long long) sched->moe_auto->expected_weight_hash,
++                      sched->moe_auto->invalid ? ", accounting overflow" : "");
++        delete sched->moe_auto;
++        sched->moe_auto = nullptr;
++    }
++    return status;
+ }
+ 
+ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
+@@ -3258,6 +3428,7 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
+     for (int i = 0; i < sched->n_backends; i++) {
+         ggml_backend_synchronize(sched->backends[i]);
+     }
++    sched_moe_auto_enable(sched);
+     if (!sched->is_alloc) {
+         // if the graph is not already allocated, always use copy 0 after a synchronization
+         // this ensures that during generation the same copy is used every time,

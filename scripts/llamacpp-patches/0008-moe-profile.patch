@@ -1,0 +1,704 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index a49ddca..80736af 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -20,6 +20,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <algorithm>
++#include <chrono>
+ #include <vector>
+ 
+ #ifdef __APPLE__
+@@ -874,6 +875,8 @@ struct ggml_backend_sched {
+ 
+     // expert pools for host-resident MoE weights (GGML_MOE_POOL_EXPERTS), NULL when off
+     struct sched_moe_state * moe;
++    // per-graph timing of the split loop (GGML_MOE_PROFILE=N), NULL when off
++    struct sched_prof * prof;
+ };
+ 
+ #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
+@@ -2499,6 +2502,259 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+     return true;
+ }
+ 
++// ---- per-graph profile of the split loop (GGML_MOE_PROFILE=N) --------------------------
++//
++// Off unless GGML_MOE_PROFILE is set: N prints one summary line every N
++// computed graphs (1 = every graph, i.e. every decode token). When on, every
++// host wait in compute_splits is timed with std::chrono by site, the host time
++// inside the pool calls and each graph submission is measured, the pool
++// counters are read per graph, and on CUDA backends every split's compute
++// stream is bracketed with timing events. The events come from the backend
++// registry (get_proc_address), so this file gains no CUDA dependency and other
++// backends simply report no GPU time. When off, the cost is a pointer test per
++// site: nothing is allocated or recorded. The computation is the same either
++// way; the only wait a profiled graph adds is the event synchronization at its
++// end, which the caller's synchronize would perform next anyway.
++
++typedef std::chrono::steady_clock::time_point sched_prof_tp;
++
++struct sched_prof_site {
++    uint64_t n = 0;
++    double ms = 0;
++};
++
++// timing events of one split on a GPU backend
++struct sched_prof_events {
++    ggml_backend_event_t pre  = nullptr;  // recorded before the split's inputs are handled
++    ggml_backend_event_t mid  = nullptr;  // just before the split's graph is submitted
++    ggml_backend_event_t post = nullptr;  // just after
++    int backend_id = -1;
++    bool expert = false;                  // the split starts with a host-expert MUL_MAT_ID
++};
++
++struct sched_prof {
++    typedef ggml_backend_event_t (*event_new_fn)(ggml_backend_dev_t);
++    typedef float (*event_elapsed_fn)(ggml_backend_event_t, ggml_backend_event_t);
++
++    int every = 1;
++    uint64_t n_graphs = 0;      // graphs computed since the scheduler was created
++    uint64_t in_window = 0;     // graphs summed into the current window
++    int last_expert_split = -1;
++    int64_t graph_batch = 0;    // columns of the first ids readback in the graph
++    uint64_t batch_sum = 0;
++    double wall_ms = 0;
++    // host waits by site (see compute_splits)
++    sched_prof_site w_input, w_pre, w_weight, w_ids, w_other;
++    uint64_t n_splits = 0, n_expert_splits = 0, n_pool = 0, n_rpc = 0, n_ids = 0;
++    uint64_t staging_bytes = 0; // expert bytes copied by the no-pool path
++    // pool counters, as deltas against the previous graph
++    uint64_t hits = 0, misses = 0, prefetched = 0, bypassed = 0, miss_bytes = 0, prefetch_bytes = 0;
++    struct pool_seen { uint64_t hits = 0, misses = 0, prefetched = 0, bypassed = 0; };
++    std::unordered_map<const sched_moe_pool *, pool_seen> seen;
++    // GPU time, CUDA backends only
++    event_new_fn     ev_new[GGML_SCHED_MAX_BACKENDS] = {};
++    event_elapsed_fn ev_elapsed[GGML_SCHED_MAX_BACKENDS] = {};
++    bool is_rpc[GGML_SCHED_MAX_BACKENDS] = {};
++    std::vector<sched_prof_events> ev;
++    size_t ev_used = 0;
++    uint64_t n_gpu = 0;
++    double gpu_expert_gap_ms = 0, gpu_expert_ms = 0, gpu_other_gap_ms = 0, gpu_other_ms = 0;
++};
++
++static struct sched_prof * sched_prof_new(ggml_backend_sched_t sched) {
++    const char * env = getenv("GGML_MOE_PROFILE");
++    if (env == nullptr || atoi(env) <= 0) {
++        return nullptr;
++    }
++    auto * pr = new sched_prof();
++    pr->every = atoi(env);
++    int n_timed = 0;
++    for (int b = 0; b < sched->n_backends; b++) {
++        pr->is_rpc[b] = strncmp(ggml_backend_name(sched->backends[b]), "RPC", 3) == 0;
++        ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
++        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
++        if (reg == nullptr) {
++            continue;
++        }
++        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
++        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
++            continue;
++        }
++        pr->ev_new[b]     = (sched_prof::event_new_fn)     ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_timing_event_new");
++        pr->ev_elapsed[b] = (sched_prof::event_elapsed_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_timing_event_elapsed_ms");
++        if (pr->ev_new[b] == nullptr || pr->ev_elapsed[b] == nullptr) {
++            pr->ev_new[b] = nullptr;
++            pr->ev_elapsed[b] = nullptr;
++        } else {
++            n_timed++;
++        }
++    }
++    fprintf(stderr, "moe-profile: on, one line every %d graph(s); GPU timing on %d of %d backend(s)\n",
++        pr->every, n_timed, sched->n_backends);
++    return pr;
++}
++
++static void sched_prof_free(struct sched_prof * pr) {
++    if (pr == nullptr) {
++        return;
++    }
++    for (auto & e : pr->ev) {
++        if (e.pre)  { ggml_backend_event_free(e.pre);  }
++        if (e.mid)  { ggml_backend_event_free(e.mid);  }
++        if (e.post) { ggml_backend_event_free(e.post); }
++    }
++    delete pr;
++}
++
++static inline double sched_prof_ms_since(const sched_prof_tp & t0) {
++    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++}
++
++// a timestamp only while profiling; ADD is a no-op without a profile
++#define SCHED_PROF_T(name) const sched_prof_tp name = pr ? std::chrono::steady_clock::now() : sched_prof_tp()
++#define SCHED_PROF_ADD(site, name) do { if (pr) { pr->site.n++; pr->site.ms += sched_prof_ms_since(name); } } while (0)
++
++// the timing events for a split on backend b, or NULL when b has none
++static sched_prof_events * sched_prof_events_for(struct sched_prof * pr, ggml_backend_sched_t sched, int b) {
++    if (pr->ev_new[b] == nullptr) {
++        return nullptr;
++    }
++    if (pr->ev_used == pr->ev.size()) {
++        pr->ev.emplace_back();
++    }
++    sched_prof_events & e = pr->ev[pr->ev_used];
++    if (e.backend_id != b) {
++        // first use, or a slot last used on another device: (re)create on this one
++        if (e.pre)  { ggml_backend_event_free(e.pre);  }
++        if (e.mid)  { ggml_backend_event_free(e.mid);  }
++        if (e.post) { ggml_backend_event_free(e.post); }
++        ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
++        e.pre  = pr->ev_new[b](dev);
++        e.mid  = pr->ev_new[b](dev);
++        e.post = pr->ev_new[b](dev);
++        e.backend_id = b;
++    }
++    e.expert = false;
++    pr->ev_used++;
++    return &e;
++}
++
++static void sched_prof_reset_window(struct sched_prof * pr) {
++    pr->in_window = 0;
++    pr->batch_sum = 0;
++    pr->wall_ms = 0;
++    pr->w_input = pr->w_pre = pr->w_weight = pr->w_ids = pr->w_other = sched_prof_site();
++    pr->n_splits = pr->n_expert_splits = pr->n_pool = pr->n_rpc = pr->n_ids = pr->staging_bytes = 0;
++    pr->hits = pr->misses = pr->prefetched = pr->bypassed = pr->miss_bytes = pr->prefetch_bytes = 0;
++    pr->n_gpu = 0;
++    pr->gpu_expert_gap_ms = pr->gpu_expert_ms = pr->gpu_other_gap_ms = pr->gpu_other_ms = 0;
++}
++
++// One line per window; every figure is a per-graph mean over the window's n graphs.
++static void sched_prof_print(const struct sched_prof * pr) {
++    const double n = (double) std::max<uint64_t>(1, pr->in_window);
++    const double mib = 1048576.0;
++    fprintf(stderr,
++        "moe-profile g%llu n=%llu batch %.1f wall %.2f ms"
++        " | splits %.1f (expert %.1f pool %.1f rpc %.1f gpu-timed %.1f) ids-readback %.1f"
++        " | host-wait %.2f ms: input %.1f/%.2f pre %.1f/%.2f weight %.1f/%.2f ids %.1f/%.2f other %.1f/%.2f"
++        " | pool: hit %.1f miss %.1f (%.1f MiB) prefetch %.1f (%.1f MiB) bypass %.1f staging %.1f MiB"
++        " | gpu: expert-gap %.2f mmid %.2f other-gap %.2f other %.2f ms\n",
++        (unsigned long long) pr->n_graphs, (unsigned long long) pr->in_window, pr->batch_sum / n, pr->wall_ms / n,
++        pr->n_splits / n, pr->n_expert_splits / n, pr->n_pool / n, pr->n_rpc / n, pr->n_gpu / n, pr->n_ids / n,
++        (pr->w_input.ms + pr->w_pre.ms + pr->w_weight.ms + pr->w_ids.ms + pr->w_other.ms) / n,
++        pr->w_input.n / n, pr->w_input.ms / n, pr->w_pre.n / n, pr->w_pre.ms / n,
++        pr->w_weight.n / n, pr->w_weight.ms / n, pr->w_ids.n / n, pr->w_ids.ms / n, pr->w_other.n / n, pr->w_other.ms / n,
++        pr->hits / n, pr->misses / n, pr->miss_bytes / n / mib, pr->prefetched / n, pr->prefetch_bytes / n / mib,
++        pr->bypassed / n, pr->staging_bytes / n / mib,
++        pr->gpu_expert_gap_ms / n, pr->gpu_expert_ms / n, pr->gpu_other_gap_ms / n, pr->gpu_other_ms / n);
++}
++
++// Close a profiled graph: read the GPU events, fold in the pool counters, print
++// when the window is full.
++static void sched_prof_end_graph(ggml_backend_sched_t sched, struct sched_prof * pr, const sched_prof_tp & t_graph) {
++    // Profiling deliberately synchronizes the last timing event on each CUDA
++    // backend. This is measurement perturbation, not an otherwise-free probe;
++    // the switch-off path never reaches this function.
++    // The last event of a backend completes after all its earlier ones (stream order).
++    bool synced[GGML_SCHED_MAX_BACKENDS] = {};
++    for (size_t i = pr->ev_used; i-- > 0; ) {
++        const sched_prof_events & e = pr->ev[i];
++        if (!synced[e.backend_id]) {
++            ggml_backend_event_synchronize(e.post);
++            synced[e.backend_id] = true;
++        }
++    }
++    for (size_t i = 0; i < pr->ev_used; i++) {
++        const sched_prof_events & e = pr->ev[i];
++        const float gap = pr->ev_elapsed[e.backend_id](e.pre, e.mid);
++        const float run = pr->ev_elapsed[e.backend_id](e.mid, e.post);
++        if (gap < 0 || run < 0) {
++            continue;   // an event that did not complete is left out, not guessed
++        }
++        pr->n_gpu++;
++        if (e.expert) {
++            pr->gpu_expert_gap_ms += gap;
++            pr->gpu_expert_ms     += run;
++        } else {
++            pr->gpu_other_gap_ms += gap;
++            pr->gpu_other_ms     += run;
++        }
++    }
++    pr->ev_used = 0;
++    if (sched->moe) {
++        for (auto & kv : sched->moe->pools) {
++            const sched_moe_pool * p = kv.second.get();
++            if (p == nullptr) {
++                continue;
++            }
++            sched_prof::pool_seen & s = pr->seen[p];
++            pr->hits           += p->hits - s.hits;
++            pr->misses         += p->misses - s.misses;
++            pr->prefetched     += p->prefetched - s.prefetched;
++            pr->bypassed       += p->bypassed - s.bypassed;
++            pr->miss_bytes     += (p->misses - s.misses) * p->expert_size;
++            pr->prefetch_bytes += (p->prefetched - s.prefetched) * p->expert_size;
++            s.hits = p->hits;
++            s.misses = p->misses;
++            s.prefetched = p->prefetched;
++            s.bypassed = p->bypassed;
++        }
++    }
++    pr->wall_ms += sched_prof_ms_since(t_graph);
++    pr->batch_sum += pr->graph_batch;
++    pr->graph_batch = 0;
++    pr->n_graphs++;
++    pr->in_window++;
++    if (pr->in_window < (uint64_t) pr->every) {
++        return;
++    }
++    sched_prof_print(pr);
++    sched_prof_reset_window(pr);
++}
++
++// A failed graph is not part of the profile. The accumulators are updated in
++// place, so discard the current window and advance the pool baselines rather
++// than letting a later successful graph inherit partial samples.
++static void sched_prof_abort_graph(ggml_backend_sched_t sched, struct sched_prof * pr) {
++    pr->ev_used = 0;
++    pr->last_expert_split = -1;
++    pr->graph_batch = 0;
++    sched_prof_reset_window(pr);
++    if (sched->moe) {
++        for (auto & kv : sched->moe->pools) {
++            const sched_moe_pool * p = kv.second.get();
++            if (p) {
++                sched_prof::pool_seen & s = pr->seen[p];
++                s.hits = p->hits;
++                s.misses = p->misses;
++                s.prefetched = p->prefetched;
++                s.bypassed = p->bypassed;
++            }
++        }
++    }
++}
++
+ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     struct ggml_backend_sched_split * splits = sched->splits;
+@@ -2509,11 +2765,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+     if (sched->moe) {
+         sched_moe_scan_pregate(sched);
+     }
++    // GGML_MOE_PROFILE: pr is NULL when off, and every SCHED_PROF_* line below is then a no-op
++    struct sched_prof * pr = sched->prof;
++    SCHED_PROF_T(t_graph);
++    if (pr) {
++        pr->last_expert_split = -1;
++    }
+ 
+     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+         struct ggml_backend_sched_split * split = &splits[split_id];
+         int split_backend_id = split->backend_id;
+         ggml_backend_t split_backend = sched->backends[split_backend_id];
++        // GPU-side brackets of this split (CUDA only): pre -> mid is the stream's gap
++        // before the split's kernels (its input copies, and idle time while the host
++        // waits or works), mid -> post the kernels themselves
++        sched_prof_events * pe = (pr && !sched->callback_eval) ? sched_prof_events_for(pr, sched, split_backend_id) : nullptr;
++        if (pe) {
++            ggml_backend_event_record(pe->pre, split_backend);
++        }
+ 
+         // copy the input tensors to the split backend
+         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+@@ -2523,18 +2792,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+ 
+             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
++                SCHED_PROF_T(t_wait);
+                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                 } else {
+                     ggml_backend_synchronize(split_backend);
+                 }
++                SCHED_PROF_ADD(w_input, t_wait);
+                 ggml_backend_tensor_copy(input, input_cpy);
+             } else {
+                 // wait for the split backend to finish using the input before overwriting it
+                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+                 } else {
++                    SCHED_PROF_T(t_wait);
+                     ggml_backend_synchronize(split_backend);
++                    SCHED_PROF_ADD(w_pre, t_wait);
+                 }
+ 
+                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
+@@ -2562,7 +2835,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
+                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
+ 
++                    SCHED_PROF_T(t_weight);
+                     ggml_backend_synchronize(input_backend);
++                    SCHED_PROF_ADD(w_weight, t_weight);
++                    if (pr) {
++                        if (pr->last_expert_split != split_id) {
++                            pr->last_expert_split = split_id;
++                            pr->n_expert_splits++;
++                        }
++                        if (pe) {
++                            pe->expert = true;
++                        }
++                    }
+ 
+                     // get the ids
+                     ggml_tensor * ids_tensor = sched_moe_router_ids(sched, input, node);
+@@ -2580,8 +2864,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+ 
+                     if (ids_tensor != prev_ids_tensor) {
+                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
++                        SCHED_PROF_T(t_ids);
+                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
+                         ggml_backend_synchronize(ids_backend);
++                        SCHED_PROF_ADD(w_ids, t_ids);
++                        if (pr) {
++                            pr->n_ids++;
++                            if (pr->graph_batch == 0) {
++                                pr->graph_batch = ids_tensor->ne[1];
++                            }
++                        }
+ 
+                         // find the used experts
+                         used_ids.clear();
+@@ -2600,7 +2892,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                     if (sched->moe && !node_local_rpc_moe && sched->n_copies == 1) {
+                         const bool fresh_ids = prev_ids_tensor == ids_tensor && ids_tensor != nullptr;
+                         if (sched_moe_pool_serve(sched, split, input, input_cpy, ids_tensor, ids, used_ids,
+-                                                 n_expert, expert_size, split_backend, split_backend_id)) {
++                                                n_expert, expert_size, split_backend, split_backend_id)) {
++                            if (pr) {
++                                pr->n_pool++;
++                            }
+                             // first split of this layer (its ids were just read back): issue this
+                             // layer's other expert tensors (exact ids) and then the next layer's
+                             // predicted experts on the prefetch stream now
+@@ -2634,6 +2929,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                                 // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
+                                 // this is necessary for MMQ in the CUDA backend
+                                 size);
++                            if (pr) {
++                                pr->staging_bytes += size;
++                            }
+                         }
+                     };
+ 
+@@ -2668,21 +2966,29 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
+                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
++                        SCHED_PROF_T(t_wait);
+                         ggml_backend_synchronize(input_backend);
+                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                         } else {
+                             ggml_backend_synchronize(split_backend);
+                         }
++                        SCHED_PROF_ADD(w_other, t_wait);
+                         ggml_backend_tensor_copy(input, input_cpy);
+                     }
+                 }
+             }
+         }
+ 
++        if (pe) {
++            ggml_backend_event_record(pe->mid, split_backend);
++        }
+         if (!sched->callback_eval) {
+             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+             if (ec != GGML_STATUS_SUCCESS) {
++                if (pr) {
++                    sched_prof_abort_graph(sched, pr);
++                }
+                 return ec;
+             }
+         } else {
+@@ -2705,11 +3011,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+ 
+                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
+                 if (ec != GGML_STATUS_SUCCESS) {
++                    if (pr) {
++                        sched_prof_abort_graph(sched, pr);
++                    }
+                     return ec;
+                 }
+ 
+                 // TODO: pass backend to the callback, then the user can decide if they want to synchronize
++                SCHED_PROF_T(t_wait);
+                 ggml_backend_synchronize(split_backend);
++                SCHED_PROF_ADD(w_other, t_wait);
+ 
+                 if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
+                     break;
+@@ -2718,6 +3029,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                 j0 = j1;
+             }
+         }
++        if (pe) {
++            ggml_backend_event_record(pe->post, split_backend);
++        }
++        if (pr) {
++            pr->n_splits++;
++            pr->n_rpc += pr->is_rpc[split_backend_id];
++        }
+ 
+         // record the event of this copy
+         if (split->n_inputs > 0) {
+@@ -2726,6 +3044,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+         }
+     }
++    if (pr) {
++        sched_prof_end_graph(sched, pr, t_graph);
++    }
+ 
+     return GGML_STATUS_SUCCESS;
+ }
+@@ -2795,6 +3116,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
+         }
+     }
+ 
++    sched->prof = sched_prof_new(sched);
++
+     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
+     sched->op_offload = op_offload;
+ 
+@@ -2830,6 +3153,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+     free(sched->graph.nodes);
+     free(sched->graph.leafs);
+     sched_moe_state_free(sched->moe);
++    sched_prof_free(sched->prof);
+     free(sched);
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index f2e381e..793f46c 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5458,8 +5458,48 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+     GGML_UNUSED(reg);
+ }
+ 
++// Timing events for the scheduler's GGML_MOE_PROFILE. The backend's own events
++// are created with cudaEventDisableTiming, so these two are reached only
++// through get_proc_address and serve nothing but elapsed-time queries; record,
++// synchronize and free go through the regular event interface.
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++static ggml_backend_event_t ggml_backend_cuda_timing_event_new(ggml_backend_dev_t dev) {
++    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *)dev->context;
++
++    ggml_cuda_set_device(dev_ctx->device);
++
++    cudaEvent_t event;
++    CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDefault));
++
++    return new ggml_backend_event {
++        /* .device  = */ dev,
++        /* .context = */ event,
++    };
++}
++
++// milliseconds between two recorded timing events, negative when either has not completed
++static float ggml_backend_cuda_timing_event_elapsed_ms(ggml_backend_event_t start, ggml_backend_event_t end) {
++    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) start->device->context;
++    ggml_cuda_set_device(dev_ctx->device);
++
++    float ms = 0.0f;
++    if (cudaEventElapsedTime(&ms, (cudaEvent_t)start->context, (cudaEvent_t)end->context) != cudaSuccess) {
++        return -1.0f;
++    }
++    return ms;
++}
++#endif
++
+ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+     GGML_UNUSED(reg);
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    if (strcmp(name, "ggml_backend_cuda_timing_event_new") == 0) {
++        return (void *)ggml_backend_cuda_timing_event_new;
++    }
++    if (strcmp(name, "ggml_backend_cuda_timing_event_elapsed_ms") == 0) {
++        return (void *)ggml_backend_cuda_timing_event_elapsed_ms;
++    }
++#endif
+     if (strcmp(name, "ggml_backend_comm_init") == 0) {
+         return (void *)ggml_backend_cuda_comm_init;
+     }
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 7d0b080..cd63317 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -1002,11 +1002,26 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device,
+ 
+ // RPC server-side implementation
+ 
++struct rpc_moe_prof {
++    explicit rpc_moe_prof(int every) : every(every) {}
++
++    int every;
++    uint64_t n_graphs = 0, in_window = 0, recomputes = 0, nodes = 0;
++    double deser_ms = 0, setup_ms = 0, assign_ms = 0, alloc_ms = 0, compute_ms = 0, total_ms = 0;
++    double deser_pending_ms = 0;
++    bool recompute_pending = false;
++};
++
+ class rpc_server {
+ public:
+     rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
+         : backends(std::move(all_backends)), cache_dir(cache_dir) {
+         stored_graphs.resize(backends.size());
++        const char * profile_env = std::getenv("GGML_MOE_PROFILE");
++        const int profile_every = profile_env ? atoi(profile_env) : 0;
++        if (profile_every > 0) {
++            prof = std::make_unique<rpc_moe_prof>(profile_every);
++        }
+     }
+     ~rpc_server();
+ 
+@@ -1060,8 +1075,48 @@ private:
+     std::unordered_map<ggml_backend_buffer_t, uint32_t> buffers;
+     // store the last computed graph for each backend
+     std::vector<stored_graph> stored_graphs;
++    // GGML_MOE_PROFILE=N (the scheduler's switch, read here as well): the
++    // server-side time of each graph compute — deserialization, scheduler
++    // setup, leaf assignment, allocation (which includes the split) and the
++    // compute itself — printed as one rpc-profile line every N graphs. Every
++    // figure on that line is a per-graph mean over the window. The state is
++    // not allocated when profiling is off.
++    std::unique_ptr<rpc_moe_prof> prof;
++    void profile_discard_pending();
++    void profile_close(int n_nodes, double setup_ms, double assign_ms, double alloc_ms, double compute_ms);
+ };
+ 
++void rpc_server::profile_discard_pending() {
++    prof->deser_pending_ms = 0;
++    prof->recompute_pending = false;
++}
++
++void rpc_server::profile_close(int n_nodes, double setup_ms, double assign_ms, double alloc_ms, double compute_ms) {
++    rpc_moe_prof & p = *prof;
++    p.n_graphs++;
++    p.in_window++;
++    p.nodes      += n_nodes;
++    p.recomputes += p.recompute_pending;
++    p.deser_ms   += p.deser_pending_ms;
++    p.setup_ms   += setup_ms;
++    p.assign_ms  += assign_ms;
++    p.alloc_ms   += alloc_ms;
++    p.compute_ms += compute_ms;
++    p.total_ms   += p.deser_pending_ms + setup_ms + assign_ms + alloc_ms + compute_ms;
++    profile_discard_pending();
++    if (p.in_window < (uint64_t) p.every) {
++        return;
++    }
++    const double n = (double) p.in_window;
++    fprintf(stderr, "rpc-profile g%llu n=%llu nodes=%.1f recompute=%.1f | deserialize %.2f setup %.2f assign %.2f split-alloc %.2f compute %.2f total %.2f ms\n",
++        (unsigned long long) p.n_graphs, (unsigned long long) p.in_window, p.nodes / n, p.recomputes / n,
++        p.deser_ms / n, p.setup_ms / n, p.assign_ms / n, p.alloc_ms / n, p.compute_ms / n, p.total_ms / n);
++    p.in_window = 0;
++    p.recomputes = 0;
++    p.nodes = 0;
++    p.deser_ms = p.setup_ms = p.assign_ms = p.alloc_ms = p.compute_ms = p.total_ms = 0;
++}
++
+ void rpc_server::hello(rpc_msg_hello_rsp & response) {
+     response.major = RPC_PROTO_MAJOR_VERSION;
+     response.minor = RPC_PROTO_MINOR_VERSION;
+@@ -1135,13 +1190,21 @@ ggml_backend_buffer_type_t rpc_server::device_buft(uint32_t dev_id) {
+ }
+ 
+ ggml_status rpc_server::compute(uint32_t device, ggml_cgraph * graph) {
++    typedef std::chrono::steady_clock clk;
++    auto ms_between = [](const clk::time_point & a, const clk::time_point & b) {
++        return std::chrono::duration<double, std::milli>(b - a).count();
++    };
+     ggml_backend_dev_t dev = ggml_backend_get_device(backends[device]);
+     const bool server_sched = ggml_backend_rpc_node_local_mode() == 2 && backends.size() > 1 &&
+         dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU &&
+         ggml_backend_dev_type(ggml_backend_get_device(backends.back())) == GGML_BACKEND_DEVICE_TYPE_CPU;
+     if (!server_sched) {
++        if (prof) {
++            profile_discard_pending();
++        }
+         return ggml_backend_graph_compute(backends[device], graph);
+     }
++    const clk::time_point t0 = prof ? clk::now() : clk::time_point();
+     // Size the scheduler for the largest graph this model will send, not for
+     // this one: every re-creation drops the expert pools cold, and a client
+     // whose ubatch sizes vary (787-token prompt: 512, 275, 1, ...) sent five
+@@ -1174,6 +1237,7 @@ ggml_status rpc_server::compute(uint32_t device, ggml_cgraph * graph) {
+     // pageable memory faults). The scheduler assigns them by buffer type here,
+     // after putting back any pool redirection left by the previous compute of
+     // the same graph (GRAPH_RECOMPUTE re-submits the stored graph).
++    const clk::time_point t1 = prof ? clk::now() : clk::time_point();
+     ggml_backend_sched_assign_leaves(sched, graph);
+     // The wire protocol carries no buffer usage, so every server-side buffer is
+     // USAGE_ANY and the scheduler would keep host-resident experts on the CPU
+@@ -1201,10 +1265,23 @@ ggml_status rpc_server::compute(uint32_t device, ggml_cgraph * graph) {
+     }
+     // allocate here: graph_compute would reset the scheduler first (the
+     // assignments above mark it dirty) and drop every pin just made
++    const clk::time_point t2 = prof ? clk::now() : clk::time_point();
+     if (!ggml_backend_sched_alloc_graph(sched, graph)) {
++        if (prof) {
++            profile_discard_pending();
++        }
+         return GGML_STATUS_ALLOC_FAILED;
+     }
+-    return ggml_backend_sched_graph_compute(sched, graph);
++    const clk::time_point t3 = prof ? clk::now() : clk::time_point();
++    const ggml_status status = ggml_backend_sched_graph_compute(sched, graph);
++    if (prof) {
++        if (status == GGML_STATUS_SUCCESS) {
++            profile_close(graph->n_nodes, ms_between(t0, t1), ms_between(t1, t2), ms_between(t2, t3), ms_between(t3, clk::now()));
++        } else {
++            profile_discard_pending();
++        }
++    }
++    return status;
+ }
+ 
+ bool rpc_server::alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_alloc_buffer_rsp & response) {
+@@ -1828,6 +1905,10 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
+ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+     // serialization format:
+     // | device (4 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
++    if (prof) {
++        profile_discard_pending();
++    }
++    const auto t_deser = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+     if (input.size() < 2*sizeof(uint32_t)) {
+         return false;
+     }
+@@ -1893,6 +1974,9 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+             graph->use_counts[hash_pos] = tensor_ptrs.at(id)->use_count;
+         }
+     }
++    if (prof) {
++        prof->deser_pending_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_deser).count();
++    }
+     ggml_status status = compute(device, graph);
+     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+     stored_graphs[device].graph = graph;
+@@ -1900,6 +1984,9 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+ }
+ 
+ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
++    if (prof) {
++        profile_discard_pending();
++    }
+     uint32_t device = request.device;
+     if (device >= backends.size()) {
+         return false;
+@@ -1909,6 +1996,9 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
+     }
+     ggml_cgraph * graph = stored_graphs[device].graph;
+     LOG_DBG("[%s] device: %u\n", __func__, device);
++    if (prof) {
++        prof->recompute_pending = true;
++    }
+     ggml_status status = compute(device, graph);
+     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+     return true;

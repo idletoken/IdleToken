@@ -201,6 +201,55 @@ async fn advise_capability(app: tauri::AppHandle) -> Result<Value, String> {
     serde_json::from_str::<Value>(line).map_err(|e| format!("bad advise JSON: {e}"))
 }
 
+/// Inspect the exact routed-expert byte layout of the selected, downloaded
+/// GGUF. The browser cannot read arbitrary local files, and reimplementing the
+/// GGUF tensor parser in TypeScript would give the resource card a second truth
+/// source. The worker already links the same parser used by runtime admission.
+#[tauri::command]
+async fn inspect_model_layout(
+    app: tauri::AppHandle,
+    model_id: String,
+    quant: String,
+    gguf_path: String,
+) -> Result<Value, String> {
+    if model_id.trim().is_empty() || gguf_path.trim().is_empty() {
+        return Err("model id and GGUF path are required".into());
+    }
+    let sidecar = app
+        .shell()
+        .sidecar("idletoken-worker")
+        .map_err(|e| format!("sidecar not found (bundle binaries/idletoken-worker): {e}"))?;
+    let quant_arg = if quant.trim().is_empty() {
+        "-"
+    } else {
+        quant.trim()
+    };
+    let output = sidecar
+        .args([
+            "--model-layout-json",
+            model_id.trim(),
+            quant_arg,
+            gguf_path.trim(),
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("failed to inspect model layout: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "worker exited with {}: {}",
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('{'))
+        .ok_or_else(|| format!("no JSON in model layout output: {stdout}"))?;
+    serde_json::from_str::<Value>(line).map_err(|e| format!("bad model layout JSON: {e}"))
+}
+
 /// One-shot chat against the cluster's own HTTP API (the dashboard's "try it"
 /// box). Lives in Rust because the engine speaks plain LAN HTTP without CORS
 /// headers — the webview cannot fetch it directly. std-only HTTP/1.1 client:
@@ -1054,6 +1103,7 @@ fn main() {
             probe_resources,
             cpu_name,
             advise_capability,
+            inspect_model_layout,
             api_chat,
             api_chat_stream,
             api_stats,

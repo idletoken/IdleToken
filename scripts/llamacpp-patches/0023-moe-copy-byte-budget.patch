@@ -1,0 +1,136 @@
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -12,6 +12,7 @@
+ #include "ggml-backend-impl.h"
+ #include "ggml-alloc.h"
+ #include "ggml-impl.h"
++#include "ggml-moe-copy-budget.h"
+ 
+ #include <assert.h>
+ #include <limits.h>
+@@ -1038,6 +1039,7 @@
+     const float * score_read_ptr = nullptr;
+     int pregate_extra = 0;   // GGML_MOE_PREGATE_EXTRA: experts to prefetch beyond the top-k
+     int pregate_horizon = 1; // GGML_MOE_PREGATE_HORIZON: predict this many layers ahead
++    size_t pregate_copy_bytes = SIZE_MAX; // optional measured per-issue diagnostic ceiling
+     int pregate_prepared_layer = -1;
+     int pregate_prepared_count = 0;
+     bool pregate_no_prefetch = false; // measure the predictor without changing cache contents or issuing H2D
+@@ -1242,6 +1244,12 @@
+     st->pregate_extra = extra ? std::max(0, atoi(extra)) : 0;
+     const char * horizon = getenv("GGML_MOE_PREGATE_HORIZON");
+     st->pregate_horizon = horizon ? std::max(1, atoi(horizon)) : 1;
++    const char * copy_bytes = getenv("GGML_MOE_PREGATE_COPY_BYTES");
++    if (copy_bytes) {
++        st->pregate_copy_bytes = (size_t) sched_moe_parse_bytes(copy_bytes);
++        if (st->pregate_copy_bytes == 0) GGML_ABORT("GGML_MOE_PREGATE_COPY_BYTES must be positive");
++        fprintf(stderr, "moe-copy-budget: per-issue=%zu bytes, rank-all, tensor-granularity\n", st->pregate_copy_bytes);
++    }
+     const char * no_prefetch = getenv("GGML_MOE_PREGATE_NOPREFETCH");
+     st->pregate_no_prefetch = no_prefetch && atoi(no_prefetch) > 0;
+     const char * stats = getenv("GGML_MOE_PREGATE_STATS");
+@@ -1697,7 +1705,8 @@
+         return false;
+     }
+     const int64_t n = pg->ne[0];
+-    const int64_t m = std::min<int64_t>(n, (int64_t) k + st.pregate_extra);
++    const int64_t m = st.pregate_copy_bytes != SIZE_MAX ? n
++        : std::min<int64_t>(n, (int64_t) k + st.pregate_extra);
+     if (m <= 0) {
+         return false;
+     }
+@@ -1789,6 +1798,20 @@
+         st.pregate_prepared_count = 0;
+         return;
+     }
++
++    // Prefer early-consumed gate/up weights within each prediction rank.
++    // Sorting also makes byte-budget A/B independent of unordered_map order.
++    const auto priority = [](const sched_moe_pool * p) {
++        const char * name = p->weight->name;
++        if (strstr(name, ".ffn_gate_exps") || strstr(name, ".ffn_gate_up_exps")) return 0;
++        if (strstr(name, ".ffn_up_exps")) return 1;
++        if (strstr(name, ".ffn_down_exps")) return 2;
++        return 3;
++    };
++    std::sort(target.begin(), target.end(), [&](const sched_moe_pool * a, const sched_moe_pool * b) {
++        const int pa = priority(a), pb = priority(b);
++        return pa != pb ? pa < pb : strcmp(a->weight->name, b->weight->name) < 0;
++    });
+ 
+     ggml_backend_t pf = st.prefetch_backend[backend_id];
+     if (pf == nullptr) {
+@@ -1824,14 +1847,24 @@
+         return;
+     }
+ 
++    std::vector<size_t> candidate_bytes((size_t) rolling_count * target.size(), 0);
++    for (int64_t i = 0; i < rolling_count; i++) {
++        for (size_t part = 0; part < target.size(); part++) {
++            const auto * p = target[part];
++            const int32_t e = st.pred[i];
++            if (e >= 0 && e < p->weight->ne[2] && !p->where.count(e)) {
++                candidate_bytes[(size_t) i * target.size() + part] = p->expert_size;
++            }
++        }
++    }
++    const auto selected = ggml_moe_copy_budget_pick(candidate_bytes, st.pregate_copy_bytes);
++
+     auto * timing = sched_moe_timing_copy_begin(sched, layer, target_layer, pf);
+     const auto submit_begin = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+     if (st.pregate_no_prefetch) {
+         if (timing) {
+-            for (const auto * p : target) {
+-                for (int64_t i = 0; i < rolling_count; i++) {
+-                    if (!p->where.count(st.pred[i])) timing->planned_bytes += p->expert_size;
+-                }
++            for (size_t i = 0; i < selected.size(); i++) {
++                if (selected[i]) timing->planned_bytes += candidate_bytes[i];
+             }
+             ggml_backend_event_record(timing->done, pf);
+             timing->done_set = true;
+@@ -1847,7 +1880,8 @@
+     rolling.segments.clear();
+     rolling.segments.reserve(target.size());
+     size_t off = 0;
+-    for (sched_moe_pool * p : target) {
++    for (size_t part = 0; part < target.size(); part++) {
++        sched_moe_pool * p = target[part];
+         off = align_up(off);
+         rolling.segments.emplace_back();
+         sched_moe_rolling_segment & seg = rolling.segments.back();
+@@ -1867,7 +1901,7 @@
+         int issued = 0;
+         for (int64_t i = 0; i < rolling_count; i++) {
+             const int32_t e = st.pred[i];
+-            if (e < 0 || e >= (int32_t) p->weight->ne[2] || p->where.count(e)) {
++            if (!selected[(size_t) i * target.size() + part]) {
+                 continue;
+             }
+             seg.where[e] = (int) i;
+--- /dev/null
++++ b/ggml/src/ggml-moe-copy-budget.h
+@@ -0,0 +1,23 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++// Candidates are already in prediction-rank / consumption order. Zero means
++// resident (no transfer). Each weight tensor is an independent repair unit:
++// a partial expert prediction can still save that tensor's exact H2D copy.
++// This only admits work under a measured byte ceiling; it estimates neither
++// bandwidth nor a latency window, and does not change cache residency.
++static inline std::vector<uint8_t> ggml_moe_copy_budget_pick(
++        const std::vector<size_t> & bytes, size_t limit) {
++    std::vector<uint8_t> selected(bytes.size(), 0);
++    size_t remaining = limit;
++    for (size_t i = 0; i < bytes.size(); i++) {
++        if (bytes[i] != 0 && bytes[i] <= remaining) {
++            selected[i] = 1;
++            remaining -= bytes[i];
++        }
++    }
++    return selected;
++}

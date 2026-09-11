@@ -210,20 +210,37 @@ typedef enum {
      *               ct[IDLETOKEN_SESSION_KEY_BYTES],
      *               tag[IDLETOKEN_PAIR_TAG_BYTES]
      *   RPC_READY:  str endpoint ("lan_ip:port" the rpc-server listens on)
-     *   RPC_CACHE_PLAN: u8 version(=1), u8 reserved, u16 layer_lo,
-     *                   u16 layer_hi, u16 reserved, str weight_repo_url
-     *   RPC_CACHE_PROGRESS: u64 downloaded_bytes, u64 total_bytes
+     *   RPC_CACHE_PLAN v1: u8 version(=1), u8 moe_mode, u16 layer_lo,
+     *                      u16 layer_hi, u16 pool_experts, str weight_repo_url
+     *   RPC_CACHE_PLAN v2: the same fixed prefix, then
+     *                      u32 auto_weight_count, u64 auto_weight_hash,
+     *                      str weight_repo_url
+     *     moe_mode (2026-09-07, was reserved): the GGML_RPC_NODE_LOCAL_MOE
+     *     the worker's rpc-server must run with — 0 = off, 1 = the client
+     *     streams expert ranges (patch 0005), 2 = server-side scheduler with
+     *     an expert pool (patch 0006). pool_experts (was reserved): per-tensor
+     *     GPU expert-pool slots for that pool, 0 = no explicit pool.
+     *     auto_weight_count/hash identify the complete GGUF-derived set of
+     *     host-resident expert weights on that node (hash = wrapping sum of
+     *     each full tensor name's 64-bit FNV-1a). Count zero means adaptive
+     *     caching is off. The engine must reproduce both values from the real
+     *     graph before using post-load free VRAM; it sizes slots from runtime
+     *     tensor strides, not padded GGUF file spans.
+     *     New workers still accept v1 as an explicit non-adaptive plan; normal
+     *     cluster admission rejects mixed engine versions before this message.
+     *   RPC_CACHE_PROGRESS: u64 checked_bytes, u64 total_bytes (legacy workers
+     *                       may report copied/downloaded bytes)
      *   RPC_CACHE_READY: u8 ok, u8 reserved[3], u16 layer_lo, u16 layer_hi,
-     *                    u64 cached_bytes, u32 tensor_count, str detail
+     *                    u64 assigned_bytes, u32 tensor_count, str detail
      *
-     * The cache plan is sent only after RPC_READY. The worker downloads the
-     * assigned layer tensors directly into ggml-RPC's content-addressed cache;
-     * the coordinator does not start llama-server until every worker replies
-     * RPC_CACHE_READY(ok=1). */
+     * RPC_CACHE_PLAN is sent before RPC_READY. The worker validates the small
+     * coordinator index against its complete local GGUF, sets the exact layer
+     * and MoE environment, then starts rpc-server once. The coordinator waits
+     * for both RPC_CACHE_READY(ok=1) and RPC_READY before llama-server starts. */
     IDLETOKEN_MSG_RPC_ASSIGN         = 0x0023,  /* coord -> worker: wrapped RPC TLS PSK */
     IDLETOKEN_MSG_RPC_READY          = 0x0024,  /* worker -> coord: rpc-server is listening */
     IDLETOKEN_MSG_RPC_CACHE_PLAN     = 0x0025,  /* coord -> worker: layer range + weight repo */
-    IDLETOKEN_MSG_RPC_CACHE_READY    = 0x0026,  /* worker -> coord: local tensor cache seeded */
+    IDLETOKEN_MSG_RPC_CACHE_READY    = 0x0026,  /* worker -> coord: local GGUF range validated */
     IDLETOKEN_MSG_RPC_CACHE_PROGRESS = 0x0027,  /* worker -> coord: cache download progress */
 
     /* --- inference -----------------------------------------------------

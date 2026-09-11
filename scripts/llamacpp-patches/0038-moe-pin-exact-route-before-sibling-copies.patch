@@ -1,0 +1,50 @@
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -12,6 +12,7 @@
+ #include "ggml-backend-impl.h"
+ #include "ggml-alloc.h"
+ #include "ggml-impl.h"
++#include "ggml-moe-cache-pin.h"
+ #include "ggml-moe-copy-budget.h"
+ #include "ggml-moe-schedule.h"
+ #include "ggml-timeline.h"
+@@ -2472,10 +2473,12 @@
+         if (q->ev == nullptr) {
+             q->ev = ggml_backend_event_new(ggml_backend_get_device(pf));
+         }
++        const uint64_t next_tick = q->tick + 1;
++        ggml_moe_cache::pin_selected(q->slot_expert, q->slot_pin, next_tick,
++            [&](int32_t e) { return e < n_expert_total && ggml_bitset_get(used_ids.data(), e); });
+         sched_moe_rolling_promote(sched, q, used_ids, n_expert_total);
+         // the coming serve of this pool will be tick+1: mark the slots as used
+         // AND pinned for it, so it treats them as hits and never evicts them
+-        const uint64_t next_tick = q->tick + 1;
+         auto * copy_sample = sched_moe_schedule_begin(sched, q->backend_id, pf, q);
+         int issued = 0;
+         for (int64_t e = 0; e < n_expert_total; e++) {
+--- /dev/null
++++ b/ggml/src/ggml-moe-cache-pin.h
+@@ -0,0 +1,23 @@
++#pragma once
++
++#include <cassert>
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++namespace ggml_moe_cache {
++
++// Protect the whole exact route BEFORE any replacement. Pinning hits while
++// visiting expert IDs lets an earlier miss evict a later, already-resident
++// selected expert, then unnecessarily uploads that expert again.
++template<class Selected>
++inline void pin_selected(const std::vector<int32_t> & experts,
++                         std::vector<uint64_t> & pins, uint64_t tick,
++                         const Selected & selected) {
++    assert(experts.size() == pins.size());
++    for (std::size_t slot = 0; slot < experts.size(); ++slot) {
++        if (experts[slot] >= 0 && selected(experts[slot])) pins[slot] = tick;
++    }
++}
++
++} // namespace ggml_moe_cache

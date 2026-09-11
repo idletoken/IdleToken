@@ -1,0 +1,118 @@
+diff --git a/ggml/src/ggml-moe-schedule-runtime.h b/ggml/src/ggml-moe-schedule-runtime.h
+index b691639..9ac30e6 100644
+--- a/ggml/src/ggml-moe-schedule-runtime.h
++++ b/ggml/src/ggml-moe-schedule-runtime.h
+@@ -92,6 +92,7 @@ static void sched_moe_schedule_learn(ggml_backend_sched_t sched) {
+ static void sched_moe_schedule_apply(ggml_backend_sched_t sched) {
+     auto & st = *sched->moe;
+     if (!st.schedule || !st.schedule_replan || st.pools.size() != st.weights.size()) return;
++    ggml_timeline::scope trace("moe.schedule_replan");
+     st.schedule_replan = false;
+     for (int b = 0; b < sched->n_backends; ++b) {
+         auto & d = st.devices[b];
+@@ -141,13 +142,16 @@ static void sched_moe_schedule_apply(ggml_backend_sched_t sched) {
+             GGML_LOG_WARN("moe-schedule: device=%d no safe repartition (%s, budget=%zu); no new allocation\n", b, plan.reason, budget);
+             continue;
+         }
+-        bool changed = plan.bank_bytes != d.bank_bytes;
++        const bool staging_changed = plan.staging_bytes != ggml_backend_buffer_get_size(d.staging);
++        std::vector<std::pair<sched_moe_pool *, size_t>> resized;
+         size_t li = 0;
+-        for (const auto * p : pools) {
++        for (auto * p : pools) {
+             while (geometry[li].id != p->layer) ++li;
+-            changed = changed || (size_t) p->cap != plan.layers[li].resident;
++            if ((size_t) p->cap != plan.layers[li].resident) resized.push_back({p, plan.layers[li].resident});
+         }
++        const bool changed = plan.bank_bytes != d.bank_bytes || staging_changed || !resized.empty();
+         if (changed) {
++            ggml_timeline::scope repartition("moe.schedule_repartition", "", resized.size(), pools.size());
+             // Pool tensors are stable objects outside gallocr. Do not re-split or invalidate caller inputs.
+             ggml_backend_synchronize(sched->backends[b]);
+             if (st.prefetch_backend[b]) ggml_backend_synchronize(st.prefetch_backend[b]);
+@@ -159,23 +163,29 @@ static void sched_moe_schedule_apply(ggml_backend_sched_t sched) {
+                     GGML_ASSERT(r.lifetime.release(r.lifetime.generation, true));
+                 }
+             }
+-            // Release old allocations first: old + new pools must not coexist above the VRAM budget.
+-            for (auto * p : pools) {
++            // A small capacity change must not discard every layer's hot set.
++            // Release all changed allocations first; unchanged buffers and all
++            // their residency/pin metadata retain their identity and contents.
++            for (const auto & entry : resized) {
++                auto * p = entry.first;
+                 ggml_backend_buffer_free(p->buf);
+                 p->buf = nullptr;
+                 p->pool.buffer = nullptr;
+                 p->pool.data = nullptr;
+-                p->staging.buffer = nullptr;
+-                p->staging.data = nullptr;
+             }
+-            ggml_backend_buffer_free(d.staging);
+-            d.staging = ggml_backend_buft_alloc_buffer(sched->bufts[b], plan.staging_bytes);
+-            if (!d.staging) GGML_ABORT("moe-schedule: device %d cannot allocate %zu staging bytes", b, plan.staging_bytes);
+-            ggml_backend_buffer_clear(d.staging, 0);
+-            li = 0;
+-            for (auto * p : pools) {
+-                while (geometry[li].id != p->layer) ++li;
+-                p->cap = (int) plan.layers[li].resident;
++            if (staging_changed) {
++                for (auto * p : pools) {
++                    p->staging.buffer = nullptr;
++                    p->staging.data = nullptr;
++                }
++                ggml_backend_buffer_free(d.staging);
++                d.staging = ggml_backend_buft_alloc_buffer(sched->bufts[b], plan.staging_bytes);
++                if (!d.staging) GGML_ABORT("moe-schedule: device %d cannot allocate %zu staging bytes", b, plan.staging_bytes);
++                ggml_backend_buffer_clear(d.staging, 0);
++            }
++            for (const auto & entry : resized) {
++                auto * p = entry.first;
++                p->cap = (int) entry.second;
+                 const size_t bytes = (size_t) p->cap * p->expert_size + 512;
+                 p->buf = ggml_backend_buft_alloc_buffer(sched->bufts[b], bytes);
+                 if (!p->buf) GGML_ABORT("moe-schedule: device %d cannot allocate %zu bytes for %s", b, bytes, p->pool.name);
+@@ -191,18 +201,23 @@ static void sched_moe_schedule_apply(ggml_backend_sched_t sched) {
+                 p->ev_pending = false;
+             }
+             // Backend graph caches may skip pointer checks for an unchanged uid.
+-            for (int i = 0; i < sched->n_splits; ++i) {
+-                if (sched->splits[i].backend_id == b) sched->splits[i].graph.uid = ggml_graph_next_uid();
++            // Merely resizing the logical rolling banks changes no graph
++            // operand: they only feed explicit D2D promotion, never a kernel.
++            if (staging_changed || !resized.empty()) {
++                for (int i = 0; i < sched->n_splits; ++i) {
++                    if (sched->splits[i].backend_id == b) sched->splits[i].graph.uid = ggml_graph_next_uid();
++                }
+             }
+             ++st.schedule_epoch;
+         }
+         d.bank_bytes = plan.bank_bytes;
+         d.plan = std::move(plan);
+         d.geometry = std::move(geometry);
+-        fprintf(stderr, "moe-schedule: device=%d epoch=%llu budget=%zu total=%zu resident=%zu staging=%zu bank=%zu changed=%d ready=%llu pending=%llu no-bank=%llu\n",
++        fprintf(stderr, "moe-schedule: device=%d epoch=%llu budget=%zu total=%zu resident=%zu staging=%zu bank=%zu changed=%d ready=%llu pending=%llu no-bank=%llu resized-pools=%zu retained-pools=%zu staging-changed=%d\n",
+                 b, (unsigned long long) st.schedule_epoch, budget, d.plan.total_bytes, d.plan.resident_bytes,
+                 d.plan.staging_bytes, d.bank_bytes, (int) changed, (unsigned long long) d.ready_hits,
+-                (unsigned long long) d.pending_hits, (unsigned long long) d.no_bank);
++                (unsigned long long) d.pending_hits, (unsigned long long) d.no_bank,
++                resized.size(), pools.size() - resized.size(), (int) staging_changed);
+         for (size_t i = 0; i < d.geometry.size(); ++i) {
+             double copy_ms = 0;
+             for (const auto & part : d.geometry[i].parts) copy_ms += part.copy_ms;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 581d6c7..4635b5d 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2021,7 +2021,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         // owner boundary that sends an extra hidden state and adds a round trip
+         // before the real layer-boundary transfer. Predict only within the same
+         // owner and actual router buffer type (including explicit placements).
+-        const bool local_prediction = (pregate || scheduled_prediction) && current_router && nl.ffn_gate_inp &&
++        // A token-indexed expert table is not selected by router logits.
++        // Predicting those logits cannot describe that target's exact routing.
++        const bool local_prediction = (pregate || scheduled_prediction) && !nl.ffn_gate_tid2eid &&
++            current_router && nl.ffn_gate_inp &&
+             current_router->buffer && nl.ffn_gate_inp->buffer &&
+             nl.ffn_gate_inp->ne[0] == cur->ne[0] &&
+             nl.ffn_gate_inp->ne[1] == n_expert &&

@@ -26,11 +26,10 @@ import {
   AVAILABLE_MODELS,
   MODEL_BRANDS,
   defaultQuant,
-  hasQuantChoice,
   quantOptions,
   shortModelLabel,
 } from "./models";
-import { fmtBytes } from "./format";
+import { fmtBytes, fmtQuant } from "./format";
 import { useDialog } from "./useDialog";
 import { loadLocalCapability, type CapabilityMode, type CapabilityRow } from "./Capability";
 import { fetchLeaderboard } from "./platform";
@@ -61,6 +60,36 @@ function fitClass(mode: CapabilityMode): string {
   if (mode === "gpu_only") return "is-fast";
   if (mode === "hybrid") return "is-slow";
   return "is-no";
+}
+
+type Pick = { modelId: string; quant: string };
+
+/** The family a model belongs to (the card it is listed under). */
+function brandIdOf(modelId: string): string {
+  return MODEL_BRANDS.find((b) => b.models.some((m) => m.id === modelId))?.id ?? "";
+}
+
+// The last APPLIED pick per family, kept across launches. Opening a family
+// lands on it, so coming back to "Qwen3.5" a week later starts from the size
+// you actually used rather than from the smallest one.
+const LAST_PICK_KEY = "idletoken.picker.lastByFamily";
+function loadLastPicks(): Record<string, Pick> {
+  try {
+    const raw = localStorage.getItem(LAST_PICK_KEY);
+    const v = raw ? (JSON.parse(raw) as unknown) : null;
+    return v && typeof v === "object" ? (v as Record<string, Pick>) : {};
+  } catch {
+    return {};
+  }
+}
+function saveLastPick(pick: Pick): void {
+  const brand = brandIdOf(pick.modelId);
+  if (!brand) return;
+  try {
+    localStorage.setItem(LAST_PICK_KEY, JSON.stringify({ ...loadLastPicks(), [brand]: pick }));
+  } catch {
+    /* storage unavailable — the pick still applies, only the memory of it is lost */
+  }
 }
 
 export default function ModelPicker(props: {
@@ -144,6 +173,14 @@ export default function ModelPicker(props: {
     ? { modelId: run.modelId, quant: run.quant }
     : { modelId: props.modelId, quant: props.quant || defaultQuant(props.modelId) };
 
+  /** The one place a pick leaves the picker: remember it for its family, hand
+   *  it to the caller, close. */
+  const commit = (pick: Pick) => {
+    saveLastPick(pick);
+    props.onPick(pick.modelId, pick.quant);
+    props.onClose();
+  };
+
   const choose = (modelId: string, quant: string) => {
     const sameAsSetting = modelId === props.modelId && quant === (props.quant || defaultQuant(props.modelId));
     // Picking what is ALREADY RUNNING never restarts anything, even when the
@@ -158,8 +195,7 @@ export default function ModelPicker(props: {
       return;
     }
     if (!run || sameAsRunning) {
-      props.onPick(modelId, quant);
-      props.onClose();
+      commit({ modelId, quant });
       return;
     }
     setPending({ modelId, quant });
@@ -167,8 +203,7 @@ export default function ModelPicker(props: {
 
   const confirm = () => {
     if (!pending) return;
-    props.onPick(pending.modelId, pending.quant);
-    props.onClose();
+    commit(pending);
   };
 
   const curQuant = cur.quant || defaultQuant(cur.modelId);
@@ -185,10 +220,21 @@ export default function ModelPicker(props: {
   // with a cluster running, the restart confirmation popped before the user
   // could even reach the precision dropdown. Now the row and the dropdown
   // only edit this draft; the Apply button is the one thing that acts.
-  const [sel, setSel] = useState({ modelId: cur.modelId, quant: curQuant });
+  const [sel, setSel] = useState<Pick>({ modelId: cur.modelId, quant: curQuant });
   const initialBrand = MODEL_BRANDS.find((b) => b.models.some((m) => m.id === cur.modelId));
   const [brandId, setBrandId] = useState(initialBrand?.id ?? MODEL_BRANDS[0]?.id ?? "");
   const [level, setLevel] = useState<"families" | "models">("families");
+  // Drafts per family for THIS opening of the picker: pick 27B under Qwen3.5,
+  // look at GLM, come back — 27B is still the draft.
+  const [drafts, setDrafts] = useState<Record<string, Pick>>({});
+  const [lastPicks] = useState(loadLastPicks);
+  const pickDraft = (pick: Pick) => {
+    setSel(pick);
+    const brand = brandIdOf(pick.modelId);
+    if (brand) setDrafts((d) => ({ ...d, [brand]: pick }));
+  };
+  const quantValid = (modelId: string, quant: string) =>
+    quantOptions(modelId).some((v) => v.quant === quant);
 
   // Usage rank (or manifest order) is the base sequence; runnable models then
   // come first. "Unknown" sits between runnable and won't-run so a row does
@@ -205,9 +251,37 @@ export default function ModelPicker(props: {
   // Array.prototype.sort is stable: equal ranks keep the usage/manifest order.
   const ordered = [...ranked].sort((a, b) => runRank(a) - runRank(b));
   const activeBrand = MODEL_BRANDS.find((b) => b.id === brandId) ?? MODEL_BRANDS[0];
-  const familyModels = activeBrand
-    ? ordered.filter((m) => activeBrand.models.some((candidate) => candidate.id === m.id))
-    : [];
+  const modelsOf = (brand: (typeof MODEL_BRANDS)[number]) =>
+    ordered.filter((m) => brand.models.some((candidate) => candidate.id === m.id));
+  const familyModels = activeBrand ? modelsOf(activeBrand) : [];
+  const selectedQuantOptions = quantOptions(sel.modelId);
+
+  // Opening a family always lands the draft INSIDE it (2026-09-07, owner's
+  // call). Before, the draft stayed on the current model — 0.8B under Qwen3.5
+  // — while you were looking at another family, so the precision dropdown
+  // belonged to a row that was not even on screen, and people read the list
+  // as if the size they were looking at were the chosen one. In order: the
+  // draft if it is already here, this opening's draft for the family, the
+  // current model, the last pick applied under this family, the first row.
+  const enterFamily = (brand: (typeof MODEL_BRANDS)[number]) => {
+    const models = modelsOf(brand);
+    const here = (id: string) => models.some((m) => m.id === id);
+    let next: Pick | null = null;
+    const draft = drafts[brand.id];
+    const last = lastPicks[brand.id];
+    if (here(sel.modelId)) next = sel;
+    else if (draft && here(draft.modelId)) next = draft;
+    else if (here(cur.modelId)) next = { modelId: cur.modelId, quant: curQuant };
+    else if (last && here(last.modelId)) {
+      next = {
+        modelId: last.modelId,
+        quant: quantValid(last.modelId, last.quant) ? last.quant : defaultQuant(last.modelId),
+      };
+    } else if (models[0]) next = { modelId: models[0].id, quant: defaultQuant(models[0].id) };
+    if (next) pickDraft(next);
+    setBrandId(brand.id);
+    setLevel("models");
+  };
 
   return (
     <div className="modelpick" ref={ref} role="dialog" aria-label={t("model.pick.title")}>
@@ -253,21 +327,27 @@ export default function ModelPicker(props: {
           </div>
           <div className="modelpick__list">
             {level === "families" ? MODEL_BRANDS.map((brand) => {
-              const selected = brand.models.find((m) => m.id === sel.modelId);
+              // The family row names the CURRENT model, not the draft: since
+              // opening a family moves the draft into it, following the draft
+              // here would make merely browsing GLM relabel the GLM row.
+              const selected = brand.models.find((m) => m.id === cur.modelId);
               return (
                 <button
                   type="button"
                   key={brand.id}
                   className={`modelpick__item modelpick__family${selected ? " is-on" : ""}`}
-                  onClick={() => {
-                    setBrandId(brand.id);
-                    setLevel("models");
-                  }}
+                  onClick={() => enterFamily(brand)}
                 >
                   <span className="modelpick__name">{brand.label}</span>
                   <span className="modelpick__family-meta">
+                    {/* Every family row says how many models it holds; the one
+                        holding the current pick adds which (2026-09-06: showing
+                        only the pick made that row look like it had one model). */}
                     {selected
-                      ? shortModelLabel(selected.label, brand.label)
+                      ? t("model.pick.familyCurrent", {
+                          n: brand.models.length,
+                          model: shortModelLabel(selected.label, brand.label),
+                        })
                       : t("model.pick.modelCount", { n: brand.models.length })}
                   </span>
                   <span className="modelpick__chevron" aria-hidden="true">›</span>
@@ -280,7 +360,8 @@ export default function ModelPicker(props: {
                   type="button"
                   key={m.id}
                   className={`modelpick__item${m.id === sel.modelId ? " is-on" : ""}`}
-                  onClick={() => setSel({ modelId: m.id, quant: defaultQuant(m.id) })}
+                  aria-pressed={m.id === sel.modelId}
+                  onClick={() => pickDraft({ modelId: m.id, quant: defaultQuant(m.id) })}
                 >
                   <span className="modelpick__name">
                     {activeBrand ? shortModelLabel(m.label, activeBrand.label) : m.label}
@@ -304,17 +385,17 @@ export default function ModelPicker(props: {
           </div>
           {/* Precision belongs to the selected model, so it stays a separate row
               rather than multiplying the list by five. */}
-          {level === "models" && hasQuantChoice(sel.modelId) ? (
+          {level === "models" && selectedQuantOptions.length > 0 ? (
             <div className="modelpick__quant">
               <span className="modelpick__quant-label">{t("settings.precision")}</span>
               <select
                 className="select"
                 value={sel.quant || defaultQuant(sel.modelId)}
-                onChange={(e) => setSel((p) => ({ ...p, quant: e.target.value }))}
+                onChange={(e) => pickDraft({ modelId: sel.modelId, quant: e.target.value })}
               >
-                {quantOptions(sel.modelId).map((v) => (
+                {selectedQuantOptions.map((v) => (
                   <option key={v.quant} value={v.quant}>
-                    {v.quant} · {fmtBytes(v.layer_weight_bytes + v.shared_weight_bytes)}
+                    {fmtQuant(v.quant)} · {fmtBytes(v.layer_weight_bytes + v.shared_weight_bytes)}
                   </option>
                 ))}
               </select>

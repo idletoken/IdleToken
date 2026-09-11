@@ -1,0 +1,222 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 4f83627..f3ad61f 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -989,6 +989,9 @@ struct sched_moe_state {
+     std::vector<int32_t> pred;
+     std::vector<float> scores;
+     int pregate_extra = 0;   // GGML_MOE_PREGATE_EXTRA: experts to prefetch beyond the top-k
++    int pregate_horizon = 1; // GGML_MOE_PREGATE_HORIZON: predict this many layers ahead
++    int pregate_prepared_layer = -1;
++    int pregate_prepared_count = 0;
+     // GGML_MOE_LAYER_ISSUE=1: when a layer's router ids are read back at its
+     // first expert tensor (gate), issue the misses of its OTHER expert tensors
+     // (up, down) right away on the prefetch stream, so those copies overlap
+@@ -1172,6 +1175,8 @@ static struct sched_moe_state * sched_moe_state_new_with(int cap, uint64_t bytes
+     st->debug = getenv("GGML_MOE_POOL_DEBUG") != nullptr;
+     const char * extra = getenv("GGML_MOE_PREGATE_EXTRA");
+     st->pregate_extra = extra ? std::max(0, atoi(extra)) : 0;
++    const char * horizon = getenv("GGML_MOE_PREGATE_HORIZON");
++    st->pregate_horizon = horizon ? std::max(1, atoi(horizon)) : 1;
+     // on by default since 2026-09-07 (+6–7 % decode on paired Windows test nodes, +13 % on
+     // DGX, byte-identical); GGML_MOE_LAYER_ISSUE=0 switches it off
+     const char * li = getenv("GGML_MOE_LAYER_ISSUE");
+@@ -1385,6 +1390,8 @@ static struct ggml_tensor * sched_moe_staging(ggml_backend_sched_t sched, sched_
+ static void sched_moe_scan_pregate(ggml_backend_sched_t sched) {
+     sched->moe->graph_seq++;   // a new graph: every pool's served_seq is now stale
+     sched->moe->pregate.clear();
++    sched->moe->pregate_prepared_layer = -1;
++    sched->moe->pregate_prepared_count = 0;
+     for (int i = 0; i < sched->graph.n_nodes; i++) {
+         const struct ggml_tensor * t = sched->graph.nodes[i];
+         if (strncmp(t->name, "ffn_moe_pregate-", 16) == 0) {
+@@ -1407,40 +1414,61 @@ static void sched_moe_scan_pregate(ggml_backend_sched_t sched) {
+     }
+ }
+ 
+-// Layer `layer` has just had its router read back (a synchronization point
+-// the scheduler pays anyway). If the graph carries this layer's pre-gate
+-// prediction, move the predicted experts of layer+1 into that layer's pools on
+-// the prefetch backend, so they arrive while this layer computes. Only for
+-// single-token batches: a prefill batch predicts nearly everything.
+-static void sched_moe_prefetch_next(ggml_backend_sched_t sched, int layer, ggml_backend_t split_backend, int k) {
++// Queue the 1 KiB pre-gate readback on the SAME backend stream as the exact
++// router-id readback. The caller synchronizes that stream once for both. The
++// former implementation entered here after the current gate misses had been
++// queued, then synchronized the whole compute stream a second time per layer;
++// that serialized the copy pipeline it was meant to create.
++static bool sched_moe_prefetch_prepare(ggml_backend_sched_t sched, int layer,
++                                       ggml_backend_t ids_backend, int k) {
+     auto & st = *sched->moe;
++    st.pregate_prepared_layer = -1;
++    st.pregate_prepared_count = 0;
+     if (layer < 0 || st.pregate.empty()) {
+-        return;
++        return false;
+     }
+     // diagnostic: GGML_MOE_PREGATE_NOPREFETCH=1 keeps the graph's pre-gate
+     // nodes but never acts on them, to tell a wrong prediction path from a
+     // graph that computes something different
+     static const bool noprefetch = [] { const char * e = getenv("GGML_MOE_PREGATE_NOPREFETCH"); return e && atoi(e) > 0; }();
+     if (noprefetch) {
+-        return;
++        return false;
+     }
+     auto pg_it = st.pregate.find(layer);
+     if (pg_it == st.pregate.end()) {
+-        return;
++        return false;
+     }
+-    const struct ggml_tensor * pg = pg_it->second;
++    struct ggml_tensor * pg = pg_it->second;
+     if (pg->data == nullptr || pg->type != GGML_TYPE_F32 || pg->ne[1] != 1) {
+-        return;
++        return false;
++    }
++    // Do not add a second device/LAN synchronization at a pipeline boundary.
++    // A prediction is optional; exact ids still repair every skipped layer.
++    if (ggml_backend_sched_get_tensor_backend(sched, pg) != ids_backend) {
++        return false;
+     }
+-    // rank the next layer's n_expert scores on the host (partial sort of ~256 floats)
+     const int64_t n = pg->ne[0];
+     const int64_t m = std::min<int64_t>(n, (int64_t) k + st.pregate_extra);
+     if (m <= 0) {
+-        return;
++        return false;
+     }
+     st.scores.resize((size_t) n);
+-    ggml_backend_synchronize(split_backend);
+-    ggml_backend_tensor_get(pg, st.scores.data(), 0, (size_t) n * sizeof(float));
++    ggml_backend_tensor_get_async(ids_backend, pg, st.scores.data(), 0, (size_t) n * sizeof(float));
++    st.pregate_prepared_layer = layer;
++    st.pregate_prepared_count = (int) m;
++    return true;
++}
++
++// Called after the shared ids/scores synchronization. Rank on the host, then
++// issue target-layer copies only after this layer's exact gate and sibling
++// misses have been queued, preserving useful work ahead of speculation.
++static void sched_moe_prefetch_issue(ggml_backend_sched_t sched, int layer) {
++    auto & st = *sched->moe;
++    if (st.pregate_prepared_layer != layer || st.pregate_prepared_count <= 0) {
++        return;
++    }
++    const int64_t n = (int64_t) st.scores.size();
++    const int64_t m = std::min<int64_t>(n, st.pregate_prepared_count);
+     st.pred.resize((size_t) n);
+     for (int64_t i = 0; i < n; i++) {
+         st.pred[i] = (int32_t) i;
+@@ -1450,7 +1478,7 @@ static void sched_moe_prefetch_next(ggml_backend_sched_t sched, int layer, ggml_
+ 
+     for (auto & kv : st.pools) {
+         sched_moe_pool * p = kv.second.get();
+-        if (p == nullptr || p->layer != layer + 1 || p->backend_id < 0) {
++        if (p == nullptr || p->layer != layer + st.pregate_horizon || p->backend_id < 0) {
+             continue;
+         }
+         ggml_backend_t pf = st.prefetch_backend[p->backend_id];
+@@ -1508,6 +1536,8 @@ static void sched_moe_prefetch_next(ggml_backend_sched_t sched, int layer, ggml_
+             p->prefetched += issued;
+         }
+     }
++    st.pregate_prepared_layer = -1;
++    st.pregate_prepared_count = 0;
+ }
+ 
+ // Layer-level early issue (GGML_MOE_LAYER_ISSUE=1). The three expert tensors
+@@ -3167,10 +3197,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         }
+                     }
+ 
++                    bool ids_just_read = false;
+                     if (ids_tensor != prev_ids_tensor) {
+                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
+                         SCHED_PROF_T(t_ids);
+                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
++                        const int moe_layer = sched_moe_layer_of(input->name);
++                        const bool pregate_prepared = sched->moe && ids_tensor->ne[1] == 1 &&
++                            sched_moe_prefetch_prepare(sched, moe_layer, ids_backend, (int) ids_tensor->ne[0]);
+                         ggml_backend_synchronize(ids_backend);
+                         SCHED_PROF_ADD(w_ids, t_ids);
+                         if (pr) {
+@@ -3192,22 +3226,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         }
+ 
+                         prev_ids_tensor = ids_tensor;
++                        ids_just_read = true;
++                        if (!pregate_prepared && sched->moe) {
++                            sched->moe->pregate_prepared_layer = -1;
++                            sched->moe->pregate_prepared_count = 0;
++                        }
+                     }
+ 
+                     if (sched->moe && !node_local_rpc_moe && sched->n_copies == 1) {
+-                        const bool fresh_ids = prev_ids_tensor == ids_tensor && ids_tensor != nullptr;
+                         if (sched_moe_pool_serve(sched, split, input, input_cpy, ids_tensor, ids, used_ids,
+                                                 n_expert, expert_size, split_backend, split_backend_id)) {
+                             if (pr) {
+                                 pr->n_pool++;
+                             }
+-                            // first split of this layer (its ids were just read back): issue this
+-                            // layer's other expert tensors (exact ids) and then the next layer's
+-                            // predicted experts on the prefetch stream now
+-                            if (fresh_ids && ids_tensor->ne[1] == 1 && input_id == 0) {
++                            // Only the first split of a layer has just read ids. The former
++                            // `prev_ids_tensor == ids_tensor` test stayed true for gate/up/down
++                            // and ran the prediction path three times per layer.
++                            if (ids_just_read && ids_tensor->ne[1] == 1 && input_id == 0) {
+                                 sched_moe_issue_layer_siblings(sched, input, used_ids, n_expert);
+-                                sched_moe_prefetch_next(sched, sched_moe_layer_of(input->name), split_backend,
+-                                                        (int) ids_tensor->ne[0]);
++                                sched_moe_prefetch_issue(sched, sched_moe_layer_of(input->name));
+                             }
+                             continue; // served from the expert pool: no staging copy for this input
+                         }
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 9b148bf..d243ab9 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1984,19 +1984,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     }
+     cb(probs, "ffn_moe_probs", il);
+ 
+-    // pre-gate (GGML_MOE_PREGATE=1): predict the NEXT MoE layer's experts by
+-    // applying its router to THIS layer's router input. Hidden states change
+-    // little between adjacent layers, so the prediction is good enough for the
+-    // scheduler's expert pool to start moving those experts to the GPU while
+-    // this layer computes. The node has no consumer in the model; it steers
+-    // prefetch only and never changes what is computed. GGML_MOE_PREGATE_EXTRA
+-    // (default 0) asks for that many experts beyond the top-k.
+-    if (probs_in == nullptr && model != nullptr && il >= 0 && il + 1 < (int) model->layers.size()) {
++    // pre-gate (GGML_MOE_PREGATE=1): apply a future layer's router to THIS
++    // layer's router input. GGML_MOE_PREGATE_HORIZON (default 1) controls how
++    // many layers of copy latency the pipeline can hide; exact target-layer ids
++    // still repair every wrong prediction. The node has no model consumer and
++    // never changes the result. GGML_MOE_PREGATE_EXTRA asks for more than top-k.
++    static const int pregate_horizon = [] {
++        const char * e = getenv("GGML_MOE_PREGATE_HORIZON");
++        return e ? std::max(1, atoi(e)) : 1;
++    }();
++    if (probs_in == nullptr && model != nullptr && il >= 0 &&
++        il + pregate_horizon < (int) model->layers.size()) {
+         static const int pregate = [] {
+             const char * e = getenv("GGML_MOE_PREGATE");
+             return e && atoi(e) > 0 ? 1 : 0;
+         }();
+-        const auto & nl = model->layers[il + 1];
++        const auto & nl = model->layers[il + pregate_horizon];
+         if (pregate && nl.ffn_gate_inp != nullptr) {
+             ggml_tensor * pg = build_lora_mm(nl.ffn_gate_inp, cur);
+             if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
+@@ -2023,8 +2026,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             static bool reported = false;
+             if (!reported && getenv("GGML_MOE_POOL_DEBUG")) {
+                 reported = true;
+-                fprintf(stderr, "moe-pool: pre-gate node %s built (%lld expert scores)\n",
+-                    pp->name, (long long) n_expert);
++                fprintf(stderr, "moe-pool: pre-gate node %s built (%lld expert scores, horizon %d)\n",
++                    pp->name, (long long) n_expert, pregate_horizon);
+             }
+         }
+     }

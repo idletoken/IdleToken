@@ -1,0 +1,59 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 59535b6..d3eff58 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1040,7 +1040,7 @@ struct sched_moe_timing {
+     size_t sample_count = 0;
+     int source[GGML_SCHED_MAX_BACKENDS] = {};
+     uint64_t clean_samples = 0;
+-    bool successful = false;
++    bool successful = false, instrumented = false;
+ };
+ 
+ struct sched_moe_readback {
+@@ -1688,7 +1688,7 @@ static sched_moe_timing_record * sched_moe_timing_copy_begin(ggml_backend_sched_
+ }
+ 
+ // Refresh the map of pre-gate nodes for the graph about to be computed.
+-static void sched_moe_scan_pregate(ggml_backend_sched_t sched) {
++static void sched_moe_scan_pregate(ggml_backend_sched_t sched, bool instrumented) {
+     sched_moe_timing_collect(sched);
+     sched_moe_schedule_apply(sched);
+     sched->moe->graph_seq++;   // a new graph: every pool's served_seq is now stale
+@@ -1723,6 +1723,7 @@ static void sched_moe_scan_pregate(ggml_backend_sched_t sched) {
+     if (tm.every > 0 && !tm.pending && sched->moe->graph_seq > (uint64_t) tm.warmup && sample_due) {
+         tm.active = tm.pending = true;
+         tm.successful = false;
++        tm.instrumented = instrumented;
+         tm.sample_count = 0;
+         std::fill(std::begin(tm.source), std::end(tm.source), -1);
+         if (sched->moe->schedule) {
+@@ -3967,7 +3968,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+     std::vector<int32_t> ids;
+     std::vector<ggml_bitset_t> used_ids;
+     if (sched->moe) {
+-        sched_moe_scan_pregate(sched);
++        sched_moe_scan_pregate(sched, trace.id != 0);
+     }
+     // GGML_MOE_PROFILE: pr is NULL when off, and every SCHED_PROF_* line below is then a no-op
+     struct sched_prof * pr = sched->prof;
+diff --git a/ggml/src/ggml-moe-schedule-runtime.h b/ggml/src/ggml-moe-schedule-runtime.h
+index 9ac30e6..4e0b231 100644
+--- a/ggml/src/ggml-moe-schedule-runtime.h
++++ b/ggml/src/ggml-moe-schedule-runtime.h
+@@ -55,6 +55,15 @@ static void sched_moe_schedule_learn(ggml_backend_sched_t sched) {
+     auto & st = *sched->moe;
+     auto & tm = st.timing;
+     if (!st.schedule || !tm.successful) return;
++    // An external timeline records many extra host/CUDA events. Do not feed
++    // its observation overhead back into the production copy/window model.
++    // Keep executing no-prediction controls and collecting their events, but
++    // learn again only from uninstrumented graphs after capture is disabled.
++    if (tm.instrumented) {
++        fprintf(stderr, "moe-schedule: ignored externally instrumented calibration graph=%llu\n",
++                (unsigned long long) tm.graph);
++        return;
++    }
+     // Active samples are always no-prediction-copy controls. Never turn a miss stall into credit.
+     for (size_t i = 0; i < tm.sample_count; ++i) {
+         const auto & s = tm.samples[i];

@@ -839,6 +839,20 @@ void idletoken_resource_print_json(const idletoken_resource_report *r) {
            (unsigned long long)r->ram_total,
            (unsigned long long)r->ram_used_other,
            (unsigned long long)r->ram_usable);
+    /* This is deliberately separate from ram_usable. Ordinary allocations may
+     * use the latter, while Windows CUDA host buffers hit WDDM's per-process
+     * NON-LOCAL budget first. The client uses this field only for MoE expert
+     * capacity and applies it per node before pooling a cluster. */
+    printf(",\"ram_expert_usable\":%llu",
+           (unsigned long long)idletoken_ram_expert_usable(
+               r->ram_total, r->ram_usable, r->ram_pinnable,
+#ifdef _WIN32
+               true,
+#else
+               false,
+#endif
+               r->unified_memory));
+    printf(",\"ram_expert_measured\":%s", r->ram_pinnable > 0 ? "true" : "false");
     printf(",\"disk_avail\":%llu", (unsigned long long)r->disk_avail);
     fputs("}\n", stdout);
 }

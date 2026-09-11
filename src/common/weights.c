@@ -1532,6 +1532,40 @@ static int local_split_marker_valid(const char *marker, const char *dir,
     return 1;
 }
 
+/* A cold split-view build has no durable marker until every selected byte is
+ * synced. If it fails (most commonly ENOSPC), keeping its full-size sparse
+ * files can consume the entire volume and make every later coordinator start
+ * fail before it can even write a log. Remove only that exact uncommitted
+ * cache directory. A warm extension has a marker and is deliberately kept: it
+ * still contains the last fully published coverage and the next pass safely
+ * overwrites the unfinished suffix. */
+static void local_split_discard_uncommitted(const char *cache_dir,
+                                            const idx_manifest_t *m,
+                                            uint64_t idx_hash) {
+    char dir[1400], marker[1500], path[1600];
+    if (!cache_dir || !cache_dir[0] || !m) return;
+    int n = snprintf(dir, sizeof(dir), "%s%slocal-%016llx", cache_dir,
+                     (cache_dir[strlen(cache_dir) - 1] == '/' ||
+                      cache_dir[strlen(cache_dir) - 1] == '\\') ? "" : "/",
+                     (unsigned long long)idx_hash);
+    if (n <= 0 || (size_t)n >= sizeof(dir)) return;
+    snprintf(marker, sizeof(marker), "%s/idletoken.done", dir);
+    FILE *published = fopen(marker, "rb");
+    if (published) {
+        fclose(published);
+        return;
+    }
+    for (unsigned i = 0; i < m->n_parts; i++) {
+        n = snprintf(path, sizeof(path), "%s/%s", dir, m->parts[i].name);
+        if (n > 0 && (size_t)n < sizeof(path)) remove(path);
+    }
+    snprintf(path, sizeof(path), "%s/idletoken.done.part", dir);
+    remove(path);
+    if (rmdir(dir) == 0)
+        fprintf(stderr, "idletoken-weights: removed incomplete local model "
+                        "view %s\n", dir);
+}
+
 static int local_split_prepare(const char *host_port, const char *primary_path,
                                const char *local_primary,
                                const idx_manifest_t *m, uint64_t idx_hash,
@@ -1706,6 +1740,8 @@ static int local_model_prepare_impl(const char *base_url,
         int rc = local_split_prepare(host_port, path, local_primary,
                                      &manifest, idx_hash,
                                      layer_hi, cache_dir, out_path, out_cap);
+        if (rc != 0)
+            local_split_discard_uncommitted(cache_dir, &manifest, idx_hash);
         idx_manifest_clear(&manifest);
         free(idx);
         return rc;
@@ -2057,6 +2093,140 @@ int idletoken_local_model_prefetch(const char *base_url,
                         "[0,%u): %.2f GiB resident before inference readiness\n",
                 layer_hi, (double)bytes / 1073741824.0);
     return rc;
+}
+
+static char *read_small_text_file(const char *path) {
+    const uint64_t raw_size = file_size_of(path);
+    /* An IdleToken tensor index is a few MiB even for very large models. Keep
+     * malformed or accidental giant inputs out of this control-plane path. */
+    if (raw_size == UINT64_MAX || raw_size > (64u << 20) ||
+        raw_size > SIZE_MAX - 1) return NULL;
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    char *text = (char *)malloc((size_t)raw_size + 1);
+    if (!text) { fclose(f); return NULL; }
+    const size_t got = fread(text, 1, (size_t)raw_size, f);
+    const int close_ok = fclose(f) == 0;
+    const int ok = got == (size_t)raw_size && close_ok;
+    if (!ok) { free(text); return NULL; }
+    text[got] = '\0';
+    return text;
+}
+
+static int idx_manifests_equal(const idx_manifest_t *a,
+                               const idx_manifest_t *b) {
+    if (!a || !b || a->version != b->version ||
+        a->n_parts != b->n_parts || a->n_tensors != b->n_tensors) return 0;
+    for (unsigned i = 0; i < a->n_parts; i++) {
+        if (a->parts[i].file_size != b->parts[i].file_size ||
+            a->parts[i].tensor_data_pos != b->parts[i].tensor_data_pos ||
+            strcmp(a->parts[i].name, b->parts[i].name) != 0) return 0;
+    }
+    for (size_t i = 0; i < a->n_tensors; i++) {
+        if (a->tensors[i].part != b->tensors[i].part ||
+            a->tensors[i].layer != b->tensors[i].layer ||
+            a->tensors[i].off != b->tensors[i].off ||
+            a->tensors[i].bytes != b->tensors[i].bytes ||
+            strcmp(a->tensors[i].name, b->tensors[i].name) != 0) return 0;
+    }
+    return 1;
+}
+
+int idletoken_rpc_local_prepare(const char *base_url,
+                                unsigned layer_lo, unsigned layer_hi,
+                                const char *local_primary_gguf,
+                                char *out_idx_path, size_t out_idx_cap,
+                                uint64_t *bytes_out,
+                                unsigned *tensors_out) {
+    if (bytes_out) *bytes_out = 0;
+    if (tensors_out) *tensors_out = 0;
+    if (!base_url || !base_url[0] || !local_primary_gguf ||
+        !local_primary_gguf[0] || !out_idx_path || out_idx_cap == 0 ||
+        layer_hi < layer_lo) return -1;
+
+    char host_port[256], path[1024], remote_idx_path[1088];
+    if (parse_http_url(base_url, host_port, sizeof(host_port),
+                       path, sizeof(path)) != 0) {
+        fprintf(stderr, "idletoken-weights: bad model-index URL: %s\n",
+                base_url);
+        return -1;
+    }
+    snprintf(remote_idx_path, sizeof(remote_idx_path), "%s.idx", path);
+    char *remote_text = http_get_all(host_port, remote_idx_path);
+    if (!remote_text) {
+        fprintf(stderr, "idletoken-weights: could not fetch model index %s\n",
+                remote_idx_path);
+        return -1;
+    }
+
+    char local_idx_path[1600];
+    const int np = snprintf(local_idx_path, sizeof(local_idx_path), "%s.idx",
+                            local_primary_gguf);
+    if (np < 0 || (size_t)np >= sizeof(local_idx_path)) {
+        free(remote_text);
+        return -1;
+    }
+    if (idletoken_idx_stale(local_primary_gguf, local_idx_path)) {
+        fprintf(stderr, "idletoken-weights: building the local tensor index %s\n",
+                local_idx_path);
+        if (idletoken_write_idx(local_primary_gguf, local_idx_path) != 0) {
+            free(remote_text);
+            return -1;
+        }
+    }
+    char *local_text = read_small_text_file(local_idx_path);
+    if (!local_text) {
+        fprintf(stderr, "idletoken-weights: cannot read local tensor index %s\n",
+                local_idx_path);
+        free(remote_text);
+        return -1;
+    }
+
+    idx_manifest_t remote, local;
+    const int remote_ok = idx_manifest_parse(remote_text, &remote) == 0;
+    const int local_ok = idx_manifest_parse(local_text, &local) == 0;
+    if (!remote_ok || !local_ok || !idx_manifests_equal(&remote, &local)) {
+        fprintf(stderr, "idletoken-weights: the worker's GGUF tensor directory "
+                        "does not match the coordinator's exact model\n");
+        if (remote_ok) idx_manifest_clear(&remote);
+        if (local_ok) idx_manifest_clear(&local);
+        free(local_text);
+        free(remote_text);
+        return -1;
+    }
+
+    uint64_t selected_bytes = 0;
+    unsigned selected_tensors = 0;
+    for (size_t i = 0; i < local.n_tensors; i++) {
+        const idx_tensor_t *t = &local.tensors[i];
+        if (t->layer < 0 || ((uint64_t)t->layer >= layer_lo &&
+                             (uint64_t)t->layer < layer_hi)) {
+            if (UINT64_MAX - selected_bytes < t->bytes ||
+                selected_tensors == UINT_MAX) {
+                idx_manifest_clear(&local);
+                idx_manifest_clear(&remote);
+                free(local_text);
+                free(remote_text);
+                return -1;
+            }
+            selected_bytes += t->bytes;
+            selected_tensors++;
+        }
+    }
+    idx_manifest_clear(&local);
+    idx_manifest_clear(&remote);
+    free(local_text);
+    free(remote_text);
+
+    if ((size_t)np >= out_idx_cap) return -1;
+    memcpy(out_idx_path, local_idx_path, (size_t)np + 1);
+    if (bytes_out) *bytes_out = selected_bytes;
+    if (tensors_out) *tensors_out = selected_tensors;
+    fprintf(stderr, "idletoken-weights: local GGUF range ready without copying: "
+                    "layers [%u,%u), %u tensors, %.2f GiB indexed by %s\n",
+            layer_lo, layer_hi, selected_tensors,
+            (double)selected_bytes / 1073741824.0, local_idx_path);
+    return 0;
 }
 
 int idletoken_rpc_cache_fetch(const char *base_url,

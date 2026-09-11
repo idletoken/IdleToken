@@ -10,7 +10,7 @@
 //   - standalone      → `idletoken-worker --advise-json` via the Tauri sidecar
 import { useEffect, useState } from "react";
 import { useI18n } from "./i18n";
-import { fmtBytes } from "./format";
+import { fmtBytes, fmtQuant } from "./format";
 
 export type CapabilityMode = "gpu_only" | "hybrid" | "no" | "unavailable";
 
@@ -21,8 +21,9 @@ export interface CapabilityRow {
   mode: CapabilityMode;
   max_ctx: number;
   weight_bytes: number;
-  /** Memory the cluster needs to serve this row — weights + per-node shared
-   *  weights + per-node inference overhead, from the planner
+  /** Resources the cluster needs to serve this row — weights + per-node shared
+   *  weights + per-node inference overhead, from the planner. In MoE Hybrid
+   *  mode this total may be split between GPU memory and node-local RAM.
    *  (`idletoken_needed_bytes_quant`). Optional because a coordinator built before
    *  2026-08-21 does not send it; absent renders as "—" rather than as a
    *  number this file made up. */
@@ -106,14 +107,14 @@ export default function Capability(props: { apiBaseUrl?: string | null }) {
   });
 
   // Four columns as of 2026-08-21 (user's call): model, precision, download
-  // size, memory needed. "Can run" / "Max context" / "Note" and the footer
+  // size, resources needed. "Can run" / "Max context" / "Note" and the footer
   // about pooling a new machine's memory are gone.
   //
   // What survives without a column of its own: the runnable-first SORT above
   // and the dimming below, both driven by `mode`. They are not columns and
   // they are the difference between a table you can scan and 150 identical
-  // rows. The verdict is still readable from the numbers — the memory column
-  // is what the row needs, and the reader knows what they have.
+  // rows. The verdict is still readable from the numbers — the resource column
+  // is what the row needs across GPU memory and, for MoE Hybrid, RAM.
   return (
     <section className="card cap-card">
       {/* "based on N machine(s) in this cluster" was the subtitle here until
@@ -137,7 +138,7 @@ export default function Capability(props: { apiBaseUrl?: string | null }) {
           {rows.map((r) => (
             <tr key={`${r.id}:${r.quant}`} className={r.mode === "no" || r.mode === "unavailable" ? "cap-row--dim" : ""}>
               <td>{r.label}</td>
-              <td>{r.quant || "—"}</td>
+              <td>{r.quant ? fmtQuant(r.quant) : "—"}</td>
               <td>{fmtBytes(r.weight_bytes)}</td>
               {/* An engine older than this column sends no need_bytes. Say so
                   with a dash — a table that fills a gap with a plausible

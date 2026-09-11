@@ -1,0 +1,66 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 25e75ab..59535b6 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1853,6 +1853,20 @@ static bool sched_moe_prefetch_prepare(ggml_backend_sched_t sched, int layer,
+     if (ggml_backend_sched_get_tensor_backend(sched, pg) != ids_backend) {
+         return false;
+     }
++    // A zero-copy plan needs neither host scores nor sorting in steady state.
++    // Calibration controls still observe the target so a later, useful window
++    // can re-enable prediction. Do not turn this into a permanent model gate.
++    if (st.schedule && !st.timing.active) {
++        for (int b = 0; b < sched->n_backends; ++b) {
++            if (sched->backends[b] != ids_backend) continue;
++            const auto & d = st.devices[b];
++            const int target = layer + st.pregate_horizon;
++            if (!d.plan.valid) return false;
++            for (size_t i = 0; i < d.geometry.size(); ++i) {
++                if (d.geometry[i].id == target && !d.plan.layers[i].rolling) return false;
++            }
++        }
++    }
+     const int64_t n = pg->ne[0];
+     const int64_t m = st.schedule || st.pregate_copy_bytes != SIZE_MAX ? n
+         : std::min<int64_t>(n, (int64_t) k + st.pregate_extra);
+@@ -1889,8 +1903,9 @@ static void sched_moe_prefetch_issue(ggml_backend_sched_t sched, int layer) {
+         st.pred[i] = (int32_t) i;
+     }
+     const int64_t rank_count = st.pregate_stats_every > 0 ? n : m;
+-    std::partial_sort(st.pred.begin(), st.pred.begin() + rank_count, st.pred.end(),
+-        [&](int32_t a, int32_t b) { return st.scores[a] > st.scores[b]; });
++    const auto higher = [&](int32_t a, int32_t b) { return st.scores[a] > st.scores[b]; };
++    if (rank_count == n) std::sort(st.pred.begin(), st.pred.end(), higher);
++    else std::partial_sort(st.pred.begin(), st.pred.begin() + rank_count, st.pred.end(), higher);
+ 
+     const int target_layer = layer + st.pregate_horizon;
+     if (st.pregate_stats_every > 0) {
+@@ -3966,6 +3981,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         int split_backend_id = split->backend_id;
+         ggml_backend_t split_backend = sched->backends[split_backend_id];
+         ggml_timeline::scope trace_split("scheduler.split", split->graph.n_nodes ? split->graph.nodes[0]->name : "", split_id, split_backend_id);
++        int deferred_prediction = -1;
+         // GPU-side brackets of this split (CUDA only): pre -> mid is the stream's gap
+         // before the split's kernels (its input copies, and idle time while the host
+         // waits or works), mid -> post the kernels themselves
+@@ -4120,7 +4136,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                             // and ran the prediction path three times per layer.
+                             if (ids_just_read && ids_tensor->ne[1] == 1 && input_id == 0) {
+                                 sched_moe_issue_layer_siblings(sched, input, used_ids, n_expert);
+-                                sched_moe_prefetch_issue(sched, sched_moe_layer_of(input->name));
++                                const int layer = sched_moe_layer_of(input->name);
++                                if (sched->moe->schedule && !sched->callback_eval) deferred_prediction = layer;
++                                else sched_moe_prefetch_issue(sched, layer);
+                             }
+                             continue; // served from the expert pool: no staging copy for this input
+                         }
+@@ -4268,6 +4286,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         if (pe) {
+             ggml_backend_event_record(pe->post, split_backend);
+         }
++        // Launch current work before ranking/submitting speculative next-layer
++        // copies on the host. Prediction must not create its own compute gap.
++        if (deferred_prediction >= 0) sched_moe_prefetch_issue(sched, deferred_prediction);
+         if (pr) {
+             pr->n_splits++;
+             pr->n_rpc += pr->is_rpc[split_backend_id];

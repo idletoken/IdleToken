@@ -1,0 +1,1303 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 51535c7..25e75ab 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -13,6 +13,7 @@
+ #include "ggml-alloc.h"
+ #include "ggml-impl.h"
+ #include "ggml-moe-copy-budget.h"
++#include "ggml-moe-schedule.h"
+ #include "ggml-timeline.h"
+ 
+ #include <assert.h>
+@@ -977,6 +978,8 @@ struct sched_moe_pool {
+     ggml_backend_event_t ev = nullptr;           // prefetch completion, recorded on the prefetch backend
+     bool ev_pending = false;
+     uint64_t served_seq = 0;                     // sched_moe_state::graph_seq of the graph that last served this pool
++    size_t active_experts = 1;
++    std::string copy_key;
+ };
+ 
+ struct sched_moe_rolling_segment {
+@@ -992,6 +995,28 @@ struct sched_moe_rolling {
+     int layer = -1;
+     int backend_id = -1;
+     std::vector<sched_moe_rolling_segment> segments;
++    ggml_moe_schedule::bank lifetime;
++    ggml_backend_event_t ready = nullptr, retired = nullptr;
++    bool backed_off = false;
++};
++
++struct sched_moe_device {
++    ggml_backend_buffer_t staging = nullptr;
++    size_t max_weight_bytes = 0, bank_bytes = 0, budget_bytes = 0;
++    sched_moe_rolling rolling[2];
++    ggml_moe_schedule::plan plan;
++    std::vector<ggml_moe_schedule::layer> geometry;
++    std::unordered_map<int, ggml_moe_schedule::samples> windows;
++    std::unordered_map<std::string, ggml_moe_schedule::samples> copies;
++    uint64_t ready_hits = 0, pending_hits = 0, no_bank = 0;
++    uint64_t predicted_bytes = 0, promoted_bytes = 0, exact_bytes = 0;
++};
++
++struct sched_moe_schedule_sample {
++    ggml_backend_event_t begin = nullptr, end = nullptr;
++    int backend_id = -1, source = -1;
++    std::string copy_key;
++    size_t count = 0;
+ };
+ 
+ struct sched_moe_timing_record {
+@@ -1011,6 +1036,11 @@ struct sched_moe_timing {
+     sched_moe_timing_event_elapsed_fn elapsed[GGML_SCHED_MAX_BACKENDS] = {};
+     bool initialized[GGML_SCHED_MAX_BACKENDS] = {};
+     std::unordered_map<int, sched_moe_timing_record> records;
++    std::vector<sched_moe_schedule_sample> samples;
++    size_t sample_count = 0;
++    int source[GGML_SCHED_MAX_BACKENDS] = {};
++    uint64_t clean_samples = 0;
++    bool successful = false;
+ };
+ 
+ struct sched_moe_readback {
+@@ -1026,18 +1056,20 @@ struct sched_moe_state {
+     std::unordered_map<std::string, std::unique_ptr<sched_moe_pool>> pools;
+     // the host-resident MoE weights of the current graph, refreshed at split time
+     std::unordered_map<std::string, const struct ggml_tensor *> weights;
++    std::unordered_set<std::string> current_weights;
+     size_t max_weight_bytes = 0;    // largest expert tensor seen: size of the shared staging buffer
+     // shared staging for batches that need more experts than a pool holds (prefill):
+     // one buffer for the whole scheduler, used by one split at a time
+-    ggml_backend_buffer_t staging_buf = nullptr;
+-    int staging_backend_id = -1;
++    sched_moe_device devices[GGML_SCHED_MAX_BACKENDS];
+     // Decode never needs the full-weight prefill staging tensor. Reuse that
+     // already-budgeted memory as a layer-shared rolling prediction area. It is
+     // separate from every layer's LRU pool, so a wrong prediction cannot evict
+     // a persistent hotspot. Exact hits are promoted device-to-device when the
+     // target layer arrives, then the same bytes immediately roll forward.
+-    sched_moe_rolling rolling;
+     sched_moe_timing timing;
++    bool schedule = false, schedule_replan = false;
++    uint64_t schedule_epoch = 0;
++    int initial_caps[GGML_SCHED_MAX_BACKENDS] = {};
+     // pre-gate prefetch: the graph's "ffn_moe_pregate-<L>" nodes and a second backend
+     // instance per device (its own stream) that carries the prefetch copies
+     std::unordered_map<int, struct ggml_tensor *> pregate;
+@@ -1175,6 +1207,7 @@ static void sched_moe_auto_enable(ggml_backend_sched_t sched) {
+     // uses the smallest safe slot count instead of assuming one particular card.
+     const size_t reserve = 512ull << 20;
+     int cap = INT_MAX;
++    int backend_caps[GGML_SCHED_MAX_BACKENDS] = {};
+     double free_gib = 0;
+     double staging_gib = 0;
+     for (const auto & kv : st->backends) {
+@@ -1195,6 +1228,7 @@ static void sched_moe_auto_enable(ggml_backend_sched_t sched) {
+         const size_t room = free > fixed ? free - fixed : 0;
+         const uint64_t raw_cap = budget.expert_bytes > 0 ? room / budget.expert_bytes : 0;
+         const int backend_cap = raw_cap > INT_MAX ? INT_MAX : (int) raw_cap;
++        backend_caps[backend_id] = backend_cap;
+         cap = std::min(cap, backend_cap);
+         free_gib += (double) free / 1073741824.0;
+         staging_gib += (double) budget.staging_bytes / 1073741824.0;
+@@ -1207,6 +1241,9 @@ static void sched_moe_auto_enable(ggml_backend_sched_t sched) {
+         sched->moe = sched_moe_state_new_with(cap, 0);
+     }
+     if (sched->moe != nullptr) {
++        if (sched->moe->schedule) {
++            std::copy(std::begin(backend_caps), std::end(backend_caps), std::begin(sched->moe->initial_caps));
++        }
+         GGML_LOG_INFO("moe-pool: adaptive cache enabled after the first complete graph: "
+                       "%d slots/tensor, %zu expert tensors on %zu device(s), %.2f GiB total free, "
+                       "%.2f GiB staging, %.2f GiB/device reserve; active from the next graph\n",
+@@ -1286,6 +1323,17 @@ static struct sched_moe_state * sched_moe_state_new_with(int cap, uint64_t bytes
+     // DGX, byte-identical); GGML_MOE_LAYER_ISSUE=0 switches it off
+     const char * li = getenv("GGML_MOE_LAYER_ISSUE");
+     st->layer_issue = li ? atoi(li) > 0 : true;
++    const char * schedule = getenv("GGML_MOE_SCHEDULE");
++    st->schedule = schedule && atoi(schedule) > 0;
++    if (st->schedule) {
++        if (!st->layer_issue || st->pregate_horizon != 1 || st->pregate_copy_bytes != SIZE_MAX ||
++            st->pregate_no_prefetch || st->timing.every > 0) {
++            GGML_ABORT("GGML_MOE_SCHEDULE requires horizon 1, layer issue, and no fixed copy/window diagnostic overrides");
++        }
++        st->timing.every = 1;
++        st->timing.warmup = 0; // Observe cold-cache copies; compute windows have their own warmup.
++        fprintf(stderr, "moe-schedule: experimental two-stage policy; learn owner-local copy cost and clean compute windows, then repartition cache\n");
++    }
+     return st;
+ }
+ 
+@@ -1301,6 +1349,7 @@ static void sched_moe_state_free(struct sched_moe_state * st) {
+     if (st == nullptr) {
+         return;
+     }
++    for (auto backend : st->prefetch_backend) if (backend) ggml_backend_synchronize(backend);
+     for (auto & kv : st->pools) {
+         sched_moe_pool * p = kv.second.get();
+         if (st->debug && p) {
+@@ -1331,16 +1380,22 @@ static void sched_moe_state_free(struct sched_moe_state * st) {
+         if (r.start) ggml_backend_event_free(r.start);
+         if (r.done)  ggml_backend_event_free(r.done);
+     }
++    for (auto & s : st->timing.samples) {
++        if (s.begin) ggml_backend_event_free(s.begin);
++        if (s.end) ggml_backend_event_free(s.end);
++    }
+     for (int b = 0; b < GGML_SCHED_MAX_BACKENDS; b++) {
++        for (auto & r : st->devices[b].rolling) {
++            if (r.ready) ggml_backend_event_free(r.ready);
++            if (r.retired) ggml_backend_event_free(r.retired);
++        }
++        if (st->devices[b].staging) ggml_backend_buffer_free(st->devices[b].staging);
+         if (st->readbacks[b].ids) ggml_backend_buffer_free(st->readbacks[b].ids);
+         if (st->readbacks[b].scores) ggml_backend_buffer_free(st->readbacks[b].scores);
+         if (st->prefetch_backend[b]) {
+             ggml_backend_free(st->prefetch_backend[b]);
+         }
+     }
+-    if (st->staging_buf) {
+-        ggml_backend_buffer_free(st->staging_buf);
+-    }
+     delete st;
+ }
+ 
+@@ -1388,7 +1443,14 @@ static sched_moe_pool * sched_moe_pool_get(ggml_backend_sched_t sched, const str
+     p->weight = weight;
+     p->expert_size = expert_size;
+     p->n_expert = n_expert;
++    p->copy_key = std::string(ggml_backend_buffer_name(weight->buffer)) + ":" + std::to_string(expert_size);
++    for (int b = 0; b < sched->n_backends; b++) {
++        if (sched->bufts[b] == buft) { p->backend_id = b; break; }
++    }
++    GGML_ASSERT(p->backend_id >= 0);
++    auto & device = sched->moe->devices[p->backend_id];
+     int cap = sched->moe->cap_experts;
++    if (sched->moe->initial_caps[p->backend_id] > 0) cap = sched->moe->initial_caps[p->backend_id];
+     if (cap <= 0 && sched->moe->pool_bytes > 0) {
+         const size_t n_w = std::max<size_t>(1, sched->moe->weights.size());
+         cap = (int) (sched->moe->pool_bytes / n_w / expert_size);
+@@ -1402,23 +1464,16 @@ static sched_moe_pool * sched_moe_pool_get(ggml_backend_sched_t sched, const str
+     // not fit a pool) is taken BEFORE the first pool: pools fill the card, and a
+     // staging allocation that fails later has no way back (the split's copy is
+     // a one-expert placeholder by then). Failing here names the cause.
+-    if (sched->moe->staging_buf == nullptr && sched->moe->max_weight_bytes > 0) {
+-        const size_t sbytes = sched->moe->max_weight_bytes + 512;
+-        sched->moe->staging_buf = ggml_backend_buft_alloc_buffer(buft, sbytes);
+-        if (sched->moe->staging_buf == nullptr) {
++    if (device.staging == nullptr && device.max_weight_bytes > 0) {
++        const size_t sbytes = device.max_weight_bytes + 512;
++        device.staging = ggml_backend_buft_alloc_buffer(buft, sbytes);
++        if (device.staging == nullptr) {
+             GGML_LOG_WARN("moe-pool: cannot allocate the %zu-byte staging tensor on %s before the first pool; no pools\n",
+                           sbytes, ggml_backend_buft_name(buft));
+             pools[weight->name] = nullptr;
+             return nullptr;
+         }
+-        ggml_backend_buffer_clear(sched->moe->staging_buf, 0);
+-        sched->moe->staging_backend_id = -1;
+-        for (int b = 0; b < sched->n_backends; b++) {
+-            if (sched->bufts[b] == buft) {
+-                sched->moe->staging_backend_id = b;
+-                break;
+-            }
+-        }
++        ggml_backend_buffer_clear(device.staging, 0);
+     }
+     // 512 B tail: MMQ reads a little past the last expert (see the staging copy)
+     const size_t bytes = (size_t) p->cap * expert_size + 512;
+@@ -1466,30 +1521,37 @@ static sched_moe_pool * sched_moe_pool_get(ggml_backend_sched_t sched, const str
+ static struct ggml_tensor * sched_moe_staging(ggml_backend_sched_t sched, sched_moe_pool * p,
+                                               const struct ggml_tensor * weight, int backend_id) {
+     auto & st = *sched->moe;
+-    st.rolling.layer = -1;
+-    st.rolling.backend_id = -1;
+-    st.rolling.segments.clear();
++    auto & device = st.devices[backend_id];
++    // Prefill reuses both banks. Finish their copies before overwriting the storage.
++    if (st.prefetch_backend[backend_id]) ggml_backend_synchronize(st.prefetch_backend[backend_id]);
++    for (auto & r : device.rolling) {
++        r.layer = r.backend_id = -1;
++        r.segments.clear();
++        if (r.lifetime.state != ggml_moe_schedule::bank_state::free) {
++            r.lifetime.retire();
++            GGML_ASSERT(r.lifetime.release(r.lifetime.generation, true));
++        }
++    }
+     const size_t need = ggml_nbytes(weight) + 512;
+-    if (st.staging_buf == nullptr || st.staging_backend_id != backend_id ||
+-        ggml_backend_buffer_get_size(st.staging_buf) < need) {
+-        if (st.staging_buf) {
+-            ggml_backend_buffer_free(st.staging_buf);
+-        }
+-        const size_t bytes = std::max(need, st.max_weight_bytes + 512);
+-        st.staging_buf = ggml_backend_buft_alloc_buffer(sched->bufts[backend_id], bytes);
+-        if (st.staging_buf == nullptr) {
++    if (device.staging == nullptr || ggml_backend_buffer_get_size(device.staging) < need) {
++        if (device.staging) {
++            ggml_backend_synchronize(sched->backends[backend_id]);
++            ggml_backend_buffer_free(device.staging);
++        }
++        const size_t bytes = std::max(need, device.max_weight_bytes + 512);
++        device.staging = ggml_backend_buft_alloc_buffer(sched->bufts[backend_id], bytes);
++        if (device.staging == nullptr) {
+             return nullptr;
+         }
+-        ggml_backend_buffer_clear(st.staging_buf, 0);
+-        st.staging_backend_id = backend_id;
++        ggml_backend_buffer_clear(device.staging, 0);
+         for (auto & kv : st.pools) {
+-            if (kv.second) {
++            if (kv.second && kv.second->backend_id == backend_id) {
+                 kv.second->staging.data = nullptr;   // re-described below on next use
+                 kv.second->staging.buffer = nullptr;
+             }
+         }
+     }
+-    if (p->staging.data == nullptr || p->staging.buffer != st.staging_buf) {
++    if (p->staging.data == nullptr || p->staging.buffer != device.staging) {
+         memset(&p->staging, 0, sizeof(p->staging));
+         p->staging.type = weight->type;
+         for (int d = 0; d < GGML_MAX_DIMS; d++) {
+@@ -1498,11 +1560,13 @@ static struct ggml_tensor * sched_moe_staging(ggml_backend_sched_t sched, sched_
+         }
+         p->staging.op = GGML_OP_NONE;
+         snprintf(p->staging.name, sizeof(p->staging.name), "%.*s#stg", (int) sizeof(p->staging.name) - 5, weight->name);
+-        ggml_backend_tensor_alloc(st.staging_buf, &p->staging, ggml_backend_buffer_get_base(st.staging_buf));
++        ggml_backend_tensor_alloc(device.staging, &p->staging, ggml_backend_buffer_get_base(device.staging));
+     }
+     return &p->staging;
+ }
+ 
++#include "ggml-moe-schedule-runtime.h"
++
+ // Sample CUDA timestamps without adding any waits to the layer loop. The
+ // source route event anchors both streams on one device clock. Read records
+ // only at the caller's existing graph synchronization (or a later graph if
+@@ -1520,11 +1584,18 @@ static void sched_moe_timing_collect(ggml_backend_sched_t sched) {
+             (r.start_set && elapsed(r.start, r.start) < 0) ||
+             (r.done_set && elapsed(r.done, r.done) < 0)) return;
+     }
++    if (!sched_moe_schedule_samples_done(tm)) return;
+     if (!tm.primed) {
++        if (sched->moe->schedule) sched_moe_schedule_learn(sched);
+         tm.primed = true; // exclude the sample that allocated CUDA events
+         tm.pending = tm.active = false;
+         return;
+     }
++    sched_moe_schedule_learn(sched);
++    if (sched->moe->schedule) {
++        tm.pending = tm.active = false;
++        return;
++    }
+     for (const auto & kv : tm.records) {
+         const auto & r = kv.second;
+         const auto ti = tm.records.find(r.target);
+@@ -1580,7 +1651,11 @@ static sched_moe_timing_record * sched_moe_timing_route(ggml_backend_sched_t sch
+             tm.elapsed[b] = (sched_moe_timing_event_elapsed_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_timing_event_elapsed_ms");
+         }
+     }
+-    if (!tm.event_new[b] || !tm.elapsed[b]) return nullptr;
++    if (!tm.event_new[b] || !tm.elapsed[b]) {
++        if (sched->moe->schedule) GGML_ABORT("moe-schedule: backend %s has no nonblocking device timing capability", ggml_backend_name(backend));
++        return nullptr;
++    }
++    tm.source[b] = layer;
+     auto & r = tm.records[layer];
+     if (r.route_set) return nullptr; // exactly one record per layer and graph
+     if (!r.route) {
+@@ -1615,12 +1690,45 @@ static sched_moe_timing_record * sched_moe_timing_copy_begin(ggml_backend_sched_
+ // Refresh the map of pre-gate nodes for the graph about to be computed.
+ static void sched_moe_scan_pregate(ggml_backend_sched_t sched) {
+     sched_moe_timing_collect(sched);
++    sched_moe_schedule_apply(sched);
+     sched->moe->graph_seq++;   // a new graph: every pool's served_seq is now stale
++    if (sched->moe->schedule && sched->moe->graph_seq % 64 == 0) {
++        for (int b = 0; b < sched->n_backends; ++b) {
++            const auto & d = sched->moe->devices[b];
++            if (d.plan.valid) fprintf(stderr,
++                "moe-schedule-progress: graph=%llu device=%d ready=%llu pending=%llu predicted-bytes=%llu promoted-bytes=%llu exact-bytes=%llu no-bank=%llu\n",
++                (unsigned long long) sched->moe->graph_seq, b, (unsigned long long) d.ready_hits,
++                (unsigned long long) d.pending_hits, (unsigned long long) d.predicted_bytes,
++                (unsigned long long) d.promoted_bytes, (unsigned long long) d.exact_bytes, (unsigned long long) d.no_bank);
++        }
++    }
+     auto & tm = sched->moe->timing;
+     tm.active = false;
+-    if (tm.every > 0 && !tm.pending && sched->moe->graph_seq > (uint64_t) tm.warmup &&
+-        sched->moe->graph_seq % (uint64_t) tm.every == 0) {
++    if (sched->moe->schedule) {
++        // Predictions do not cross graph generations. Retire unused entries without a host wait.
++        for (int b = 0; b < sched->n_backends; ++b) {
++            for (auto & r : sched->moe->devices[b].rolling) {
++                if (r.lifetime.state != ggml_moe_schedule::bank_state::free &&
++                    r.lifetime.state != ggml_moe_schedule::bank_state::retiring) {
++                    ggml_backend_event_record(r.retired, sched->moe->prefetch_backend[b]);
++                    GGML_ASSERT(r.lifetime.retire());
++                    r.layer = r.backend_id = -1;
++                }
++            }
++        }
++    }
++    const bool sample_due = sched->moe->schedule
++        ? (tm.clean_samples < 16 || sched->moe->graph_seq % 32 == 0)
++        : (tm.every > 0 && sched->moe->graph_seq % (uint64_t) tm.every == 0);
++    if (tm.every > 0 && !tm.pending && sched->moe->graph_seq > (uint64_t) tm.warmup && sample_due) {
+         tm.active = tm.pending = true;
++        tm.successful = false;
++        tm.sample_count = 0;
++        std::fill(std::begin(tm.source), std::end(tm.source), -1);
++        if (sched->moe->schedule) {
++            // A calibration frame must not inherit speculative DMA from the previous frame.
++            for (auto backend : sched->moe->prefetch_backend) if (backend) ggml_backend_synchronize(backend);
++        }
+         tm.graph = sched->moe->graph_seq;
+         for (auto & kv : tm.records) {
+             auto & r = kv.second;
+@@ -1635,6 +1743,17 @@ static void sched_moe_scan_pregate(ggml_backend_sched_t sched) {
+     sched->moe->pregate_prepared_layer = -1;
+     sched->moe->pregate_prepared_count = 0;
+     sched->moe->pregate_stats_target_layer = -1;
++    sched->moe->current_weights.clear();
++    for (int s = 0; s < sched->n_splits; ++s) {
++        const auto & split = sched->splits[s];
++        for (int i = 0; i < split.n_inputs; ++i) {
++            const auto * input = split.inputs[i];
++            if (sched->moe->weights.count(input->name)) {
++                sched->moe->current_weights.insert(input->name);
++                sched->moe->weights[input->name] = input;
++            }
++        }
++    }
+     for (int i = 0; i < sched->graph.n_nodes; i++) {
+         const struct ggml_tensor * t = sched->graph.nodes[i];
+         if (strncmp(t->name, "ffn_moe_pregate-", 16) == 0) {
+@@ -1735,7 +1854,7 @@ static bool sched_moe_prefetch_prepare(ggml_backend_sched_t sched, int layer,
+         return false;
+     }
+     const int64_t n = pg->ne[0];
+-    const int64_t m = st.pregate_copy_bytes != SIZE_MAX ? n
++    const int64_t m = st.schedule || st.pregate_copy_bytes != SIZE_MAX ? n
+         : std::min<int64_t>(n, (int64_t) k + st.pregate_extra);
+     if (m <= 0) {
+         return false;
+@@ -1801,30 +1920,32 @@ static void sched_moe_prefetch_issue(ggml_backend_sched_t sched, int layer) {
+     std::vector<sched_moe_pool *> target;
+     for (auto & kv : st.pools) {
+         sched_moe_pool * p = kv.second.get();
+-        if (p == nullptr || p->layer != target_layer || p->backend_id < 0 || p->weight == nullptr) {
++        if (p == nullptr || p->layer != target_layer || p->backend_id < 0 || p->weight == nullptr ||
++            !st.current_weights.count(kv.first)) {
+             continue;
+         }
+         target.push_back(p);
+     }
+ 
+-    // One staging buffer belongs to one target backend. That is the product
+-    // topology today (one owner GPU per scheduler); leave prediction disabled
+-    // rather than mixing device address spaces if a future topology differs.
+-    if (!st.layer_issue || target.empty() || st.staging_buf == nullptr ||
+-        st.staging_backend_id < 0) {
++    // Predictions and staging bytes belong to the same owner backend.
++    if (!st.layer_issue || target.empty()) {
+         st.pregate_prepared_layer = -1;
+         st.pregate_prepared_count = 0;
+         return;
+     }
+     const int backend_id = target.front()->backend_id;
++    const auto prediction = st.pregate.find(layer);
++    if (prediction == st.pregate.end() ||
++        ggml_backend_sched_get_tensor_backend(sched, prediction->second) != sched->backends[backend_id]) return;
+     for (const sched_moe_pool * p : target) {
+-        if (p->backend_id != backend_id) {
++        if (p->backend_id != backend_id || p->n_expert != n) {
+             st.pregate_prepared_layer = -1;
+             st.pregate_prepared_count = 0;
+             return;
+         }
+     }
+-    if (backend_id != st.staging_backend_id) {
++    auto & device = st.devices[backend_id];
++    if (!device.staging) {
+         st.pregate_prepared_layer = -1;
+         st.pregate_prepared_count = 0;
+         return;
+@@ -1832,17 +1953,7 @@ static void sched_moe_prefetch_issue(ggml_backend_sched_t sched, int layer) {
+ 
+     // Prefer early-consumed gate/up weights within each prediction rank.
+     // Sorting also makes byte-budget A/B independent of unordered_map order.
+-    const auto priority = [](const sched_moe_pool * p) {
+-        const char * name = p->weight->name;
+-        if (strstr(name, ".ffn_gate_exps") || strstr(name, ".ffn_gate_up_exps")) return 0;
+-        if (strstr(name, ".ffn_up_exps")) return 1;
+-        if (strstr(name, ".ffn_down_exps")) return 2;
+-        return 3;
+-    };
+-    std::sort(target.begin(), target.end(), [&](const sched_moe_pool * a, const sched_moe_pool * b) {
+-        const int pa = priority(a), pb = priority(b);
+-        return pa != pb ? pa < pb : strcmp(a->weight->name, b->weight->name) < 0;
+-    });
++    std::sort(target.begin(), target.end(), sched_moe_pool_order);
+ 
+     ggml_backend_t pf = st.prefetch_backend[backend_id];
+     if (pf == nullptr) {
+@@ -1859,7 +1970,7 @@ static void sched_moe_prefetch_issue(ggml_backend_sched_t sched, int layer) {
+     const auto align_up = [alignment](size_t value) {
+         return ((value + alignment - 1) / alignment) * alignment;
+     };
+-    const size_t available = ggml_backend_buffer_get_size(st.staging_buf);
++    const size_t available = ggml_backend_buffer_get_size(device.staging);
+     auto bytes_for = [&](int64_t count) {
+         size_t off = 0;
+         for (const sched_moe_pool * p : target) {
+@@ -1868,7 +1979,38 @@ static void sched_moe_prefetch_issue(ggml_backend_sched_t sched, int layer) {
+         }
+         return off;
+     };
+-    int64_t rolling_count = m;
++    const bool control = st.schedule && st.timing.active;
++    auto * timing = sched_moe_timing_copy_begin(sched, layer, target_layer, pf);
++    if (control) {
++        if (timing) {
++            ggml_backend_event_record(timing->done, pf);
++            timing->done_set = true;
++        }
++        st.pregate_prepared_layer = -1;
++        st.pregate_prepared_count = 0;
++        return;
++    }
++    size_t plan_index = 0, bank_index = 0;
++    if (st.schedule) {
++        while (plan_index < device.geometry.size() && device.geometry[plan_index].id != target_layer) ++plan_index;
++        if (!device.plan.valid || plan_index == device.geometry.size() || !device.plan.layers[plan_index].rolling) return;
++        if (device.geometry[plan_index].parts.size() != target.size()) return;
++        for (size_t i = 0; i < target.size(); ++i) {
++            if (target[i]->expert_size != device.geometry[plan_index].parts[i].bytes) return;
++        }
++        for (; bank_index < 2; ++bank_index) {
++            auto & r = device.rolling[bank_index];
++            if (r.lifetime.state == ggml_moe_schedule::bank_state::retiring &&
++                st.timing.elapsed[backend_id](r.retired, r.retired) >= 0) {
++                GGML_ASSERT(r.lifetime.release(r.lifetime.generation, true));
++                r.segments.clear();
++                r.layer = r.backend_id = -1;
++            }
++            if (r.lifetime.state == ggml_moe_schedule::bank_state::free) break;
++        }
++        if (bank_index == 2) { ++device.no_bank; return; }
++    }
++    int64_t rolling_count = st.schedule ? (int64_t) device.plan.layers[plan_index].rolling : m;
+     while (rolling_count > 0 && bytes_for(rolling_count) > available) {
+         rolling_count--;
+     }
+@@ -1888,9 +2030,20 @@ static void sched_moe_prefetch_issue(ggml_backend_sched_t sched, int layer) {
+             }
+         }
+     }
+-    const auto selected = ggml_moe_copy_budget_pick(candidate_bytes, st.pregate_copy_bytes);
++    auto selected = ggml_moe_copy_budget_pick(candidate_bytes, st.pregate_copy_bytes);
++    std::vector<int> schedule_slots;
++    if (st.schedule) {
++        std::vector<ggml_moe_schedule::candidate> candidates;
++        for (int64_t rank = 0; rank < n; ++rank) {
++            for (size_t part = 0; part < target.size(); ++part) {
++                candidates.push_back({part, target[part]->where.count(st.pred[rank]) != 0});
++            }
++        }
++        const auto admitted = ggml_moe_schedule::admit(device.geometry[plan_index], device.plan.layers[plan_index], candidates);
++        if (!admitted.bytes) return;
++        schedule_slots = admitted.slots;
++    }
+ 
+-    auto * timing = sched_moe_timing_copy_begin(sched, layer, target_layer, pf);
+     const auto submit_begin = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+     if (st.pregate_no_prefetch) {
+         if (timing) {
+@@ -1905,12 +2058,21 @@ static void sched_moe_prefetch_issue(ggml_backend_sched_t sched, int layer) {
+         return;
+     }
+ 
+-    auto & rolling = st.rolling;
++    auto & rolling = device.rolling[bank_index];
++    if (st.schedule) {
++        GGML_ASSERT(rolling.lifetime.begin(target_layer));
++        rolling.backed_off = false;
++        if (!rolling.ready) {
++            const auto dev = ggml_backend_get_device(pf);
++            rolling.ready = st.timing.event_new[backend_id](dev);
++            rolling.retired = st.timing.event_new[backend_id](dev);
++        }
++    }
+     rolling.layer = target_layer;
+     rolling.backend_id = backend_id;
+     rolling.segments.clear();
+     rolling.segments.reserve(target.size());
+-    size_t off = 0;
++    size_t off = st.schedule ? bank_index * device.bank_bytes : 0;
+     for (size_t part = 0; part < target.size(); part++) {
+         sched_moe_pool * p = target[part];
+         off = align_up(off);
+@@ -1927,26 +2089,32 @@ static void sched_moe_prefetch_issue(ggml_backend_sched_t sched, int layer) {
+         seg.tensor.op = GGML_OP_NONE;
+         snprintf(seg.tensor.name, sizeof(seg.tensor.name), "%.*s#roll",
+                  (int) sizeof(seg.tensor.name) - 6, p->weight->name);
+-        ggml_backend_tensor_alloc(st.staging_buf, &seg.tensor,
+-            (uint8_t *) ggml_backend_buffer_get_base(st.staging_buf) + off);
++        ggml_backend_tensor_alloc(device.staging, &seg.tensor,
++            (uint8_t *) ggml_backend_buffer_get_base(device.staging) + off);
+         int issued = 0;
+-        for (int64_t i = 0; i < rolling_count; i++) {
++        for (int64_t i = 0, count = st.schedule ? n : rolling_count; i < count; i++) {
+             const int32_t e = st.pred[i];
+-            if (!selected[(size_t) i * target.size() + part]) {
++            const int slot = st.schedule ? schedule_slots[(size_t) i * target.size() + part] : (int) i;
++            if (st.schedule ? slot < 0 : !selected[(size_t) i * target.size() + part]) {
+                 continue;
+             }
+-            seg.where[e] = (int) i;
++            seg.where[e] = slot;
+             ggml_backend_tensor_set_async(pf, &seg.tensor,
+                 (const uint8_t *) p->weight->data + (size_t) e * p->expert_size,
+-                (size_t) i * p->expert_size, p->expert_size);
++                (size_t) slot * p->expert_size, p->expert_size);
+             issued++;
++            if (st.schedule) device.predicted_bytes += p->expert_size;
+             if (timing) {
+                 timing->planned_bytes += p->expert_size;
+                 timing->copied_bytes += p->expert_size;
+             }
+         }
+         p->prefetched += issued;
+-        off += (size_t) rolling_count * p->expert_size;
++        off += (size_t) rolling_count * p->expert_size + (st.schedule ? 512 : 0);
++    }
++    if (st.schedule) {
++        GGML_ASSERT(off <= (bank_index + 1) * device.bank_bytes);
++        ggml_backend_event_record(rolling.ready, pf);
+     }
+     if (timing) {
+         ggml_backend_event_record(timing->done, pf);
+@@ -2096,10 +2264,12 @@ static int sched_moe_rolling_promote(ggml_backend_sched_t sched, sched_moe_pool
+                                      const std::vector<ggml_bitset_t> & used_ids,
+                                      int64_t n_expert_total) {
+     auto & st = *sched->moe;
+-    auto & rolling = st.rolling;
+-    if (p == nullptr || rolling.layer != p->layer || rolling.backend_id != p->backend_id) {
++    if (!p || p->backend_id < 0) return 0;
++    auto * bank = sched_moe_schedule_rolling(sched, p->backend_id, p->layer);
++    if (!bank || bank->backend_id != p->backend_id) {
+         return 0;
+     }
++    auto & rolling = *bank;
+     auto found = std::find_if(rolling.segments.begin(), rolling.segments.end(),
+         [&](const sched_moe_rolling_segment & seg) { return seg.pool == p; });
+     if (found == rolling.segments.end()) {
+@@ -2110,6 +2280,18 @@ static int sched_moe_rolling_promote(ggml_backend_sched_t sched, sched_moe_pool
+         return 0;
+     }
+     const uint64_t next_tick = p->tick + 1;
++    // Pin existing exact hits before choosing victims for promoted predictions.
++    for (const auto & entry : p->where) {
++        if (ggml_bitset_get(used_ids.data(), entry.first)) p->slot_pin[entry.second] = next_tick;
++    }
++    bool ready = false;
++    if (st.schedule) {
++        ready = st.timing.elapsed[p->backend_id](rolling.ready, rolling.ready) >= 0;
++        if (ready && rolling.lifetime.state == ggml_moe_schedule::bank_state::filling) {
++            GGML_ASSERT(rolling.lifetime.complete(rolling.lifetime.generation));
++            GGML_ASSERT(rolling.lifetime.consume(p->layer, rolling.lifetime.generation));
++        }
++    }
+     int promoted = 0;
+     for (int64_t e = 0; e < n_expert_total; e++) {
+         if (!ggml_bitset_get(used_ids.data(), e) || p->where.count((int32_t) e)) {
+@@ -2147,6 +2329,17 @@ static int sched_moe_rolling_promote(ggml_backend_sched_t sched, sched_moe_pool
+         ggml_backend_tensor_copy_async(pf, pf, &src, &dst);
+         promoted++;
+     }
++    if (st.schedule && promoted) {
++        auto & device = st.devices[p->backend_id];
++        (ready ? device.ready_hits : device.pending_hits) += promoted;
++        device.promoted_bytes += (uint64_t) promoted * p->expert_size;
++        if (!ready && !rolling.backed_off) {
++            rolling.backed_off = true;
++            for (size_t i = 0; i < device.geometry.size(); ++i) {
++                if (device.geometry[i].id == p->layer) device.plan.layers[i].copy_budget_ms *= .5;
++            }
++        }
++    }
+     if (promoted > 0) {
+         if (p->ev == nullptr) {
+             p->ev = ggml_backend_event_new(ggml_backend_get_device(pf));
+@@ -2187,7 +2380,7 @@ static void sched_moe_issue_layer_siblings(ggml_backend_sched_t sched, const str
+     for (auto & kv : st.pools) {
+         sched_moe_pool * q = kv.second.get();
+         if (q == nullptr || q->layer != layer || q->weight == nullptr || q->weight == input ||
+-            q->backend_id < 0 || q->cap < n_used || q->weight->ne[2] != n_expert_total) {
++            q->backend_id < 0 || q->cap < n_used || !st.current_weights.count(kv.first) || q->weight->ne[2] != n_expert_total) {
+             continue;
+         }
+         // Only pools this graph has NOT served yet. A pool served earlier in
+@@ -2214,6 +2407,7 @@ static void sched_moe_issue_layer_siblings(ggml_backend_sched_t sched, const str
+         // the coming serve of this pool will be tick+1: mark the slots as used
+         // AND pinned for it, so it treats them as hits and never evicts them
+         const uint64_t next_tick = q->tick + 1;
++        auto * copy_sample = sched_moe_schedule_begin(sched, q->backend_id, pf, q);
+         int issued = 0;
+         for (int64_t e = 0; e < n_expert_total; e++) {
+             if (!ggml_bitset_get(used_ids.data(), e)) {
+@@ -2248,6 +2442,8 @@ static void sched_moe_issue_layer_siblings(ggml_backend_sched_t sched, const str
+                 (size_t) slot * q->expert_size, q->expert_size);
+             issued++;
+         }
++        sched_moe_schedule_end(copy_sample, pf, (size_t) issued);
++        if (st.schedule) st.devices[q->backend_id].exact_bytes += (uint64_t) issued * q->expert_size;
+         if (issued > 0 && q->ev) {
+             ggml_backend_event_record(q->ev, pf);
+             q->ev_pending = true;
+@@ -2258,10 +2454,16 @@ static void sched_moe_issue_layer_siblings(ggml_backend_sched_t sched, const str
+     // was promoted above. All device-to-device copies are now ahead of the
+     // next prediction on the same prefetch stream, so the shared bytes can roll
+     // forward immediately without waiting on the host.
+-    if (st.rolling.layer == layer) {
+-        st.rolling.layer = -1;
+-        st.rolling.backend_id = -1;
+-        st.rolling.segments.clear();
++    for (int b = 0; b < sched->n_backends; ++b) {
++        auto * r = sched_moe_schedule_rolling(sched, b, layer);
++        if (!r) continue;
++        if (st.schedule) {
++            ggml_backend_event_record(r->retired, st.prefetch_backend[b]);
++            GGML_ASSERT(r->lifetime.retire());
++        } else {
++            r->segments.clear();
++        }
++        r->layer = r->backend_id = -1;
+     }
+ }
+ 
+@@ -2285,6 +2487,7 @@ static bool sched_moe_pool_serve(ggml_backend_sched_t sched, struct ggml_backend
+                    input->name, expert_size);
+     }
+     p->served_seq = sched->moe->graph_seq;
++    p->active_experts = std::max(p->active_experts, (size_t) ids_tensor->ne[0]);
+     int n_used = 0;
+     for (int64_t e = 0; e < n_expert; e++) {
+         if (ggml_bitset_get(used_ids.data(), e)) {
+@@ -2315,6 +2518,12 @@ static bool sched_moe_pool_serve(ggml_backend_sched_t sched, struct ggml_backend
+             p->node = nd;
+             p->orig_ids = nd->src[2];
+         }
++        const auto * next_weight = fits ? &p->pool : stg;
++        const auto * next_ids = fits ? &p->ids : (nd == p->node && p->orig_ids ? p->orig_ids : nd->src[2]);
++        if (nd->src[0] != next_weight || nd->src[2] != next_ids) {
++            // Pool/staging transitions also change captured kernel arguments.
++            split->graph.uid = ggml_graph_next_uid();
++        }
+         if (!fits) {
+             nd->src[0] = stg;
+             if (nd == p->node && p->orig_ids) {
+@@ -2372,6 +2581,8 @@ static bool sched_moe_pool_serve(ggml_backend_sched_t sched, struct ggml_backend
+     // prefetch carry a fresh slot_last, so they go last, but they are never
+     // pinned: a wrong prediction must not be able to starve a real miss
+     // (n_used <= cap, so an unpinned slot always exists).
++    auto * copy_sample = sched_moe_schedule_begin(sched, split_backend_id, split_backend, p);
++    size_t sample_misses = 0;
+     for (int64_t e = 0; e < n_expert; e++) {
+         if (!ggml_bitset_get(used_ids.data(), e) || p->where.count((int32_t) e)) {
+             continue;
+@@ -2393,9 +2604,12 @@ static bool sched_moe_pool_serve(ggml_backend_sched_t sched, struct ggml_backend
+         p->slot_pin[slot] = p->tick;
+         p->where[(int32_t) e] = slot;
+         p->misses++;
++        ++sample_misses;
+         ggml_backend_tensor_set_async(split_backend, &p->pool,
+             (const uint8_t *) input->data + (size_t) e * expert_size, (size_t) slot * expert_size, expert_size);
+     }
++    sched_moe_schedule_end(copy_sample, split_backend, sample_misses);
++    if (sched->moe->schedule) sched->moe->devices[split_backend_id].exact_bytes += sample_misses * p->expert_size;
+     // slot-remapped ids, contiguous [k, n_tokens]
+     const int64_t k = ids_tensor->ne[0];
+     const int64_t nt = ids_tensor->ne[1];
+@@ -2410,6 +2624,8 @@ static bool sched_moe_pool_serve(ggml_backend_sched_t sched, struct ggml_backend
+         memset(&p->ids, 0, sizeof(p->ids));
+     }
+     if (p->ids.data == nullptr || p->ids.ne[0] != k || p->ids.ne[1] != nt) {
++        // The tensor object can survive a buffer or shape change across cached graphs.
++        split->graph.uid = ggml_graph_next_uid();
+         ggml_backend_buffer_t keep = p->ids_buf;
+         memset(&p->ids, 0, sizeof(p->ids));
+         p->ids.type = GGML_TYPE_I32;
+@@ -3260,6 +3476,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                         if (pool_served) {
+                             sched->moe->weights[src->name] = src;
+                             sched->moe->max_weight_bytes = std::max(sched->moe->max_weight_bytes, ggml_nbytes(src));
++                            auto & device = sched->moe->devices[cur_backend_id];
++                            device.max_weight_bytes = std::max(device.max_weight_bytes, ggml_nbytes(src));
+                         }
+                         for (int c = 0; c < sched->n_copies; c++) {
+                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
+@@ -3985,7 +4203,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         }
+         if (!sched->callback_eval) {
+             SCHED_PROF_T(t_submit);
++            auto * compute_sample = sched_moe_schedule_begin(sched, split_backend_id, split_backend);
+             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
++            sched_moe_schedule_end(compute_sample, split_backend);
+             if (pr) {
+                 ggml_backend_dev_t submit_dev = ggml_backend_get_device(split_backend);
+                 const enum ggml_backend_dev_type submit_type = submit_dev
+@@ -4289,6 +4509,9 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
+     }
+ 
+     const enum ggml_status status = ggml_backend_sched_compute_splits(sched);
++    if (sched->moe && sched->moe->timing.pending) {
++        sched->moe->timing.successful = status == GGML_STATUS_SUCCESS;
++    }
+     if (status == GGML_STATUS_SUCCESS && sched->moe_auto) {
+         sched_moe_auto_state * st = sched->moe_auto;
+         if (sched_moe_auto_complete(st)) {
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 25d9fca..581d6c7 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2000,15 +2000,31 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             const char * e = getenv("GGML_MOE_PREGATE");
+             return e && atoi(e) > 0 ? 1 : 0;
+         }();
++        static const bool schedule = [] {
++            const char * e = getenv("GGML_MOE_SCHEDULE");
++            return e && atoi(e) > 0;
++        }();
+         const auto & nl = model->layers[il + pregate_horizon];
+         const auto * current_router = model->layers[il].ffn_gate_inp;
++        const auto host_experts = [](const ggml_tensor * t) {
++            if (!t || !t->buffer) return false;
++            const auto buft = ggml_backend_buffer_get_type(t->buffer);
++            const auto dev = ggml_backend_buft_get_device(buft);
++            return ggml_backend_buffer_is_host(t->buffer) ||
++                (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU);
++        };
++        const bool scheduled_prediction = schedule && cur->ne[1] == 1 &&
++            (host_experts(up_exps) || host_experts(gate_up_exps)) &&
++            (host_experts(nl.ffn_up_exps) || host_experts(nl.ffn_gate_up_exps));
+         // A scheduler-side skip is too late: expanding this otherwise-unused
+         // node already makes a remote router an RPC graph dependency. At an
+         // owner boundary that sends an extra hidden state and adds a round trip
+         // before the real layer-boundary transfer. Predict only within the same
+         // owner and actual router buffer type (including explicit placements).
+-        const bool local_prediction = pregate && current_router && nl.ffn_gate_inp &&
++        const bool local_prediction = (pregate || scheduled_prediction) && current_router && nl.ffn_gate_inp &&
+             current_router->buffer && nl.ffn_gate_inp->buffer &&
++            nl.ffn_gate_inp->ne[0] == cur->ne[0] &&
++            nl.ffn_gate_inp->ne[1] == n_expert &&
+             model->dev_layer(il) == model->dev_layer(il + pregate_horizon) &&
+             ggml_backend_buffer_get_type(current_router->buffer) ==
+                 ggml_backend_buffer_get_type(nl.ffn_gate_inp->buffer);
+diff --git a/ggml/src/ggml-moe-schedule.h b/ggml/src/ggml-moe-schedule.h
+new file mode 100644
+--- /dev/null
++++ b/ggml/src/ggml-moe-schedule.h
+@@ -0,0 +1,278 @@
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++#include <cstddef>
++#include <cstdint>
++#include <limits>
++#include <vector>
++
++// Pure policy. All geometry and timing inputs belong to one owner device.
++namespace ggml_moe_schedule {
++
++static inline bool add(size_t a, size_t b, size_t & out) {
++    if (a > SIZE_MAX - b) return false;
++    out = a + b;
++    return true;
++}
++
++static inline bool mul(size_t a, size_t b, size_t & out) {
++    if (b && a > SIZE_MAX / b) return false;
++    out = a * b;
++    return true;
++}
++
++static inline bool align(size_t a, size_t alignment, size_t & out) {
++    if (!alignment) return false;
++    const size_t rem = a % alignment;
++    return add(a, rem ? alignment - rem : 0, out);
++}
++
++struct samples {
++    static constexpr size_t capacity = 32;
++    std::vector<double> values;
++    size_t next = 0;
++
++    bool push(double ms) {
++        if (!std::isfinite(ms) || ms < 0) return false;
++        if (values.size() < capacity) values.push_back(ms);
++        else values[next] = ms;
++        next = (next + 1) % capacity;
++        return true;
++    }
++
++    double quantile(double q, size_t minimum = 8) const {
++        if (values.size() < minimum || !(q > 0 && q <= 1)) return -1;
++        auto sorted = values;
++        std::sort(sorted.begin(), sorted.end());
++        return sorted[(size_t) std::ceil(q * sorted.size()) - 1];
++    }
++};
++
++struct part {
++    size_t bytes = 0;          // Actual expert stride, not a GGUF file span.
++    double copy_ms = -1;       // Measured cost of one copy of this part.
++};
++
++struct layer {
++    int id = -1;
++    size_t experts = 0;
++    size_t active = 0;         // Minimum resident capacity for exact repair.
++    double window_ms = -1;     // Independent compute, measured without prediction copies.
++    std::vector<part> parts;
++};
++
++struct allocation {
++    size_t resident = 0;
++    size_t rolling = 0;
++    size_t rolling_bytes = 0;
++    double copy_budget_ms = 0;
++};
++
++struct plan {
++    bool valid = false;
++    const char * reason = "invalid-input";
++    size_t bank_bytes = 0;
++    size_t staging_bytes = 0;
++    size_t resident_bytes = 0;
++    size_t total_bytes = 0;
++    std::vector<allocation> layers;
++};
++
++static inline bool layer_bytes(const layer & l, size_t slots, size_t alignment,
++                               size_t tail, size_t & bytes) {
++    bytes = 0;
++    if (!slots) return true;
++    for (const auto & p : l.parts) {
++        size_t payload = 0;
++        if (!mul(slots, p.bytes, payload) || !add(payload, tail, payload) ||
++            !align(bytes, alignment, bytes) || !add(bytes, payload, bytes)) return false;
++    }
++    return align(bytes, alignment, bytes);
++}
++
++// Reserve the time-sized rolling banks first, then distribute resident slots.
++// Prefill and decode are mutually exclusive, so they share max(prefill, 2 banks).
++static inline plan make_plan(const std::vector<layer> & layers, size_t budget,
++                             size_t prefill_bytes, size_t alignment, size_t tail,
++                             double headroom = 0.9) {
++    plan out;
++    if (layers.empty() || !alignment || !std::isfinite(headroom) ||
++        !(headroom > 0 && headroom <= 1)) return out;
++    out.layers.resize(layers.size());
++    std::vector<size_t> wanted(layers.size());
++    for (size_t i = 0; i < layers.size(); ++i) {
++        const auto & l = layers[i];
++        if (!l.experts || !l.active || l.active > l.experts || l.parts.empty()) return out;
++        for (size_t j = 0; j < i; ++j) if (l.id == layers[j].id) return out;
++        double cost = 0;
++        bool measured = std::isfinite(l.window_ms) && l.window_ms >= 0;
++        for (const auto & p : l.parts) {
++            if (!p.bytes) return out;
++            if (!std::isfinite(p.copy_ms) || p.copy_ms <= 0) measured = false;
++            cost += p.copy_ms;
++        }
++        if (measured && std::isfinite(cost) && cost > 0) {
++            out.layers[i].copy_budget_ms = l.window_ms * headroom;
++            const double count = std::floor(out.layers[i].copy_budget_ms / cost);
++            wanted[i] = count >= (double) l.experts ? l.experts : (size_t) count;
++        }
++    }
++
++    // Integer fractions make the memory search monotone and reproducible.
++    const size_t scale = 1000000;
++    auto evaluate = [&](size_t rolling_fraction, size_t resident_fraction, plan & p) {
++        p.bank_bytes = p.resident_bytes = 0;
++        for (size_t i = 0; i < layers.size(); ++i) {
++            const auto & l = layers[i];
++            auto & a = p.layers[i];
++            size_t scaled = 0;
++            if (!mul(wanted[i], rolling_fraction, scaled)) return false;
++            a.rolling = scaled / scale;
++            if (!mul(l.experts - l.active, resident_fraction, scaled)) return false;
++            a.resident = l.active + scaled / scale;
++            if (!layer_bytes(l, a.rolling, alignment, tail, a.rolling_bytes)) return false;
++            p.bank_bytes = std::max(p.bank_bytes, a.rolling_bytes);
++            size_t bytes = 0;
++            if (!layer_bytes(l, a.resident, alignment, tail, bytes) ||
++                !add(p.resident_bytes, bytes, p.resident_bytes)) return false;
++        }
++        if (!mul(p.bank_bytes, 2, p.staging_bytes)) return false;
++        p.staging_bytes = std::max(p.staging_bytes, prefill_bytes);
++        return add(p.resident_bytes, p.staging_bytes, p.total_bytes) && p.total_bytes <= budget;
++    };
++    if (!evaluate(0, 0, out)) {
++        out.reason = "exact-repair-does-not-fit";
++        return out;
++    }
++    auto search = [&](bool rolling, size_t fixed) {
++        size_t lo = 0, hi = scale;
++        while (lo < hi) {
++            const size_t mid = lo + (hi - lo + 1) / 2;
++            if (evaluate(rolling ? mid : fixed, rolling ? 0 : mid, out)) lo = mid;
++            else hi = mid - 1;
++        }
++        return lo;
++    };
++    const size_t rolling_fraction = search(true, 0);
++    const size_t resident_fraction = search(false, rolling_fraction);
++    if (!evaluate(rolling_fraction, resident_fraction, out)) return out;
++
++    // Equal coverage can strand several whole slots when multiple layers round
++    // up together. Spend that remainder without growing either rolling bank.
++    // Prefer cheaper next slots; binary search bounds work even for large counts.
++    struct refill { size_t index, next_bytes; };
++    std::vector<refill> order;
++    for (size_t i = 0; i < layers.size(); ++i) {
++        if (out.layers[i].resident == layers[i].experts) continue;
++        size_t current = 0, next = 0;
++        if (layer_bytes(layers[i], out.layers[i].resident, alignment, tail, current) &&
++            layer_bytes(layers[i], out.layers[i].resident + 1, alignment, tail, next)) {
++            order.push_back({i, next - current});
++        }
++    }
++    std::sort(order.begin(), order.end(), [](const refill & a, const refill & b) {
++        return a.next_bytes != b.next_bytes ? a.next_bytes < b.next_bytes : a.index < b.index;
++    });
++    // Repair the common fractional rounding before letting one layer use more.
++    for (const auto & entry : order) {
++        if (entry.next_bytes <= budget - out.total_bytes) {
++            ++out.layers[entry.index].resident;
++            out.resident_bytes += entry.next_bytes;
++            out.total_bytes += entry.next_bytes;
++        }
++    }
++    for (const auto & entry : order) {
++        const size_t i = entry.index;
++        auto & a = out.layers[i];
++        const size_t remaining = budget - out.total_bytes;
++        size_t current = 0;
++        if (!layer_bytes(layers[i], a.resident, alignment, tail, current)) return out;
++        size_t lo = a.resident, hi = layers[i].experts;
++        while (lo < hi) {
++            const size_t mid = lo + (hi - lo + 1) / 2;
++            size_t bytes = 0;
++            if (layer_bytes(layers[i], mid, alignment, tail, bytes) && bytes - current <= remaining) lo = mid;
++            else hi = mid - 1;
++        }
++        size_t bytes = 0;
++        if (!layer_bytes(layers[i], lo, alignment, tail, bytes)) return out;
++        a.resident = lo;
++        out.resident_bytes += bytes - current;
++        out.total_bytes += bytes - current;
++    }
++    out.valid = true;
++    out.reason = "ok";
++    return out;
++}
++
++struct candidate {
++    size_t part_index = 0;
++    bool resident = false;
++};
++
++struct admission {
++    std::vector<int> slots;     // -1 means not copied; resident entries consume no slot.
++    size_t bytes = 0;
++    double copy_ms = 0;
++};
++
++static inline admission admit(const layer & l, const allocation & a,
++                               const std::vector<candidate> & candidates) {
++    admission out;
++    out.slots.assign(candidates.size(), -1);
++    std::vector<size_t> used(l.parts.size());
++    if (!std::isfinite(a.copy_budget_ms) || a.copy_budget_ms <= 0) return out;
++    for (size_t i = 0; i < candidates.size(); ++i) {
++        const auto & c = candidates[i];
++        if (c.resident || c.part_index >= l.parts.size()) continue;
++        const auto & p = l.parts[c.part_index];
++        size_t bytes = 0;
++        if (!p.bytes || !std::isfinite(p.copy_ms) || p.copy_ms <= 0 ||
++            used[c.part_index] >= a.rolling || used[c.part_index] > INT32_MAX ||
++            p.copy_ms > a.copy_budget_ms - out.copy_ms || !add(out.bytes, p.bytes, bytes)) continue;
++        out.slots[i] = (int) used[c.part_index]++;
++        out.copy_ms += p.copy_ms;
++        out.bytes = bytes;
++    }
++    return out;
++}
++
++// Event completion comes from the backend. Allocation or submission is not readiness.
++enum class bank_state { free, filling, ready, consuming, retiring };
++struct bank {
++    bank_state state = bank_state::free;
++    uint64_t generation = 0;
++    int layer = -1;
++
++    bool begin(int next_layer) {
++        if (state != bank_state::free || next_layer < 0 || generation == UINT64_MAX) return false;
++        ++generation;
++        layer = next_layer;
++        state = bank_state::filling;
++        return true;
++    }
++    bool complete(uint64_t ticket) {
++        if (ticket != generation || state != bank_state::filling) return false;
++        state = bank_state::ready;
++        return true;
++    }
++    bool consume(int target, uint64_t ticket) {
++        if (ticket != generation || target != layer || state != bank_state::ready) return false;
++        state = bank_state::consuming;
++        return true;
++    }
++    bool retire() {
++        if (state != bank_state::consuming && state != bank_state::ready && state != bank_state::filling) return false;
++        state = bank_state::retiring;
++        return true;
++    }
++    bool release(uint64_t ticket, bool readers_done) {
++        if (ticket != generation || !readers_done || state != bank_state::retiring) return false;
++        state = bank_state::free;
++        layer = -1;
++        return true;
++    }
++};
++
++} // namespace ggml_moe_schedule
+diff --git a/ggml/src/ggml-moe-schedule-runtime.h b/ggml/src/ggml-moe-schedule-runtime.h
+new file mode 100644
+--- /dev/null
++++ b/ggml/src/ggml-moe-schedule-runtime.h
+@@ -0,0 +1,219 @@
++#pragma once
++
++static bool sched_moe_pool_order(const sched_moe_pool * a, const sched_moe_pool * b) {
++    const auto priority = [](const char * name) {
++        if (strstr(name, ".ffn_gate_exps") || strstr(name, ".ffn_gate_up_exps")) return 0;
++        if (strstr(name, ".ffn_up_exps")) return 1;
++        if (strstr(name, ".ffn_down_exps")) return 2;
++        return 3;
++    };
++    const int pa = priority(a->pool.name), pb = priority(b->pool.name);
++    return pa != pb ? pa < pb : strcmp(a->pool.name, b->pool.name) < 0;
++}
++
++static sched_moe_schedule_sample * sched_moe_schedule_begin(ggml_backend_sched_t sched,
++        int backend_id, ggml_backend_t stream, const sched_moe_pool * pool = nullptr) {
++    if (!sched->moe || !sched->moe->schedule || !sched->moe->timing.active) return nullptr;
++    auto & tm = sched->moe->timing;
++    if (!tm.event_new[backend_id] || tm.source[backend_id] < 0) return nullptr;
++    const size_t index = tm.sample_count++;
++    if (index == tm.samples.size()) tm.samples.emplace_back();
++    auto & s = tm.samples[index];
++    if (s.backend_id != backend_id) {
++        if (s.begin) ggml_backend_event_free(s.begin);
++        if (s.end) ggml_backend_event_free(s.end);
++        s.begin = s.end = nullptr;
++    }
++    if (!s.begin) {
++        const auto dev = ggml_backend_get_device(stream);
++        s.begin = tm.event_new[backend_id](dev);
++        s.end = tm.event_new[backend_id](dev);
++    }
++    s.backend_id = backend_id;
++    s.source = tm.source[backend_id];
++    s.copy_key = pool ? pool->copy_key : "";
++    s.count = 0;
++    ggml_backend_event_record(s.begin, stream);
++    return &s;
++}
++
++static void sched_moe_schedule_end(sched_moe_schedule_sample * s, ggml_backend_t stream, size_t count = 0) {
++    if (!s) return;
++    s->count = count;
++    ggml_backend_event_record(s->end, stream);
++}
++
++static bool sched_moe_schedule_samples_done(const sched_moe_timing & tm) {
++    for (size_t i = 0; i < tm.sample_count; ++i) {
++        const auto & s = tm.samples[i];
++        if (tm.elapsed[s.backend_id](s.begin, s.end) < 0) return false;
++    }
++    return true;
++}
++
++static void sched_moe_schedule_learn(ggml_backend_sched_t sched) {
++    auto & st = *sched->moe;
++    auto & tm = st.timing;
++    if (!st.schedule || !tm.successful) return;
++    // Active samples are always no-prediction-copy controls. Never turn a miss stall into credit.
++    for (size_t i = 0; i < tm.sample_count; ++i) {
++        const auto & s = tm.samples[i];
++        if (!s.copy_key.empty() && s.count) {
++            const double ms = tm.elapsed[s.backend_id](s.begin, s.end);
++            if (ms > 0) st.devices[s.backend_id].copies[s.copy_key].push(ms / s.count);
++        }
++    }
++    if (tm.graph <= 8) return; // Cache-cold copies are useful; cold graph execution is not overlap credit.
++    bool measured = false;
++    for (const auto & kv : tm.records) {
++        const auto & r = kv.second;
++        const auto target = tm.records.find(r.target);
++        if (!r.route_set || !r.ready_set || !r.start_set || target == tm.records.end()) continue;
++        const auto & t = target->second;
++        if (!t.route_set || t.backend_id != r.backend_id) continue;
++        const auto elapsed = tm.elapsed[r.backend_id];
++        const double open = std::max(elapsed(r.route, r.ready), elapsed(r.route, r.start));
++        const double deadline = elapsed(r.route, t.route);
++        if (open < 0 || deadline < open) continue;
++        double compute = 0;
++        for (size_t i = 0; i < tm.sample_count; ++i) {
++            const auto & s = tm.samples[i];
++            if (!s.copy_key.empty() || s.backend_id != r.backend_id || s.source != r.layer) continue;
++            const double begin = elapsed(r.route, s.begin), end = elapsed(r.route, s.end);
++            if (begin < 0 || end < begin) continue;
++            compute += std::max(0.0, std::min(end, deadline) - std::max(begin, open));
++        }
++        st.devices[r.backend_id].windows[r.target].push(compute);
++        measured = true;
++    }
++    if (measured && ++tm.clean_samples % 8 == 0) st.schedule_replan = true;
++}
++
++static void sched_moe_schedule_apply(ggml_backend_sched_t sched) {
++    auto & st = *sched->moe;
++    if (!st.schedule || !st.schedule_replan || st.pools.size() != st.weights.size()) return;
++    st.schedule_replan = false;
++    for (int b = 0; b < sched->n_backends; ++b) {
++        auto & d = st.devices[b];
++        if (!d.staging || !st.timing.event_new[b]) continue;
++        std::vector<sched_moe_pool *> pools;
++        for (auto & kv : st.pools) if (kv.second && kv.second->backend_id == b) pools.push_back(kv.second.get());
++        if (pools.empty()) continue;
++        std::sort(pools.begin(), pools.end(), [](const sched_moe_pool * a, const sched_moe_pool * c) {
++            return a->layer != c->layer ? a->layer < c->layer : sched_moe_pool_order(a, c);
++        });
++        size_t owned = ggml_backend_buffer_get_size(d.staging);
++        std::vector<ggml_moe_schedule::layer> geometry;
++        bool valid = true;
++        for (const auto * p : pools) {
++            if (p->layer < 0 || p->n_expert <= 0 || p->n_expert > INT_MAX ||
++                !ggml_moe_schedule::add(owned, ggml_backend_buffer_get_size(p->buf), owned)) {
++                valid = false;
++                break;
++            }
++            if (geometry.empty() || geometry.back().id != p->layer) {
++                ggml_moe_schedule::layer l;
++                l.id = p->layer;
++                l.experts = (size_t) p->n_expert;
++                l.window_ms = d.windows[l.id].quantile(.1);
++                geometry.push_back(l);
++            }
++            auto & l = geometry.back();
++            if (l.experts != (size_t) p->n_expert) { valid = false; break; }
++            l.active = std::max(l.active, p->active_experts);
++            l.parts.push_back({p->expert_size, d.copies[p->copy_key].quantile(.9)});
++        }
++        if (!valid) {
++            GGML_LOG_WARN("moe-schedule: device=%d incompatible expert geometry; retaining the exact-copy cache\n", b);
++            continue;
++        }
++        if (!d.budget_bytes) d.budget_bytes = owned;
++        size_t free = 0, total = 0;
++        ggml_backend_dev_memory(ggml_backend_get_device(sched->backends[b]), &free, &total);
++        const size_t reserve = 512ull << 20;
++        size_t available = owned;
++        if (free < reserve) available = owned > reserve - free ? owned - (reserve - free) : 0;
++        else if (!ggml_moe_schedule::add(owned, free - reserve, available)) available = SIZE_MAX;
++        const size_t budget = std::min(d.budget_bytes, available);
++        const size_t alignment = ggml_backend_buft_get_alignment(sched->bufts[b]);
++        auto plan = ggml_moe_schedule::make_plan(geometry, budget, d.max_weight_bytes + 512, alignment, 512);
++        if (!plan.valid) {
++            GGML_LOG_WARN("moe-schedule: device=%d no safe repartition (%s, budget=%zu); no new allocation\n", b, plan.reason, budget);
++            continue;
++        }
++        bool changed = plan.bank_bytes != d.bank_bytes;
++        size_t li = 0;
++        for (const auto * p : pools) {
++            while (geometry[li].id != p->layer) ++li;
++            changed = changed || (size_t) p->cap != plan.layers[li].resident;
++        }
++        if (changed) {
++            // Pool tensors are stable objects outside gallocr. Do not re-split or invalidate caller inputs.
++            ggml_backend_synchronize(sched->backends[b]);
++            if (st.prefetch_backend[b]) ggml_backend_synchronize(st.prefetch_backend[b]);
++            for (auto & r : d.rolling) {
++                r.layer = r.backend_id = -1;
++                r.segments.clear();
++                if (r.lifetime.state != ggml_moe_schedule::bank_state::free) {
++                    r.lifetime.retire();
++                    GGML_ASSERT(r.lifetime.release(r.lifetime.generation, true));
++                }
++            }
++            // Release old allocations first: old + new pools must not coexist above the VRAM budget.
++            for (auto * p : pools) {
++                ggml_backend_buffer_free(p->buf);
++                p->buf = nullptr;
++                p->pool.buffer = nullptr;
++                p->pool.data = nullptr;
++                p->staging.buffer = nullptr;
++                p->staging.data = nullptr;
++            }
++            ggml_backend_buffer_free(d.staging);
++            d.staging = ggml_backend_buft_alloc_buffer(sched->bufts[b], plan.staging_bytes);
++            if (!d.staging) GGML_ABORT("moe-schedule: device %d cannot allocate %zu staging bytes", b, plan.staging_bytes);
++            ggml_backend_buffer_clear(d.staging, 0);
++            li = 0;
++            for (auto * p : pools) {
++                while (geometry[li].id != p->layer) ++li;
++                p->cap = (int) plan.layers[li].resident;
++                const size_t bytes = (size_t) p->cap * p->expert_size + 512;
++                p->buf = ggml_backend_buft_alloc_buffer(sched->bufts[b], bytes);
++                if (!p->buf) GGML_ABORT("moe-schedule: device %d cannot allocate %zu bytes for %s", b, bytes, p->pool.name);
++                ggml_backend_buffer_clear(p->buf, 0);
++                p->pool.ne[2] = p->cap;
++                ggml_backend_tensor_alloc(p->buf, &p->pool, ggml_backend_buffer_get_base(p->buf));
++                p->where.clear();
++                p->slot_expert.assign(p->cap, -1);
++                p->slot_last.assign(p->cap, 0);
++                p->slot_pin.assign(p->cap, 0);
++                p->slot_hot.assign(p->cap, 0);
++                p->tick = p->served_seq = 0;
++                p->ev_pending = false;
++            }
++            // Backend graph caches may skip pointer checks for an unchanged uid.
++            for (int i = 0; i < sched->n_splits; ++i) {
++                if (sched->splits[i].backend_id == b) sched->splits[i].graph.uid = ggml_graph_next_uid();
++            }
++            ++st.schedule_epoch;
++        }
++        d.bank_bytes = plan.bank_bytes;
++        d.plan = std::move(plan);
++        d.geometry = std::move(geometry);
++        fprintf(stderr, "moe-schedule: device=%d epoch=%llu budget=%zu total=%zu resident=%zu staging=%zu bank=%zu changed=%d ready=%llu pending=%llu no-bank=%llu\n",
++                b, (unsigned long long) st.schedule_epoch, budget, d.plan.total_bytes, d.plan.resident_bytes,
++                d.plan.staging_bytes, d.bank_bytes, (int) changed, (unsigned long long) d.ready_hits,
++                (unsigned long long) d.pending_hits, (unsigned long long) d.no_bank);
++        for (size_t i = 0; i < d.geometry.size(); ++i) {
++            double copy_ms = 0;
++            for (const auto & part : d.geometry[i].parts) copy_ms += part.copy_ms;
++            fprintf(stderr, "moe-schedule-layer: device=%d layer=%d experts=%zu active=%zu resident=%zu rolling=%zu window-p10-ms=%.6f part-sum-p90-ms=%.6f budget-ms=%.6f\n",
++                    b, d.geometry[i].id, d.geometry[i].experts, d.geometry[i].active, d.plan.layers[i].resident,
++                    d.plan.layers[i].rolling, d.geometry[i].window_ms, copy_ms, d.plan.layers[i].copy_budget_ms);
++        }
++    }
++}
++
++static sched_moe_rolling * sched_moe_schedule_rolling(ggml_backend_sched_t sched, int backend, int layer) {
++    for (auto & r : sched->moe->devices[backend].rolling) if (r.layer == layer) return &r;
++    return nullptr;
++}

@@ -1977,6 +1977,71 @@ textarea {
   border: 1px solid var(--line);
 }
 
+/* Long model starts have no trustworthy percentage from llama.cpp. This bar
+   is deliberately indeterminate: its motion says the client is still watching,
+   while the label and elapsed clock carry the useful facts. */
+.startup-progress {
+  margin-top: 14px;
+  padding: 13px 15px;
+  border: 1px solid color-mix(in srgb, var(--electric) 32%, var(--line));
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--electric) 5%, var(--surface-2));
+}
+
+.startup-progress--compact {
+  margin: 0 0 12px;
+}
+
+.startup-progress__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.startup-progress__label {
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.startup-progress__elapsed {
+  flex: none;
+  color: var(--ink-faint);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.startup-progress__track {
+  height: 5px;
+  margin-top: 10px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--electric) 13%, var(--line));
+}
+
+.startup-progress__track > i {
+  display: block;
+  width: 38%;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, transparent, var(--electric), transparent);
+  animation: startup-scan 1.55s ease-in-out infinite;
+}
+
+@keyframes startup-scan {
+  from { transform: translateX(-110%); }
+  to { transform: translateX(265%); }
+}
+
+.startup-progress__detail {
+  max-width: 72ch;
+  margin: 9px 0 0;
+  color: var(--ink-dim);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .spinner--sm {
   width: 15px;
   height: 15px;
@@ -2777,9 +2842,8 @@ textarea {
   margin-top: 0;
 }
 
-/* Dense models show accelerator + VRAM. MoE adds RAM as a third column because
-   single-machine expert offload can consume it; auto-fit keeps both layouts
-   balanced without a second card variant. */
+/* GPU-only shows accelerator + VRAM. Hybrid adds its separate host-memory pool;
+   architecture alone does not decide the card shape. */
 .node-strip {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
@@ -2817,6 +2881,16 @@ textarea {
 .nstat--gpu .nstat__v {
   font-family: var(--font-display);
   letter-spacing: -0.01em;
+}
+
+.nstat--cpu .nstat__v {
+  overflow: hidden;
+  font-family: var(--font-display);
+  font-size: 14px;
+  line-height: 1.35;
+  letter-spacing: -0.01em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .nstat__sub {
@@ -2864,10 +2938,92 @@ textarea {
 }
 
 .capacity__mode {
-  margin: 9px 0 0;
+  margin: 0;
   font-size: 11.5px;
+  font-weight: 600;
   line-height: 1.5;
   color: var(--ink-dim);
+}
+
+/* Two aligned physical pools, not little nested cards and never one invented
+   VRAM+RAM total. The labels stay quiet; the independently comparable numbers
+   carry the hierarchy. */
+.capacity__resources {
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.capacity__resources--headless {
+  border-top: 0;
+}
+
+.capacity__resource {
+  display: grid;
+  grid-template-columns: minmax(58px, 72px) minmax(0, 1fr);
+  grid-template-rows: auto auto;
+  gap: 8px 14px;
+  align-items: stretch;
+  padding: 12px 0;
+}
+
+.capacity__resource + .capacity__resource {
+  border-top: 1px solid var(--line);
+}
+
+.capacity__resource-kind {
+  grid-row: 1 / span 2;
+  display: flex;
+  align-items: center;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.capacity__resource-stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(96px, 1fr));
+  gap: 12px;
+}
+
+.capacity__resource-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--ink-faint);
+}
+
+.capacity__resource-stat strong {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.capacity__resource-stat strong.capacity__gap {
+  color: #b45309;
+}
+
+[data-theme="dark"] .capacity__resource-stat strong.capacity__gap {
+  color: var(--spark-2);
+}
+
+.capacity__spine {
+  height: 52px;
+  margin: 0;
+}
+
+@media (max-width: 520px) {
+  .capacity__resource {
+    grid-template-columns: minmax(48px, 58px) minmax(0, 1fr);
+    gap: 8px 10px;
+  }
+
+  .capacity__resource-stats {
+    gap: 8px;
+  }
 }
 
 /* The one line under the layer bar: fits, or it doesn't. Green/amber rather
@@ -2887,12 +3043,12 @@ textarea {
 [data-theme="dark"] .capacity__verdict--no { color: var(--spark-2); }
 
 .capacity__gap {
-  color: var(--electric-ink);
+  color: #b45309;
   font-weight: 600;
 }
 
 [data-theme="dark"] .capacity__gap {
-  color: var(--electric-2);
+  color: var(--spark-2);
 }
 
 .capacity__ok {
@@ -2979,6 +3135,15 @@ textarea {
 
 .cluster-model__change {
   margin-left: auto;
+}
+
+/* Paired: the Change link's place is taken by the reason a pick would be
+   ignored (a cluster is rebuilt around one model), in the same muted voice as
+   the precision chip so it reads as a fact, not a control. */
+.cluster-model__paired {
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--ink-dim);
 }
 
 /* The checkbox and the Change link BOTH take an auto margin, so the free space
@@ -3128,6 +3293,19 @@ textarea {
 .modelpick__item.is-on {
   border-color: var(--line-strong);
   background: var(--surface-2);
+}
+/* The chosen MODEL row reads as chosen from across the room (2026-09-07,
+   owner's call: the grey tint above was easy to miss, and the precision
+   dropdown below the list belongs to exactly this row). Family rows keep the
+   quiet style: theirs only says "the current model lives here". */
+.modelpick__item.is-on:not(.modelpick__family) {
+  border-color: var(--amber);
+  background: color-mix(in srgb, var(--amber) 12%, var(--surface));
+  box-shadow: inset 3px 0 0 var(--amber);
+}
+.modelpick__item.is-on:not(.modelpick__family) .modelpick__name {
+  color: var(--amber);
+  font-weight: 700;
 }
 
 .modelpick__family {
@@ -3550,6 +3728,10 @@ textarea {
   gap: 20px;
 }
 
+.chat--bar-collapsed {
+  gap: 0;
+}
+
 /* The thread fills the space left of the sidebar and CENTERS its readable
    measure in it. It used to be `max-width: 860px` with no centering, so on a
    maximised window the conversation hugged the sidebar with a few hundred
@@ -3620,6 +3802,27 @@ textarea {
   margin: 0 auto;
   padding: 0 0 10px;
   border-bottom: 1px solid var(--line);
+}
+
+.chatbar__toggle {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--ink-faint);
+  cursor: pointer;
+}
+
+.chatbar__toggle:hover,
+.chatbar__toggle:focus-visible {
+  border-color: var(--line);
+  background: var(--surface-2);
+  color: var(--ink);
 }
 
 .chat__head-change {
@@ -3752,6 +3955,10 @@ textarea {
   min-width: 0;
   padding-right: 18px;
   border-right: 1px solid var(--line);
+}
+
+.chatbar[hidden] {
+  display: none;
 }
 
 .chatbar__new { width: 100%; }

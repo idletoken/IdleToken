@@ -50,6 +50,60 @@
 #define IDLETOKEN_METAL_WORKSPACE_BYTES (512ull * 1024ull * 1024ull)          /* 0.5 GB */
 #define IDLETOKEN_RAM_SAFETY_BYTES      (4ull * 1024ull * 1024ull * 1024ull)  /* 4.0 GB */
 
+/* Windows WDDM limits each process's NON-LOCAL video-memory budget. For the
+ * CUDA host buffers used by MoE Hybrid, cudaHostAlloc stops succeeding near
+ * this line even when ordinary system RAM is still free. Microsoft's graphics-
+ * memory formula ("Total system memory available for graphics") is:
+ *
+ *   shared = min(RAM * 80%, max(RAM - 16 GiB, RAM * 50%))
+ *
+ * In piecewise form: <=32 GiB uses half of RAM, 32..80 GiB reserves a fixed
+ * 16 GiB, and >80 GiB uses 80%. The additional 0.75 GiB below is NOT part of
+ * Microsoft's formula. It is IdleToken's measured gap/headroom between that
+ * graphics-memory ceiling and the largest reliable cudaHostAlloc working set,
+ * confirmed against QueryVideoMemoryInfo and cudaHostAlloc on both Windows
+ * test nodes (2026-09-07):
+ *
+ *   budget = shared - 0.75 GiB
+ *
+ * Keep this helper platform-independent so the native/client parity gate can
+ * exercise the exact byte arithmetic on macOS/Linux. A live engine probe is
+ * still preferred because a driver may lower the OS budget; this is the cheap
+ * pre-flight estimate and the fail-safe fallback when that probe cannot run. */
+#define IDLETOKEN_WDDM_FIXED_RESERVE_BYTES (16ull * 1024ull * 1024ull * 1024ull)
+#define IDLETOKEN_WDDM_BUDGET_MARGIN_BYTES ( 3ull * 1024ull * 1024ull * 1024ull / 4ull)
+
+static inline uint64_t idletoken_windows_pinnable_budget(uint64_t ram_total) {
+    /* floor(4 * RAM / 5), written without a potentially overflowing multiply. */
+    const uint64_t eighty_pct = (ram_total / 5ull) * 4ull +
+                                 ((ram_total % 5ull) * 4ull) / 5ull;
+    const uint64_t half = ram_total / 2ull;
+    const uint64_t minus_fixed = ram_total > IDLETOKEN_WDDM_FIXED_RESERVE_BYTES
+        ? ram_total - IDLETOKEN_WDDM_FIXED_RESERVE_BYTES : 0;
+    const uint64_t lower_bound = minus_fixed > half ? minus_fixed : half;
+    const uint64_t shared = eighty_pct < lower_bound ? eighty_pct : lower_bound;
+    return shared > IDLETOKEN_WDDM_BUDGET_MARGIN_BYTES
+        ? shared - IDLETOKEN_WDDM_BUDGET_MARGIN_BYTES : 0;
+}
+
+/* Host RAM that can be advertised as the fast, RAM-resident expert tier in a
+ * pre-launch UI. The normal ram_usable subtraction and the WDDM ceiling are
+ * independent gates, so Windows takes their minimum. Unified-memory machines
+ * have no second pool and contribute zero here. */
+static inline uint64_t idletoken_ram_expert_usable(uint64_t ram_total,
+                                                   uint64_t ram_usable,
+                                                   uint64_t ram_pinnable,
+                                                   bool is_windows,
+                                                   bool unified_memory) {
+    if (unified_memory) return 0;
+    if (!is_windows) return ram_usable;
+    /* A cached engine probe is the measured lower bound and therefore wins.
+     * The closed form is only the pre-measurement fallback. */
+    const uint64_t pinnable = ram_pinnable > 0
+        ? ram_pinnable : idletoken_windows_pinnable_budget(ram_total);
+    return pinnable < ram_usable ? pinnable : ram_usable;
+}
+
 /* Headroom the machine keeps for itself, as an ABSOLUTE amount — applied on
  * top of the "total − used_other − safety" subtraction, and only ever as a
  * backstop.
@@ -233,22 +287,33 @@ typedef struct {
     uint64_t ram_total;
     uint64_t ram_used_other;     /* MemTotal - MemAvailable */
     uint64_t ram_usable;         /* ram_total - ram_used_other - safety */
-    /* Legacy measured ceiling on pinned (cudaHostAlloc) host memory; 0 =
-     * unknown. The retired generic layer-spill backend used this field. The
-     * llama.cpp MoE-only Hybrid path mmaps expert weights and is bounded by
-     * ram_usable instead; clusters never add either host pool to GPU capacity.
-     * It is retained on the wire for compatibility and historical diagnostics.
+    /* Measured ceiling on pinned (cudaHostAlloc) host memory; 0 = unknown.
+     * Since 2026-09-07 the llama.cpp MoE Hybrid planner caps the routed
+     * experts it keeps in a node's RAM at min(ram_usable, ram_pinnable): the
+     * engine stores them in the GPU's page-locked host buffers and silently
+     * drops to pageable memory, several times slower over PCIe, when the lock
+     * fails. Clusters never add either host pool to GPU capacity.
      *
-     * The old path showed why physical RAM cannot stand in for pinned RAM: it is
-     * far below physical RAM and not derivable from it: measured 47616 MiB on a
-     * 65190 MiB box (73.0%) and 23552 MiB on a 48897 MiB box (48.2%), same GPU
-     * model, each exactly reproducible across runs. Neither physical memory
-     * (the smaller box still had 22 GiB free when it failed), nor the commit
-     * limit, nor pagefile size predicts it.
+     * What the number is (2026-09-07, DXGI QueryVideoMemoryInfo on both
+     * testbed boxes + Microsoft "Calculating Graphics Memory"): on Windows it
+     * is WDDM's per-process NON-LOCAL memory budget,
+     *   SharedSystemMemory = MIN(RAM * 80 %, MAX(RAM - 16 GiB, RAM * 50 %)),
+     *   budget = SharedSystemMemory - 0.75 GiB,
+     * and cudaHostAlloc fails exactly where the process's non-local usage
+     * would cross the budget (63.66 GiB RAM -> 46.91 GiB; 47.75 -> 31.00,
+     * both measured to the GiB). The 16 GiB is the fixed-reserve term in the
+     * middle branch, not the card's VRAM; below 32 GiB the 50% branch wins.
+     * The budget is not configurable (the OS sets it, and a driver may only
+     * lower it); Linux has no such budget. Neither free RAM,
+     * commit limit nor pagefile size enters. The probe remains the source of
+     * truth (a Windows build could change the formula); the formula is the
+     * cross-check. An older 23.5 GiB reading on the 48 GiB box predates the
+     * idle-machine rule and is not reproduced by an idle probe (31.3 GiB).
      *
-     * Measuring means allocating until failure, so legacy builds cache it
-     * (see worker_main.c). 0 means "not measured" and callers must treat the
-     * host side as unconstrained — the behaviour before this field existed. */
+     * Measuring means allocating until failure on an IDLE machine, so it is
+     * cached per machine (see idletoken_engine_pinned_ceiling). 0 means "not
+     * measured"; Windows callers must substitute the formula above rather
+     * than treating the host side as unconstrained. */
     uint64_t ram_pinnable;
     uint32_t cpu_count;
 

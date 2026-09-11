@@ -32,9 +32,10 @@
 //! already been bitten by hand-maintained copies drifting apart
 //! (`model_manifest_check.py` exists for exactly that reason).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -235,9 +236,16 @@ fn file_sha256(
         if last_emit.elapsed() >= Duration::from_millis(400) {
             emit(serde_json::json!({
                 "id": id, "kind": "progress",
+                "phase": "verifying",
                 // "[CODE] detail" — localized by the UI (ERROR_KEYS in i18n.ts).
                 "note": "[WEIGHTS_VERIFYING] checking the file hash against the manifest",
-                "have": done, "total": total
+                // `have` / `total` preserve the standalone-verify contract.
+                // A split-model download additionally rewrites those two to
+                // the monotonic whole-model download position; these phase
+                // fields keep the actual hash pass visible without making the
+                // download bar walk the same bytes a second time.
+                "have": done, "total": total,
+                "phaseHave": done, "phaseTotal": total
             }));
             last_emit = Instant::now();
         }
@@ -309,15 +317,119 @@ fn ensure_final_verified(
     Ok(())
 }
 
-/// One weight file sitting in the model folder.
+/// One logical model sitting in the model folder. A split GGUF is one row,
+/// even though it occupies several files in a repository subdirectory.
 #[derive(serde::Serialize)]
 pub struct StoredWeights {
-    /// File name without the `.part` suffix — i.e. the name the manifest knows,
-    /// so the front end can put a model label on it.
+    /// Primary GGUF path, relative to the configured model folder and using
+    /// forward slashes. For a split set this is its `00001-of-N` member.
     pub file: String,
+    /// Every GGUF member actually present (finished or `.part`), also relative
+    /// to the model folder. The delete command receives this exact allow-list.
+    pub files: Vec<String>,
     pub bytes: u64,
-    /// An unfinished download (`.part`). Continuing resumes from these bytes.
+    /// An unfinished `.part`, or a split set with one or more members missing.
     pub partial: bool,
+}
+
+#[derive(Default)]
+struct StoredWeightGroup {
+    file: String,
+    files: BTreeSet<String>,
+    bytes: u64,
+    has_partial: bool,
+    split_total: u32,
+    split_parts: BTreeSet<u32>,
+}
+
+#[cfg(windows)]
+fn metadata_is_link(md: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    md.file_type().is_symlink()
+        || md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_link(md: &fs::Metadata) -> bool {
+    md.file_type().is_symlink()
+}
+
+fn relative_for_ui(path: &Path) -> String {
+    path.components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Parse `name-00002-of-00003.gguf` without assuming a particular model,
+/// quantization, number of digits, or repository directory. The returned key
+/// names part one so the front end can resolve the set against its manifest.
+fn split_gguf_key(rel: &str) -> Option<(String, u32, u32)> {
+    let (parent, leaf) = rel.rsplit_once('/').unwrap_or(("", rel));
+    let body = leaf.strip_suffix(".gguf")?;
+    let (left, total_s) = body.rsplit_once("-of-")?;
+    let (prefix, part_s) = left.rsplit_once('-')?;
+    if part_s.is_empty()
+        || total_s.is_empty()
+        || !part_s.bytes().all(|b| b.is_ascii_digit())
+        || !total_s.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let part = part_s.parse::<u32>().ok()?;
+    let total = total_s.parse::<u32>().ok()?;
+    if part == 0 || total == 0 || part > total {
+        return None;
+    }
+    let first = format!("{prefix}-{:0width$}-of-{total_s}.gguf", 1, width = part_s.len());
+    let key = if parent.is_empty() {
+        first
+    } else {
+        format!("{parent}/{first}")
+    };
+    Some((key, part, total))
+}
+
+fn collect_weight_files(root: &Path, dir: &Path, depth: usize, out: &mut Vec<(String, u64, bool)>) {
+    // Model repositories use one quantization directory. The bound is only a
+    // defence against a pathological directory tree; it is not a product
+    // assumption about a particular model layout.
+    if depth > 32 {
+        return;
+    }
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let Ok(md) = fs::symlink_metadata(&path) else { continue };
+        // Do not follow a symlink/junction placed inside the model folder. The
+        // configured folder itself may be a junction (a normal Windows disk
+        // migration), but a nested reparse point could escape the delete root
+        // or create a recursive scan.
+        if metadata_is_link(&md) {
+            continue;
+        }
+        if md.is_dir() {
+            collect_weight_files(root, &path, depth + 1, out);
+            continue;
+        }
+        if !md.is_file() {
+            continue;
+        }
+        let Ok(rel_path) = path.strip_prefix(root) else { continue };
+        let rel = relative_for_ui(rel_path);
+        let (base, partial) = match rel.strip_suffix(".part") {
+            Some(b) => (b.to_string(), true),
+            None => (rel, false),
+        };
+        if !base.ends_with(".gguf") {
+            continue;
+        }
+        out.push((base, md.len(), partial));
+    }
 }
 
 /// What is actually on disk in the model folder.
@@ -329,58 +441,142 @@ pub struct StoredWeights {
 /// hunting when the disk is full.
 #[tauri::command]
 pub fn weights_list(dest_dir: String) -> Vec<StoredWeights> {
-    let mut out: Vec<StoredWeights> = Vec::new();
-    let Ok(rd) = fs::read_dir(&dest_dir) else { return out };
-    for e in rd.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        let (base, partial) = match name.strip_suffix(".part") {
-            Some(b) => (b.to_string(), true),
-            None => (name.clone(), false),
-        };
-        if !base.ends_with(".gguf") {
-            continue;
+    let root = PathBuf::from(&dest_dir);
+    let mut found = Vec::new();
+    collect_weight_files(&root, &root, 0, &mut found);
+
+    let mut groups: BTreeMap<String, StoredWeightGroup> = BTreeMap::new();
+    for (base, bytes, partial) in found {
+        let split = split_gguf_key(&base);
+        let key = split.as_ref().map(|v| v.0.clone()).unwrap_or_else(|| base.clone());
+        let g = groups.entry(key.clone()).or_insert_with(|| StoredWeightGroup {
+            file: key,
+            ..StoredWeightGroup::default()
+        });
+        g.files.insert(base);
+        g.bytes = g.bytes.saturating_add(bytes);
+        g.has_partial |= partial;
+        if let Some((_, part, total)) = split {
+            g.split_total = total;
+            g.split_parts.insert(part);
         }
-        let bytes = e.metadata().map(|m| m.len()).unwrap_or(0);
-        out.push(StoredWeights { file: base, bytes, partial });
     }
+
+    let mut out: Vec<StoredWeights> = groups
+        .into_values()
+        .map(|g| {
+            let partial = g.has_partial
+                || (g.split_total > 0 && g.split_parts.len() != g.split_total as usize);
+            StoredWeights {
+                file: g.file,
+                files: g.files.into_iter().collect(),
+                bytes: g.bytes,
+                partial,
+            }
+        })
+        .collect();
     out.sort_by(|a, b| b.bytes.cmp(&a.bytes));
     out
 }
 
-/// Delete one model's weights from the folder — the finished file and any
-/// leftover `.part` of the same name.
-///
-/// `file` must be a bare file name. Anything with a separator (or `..`) is
-/// refused: this command exists to free disk space in ONE directory, and a
-/// caller that can steer it elsewhere turns "delete a model" into "delete any
-/// file the app can reach". Non-`.gguf` names are refused for the same reason.
+fn validate_weight_relative(file: &str) -> Result<PathBuf, String> {
+    // The scanner emits this portable form on every OS. Keeping one accepted
+    // separator makes the traversal rules identical in Windows and Unix tests.
+    if file.is_empty() || file.contains('\\') || file.starts_with('/') {
+        return Err(format!("refusing to delete {file:?}: not a relative weights path"));
+    }
+    let pieces: Vec<&str> = file.split('/').collect();
+    if pieces.iter().any(|p| p.is_empty() || *p == "." || *p == ".." || p.contains(':'))
+        || !pieces.last().is_some_and(|p| p.ends_with(".gguf"))
+    {
+        return Err(format!("refusing to delete {file:?}: not a weights path"));
+    }
+    let path = PathBuf::from(file);
+    if path.components().any(|c| !matches!(c, Component::Normal(_))) {
+        return Err(format!("refusing to delete {file:?}: path leaves the model folder"));
+    }
+    Ok(path)
+}
+
+fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+/// Delete one logical model's weights from the folder. `files` is the exact
+/// relative allow-list returned by `weights_list`; split sets are therefore
+/// removed as one UI operation without teaching this disk-facing layer about
+/// the curated manifest registry.
 ///
 /// Returns the bytes freed. A file the OS will not let go of (Windows keeps a
 /// loaded model open) comes back as an error the UI can show, rather than a
 /// silent no-op that leaves the row on screen.
 #[tauri::command]
-pub fn weights_delete(dest_dir: String, file: String) -> Result<u64, String> {
-    if file.is_empty()
-        || file.contains('/')
-        || file.contains('\\')
-        || file.contains("..")
-        || !file.ends_with(".gguf")
-    {
-        return Err(format!("refusing to delete {file:?}: not a weights file name"));
+pub fn weights_delete(dest_dir: String, files: Vec<String>) -> Result<u64, String> {
+    if files.is_empty() {
+        return Err("refusing to delete an empty weights set".into());
     }
-    let final_path = PathBuf::from(&dest_dir).join(&file);
-    let part_path = part_of(&final_path);
-    // The verification marker goes with its file; an orphaned marker would
-    // bless a future download it never saw.
-    let _ = fs::remove_file(marker_of(&final_path));
+    let root = fs::canonicalize(&dest_dir)
+        .map_err(|e| format!("cannot open model folder {dest_dir}: {e}"))?;
+    let mut targets = BTreeSet::new();
+    for file in &files {
+        let rel = validate_weight_relative(file)?;
+        let mut current = root.clone();
+        for component in rel.components() {
+            let Component::Normal(piece) = component else { unreachable!() };
+            current.push(piece);
+            if let Ok(md) = fs::symlink_metadata(&current) {
+                if metadata_is_link(&md) {
+                    return Err(format!(
+                        "refusing to delete {file:?}: a symlink or junction leaves the model folder"
+                    ));
+                }
+            }
+        }
+        targets.insert(current);
+    }
+
     let mut freed = 0u64;
     let mut errs: Vec<String> = Vec::new();
-    for p in [final_path, part_path] {
-        let Ok(md) = fs::metadata(&p) else { continue };
-        let len = md.len();
-        match fs::remove_file(&p) {
-            Ok(()) => freed += len,
-            Err(e) => errs.push(format!("{}: {e}", p.display())),
+    let mut parents = BTreeSet::new();
+    for final_path in targets {
+        if let Some(parent) = final_path.parent() {
+            parents.insert(parent.to_path_buf());
+        }
+        // Verification/index sidecars belong to the same exact GGUF. Leaving
+        // them behind both wastes space and can bless or describe a later file
+        // that the sidecar never saw.
+        for p in [
+            final_path.clone(),
+            part_of(&final_path),
+            marker_of(&final_path),
+            append_suffix(&final_path, ".idx"),
+            append_suffix(&final_path, ".idx.gen"),
+        ] {
+            let Ok(md) = fs::symlink_metadata(&p) else { continue };
+            if metadata_is_link(&md) || !md.is_file() {
+                errs.push(format!("{}: refusing a non-regular file", p.display()));
+                continue;
+            }
+            let len = md.len();
+            match fs::remove_file(&p) {
+                Ok(()) => freed = freed.saturating_add(len),
+                Err(e) => errs.push(format!("{}: {e}", p.display())),
+            }
+        }
+    }
+    // Remove only newly-empty repository subdirectories. The root is a user
+    // setting and must remain even after its last model is deleted.
+    let mut parents: Vec<PathBuf> = parents.into_iter().collect();
+    parents.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    for mut p in parents {
+        while p != root {
+            if fs::remove_dir(&p).is_err() {
+                break;
+            }
+            let Some(parent) = p.parent() else { break };
+            p = parent.to_path_buf();
         }
     }
     if errs.is_empty() {
@@ -388,6 +584,39 @@ pub fn weights_delete(dest_dir: String, file: String) -> Result<u64, String> {
     } else {
         Err(errs.join("; "))
     }
+}
+
+/// Convert one part's progress into the whole split model's progress story.
+///
+/// Download bytes are offset by the parts already complete. Verification is
+/// different: the current part is already fully downloaded, and hashing merely
+/// reads it back from local disk. Keep the whole-model download bar parked at
+/// the end of that part while `phaseHave` / `phaseTotal` report the hash pass.
+fn whole_model_progress(
+    mut v: serde_json::Value,
+    base: u64,
+    declared_total: u64,
+    part: u64,
+    parts: u64,
+) -> serde_json::Value {
+    if let Some(o) = v.as_object_mut() {
+        let verifying = o.get("phase").and_then(|x| x.as_str()) == Some("verifying");
+        if verifying {
+            if let Some(part_total) = o.get("phaseTotal").and_then(|x| x.as_u64()) {
+                o.insert("have".into(), base.saturating_add(part_total).into());
+            }
+        } else if let Some(h) = o.get("have").and_then(|x| x.as_u64()) {
+            o.insert("have".into(), base.saturating_add(h).into());
+        }
+        if declared_total > 0 {
+            o.insert("total".into(), declared_total.into());
+        }
+        if parts > 1 {
+            o.insert("part".into(), part.into());
+            o.insert("parts".into(), parts.into());
+        }
+    }
+    v
 }
 
 /// Download a set of weights. Progress is pushed to the front end through
@@ -466,20 +695,14 @@ pub async fn weights_fetch(
         let mut out: Result<String, String> = Err("no parts to download".into());
         for (idx, (pfile, pbytes, psha)) in all.iter().enumerate() {
             let base = *done_before.lock().unwrap();
-            let emit = |mut v: serde_json::Value| {
-                if let Some(o) = v.as_object_mut() {
-                    if let Some(h) = o.get("have").and_then(|x| x.as_u64()) {
-                        o.insert("have".into(), (base + h).into());
-                    }
-                    if declared_total > 0 {
-                        o.insert("total".into(), declared_total.into());
-                    }
-                    if all.len() > 1 {
-                        o.insert("part".into(), (idx as u64 + 1).into());
-                        o.insert("parts".into(), (all.len() as u64).into());
-                    }
-                }
-                raw_emit(v);
+            let emit = |v: serde_json::Value| {
+                raw_emit(whole_model_progress(
+                    v,
+                    base,
+                    declared_total,
+                    idx as u64 + 1,
+                    all.len() as u64,
+                ));
             };
             out = fetch_inner(
                 &id2, &repo, pfile, &dest_dir, *pbytes, psha, &revision, &endpoints,
@@ -644,7 +867,7 @@ fn probe(
     id: &str,
     cancel: &AtomicBool,
 ) -> Result<Probe, String> {
-    emit(serde_json::json!({ "id": id, "kind": "probe" }));
+    emit(serde_json::json!({ "id": id, "kind": "probe", "phase": "probing" }));
     let (tx, rx) = std::sync::mpsc::channel();
     for (i, ep) in endpoints.iter().enumerate() {
         let tx = tx.clone();
@@ -797,7 +1020,7 @@ fn fetch_inner(
     if total > 0 && have > total {
         let _ = fs::remove_file(&part_path);
         emit(serde_json::json!({
-            "id": id, "kind": "progress",
+            "id": id, "kind": "progress", "phase": "downloading",
             // "[CODE] detail" — localized by the UI (ERROR_KEYS in i18n.ts).
             "note": "[WEIGHTS_PART_OVERRUN] the partial file was longer than the source and could not be a resume point; starting over",
             "have": 0u64, "total": total
@@ -812,7 +1035,7 @@ fn fetch_inner(
     }
 
     emit(serde_json::json!({
-        "id": id, "kind": "progress", "endpoint": p.endpoint,
+        "id": id, "kind": "progress", "phase": "downloading", "endpoint": p.endpoint,
         "have": have, "total": total
     }));
 
@@ -838,7 +1061,7 @@ fn fetch_inner(
     // wrong -- far worse than a failed download.
     if have > 0 && resp.status().as_u16() == 200 {
         emit(serde_json::json!({
-            "id": id, "kind": "progress",
+            "id": id, "kind": "progress", "phase": "downloading",
             // "[CODE] detail" — localized by the UI (ERROR_KEYS in i18n.ts).
             "note": "[WEIGHTS_NO_RESUME] the server does not support resumption; restarting from the beginning",
             "have": 0u64, "total": total
@@ -891,7 +1114,8 @@ fn fetch_inner(
         // UI would be dragged down by its own progress bar.
         if last_emit.elapsed() >= Duration::from_millis(400) {
             emit(serde_json::json!({
-                "id": id, "kind": "progress", "have": done, "total": total,
+                "id": id, "kind": "progress", "phase": "downloading",
+                "have": done, "total": total,
                 "endpoint": p.endpoint
             }));
             last_emit = Instant::now();
@@ -974,12 +1198,57 @@ pub async fn weights_verify(
     }
 }
 
+/// Regression tests for split-model progress. A hash pass rereads bytes that
+/// have already downloaded, so it gets its own counters and never rewinds the
+/// whole-model transfer position.
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    #[test]
+    fn download_progress_is_offset_by_completed_parts() {
+        let got = whole_model_progress(
+            serde_json::json!({
+                "kind": "progress", "phase": "downloading",
+                "have": 20u64, "total": 50u64
+            }),
+            100,
+            300,
+            2,
+            3,
+        );
+        assert_eq!(got["have"].as_u64(), Some(120));
+        assert_eq!(got["total"].as_u64(), Some(300));
+        assert_eq!(got["part"].as_u64(), Some(2));
+        assert_eq!(got["parts"].as_u64(), Some(3));
+    }
+
+    #[test]
+    fn verification_keeps_download_position_at_end_of_current_part() {
+        let got = whole_model_progress(
+            serde_json::json!({
+                "kind": "progress", "phase": "verifying",
+                "have": 7u64, "total": 50u64,
+                "phaseHave": 7u64, "phaseTotal": 50u64
+            }),
+            100,
+            300,
+            2,
+            3,
+        );
+        assert_eq!(got["have"].as_u64(), Some(150));
+        assert_eq!(got["total"].as_u64(), Some(300));
+        assert_eq!(got["phaseHave"].as_u64(), Some(7));
+        assert_eq!(got["phaseTotal"].as_u64(), Some(50));
+    }
+}
+
 /// Tests for the disk-facing half of "delete a model".
 ///
-/// `weights_delete` takes a file name from the front end and removes it, so the
-/// guard on that name is the only thing between a housekeeping feature and an
-/// arbitrary-file-delete. It is pure string work plus the filesystem, which
-/// means it can be tested here rather than argued about.
+/// `weights_delete` takes relative paths from the front end and removes them,
+/// so the guard on those paths is the only thing between a housekeeping feature
+/// and an arbitrary-file-delete. It is pure path work plus the filesystem,
+/// which means it can be tested here rather than argued about.
 #[cfg(test)]
 mod delete_tests {
     use super::*;
@@ -1007,7 +1276,7 @@ mod delete_tests {
         let d = tmpdir();
         write(&d, "m.gguf", 10);
         write(&d, "m.gguf.part", 5);
-        let freed = weights_delete(d.to_string_lossy().into(), "m.gguf".into()).unwrap();
+        let freed = weights_delete(d.to_string_lossy().into(), vec!["m.gguf".into()]).unwrap();
         assert_eq!(freed, 15, "both files count towards the space freed");
         assert!(!d.join("m.gguf").exists());
         assert!(!d.join("m.gguf.part").exists(), "a stale .part would keep the disk full");
@@ -1017,7 +1286,7 @@ mod delete_tests {
     fn deleting_a_partial_only_download_works() {
         let d = tmpdir();
         write(&d, "m.gguf.part", 7);
-        let freed = weights_delete(d.to_string_lossy().into(), "m.gguf".into()).unwrap();
+        let freed = weights_delete(d.to_string_lossy().into(), vec!["m.gguf".into()]).unwrap();
         assert_eq!(freed, 7);
         assert!(!d.join("m.gguf.part").exists());
     }
@@ -1027,8 +1296,15 @@ mod delete_tests {
         let outside = tmpdir();
         write(&outside, "precious.gguf", 3);
         let inside = tmpdir();
-        for name in ["../precious.gguf", "..\\precious.gguf", "sub/precious.gguf", "/tmp/precious.gguf"] {
-            let r = weights_delete(inside.to_string_lossy().into(), name.into());
+        for name in [
+            "../precious.gguf",
+            "..\\precious.gguf",
+            "/tmp/precious.gguf",
+            "sub//precious.gguf",
+            "./precious.gguf",
+            "C:/precious.gguf",
+        ] {
+            let r = weights_delete(inside.to_string_lossy().into(), vec![name.into()]);
             assert!(r.is_err(), "{name:?} must be refused");
         }
         assert!(outside.join("precious.gguf").exists(), "nothing outside the folder may be touched");
@@ -1038,8 +1314,9 @@ mod delete_tests {
     fn refuses_anything_that_is_not_weights() {
         let d = tmpdir();
         write(&d, "notes.txt", 3);
-        assert!(weights_delete(d.to_string_lossy().into(), "notes.txt".into()).is_err());
-        assert!(weights_delete(d.to_string_lossy().into(), "".into()).is_err());
+        assert!(weights_delete(d.to_string_lossy().into(), vec!["notes.txt".into()]).is_err());
+        assert!(weights_delete(d.to_string_lossy().into(), vec!["".into()]).is_err());
+        assert!(weights_delete(d.to_string_lossy().into(), Vec::new()).is_err());
         assert!(d.join("notes.txt").exists());
     }
 
@@ -1047,7 +1324,7 @@ mod delete_tests {
     fn missing_files_are_not_an_error() {
         // The row may already be gone (deleted in another window, or by hand).
         let d = tmpdir();
-        assert_eq!(weights_delete(d.to_string_lossy().into(), "nope.gguf".into()).unwrap(), 0);
+        assert_eq!(weights_delete(d.to_string_lossy().into(), vec!["nope.gguf".into()]).unwrap(), 0);
     }
 
     #[test]
@@ -1060,13 +1337,90 @@ mod delete_tests {
         got.sort_by(|a, b| a.file.cmp(&b.file));
         assert_eq!(got.len(), 2, "only weights files are listed");
         assert_eq!(got[0].file, "done.gguf");
+        assert_eq!(got[0].files, vec!["done.gguf"]);
         assert!(!got[0].partial);
         assert_eq!(got[0].bytes, 100);
         // The .part suffix is stripped so the front end can look the name up in
         // a manifest — otherwise every unfinished download shows as unknown.
         assert_eq!(got[1].file, "half.gguf");
+        assert_eq!(got[1].files, vec!["half.gguf"]);
         assert!(got[1].partial);
         assert_eq!(got[1].bytes, 40);
+    }
+
+    #[test]
+    fn recursively_groups_a_complete_split_model() {
+        let d = tmpdir();
+        let q = d.join("UD-IQ2_XXS");
+        fs::create_dir_all(&q).unwrap();
+        for (part, len) in [(1, 5), (2, 50), (3, 41)] {
+            write(
+                &q,
+                &format!("DeepSeek-V4-Flash-UD-IQ2_XXS-{part:05}-of-00003.gguf"),
+                len,
+            );
+        }
+        let got = weights_list(d.to_string_lossy().into());
+        assert_eq!(got.len(), 1, "one split model must be one UI row");
+        assert_eq!(
+            got[0].file,
+            "UD-IQ2_XXS/DeepSeek-V4-Flash-UD-IQ2_XXS-00001-of-00003.gguf"
+        );
+        assert_eq!(got[0].files.len(), 3);
+        assert_eq!(got[0].bytes, 96);
+        assert!(!got[0].partial);
+    }
+
+    #[test]
+    fn a_missing_or_partial_split_member_marks_the_set_unfinished() {
+        let d = tmpdir();
+        let q = d.join("quant");
+        fs::create_dir_all(&q).unwrap();
+        write(&q, "model-00001-of-00003.gguf", 5);
+        write(&q, "model-00002-of-00003.gguf.part", 17);
+        let got = weights_list(d.to_string_lossy().into());
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].bytes, 22);
+        assert!(got[0].partial);
+        assert_eq!(got[0].files, vec![
+            "quant/model-00001-of-00003.gguf",
+            "quant/model-00002-of-00003.gguf",
+        ]);
+    }
+
+    #[test]
+    fn deletes_a_nested_split_set_and_its_sidecars() {
+        let d = tmpdir();
+        let q = d.join("quant");
+        fs::create_dir_all(&q).unwrap();
+        for part in 1..=3 {
+            let name = format!("model-{part:05}-of-00003.gguf");
+            write(&q, &name, part as usize);
+            write(&q, &format!("{name}.sha256"), 2);
+        }
+        write(&q, "model-00001-of-00003.gguf.idx", 4);
+        write(&q, "model-00001-of-00003.gguf.idx.gen", 3);
+        let row = weights_list(d.to_string_lossy().into()).pop().unwrap();
+        let freed = weights_delete(d.to_string_lossy().into(), row.files).unwrap();
+        assert_eq!(freed, 19, "weights plus verification/index sidecars are removed");
+        assert!(!q.exists(), "an empty quantization directory should not linger");
+        assert!(d.exists(), "the configured model folder itself must remain");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_and_delete_do_not_follow_a_nested_symlink() {
+        use std::os::unix::fs::symlink;
+        let outside = tmpdir();
+        write(&outside, "precious.gguf", 9);
+        let inside = tmpdir();
+        symlink(&outside, inside.join("escape")).unwrap();
+        assert!(weights_list(inside.to_string_lossy().into()).is_empty());
+        assert!(weights_delete(
+            inside.to_string_lossy().into(),
+            vec!["escape/precious.gguf".into()]
+        ).is_err());
+        assert!(outside.join("precious.gguf").exists());
     }
 
     #[test]
@@ -1093,7 +1447,7 @@ mod delete_tests {
         assert!(state.path.ends_with("中文模型.gguf"));
 
         assert_eq!(weights_delete(
-            dir, "中文模型.gguf".into()).unwrap(), 13);
+            dir, vec!["中文模型.gguf".into()]).unwrap(), 13);
         assert!(!d.join("中文模型.gguf").exists());
     }
 }
@@ -1236,7 +1590,7 @@ mod integrity_tests {
         let d = tmpdir();
         fs::write(d.join("m.gguf"), b"abc").unwrap();
         fs::write(d.join("m.gguf.sha256"), ABC).unwrap();
-        weights_delete(d.to_string_lossy().into(), "m.gguf".into()).unwrap();
+        weights_delete(d.to_string_lossy().into(), vec!["m.gguf".into()]).unwrap();
         assert!(!d.join("m.gguf.sha256").exists(), "an orphaned marker would bless a future download it never saw");
     }
 }

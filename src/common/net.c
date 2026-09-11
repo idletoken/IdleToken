@@ -29,6 +29,24 @@
       static int inited = 0;
       if (!inited) { WSADATA w; WSAStartup(MAKEWORD(2, 2), &w); inited = 1; }
   }
+  /* Winsock reports failures through WSAGetLastError(), not errno.  Most
+   * callers deliberately use the POSIX-shaped net API and print strerror,
+   * so leaving errno untouched turns a filtered coordinator port into a
+   * misleading "Invalid argument" (usually residue from parse_addr). */
+  static int socket_errno(void) {
+      switch (WSAGetLastError()) {
+          case WSAEACCES:       return EACCES;
+          case WSAEADDRINUSE:   return EADDRINUSE;
+          case WSAECONNREFUSED: return ECONNREFUSED;
+          case WSAECONNRESET:   return ECONNRESET;
+          case WSAEHOSTUNREACH: return EHOSTUNREACH;
+          case WSAEINTR:        return EINTR;
+          case WSAENETUNREACH:  return ENETUNREACH;
+          case WSAETIMEDOUT:    return ETIMEDOUT;
+          case WSAEWOULDBLOCK:  return EWOULDBLOCK;
+          default:              return EIO;
+      }
+  }
 #else
   #include <arpa/inet.h>
   #include <fcntl.h>
@@ -390,7 +408,12 @@ int idletoken_connect_tcp(const char *peer_addr) {
     if (fd < 0) { int e = errno; freeaddrinfo(res); errno = e; return -1; }
 
     if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
-        int e = errno; closesock(fd); freeaddrinfo(res); errno = e; return -1;
+#ifdef _WIN32
+        int e = socket_errno();
+#else
+        int e = errno;
+#endif
+        closesock(fd); freeaddrinfo(res); errno = e; return -1;
     }
     freeaddrinfo(res);
 
@@ -611,13 +634,29 @@ int idletoken_local_ipv4(char *out, size_t cap) {
     return rc;
 }
 
+int idletoken_socket_local_ipv4(int fd, char *out, size_t cap) {
+    if (fd < 0 || !out || cap == 0) { errno = EINVAL; return -1; }
+    out[0] = '\0';
+    struct sockaddr_in local;
+    socklen_t llen = sizeof(local);
+    memset(&local, 0, sizeof(local));
+    if (getsockname(fd, (struct sockaddr *)&local, &llen) != 0 ||
+        local.sin_family != AF_INET ||
+        !inet_ntop(AF_INET, &local.sin_addr, out, (socklen_t)cap)) {
+        if (cap) out[0] = '\0';
+        return -1;
+    }
+    return 0;
+}
+
 int idletoken_ip_is_overlay(const char *ip) {
     if (!ip || !ip[0]) return 0;
     unsigned a = 0, b = 0;
     if (sscanf(ip, "%u.%u.", &a, &b) == 2)
         /* 100.64.0.0/10 — the CGNAT range Tailscale (and most overlay meshes)
          * hand out: second octet 64..127. */
-        return (a == 100 && b >= 64 && b <= 127) ? 1 : 0;
+        return ((a == 100 && b >= 64 && b <= 127) ||
+                (a == 198 && b >= 18 && b <= 19)) ? 1 : 0;
     /* Tailscale IPv6: fd7a:115c:a1e0::/48. Compare the first three hextets
      * value by value, NOT as a string prefix — "fd7a:115c:a1e00::" (a longer
      * fourth-nibble hextet) must not match, while case and leading zeros must

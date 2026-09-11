@@ -1,0 +1,121 @@
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1035,6 +1035,7 @@
+     std::vector<int32_t> pred;
+     std::vector<float> scores;
+     bool pinned_readback = false; // isolated diagnostic A/B; no cache-policy change
++    bool mapped_readback = false; // tiny CUDA routing reads only; opt-in diagnostic
+     sched_moe_readback readbacks[GGML_SCHED_MAX_BACKENDS];
+     const float * score_read_ptr = nullptr;
+     int pregate_extra = 0;   // GGML_MOE_PREGATE_EXTRA: experts to prefetch beyond the top-k
+@@ -1260,6 +1261,9 @@
+     st->timing.warmup = timing_warmup ? std::max(0, atoi(timing_warmup)) : 64;
+     const char * pinned_readback = getenv("GGML_MOE_PINNED_READBACK");
+     st->pinned_readback = pinned_readback && atoi(pinned_readback) > 0;
++    const char * mapped_readback = getenv("GGML_MOE_MAPPED_READBACK");
++    st->mapped_readback = mapped_readback && atoi(mapped_readback) > 0;
++    st->pinned_readback = st->pinned_readback || st->mapped_readback;
+     if (st->timing.every > 0 || st->pregate_stats_every > 0) {
+         const char * enabled = getenv("GGML_MOE_PREGATE");
+         if (!enabled || atoi(enabled) <= 0) {
+@@ -1671,11 +1675,27 @@
+         if (!buffer || ggml_backend_buffer_get_type(buffer) != buft) {
+             GGML_ABORT("pinned MoE readback allocation failed; cannot measure a pageable fallback as pinned");
+         }
+-        fprintf(stderr, "moe-readback: device=%s kind=%s bytes=%zu buffer=%s\n",
++        fprintf(stderr, "moe-readback: device=%s kind=%s bytes=%zu buffer=%s mapped=%d\n",
+                 ggml_backend_dev_name(dev), scores ? "scores" : "ids",
+-                ggml_backend_buffer_get_size(buffer), ggml_backend_buffer_name(buffer));
++                ggml_backend_buffer_get_size(buffer), ggml_backend_buffer_name(buffer), (int) sched->moe->mapped_readback);
+     }
+     return ggml_backend_buffer_get_base(buffer);
++}
++
++static void sched_moe_readback_async(ggml_backend_sched_t sched, ggml_backend_t backend,
++                                     const struct ggml_tensor * tensor, void * data, size_t bytes) {
++    if (sched->moe && sched->moe->mapped_readback && bytes <= 4096) {
++        const auto dev = ggml_backend_get_device(backend);
++        const auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
++        if (reg && strcmp(ggml_backend_reg_name(reg), "CUDA") == 0) {
++            using get_fn = void (*)(ggml_backend_t, const struct ggml_tensor *, void *, size_t, size_t);
++            const auto get = (get_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_get_tensor_async_mapped");
++            if (!get) GGML_ABORT("mapped MoE readback requested but CUDA helper is unavailable");
++            get(backend, tensor, data, 0, bytes);
++            return;
++        }
++    }
++    ggml_backend_tensor_get_async(backend, tensor, data, 0, bytes);
+ }
+ 
+ static bool sched_moe_prefetch_prepare(ggml_backend_sched_t sched, int layer,
+@@ -1714,7 +1734,7 @@
+     void * read_ptr = sched_moe_readback_ptr(sched, ids_backend, true,
+                                             (size_t) n * sizeof(float), st.scores.data());
+     st.score_read_ptr = (const float *) read_ptr;
+-    ggml_backend_tensor_get_async(ids_backend, pg, read_ptr, 0, (size_t) n * sizeof(float));
++    sched_moe_readback_async(sched, ids_backend, pg, read_ptr, (size_t) n * sizeof(float));
+     st.pregate_prepared_layer = layer;
+     st.pregate_prepared_count = (int) m;
+     return true;
+@@ -3806,7 +3826,11 @@
+                         void * ids_read_ptr = ids_tensor->ne[1] == 1
+                             ? sched_moe_readback_ptr(sched, ids_backend, false, ggml_nbytes(ids_tensor), ids.data())
+                             : ids.data();
+-                        ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids_read_ptr, 0, ggml_nbytes(ids_tensor));
++                        if (ids_tensor->ne[1] == 1) {
++                            sched_moe_readback_async(sched, ids_backend, ids_tensor, ids_read_ptr, ggml_nbytes(ids_tensor));
++                        } else {
++                            ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids_read_ptr, 0, ggml_nbytes(ids_tensor));
++                        }
+                         const bool pregate_prepared = sched->moe && ids_tensor->ne[1] == 1 &&
+                             sched_moe_prefetch_prepare(sched, moe_layer, ids_backend, (int) ids_tensor->ne[0]);
+                         ggml_backend_synchronize(ids_backend);
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2441,7 +2441,36 @@
+     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+ 
+     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
++}
++
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++// Tiny, explicitly requested routing readbacks need not queue behind expert
++// H2D traffic on GPUs with one copy engine. Store to mapped pinned host memory
++// using an SM instead. The caller still performs its existing stream sync;
++// there is no host polling, relaxed completion test, or change to tensor data.
++static __global__ void ggml_cuda_mapped_readback_kernel(
++        volatile uint32_t * dst, const uint32_t * src, size_t words) {
++    for (size_t i = threadIdx.x; i < words; i += blockDim.x) dst[i] = src[i];
++    __threadfence_system();
++}
++
++static void ggml_backend_cuda_get_tensor_async_mapped(ggml_backend_t backend,
++        const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
++    auto * ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
++    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(ctx->device));
++    GGML_ASSERT(size > 0 && size <= 4096 && size % sizeof(uint32_t) == 0);
++    GGML_ASSERT(offset % sizeof(uint32_t) == 0 && (uintptr_t) data % sizeof(uint32_t) == 0);
++    ggml_cuda_set_device(ctx->device);
++    cudaPointerAttributes attributes{};
++    CUDA_CHECK(cudaPointerGetAttributes(&attributes, data));
++    GGML_ASSERT(attributes.type == cudaMemoryTypeHost && attributes.devicePointer != nullptr);
++    ggml_cuda_mapped_readback_kernel<<<1, 128, 0, ctx->stream()>>>(
++        (volatile uint32_t *) attributes.devicePointer,
++        (const uint32_t *) ((const char *) tensor->data + offset), size / sizeof(uint32_t));
++    CUDA_CHECK(cudaGetLastError());
+ }
++#endif
+ 
+ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data,
+         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+@@ -5493,6 +5522,9 @@
+ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+     GGML_UNUSED(reg);
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    if (strcmp(name, "ggml_backend_cuda_get_tensor_async_mapped") == 0) {
++        return (void *)ggml_backend_cuda_get_tensor_async_mapped;
++    }
+     if (strcmp(name, "ggml_backend_cuda_timing_event_new") == 0) {
+         return (void *)ggml_backend_cuda_timing_event_new;
+     }

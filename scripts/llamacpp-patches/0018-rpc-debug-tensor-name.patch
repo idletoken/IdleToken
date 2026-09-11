@@ -1,0 +1,13 @@
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -1669,7 +1669,8 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
+         GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+         return false;
+     }
+-    LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %zu\n", __func__, (void*)tensor->buffer, tensor->data, offset, size);
++    LOG_DBG("[%s] name: '%s', buffer: %p, data: %p, offset: %" PRIu64 ", size: %zu\n",
++            __func__, tensor->name, (void *) tensor->buffer, tensor->data, offset, size);
+ 
+     // sanitize tensor->data
+     {

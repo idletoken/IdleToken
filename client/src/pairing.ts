@@ -31,7 +31,8 @@ export interface PeerNode {
    *  online — which is what absence used to mean. */
   online?: boolean;
   /** What this machine brings to the pool, as its OWN uncapped probe measured
-   *  it: real currently-free VRAM in bytes, and
+   *  it: real currently-free VRAM in bytes, ordinary usable RAM, the smaller
+   *  fast expert-RAM pool, and
    *  whether the two are one physical pool (Apple Silicon). The wire names
    *  stay vramFree/ramFree for compatibility. Carried by the roster so any member
    *  can total the cluster and answer "does the model fit on all of us" before
@@ -39,6 +40,9 @@ export interface PeerNode {
    *  total is then incomplete and the UI must say so, not guess. */
   vramFree?: number;
   ramFree?: number;
+  /** RAM that may actually back fast node-local MoE experts. Windows applies
+   * its per-process WDDM page-lock budget before publishing this number. */
+  ramExpertFree?: number;
   unifiedMemory?: boolean;
   /** True only when this node has the cluster's exact model+precision as a
    * complete, integrity-checked local GGUF. Start is gated on every member. */
@@ -67,7 +71,7 @@ export interface SelfInfo {
 }
 
 // Cluster-wide orchestration phase (P4) and the exposed API (P6).
-export type OrchestrationPhase = "idle" | "probing" | "splitting" | "loading" | "ready";
+export type OrchestrationPhase = "idle" | "starting" | "probing" | "splitting" | "loading" | "ready";
 export type ApiStatus = "offline" | "starting" | "online";
 
 export interface ClusterApi {
@@ -290,7 +294,8 @@ class DevSimPairing implements PairingProvider {
     // Memory the dev-sim reports for this machine, so the pooled verdict can
     // be exercised in a browser (the real path fills these from the probe).
     return { id: "self", hostname: self.hostname, gpu: self.gpu, role, self: true, stage: "joined", online: true, modelReady: true,
-             vramFree: 13.2 * 1024 ** 3, ramFree: 20.6 * 1024 ** 3, unifiedMemory: false };
+             vramFree: 13.2 * 1024 ** 3, ramFree: 20.6 * 1024 ** 3,
+             ramExpertFree: 15.25 * 1024 ** 3, unifiedMemory: false };
   }
 
   async create(self: SelfInfo, code?: string): Promise<void> {
@@ -323,7 +328,8 @@ class DevSimPairing implements PairingProvider {
       code: _code.trim().toUpperCase(),
       peers: [
         { id: "peer-coord", hostname: "machine-a", gpu: "RTX 5060 Ti", role: "coordinator", self: false, stage: "joined", online: true, modelReady: true,
-          vramFree: 13.2 * 1024 ** 3, ramFree: 20.6 * 1024 ** 3, unifiedMemory: false },
+          vramFree: 13.2 * 1024 ** 3, ramFree: 20.6 * 1024 ** 3,
+          ramExpertFree: 15.25 * 1024 ** 3, unifiedMemory: false },
         this.selfPeer(self, "worker"),
       ],
       coordinatorId: "peer-coord",
@@ -407,6 +413,7 @@ class DevSimPairing implements PairingProvider {
       wantsCoordinator: this.seq === 1,
       vramFree: (unified ? 96 : 6.5) * 1024 ** 3,
       ramFree: (unified ? 96 : 12) * 1024 ** 3,
+      ramExpertFree: unified ? 0 : 12 * 1024 ** 3,
       unifiedMemory: unified,
     });
     this.emit();

@@ -90,6 +90,23 @@ int idletoken_rpc_cache_fetch(const char *base_url,
                               uint64_t *bytes_out,
                               unsigned *tensors_out);
 
+/* Validate that this worker's complete GGUF has the same tensor directory as
+ * the coordinator's model, and prepare the tiny local `.idx` consumed by the
+ * patched rpc-server. No tensor bytes are copied and no model-sized cache is
+ * created: rpc-server reads each assigned tensor directly from the original
+ * GGUF part at its indexed offset.
+ *
+ * `base_url` is used only to fetch `<base_url>.idx`; model bytes are never
+ * fetched from it. `out_idx_path` receives `<local_primary_gguf>.idx`.
+ * `bytes_out` / `tensors_out` describe the assigned range plus shared tensors.
+ * Returns 0 only when the local and coordinator indices match exactly. */
+int idletoken_rpc_local_prepare(const char *base_url,
+                                unsigned layer_lo, unsigned layer_hi,
+                                const char *local_primary_gguf,
+                                char *out_idx_path, size_t out_idx_cap,
+                                uint64_t *bytes_out,
+                                unsigned *tensors_out);
+
 /* Serve `dir` over HTTP with byte-range support on `bind_addr` (blocking; the
  * coordinator runs this as an isolated `idletoken-worker --serve-weights` sidecar
  * so big weight transfers never touch the inference HTTP path). Returns only on

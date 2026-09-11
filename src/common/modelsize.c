@@ -134,12 +134,40 @@ static int tensor_is_moe_expert(const char *name, unsigned *layer_out) {
     return 1;
 }
 
+static uint64_t tensor_name_fnv1a(const char *name) {
+    uint64_t h = UINT64_C(14695981039346656037);
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+        h ^= *p;
+        h *= UINT64_C(1099511628211);
+    }
+    return h;
+}
+
+/* Subset of tensor_is_moe_expert() that the scheduler can actually cache:
+ * a routed-expert weight whose third GGML dimension is the expert axis. This
+ * is metadata-derived and architecture-independent; bias/scale tensors remain
+ * in the Hybrid capacity accounting above but never enter the pool contract. */
+static int tensor_is_moe_pool_weight(const idletoken_gguf_tensor *t,
+                                     uint32_t n_expert, unsigned *layer_out) {
+    if (!t || t->ndim < 3 || t->dims[2] != n_expert) return 0;
+    const size_t n = strlen(t->name);
+    if (n < 7 || strcmp(t->name + n - 7, ".weight") != 0) return 0;
+    return tensor_is_moe_expert(t->name, layer_out);
+}
+
 /* Add one GGUF part's padded tensor spans to the per-layer expert buckets.
  * Offsets, rather than a hand-maintained ggml dtype table, are the source of
  * truth; this is the same byte-accounting rule model_auto.c uses for the
  * layer/shared split. */
 static int add_expert_part(const char *path, uint32_t n_layers,
+                           uint32_t n_expert,
                            uint64_t per_layer[IDLETOKEN_LLPLAN_MAX_LAYERS],
+                           uint32_t pool_count[IDLETOKEN_LLPLAN_MAX_LAYERS],
+                           uint64_t pool_hash[IDLETOKEN_LLPLAN_MAX_LAYERS],
+                           uint64_t pool_slot[IDLETOKEN_LLPLAN_MAX_LAYERS],
+                           uint64_t pool_max[IDLETOKEN_LLPLAN_MAX_LAYERS],
+                           uint64_t block_bytes[IDLETOKEN_LLPLAN_MAX_LAYERS],
+                           uint64_t *shared_bytes,
                            uint64_t *total, char *err, size_t err_cap) {
     char gerr[256] = "";
     idletoken_gguf_meta *m = idletoken_gguf_meta_open(path, gerr, sizeof gerr);
@@ -156,7 +184,7 @@ static int add_expert_part(const char *path, uint32_t n_layers,
     }
     const uint64_t data_bytes = (uint64_t)st.st_size - data_start;
     const uint64_t nt = idletoken_gguf_meta_n_tensors(m);
-    typedef struct { uint64_t off; int layer; } ent;
+    typedef struct { uint64_t off; int layer; int block; int pool; } ent;
     ent *e = (ent *)calloc(nt ? (size_t)nt : 1, sizeof(*e));
     if (!e) {
         if (err && err_cap) snprintf(err, err_cap, "out of memory reading GGUF tensors");
@@ -173,6 +201,16 @@ static int add_expert_part(const char *path, uint32_t n_layers,
         }
         unsigned layer = 0;
         e[i].off = t.offset;
+        unsigned block = 0;
+        int consumed = 0;
+        e[i].block = sscanf(t.name, "blk.%u.%n", &block, &consumed) == 1 && consumed > 0
+            ? (int)block : -1;
+        if (e[i].block >= 0 && (block >= n_layers || block >= IDLETOKEN_LLPLAN_MAX_LAYERS)) {
+            if (err && err_cap) snprintf(err, err_cap, "tensor %s names an out-of-range block", t.name);
+            free(e);
+            idletoken_gguf_meta_close(m);
+            return -1;
+        }
         e[i].layer = tensor_is_moe_expert(t.name, &layer) ? (int)layer : -1;
         if (e[i].layer >= 0 &&
             ((uint32_t)e[i].layer >= n_layers ||
@@ -183,6 +221,21 @@ static int add_expert_part(const char *path, uint32_t n_layers,
             free(e);
             idletoken_gguf_meta_close(m);
             return -1;
+        }
+        unsigned pool_layer = 0;
+        if (tensor_is_moe_pool_weight(&t, n_expert, &pool_layer)) {
+            if (pool_layer >= n_layers ||
+                pool_layer >= IDLETOKEN_LLPLAN_MAX_LAYERS ||
+                pool_count[pool_layer] == UINT32_MAX) {
+                if (err && err_cap)
+                    snprintf(err, err_cap, "invalid expert-pool weight %s", t.name);
+                free(e);
+                idletoken_gguf_meta_close(m);
+                return -1;
+            }
+            pool_count[pool_layer]++;
+            pool_hash[pool_layer] += tensor_name_fnv1a(t.name);
+            e[i].pool = 1;
         }
     }
     for (uint64_t i = 1; i < nt; i++) {
@@ -199,8 +252,16 @@ static int add_expert_part(const char *path, uint32_t n_layers,
             idletoken_gguf_meta_close(m);
             return -1;
         }
+        const uint64_t bytes = end - e[i].off;
+        uint64_t *bucket = e[i].block >= 0 ? &block_bytes[e[i].block] : shared_bytes;
+        if (UINT64_MAX - *bucket < bytes) {
+            if (err && err_cap) snprintf(err, err_cap, "weight byte count overflow in %s", path);
+            free(e);
+            idletoken_gguf_meta_close(m);
+            return -1;
+        }
+        *bucket += bytes;
         if (e[i].layer >= 0) {
-            const uint64_t bytes = end - e[i].off;
             if (UINT64_MAX - per_layer[e[i].layer] < bytes ||
                 UINT64_MAX - *total < bytes) {
                 if (err && err_cap) snprintf(err, err_cap, "expert byte count overflow in %s", path);
@@ -210,8 +271,27 @@ static int add_expert_part(const char *path, uint32_t n_layers,
             }
             per_layer[e[i].layer] += bytes;
             *total += bytes;
+            if (e[i].pool) {
+                const uint64_t slot = bytes / n_expert + (bytes % n_expert != 0);
+                if (slot == 0 || UINT64_MAX - pool_slot[e[i].layer] < slot) {
+                    if (err && err_cap) snprintf(err, err_cap, "invalid expert cache span in %s", path);
+                    free(e);
+                    idletoken_gguf_meta_close(m);
+                    return -1;
+                }
+                pool_slot[e[i].layer] += slot;
+                if (bytes > pool_max[e[i].layer]) pool_max[e[i].layer] = bytes;
+            }
         }
     }
+    const uint64_t prefix = data_start + (nt ? e[0].off : data_bytes);
+    if (UINT64_MAX - *shared_bytes < prefix) {
+        if (err && err_cap) snprintf(err, err_cap, "shared byte count overflow in %s", path);
+        free(e);
+        idletoken_gguf_meta_close(m);
+        return -1;
+    }
+    *shared_bytes += prefix;
     free(e);
     idletoken_gguf_meta_close(m);
     return 0;
@@ -249,7 +329,14 @@ static int gguf_expert_layout(const char *path, uint32_t n_layers,
             snprintf(idxbuf, sizeof idxbuf, "%05u", part);
             memcpy(tail, idxbuf, 5);
         }
-        if (add_expert_part(current, n_layers, out->expert_bytes_per_layer,
+        if (add_expert_part(current, n_layers, out->n_expert,
+                            out->expert_bytes_per_layer,
+                            out->expert_pool_weight_count_per_layer,
+                            out->expert_pool_weight_hash_per_layer,
+                            out->expert_pool_slot_bytes_per_layer,
+                            out->expert_pool_max_tensor_per_layer,
+                            out->weight_bytes_per_layer,
+                            &out->weight_bytes_shared,
                             &out->expert_bytes_total, err, err_cap) != 0)
             return -1;
     }
@@ -427,6 +514,16 @@ int idletoken_model_size_resolve(const idletoken_model_spec *spec,
                 out->expert_bytes_total = 0;
                 memset(out->expert_bytes_per_layer, 0,
                        sizeof out->expert_bytes_per_layer);
+                memset(out->expert_pool_weight_count_per_layer, 0,
+                       sizeof out->expert_pool_weight_count_per_layer);
+                memset(out->expert_pool_weight_hash_per_layer, 0,
+                       sizeof out->expert_pool_weight_hash_per_layer);
+                memset(out->expert_pool_slot_bytes_per_layer, 0,
+                       sizeof out->expert_pool_slot_bytes_per_layer);
+                memset(out->expert_pool_max_tensor_per_layer, 0,
+                       sizeof out->expert_pool_max_tensor_per_layer);
+                memset(out->weight_bytes_per_layer, 0, sizeof out->weight_bytes_per_layer);
+                out->weight_bytes_shared = 0;
             }
             int ambiguous = 0;
             const idletoken_model_variant *v = nearest_variant(spec, bytes, &ambiguous);

@@ -23,7 +23,7 @@
 // `PairingSnapshot` (client/src/pairing.ts).
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -31,6 +31,8 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, State};
+
+use if_addrs::{get_if_addrs, IfAddr};
 
 /// UDP port the creator broadcasts beacons on (joiner binds it to listen).
 /// Default for Tuning::discovery_port (settings.discoveryPort).
@@ -98,7 +100,7 @@ pub struct Tuning {
     #[serde(default = "default_max_decode")]
     max_decode: u32,
     /// How much of THIS machine IdleToken may use (settings "This machine's
-    /// usage") → worker `--max-vram-mb`, MiB, 0 = no cap.
+    /// usage") → worker `--max-vram-mb` / `--max-ram-mb`, MiB, 0 = no cap.
     ///
     /// Per-machine, so it is never adopted from the roster the way model_id and
     /// quant are: the creator's "conservative" says nothing about how much of
@@ -107,6 +109,8 @@ pub struct Tuning {
     /// changed the dashboard's numbers and nothing else.
     #[serde(default)]
     max_vram_mb: u64,
+    #[serde(default)]
+    max_ram_mb: u64,
     // ---- pairing behaviour (settings "Pairing & discovery") ------------------
     // Wired on 2026-08-13. Before that these six were rendered as live controls
     // and read by nobody; settings.ts resets stored values once (schema v3)
@@ -215,6 +219,7 @@ impl Default for Tuning {
             kv_cache_v: String::new(),
             max_decode: default_max_decode(),
             max_vram_mb: 0,
+            max_ram_mb: 0,
             lan_discovery: true,
             manual_peers: String::new(),
             heartbeat_sec: default_heartbeat(),
@@ -806,6 +811,12 @@ pub struct Peer {
     vram_free: u64,
     #[serde(rename = "ramFree")]
     ram_free: u64,
+    /// The part of ram_free that may back fast node-local MoE experts. On
+    /// Windows the native probe has already applied WDDM's per-process
+    /// NON-LOCAL/page-lock budget. Kept separate because ordinary free RAM and
+    /// GPU-page-lockable RAM answer different questions.
+    #[serde(rename = "ramExpertFree")]
+    ram_expert_free: u64,
     /// Unified memory (Apple Silicon): VRAM and RAM are one physical pool and
     /// must be counted once, not summed (the engine's plan.c rule).
     #[serde(rename = "unifiedMemory")]
@@ -828,6 +839,11 @@ enum Mode {
     Off,
     Creator,
     Joiner,
+    /// The creator has explicitly ended the cluster. Its local snapshot is
+    /// already empty, but the roster listener stays alive for a short grace
+    /// period so authenticated members receive an unambiguous `closed`
+    /// response instead of mistaking the clean shutdown for packet loss.
+    Closing,
 }
 
 struct Inner {
@@ -840,11 +856,13 @@ struct Inner {
     self_id: String,
     self_host: String,
     self_gpu: String,
-    /// This machine's own scheduler-usable VRAM/RAM (bytes) and whether it is unified
-    /// memory, as reported by the UI's probe through `pairing_report_memory`.
-    /// Sent with every join/poll so the roster can total the pool.
+    /// This machine's own scheduler-usable VRAM/RAM, fast expert-RAM budget
+    /// (bytes), and whether it is unified memory, as reported by the UI's probe
+    /// through `pairing_report_memory`. Sent with every join/poll so the roster
+    /// can total the pool.
     self_vram_free: u64,
     self_ram_free: u64,
+    self_ram_expert_free: u64,
     self_unified: bool,
     peers: Vec<Peer>,
     coordinator_id: Option<String>,
@@ -894,11 +912,23 @@ struct Inner {
     /// memory only — it describes the current cluster, and writing home LAN
     /// topology to disk is the profiling material HOST-15 warns about.
     audit: Vec<String>,
+    /// Recently closed creator memberships. A creator may start a new local
+    /// deployment before the old workers' next heartbeat; retaining only the
+    /// old per-member proof lets the new roster listener still answer those
+    /// delayed polls with `closed`, without exposing the old topology.
+    closed_members: Vec<ClosedMember>,
     generation: u64,
     /// Settings-derived engine tuning (defaults = historical hard-coded
     /// ports). On a joiner, `api_port` is overwritten by the roster so it
     /// polls the coordinator on the creator's configured port.
     tuning: Tuning,
+}
+
+struct ClosedMember {
+    id: String,
+    token: String,
+    ip: String,
+    until: Instant,
 }
 
 pub struct Pairing(Mutex<Inner>);
@@ -914,6 +944,7 @@ impl Default for Pairing {
             self_gpu: String::new(),
             self_vram_free: 0,
             self_ram_free: 0,
+            self_ram_expert_free: 0,
             self_unified: false,
             peers: Vec::new(),
             coordinator_id: None,
@@ -928,10 +959,30 @@ impl Default for Pairing {
             self_device_id: String::new(),
             gate: LanGate::default(),
             audit: Vec::new(),
+            closed_members: Vec::new(),
             generation: 0,
             tuning: Tuning::default(),
         }))
     }
+}
+
+/// Clear this machine's membership while retaining machine-local facts that
+/// survive clusters (probe memory, device identity, selected model tuning).
+/// Callers bump `generation` separately so they can decide whether a creator
+/// needs a short authenticated shutdown-notification grace period first.
+fn clear_membership(inner: &mut Inner) {
+    inner.mode = Mode::Off;
+    inner.code = None;
+    inner.engine_code.clear();
+    inner.peers.clear();
+    inner.coordinator_id = None;
+    inner.phase = "idle".into();
+    inner.coord_ip = None;
+    inner.engine_started = false;
+    inner.account_mode = false;
+    inner.last_error = None;
+    inner.required_model = None;
+    inner.challenges.clear();
 }
 
 /// Convert the roster proof into the native engine's six-character pairing
@@ -960,9 +1011,14 @@ fn snapshot_json(inner: &Inner) -> Value {
     // coordinator role, but joiners must not receive a durable home-network
     // fingerprint.  Enrich only the creator's local snapshot, and only with a
     // short digest label rather than the raw id.
+    // Closing is a wire-only grace state. Locally the user has already left,
+    // so expose the same empty snapshot as Off while retaining the authenticated
+    // peer records long enough to tell remote workers to release their engine.
+    let locally_closed = inner.mode == Mode::Closing;
     let peers: Vec<Value> = inner
         .peers
         .iter()
+        .filter(|_| !locally_closed)
         .map(|peer| {
             let mut value = serde_json::to_value(peer).unwrap_or_else(|_| json!({}));
             if inner.mode == Mode::Creator {
@@ -981,14 +1037,14 @@ fn snapshot_json(inner: &Inner) -> Value {
         .collect();
     json!({
         // Account mode: the derived secret is not a shareable code — hide it.
-        "code": if inner.account_mode { &None } else { &inner.code },
-        "accountMode": inner.account_mode,
+        "code": if locally_closed || inner.account_mode { &None } else { &inner.code },
+        "accountMode": inner.account_mode && !locally_closed,
         "peers": peers,
         // Fail closed on old snapshot shapes: the TypeScript side treats an
         // absent value as false and never shows a role-approval action.
         "isCreator": inner.mode == Mode::Creator,
-        "coordinatorId": inner.coordinator_id,
-        "phase": inner.phase,
+        "coordinatorId": if locally_closed { &None } else { &inner.coordinator_id },
+        "phase": if locally_closed { "idle" } else { inner.phase.as_str() },
         "modelId": inner.tuning.model_id,
         "quant": inner.tuning.quant,
         // The inference API is loopback-only on the coordinator (2026-08-15,
@@ -1071,6 +1127,7 @@ fn roster_reply(inner: &Inner) -> Value {
             // Each member's own measurement, echoed to everyone so any machine
             // can total the pool (not just the creator that collected them).
             "vramFree": p.vram_free, "ramFree": p.ram_free,
+            "ramExpertFree": p.ram_expert_free,
             "unifiedMemory": p.unified_memory,
             "modelReady": p.model_ready,
         })).collect::<Vec<_>>(),
@@ -1141,8 +1198,22 @@ fn merge_peer_memory(peer: &mut Peer, req: &Value) {
     if let Some(v) = req["ramFree"].as_u64().and_then(|v| sane(v, "RAM")) {
         peer.ram_free = v;
     }
+    if let Some(v) = req["ramExpertFree"]
+        .as_u64()
+        .and_then(|v| sane(v, "MoE expert RAM"))
+    {
+        /* A peer may understate its usable expert pool, but it may not claim
+         * that more RAM is page-lockable than it reported as generally usable. */
+        peer.ram_expert_free = v.min(peer.ram_free);
+    }
+    if peer.ram_expert_free > peer.ram_free {
+        peer.ram_expert_free = peer.ram_free;
+    }
     if let Some(v) = req["unifiedMemory"].as_bool() {
         peer.unified_memory = v;
+    }
+    if peer.unified_memory {
+        peer.ram_expert_free = 0;
     }
 }
 
@@ -1211,6 +1282,13 @@ fn apply_roster(inner: &mut Inner, v: &Value) -> RosterEffect {
         .iter()
         .map(|m| {
             let id = m["id"].as_str().unwrap_or("").to_string();
+            let ram_free = m["ramFree"].as_u64().unwrap_or(0);
+            let unified_memory = m["unifiedMemory"].as_bool().unwrap_or(false);
+            let ram_expert_free = if unified_memory {
+                0
+            } else {
+                m["ramExpertFree"].as_u64().unwrap_or(0).min(ram_free)
+            };
             Peer {
                 is_self: id == inner.self_id,
                 role: if Some(id.as_str()) == coordinator_id.as_deref() { "coordinator" } else { "worker" },
@@ -1239,8 +1317,9 @@ fn apply_roster(inner: &mut Inner, v: &Value) -> RosterEffect {
                 // Memory travels with the roster so every machine can total
                 // the pool, not just the creator (0 = an older peer).
                 vram_free: m["vramFree"].as_u64().unwrap_or(0),
-                ram_free: m["ramFree"].as_u64().unwrap_or(0),
-                unified_memory: m["unifiedMemory"].as_bool().unwrap_or(false),
+                ram_free,
+                ram_expert_free,
+                unified_memory,
                 model_ready: m["modelReady"].as_bool().unwrap_or(false),
                 model_id: cluster_model.clone(),
                 quant: cluster_quant.clone(),
@@ -1269,29 +1348,190 @@ fn apply_roster(inner: &mut Inner, v: &Value) -> RosterEffect {
     eff
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LocalLanInterface {
+    name: String,
+    ip: Ipv4Addr,
+    netmask: Ipv4Addr,
+}
+
+fn ipv4_bits(ip: Ipv4Addr) -> u32 {
+    u32::from_be_bytes(ip.octets())
+}
+
+/// Addresses that must never be selected automatically for model/index or
+/// tensor traffic.  100.64/10 is the range used by Tailscale and other overlay
+/// meshes; 198.18/15 is the benchmarking range commonly used by system-proxy
+/// TUN adapters (including the adapter that exposed this bug).  Neither is a
+/// real household LAN address.
+fn usable_cluster_ipv4(ip: Ipv4Addr) -> bool {
+    let [a, b, _, _] = ip.octets();
+    !ip.is_unspecified()
+        && !ip.is_loopback()
+        && !ip.is_link_local()
+        && !ip.is_multicast()
+        && ip != Ipv4Addr::BROADCAST
+        && !(a == 100 && (64..=127).contains(&b))
+        && !(a == 198 && (18..=19).contains(&b))
+}
+
+/// Interface names are only a safety supplement to address-range checks, not
+/// the primary routing decision.  VPNs which use RFC1918 addresses are
+/// indistinguishable by address alone, while their OS interface names retain a
+/// useful cross-platform signal.  An explicit bind IP still lets a developer
+/// use an unusually named physical interface; automatic mode stays fail-safe.
+fn likely_vpn_interface(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    if lower == "meta" || lower.starts_with("utun") || lower.starts_with("tun")
+        || lower.starts_with("tap") || lower.starts_with("wg")
+    {
+        return true;
+    }
+    [
+        "vpn", "tailscale", "wireguard", "wintun", "zerotier", "hamachi",
+        "nordlynx", "openvpn", "proton", "clash", "sing-box", "singbox",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn local_ipv4_interfaces() -> Vec<LocalLanInterface> {
+    let Ok(interfaces) = get_if_addrs() else {
+        eprintln!("[pairing] could not enumerate local network interfaces");
+        return Vec::new();
+    };
+    let mut out: Vec<LocalLanInterface> = interfaces
+        .into_iter()
+        .filter_map(|iface| match iface.addr {
+            IfAddr::V4(v4) => Some(LocalLanInterface {
+                name: iface.name,
+                ip: v4.ip,
+                netmask: v4.netmask,
+            }),
+            IfAddr::V6(_) => None,
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name).then(a.ip.octets().cmp(&b.ip.octets())));
+    out.dedup_by(|a, b| a.name == b.name && a.ip == b.ip);
+    out
+}
+
+fn usable_lan_interfaces() -> Vec<LocalLanInterface> {
+    let mut out: Vec<LocalLanInterface> = local_ipv4_interfaces()
+        .into_iter()
+        .filter(|iface| usable_cluster_ipv4(iface.ip) && !likely_vpn_interface(&iface.name))
+        .collect();
+    // RFC1918 is the normal household-LAN case, but do not make it a hard
+    // requirement: routed/public lab LANs remain supported after private
+    // candidates.  The name/IP tie-breakers make the UI address deterministic.
+    out.sort_by(|a, b| {
+        (!a.ip.is_private())
+            .cmp(&(!b.ip.is_private()))
+            .then(a.name.cmp(&b.name))
+            .then(a.ip.octets().cmp(&b.ip.octets()))
+    });
+    out.dedup_by(|a, b| a.ip == b.ip);
+    out
+}
+
+fn directed_broadcast(ip: Ipv4Addr, netmask: Ipv4Addr) -> Option<Ipv4Addr> {
+    let mask = ipv4_bits(netmask);
+    let host = !mask;
+    // A valid IPv4 netmask has one contiguous run of host bits. /31 and /32
+    // are point-to-point/host routes and have no usable broadcast destination.
+    if mask == 0 || host < 3 || (host & host.wrapping_add(1)) != 0 {
+        return None;
+    }
+    Some(Ipv4Addr::from(ipv4_bits(ip) | host))
+}
+
+fn configured_bind_ip(tuning: &Tuning) -> Option<Ipv4Addr> {
+    let nic = tuning.bind_nic.trim();
+    if nic.is_empty() || nic == "auto" {
+        return None;
+    }
+    nic.parse::<Ipv4Addr>().ok().filter(|ip| usable_cluster_ipv4(*ip))
+}
+
 /// The address this machine binds cluster traffic to and advertises to the
 /// others: the "Bind interface / IP" setting when it is a usable IPv4,
-/// otherwise whatever the OS routes from (`local_lan_ip`).
+/// otherwise an enumerated physical-LAN address.
 ///
 /// One function for both jobs on purpose. Binding to a specific NIC while
 /// still telling peers the auto-detected address is the multi-homed failure
 /// mode that produces "connection refused" against a machine that is plainly
 /// up — the two answers have to come from the same place.
 fn self_ip(tuning: &Tuning) -> String {
-    let nic = tuning.bind_nic.trim();
-    if !nic.is_empty() && nic != "auto" && nic.parse::<std::net::Ipv4Addr>().is_ok() {
-        return nic.to_string();
+    if let Some(ip) = configured_bind_ip(tuning) {
+        return ip.to_string();
     }
     local_lan_ip()
 }
 
 /// Bind host for listeners: a chosen NIC, else every interface.
 fn bind_host(tuning: &Tuning) -> String {
-    let nic = tuning.bind_nic.trim();
-    if !nic.is_empty() && nic != "auto" && nic.parse::<std::net::Ipv4Addr>().is_ok() {
-        return nic.to_string();
+    if let Some(ip) = configured_bind_ip(tuning) {
+        return ip.to_string();
     }
     "0.0.0.0".into()
+}
+
+/// Pick the source address the OS routes specifically to this coordinator.
+/// This is intentionally peer-specific: the Internet default route is exactly
+/// what a full-tunnel VPN replaces, and therefore cannot answer which local
+/// Ethernet/Wi-Fi address the coordinator can dial back.
+fn source_ip_for_peer(peer: &str) -> Result<Ipv4Addr, String> {
+    let peer_ip = peer
+        .parse::<Ipv4Addr>()
+        .map_err(|_| format!("coordinator address '{peer}' is not IPv4"))?;
+    // Preserve same-host developer/e2e clusters without ever turning a failed
+    // remote lookup into loopback.  Loopback is accepted only when the peer is
+    // itself explicitly loopback.
+    if peer_ip.is_loopback() {
+        return Ok(Ipv4Addr::LOCALHOST);
+    }
+    if !usable_cluster_ipv4(peer_ip) {
+        return Err(format!(
+            "coordinator address {peer_ip} belongs to a loopback, VPN/overlay, or non-LAN range"
+        ));
+    }
+    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .map_err(|e| format!("cannot open a route probe: {e}"))?;
+    sock.connect((peer_ip, COORD_PORT))
+        .map_err(|e| format!("no route to coordinator {peer_ip}: {e}"))?;
+    let local = match sock.local_addr().map_err(|e| format!("cannot inspect route to {peer_ip}: {e}"))?.ip() {
+        std::net::IpAddr::V4(ip) => ip,
+        std::net::IpAddr::V6(_) => return Err(format!("route to IPv4 coordinator {peer_ip} selected IPv6")),
+    };
+    if !usable_cluster_ipv4(local) {
+        return Err(format!(
+            "route to coordinator {peer_ip} selected unusable local address {local}"
+        ));
+    }
+
+    let interfaces = local_ipv4_interfaces();
+    if !interfaces.is_empty() {
+        let matching: Vec<&LocalLanInterface> = interfaces.iter().filter(|i| i.ip == local).collect();
+        if matching.is_empty() {
+            return Err(format!(
+                "route to coordinator {peer_ip} selected {local}, which is not assigned to a current interface"
+            ));
+        }
+        if matching.iter().all(|i| likely_vpn_interface(&i.name)) {
+            return Err(format!(
+                "route to coordinator {peer_ip} selected VPN/virtual interface {} ({local}); tensor traffic requires the real LAN",
+                matching.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join(", ")
+            ));
+        }
+    }
+    Ok(local)
+}
+
+fn rpc_host_for_coordinator(tuning: &Tuning, coordinator: &str) -> Result<String, String> {
+    if let Some(ip) = configured_bind_ip(tuning) {
+        return Ok(ip.to_string());
+    }
+    source_ip_for_peer(coordinator).map(|ip| ip.to_string())
 }
 
 /// Same /24? Used by "Only same subnet" on both sides of the handshake.
@@ -1326,14 +1566,18 @@ fn heartbeat(tuning: &Tuning) -> Duration {
 /// "This machine's usage" as rpc-supervisor flags. The worker probes and sends
 /// these capped resources in HELLO; the llama.cpp planner consumes them.
 ///
-/// 0 = no cap, and then no flag at all: an explicit `--max-vram-mb 0` and a
-/// missing flag mean the same thing to the worker, but the shorter command line
-/// is the one that reads correctly in a log.
+/// 0 = no cap, and then no flag at all: an explicit zero and a missing flag
+/// mean the same thing to the worker, but the shorter command line is the one
+/// that reads correctly in a log.
 fn usage_cap_args(tuning: &Tuning) -> Vec<String> {
     let mut v: Vec<String> = Vec::new();
     if tuning.max_vram_mb > 0 {
         v.push("--max-vram-mb".into());
         v.push(tuning.max_vram_mb.to_string());
+    }
+    if tuning.max_ram_mb > 0 {
+        v.push("--max-ram-mb".into());
+        v.push(tuning.max_ram_mb.to_string());
     }
     v
 }
@@ -1534,6 +1778,19 @@ fn materialize_engine(app: &AppHandle) {
             eprintln!("[pairing] coord start failed: {e}");
         }
     } else {
+        let rpc_host = match rpc_host_for_coordinator(&tuning, &coord_ip) {
+            Ok(ip) => ip,
+            Err(e) => {
+                eprintln!("[pairing] rpc worker start refused: {e}");
+                let pairing = app.state::<Pairing>();
+                pairing.0.lock().unwrap().last_error = Some(("lanRoute".into(), e));
+                emit_snapshot(app);
+                return;
+            }
+        };
+        eprintln!(
+            "[pairing] coordinator {coord_ip} is reached through local LAN address {rpc_host}"
+        );
         let engine_dir = match crate::engine::llama_engine_dir() {
             Ok(p) => p,
             Err(e) => {
@@ -1554,7 +1811,7 @@ fn materialize_engine(app: &AppHandle) {
             "--engine-dir".into(), engine_dir_arg,
             "--coordinator".into(), format!("{coord_ip}:{COORD_PORT}"),
             "--discovery-port".into(), tuning.discovery_port.to_string(),
-            "--rpc-host".into(), self_ip(&tuning),
+            "--rpc-host".into(), rpc_host,
             "--rpc-port".into(), tuning.inter_stage_port.to_string(),
         ];
         // Every node keeps the complete curated GGUF on its own disk. The RPC
@@ -1827,6 +2084,44 @@ fn roster_request(inner: &mut Inner, req: &Value, peer_ip: &str, now: Instant) -
         return json!({"ok": false, "err": "bad field"});
     }
 
+    // This check precedes the live-roster authorization on purpose. The
+    // creator is allowed to start a fresh standalone deployment immediately;
+    // its new roster then owns the same port, but an old worker's delayed poll
+    // must still be told that the previous cluster ended instead of becoming
+    // an unauthorized/rejoin loop.
+    inner.closed_members.retain(|member| member.until > now);
+    if matches!(req["op"].as_str(), Some("roster") | Some("leave")) {
+        let id = req["id"].as_str().unwrap_or("");
+        let token = req["token"].as_str().unwrap_or("");
+        if inner.closed_members.iter().any(|member| {
+            member.id == id && member.ip == peer_ip && token_eq(&member.token, token)
+        }) {
+            return json!({"ok": true, "closed": true});
+        }
+    }
+
+    // An explicit creator leave is different from an unreachable creator.
+    // Keep answering only already-authenticated members during the short
+    // closing grace window, and tell them to drop their roster and worker
+    // immediately. No topology or model metadata is returned in this state.
+    if inner.mode == Mode::Closing {
+        return match req["op"].as_str() {
+            Some("roster") | Some("leave") => {
+                if member_authorized(inner, req, peer_ip).is_some() {
+                    json!({"ok": true, "closed": true})
+                } else {
+                    eprintln!(
+                        "[pairing] refused an unauthenticated closing notice request from \
+                         {peer_ip} (id={:?})",
+                        req["id"].as_str().unwrap_or("")
+                    );
+                    json!({"ok": false, "err": ERR_UNAUTHORIZED})
+                }
+            }
+            _ => json!({"ok": false, "err": "cluster closed"}),
+        };
+    }
+
     match req["op"].as_str() {
         // Step one of the join handshake (A-P0-3): answer the caller's nonce
         // with proof that we hold the same join code, and hand out a nonce of
@@ -2017,6 +2312,7 @@ fn roster_request(inner: &mut Inner, req: &Value, peer_ip: &str, now: Instant) -
                     wants_coordinator: false,
                     vram_free: 0,
                     ram_free: 0,
+                    ram_expert_free: 0,
                     unified_memory: req["unifiedMemory"].as_bool().unwrap_or(false),
                     model_ready: false,
                     model_id: String::new(),
@@ -2126,7 +2422,9 @@ fn handle_roster_conn(app: &AppHandle, stream: TcpStream, generation: u64) {
     {
         let pairing = app.state::<Pairing>();
         let mut inner = pairing.0.lock().unwrap();
-        if inner.generation != generation || inner.mode != Mode::Creator {
+        if inner.generation != generation
+            || (inner.mode != Mode::Creator && inner.mode != Mode::Closing)
+        {
             return;
         }
         let now = Instant::now();
@@ -2182,7 +2480,9 @@ fn handle_roster_conn(app: &AppHandle, stream: TcpStream, generation: u64) {
 
     let pairing = app.state::<Pairing>();
     let mut inner = pairing.0.lock().unwrap();
-    if inner.generation != generation || inner.mode != Mode::Creator {
+    if inner.generation != generation
+        || (inner.mode != Mode::Creator && inner.mode != Mode::Closing)
+    {
         return;
     }
     let reply = roster_request(&mut inner, &req, &peer_ip, Instant::now());
@@ -2198,6 +2498,40 @@ fn handle_roster_conn(app: &AppHandle, stream: TcpStream, generation: u64) {
 /// bytes on the wire do not depend on the join code (A-P0-3).
 fn beacon_packet(session: &str, nonce: &str, roster_port: u16) -> String {
     format!("{BEACON_MAGIC}|{session}|{nonce}|{roster_port}")
+}
+
+/// One bound sender per eligible interface.  A single socket aimed at
+/// 255.255.255.255 follows Windows' preferred/default interface, which becomes
+/// the VPN as soon as a full-tunnel client is enabled.  Directed broadcasts
+/// from interface-bound sockets reach every real LAN independently of route
+/// metrics and never depend on a particular adapter name or address.
+fn discovery_senders() -> Vec<(UdpSocket, Ipv4Addr, String)> {
+    let mut out = Vec::new();
+    for iface in usable_lan_interfaces() {
+        let Some(broadcast) = directed_broadcast(iface.ip, iface.netmask) else {
+            continue;
+        };
+        if out.iter().any(|(_, seen, _)| *seen == broadcast) {
+            continue;
+        }
+        match UdpSocket::bind(SocketAddrV4::new(iface.ip, 0)) {
+            Ok(sock) => {
+                if let Err(e) = sock.set_broadcast(true) {
+                    eprintln!(
+                        "[pairing] cannot enable discovery broadcast on {} ({}): {e}",
+                        iface.name, iface.ip
+                    );
+                    continue;
+                }
+                out.push((sock, broadcast, format!("{} ({})", iface.name, iface.ip)));
+            }
+            Err(e) => eprintln!(
+                "[pairing] cannot bind discovery sender to {} ({}): {e}",
+                iface.name, iface.ip
+            ),
+        }
+    }
+    out
 }
 
 fn spawn_creator_tasks(app: AppHandle, generation: u64, _code: String, discovery_port: u16) {
@@ -2220,13 +2554,27 @@ fn spawn_creator_tasks(app: AppHandle, generation: u64, _code: String, discovery
         if !announce {
             return;
         }
-        let Ok(sock) = UdpSocket::bind(("0.0.0.0", 0)) else { return };
-        let _ = sock.set_broadcast(true);
+        let senders = discovery_senders();
+        if senders.is_empty() {
+            eprintln!(
+                "[pairing] LAN discovery has no eligible Ethernet/Wi-Fi IPv4 interface; VPN/overlay and loopback interfaces are not advertised"
+            );
+        } else {
+            eprintln!(
+                "[pairing] LAN discovery advertising through {}",
+                senders
+                    .iter()
+                    .map(|(_, _, label)| label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        let loopback = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).ok();
         loop {
             {
                 let pairing = beacon_app.state::<Pairing>();
                 let inner = pairing.0.lock().unwrap();
-                if inner.generation != generation {
+                if inner.generation != generation || inner.mode != Mode::Creator {
                     return;
                 }
                 // Keep announcing while forming; stop once started.
@@ -2235,8 +2583,14 @@ fn spawn_creator_tasks(app: AppHandle, generation: u64, _code: String, discovery
                 }
             }
             let msg = beacon_packet(&session, &random_hex(8), ROSTER_PORT);
-            let _ = sock.send_to(msg.as_bytes(), ("255.255.255.255", discovery_port));
-            let _ = sock.send_to(msg.as_bytes(), ("127.0.0.1", discovery_port)); // same-host joiners
+            for (sock, broadcast, label) in &senders {
+                if let Err(e) = sock.send_to(msg.as_bytes(), (*broadcast, discovery_port)) {
+                    eprintln!("[pairing] discovery send through {label} failed: {e}");
+                }
+            }
+            if let Some(sock) = &loopback {
+                let _ = sock.send_to(msg.as_bytes(), (Ipv4Addr::LOCALHOST, discovery_port));
+            }
             std::thread::sleep(Duration::from_secs(1));
         }
     });
@@ -2475,12 +2829,14 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
         //   one that measured them, and the roster is where the cluster totals
         //   them up (pre-flight "will this model fit on all of us together").
         let join_req = |nonce: &str| {
-            let (vram_free, ram_free, unified, model_id, quant, ctx, model_ready) = {
+            let (vram_free, ram_free, ram_expert_free, unified,
+                 model_id, quant, ctx, model_ready) = {
                 let pairing = app.state::<Pairing>();
                 let inner = pairing.0.lock().unwrap();
                 (
                     inner.self_vram_free,
                     inner.self_ram_free,
+                    inner.self_ram_expert_free,
                     inner.self_unified,
                     inner.tuning.model_id.clone(),
                     inner.tuning.quant.clone(),
@@ -2495,7 +2851,8 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
                    // happens to share its name.
                    "deviceId": self_device,
                    "prefer": prefer, "hb": poll.as_secs(),
-                   "vramFree": vram_free, "ramFree": ram_free, "unifiedMemory": unified,
+                   "vramFree": vram_free, "ramFree": ram_free,
+                   "ramExpertFree": ram_expert_free, "unifiedMemory": unified,
                    // All three of model, precision and context window must
                    // match to be admitted (docs/ctx-tiers-2026-09.md).
                    "modelId": model_id, "quant": quant, "ctx": ctx,
@@ -2661,12 +3018,14 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
                 // report this machine's live engine state so the whole roster
                 // sees per-node progress (P4). The token is what makes this a
                 // MEMBER's poll rather than anyone's TCP connection (A-P0-2).
-                let (vram_free, ram_free, unified, model_id, quant, model_ready) = {
+                let (vram_free, ram_free, ram_expert_free, unified,
+                     model_id, quant, model_ready) = {
                     let pairing = app.state::<Pairing>();
                     let inner = pairing.0.lock().unwrap();
                     (
                         inner.self_vram_free,
                         inner.self_ram_free,
+                        inner.self_ram_expert_free,
                         inner.self_unified,
                         inner.tuning.model_id.clone(),
                         inner.tuning.quant.clone(),
@@ -2678,6 +3037,7 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
                        "engine": crate::engine::current_state_str(&app),
                        "hb": poll.as_secs(),
                        "vramFree": vram_free, "ramFree": ram_free,
+                       "ramExpertFree": ram_expert_free,
                        "unifiedMemory": unified,
                        "modelId": model_id, "quant": quant, "modelReady": model_ready})
             } else {
@@ -2697,6 +3057,23 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
             };
             let reply: Option<Value> = roster_call(&creator_ip, &req);
             if let Some(v) = reply {
+                // A clean creator shutdown is not a transient network loss.
+                // Drop membership and stop the RPC worker now, so this machine
+                // is immediately available for a new standalone deployment.
+                if v["closed"].as_bool() == Some(true) {
+                    let pairing = app.state::<Pairing>();
+                    let mut inner = pairing.0.lock().unwrap();
+                    if inner.generation != generation {
+                        return;
+                    }
+                    inner.generation += 1;
+                    clear_membership(&mut inner);
+                    drop(inner);
+                    let _ = crate::engine::stop_engine(&app);
+                    emit_snapshot(&app);
+                    eprintln!("[pairing] cluster creator closed the cluster — worker released");
+                    return;
+                }
                 if v["ok"].as_bool() == Some(false) {
                     let err = v["err"].as_str().unwrap_or("").to_string();
                     // Our token stopped being accepted: the creator rotated the
@@ -2915,6 +3292,7 @@ pub fn pairing_create(
         // roster row to zero and waiting for a probe that may not run again.
         let self_vram_free = inner.self_vram_free;
         let self_ram_free = inner.self_ram_free;
+        let self_ram_expert_free = inner.self_ram_expert_free;
         let self_unified = inner.self_unified;
         let model_id = inner.tuning.model_id.clone();
         let quant = inner.tuning.quant.clone();
@@ -2942,6 +3320,7 @@ pub fn pairing_create(
             // refreshes still update this same row.
             vram_free: self_vram_free,
             ram_free: self_ram_free,
+            ram_expert_free: self_ram_expert_free,
             unified_memory: self_unified,
             model_ready: true,
             model_id,
@@ -3196,27 +3575,37 @@ fn approve_coordinator_request(inner: &mut Inner, peer_id: &str) -> Result<(), S
 /// Called whenever the probe refreshes, in every mode — the numbers must be in
 /// place BEFORE a join is sent, and the creator's own roster entry is filled
 /// from here too, so one path feeds every member. Cheap and idempotent: it
-/// only writes three integers and refreshes this machine's roster row.
+/// only writes three byte counts plus the pool kind and refreshes this
+/// machine's roster row.
 #[tauri::command]
 pub fn pairing_report_memory(
     app: AppHandle,
     state: State<'_, Pairing>,
     vram_free: u64,
     ram_free: u64,
+    ram_expert_free: u64,
     unified_memory: bool,
 ) -> Result<(), String> {
+    let ram_expert_free = if unified_memory {
+        0
+    } else {
+        ram_expert_free.min(ram_free)
+    };
     let changed = {
         let mut inner = state.0.lock().unwrap();
         inner.self_vram_free = vram_free;
         inner.self_ram_free = ram_free;
+        inner.self_ram_expert_free = ram_expert_free;
         inner.self_unified = unified_memory;
         let self_id = inner.self_id.clone();
         match inner.peers.iter_mut().find(|p| p.id == self_id) {
             Some(p) if p.vram_free != vram_free
                 || p.ram_free != ram_free
+                || p.ram_expert_free != ram_expert_free
                 || p.unified_memory != unified_memory => {
                 p.vram_free = vram_free;
                 p.ram_free = ram_free;
+                p.ram_expert_free = ram_expert_free;
                 p.unified_memory = unified_memory;
                 true
             }
@@ -3231,25 +3620,72 @@ pub fn pairing_report_memory(
 
 #[tauri::command]
 pub fn pairing_leave(app: AppHandle, state: State<'_, Pairing>) -> Result<(), String> {
-    {
+    let closing = {
         let mut inner = state.0.lock().unwrap();
-        inner.generation += 1; // ends beacon/roster/poll threads
-        inner.mode = Mode::Off;
-        inner.code = None;
-        inner.engine_code.clear();
-        inner.peers.clear();
-        inner.coordinator_id = None;
-        inner.phase = "idle".into();
-        inner.coord_ip = None;
-        inner.engine_started = false;
-        inner.account_mode = false;
-        inner.last_error = None;
-        inner.required_model = None;
-        inner.challenges.clear();
-    }
+        let has_remote_members = inner.peers.iter().any(|p| !p.is_self);
+        if inner.mode == Mode::Creator && has_remote_members {
+            // Keep the current generation's roster socket and member tokens
+            // alive just long enough for every configured heartbeat cadence to
+            // receive `closed: true`. snapshot_json hides this wire-only state,
+            // so the creator is locally standalone as soon as Leave returns.
+            let max_poll_s = inner
+                .peers
+                .iter()
+                .filter(|p| !p.is_self)
+                .map(|p| u64::from(p.hb_secs.clamp(1, 60)))
+                .max()
+                .unwrap_or(1);
+            let grace = Duration::from_secs(max_poll_s + 4);
+            let until = Instant::now() + grace;
+            let closing_members: Vec<ClosedMember> = inner
+                .peers
+                .iter()
+                .filter(|p| !p.is_self && !p.token.is_empty())
+                .map(|p| ClosedMember {
+                    id: p.id.clone(),
+                    token: p.token.clone(),
+                    ip: p.ip.clone(),
+                    until,
+                })
+                .collect();
+            inner.closed_members.retain(|member| member.until > Instant::now());
+            inner.closed_members.extend(closing_members);
+            inner.mode = Mode::Closing;
+            inner.code = None;
+            inner.engine_code.clear();
+            inner.coordinator_id = None;
+            inner.phase = "idle".into();
+            inner.coord_ip = None;
+            inner.engine_started = false;
+            inner.account_mode = false;
+            inner.last_error = None;
+            inner.required_model = None;
+            inner.challenges.clear();
+            Some((inner.generation, grace))
+        } else {
+            inner.generation += 1; // ends beacon/roster/poll threads
+            clear_membership(&mut inner);
+            None
+        }
+    };
     // Leaving the cluster also stops this machine's engine process.
     let _ = crate::engine::stop_engine(&app);
     emit_snapshot(&app);
+    if let Some((generation, grace)) = closing {
+        std::thread::spawn(move || {
+            std::thread::sleep(grace);
+            let pairing = app.state::<Pairing>();
+            let mut inner = pairing.0.lock().unwrap();
+            inner.closed_members.retain(|member| member.until > Instant::now());
+            if inner.generation != generation || inner.mode != Mode::Closing {
+                return;
+            }
+            inner.generation += 1;
+            clear_membership(&mut inner);
+            drop(inner);
+            emit_snapshot(&app);
+        });
+    }
     Ok(())
 }
 
@@ -3263,18 +3699,29 @@ pub fn pairing_status(state: State<'_, Pairing>) -> Value {
 /// pairing path without the webview — needed where the GUI can't run (e.g. a
 /// locked Windows session, or CI). Spec: `create:<CODE>:<name>` or
 /// `join:<CODE>:<name>` (optional `:apiPort=<n>`, `:apiToken=<s>`,
-/// `:model=<path>` — same tuning overrides as the UI-test directives, so the
-/// P5 settings gate can also drive GUI-less machines). The creator auto-starts
-/// once a second machine joins, mirroring the `pairing-auto-start` UI directive.
+/// `:quant=<name>`, `:ctxSize=<n>`, `:model=<path>` — same tuning overrides as
+/// the UI-test directives, so the P5 settings gate can also drive GUI-less
+/// machines). The creator auto-starts once a second machine joins, mirroring
+/// the `pairing-auto-start` UI directive.
 pub fn headless_pair(app: &AppHandle, spec: &str) {
-    // op : code : name [ : apiPort=<n> ] [ : apiToken=<s> ] [ : model=<path> ]
+    // op : code : name [ : apiPort=<n> ] [ : apiToken=<s> ]
+    //                  [ : quant=<name> ] [ : ctxSize=<n> ] [ : model=<path> ]
     let mut op = "";
     let mut code = "";
     let mut name = "headless-node";
     let mut model = String::new();
+    let mut reading_model = false;
     let mut tuning = Tuning::default();
     let mut tuned = false;
     for (i, tok) in spec.split(':').enumerate() {
+        // `model=` is deliberately the final option. Preserve every following
+        // colon so an ordinary Windows drive path (`F:\\...`) survives the
+        // option separator instead of becoming the nonexistent path `F`.
+        if reading_model {
+            model.push(':');
+            model.push_str(tok);
+            continue;
+        }
         match i {
             0 => op = tok,
             1 => code = tok,
@@ -3282,6 +3729,15 @@ pub fn headless_pair(app: &AppHandle, spec: &str) {
             _ => {
                 if let Some(m) = tok.strip_prefix("model=") {
                     model = m.to_string();
+                    reading_model = true;
+                } else if let Some(q) = tok.strip_prefix("quant=") {
+                    tuning.quant = q.to_string();
+                    tuned = true;
+                } else if let Some(c) = tok.strip_prefix("ctxSize=") {
+                    if let Ok(c) = c.parse::<u32>() {
+                        tuning.ctx_size = c;
+                        tuned = true;
+                    }
                 } else if let Some(p) = tok.strip_prefix("apiPort=") {
                     if let Ok(p) = p.parse::<u16>() {
                         tuning.api_port = p;
@@ -3337,18 +3793,16 @@ pub fn net_lan_ip() -> String {
     local_lan_ip()
 }
 
-/// Best-effort LAN ip of this machine (the address peers should dial): open a
-/// UDP socket "towards" a public address (no packet is sent) and read the
-/// local address the OS picked.
+/// Best-effort physical-LAN IPv4 for display and pre-pairing bookkeeping.
+/// Interface enumeration is deliberate: the OS's Internet default route is
+/// owned by a full-tunnel VPN and is not evidence of the LAN peers can dial.
+/// An empty result is honest and lets the pairing flow report a network error;
+/// it must never turn into 127.0.0.1 for a remote machine.
 fn local_lan_ip() -> String {
-    UdpSocket::bind(("0.0.0.0", 0))
-        .and_then(|s| {
-            s.connect(("8.8.8.8", 80))?;
-            s.local_addr()
-        })
-        .map(|a: SocketAddr| a.ip())
-        .map(|ip: IpAddr| ip.to_string())
-        .unwrap_or_else(|_| "127.0.0.1".into())
+    usable_lan_interfaces()
+        .first()
+        .map(|iface| iface.ip.to_string())
+        .unwrap_or_default()
 }
 
 /// Tests for the pairing settings helpers.
@@ -3416,10 +3870,69 @@ mod pairing_settings_tests {
 
     #[test]
     fn bind_nic_falls_back_when_it_is_not_a_usable_address() {
-        for v in ["", "auto", " AUTO-ish ", "eth0", "999.1.1.1"] {
+        for v in [
+            "", "auto", " AUTO-ish ", "eth0", "999.1.1.1", "127.0.0.1",
+            "100.100.1.2", "198.18.0.1",
+        ] {
             let t = tuning(|t| t.bind_nic = v.into());
             assert_eq!(bind_host(&t), "0.0.0.0", "{v:?} must not become a bind host");
             assert_ne!(self_ip(&t), v.trim(), "{v:?} must not be advertised verbatim");
+        }
+    }
+
+    #[test]
+    fn automatic_cluster_addresses_exclude_vpn_and_non_lan_ranges() {
+        for ip in [
+            "127.0.0.1", "169.254.2.3", "100.64.0.1", "100.127.255.254",
+            "198.18.0.1", "198.19.255.254", "224.0.0.1", "255.255.255.255",
+        ] {
+            assert!(!usable_cluster_ipv4(ip.parse().unwrap()), "{ip} must be refused");
+        }
+        for ip in ["192.168.10.248", "10.23.4.5", "172.20.1.9", "203.0.113.9"] {
+            assert!(usable_cluster_ipv4(ip.parse().unwrap()), "{ip} remains a usable routed LAN address");
+        }
+    }
+
+    #[test]
+    fn common_vpn_interfaces_are_not_auto_selected() {
+        for name in [
+            "Meta", "Tailscale", "utun4", "tun0", "tap-windows6", "wg0",
+            "WireGuard Home", "OpenVPN Data Channel Offload", "Clash TUN",
+        ] {
+            assert!(likely_vpn_interface(name), "{name:?} must be treated as a VPN interface");
+        }
+        for name in ["Ethernet 2", "Wi-Fi", "en0", "eth0"] {
+            assert!(!likely_vpn_interface(name), "{name:?} must remain eligible");
+        }
+    }
+
+    #[test]
+    fn directed_broadcast_uses_each_interfaces_real_netmask() {
+        assert_eq!(
+            directed_broadcast("192.168.10.248".parse().unwrap(), "255.255.255.0".parse().unwrap()),
+            Some("192.168.10.255".parse().unwrap())
+        );
+        assert_eq!(
+            directed_broadcast("10.30.44.5".parse().unwrap(), "255.255.252.0".parse().unwrap()),
+            Some("10.30.47.255".parse().unwrap())
+        );
+        assert_eq!(
+            directed_broadcast("10.0.0.1".parse().unwrap(), "255.255.255.252".parse().unwrap()),
+            Some("10.0.0.3".parse().unwrap())
+        );
+        assert!(directed_broadcast(
+            "10.0.0.1".parse().unwrap(), "255.255.255.255".parse().unwrap()
+        ).is_none());
+        assert!(directed_broadcast(
+            "10.0.0.1".parse().unwrap(), "255.0.255.0".parse().unwrap()
+        ).is_none());
+    }
+
+    #[test]
+    fn peer_specific_route_never_falls_back_to_loopback() {
+        assert_eq!(source_ip_for_peer("127.0.0.1").unwrap(), Ipv4Addr::LOCALHOST);
+        for remote in ["100.100.1.2", "198.18.0.1", "not-an-ip"] {
+            assert!(source_ip_for_peer(remote).is_err(), "{remote} must be refused");
         }
     }
 
@@ -3428,13 +3941,16 @@ mod pairing_settings_tests {
         assert!(usage_cap_args(&Tuning::default()).is_empty());
         let t = tuning(|t| {
             t.max_vram_mb = 8192;
+            t.max_ram_mb = 16384;
         });
         assert_eq!(
             usage_cap_args(&t),
-            vec!["--max-vram-mb", "8192"]
+            vec!["--max-vram-mb", "8192", "--max-ram-mb", "16384"]
         );
         let only_vram = tuning(|t| t.max_vram_mb = 4096);
         assert_eq!(usage_cap_args(&only_vram), vec!["--max-vram-mb", "4096"]);
+        let only_ram = tuning(|t| t.max_ram_mb = 12288);
+        assert_eq!(usage_cap_args(&only_ram), vec!["--max-ram-mb", "12288"]);
     }
 
     /// Overflow travels as a pair. One half without the other would ask the
@@ -3470,6 +3986,7 @@ mod pairing_settings_tests {
             t.model_id = "qwen3-8b".into();
             t.api_port = 8123;
             t.max_vram_mb = 8192;
+            t.max_ram_mb = 16384;
             t.overflow_url = "http://old-platform".into();
             t.overflow_key = "old-key".into();
         });
@@ -3489,6 +4006,7 @@ mod pairing_settings_tests {
         assert_eq!(t.model_id, "qwen3-8b", "launch routing must not change the roster model");
         assert_eq!(t.api_port, 8123, "launch routing must not move the local API");
         assert_eq!(t.max_vram_mb, 8192, "launch routing must not alter resource caps");
+        assert_eq!(t.max_ram_mb, 16384, "launch routing must not alter resource caps");
 
         // Off is an explicit backend decision. Even stale credentials in the
         // payload must not revive a choice captured when the roster was made.
@@ -3545,6 +4063,7 @@ mod pairing_settings_tests {
         assert_eq!(t.overflow_wait_s, 7);
         assert_eq!(t.overflow_daily_cap_milli, 4200);
         assert_eq!(t.max_vram_mb, 8192);
+        assert_eq!(t.max_ram_mb, 16384);
         assert!(!t.lan_discovery);
         assert_eq!(manual_peer_list(&t), vec!["192.168.1.50"]);
         assert_eq!(heartbeat(&t), Duration::from_secs(3));
@@ -3728,6 +4247,7 @@ mod pairing_settings_tests {
             wants_coordinator: false,
             vram_free: 0,
             ram_free: 0,
+            ram_expert_free: 0,
             unified_memory: false,
             model_ready: false,
             model_id: String::new(),
@@ -3774,6 +4294,65 @@ mod pairing_settings_tests {
             member_authorized(&inner, &json!({"id": "machine-a", "token": "a1b2c3"}), ip),
             Some("machine-a".to_string())
         );
+    }
+
+    #[test]
+    fn closed_cluster_notice_survives_an_immediate_new_roster() {
+        let now = Instant::now();
+        // The old worker is deliberately absent from the live peers: this is
+        // the state after the creator has already started a fresh standalone
+        // deployment and replaced its roster.
+        let mut inner = inner_with(vec![joined_member(
+            "new-local",
+            "192.168.1.10",
+            "new-token",
+        )]);
+        inner.closed_members.push(ClosedMember {
+            id: "old-worker".into(),
+            token: "old-token".into(),
+            ip: "192.168.1.50".into(),
+            until: now + Duration::from_secs(5),
+        });
+
+        let closed = roster_request(
+            &mut inner,
+            &json!({"op": "roster", "id": "old-worker", "token": "old-token"}),
+            "192.168.1.50",
+            now,
+        );
+        assert_eq!(closed, json!({"ok": true, "closed": true}));
+
+        // The tombstone is still bound to both its source address and token;
+        // it must not become a public oracle saying which machines were in the
+        // previous cluster.
+        let stolen = roster_request(
+            &mut inner,
+            &json!({"op": "roster", "id": "old-worker", "token": "old-token"}),
+            "192.168.1.99",
+            now,
+        );
+        assert_eq!(stolen["ok"], false);
+        assert_ne!(stolen["closed"], true);
+    }
+
+    #[test]
+    fn closing_creator_is_locally_already_standalone() {
+        let mut inner = inner_with(vec![joined_member(
+            "old-worker",
+            "192.168.1.50",
+            "old-token",
+        )]);
+        inner.mode = Mode::Closing;
+        inner.code = Some("ABC234".into());
+        inner.coordinator_id = Some("creator".into());
+        inner.phase = "ready".into();
+
+        let snap = snapshot_json(&inner);
+        assert_eq!(snap["phase"], "idle");
+        assert_eq!(snap["peers"], json!([]));
+        assert!(snap["code"].is_null());
+        assert!(snap["coordinatorId"].is_null());
+        assert_eq!(snap["isCreator"], false);
     }
 
     #[test]
@@ -3825,24 +4404,34 @@ mod pairing_settings_tests {
         let mut peer = joined_member("machine-a", "192.168.1.50", "token");
         peer.vram_free = 1;
         peer.ram_free = 2;
+        peer.ram_expert_free = 1;
 
         merge_peer_memory(
             &mut peer,
             &json!({
                 "vramFree": 13_u64 << 30,
                 "ramFree": 42_u64 << 30,
-                "unifiedMemory": true,
+                "ramExpertFree": 31_u64 << 30,
+                "unifiedMemory": false,
             }),
         );
         assert_eq!(peer.vram_free, 13_u64 << 30);
         assert_eq!(peer.ram_free, 42_u64 << 30);
-        assert!(peer.unified_memory);
+        assert_eq!(peer.ram_expert_free, 31_u64 << 30);
+        assert!(!peer.unified_memory);
 
         // Backward compatibility: an older heartbeat has no resource keys.
         // It must not turn a complete pool back into "cannot tell".
         merge_peer_memory(&mut peer, &json!({"op": "roster"}));
         assert_eq!(peer.vram_free, 13_u64 << 30);
         assert_eq!(peer.ram_free, 42_u64 << 30);
+        assert_eq!(peer.ram_expert_free, 31_u64 << 30);
+        assert!(!peer.unified_memory);
+
+        // A unified-memory node has no second expert pool even if a stale or
+        // malicious heartbeat tries to publish one.
+        merge_peer_memory(&mut peer, &json!({"unifiedMemory": true}));
+        assert_eq!(peer.ram_expert_free, 0);
         assert!(peer.unified_memory);
     }
 
@@ -4578,7 +5167,7 @@ mod pairing_settings_tests {
 
         let allowed = [
             "id", "hostname", "gpu", "stage", "online", "layerLo", "layerHi",
-            "vramFree", "ramFree", "unifiedMemory", "modelReady",
+            "vramFree", "ramFree", "ramExpertFree", "unifiedMemory", "modelReady",
         ];
         for (k, _) in member.as_object().unwrap() {
             assert!(allowed.contains(&k.as_str()), "new roster field {k:?} needs a disclosure decision");

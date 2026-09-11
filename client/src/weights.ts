@@ -134,6 +134,14 @@ export interface FetchProgress {
   endpoint?: string;
   have?: number;
   total?: number;
+  /** Current I/O phase. During verification, `have` remains the monotonic
+   * whole-model download position while these phase counters describe the
+   * local hash pass. */
+  phase?: "probing" | "downloading" | "verifying";
+  phaseHave?: number;
+  phaseTotal?: number;
+  part?: number;
+  parts?: number;
   note?: string;
   path?: string;
   message?: string;
@@ -204,12 +212,15 @@ export async function fetchWeights(args: {
   }
 }
 
-/** A weight file on this machine, as found by scanning the model folder. */
+/** One logical model on this machine, as found by recursively scanning the
+ * configured model folder. Split GGUF parts are grouped into one row. */
 export interface StoredWeights {
-  /** File name without `.part` — the name a manifest would use. */
+  /** Primary GGUF path relative to the model folder. */
   file: string;
+  /** Every GGUF member present for this row; deleting uses this allow-list. */
+  files: string[];
   bytes: number;
-  /** An unfinished download; continuing resumes from these bytes. */
+  /** An unfinished download or an incomplete split GGUF set. */
   partial: boolean;
 }
 
@@ -220,8 +231,8 @@ export async function listWeights(destDir: string): Promise<StoredWeights[]> {
 
 /** Delete one model's weights (finished file plus any leftover `.part`).
  *  Returns the bytes freed. */
-export async function deleteWeights(destDir: string, file: string): Promise<number> {
-  return invoke<number>("weights_delete", { destDir, file });
+export async function deleteWeights(destDir: string, files: string[]): Promise<number> {
+  return invoke<number>("weights_delete", { destDir, files });
 }
 
 export async function cancelFetch(id: string): Promise<boolean> {

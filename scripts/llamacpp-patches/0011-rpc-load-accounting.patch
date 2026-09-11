@@ -1,0 +1,35 @@
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1540,6 +1540,8 @@ bool llama_model_loader::load_all_data(
+ 
+     const char * require_rpc_cache = std::getenv("GGML_RPC_REQUIRE_MODEL_CACHE");
+     const bool prefetch_sparse_local = use_mmap && require_rpc_cache != nullptr && strcmp(require_rpc_cache, "0") != 0;
++    size_t backend_source_tensors = 0;
++    size_t backend_source_bytes = 0;
+ 
+     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
+         const auto * weight = get_weight(ggml_get_name(cur));
+@@ -1564,5 +1566,7 @@ bool llama_model_loader::load_all_data(
+          * takes the ordinary local-read path when explicitly requested. */
+         if (!check_tensors && ggml_backend_tensor_set_from_source(cur, 0, n_size)) {
++            backend_source_tensors++;
++            backend_source_bytes += n_size;
+             size_done += n_size;
+             continue;
+         }
+@@ -1682,6 +1686,14 @@ bool llama_model_loader::load_all_data(
+         size_done += n_size;
+     }
+ 
++    if (backend_source_tensors > 0) {
++        LLAMA_LOG_INFO("llama_model_loader: delegated %zu tensors (%.2f GiB) "
++                       "to backend-owned sources; this process did not read "
++                       "those weight bytes\n",
++                       backend_source_tensors,
++                       (double) backend_source_bytes / (double) GiB);
++    }
++
+     // free temporary resources used for async uploads
+     for (auto * event : events) {
+         ggml_backend_event_synchronize(event);

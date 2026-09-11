@@ -147,7 +147,7 @@ export interface AppSettings {
   resourcePreset: ResourcePreset;
   // ---- advanced: resources (precise; used when resourcePreset === "custom") ----
   maxVramMb: number; // 0 = no cap
-  maxRamMb: number; // legacy stored field; serving capacity is GPU memory only
+  maxRamMb: number; // 0 = no cap; node-local MoE experts may use this RAM pool
   // No "weights source" / "GGUF file path" any more (2026-08-13). Resolution is
   // policy, not preference — see resolveLocalWeights: a complete local copy is
   // used, a joiner streams its layers from the coordinator, everyone else
@@ -781,11 +781,12 @@ export interface EngineTuning {
   kvCacheV: string;
   /** Per-request generation ceiling → coord `--max-decode`. 0 = context-bound. */
   maxDecode: number;
-  /** This machine's usage cap (MiB, 0 = no cap) → worker `--max-vram-mb`.
-   *  Unlike the model/ctx settings, the VRAM cap is the
+  /** This machine's usage caps (MiB, 0 = no cap) → worker `--max-vram-mb` /
+   *  `--max-ram-mb`. Unlike the model/ctx settings, these caps are the
    *  answer to "how much of MY computer may IdleToken use", so each node
    *  passes its own and joiners never adopt the creator's. */
   maxVramMb: number;
+  maxRamMb: number;
   // ---- pairing behaviour (client-side, consumed by src-tauri/src/pairing.rs) --
   /** Announce/listen for the UDP discovery beacon. Off = this machine is found
    *  (or finds others) only through `manualPeers`. */
@@ -865,11 +866,12 @@ export function tierCtx(tier: Tier["id"] | 0): number {
  */
 export function engineTuning(
   s: AppSettings,
-  caps: { maxVramMb: number }
+  caps: { maxVramMb: number; maxRamMb: number }
 ): EngineTuning {
   const overflow = overflowTuning(s);
   return {
     maxVramMb: caps.maxVramMb,
+    maxRamMb: caps.maxRamMb,
     lanDiscovery: s.mdns,
     manualPeers: s.manualPeers,
     // Clamped where it is read (pairing.rs) too; here it just keeps a 0 from a
@@ -922,14 +924,15 @@ export function engineTuning(
 export function effectiveCaps(
   s: AppSettings,
   totals: { vram_total: number; ram_total: number } | null
-): { maxVramMb: number } {
+): { maxVramMb: number; maxRamMb: number } {
   if (s.resourcePreset === "custom") {
-    return { maxVramMb: s.maxVramMb };
+    return { maxVramMb: s.maxVramMb, maxRamMb: s.maxRamMb };
   }
   const f = PRESET_FRACTION[s.resourcePreset];
-  if (!totals || f >= 1) return { maxVramMb: 0 };
+  if (!totals || f >= 1) return { maxVramMb: 0, maxRamMb: 0 };
   return {
     maxVramMb: Math.floor((totals.vram_total * f) / MiB),
+    maxRamMb: Math.floor((totals.ram_total * f) / MiB),
   };
 }
 

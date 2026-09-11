@@ -1,6 +1,6 @@
 [package]
 name = "idletoken-client"
-version = "0.1.45"
+version = "0.1.63"
 description = "IdleToken desktop/mobile client"
 authors = ["IdleToken"]
 edition = "2021"
@@ -42,6 +42,11 @@ sha2 = "0.10"
 # nonce is the thing that must not be a function of anything guessable. Already
 # in the tree as a transitive dependency of tauri, so this costs no new code.
 getrandom = "0.2"
+# Enumerate every IPv4 interface for LAN discovery.  Asking the OS which
+# address it would use for an Internet destination is not LAN discovery: a VPN
+# can become the default route and make an otherwise healthy local cluster
+# advertise loopback/the tunnel instead of Ethernet or Wi-Fi.
+if-addrs = "0.15"
 # Backoff sleeps in the engine supervisor; tauri's async runtime is tokio.
 tokio = { version = "1", features = ["time"] }
 # Weight downloads (weights.rs). Why the client downloads them rather than the

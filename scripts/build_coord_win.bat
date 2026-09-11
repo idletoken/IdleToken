@@ -18,12 +18,18 @@ REM Run from the repo root:  scripts\build_coord_win.bat
 REM Contract: prints COORD_WIN_OK or COORD_WIN_FAIL (details in coord_build.log).
 setlocal
 cd /d "%~dp0.."
-REM MinGW location: defaults to the per-user copy winget installs; override with
-REM the IDLETOKEN_MINGW_BIN environment variable. This used to hardcode one build
-REM machine's absolute path (username included) -- useless on any other machine,
-REM and that username belongs to someone else and must not ship with an
-REM open-source repository.
-if defined IDLETOKEN_MINGW_BIN (set "M=%IDLETOKEN_MINGW_BIN%") else (set "M=%LOCALAPPDATA%\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT.LLVM_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin")
+REM MinGW location: an explicit override wins, then use the repo-local WinLibs
+REM archive accepted by build_worker_win.bat, and only then try winget's
+REM per-user install.  The old implementation claimed to share the worker's
+REM probe but skipped the repo-local case, so a deploy node with a perfectly
+REM usable <repo>\mingw64 failed before it could even create coord_build.log.
+if defined IDLETOKEN_MINGW_BIN (
+    set "M=%IDLETOKEN_MINGW_BIN%"
+) else if exist "%~dp0..\mingw64\bin\gcc.exe" (
+    set "M=%~dp0..\mingw64\bin"
+) else (
+    set "M=%LOCALAPPDATA%\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT.LLVM_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin"
+)
 set PATH=%M%;C:\WINDOWS\system32;C:\WINDOWS;C:\WINDOWS\System32\Wbem;C:\WINDOWS\System32\OpenSSH\
 del coord_build.log 2>nul
 where windres >nul 2>&1

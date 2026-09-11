@@ -1,0 +1,33 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index c86f84f..f9406ea 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1329,7 +1329,9 @@ static struct sched_moe_state * sched_moe_state_new_with(int cap, uint64_t bytes
+     const char * pinned_readback = getenv("GGML_MOE_PINNED_READBACK");
+     st->pinned_readback = pinned_readback && atoi(pinned_readback) > 0;
+     const char * mapped_readback = getenv("GGML_MOE_MAPPED_READBACK");
+-    st->mapped_readback = mapped_readback && atoi(mapped_readback) > 0;
++    // Tiny CUDA routing reads use mapped pinned storage by default. Explicit
++    // zero retains the DMA control; non-CUDA backends keep their existing path.
++    st->mapped_readback = mapped_readback ? atoi(mapped_readback) > 0 : true;
+     st->pinned_readback = st->pinned_readback || st->mapped_readback;
+     const char * inline_ids = getenv("GGML_MOE_INLINE_IDS");
+     st->inline_ids = inline_ids && atoi(inline_ids) > 0;
+@@ -1818,7 +1820,7 @@ static void * sched_moe_readback_ptr(ggml_backend_sched_t sched, ggml_backend_t
+     if (!sched->moe || !sched->moe->pinned_readback) return ordinary;
+     const auto dev = ggml_backend_get_device(backend);
+     const auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+-    // This diagnostic targets discrete CUDA. It must not allocate a host
++    // This path targets discrete CUDA. It must not allocate a host
+     // buffer on an RPC backend or change the Metal/unified-memory path.
+     if (!reg || strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) return ordinary;
+     int b = -1;
+@@ -1834,7 +1836,7 @@ static void * sched_moe_readback_ptr(ggml_backend_sched_t sched, ggml_backend_t
+         if (!buft) GGML_ABORT("pinned MoE readback requested but CUDA exposes no host buffer type");
+         buffer = ggml_backend_buft_alloc_buffer(buft, std::max<size_t>(4096, bytes));
+         if (!buffer || ggml_backend_buffer_get_type(buffer) != buft) {
+-            GGML_ABORT("pinned MoE readback allocation failed; cannot measure a pageable fallback as pinned");
++            GGML_ABORT("pinned MoE readback allocation failed; refusing a pageable fallback");
+         }
+         fprintf(stderr, "moe-readback: device=%s kind=%s bytes=%zu buffer=%s mapped=%d\n",
+                 ggml_backend_dev_name(dev), scores ? "scores" : "ids",

@@ -55,6 +55,7 @@
  * ~25 existing call sites stay as they are. */
 #ifdef _WIN32
   #include <winsock2.h>
+  #include <windows.h>
   #include <direct.h>
   #undef close
   #define close(fd) closesocket((SOCKET)(fd))
@@ -266,11 +267,13 @@ typedef struct {
     uint64_t vram_total, vram_used_other, vram_usable;
     uint64_t ram_total,  ram_used_other,  ram_usable;
     uint64_t ram_pinnable;   /* measured pinned-memory ceiling, 0 = unknown (see idletoken_resource.h) */
+    uint32_t engine_flags;   /* IDLETOKEN_ENGINE_FLAG_* read from the worker's engine binary (RESOURCE_REPORT) */
     uint32_t cpu_count;
     uint64_t disk_avail;
     uint32_t net_link_mbps;
     uint8_t  can_run_ds4;
     uint8_t  rpc_cpu_active; /* requested as endpoint device 1 in RPC_ASSIGN */
+    uint64_t rpc_request_id; /* HELLO request id echoed by the deferred RPC_READY */
 
     /* derived */
     uint64_t score;
@@ -624,7 +627,8 @@ static int recv_resource_report(int fd, idletoken_worker_info *w) {
     w->ram_pinnable = (uint64_t)r1 << 20;
     idletoken_buf_get_u64  (&b, &w->disk_avail);
     idletoken_buf_get_u32  (&b, &w->net_link_mbps);
-    idletoken_buf_get_u32  (&b, &r2);
+    idletoken_buf_get_u32  (&b, &r2);            /* engine capability flags (was reserved; old workers send 0) */
+    w->engine_flags = r2;
     idletoken_buf_get_u8   (&b, &w->can_run_ds4);
     idletoken_buf_get_bytes(&b, pad7, 7);
     if (b.err) { fprintf(stderr, "coord: RESOURCE_REPORT payload malformed\n"); return -1; }
@@ -652,6 +656,13 @@ static int cmp_worker_desc(const void *pa, const void *pb) {
  * pure unit-tested functions (src/tools/plan_test.c). This wrapper adapts
  * idletoken_worker_info (callers pass it sorted by usable VRAM) and stamps
  * stage ids / contiguous layer ranges. */
+/* Page-lockable RAM is a hard admission cap. Patch 0007's staged pageable
+ * tail was withdrawn after measuring the slow path, so an old engine carrying
+ * that marker must not turn this limit into an oversubscription escape hatch. */
+static uint64_t worker_plan_ram_pinnable(const idletoken_worker_info *w) {
+    return w->ram_pinnable;
+}
+
 static void plan_layers(idletoken_worker_info *ws, int n, idletoken_mode mode,
                         uint32_t ctx_size) {
     if (n <= 0) return;
@@ -660,7 +671,7 @@ static void plan_layers(idletoken_worker_info *ws, int n, idletoken_mode mode,
     for (int i = 0; i < n && i < IDLETOKEN_MAX_WORKERS; i++) {
         nodes[i].vram_usable = ws[i].vram_usable;
         nodes[i].ram_usable  = ws[i].ram_usable;
-        nodes[i].ram_pinnable= ws[i].ram_pinnable;
+        nodes[i].ram_pinnable= worker_plan_ram_pinnable(&ws[i]);
         nodes[i].unified     = ws[i].unified;
         nodes[i].backend     = IDLETOKEN_BACKEND_OF_OS(ws[i].os_family);
         snprintf(nodes[i].label, sizeof nodes[i].label, "%s", ws[i].hostname);
@@ -3075,7 +3086,6 @@ static int coord_selftest(void) {
 #ifdef _WIN32
     fails += windows_utf8_path_selftest();
 #endif
-
 #undef ST
     fails += cluster_moe_args_selftest();
     /* Node-crypto framing (docs/inter-node-encryption.md N1). Lives with the
@@ -5907,7 +5917,7 @@ static void handle_http_request(int conn_fd,
         for (int i = 0; i < n && i < IDLETOKEN_MAX_WORKERS; i++) {
             nodes[i].vram_usable = ws[i].vram_usable;
             nodes[i].ram_usable  = ws[i].ram_usable;
-            nodes[i].ram_pinnable= ws[i].ram_pinnable;
+            nodes[i].ram_pinnable= worker_plan_ram_pinnable(&ws[i]);
             nodes[i].unified     = ws[i].unified;
             nodes[i].backend     = IDLETOKEN_BACKEND_OF_OS(ws[i].os_family);
             snprintf(nodes[i].label, sizeof nodes[i].label, "%s", ws[i].hostname);
@@ -7591,12 +7601,22 @@ static void coord_sleep_ms(unsigned ms) {
  * set IDLETOKEN_SHARD_REPO to a DGX/LAN repository; the automatic local server
  * is the zero-configuration desktop path. */
 static int coord_weight_repo_start(const char *gguf,
-                                   char *url, size_t url_cap) {
+                                   const idletoken_rpc_peer *peers,
+                                   int n_peers,
+                                   char peer_urls[][512],
+                                   char *local_url, size_t local_url_cap) {
+    if (!peers || n_peers <= 0 || !peer_urls || !local_url || local_url_cap == 0)
+        return -1;
     const char *external = getenv("IDLETOKEN_SHARD_REPO");
     if (external && external[0]) {
-        if (snprintf(url, url_cap, "%s", external) < 0 ||
-            strlen(external) >= url_cap) return -1;
-        fprintf(stderr, "coord: using configured layer repository %s\n", url);
+        if (snprintf(local_url, local_url_cap, "%s", external) < 0 ||
+            strlen(external) >= local_url_cap) return -1;
+        for (int i = 0; i < n_peers; i++) {
+            if (snprintf(peer_urls[i], 512, "%s", external) < 0 ||
+                strlen(external) >= 512) return -1;
+        }
+        fprintf(stderr, "coord: using configured layer repository %s\n",
+                local_url);
         return 0;
     }
 
@@ -7607,29 +7627,21 @@ static int coord_weight_repo_start(const char *gguf,
         if (idletoken_write_idx(gguf, idx) != 0) return -1;
     }
 
-    coord_weight_repo_args *a =
-        (coord_weight_repo_args *)calloc(1, sizeof(*a));
-    if (!a) return -1;
-    snprintf(a->dir, sizeof(a->dir), "%s", gguf);
-    char *slash = strrchr(a->dir, '/');
+    char dir[1024];
+    snprintf(dir, sizeof(dir), "%s", gguf);
+    char *slash = strrchr(dir, '/');
 #ifdef _WIN32
-    { char *bs = strrchr(a->dir, '\\'); if (!slash || (bs && bs > slash)) slash = bs; }
+    { char *bs = strrchr(dir, '\\'); if (!slash || (bs && bs > slash)) slash = bs; }
 #endif
     const char *base = gguf;
     for (const char *p = gguf; *p; p++)
         if (*p == '/' || *p == '\\') base = p + 1;
     if (slash) *slash = '\0';
-    else snprintf(a->dir, sizeof(a->dir), ".");
+    else snprintf(dir, sizeof(dir), ".");
 
-    char lan_ip[64] = "";
-    if (idletoken_local_ipv4(lan_ip, sizeof(lan_ip)) != 0 || !lan_ip[0]) {
-        free(a);
-        return -1;
-    }
     int port = 8001;
     const char *pe = getenv("IDLETOKEN_WEIGHT_REPO_PORT");
     if (pe && atoi(pe) > 0 && atoi(pe) <= 65535) port = atoi(pe);
-    snprintf(a->bind, sizeof(a->bind), "%s:%d", lan_ip, port);
 #ifdef _WIN32
     {
         char rule[80];
@@ -7638,111 +7650,167 @@ static int coord_weight_repo_start(const char *gguf,
     }
 #endif
 
-    pthread_t tid;
-    if (pthread_create(&tid, NULL, coord_weight_repo_thread, a) != 0) {
-        free(a);
-        return -1;
-    }
-    pthread_detach(tid);
-    int ready = 0;
-    for (int i = 0; i < 50; i++) {
-        int fd = idletoken_connect_tcp(a->bind);
-        if (fd >= 0) {
-            idletoken_close_fd(fd);
-            ready = 1;
-            break;
+    /* One listener per distinct local route.  Most clusters have one address,
+     * but a coordinator may bridge two real LANs and serve workers on both.
+     * Binding only the first interface makes machine count/order affect which
+     * workers can fetch the index; binding 0.0.0.0 would expose the repository
+     * to VPN adapters too.  Connected control sockets give us the exact safe
+     * set without guessing interface metrics or names. */
+    char started_ips[IDLETOKEN_LLPLAN_MAX_NODES][64];
+    int n_started = 0;
+    for (int i = 0; i < n_peers; i++) {
+        char lan_ip[64] = "";
+        if (idletoken_socket_local_ipv4(peers[i].fd, lan_ip,
+                                        sizeof(lan_ip)) != 0 || !lan_ip[0]) {
+            fprintf(stderr, "coord: cannot determine the LAN address used by "
+                            "connected worker %s\n", peers[i].hostname);
+            return -1;
         }
-        coord_sleep_ms(100);
-    }
-    if (!ready) {
-        fprintf(stderr, "coord: layer repository did not listen on %s\n", a->bind);
-        return -1;
-    }
-    int n = snprintf(url, url_cap, "http://%s:%d/%s", lan_ip, port, base);
-    if (n < 0 || (size_t)n >= url_cap) return -1;
-    fprintf(stderr, "coord: layer repository ready: %s\n", url);
-    return 0;
-}
+        if (idletoken_ip_is_overlay(lan_ip)) {
+            fprintf(stderr, "coord: worker %s's route selected VPN/overlay "
+                            "address %s; model and tensor traffic require the real LAN\n",
+                    peers[i].hostname, lan_ip);
+            return -1;
+        }
+        int url_n = snprintf(peer_urls[i], 512, "http://%s:%d/%s",
+                             lan_ip, port, base);
+        if (url_n < 0 || url_n >= 512) return -1;
 
-static int coord_local_model_cache_dir(char *out, size_t cap) {
-    const char *configured = getenv("IDLETOKEN_LOCAL_MODEL_CACHE");
-    if (configured && configured[0]) {
-        int n = snprintf(out, cap, "%s", configured);
-        return n >= 0 && (size_t)n < cap ? 0 : -1;
-    }
-#ifdef _WIN32
-    const char *base = getenv("LOCALAPPDATA");
-    if (base && base[0]) {
-        int n = snprintf(out, cap, "%s\\IdleToken\\model-views", base);
-        return n >= 0 && (size_t)n < cap ? 0 : -1;
-    }
-    base = getenv("USERPROFILE");
-    int n = snprintf(out, cap, "%s\\.idletoken\\model-views",
-                     base && base[0] ? base : ".");
-#else
-    const char *base = getenv("HOME");
-    int n = snprintf(out, cap, "%s/.idletoken/model-views",
-                     base && base[0] ? base : ".");
-#endif
-    return n >= 0 && (size_t)n < cap ? 0 : -1;
-}
+        int already_started = 0;
+        for (int j = 0; j < n_started; j++)
+            if (strcmp(started_ips[j], lan_ip) == 0) already_started = 1;
+        if (already_started) continue;
 
-typedef struct {
-    const idletoken_rpc_peer *peers;
-    int n_peers;
-    volatile int stop;
-    int failed;
-} coord_prepare_heartbeat;
-
-/* Preparing a cold local prefix can take minutes on a large HDD. Workers
- * intentionally close their rpc-server after 60 seconds of coordinator
- * silence, so keep the already-paired control links alive while the
- * coordinator is doing that legitimate work. No other thread touches these
- * sockets until this helper is joined. */
-static void *coord_prepare_heartbeat_thread(void *opaque) {
-    coord_prepare_heartbeat *hb = (coord_prepare_heartbeat *)opaque;
-    while (!hb->stop) {
-        idletoken_msg_header h = {
-            .magic = IDLETOKEN_PROTO_MAGIC,
-            .version = IDLETOKEN_PROTO_VERSION,
-            .msg_type = IDLETOKEN_MSG_HEARTBEAT,
-            .payload_bytes = 0,
-            .request_id = 0,
-            .stage_id = IDLETOKEN_STAGE_COORD,
-            .segment_id = IDLETOKEN_SEGMENT_NONE,
-        };
-        for (int i = 0; i < hb->n_peers; i++) {
-            if (idletoken_send_msg(hb->peers[i].fd, &h, NULL, 0) != 0) {
-                fprintf(stderr, "coord: preparation heartbeat to %s (%s) "
-                                "failed: %s\n",
-                        hb->peers[i].hostname, hb->peers[i].endpoint,
-                        strerror(errno));
-                hb->failed = 1;
-                hb->stop = 1;
+        coord_weight_repo_args *a =
+            (coord_weight_repo_args *)calloc(1, sizeof(*a));
+        if (!a) return -1;
+        snprintf(a->dir, sizeof(a->dir), "%s", dir);
+        snprintf(a->bind, sizeof(a->bind), "%s:%d", lan_ip, port);
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, coord_weight_repo_thread, a) != 0) {
+            free(a);
+            return -1;
+        }
+        pthread_detach(tid);
+        int ready = 0;
+        for (int attempt = 0; attempt < 50; attempt++) {
+            int fd = idletoken_connect_tcp(a->bind);
+            if (fd >= 0) {
+                idletoken_close_fd(fd);
+                ready = 1;
                 break;
             }
+            coord_sleep_ms(100);
         }
-        for (int i = 0; i < 40 && !hb->stop; i++) coord_sleep_ms(250);
+        if (!ready) {
+            fprintf(stderr, "coord: layer repository did not listen on %s\n",
+                    a->bind);
+            return -1;
+        }
+        snprintf(started_ips[n_started++], sizeof(started_ips[0]), "%s", lan_ip);
+        fprintf(stderr, "coord: layer repository ready for %s through %s\n",
+                peers[i].hostname, peer_urls[i]);
     }
-    return NULL;
+
+    if (snprintf(local_url, local_url_cap, "%s", peer_urls[0]) < 0 ||
+        strlen(peer_urls[0]) >= local_url_cap) return -1;
+    return 0;
 }
 
 /* Mirror llama_model::load_tensors' LLAMA_SPLIT_MODE_LAYER assignment. Device
  * interval [dev_lo,dev_hi) belongs to one remote machine. Output tensors are
  * shared/global in the GGUF index and are fetched for every worker, so only
  * repeating layers are returned here. */
+/* Expert-pool slot count actually handed out, after the measurement knob
+ * IDLETOKEN_MOE_POOL_EXPERTS (2026-09-07): unset = the planner's number; a
+ * value forces every node's per-tensor pool to it, and 0 means NO pool — the
+ * routed experts then stay on the CPU device and the engine computes them
+ * there instead of copying them to the GPU per token. Not a product setting;
+ * it exists to measure that path against the pool path on the same plan. */
+static int coord_moe_pool_override_value(uint32_t *value) {
+    const char *e = getenv("IDLETOKEN_MOE_POOL_EXPERTS");
+    if (!e || !e[0] || !value) return 0;
+    char *end = NULL;
+    const long v = strtol(e, &end, 10);
+    if (end == e || *end != '\0' || v < 0 || v > 4096) return 0;
+    *value = (uint32_t)v;
+    return 1;
+}
+
+static uint32_t coord_moe_pool_override(uint32_t planned) {
+    uint32_t value = 0;
+    if (!coord_moe_pool_override_value(&value)) return planned;
+    fprintf(stderr, "coord: *** MEASUREMENT OVERRIDE *** IDLETOKEN_MOE_POOL_EXPERTS=%ld replaces the "
+                    "planned %u expert-pool slots per tensor%s\n",
+            (long)value, planned,
+            value == 0 ? " (no pool: experts computed on the CPU)" : "");
+    return value;
+}
+
+/* Subtract the same metadata-derived staging/tail/runtime budget used by
+ * admission, not just the runtime reserve. */
+static uint64_t coord_moe_pool_room(uint64_t free_bytes, uint64_t fixed_bytes) {
+    return free_bytes > fixed_bytes ? free_bytes - fixed_bytes : 0;
+}
+
+/* A useful decode pool must hold the model's complete routed set for one
+ * token. This is GGUF `expert_used_count`, not a product-wide constant:
+ * current curated models include top-4, top-6, top-8, and top-10 MoEs. */
+static int coord_moe_pool_covers_active(uint32_t capacity,
+                                        uint32_t n_expert_used) {
+    return n_expert_used > 0 && capacity >= n_expert_used;
+}
+
+/* Metadata identity of the exact routed-expert weight set the runtime cache
+ * must observe for an owner range. Hash addition is deliberately commutative:
+ * GGUF directory order and graph traversal order are not required to match. */
+static int coord_moe_weight_signature(const idletoken_llm_model_size *msize,
+                                      uint32_t lo, uint32_t hi,
+                                      uint32_t *count, uint64_t *hash) {
+    if (!msize || !count || !hash || lo > hi || hi > msize->n_layers)
+        return -1;
+    uint32_t n = 0;
+    uint64_t h = 0;
+    for (uint32_t layer = lo; layer < hi; layer++) {
+        const uint32_t add = msize->expert_pool_weight_count_per_layer[layer];
+        if (UINT32_MAX - n < add) return -1;
+        n += add;
+        h += msize->expert_pool_weight_hash_per_layer[layer];
+    }
+    if (n == 0) return -1;
+    *count = n;
+    *hash = h;
+    return 0;
+}
+
+/* The engine's layer-level expert copy issue (patch 0006, GGML_MOE_LAYER_ISSUE)
+ * is on for every engine the coordinator launches — measured +6–7 % decode on
+ * paired Windows test nodes, +13 % on DGX, byte-identical (2026-09-07). Workers get it
+ * with their cache plan. IDLETOKEN_MOE_LAYER_ISSUE=0 turns it off for an A/B. */
+static void coord_moe_layer_issue_env(void) {
+    const char *e = getenv("IDLETOKEN_MOE_LAYER_ISSUE");
+    setenv("GGML_MOE_LAYER_ISSUE", e && e[0] == '0' ? "0" : "1", 1);
+}
+
 static int coord_send_rpc_cache_plan(const idletoken_rpc_peer *peer,
                                      uint64_t request_id,
                                      unsigned lo, unsigned hi,
-                                     const char *repo) {
+                                     const char *repo,
+                                     uint8_t moe_mode, uint32_t pool_experts,
+                                     uint32_t auto_weight_count,
+                                     uint64_t auto_weight_hash) {
     uint8_t pay[512];
     idletoken_buf b;
     idletoken_buf_init(&b, pay, sizeof(pay));
-    idletoken_buf_put_u8(&b, 1);
-    idletoken_buf_put_u8(&b, 0);
+    idletoken_buf_put_u8(&b, 2);
+    /* Version 2 adds the exact expert-weight set identity. A zero count keeps
+     * adaptive sizing off; otherwise count and hash must match the graph. */
+    idletoken_buf_put_u8(&b, moe_mode);
     idletoken_buf_put_u16(&b, (uint16_t)lo);
     idletoken_buf_put_u16(&b, (uint16_t)hi);
-    idletoken_buf_put_u16(&b, 0);
+    idletoken_buf_put_u16(&b, pool_experts > 0xFFFF ? 0xFFFF : (uint16_t)pool_experts);
+    idletoken_buf_put_u32(&b, auto_weight_count);
+    idletoken_buf_put_u64(&b, auto_weight_hash);
     idletoken_buf_put_str(&b, repo);
     idletoken_msg_header h = {
         .magic = IDLETOKEN_PROTO_MAGIC,
@@ -7759,17 +7827,16 @@ static int coord_send_rpc_cache_plan(const idletoken_rpc_peer *peer,
 static int coord_wait_rpc_cache_ready(const idletoken_rpc_peer *peer,
                                       uint64_t request_id,
                                       unsigned want_lo, unsigned want_hi) {
-    /* Bounded silence, not a bounded fetch (CLUS-13). A real shard takes as
-     * long as it takes and reports progress every 256 MiB; a worker that says
-     * nothing at all for this long has either gone away or is deliberately
-     * holding the coordinator, and both deserve the same answer. */
+    /* Bounded silence (CLUS-13). Direct local-GGUF validation normally needs
+     * only an index scan; the generous legacy bound also covers a first-time
+     * index build on a slow disk. */
     idletoken_set_recv_timeout(peer->fd, IDLETOKEN_CACHE_SILENCE_TIMEOUT_MS);
     for (;;) {
         uint8_t pay[512];
         idletoken_msg_header h;
         if (idletoken_recv_msg(peer->fd, &h, pay, sizeof(pay)) != 0) {
             fprintf(stderr, "coord: %s went silent or disconnected while "
-                            "preparing its local shard\n",
+                            "validating its local GGUF\n",
                     peer->hostname);
             return -1;
         }
@@ -7781,7 +7848,8 @@ static int coord_wait_rpc_cache_ready(const idletoken_rpc_peer *peer,
             idletoken_buf_get_u64(&b, &done);
             idletoken_buf_get_u64(&b, &total);
             if (!b.err)
-                fprintf(stderr, "coord: %s local shard %.2f/%.2f GiB (%.0f%%)\n",
+                fprintf(stderr, "coord: %s local GGUF validation %.2f/%.2f GiB "
+                                "(%.0f%%)\n",
                         peer->hostname,
                         (double)done / 1073741824.0,
                         (double)total / 1073741824.0,
@@ -7807,16 +7875,73 @@ static int coord_wait_rpc_cache_ready(const idletoken_rpc_peer *peer,
         if (!idletoken_peer_label_ok(detail, sizeof(detail)))
             snprintf(detail, sizeof(detail), "(unprintable detail from the worker)");
         if (b.err || lo != want_lo || hi != want_hi || !ok) {
-            fprintf(stderr, "coord: worker %s failed local shard preparation: %s\n",
+            fprintf(stderr, "coord: worker %s failed local GGUF validation: %s\n",
                     peer->hostname, detail[0] ? detail : "malformed response");
             return -1;
         }
-        fprintf(stderr, "coord: worker %s local shard ready: layers [%u,%u), "
+        fprintf(stderr, "coord: worker %s local GGUF ready: layers [%u,%u), "
                         "%u tensors, %.2f GiB\n",
                 peer->hostname, (unsigned)lo, (unsigned)hi, tensors,
                 (double)bytes / 1073741824.0);
         return 0;
     }
+}
+
+/* RPC startup is deliberately deferred until after RPC_CACHE_PLAN. The worker
+ * can therefore validate its complete local GGUF, set the exact layer/mode
+ * environment, and start rpc-server once. `expected_endpoint` is the endpoint
+ * already used to build --rpc; accepting a different value here would make
+ * the readiness check describe one socket while llama-server dials another. */
+static int coord_wait_rpc_ready(idletoken_worker_info *worker,
+                                const char *expected_endpoint) {
+    idletoken_set_recv_timeout(worker->fd, IDLETOKEN_RPC_READY_TIMEOUT_MS);
+    uint8_t pay[512];
+    idletoken_msg_header h;
+    if (idletoken_recv_msg(worker->fd, &h, pay, sizeof(pay)) != 0 ||
+        h.msg_type != IDLETOKEN_MSG_RPC_READY ||
+        h.request_id != worker->rpc_request_id) {
+        fprintf(stderr, "coord: worker %s did not reach RPC_READY (%s)\n",
+                worker->hostname,
+                errno ? strerror(errno) : "unexpected message");
+        return -1;
+    }
+    idletoken_buf b;
+    idletoken_buf_init(&b, pay, h.payload_bytes);
+    char endpoint[64] = "";
+    idletoken_buf_get_str_strict(&b, endpoint, sizeof(endpoint));
+    if (b.err || !idletoken_peer_host_ok(endpoint, sizeof(endpoint)) ||
+        strcmp(endpoint, expected_endpoint) != 0) {
+        fprintf(stderr, "coord: worker %s reported rpc endpoint '%s', expected "
+                        "'%s' — refusing a changed or malformed route\n",
+                worker->hostname, endpoint, expected_endpoint);
+        return -1;
+    }
+    char host[64] = "";
+    const char *colon = strrchr(endpoint, ':');
+    const size_t host_len = colon ? (size_t)(colon - endpoint) : strlen(endpoint);
+    if (host_len < sizeof(host)) {
+        memcpy(host, endpoint, host_len);
+        host[host_len] = '\0';
+    }
+    if (idletoken_ip_is_overlay(host)) {
+        fprintf(stderr, "coord: worker %s bound rpc-server to %s, which is on "
+                        "an overlay network; tensor traffic must use the real LAN\n",
+                worker->hostname, endpoint);
+        return -1;
+    }
+    int probe = idletoken_connect_tcp(endpoint);
+    if (probe < 0) {
+        fprintf(stderr, "coord: worker %s says rpc-server is ready on %s, but "
+                        "this machine cannot connect to it. Check the worker's "
+                        "inbound firewall rule for this port.\n",
+                worker->hostname, endpoint);
+        return -1;
+    }
+    close(probe);
+    idletoken_set_recv_timeout(worker->fd, 0);
+    fprintf(stderr, "coord: worker %s rpc-server is reachable on %s\n",
+            worker->hostname, endpoint);
+    return 0;
 }
 
 static int cluster_text_append(char *dst, size_t cap, const char *fmt, ...) {
@@ -7850,8 +7975,63 @@ static int cluster_append_moe_override(char *dst, size_t cap, int *n_entries,
     return 0;
 }
 
+static int cluster_append_output_head_override(char *dst, size_t cap,
+                                               int *n_entries,
+                                               const char *target) {
+    if (!dst || !n_entries || !target || !target[0]) return -1;
+    if (cluster_text_append(dst, cap,
+            "%soutput\\.(weight|bias)=%s,output_norm\\.(weight|bias)=%s",
+            *n_entries ? "," : "", target, target) != 0)
+        return -1;
+    *n_entries += 2;
+    return 0;
+}
+
 static int cluster_moe_args_selftest(void) {
     int fails = 0;
+
+    {
+        const uint64_t MiB = 1ull << 20;
+        idletoken_llm_model_size fixture = {0};
+        fixture.n_layers = 1;
+        fixture.n_expert = 8;
+        fixture.n_expert_used = 2;
+        fixture.expert_bytes_per_layer[0] = 256 * MiB;
+        fixture.expert_pool_slot_bytes_per_layer[0] = 32 * MiB;
+        fixture.expert_pool_max_tensor_per_layer[0] = 128 * MiB;
+        fixture.expert_pool_weight_count_per_layer[0] = 3;
+        uint64_t slots = 0, fixed = 0;
+        if (idletoken_llama_moe_cache_budget(&fixture, 0, 1, &slots, &fixed) == 0 &&
+            slots == 32 * MiB && fixed == 640 * MiB + 4 * 512 &&
+            coord_moe_pool_room(fixed + 64 * MiB, fixed) == 64 * MiB &&
+            coord_moe_pool_room(fixed, fixed) == 0 &&
+            coord_moe_pool_room(fixed - 1, fixed) == 0) {
+            fprintf(stderr, "selftest PASS MoE pool budgets reserve, staging, tails and active slots\n");
+        } else {
+            fprintf(stderr, "selftest FAIL MoE pool reserve drifted from the engine\n");
+            fails++;
+        }
+    }
+
+    /* The minimum useful pool follows the model metadata. Keep all curated
+     * routing widths represented so a convenient top-8 model cannot turn back
+     * into a global threshold. */
+    {
+        static const uint32_t active[] = { 4, 6, 8, 10 };
+        int bad = 0;
+        for (size_t i = 0; i < sizeof active / sizeof active[0]; i++) {
+            bad += !coord_moe_pool_covers_active(active[i], active[i]);
+            bad += coord_moe_pool_covers_active(active[i] - 1, active[i]);
+        }
+        if (!bad && !coord_moe_pool_covers_active(8, 10) &&
+            coord_moe_pool_covers_active(6, 6)) {
+            fprintf(stderr, "selftest PASS MoE pool floor follows top-4/6/8/10 model metadata\n");
+        } else {
+            fprintf(stderr, "selftest FAIL MoE pool floor used a model-independent threshold\n");
+            fails++;
+        }
+    }
+
     char args[256] = "";
     int entries = 0;
     const char *expected =
@@ -7863,6 +8043,21 @@ static int cluster_moe_args_selftest(void) {
     } else {
         fprintf(stderr, "selftest FAIL cluster MoE node-local override: '%s'\n", args);
         fails++;
+    }
+
+    {
+        char head[160] = "";
+        int head_entries = 0;
+        const char *head_expected =
+            "output\\.(weight|bias)=CUDA0,output_norm\\.(weight|bias)=CUDA0";
+        if (cluster_append_output_head_override(
+                head, sizeof(head), &head_entries, "CUDA0") == 0 &&
+            head_entries == 2 && strcmp(head, head_expected) == 0) {
+            fprintf(stderr, "selftest PASS cluster output head is pinned locally\n");
+        } else {
+            fprintf(stderr, "selftest FAIL cluster output-head override: '%s'\n", head);
+            fails++;
+        }
     }
 
     if (cluster_append_moe_override(args, sizeof(args), &entries, 5, 5,
@@ -8143,6 +8338,7 @@ static int run_llamacpp_cluster_mode(
 
         uint64_t rid = 0;
         if (do_hello(cfd, &ws[n], &rid) != 0) { close(cfd); continue; }
+        ws[n].rpc_request_id = rid;
 
         /* WS-C3: the ONE cluster invariant — same llama.cpp build everywhere.
          * (OS families may mix freely now; the old G-HOMO rule is a ds4-era
@@ -8183,8 +8379,8 @@ static int run_llamacpp_cluster_mode(
                 char why[256];
                 snprintf(why, sizeof(why),
                          "machine %s offered rpc endpoint %s, which is on an "
-                         "overlay network (Tailscale/CGNAT — 100.64.0.0/10 or "
-                         "fd7a:115c:a1e0::/48). "
+                         "overlay network (Tailscale/CGNAT 100.64.0.0/10, "
+                         "proxy TUN 198.18.0.0/15, or fd7a:115c:a1e0::/48). "
                          "Tensor traffic must use the real LAN; bind the "
                          "rpc-server to the machine's LAN interface.",
                          ws[n].hostname, ws[n].bind_addr);
@@ -8244,31 +8440,22 @@ static int run_llamacpp_cluster_mode(
                 msize->n_expert > 0 &&
                 strstr(ws[n].version, "rpc-cpu-v1") != NULL &&
                 IDLETOKEN_BACKEND_OF_OS(ws[n].os_family) == IDLETOKEN_NODE_BACKEND_CUDA;
-            /* The request is made only under the opt-in switch: with it off,
-             * an MoE run is byte-for-byte the pre-0005 GPU-only launch (one
-             * RPC device per worker, unchanged device numbering), which is
-             * what the no-slowdown rule requires until the LAN A/B exists. */
+            /* Expose the owner-local CPU device whenever the selected MoE and
+             * both engines support it. This is only a capability: the planner
+             * still selects GPU_ONLY whenever usable VRAM is sufficient, and
+             * only assigns expert tensors to CPU when VRAM is short. */
             ws[n].rpc_cpu_active =
-                worker_can_expose_cpu && self_node_local == 1 &&
-                idletoken_cluster_moe_hybrid_enabled();
-            if (worker_can_expose_cpu && self_node_local != 1 &&
-                idletoken_cluster_moe_hybrid_enabled()) {
-                fprintf(stderr, "coord: cluster MoE Hybrid opt-in is ON, but "
+                worker_can_expose_cpu && self_node_local == 1;
+            if (worker_can_expose_cpu && self_node_local != 1) {
+                fprintf(stderr, "coord: worker %s has owner-local MoE RAM, but "
                                 "this coordinator's engine %s the node-local "
-                                "MoE RPC commands (patch 0005); worker %s keeps "
-                                "its single GPU device\n",
-                        self_node_local == 0 ? "lacks" : "could not be checked for",
-                        ws[n].hostname);
+                                "MoE RPC commands (patch 0005); it cannot be used\n",
+                        ws[n].hostname,
+                        self_node_local == 0 ? "lacks" : "could not be checked for");
             } else if (worker_can_expose_cpu) {
-                fprintf(stderr, ws[n].rpc_cpu_active
-                        ? "coord: cluster MoE Hybrid opt-in is ON ("
-                          IDLETOKEN_CLUSTER_MOE_HYBRID_ENV "=1): worker %s "
-                          "will expose its CPU as a zero-share expert store\n"
-                        : "coord: worker %s could expose node-local RAM for MoE "
-                          "experts, but cluster MoE Hybrid is opt-in ("
-                          IDLETOKEN_CLUSTER_MOE_HYBRID_ENV "=1) until its "
-                          "real-LAN performance gate passes; keeping its single "
-                          "GPU device\n",
+                fprintf(stderr, "coord: worker %s exposes owner-local RAM as a "
+                                "zero-share MoE capability; the resource planner "
+                                "will use it only if GPU_ONLY cannot fit\n",
                         ws[n].hostname);
             }
             z3[0] = ws[n].rpc_cpu_active ? 1 : 0;
@@ -8293,94 +8480,15 @@ static int run_llamacpp_cluster_mode(
             }
         }
 
-        /* Wait for the worker's rpc-server to come up (it spawns only after
-         * it has the PSK). A worker that cannot start its rpc-server reports
-         * an error instead — surface it and fail closed for that worker. */
-        {
-            /* Starting a real rpc-server means loading a backend and binding a
-             * port; on a cold Windows machine that is tens of seconds, not the
-             * handshake's 15. Still bounded — this is the last unbounded read
-             * in the join path. */
-            idletoken_set_recv_timeout(cfd, IDLETOKEN_RPC_READY_TIMEOUT_MS);
-            uint8_t rp[512];
-            idletoken_msg_header rh;
-            if (idletoken_recv_msg(cfd, &rh, rp, sizeof(rp)) != 0 ||
-                rh.msg_type != IDLETOKEN_MSG_RPC_READY) {
-                fprintf(stderr, "coord: worker %s did not reach RPC_READY "
-                                "(%s) — dropping it\n",
-                        ws[n].hostname,
-                        errno ? strerror(errno) : "unexpected message");
-                close(cfd);
-                continue;
-            }
-            idletoken_buf rb;
-            idletoken_buf_init(&rb, rp, rh.payload_bytes);
-            char ep[64] = "";
-            /* The endpoint the coordinator will DIAL and hand to llama-server.
-             * Strict read + address charset: a truncated or decorated endpoint
-             * points somewhere else, and "somewhere else" is chosen by the
-             * peer (CLUS-14). */
-            idletoken_buf_get_str_strict(&rb, ep, sizeof(ep));
-            if (rb.err || !idletoken_peer_host_ok(ep, sizeof(ep))) {
-                fprintf(stderr, "coord: worker %s reported an rpc endpoint that "
-                                "is not an address — dropping it\n",
-                        ws[n].hostname);
-                close(cfd);
-                continue;
-            }
-            /* Invariant #9 again, on the value we actually dial: the HELLO
-             * check above ran on the address the worker PREDICTED it would
-             * bind, and this is the one it really bound. Checking only the
-             * first left the second unchecked. */
-            {
-                char h2[64] = "";
-                const char *c2 = strrchr(ep, ':');
-                size_t l2 = c2 ? (size_t)(c2 - ep) : strlen(ep);
-                if (l2 < sizeof(h2)) { memcpy(h2, ep, l2); h2[l2] = '\0'; }
-                if (idletoken_ip_is_overlay(h2)) {
-                    fprintf(stderr, "coord: worker %s bound its rpc-server to %s, "
-                                    "which is on an overlay network — tensor "
-                                    "traffic must use the real LAN. Dropping it.\n",
-                            ws[n].hostname, ep);
-                    close(cfd);
-                    continue;
-                }
-            }
-            snprintf(ws[n].bind_addr, sizeof(ws[n].bind_addr), "%s", ep);
-        }
-
-        /* "Bound" is not "reachable from here": Windows Firewall filters the
-         * inbound port silently, so the worker honestly reports READY while
-         * this machine cannot connect (measured on Windows, 2026-08-15) — and the
-         * engine's later failure would read as a coordinator problem. Probe
-         * once now and, if blocked, name the machine that can fix it. The
-         * rpc-server survives a bare connect+close (same probe the health
-         * monitor uses). */
-        {
-            int pfd = idletoken_connect_tcp(ws[n].bind_addr);
-            if (pfd < 0) {
-                fprintf(stderr,
-                        "coord: worker %s says its rpc-server is ready on %s, but "
-                        "this machine CANNOT connect to it. The block is on the "
-                        "WORKER side — usually its firewall filtering the inbound "
-                        "port (on Windows the worker provisions the rule itself; "
-                        "if it printed 'could not add firewall rule', run the "
-                        "netsh command it showed, as admin, ON %s) — dropping "
-                        "this worker\n",
-                        ws[n].hostname, ws[n].bind_addr, ws[n].hostname);
-                close(cfd);
-                continue;
-            }
-            close(pfd);
-        }
-
         fprintf(stderr,
-                "coord: rpc worker %d ready: %-16s %s engine=%s os=%s "
-                "vram_usable=%.1fGiB ram_usable=%.1fGiB\n",
+                "coord: rpc worker %d admitted: %-16s %s engine=%s os=%s "
+                "vram_usable=%.1fGiB ram_usable=%.1fGiB ram_pinnable=%.1fGiB%s\n",
                 n, ws[n].hostname, ws[n].bind_addr, ws[n].engine_version,
                 idletoken_os_family_name(ws[n].os_family),
                 ws[n].vram_usable / 1073741824.0,
-                ws[n].ram_usable / 1073741824.0);
+                ws[n].ram_usable / 1073741824.0,
+                ws[n].ram_pinnable / 1073741824.0,
+                !ws[n].ram_pinnable ? " (not measured: unconstrained)" : " (hard cap)");
         n++;
     }
     if (disc) { disc->destroy(disc); disc = NULL; }
@@ -8393,15 +8501,18 @@ static int run_llamacpp_cluster_mode(
      * a slow-but-honest worker into a dropped one. */
     for (int i = 0; i < n; i++) idletoken_set_recv_timeout(ws[i].fd, 0);
 
-    /* Partial local loading is a cluster invariant, not an optional warm-start
-     * optimization. An older worker would accept the run and silently receive
-     * its model tensors from the coordinator over RPC. */
+    /* Direct local-GGUF loading is a cluster invariant. An older worker would
+     * create a second model-sized tensor cache even though it already owns the
+     * complete GGUF. */
     for (int i = 0; i < n; i++) {
-        if (!strstr(ws[i].version, "rpc-cache-v1")) {
+        if (!strstr(ws[i].version, "rpc-gguf-v3")) {
             fprintf(stderr, "idletoken-coord: refuse: worker %s does not "
-                            "support local layer shards (rpc-cache-v1). Upgrade "
-                            "IdleToken on that machine; full-model RPC transfer "
-                            "is no longer allowed.\n", ws[i].hostname);
+                            "support the current direct-GGUF/cache-plan protocol "
+                            "(rpc-gguf-v3). "
+                            "Upgrade IdleToken on that machine; copied tensor "
+                            "shards, full-model RPC transfer, and an empty "
+                            "rpc-server warm-up are not allowed.\n",
+                    ws[i].hostname);
             for (int j = 0; j < n; j++) close(ws[j].fd);
             close(lfd);
             return 3;
@@ -8447,6 +8558,12 @@ static int run_llamacpp_cluster_mode(
             !ws[i].unified &&
             nodes[i + 1].backend == IDLETOKEN_NODE_BACKEND_CUDA
                 ? ws[i].ram_usable : 0;
+        /* The worker's measured page-lockable ceiling (HELLO); the planner
+         * caps that node's RAM-resident experts at min(usable, pinnable).
+         * Forgotten here on the first 0.1.50: the table is memset to zero, so
+         * the cap silently read "unmeasured" and a 48 GiB Windows test node was handed 33,984 MiB
+         * against a 31,324 MiB ceiling (2026-09-07 13:14). */
+        nodes[i + 1].ram_pinnable = worker_plan_ram_pinnable(&ws[i]);
         snprintf(nodes[i + 1].label, sizeof nodes[i + 1].label,
                  "%s", ws[i].hostname);
     }
@@ -8520,15 +8637,26 @@ static int run_llamacpp_cluster_mode(
     char rpc_list[1024] = "", dev_list[1024] = "", split_list[1024] = "";
     char override_list[4096] = "";
     snprintf(dev_list, sizeof(dev_list), "%s", local_dev);
-    snprintf(split_list, sizeof(split_list), "%.4f", lplan.tensor_split[0]);
+    /* Nine significant digits round-trip an IEEE-754 float. Keep the exact
+     * wire value for range preparation below; using four decimals for the
+     * coordinator share moved a boundary layer to the wrong machine. */
+    const float first_wire_share = (float)lplan.tensor_split[0];
+    snprintf(split_list, sizeof(split_list), "%.9g", (double)first_wire_share);
     double placement_shares[IDLETOKEN_LLPLAN_MAX_DEVICES] = {0};
-    placement_shares[0] = lplan.tensor_split[0];
+    placement_shares[0] = (double)first_wire_share;
     int placement_devices = 1;
     int peer_dev_lo[IDLETOKEN_LLPLAN_MAX_NODES] = {0};
     int peer_dev_hi[IDLETOKEN_LLPLAN_MAX_NODES] = {0};
     int peer_plan_slot[IDLETOKEN_LLPLAN_MAX_NODES] = {0};
     static idletoken_rpc_peer peers[IDLETOKEN_LLPLAN_MAX_NODES];
     int n_peers = 0, next_rpc_dev = 0;
+    /* What each worker's rpc-server must run with, carried in RPC_CACHE_PLAN
+     * (2026-09-07): the node-local MoE mode (0 = off) and the per-tensor
+     * expert-pool slots for its plan slot (0 = no pool). */
+    uint8_t worker_moe_mode = 0;
+    uint32_t pool_experts_slot[IDLETOKEN_LLPLAN_MAX_NODES] = {0};
+    uint32_t auto_weight_count_slot[IDLETOKEN_LLPLAN_MAX_NODES] = {0};
+    uint64_t auto_weight_hash_slot[IDLETOKEN_LLPLAN_MAX_NODES] = {0};
     for (int i = 1; i < lplan.n_nodes; i++) {
         const int widx = lplan.order[i] - 1;   /* nodes[k] -> ws[k-1] */
         if (widx < 0 || widx >= n) continue;   /* cannot happen; belt+braces */
@@ -8545,18 +8673,19 @@ static int run_llamacpp_cluster_mode(
         }
         const int rpc_gpu_dev = next_rpc_dev++;
         const int rpc_cpu_dev = rpc_cpu ? next_rpc_dev++ : -1;
+        const float wire_share = (float)lplan.tensor_split[i];
         if (cluster_text_append(rpc_list, sizeof(rpc_list), "%s%s",
                                 rpc_list[0] ? "," : "", ws[widx].bind_addr) != 0 ||
             cluster_text_append(dev_list, sizeof(dev_list), ",RPC%d", rpc_gpu_dev) != 0 ||
-            cluster_text_append(split_list, sizeof(split_list), ",%.8f",
-                                lplan.tensor_split[i]) != 0) {
+            cluster_text_append(split_list, sizeof(split_list), ",%.9g",
+                                (double)wire_share) != 0) {
             fprintf(stderr, "idletoken-coord: cluster device list is too long\n");
             for (int j = 0; j < n; j++) close(ws[j].fd);
             close(lfd);
             return 1;
         }
         peer_dev_lo[n_peers] = placement_devices;
-        placement_shares[placement_devices++] = lplan.tensor_split[i];
+        placement_shares[placement_devices++] = (double)wire_share;
         if (use_cpu) {
             if (placement_devices >= IDLETOKEN_LLPLAN_MAX_DEVICES ||
                 cluster_text_append(dev_list, sizeof(dev_list), ",RPC%d", rpc_cpu_dev) != 0 ||
@@ -8584,6 +8713,15 @@ static int run_llamacpp_cluster_mode(
 
     int override_entries = 0;
     if (lplan.cluster_moe_hybrid) {
+        if (!lplan.output_head_local ||
+            cluster_append_output_head_override(
+                override_list, sizeof(override_list), &override_entries,
+                local_dev) != 0) {
+            fprintf(stderr, "idletoken-coord: local output-head override is unavailable\n");
+            for (int j = 0; j < n; j++) close(ws[j].fd);
+            close(lfd);
+            return 1;
+        }
         if (cluster_append_moe_override(
                 override_list, sizeof(override_list), &override_entries,
                 lplan.layer_lo[0], lplan.cpu_moe_layer_hi[0], "CPU") != 0) {
@@ -8610,51 +8748,99 @@ static int run_llamacpp_cluster_mode(
         /* Mode 2 = the worker's rpc-server runs its own scheduler over its GPU
          * and CPU devices (patch 0006 expert pool on the worker, one graph per
          * token instead of three range-copy round trips per RAM-expert layer).
-         * Opt-in for now: IDLETOKEN_MOE_SERVER_SCHED=1. */
+         * The default since 2026-09-07 (6.76 tok/s against mode 1's 1.96 on
+         * the DSv4-Flash pair, results/moe-node-local-rpc-20260905.md §9.1);
+         * IDLETOKEN_MOE_SERVER_SCHED=0 falls back to mode 1. The same mode
+         * goes to every worker in RPC_CACHE_PLAN (worker_moe_mode). */
         const char *server_sched = getenv("IDLETOKEN_MOE_SERVER_SCHED");
-        setenv("GGML_RPC_NODE_LOCAL_MOE",
-               server_sched && server_sched[0] == '1' ? "2" : "1", 1);
-        /* Expert pools: the device memory the plan left free on each node,
-         * handed to the engine as a per-tensor slot count. Not as a byte
-         * budget: the engine divides a budget by the expert tensors it has
-         * seen so far, and the client's tiny fused-op probe graphs (three
-         * tensors) made a worker size 256-expert pools on a full card
-         * (2026-09-06). One full expert tensor of staging plus the
-         * placeholder copies come out of the same room, so 1 GiB stays back.
-         * Slot 0 is the coordinator (it holds layer 0); the workers' counts
-         * are not carried by RPC_ASSIGN yet, so they are printed for the
-         * worker's environment (GGML_MOE_POOL_EXPERTS). */
+        worker_moe_mode = server_sched && server_sched[0] == '0' ? 1 : 2;
+        setenv("GGML_RPC_NODE_LOCAL_MOE", worker_moe_mode == 2 ? "2" : "1", 1);
+        /* Prefer the plan-time pool when its conservative remainder fits a
+         * useful batch. Otherwise give the engine the exact bytes for one slot
+         * across this node's real RAM-resident expert tensors. It may then use
+         * only memory genuinely left after model/graph allocation. */
         unsetenv("GGML_MOE_POOL_BYTES");
+        coord_moe_layer_issue_env();
         for (int s = 0; s < lplan.n_nodes; s++) {
             const uint32_t spilled = lplan.cpu_moe_layer_hi[s] > lplan.layer_lo[s]
                 ? lplan.cpu_moe_layer_hi[s] - lplan.layer_lo[s] : 0;
-            const uint64_t per_expert_layer = msize->n_expert > 0
-                ? msize->expert_bytes_per_layer[lplan.layer_lo[s]] / msize->n_expert : 0;
-            const uint64_t room = lplan.moe_pool_bytes_per_node[s] > (1ull << 30)
-                ? lplan.moe_pool_bytes_per_node[s] - (1ull << 30) : 0;
-            const uint64_t cap = spilled > 0 && per_expert_layer > 0
-                ? room / ((uint64_t)spilled * per_expert_layer) : 0;
-            const uint32_t n_cap = cap > msize->n_expert ? msize->n_expert : (uint32_t)cap;
-            fprintf(stderr, "coord: expert pool on node %u: %u of %u experts per tensor "
-                            "(%u RAM-expert layers, %.2f GiB free after a %.2f GiB GPU share, "
-                            "%.2f GiB of experts in RAM)%s\n",
-                    s, n_cap, msize->n_expert, spilled,
+            uint64_t slot_bytes = 0, fixed_bytes = 0;
+            if (spilled > 0 &&
+                idletoken_llama_moe_cache_budget(msize, lplan.layer_lo[s],
+                    lplan.cpu_moe_layer_hi[s], &slot_bytes, &fixed_bytes) != 0) {
+                fprintf(stderr, "idletoken-coord: exact expert-slot accounting failed "
+                                "for node %d layers [%u,%u) — refusing an unverified cache plan\n",
+                        s, lplan.layer_lo[s], lplan.cpu_moe_layer_hi[s]);
+                for (int j = 0; j < n; j++) close(ws[j].fd);
+                close(lfd);
+                return 1;
+            }
+            /* The cache budget includes its required floor. Charge fixed
+             * staging/tails once before converting the remainder to slots. */
+            const uint64_t room = coord_moe_pool_room(
+                lplan.moe_pool_bytes_per_node[s], fixed_bytes);
+            const uint64_t cap = slot_bytes > 0 ? room / slot_bytes : 0;
+            const uint32_t planned_cap = cap > msize->n_expert
+                ? msize->n_expert : (uint32_t)cap;
+            uint32_t override_value = 0;
+            const int pool_overridden =
+                coord_moe_pool_override_value(&override_value);
+            const uint32_t n_cap = coord_moe_pool_override(planned_cap);
+            const int pool_ready = coord_moe_pool_covers_active(
+                n_cap, msize->n_expert_used);
+            const int use_adaptive = worker_moe_mode == 2 && spilled > 0 &&
+                                     !pool_overridden;
+            fprintf(stderr, "coord: expert pool on node %u: planner estimates %u of %u "
+                            "experts per tensor (%u RAM-expert layers, %.2f GiB total cache budget, "
+                            "%.2f GiB GPU need including its cache floor, %.2f GiB of experts in RAM)%s%s\n",
+                    s, planned_cap, msize->n_expert, spilled,
                     (double)lplan.moe_pool_bytes_per_node[s] / 1073741824.0,
                     (double)lplan.gpu_need_bytes_per_node[s] / 1073741824.0,
                     (double)lplan.cpu_moe_bytes_per_node[s] / 1073741824.0,
-                    n_cap < 8 ? " -- below the one-batch floor, no pool" : "");
+                    pool_ready ? "" : " -- below this model's active-expert count",
+                    use_adaptive ? "; runtime will size it from post-load free VRAM" : "");
+            pool_experts_slot[s] = use_adaptive ? 0
+                : (pool_overridden ? n_cap : (pool_ready ? n_cap : 0));
+            if (use_adaptive) {
+                if (coord_moe_weight_signature(
+                        msize, lplan.layer_lo[s], lplan.cpu_moe_layer_hi[s],
+                        &auto_weight_count_slot[s], &auto_weight_hash_slot[s]) != 0) {
+                    fprintf(stderr, "idletoken-coord: exact expert-weight identity failed "
+                                    "for node %d layers [%u,%u)\n",
+                            s, lplan.layer_lo[s], lplan.cpu_moe_layer_hi[s]);
+                    for (int j = 0; j < n; j++) close(ws[j].fd);
+                    close(lfd);
+                    return 1;
+                }
+            }
             if (s == 0) {
-                if (n_cap >= 8) {
+                if (use_adaptive) {
+                    char count[16], hash[32];
+                    snprintf(count, sizeof(count), "%u", auto_weight_count_slot[s]);
+                    snprintf(hash, sizeof(hash), "%llu",
+                             (unsigned long long)auto_weight_hash_slot[s]);
+                    unsetenv("GGML_MOE_POOL_EXPERTS");
+                    setenv("GGML_MOE_AUTO_WEIGHT_COUNT", count, 1);
+                    setenv("GGML_MOE_AUTO_WEIGHT_HASH", hash, 1);
+                } else if (pool_overridden || pool_ready) {
                     char pool[16];
                     snprintf(pool, sizeof(pool), "%u", n_cap);
                     setenv("GGML_MOE_POOL_EXPERTS", pool, 1);
+                    unsetenv("GGML_MOE_AUTO_WEIGHT_COUNT");
+                    unsetenv("GGML_MOE_AUTO_WEIGHT_HASH");
                 } else {
                     unsetenv("GGML_MOE_POOL_EXPERTS");
+                    unsetenv("GGML_MOE_AUTO_WEIGHT_COUNT");
+                    unsetenv("GGML_MOE_AUTO_WEIGHT_HASH");
                 }
             }
         }
     } else {
         unsetenv("GGML_RPC_NODE_LOCAL_MOE");
+        unsetenv("GGML_MOE_POOL_EXPERTS");
+        unsetenv("GGML_MOE_POOL_BYTES");
+        unsetenv("GGML_MOE_AUTO_WEIGHT_COUNT");
+        unsetenv("GGML_MOE_AUTO_WEIGHT_HASH");
     }
 
     char cluster_args[8192] = "";
@@ -8701,13 +8887,19 @@ static int run_llamacpp_cluster_mode(
                     "the first nonzero tensor-split share, and llama.cpp pins "
                     "the input (token_embd) layer to the host CPU. The "
                     "packet-level G-PRIV-7 gate lands in WS-F.\n\n");
+    if (lplan.output_head_local)
+        fprintf(stderr, "coord: output head pinned to %s; the final worker returns "
+                        "the last hidden state and logits are computed locally\n\n",
+                local_dev);
 
-    /* Pre-seed every remote model slice before llama-server opens the GGUF.
-     * Once the engine starts, its RPC SET_TENSOR_HASH requests become local
-     * cache hits and carry hashes only; model bytes never travel on the
-     * inference transport. */
+    /* Publish the small tensor index before llama-server opens the GGUF. Each
+     * worker validates it against its complete local copy, then RPC name
+     * lookups read the assigned ranges directly from that copy. Model bytes
+     * never travel on the control or inference transports. */
     char weight_repo[512];
-    if (coord_weight_repo_start(llama_gguf, weight_repo,
+    char peer_weight_repos[IDLETOKEN_LLPLAN_MAX_NODES][512] = {{0}};
+    if (coord_weight_repo_start(llama_gguf, peers, n_peers,
+                                peer_weight_repos, weight_repo,
                                 sizeof(weight_repo)) != 0) {
         fprintf(stderr, "idletoken-coord: could not start or reach a layer "
                         "weight repository; refusing full-model RPC fallback\n");
@@ -8809,54 +9001,43 @@ static int run_llamacpp_cluster_mode(
         return 1;
     }
 
-    char local_cache[1024], local_gguf[1280];
-    coord_prepare_heartbeat prep_hb = {
-        .peers = peers,
-        .n_peers = n_peers,
-        .stop = 0,
-        .failed = 0,
-    };
-    pthread_t prep_hb_thread;
-    ignore_sigpipe();
-    int prep_hb_started = pthread_create(&prep_hb_thread, NULL,
-                                         coord_prepare_heartbeat_thread,
-                                         &prep_hb) == 0;
-    if (!prep_hb_started) {
-        fprintf(stderr, "idletoken-coord: cannot start the model-preparation "
-                        "heartbeat; refusing to let paired workers time out "
-                        "silently\n");
-        for (int j = 0; j < n_peers; j++) close(peers[j].fd);
-        close(lfd);
-        return 1;
-    }
-    const int local_prepare_rc =
-        coord_local_model_cache_dir(local_cache, sizeof(local_cache)) != 0
-            ? -1
-            : idletoken_local_model_prepare_from_file(
-                  weight_repo, llama_gguf, local_layer_hi,
-                  local_cache, local_gguf, sizeof(local_gguf));
-    prep_hb.stop = 1;
-    pthread_join(prep_hb_thread, NULL);
-    if (local_prepare_rc != 0 || prep_hb.failed) {
-        fprintf(stderr, "idletoken-coord: could not prepare the coordinator's "
-                        "dynamic local model prefix [0,%u); refusing a full "
-                        "model fallback\n", local_layer_hi);
-        for (int j = 0; j < n_peers; j++) close(peers[j].fd);
-        close(lfd);
-        return 3;
-    }
-    fprintf(stderr, "coord: coordinator local model: layers [0,%u) + shared "
-                    "tensors at %s\n", local_layer_hi, local_gguf);
+    /* Every admitted member already owns the complete, verified GGUF. The
+     * coordinator opens that file directly and llama.cpp reads only the
+     * tensors placed on this machine. Materialising a second sparse GGUF here
+     * duplicated tens of GiB and made free disk space an accidental cluster
+     * prerequisite. */
+    const char *local_gguf = llama_gguf;
+    fprintf(stderr, "coord: coordinator reads layers [0,%u) + shared tensors "
+                    "directly from its verified GGUF: %s\n",
+            local_layer_hi, local_gguf);
 
     for (int i = 0; i < n_peers; i++) {
         cache_request[i] = ((uint64_t)time(NULL) << 24) ^
                            ((uint64_t)(i + 1) << 8) ^ UINT64_C(0x52);
-        fprintf(stderr, "coord: assigning %s only layers [%u,%u) from %s\n",
+        const int slot = peer_plan_slot[i];
+        const uint32_t peer_pool = pool_experts_slot[slot];
+        const uint32_t peer_auto_count = auto_weight_count_slot[slot];
+        const uint64_t peer_auto_hash = auto_weight_hash_slot[slot];
+        char peer_pool_desc[112];
+        if (peer_pool > 0) {
+            snprintf(peer_pool_desc, sizeof(peer_pool_desc), "%u slots/tensor",
+                     (unsigned)peer_pool);
+        } else if (peer_auto_count > 0) {
+            snprintf(peer_pool_desc, sizeof(peer_pool_desc),
+                     "post-load adaptive (%u verified expert weights)",
+                     (unsigned)peer_auto_count);
+        } else {
+            snprintf(peer_pool_desc, sizeof(peer_pool_desc), "disabled");
+        }
+        fprintf(stderr, "coord: assigning %s only layers [%u,%u) from %s"
+                        " (node-local MoE mode %u, expert pool %s)\n",
                 peers[i].hostname, peer_layer_lo[i], peer_layer_hi[i],
-                weight_repo);
+                peer_weight_repos[i], (unsigned)worker_moe_mode,
+                peer_pool_desc);
         if (coord_send_rpc_cache_plan(&peers[i], cache_request[i],
                                       peer_layer_lo[i], peer_layer_hi[i],
-                                      weight_repo) != 0) {
+                                      peer_weight_repos[i], worker_moe_mode, peer_pool,
+                                      peer_auto_count, peer_auto_hash) != 0) {
             fprintf(stderr, "idletoken-coord: send RPC_CACHE_PLAN to %s failed\n",
                     peers[i].hostname);
             for (int j = 0; j < n_peers; j++) close(peers[j].fd);
@@ -8872,8 +9053,18 @@ static int run_llamacpp_cluster_mode(
             return 3;
         }
     }
-    fprintf(stderr, "coord: all remote layer shards are local; starting "
-                    "llama-server with hash-only RPC model loading\n");
+    for (int i = 0; i < n_peers; i++) {
+        const int worker_index = lplan.order[peer_plan_slot[i]] - 1;
+        if (worker_index < 0 || worker_index >= n ||
+            coord_wait_rpc_ready(&ws[worker_index], peers[i].endpoint) != 0) {
+            for (int j = 0; j < n_peers; j++) close(peers[j].fd);
+            close(lfd);
+            return 3;
+        }
+    }
+    fprintf(stderr, "coord: all workers validated their local GGUF ranges and "
+                    "started rpc-server once; starting llama-server with "
+                    "name-only RPC model loading\n");
 
     /* The idletoken-server child (RPC client side of the TLS transport) reads the
      * PSK from its environment, inherited across fork — and, on Windows, across
@@ -8887,10 +9078,9 @@ static int run_llamacpp_cluster_mode(
      * behaved correctly; the cluster simply could never form on Windows.
      * setenv() is MinGW-shimmed in src/platform/win/win_compat.c. */
     setenv("GGML_RPC_PSK", psk_hex, 1);
-    /* A remote model-weight cache miss must stop the engine. Otherwise
-     * llama.cpp falls back to SET_TENSOR and a sparse coordinator GGUF would
-     * silently send hole bytes while also recreating the old full-weight RPC
-     * transfer. Dynamic graph inputs are still allowed to use SET_TENSOR. */
+    /* A remote model-weight lookup miss must stop the engine. Otherwise
+     * llama.cpp falls back to SET_TENSOR and recreates full-weight transfer
+     * over the LAN. Dynamic graph inputs are still allowed to use SET_TENSOR. */
     setenv("GGML_RPC_REQUIRE_MODEL_CACHE", "1", 1);
 
     /* Slots across a cluster = the MINIMUM over nodes, never the sum: under
@@ -9425,8 +9615,42 @@ int main(int argc, char **argv) {
                 }
                 me.vram_usable  = rep.vram_usable;
                 me.ram_usable   = rep.ram_usable;
-                me.ram_pinnable = 0;
                 me.unified      = rep.unified_memory ? 1 : 0;
+                /* How much of this machine's RAM its GPU can page-lock — the
+                 * planner's cap on the experts the coordinator's own engine
+                 * keeps in RAM (2026-09-07). The probe lives in the rpc-server
+                 * binary next to the llama-server we were given; measured once
+                 * and cached. On Windows, failure falls back to the verified
+                 * WDDM budget instead of turning unknown into unconstrained. */
+                me.ram_pinnable = 0;
+                if (llama_bin && llama_bin[0]) {
+                    char rpc_bin[1200];
+                    const char *slash = strrchr(llama_bin, '/');
+                    const char *bslash = strrchr(llama_bin, '\\');
+                    if (bslash && (!slash || bslash > slash)) slash = bslash;
+                    const int dirlen = slash ? (int)(slash - llama_bin) + 1 : 0;
+#ifdef _WIN32
+                    const char *rpc_names[] = { "idletoken-rpc-server.exe", "ggml-rpc-server.exe" };
+#else
+                    const char *rpc_names[] = { "idletoken-rpc-server", "ggml-rpc-server" };
+#endif
+                    for (int k = 0; k < 2 && me.ram_pinnable == 0; k++) {
+                        struct stat sb;
+                        snprintf(rpc_bin, sizeof(rpc_bin), "%.*s%s", dirlen, llama_bin, rpc_names[k]);
+                        if (stat(rpc_bin, &sb) == 0)
+                            me.ram_pinnable = idletoken_engine_pinned_ceiling(rpc_bin, rep.ram_total);
+                    }
+                }
+#ifdef _WIN32
+                if (me.ram_pinnable == 0) {
+                    me.ram_pinnable = idletoken_windows_pinnable_budget(rep.ram_total);
+                    fprintf(stderr, "coord: WARNING: the engine page-lock probe was "
+                                    "unavailable; using the Windows WDDM formula "
+                                    "fallback %.1f GiB instead of treating the limit "
+                                    "as unlimited\n",
+                            me.ram_pinnable / 1073741824.0);
+                }
+#endif
             }
             /* Both llamacpp branches below return without ever reaching the
              * variant resolution near the end of main(), so the precision has
@@ -9521,26 +9745,64 @@ int main(int argc, char **argv) {
                 return 3;
             }
             fprintf(stderr, "coord: scheduler: %s\n", lplan.why);
-            /* Single-machine expert pool (patch 0006): the device memory the
-             * plan left free after the GPU-resident share, as a per-tensor
-             * slot count (see the cluster path for why not a byte budget);
-             * 1 GiB stays back for the staging tensor and placeholder copies. */
+            /* Single-machine path uses the same exact-slot contract as every
+             * cluster node; no machine/model/order-specific branch exists. */
             unsetenv("GGML_MOE_POOL_BYTES");
-            if (lplan.mode == IDLETOKEN_MODE_HYBRID && lplan.moe_pool_bytes > (1ull << 30) &&
+            coord_moe_layer_issue_env();
+            if (lplan.mode == IDLETOKEN_MODE_HYBRID &&
                 lplan.n_cpu_moe > 0 && msize.n_expert > 0) {
-                const uint64_t per_expert_layer = msize.expert_bytes_per_layer[0] / msize.n_expert;
-                const uint64_t cap = per_expert_layer > 0
-                    ? (lplan.moe_pool_bytes - (1ull << 30)) / ((uint64_t)lplan.n_cpu_moe * per_expert_layer) : 0;
-                const uint32_t n_cap = cap > msize.n_expert ? msize.n_expert : (uint32_t)cap;
-                char pool[16];
-                snprintf(pool, sizeof(pool), "%u", n_cap);
-                if (n_cap >= 8) setenv("GGML_MOE_POOL_EXPERTS", pool, 1); else unsetenv("GGML_MOE_POOL_EXPERTS");
-                fprintf(stderr, "coord: expert pool: %u of %u experts per tensor "
-                                "(%.2f GiB of device memory free, %u block(s) of experts in RAM)%s\n",
-                        n_cap, msize.n_expert, (double)lplan.moe_pool_bytes / 1073741824.0,
-                        lplan.n_cpu_moe, n_cap < 8 ? " -- below the one-batch floor, no pool" : "");
+                uint64_t slot_bytes = 0, fixed_bytes = 0;
+                if (idletoken_llama_moe_cache_budget(&msize, 0, lplan.n_cpu_moe,
+                        &slot_bytes, &fixed_bytes) != 0 || slot_bytes == 0) {
+                    fprintf(stderr, "idletoken-coord: exact expert-slot accounting failed "
+                                    "for local layers [0,%u)\n", lplan.n_cpu_moe);
+                    return 1;
+                }
+                const uint64_t room = coord_moe_pool_room(lplan.moe_pool_bytes, fixed_bytes);
+                const uint64_t cap = room / slot_bytes;
+                const uint32_t planned_cap = cap > msize.n_expert
+                    ? msize.n_expert : (uint32_t)cap;
+                uint32_t override_value = 0;
+                const int pool_overridden =
+                    coord_moe_pool_override_value(&override_value);
+                const uint32_t n_cap = coord_moe_pool_override(planned_cap);
+                const int pool_ready = coord_moe_pool_covers_active(
+                    n_cap, msize.n_expert_used);
+                if (!pool_overridden) {
+                    uint32_t weight_count = 0;
+                    uint64_t weight_hash = 0;
+                    if (coord_moe_weight_signature(&msize, 0, lplan.n_cpu_moe,
+                                                   &weight_count, &weight_hash) != 0) {
+                        fprintf(stderr, "idletoken-coord: exact expert-weight identity failed "
+                                        "for local layers [0,%u)\n", lplan.n_cpu_moe);
+                        return 1;
+                    }
+                    char count[16], hash[32];
+                    snprintf(count, sizeof(count), "%u", weight_count);
+                    snprintf(hash, sizeof(hash), "%llu", (unsigned long long)weight_hash);
+                    unsetenv("GGML_MOE_POOL_EXPERTS");
+                    setenv("GGML_MOE_AUTO_WEIGHT_COUNT", count, 1);
+                    setenv("GGML_MOE_AUTO_WEIGHT_HASH", hash, 1);
+                } else {
+                    char pool[16];
+                    snprintf(pool, sizeof(pool), "%u", n_cap);
+                    setenv("GGML_MOE_POOL_EXPERTS", pool, 1);
+                    unsetenv("GGML_MOE_AUTO_WEIGHT_COUNT");
+                    unsetenv("GGML_MOE_AUTO_WEIGHT_HASH");
+                }
+                fprintf(stderr, "coord: expert pool: planner estimates %u of %u experts per "
+                                "tensor (%.2f GiB total cache budget, %u block(s) of experts "
+                                "in RAM)%s%s\n",
+                        planned_cap, msize.n_expert,
+                        (double)lplan.moe_pool_bytes / 1073741824.0,
+                        lplan.n_cpu_moe,
+                        pool_ready ? "" : " -- below this model's active-expert count",
+                        pool_overridden ? "" :
+                            "; runtime will size it from post-load free VRAM");
             } else {
                 unsetenv("GGML_MOE_POOL_EXPERTS");
+                unsetenv("GGML_MOE_AUTO_WEIGHT_COUNT");
+                unsetenv("GGML_MOE_AUTO_WEIGHT_HASH");
             }
 
             /* Sequence slots from what is left in the pool the KV lives in
@@ -10030,7 +10292,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < n; i++) {
         mode_nodes[i].vram_usable = ws[i].vram_usable;
         mode_nodes[i].ram_usable  = ws[i].ram_usable;
-        mode_nodes[i].ram_pinnable= ws[i].ram_pinnable;
+        mode_nodes[i].ram_pinnable= worker_plan_ram_pinnable(&ws[i]);
         mode_nodes[i].unified     = ws[i].unified;
         mode_nodes[i].backend     = IDLETOKEN_BACKEND_OF_OS(ws[i].os_family);
         /* Every number above is that machine's own declaration; when one is

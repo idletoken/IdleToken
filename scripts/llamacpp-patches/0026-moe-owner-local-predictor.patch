@@ -1,0 +1,36 @@
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1985,9 +1985,10 @@
+     cb(probs, "ffn_moe_probs", il);
+ 
+     // pre-gate (GGML_MOE_PREGATE=1): apply a future layer's router to THIS
+-    // layer's router input. GGML_MOE_PREGATE_HORIZON (default 1) controls how
+-    // many layers of copy latency the pipeline can hide; exact target-layer ids
+-    // still repair every wrong prediction. The node has no model consumer and
++    // layer's router input. GGML_MOE_PREGATE_HORIZON selects the predictor's
++    // lookahead; the rolling copy area currently supports one hop, not a
++    // multi-level pipeline. Exact target-layer ids repair every wrong prediction.
++    // The node has no model consumer and
+     // never changes the result. GGML_MOE_PREGATE_EXTRA asks for more than top-k.
+     static const int pregate_horizon = [] {
+         const char * e = getenv("GGML_MOE_PREGATE_HORIZON");
+@@ -2000,7 +2001,18 @@
+             return e && atoi(e) > 0 ? 1 : 0;
+         }();
+         const auto & nl = model->layers[il + pregate_horizon];
+-        if (pregate && nl.ffn_gate_inp != nullptr) {
++        const auto * current_router = model->layers[il].ffn_gate_inp;
++        // A scheduler-side skip is too late: expanding this otherwise-unused
++        // node already makes a remote router an RPC graph dependency. At an
++        // owner boundary that sends an extra hidden state and adds a round trip
++        // before the real layer-boundary transfer. Predict only within the same
++        // owner and actual router buffer type (including explicit placements).
++        const bool local_prediction = pregate && current_router && nl.ffn_gate_inp &&
++            current_router->buffer && nl.ffn_gate_inp->buffer &&
++            model->dev_layer(il) == model->dev_layer(il + pregate_horizon) &&
++            ggml_backend_buffer_get_type(current_router->buffer) ==
++                ggml_backend_buffer_get_type(nl.ffn_gate_inp->buffer);
++        if (local_prediction) {
+             ggml_tensor * pg = build_lora_mm(nl.ffn_gate_inp, cur);
+             if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
+                 ggml_mul_mat_set_prec(pg, GGML_PREC_F32);

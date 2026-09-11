@@ -1,10 +1,13 @@
 import { readFileSync } from "node:fs";
 import {
+  clusterCapacityVerdict,
   MODELS,
   estimateClusterCapacity,
   getManifest,
   getVariant,
+  hybridRequirements,
   kvBytesForContext,
+  poolRam,
 } from "../src/models";
 import { PRODUCT_CONTEXT_CAP, modelCtxMax } from "../src/settings";
 
@@ -24,7 +27,15 @@ interface OracleCase {
 
 const oraclePath = process.argv[2];
 if (!oraclePath) throw new Error("usage: resource_estimate_check <C-oracle.json>");
-const oracle = JSON.parse(readFileSync(oraclePath, "utf8")) as { cases: OracleCase[] };
+interface WddmCase {
+  ram_total: number;
+  budget: number;
+}
+
+const oracle = JSON.parse(readFileSync(oraclePath, "utf8")) as {
+  cases: OracleCase[];
+  wddm_cases: WddmCase[];
+};
 const models = new Map(MODELS.map((m) => [m.id, m]));
 let failures = 0;
 
@@ -90,6 +101,109 @@ for (const c of oracle.cases) {
 for (const want of ["cuda", "metal"]) {
   if (!oracle.cases.some((c) => c.backend === want)) {
     console.error(`RESOURCE_ESTIMATE_MISMATCH oracle has no ${want} cases`);
+    failures++;
+  }
+}
+// The native side owns the Windows formula and publishes the per-node result.
+// The client must consume that field rather than raw free RAM, and must apply
+// it independently to every member before summing the cluster.
+if (!Array.isArray(oracle.wddm_cases) || oracle.wddm_cases.length < 14) {
+  console.error("RESOURCE_ESTIMATE_MISMATCH native oracle lacks low-RAM or WDDM boundary cases");
+  failures++;
+} else {
+  for (const c of oracle.wddm_cases) {
+    const one = poolRam([{
+      ramFree: c.ram_total,
+      ramExpertFree: c.budget,
+      unifiedMemory: false,
+    }]);
+    if (!one.complete || one.bytes !== c.budget) {
+      console.error(
+        `RESOURCE_ESTIMATE_MISMATCH WDDM per-node budget: total=${c.ram_total} ` +
+        `native=${c.budget} client=${one.bytes} complete=${one.complete}`,
+      );
+      failures++;
+    }
+  }
+  const a = oracle.wddm_cases.find((c) => c.ram_total === 48 * 1024 ** 3);
+  const b = oracle.wddm_cases.find((c) => c.ram_total === 64 * 1024 ** 3);
+  if (!a || !b) {
+    console.error("RESOURCE_ESTIMATE_MISMATCH native oracle lacks 48/64-GiB WDDM cases");
+    failures++;
+  } else {
+    const pair = poolRam([
+      { ramFree: a.ram_total, ramExpertFree: a.budget, unifiedMemory: false },
+      { ramFree: b.ram_total, ramExpertFree: b.budget, unifiedMemory: false },
+    ]);
+    if (!pair.complete || pair.bytes !== a.budget + b.budget) {
+      console.error("RESOURCE_ESTIMATE_MISMATCH WDDM reserve was not applied per node");
+      failures++;
+    }
+    const oldWindowsPeer = poolRam([{
+      ramFree: a.ram_total,
+      unifiedMemory: false,
+    }]);
+    if (oldWindowsPeer.complete || oldWindowsPeer.bytes !== 0) {
+      console.error("RESOURCE_ESTIMATE_MISMATCH missing ramExpertFree was treated as usable RAM");
+      failures++;
+    }
+  }
+}
+if (clusterCapacityVerdict(88.7, 31.3, 77.3, true) !== "hybrid-check") {
+  console.error("RESOURCE_ESTIMATE_MISMATCH pooled MoE RAM was treated as a proved fit");
+  failures++;
+}
+if (clusterCapacityVerdict(88.7, 31.3, 50, true) !== "short") {
+  console.error("RESOURCE_ESTIMATE_MISMATCH definite MoE aggregate shortfall was hidden");
+  failures++;
+}
+if (clusterCapacityVerdict(30, 31.3, 0, false) !== "fits") {
+  console.error("RESOURCE_ESTIMATE_MISMATCH GPU-only fit became uncertain");
+  failures++;
+}
+if (clusterCapacityVerdict(88.7, 31.3, 0, true, true, false) !== "unknown") {
+  console.error("RESOURCE_ESTIMATE_MISMATCH missing expert-RAM report was treated as a shortfall");
+  failures++;
+}
+
+// Hybrid is two independent requirements. This is the measured DSv4-shaped
+// boundary from the Windows pair: 77.340027 GiB page-lockable versus
+// 77.265625 GiB of expert weights (about 76 MiB spare). The old card added RAM
+// to VRAM and compared that made-up pool with 88.7 GiB; the new calculation
+// must retain the complete expert store as the RAM requirement and charge the
+// model's own active expert count on the VRAM side.
+{
+  const GiB = 1024 ** 3;
+  const fullGpu = Math.round(88.7 * GiB);
+  const experts = Math.round(77.265625 * GiB);
+  for (const active of [4, 6, 8, 10]) {
+    const hybrid = hybridRequirements(fullGpu, {
+      expertBytesTotal: experts,
+      nExpert: 256,
+      nExpertUsed: active,
+      complete: true,
+    });
+    const transfer = Math.ceil((experts * active) / 256);
+    if (
+      !hybrid ||
+      hybrid.ramNeedBytes !== experts ||
+      hybrid.transferBytes !== transfer ||
+      hybrid.poolExperts !== active ||
+      hybrid.vramNeedBytes !== fullGpu - experts + transfer
+    ) {
+      console.error(
+        `RESOURCE_ESTIMATE_MISMATCH top-${active} Hybrid VRAM/RAM requirements drifted`,
+      );
+      failures++;
+    }
+  }
+  if (hybridRequirements(fullGpu, {
+    expertBytesTotal: experts,
+    nExpert: 256,
+    nExpertUsed: 6,
+    complete: false,
+  }) !== null) {
+    console.error("RESOURCE_ESTIMATE_MISMATCH incomplete GGUF expert layout was guessed");
     failures++;
   }
 }

@@ -383,19 +383,39 @@ static const idletoken_model_variant DSV4_PRO_VARIANTS[] = {
     { .quant = "Q4_K_M",  .layer_weight_bytes = 950879580768ull, .shared_weight_bytes = 0ull, .gguf = "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00001-of-00076.gguf" },  /* 76 parts, 886 GiB, DevQuasar */
 };
 
-/* OpenAI's native MXFP4 releases. Tensor bytes were summed from the official
- * ggml-org GGUF directories; graph workspaces were measured with the pinned
- * llama-fit-params on CUDA and Metal at the model's 128K ceiling. */
+/* Curated Unsloth gpt-oss quantizations, smallest first. Tensor bytes were
+ * summed from every GGUF shard at fixed HF revisions; graph workspaces were
+ * measured with the pinned llama-fit-params on CUDA and Metal at the model's
+ * 128K ceiling. Unsloth keeps the expert tensors MXFP4-derived, so the storage
+ * gap between these rows is intentionally much smaller than a dense model's. */
 static const idletoken_model_variant GPT_OSS_20B_VARIANTS[] = {
-    { .quant = "MXFP4", .layer_weight_bytes = 10865888256ull,
+    { .quant = "Q3_K_S", .layer_weight_bytes = 10509782016ull,
+      .shared_weight_bytes = 941103360ull,
+      .gguf = "gpt-oss-20b-Q3_K_S.gguf" },
+    { .quant = "Q4_K_XL", .layer_weight_bytes = 10628668416ull,
       .shared_weight_bytes = 1230670080ull,
-      .gguf = "gpt-oss-20b-MXFP4.gguf" },
+      .gguf = "gpt-oss-20b-UD-Q4_K_XL.gguf" },
+    { .quant = "Q8_0", .layer_weight_bytes = 10865888256ull,
+      .shared_weight_bytes = 1230670080ull,
+      .gguf = "gpt-oss-20b-Q8_0.gguf" },
+    { .quant = "F16", .layer_weight_bytes = 11463085056ull,
+      .shared_weight_bytes = 2316545280ull,
+      .gguf = "gpt-oss-20b-F16.gguf" },
 };
 
 static const idletoken_model_variant GPT_OSS_120B_VARIANTS[] = {
-    { .quant = "MXFP4", .layer_weight_bytes = 62143653888ull,
+    { .quant = "Q3_K_S", .layer_weight_bytes = 61609494528ull,
+      .shared_weight_bytes = 941103360ull,
+      .gguf = "Q3_K_S/gpt-oss-120b-Q3_K_S-00001-of-00002.gguf" },
+    { .quant = "Q4_K_XL", .layer_weight_bytes = 61772617728ull,
       .shared_weight_bytes = 1230670080ull,
-      .gguf = "gpt-oss-120b-MXFP4.gguf" },
+      .gguf = "UD-Q4_K_XL/gpt-oss-120b-UD-Q4_K_XL-00001-of-00002.gguf" },
+    { .quant = "Q8_0", .layer_weight_bytes = 62143653888ull,
+      .shared_weight_bytes = 1230670080ull,
+      .gguf = "Q8_0/gpt-oss-120b-Q8_0-00001-of-00002.gguf" },
+    { .quant = "F16", .layer_weight_bytes = 63039449088ull,
+      .shared_weight_bytes = 2316545280ull,
+      .gguf = "gpt-oss-120b-F16.gguf" },
 };
 
 static const idletoken_model_spec MODELS[] = {
@@ -959,8 +979,8 @@ static const idletoken_model_spec MODELS[] = {
         .n_vocab  = 201088,
         .n_expert = 32,
         .n_expert_used = 4,
-        .layer_weight_bytes  = 10865888256ull,
-        .shared_weight_bytes = 1230670080ull,
+        .layer_weight_bytes  = 10509782016ull,
+        .shared_weight_bytes = 941103360ull,
         .ctx_max  = 131072,
         .split_boundary_multiple = 0,
         /* Even blocks use a 128-token sliding window; odd blocks use full
@@ -976,7 +996,7 @@ static const idletoken_model_spec MODELS[] = {
         .compute_bytes_128k_metal = { 423624704ull, 423624704ull, 423624704ull },
         .compute_bytes_256k_metal = { 0ull, 0ull, 0ull },
         .compute_bytes_1m_metal = { 0ull, 0ull, 0ull },
-        .default_gguf = "gpt-oss-20b-MXFP4.gguf",
+        .default_gguf = "gpt-oss-20b-Q3_K_S.gguf",
         .variants = GPT_OSS_20B_VARIANTS,
         .n_variants = sizeof(GPT_OSS_20B_VARIANTS) / sizeof(GPT_OSS_20B_VARIANTS[0]),
         .default_variant = 0,
@@ -993,8 +1013,8 @@ static const idletoken_model_spec MODELS[] = {
         .n_vocab  = 201088,
         .n_expert = 128,
         .n_expert_used = 4,
-        .layer_weight_bytes  = 62143653888ull,
-        .shared_weight_bytes = 1230670080ull,
+        .layer_weight_bytes  = 61609494528ull,
+        .shared_weight_bytes = 941103360ull,
         .ctx_max  = 131072,
         .split_boundary_multiple = 0,
         .kv_kind  = IDLETOKEN_KV_HYBRID,
@@ -1008,7 +1028,7 @@ static const idletoken_model_spec MODELS[] = {
         .compute_bytes_128k_metal = { 423624704ull, 423624704ull, 423624704ull },
         .compute_bytes_256k_metal = { 0ull, 0ull, 0ull },
         .compute_bytes_1m_metal = { 0ull, 0ull, 0ull },
-        .default_gguf = "gpt-oss-120b-MXFP4.gguf",
+        .default_gguf = "Q3_K_S/gpt-oss-120b-Q3_K_S-00001-of-00002.gguf",
         .variants = GPT_OSS_120B_VARIANTS,
         .n_variants = sizeof(GPT_OSS_120B_VARIANTS) / sizeof(GPT_OSS_120B_VARIANTS[0]),
         .default_variant = 0,

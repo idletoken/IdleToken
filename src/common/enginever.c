@@ -86,16 +86,14 @@ int idletoken_engine_version(const char *llama_server_bin,
 #endif
 }
 
-int idletoken_engine_has_node_local_moe(const char *engine_bin) {
+/* Scan an engine binary for a string that only the patched sources contain.
+ * Overlap the chunks by the needle length so a match straddling a chunk
+ * boundary is not missed. 1 found, 0 absent, -1 unreadable. */
+static int engine_has_needle(const char *engine_bin, const char *needle) {
     if (!engine_bin || !engine_bin[0]) return -1;
     FILE *f = fopen(engine_bin, "rb");
     if (!f) return -1;
-    /* The marker is a log format string compiled into both llama-server and
-     * ggml-rpc-server by patch 0005; it is absent from every earlier series.
-     * Overlap the chunks by the needle length so a match straddling a chunk
-     * boundary is not missed. */
-    static const char needle[] = "selected-expert ranges";
-    const size_t nlen = sizeof(needle) - 1;
+    const size_t nlen = strlen(needle);
     enum { CHUNK = 1 << 20 };
     unsigned char *buf = (unsigned char *)malloc(CHUNK + nlen);
     if (!buf) { fclose(f); return -1; }
@@ -116,4 +114,105 @@ int idletoken_engine_has_node_local_moe(const char *engine_bin) {
     free(buf);
     fclose(f);
     return found;
+}
+
+int idletoken_engine_has_node_local_moe(const char *engine_bin) {
+    /* A log format string compiled into both llama-server and ggml-rpc-server
+     * by patch 0005; absent from every earlier series. */
+    return engine_has_needle(engine_bin, "selected-expert ranges");
+}
+
+int idletoken_engine_has_host_staging(const char *engine_bin) {
+    /* The staged allocator's log line, patch 0007 (ggml-cuda is linked
+     * statically into both engine binaries). */
+    return engine_has_needle(engine_bin, "staged host buffer:");
+}
+
+/* --- page-lockable host memory (see the header) -------------------------- */
+
+uint64_t idletoken_engine_probe_pinned(const char *rpc_server_bin) {
+    if (!rpc_server_bin || !rpc_server_bin[0]) return 0;
+    char cmd[1200];
+#ifdef _WIN32
+    if (snprintf(cmd, sizeof(cmd), "\"\"%s\" --pinned-probe 2>&1\"", rpc_server_bin) >= (int)sizeof(cmd))
+        return 0;
+    FILE *p = _popen(cmd, "r");
+#else
+    if (snprintf(cmd, sizeof(cmd), "'%s' --pinned-probe 2>&1", rpc_server_bin) >= (int)sizeof(cmd))
+        return 0;
+    FILE *p = popen(cmd, "r");
+#endif
+    if (!p) return 0;
+    char line[512];
+    uint64_t mib = 0;
+    int found = 0;
+    while (fgets(line, sizeof(line), p)) {
+        const char *k = strstr(line, "PINNED_MAX_MIB=");
+        if (k) {
+            mib = (uint64_t)strtoull(k + strlen("PINNED_MAX_MIB="), NULL, 10);
+            found = 1;
+        }
+    }
+#ifdef _WIN32
+    _pclose(p);
+#else
+    pclose(p);
+#endif
+    if (!found) {
+        fprintf(stderr, "idletoken: %s printed no PINNED_MAX_MIB (an engine without the "
+                        "probe, or it failed to start); the pinned ceiling stays unknown\n",
+                rpc_server_bin);
+        return 0;
+    }
+    return mib << 20;
+}
+
+static void pinned_cache_path(char *out, size_t cap) {
+#ifdef _WIN32
+    const char *base = getenv("LOCALAPPDATA");
+    if (!base || !base[0]) base = getenv("TEMP");
+    snprintf(out, cap, "%s\\IdleToken-pinned-max.txt", base ? base : ".");
+#else
+    const char *base = getenv("XDG_CACHE_HOME");
+    if (base && base[0]) snprintf(out, cap, "%s/idletoken-pinned-max", base);
+    else {
+        const char *home = getenv("HOME");
+        snprintf(out, cap, "%s/.cache/idletoken-pinned-max", home ? home : ".");
+    }
+#endif
+}
+
+uint64_t idletoken_engine_cached_pinned_ceiling(uint64_t ram_total) {
+    char path[512];
+    pinned_cache_path(path, sizeof(path));
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    unsigned long long key = 0, val = 0;
+    const int n = fscanf(f, "%llu %llu", &key, &val);
+    fclose(f);
+    if (n != 2 || key != (unsigned long long)ram_total || val == 0) return 0;
+    return (uint64_t)val;
+}
+
+uint64_t idletoken_engine_pinned_ceiling(const char *rpc_server_bin, uint64_t ram_total) {
+    char path[512];
+    pinned_cache_path(path, sizeof(path));
+    const uint64_t cached = idletoken_engine_cached_pinned_ceiling(ram_total);
+    if (cached > 0) {
+        fprintf(stderr, "idletoken: pinned ceiling %.2f GiB (cached in %s)\n",
+                (double)cached / 1073741824.0, path);
+        return cached;
+    }
+    fprintf(stderr, "idletoken: measuring how much RAM this GPU can page-lock, once "
+                    "(brief high memory use, up to a minute; cached in %s)\n", path);
+    const uint64_t got = idletoken_engine_probe_pinned(rpc_server_bin);
+    if (got == 0) return 0;   /* caller applies the platform fallback, if any */
+    fprintf(stderr, "idletoken: pinned ceiling %.2f GiB of %.2f GiB RAM\n",
+            (double)got / 1073741824.0, (double)ram_total / 1073741824.0);
+    FILE *f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "%llu %llu\n", (unsigned long long)ram_total, (unsigned long long)got);
+        fclose(f);
+    }
+    return got;
 }

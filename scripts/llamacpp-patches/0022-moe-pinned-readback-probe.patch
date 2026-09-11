@@ -1,0 +1,118 @@
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1000,6 +1000,10 @@
+     sched_moe_timing_event_elapsed_fn elapsed[GGML_SCHED_MAX_BACKENDS] = {};
+     bool initialized[GGML_SCHED_MAX_BACKENDS] = {};
+     std::unordered_map<int, sched_moe_timing_record> records;
++};
++
++struct sched_moe_readback {
++    ggml_backend_buffer_t ids = nullptr, scores = nullptr;
+ };
+ 
+ struct sched_moe_state {
+@@ -1029,6 +1033,9 @@
+     ggml_backend_t prefetch_backend[GGML_SCHED_MAX_BACKENDS] = {};
+     std::vector<int32_t> pred;
+     std::vector<float> scores;
++    bool pinned_readback = false; // isolated diagnostic A/B; no cache-policy change
++    sched_moe_readback readbacks[GGML_SCHED_MAX_BACKENDS];
++    const float * score_read_ptr = nullptr;
+     int pregate_extra = 0;   // GGML_MOE_PREGATE_EXTRA: experts to prefetch beyond the top-k
+     int pregate_horizon = 1; // GGML_MOE_PREGATE_HORIZON: predict this many layers ahead
+     int pregate_prepared_layer = -1;
+@@ -1243,6 +1250,8 @@
+     st->timing.every = rolling_profile ? std::max(0, atoi(rolling_profile)) : 0;
+     const char * timing_warmup = getenv("GGML_MOE_ROLLING_WARMUP");
+     st->timing.warmup = timing_warmup ? std::max(0, atoi(timing_warmup)) : 64;
++    const char * pinned_readback = getenv("GGML_MOE_PINNED_READBACK");
++    st->pinned_readback = pinned_readback && atoi(pinned_readback) > 0;
+     if (st->timing.every > 0 || st->pregate_stats_every > 0) {
+         const char * enabled = getenv("GGML_MOE_PREGATE");
+         if (!enabled || atoi(enabled) <= 0) {
+@@ -1301,6 +1310,8 @@
+         if (r.done)  ggml_backend_event_free(r.done);
+     }
+     for (int b = 0; b < GGML_SCHED_MAX_BACKENDS; b++) {
++        if (st->readbacks[b].ids) ggml_backend_buffer_free(st->readbacks[b].ids);
++        if (st->readbacks[b].scores) ggml_backend_buffer_free(st->readbacks[b].scores);
+         if (st->prefetch_backend[b]) {
+             ggml_backend_free(st->prefetch_backend[b]);
+         }
+@@ -1629,6 +1640,36 @@
+ // former implementation entered here after the current gate misses had been
+ // queued, then synchronized the whole compute stream a second time per layer;
+ // that serialized the copy pipeline it was meant to create.
++static void * sched_moe_readback_ptr(ggml_backend_sched_t sched, ggml_backend_t backend,
++                                    bool scores, size_t bytes, void * ordinary) {
++    if (!sched->moe || !sched->moe->pinned_readback) return ordinary;
++    const auto dev = ggml_backend_get_device(backend);
++    const auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
++    // This diagnostic targets discrete CUDA. It must not allocate a host
++    // buffer on an RPC backend or change the Metal/unified-memory path.
++    if (!reg || strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) return ordinary;
++    int b = -1;
++    for (int i = 0; i < sched->n_backends; i++) {
++        if (sched->backends[i] == backend) { b = i; break; }
++    }
++    if (b < 0) return ordinary;
++    auto & reads = sched->moe->readbacks[b];
++    auto & buffer = scores ? reads.scores : reads.ids;
++    if (!buffer || ggml_backend_buffer_get_size(buffer) < bytes) {
++        if (buffer) ggml_backend_buffer_free(buffer);
++        const auto buft = ggml_backend_dev_host_buffer_type(dev);
++        if (!buft) GGML_ABORT("pinned MoE readback requested but CUDA exposes no host buffer type");
++        buffer = ggml_backend_buft_alloc_buffer(buft, std::max<size_t>(4096, bytes));
++        if (!buffer || ggml_backend_buffer_get_type(buffer) != buft) {
++            GGML_ABORT("pinned MoE readback allocation failed; cannot measure a pageable fallback as pinned");
++        }
++        fprintf(stderr, "moe-readback: device=%s kind=%s bytes=%zu buffer=%s\n",
++                ggml_backend_dev_name(dev), scores ? "scores" : "ids",
++                ggml_backend_buffer_get_size(buffer), ggml_backend_buffer_name(buffer));
++    }
++    return ggml_backend_buffer_get_base(buffer);
++}
++
+ static bool sched_moe_prefetch_prepare(ggml_backend_sched_t sched, int layer,
+                                        ggml_backend_t ids_backend, int k) {
+     auto & st = *sched->moe;
+@@ -1661,7 +1702,10 @@
+         return false;
+     }
+     st.scores.resize((size_t) n);
+-    ggml_backend_tensor_get_async(ids_backend, pg, st.scores.data(), 0, (size_t) n * sizeof(float));
++    void * read_ptr = sched_moe_readback_ptr(sched, ids_backend, true,
++                                            (size_t) n * sizeof(float), st.scores.data());
++    st.score_read_ptr = (const float *) read_ptr;
++    ggml_backend_tensor_get_async(ids_backend, pg, read_ptr, 0, (size_t) n * sizeof(float));
+     st.pregate_prepared_layer = layer;
+     st.pregate_prepared_count = (int) m;
+     return true;
+@@ -1678,6 +1722,9 @@
+     }
+     const int64_t n = (int64_t) st.scores.size();
+     const int64_t m = std::min<int64_t>(n, st.pregate_prepared_count);
++    if (st.score_read_ptr != st.scores.data()) {
++        memcpy(st.scores.data(), st.score_read_ptr, (size_t) n * sizeof(float));
++    }
+     st.pred.resize((size_t) n);
+     for (int64_t i = 0; i < n; i++) {
+         st.pred[i] = (int32_t) i;
+@@ -3722,10 +3769,16 @@
+                         auto * moe_timing = ids_tensor->ne[1] == 1
+                             ? sched_moe_timing_route(sched, moe_layer, ids_backend) : nullptr;
+                         SCHED_PROF_T(t_ids);
+-                        ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
++                        void * ids_read_ptr = ids_tensor->ne[1] == 1
++                            ? sched_moe_readback_ptr(sched, ids_backend, false, ggml_nbytes(ids_tensor), ids.data())
++                            : ids.data();
++                        ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids_read_ptr, 0, ggml_nbytes(ids_tensor));
+                         const bool pregate_prepared = sched->moe && ids_tensor->ne[1] == 1 &&
+                             sched_moe_prefetch_prepare(sched, moe_layer, ids_backend, (int) ids_tensor->ne[0]);
+                         ggml_backend_synchronize(ids_backend);
++                        if (ids_read_ptr != ids.data()) {
++                            memcpy(ids.data(), ids_read_ptr, ggml_nbytes(ids_tensor));
++                        }
+                         if (moe_timing) {
+                             ggml_backend_event_record(moe_timing->ready, ids_backend);
+                             moe_timing->ready_set = true;

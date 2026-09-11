@@ -90,6 +90,7 @@ const PROBE_RULE = objectRule({
   ram_total: SCALAR,
   ram_used_other: SCALAR,
   ram_usable: SCALAR,
+  ram_expert_usable: SCALAR,
   disk_avail: SCALAR,
   driver_version: SCALAR,
   hw_status: SCALAR,

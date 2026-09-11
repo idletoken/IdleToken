@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useI18n } from "./i18n";
 import {
   approveCoordinatorRequest,
@@ -16,8 +16,9 @@ import type { Session } from "./auth";
 import { platformGate } from "./platform";
 import { useDialog } from "./useDialog";
 import { loadSettings, overflowTuning, type EngineTuning } from "./settings";
-import { ctxLabel, floorGiB1 } from "./format";
+import { ctxLabel, floorGiB1, fmtQuant } from "./format";
 import { isMoeModel } from "./models";
+import StartupProgress from "./StartupProgress";
 
 type View = "choose" | "join" | "active";
 
@@ -62,7 +63,9 @@ function PeerRow(props: {
             <span className="peer__resources">
               {t("pairing.moeResources", {
                 gpu: mem(p.vramFree),
-                ram: mem(p.ramFree),
+                // Show the schedulable expert pool, not ordinary free RAM.
+                // On Windows this has already paid the per-node WDDM reserve.
+                ram: mem(p.ramExpertFree),
               })}
               {p.unifiedMemory ? ` · ${t("node.unified")}` : ""}
             </span>
@@ -146,22 +149,53 @@ export default function PairingPanel(props: {
   // back as rejected invokes; without a catch they were unhandled rejections —
   // the button just did nothing on screen.
   const [opErr, setOpErr] = useState<string | null>(null);
+  // A join command returns after starting LAN discovery; the real result
+  // arrives later in a snapshot. Keep the action visibly alive across that
+  // gap instead of letting the button look as though it did nothing.
+  const [connecting, setConnecting] = useState<"code" | "account" | null>(null);
+  const [startRequested, setStartRequested] = useState(false);
+  // A panel opened from "Manage cluster" must stay open, including when its
+  // first snapshot is already ready. Only an action started inside this panel
+  // arms auto-close: a join closes once this machine appears in the roster;
+  // Start closes once orchestration has actually left the idle phase. The
+  // dashboard then owns the progress UI and the management dialog no longer
+  // sits over it after a successful connection.
+  const autoClose = useRef<"joined" | "started" | null>(null);
   // Wrap a provider call so its rejection lands on the panel instead of the
   // console. tErr maps client codes to localized copy; unknown text verbatim.
-  const guard = (p: Promise<void>) => {
+  const guard = (p: Promise<void>, onError?: () => void) => {
     setOpErr(null);
-    return p.catch((e) => setOpErr(tErr(String(e))));
+    return p.catch((e) => {
+      onError?.();
+      setOpErr(tErr(String(e)));
+    });
   };
 
   useEffect(() => {
     const unsub = getPairingProvider().subscribe((s) => {
       setSnap(s);
-      if (s.peers.length > 0) setView("active");
+      if (s.peers.length > 0) {
+        setConnecting(null);
+        if (s.phase !== "idle") setStartRequested(false);
+        setView("active");
+        if (
+          autoClose.current === "joined"
+          || (autoClose.current === "started" && s.phase !== "idle")
+        ) {
+          autoClose.current = null;
+          props.onClose();
+        }
+      }
       // A background failure tore the roster down (creator's roster port
       // busy, and the like): an "active" view over zero peers would render a
       // ghost cluster — fall back to the entry screen, where the error strip
       // below says what happened.
-      else if (s.lastError) setView((v) => (v === "active" ? "choose" : v));
+      else if (s.lastError) {
+        autoClose.current = null;
+        setConnecting(null);
+        setStartRequested(false);
+        setView((v) => (v === "active" ? "choose" : v));
+      }
     });
     return unsub;
   }, []);
@@ -209,6 +243,8 @@ export default function PairingPanel(props: {
         return t("pairing.err.portBusy", { port: e.detail || "14098" });
       case "creatorLost":
         return t("pairing.err.creatorLost");
+      case "lanRoute":
+        return t("pairing.err.lanRoute", { detail: e.detail });
       default:
         return e.detail || e.code;
     }
@@ -245,6 +281,8 @@ export default function PairingPanel(props: {
     const secret = await deriveSecret();
     if (!secret) return;
     setJoinKind("account");
+    setConnecting("account");
+    autoClose.current = "joined";
     await guard(
       (async () => {
         const modelPath = over?.modelPath ?? (await props.prepareSelectedModel());
@@ -252,7 +290,11 @@ export default function PairingPanel(props: {
           { ...props.self, modelPath, tuning: over?.tuning ?? props.self.tuning },
           secret
         );
-      })()
+      })(),
+      () => {
+        autoClose.current = null;
+        setConnecting(null);
+      },
     );
   };
 
@@ -269,6 +311,8 @@ export default function PairingPanel(props: {
     }
     setCodeErr(false);
     setJoinKind("code");
+    setConnecting("code");
+    autoClose.current = "joined";
     await guard(
       (async () => {
         // Admission requires verified local weights. Never send an empty path:
@@ -280,7 +324,11 @@ export default function PairingPanel(props: {
           modelPath,
           tuning: over?.tuning ?? props.self.tuning,
         });
-      })()
+      })(),
+      () => {
+        autoClose.current = null;
+        setConnecting(null);
+      },
     );
   };
 
@@ -376,7 +424,7 @@ export default function PairingPanel(props: {
                   ? t("pairing.fetchingModel")
                   : t("pairing.fetchModel", {
                       model: snap.requiredModel.modelId,
-                      quant: snap.requiredModel.quant,
+                      quant: fmtQuant(snap.requiredModel.quant),
                     })}
               </button>
             ) : null}
@@ -385,13 +433,20 @@ export default function PairingPanel(props: {
 
         {view === "choose" ? (
           <>
-            <button className="choice" onClick={create} disabled={!modelReady}>
+            {connecting === "account" ? (
+              <StartupProgress
+                compact
+                label={t("startup.finding")}
+                detail={t("startup.findingDetail")}
+              />
+            ) : null}
+            <button className="choice" onClick={create} disabled={!modelReady || connecting !== null}>
               <span className="choice__title">{t("pairing.chooseCreate")}</span>
               <span className="choice__hint">
                 {modelReady ? t("pairing.chooseCreateHint") : t("pairing.needsModel")}
               </span>
             </button>
-            <button className="choice" onClick={() => setView("join")} disabled={!modelReady}>
+            <button className="choice" onClick={() => setView("join")} disabled={!modelReady || connecting !== null}>
               <span className="choice__title">{t("pairing.chooseJoin")}</span>
               <span className="choice__hint">
                 {modelReady ? t("pairing.chooseJoinHint") : t("pairing.needsModel")}
@@ -402,7 +457,7 @@ export default function PairingPanel(props: {
                 <div className="setting-group__label" style={{ marginTop: 8 }}>
                   {t("pairing.accountTitle")}
                 </div>
-                <button className="choice" onClick={accountCreate} disabled={!modelReady}>
+                <button className="choice" onClick={accountCreate} disabled={!modelReady || connecting !== null}>
                   <span className="choice__title">{t("pairing.accountCreate")}</span>
                   <span className="choice__hint">
                     {modelReady ? t("pairing.accountCreateHint") : t("pairing.needsModel")}
@@ -411,7 +466,7 @@ export default function PairingPanel(props: {
                 {/* Wrapped: accountJoin now takes an optional "weights we just
                     fetched" argument, and a bare handler would hand it the
                     click event as that argument. */}
-                <button className="choice" onClick={() => void accountJoin()} disabled={!modelReady}>
+                <button className="choice" onClick={() => void accountJoin()} disabled={!modelReady || connecting !== null}>
                   <span className="choice__title">{t("pairing.accountJoin")}</span>
                   <span className="choice__hint">
                     {modelReady
@@ -479,17 +534,30 @@ export default function PairingPanel(props: {
                   ? t("pairing.fetchingModel")
                   : t("pairing.fetchModel", {
                       model: snap.requiredModel.modelId,
-                      quant: snap.requiredModel.quant,
+                      quant: fmtQuant(snap.requiredModel.quant),
                     })}
               </button>
             ) : (
-              <button
-                className="btn-primary btn-block"
-                disabled={!modelReady}
-                onClick={() => void join()}
-              >
-                {snap?.lastError ? t("state.retry") : t("pairing.join")}
-              </button>
+              <>
+                {connecting === "code" ? (
+                  <StartupProgress
+                    compact
+                    label={t("startup.finding")}
+                    detail={t("startup.findingDetail")}
+                  />
+                ) : null}
+                <button
+                  className="btn-primary btn-block"
+                  disabled={!modelReady || connecting !== null}
+                  onClick={() => void join()}
+                >
+                  {connecting === "code"
+                    ? t("startup.finding")
+                    : snap?.lastError
+                      ? t("state.retry")
+                      : t("pairing.join")}
+                </button>
+              </>
             )}
             <button className="linkbtn linkbtn--center" onClick={() => setView("choose")}>
               {t("pairing.back")}
@@ -534,10 +602,11 @@ export default function PairingPanel(props: {
             ) : null}
 
             {snap.phase !== "idle" && snap.phase !== "ready" ? (
-              <div className="phase-banner">
-                <span className="spinner spinner--sm" />
-                {t(`pairing.phase.${snap.phase}` as const)}
-              </div>
+              <StartupProgress
+                compact
+                label={t(`pairing.phase.${snap.phase}` as const)}
+                detail={snap.peers.length > 1 ? t("startup.clusterDetail") : t("startup.localDetail")}
+              />
             ) : null}
 
             <div className="setting-group__label" style={{ marginTop: 4 }}>
@@ -566,15 +635,26 @@ export default function PairingPanel(props: {
               <div className="cluster-start-actions cluster-start-actions--modal">
                 <button
                   className="btn-primary btn-block cluster-start"
-                  onClick={() => void guard(
-                    getPairingProvider().start(
-                      false,
-                      props.self.modelPath,
-                      overflowTuning(loadSettings()),
-                    )
-                  )}
+                  disabled={startRequested}
+                  onClick={() => {
+                    setStartRequested(true);
+                    autoClose.current = "started";
+                    void guard(
+                      getPairingProvider().start(
+                        false,
+                        props.self.modelPath,
+                        overflowTuning(loadSettings()),
+                      ),
+                      () => {
+                        autoClose.current = null;
+                        setStartRequested(false);
+                      },
+                    );
+                  }}
                 >
-                  {t("pairing.startCluster", { n: snap.peers.length })} →
+                  {startRequested
+                    ? t("pairing.phase.starting")
+                    : `${t("pairing.startCluster", { n: snap.peers.length })} →`}
                 </button>
               </div>
             ) : null}

@@ -1,0 +1,264 @@
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index cd63317..99d17cd 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -19,6 +19,7 @@
+ #include <algorithm>
+ #include <chrono>
+ #include <fcntl.h>
++#include <sstream>
+ 
+ #ifdef _WIN32
+ #include <io.h>
+@@ -1571,6 +1572,235 @@ static bool read_cached_file(const fs::path & cache_file, std::vector<uint8_t> &
+     return true;
+ }
+ 
++struct rpc_local_tensor_source {
++    fs::path path;
++    uint64_t offset;
++    uint64_t size;
++};
++
++struct rpc_local_model_index {
++    bool configured = false;
++    bool valid = false;
++    std::unordered_map<std::string, rpc_local_tensor_source> tensors;
++};
++
++static fs::path rpc_u8path(const char * value) {
++#if defined(_WIN32) && defined(__cpp_char8_t)
++    return fs::u8path(reinterpret_cast<const char8_t *>(value));
++#else
++    return fs::u8path(value);
++#endif
++}
++
++static rpc_local_model_index load_rpc_local_model_index() {
++    rpc_local_model_index result;
++    const char * model_raw = std::getenv("GGML_RPC_LOCAL_MODEL");
++    const char * index_raw = std::getenv("GGML_RPC_LOCAL_MODEL_INDEX");
++    const char * layers_raw = std::getenv("GGML_RPC_LOCAL_MODEL_LAYERS");
++    if (model_raw == nullptr || model_raw[0] == '\0' ||
++        index_raw == nullptr || index_raw[0] == '\0' ||
++        layers_raw == nullptr || layers_raw[0] == '\0') {
++        return result;
++    }
++    result.configured = true;
++
++    unsigned layer_lo = 0, layer_hi = 0;
++    char tail = '\0';
++    if (sscanf(layers_raw, "%u:%u%c", &layer_lo, &layer_hi, &tail) != 2 ||
++        layer_hi < layer_lo) {
++        GGML_LOG_ERROR("[rpc] invalid GGML_RPC_LOCAL_MODEL_LAYERS='%s'\n",
++                       layers_raw);
++        return result;
++    }
++
++    const fs::path primary = rpc_u8path(model_raw);
++    const fs::path index_path = rpc_u8path(index_raw);
++    std::ifstream input(index_path);
++    if (!input) {
++        GGML_LOG_ERROR("[rpc] cannot open local model index '%s'\n", index_raw);
++        return result;
++    }
++
++    std::string line;
++    if (!std::getline(input, line)) {
++        GGML_LOG_ERROR("[rpc] local model index '%s' is empty\n", index_raw);
++        return result;
++    }
++    uint64_t total_size = 0, tensor_data_pos = 0, n_tensors = 0;
++    unsigned version = 0, n_parts = 0;
++    {
++        std::istringstream header(line);
++        if (!(header >> total_size >> tensor_data_pos >> n_tensors >> version) ||
++            (version != 2 && version != 3) || n_tensors == 0 ||
++            n_tensors > 10000000) {
++            GGML_LOG_ERROR("[rpc] malformed local model index header in '%s'\n",
++                           index_raw);
++            return result;
++        }
++        if (version == 3 && (!(header >> n_parts) || n_parts == 0 || n_parts > 999)) {
++            GGML_LOG_ERROR("[rpc] malformed split-part count in '%s'\n", index_raw);
++            return result;
++        }
++        if (version == 2) {
++            n_parts = 1;
++        }
++    }
++
++    struct local_part {
++        fs::path path;
++        uint64_t size = 0;
++    };
++    std::vector<local_part> parts(n_parts);
++    if (version == 2) {
++        parts[0].path = primary;
++        parts[0].size = total_size;
++    } else {
++        for (unsigned i = 0; i < n_parts; ++i) {
++            if (!std::getline(input, line)) {
++                GGML_LOG_ERROR("[rpc] missing split part %u in '%s'\n",
++                               i + 1, index_raw);
++                return result;
++            }
++            unsigned part = 0;
++            uint64_t part_size = 0, part_data_pos = 0;
++            std::string tag, name, extra;
++            std::istringstream row(line);
++            if (!(row >> tag >> part >> part_size >> part_data_pos >> name) ||
++                tag != "P" || part != i + 1 || part_data_pos == 0 ||
++                part_data_pos > part_size || (row >> extra) ||
++                name.find("..") != std::string::npos ||
++                name.find('/') != std::string::npos ||
++                name.find('\\') != std::string::npos) {
++                GGML_LOG_ERROR("[rpc] malformed split part %u in '%s'\n",
++                               i + 1, index_raw);
++                return result;
++            }
++            parts[i].path = primary.parent_path() / rpc_u8path(name.c_str());
++            parts[i].size = part_size;
++        }
++    }
++
++    for (unsigned i = 0; i < n_parts; ++i) {
++        std::error_code ec;
++        const uintmax_t actual = fs::file_size(parts[i].path, ec);
++        if (ec || actual != parts[i].size) {
++            GGML_LOG_ERROR("[rpc] local GGUF part %u has size %" PRIuMAX
++                           ", expected %" PRIu64 "\n",
++                           i + 1, ec ? UINTMAX_MAX : actual, parts[i].size);
++            return result;
++        }
++    }
++
++    for (uint64_t i = 0; i < n_tensors; ++i) {
++        if (!std::getline(input, line)) {
++            GGML_LOG_ERROR("[rpc] local model index ended at tensor %" PRIu64
++                           " of %" PRIu64 "\n", i, n_tensors);
++            return result;
++        }
++        unsigned part = 1;
++        int64_t layer = 0;
++        uint64_t offset = 0, size = 0;
++        std::string tag, name, extra;
++        std::istringstream row(line);
++        const bool parsed = version == 2
++            ? static_cast<bool>(row >> layer >> offset >> size >> name)
++            : static_cast<bool>(row >> tag >> part >> layer >> offset >> size >> name);
++        if (!parsed || (version == 3 && tag != "T") || part == 0 ||
++            part > n_parts || layer < -1 || size == 0 ||
++            offset > parts[part - 1].size ||
++            size > parts[part - 1].size - offset || (row >> extra)) {
++            GGML_LOG_ERROR("[rpc] malformed tensor row %" PRIu64 " in '%s'\n",
++                           i + 1, index_raw);
++            return result;
++        }
++        if (layer < 0 ||
++            (static_cast<uint64_t>(layer) >= layer_lo &&
++             static_cast<uint64_t>(layer) < layer_hi)) {
++            const auto inserted = result.tensors.emplace(
++                name, rpc_local_tensor_source { parts[part - 1].path, offset, size });
++            if (!inserted.second) {
++                GGML_LOG_ERROR("[rpc] duplicate tensor '%s' in local model index\n",
++                               name.c_str());
++                return result;
++            }
++        }
++    }
++    result.valid = !result.tensors.empty();
++    if (!result.valid) {
++        GGML_LOG_ERROR("[rpc] local model index selected no tensors for layers [%u,%u)\n",
++                       layer_lo, layer_hi);
++        return result;
++    }
++    GGML_LOG_INFO("[rpc] direct local GGUF index ready: %zu tensors for layers "
++                  "[%u,%u); no tensor cache\n",
++                  result.tensors.size(), layer_lo, layer_hi);
++    return result;
++}
++
++static const rpc_local_model_index & rpc_get_local_model_index() {
++    static const rpc_local_model_index index = load_rpc_local_model_index();
++    return index;
++}
++
++static bool read_rpc_local_tensor(const std::string & name,
++                                  std::vector<uint8_t> & data) {
++    const rpc_local_model_index & index = rpc_get_local_model_index();
++    if (!index.configured || !index.valid) {
++        return false;
++    }
++    const auto found = index.tensors.find(name);
++    if (found == index.tensors.end() || found->second.size > SIZE_MAX) {
++        return false;
++    }
++    const rpc_local_tensor_source & source = found->second;
++    data.resize(static_cast<size_t>(source.size));
++#ifdef _WIN32
++    const int fd = _wopen(source.path.c_str(), _O_RDONLY | _O_BINARY | _O_SEQUENTIAL);
++    const bool seek_ok = fd >= 0 && source.offset <= INT64_MAX &&
++                         _lseeki64(fd, static_cast<int64_t>(source.offset), SEEK_SET) >= 0;
++#else
++    const int fd = open(source.path.c_str(), O_RDONLY);
++    const bool seek_ok = fd >= 0 && source.offset <= INT64_MAX &&
++                         lseek(fd, static_cast<off_t>(source.offset), SEEK_SET) >= 0;
++#endif
++    if (!seek_ok) {
++        if (fd >= 0) {
++#ifdef _WIN32
++            _close(fd);
++#else
++            close(fd);
++#endif
++        }
++        data.clear();
++        return false;
++    }
++    size_t done = 0;
++    while (done < data.size()) {
++        const unsigned chunk = static_cast<unsigned>(
++            std::min<size_t>(data.size() - done, 8U << 20));
++#ifdef _WIN32
++        const int n = _read(fd, data.data() + done, chunk);
++#else
++        const ssize_t n = read(fd, data.data() + done, chunk);
++#endif
++        if (n <= 0) {
++            break;
++        }
++        done += static_cast<size_t>(n);
++    }
++#ifdef _WIN32
++    _close(fd);
++#else
++    close(fd);
++#endif
++    if (done != data.size()) {
++        GGML_LOG_ERROR("[rpc] short read for local GGUF tensor '%s'\n", name.c_str());
++        data.clear();
++        return false;
++    }
++    return true;
++}
++
+ bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
+     if (!cache_dir) {
+         return false;
+@@ -1581,7 +1811,14 @@ bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
+ }
+ 
+ bool rpc_server::get_cached_tensor_name(const rpc_tensor & tensor, std::vector<uint8_t> & data) {
+-    if (!cache_dir || tensor.name[0] == '\0') {
++    if (tensor.name[0] == '\0') {
++        return false;
++    }
++    const rpc_local_model_index & local = rpc_get_local_model_index();
++    if (local.configured) {
++        return read_rpc_local_tensor(tensor.name, data);
++    }
++    if (!cache_dir) {
+         return false;
+     }
+     size_t name_len = 0;

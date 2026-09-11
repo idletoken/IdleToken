@@ -3,7 +3,6 @@ import { useI18n, type Lang } from "./i18n";
 import { EndpointsPanel } from "./EndpointsPanel";
 import { defaultModelDir } from "./weights";
 import { inTauri } from "./platform";
-import Capability from "./Capability";
 import {
   APP_VERSION,
   DEFAULT_SETTINGS,
@@ -110,7 +109,7 @@ function CapSlider(props: { label: string; noCap: string; totalBytes: number; va
 // Reorganized 2026-08-15 along scenario lines (the same split as the pages:
 // Settings downloads, Cluster runs, Chat talks):
 //   Models        everything about model files on THIS machine — the download
-//                 manager, precision, the capability table, the folder.
+//                 manager, precision, and the folder.
 //   Cluster & API pairing, the API service, inference/cache knobs, and how to
 //                 connect a client.
 // "Advanced (coming soon)" is GONE, not moved: it did nothing a user could
@@ -118,8 +117,8 @@ function CapSlider(props: { label: string; noCap: string; totalBytes: number; va
 // (principle 15).
 //
 const CATEGORIES: Category[] = [
-  // The model page: download manager, capability table, storage, plus the
-  // model-adjacent runtime knobs (context tier, resource caps). Language and
+  // The model page: download manager, storage, plus the model-adjacent runtime
+  // knobs (context tier, resource caps). Language and
   // theme moved to Appearance (2026-08-15) — they were the one group here
   // that had nothing to do with models.
   { id: "quick", label: { en: "Models", zh: "模型" }, bespoke: "quick" },
@@ -344,11 +343,6 @@ export default function SettingsPanel(props: {
   // Sidebar IA: settings is a PLACE now, rendered inline in the content area.
   // (The modal wrapper remains only for potential embedded reuse.)
   asPage?: boolean;
-  // The diagnostics bundle asks for the current cluster state. When an address is
-  // given, use the one the cluster actually advertises; when it is not (this
-  // machine is not the coordinator, or no cluster is running) fall back to the
-  // local API port -- in that case "cannot connect" is itself a useful fact.
-  apiBaseUrl?: string | null;
 }) {
   const { t, lang } = useI18n();
   // Recomputed per render: the platform category appears the moment a
@@ -363,7 +357,6 @@ export default function SettingsPanel(props: {
   const fileRef = useRef<HTMLInputElement>(null);
   const s = props.settings;
   const set = <K extends keyof AppSettings>(k: K, v: AppSettings[K]) => props.onChange({ ...s, [k]: v });
-  const setCap = (v: number) => props.onChange({ ...s, maxVramMb: v, maxRamMb: 0, resourcePreset: "custom" });
 
   // Model-folder editing. The draft is committed on blur/Enter rather than per
   // keystroke — see the field for why. It re-syncs when the stored value
@@ -400,6 +393,17 @@ export default function SettingsPanel(props: {
   // given. Under a preset these are a fraction of this machine's totals; under
   // "custom" they are the slider values verbatim.
   const liveCaps = effectiveCaps(s, { vram_total: props.snap.vram_total, ram_total: props.snap.ram_total });
+  // Moving one slider switches to Custom without silently changing the other
+  // resource. Under a preset, copy both currently effective values first;
+  // otherwise a VRAM adjustment would unexpectedly make RAM uncapped (or vice
+  // versa) in the same click.
+  const setCap = (key: "maxVramMb" | "maxRamMb", value: number) => props.onChange({
+    ...s,
+    maxVramMb: liveCaps.maxVramMb,
+    maxRamMb: liveCaps.maxRamMb,
+    [key]: value,
+    resourcePreset: "custom",
+  });
 
   const runAction = (a: Field["action"]) => {
     if (a === "export") {
@@ -524,10 +528,6 @@ export default function SettingsPanel(props: {
           model picker offers "Download weights" in place when the selected
           model+precision is not in the model folder yet. Settings keeps the
           storage half (the folder, what it holds, deleting). */}
-      {/* Page order (2026-08-15, user-specified): models → context/performance
-          → storage → inference & cache → the capability table LAST. The table
-          is a summary verdict over everything set above it — context tier
-          changes its "max context" column — so it reads best at the bottom. */}
       {/* Context is selected on the cluster page beside the model: exact 256K
           by default, or explicit 1M. It is a service identity decision rather
           than an advanced tuning knob. */}
@@ -588,11 +588,6 @@ export default function SettingsPanel(props: {
             setting. The cluster page reads back what actually runs
             (/idletoken/v1/stats kv_cache_k/_v). */}
       </div>
-      {/* "What can I run?" — the summary verdict, last on purpose (see the
-          order note above). Moved out of the model group 2026-08-15. */}
-      <div className="setting-group">
-        <Capability apiBaseUrl={props.apiBaseUrl ?? null} />
-      </div>
     </>
   );
 
@@ -624,7 +619,8 @@ export default function SettingsPanel(props: {
           here meant the default install said "Balanced" and "No limit" in the
           same box, one line apart, while 75% was what the engine got.
           Dragging either one takes over as a custom limit (setCap). */}
-      <CapSlider label={t("settings.maxVram")} noCap={t("settings.noCap")} totalBytes={props.snap.vram_total} valueMb={liveCaps.maxVramMb} onChange={setCap} />
+      <CapSlider label={t("settings.maxVram")} noCap={t("settings.noCap")} totalBytes={props.snap.vram_total} valueMb={liveCaps.maxVramMb} onChange={(mb) => setCap("maxVramMb", mb)} />
+      <CapSlider label={t("settings.maxRam")} noCap={t("settings.noCap")} totalBytes={props.snap.ram_total} valueMb={liveCaps.maxRamMb} onChange={(mb) => setCap("maxRamMb", mb)} />
     </div>
   );
 

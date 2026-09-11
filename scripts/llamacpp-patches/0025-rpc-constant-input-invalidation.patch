@@ -1,0 +1,175 @@
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -3,6 +3,7 @@
+ #include "ggml-backend-impl.h"
+ #include "ggml-cpp.h"
+ #include "transport.h"
++#include "rpc-input-cache.h"
+ 
+ #include <array>
+ #include <cinttypes>
+@@ -282,10 +283,9 @@
+     std::shared_ptr<socket_t> sock;
+     void * base_ptr;
+     uint64_t remote_ptr;
+-    // Constant graph inputs are read-only after the scheduler uploads them.
+-    // Keyed by the exact remote tensor address; this state dies with the
+-    // containing remote buffer, so address reuse after buffer free is safe.
+-    std::unordered_map<uint64_t, std::pair<size_t, size_t>> constant_inputs;
++    // Invalidate on writes and allocator reset as well as buffer destruction.
++    // Compare bytes too: an input name alone must not suppress a changed value.
++    rpc_input_cache constant_inputs;
+     std::mutex constant_inputs_mutex;
+ };
+ 
+@@ -520,6 +520,8 @@
+     // Due to bandwidth constraints, we only call the server init tensor functions if necessary.
+     // In particular, only quantized tensors need padding
+     if (ggml_is_quantized(tensor->type) && (tensor->ne[0] % 512 != 0) && (tensor->view_src == nullptr)) {
++        std::lock_guard<std::mutex> lock(ctx->constant_inputs_mutex);
++        ctx->constant_inputs.clear(); // backend initialization can write padding
+         rpc_msg_init_tensor_req request;
+ 
+         request.tensor = serialize_tensor(tensor);
+@@ -539,6 +541,8 @@
+         /* .size   = */ size,
+         /* .value  = */ value,
+     };
++    std::lock_guard<std::mutex> lock(ctx->constant_inputs_mutex);
++    ctx->constant_inputs.invalidate(request.tensor.data + offset, size);
+     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_MEMSET_TENSOR, &request, sizeof(request), nullptr, 0);
+     RPC_STATUS_ASSERT(status);
+ }
+@@ -581,6 +585,8 @@
+     }
+     ggml_backend_rpc_buffer_context * ctx =
+         (ggml_backend_rpc_buffer_context *) buffer->context;
++    std::lock_guard<std::mutex> lock(ctx->constant_inputs_mutex);
++    ctx->constant_inputs.invalidate((uint64_t) (uintptr_t) tensor->data + offset, size);
+     rpc_msg_set_tensor_hash_req request;
+     request.tensor = serialize_tensor(tensor);
+     request.offset = offset;
+@@ -614,13 +620,15 @@
+ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+     rpc_tensor rpc_tensor = serialize_tensor(tensor);
++    if (ggml_backend_rpc_buffer_set_tensor_from_source(buffer, tensor, offset, size)) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(ctx->constant_inputs_mutex);
+     const bool constant_input = rpc_constant_input_cache_enabled() &&
+-                                rpc_is_constant_graph_input(rpc_tensor.name);
++                                rpc_is_constant_graph_input(rpc_tensor.name) &&
++                                offset == 0 && size == ggml_nbytes(tensor) && ggml_is_contiguous(tensor);
+     if (constant_input) {
+-        std::lock_guard<std::mutex> lock(ctx->constant_inputs_mutex);
+-        const auto found = ctx->constant_inputs.find(rpc_tensor.data);
+-        if (found != ctx->constant_inputs.end() &&
+-            found->second.first == offset && found->second.second == size) {
++        if (ctx->constant_inputs.matches(rpc_tensor.data, data, size)) {
+             if (RPC_WIRE_TRACE) {
+                 fprintf(stderr, "[rpc-wire] skip-constant tensor='%s' data=%zu\n",
+                         rpc_tensor.name, size);
+@@ -628,9 +636,7 @@
+             return;
+         }
+     }
+-    if (ggml_backend_rpc_buffer_set_tensor_from_source(buffer, tensor, offset, size)) {
+-        return;
+-    }
++    ctx->constant_inputs.invalidate(rpc_tensor.data + offset, size);
+     if (size > HASH_THRESHOLD || rpc_is_model_tensor_name(rpc_tensor.name)) {
+         rpc_msg_set_tensor_hash_req request;
+         request.tensor = rpc_tensor;
+@@ -641,6 +647,7 @@
+         RPC_STATUS_ASSERT(status);
+         if (response.result) {
+             // the server has the same data, no need to send it
++            if (constant_input) ctx->constant_inputs.remember(rpc_tensor.data, data, size);
+             return;
+         }
+     }
+@@ -653,8 +660,7 @@
+     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
+     RPC_STATUS_ASSERT(status);
+     if (constant_input) {
+-        std::lock_guard<std::mutex> lock(ctx->constant_inputs_mutex);
+-        ctx->constant_inputs[rpc_tensor.data] = {offset, size};
++        ctx->constant_inputs.remember(rpc_tensor.data, data, size);
+     }
+     if (RPC_WIRE_TRACE) {
+         fprintf(stderr, "[rpc-wire] set tensor='%s' data=%zu request=%zu\n",
+@@ -690,6 +696,8 @@
+         rpc_msg_copy_tensor_req request;
+         request.src = serialize_tensor(src);
+         request.dst = serialize_tensor(dst);
++        std::lock_guard<std::mutex> lock(dst_ctx->constant_inputs_mutex);
++        dst_ctx->constant_inputs.invalidate(request.dst.data, ggml_nbytes(dst));
+         rpc_msg_copy_tensor_rsp response;
+         bool status = send_rpc_cmd(ctx->sock, RPC_CMD_COPY_TENSOR, &request, sizeof(request), &response, sizeof(response));
+         RPC_STATUS_ASSERT(status);
+@@ -700,9 +708,17 @@
+ 
+ static void ggml_backend_rpc_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
++    std::lock_guard<std::mutex> lock(ctx->constant_inputs_mutex);
++    ctx->constant_inputs.clear();
+     rpc_msg_buffer_clear_req request = {ctx->remote_ptr, value};
+     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_CLEAR, &request, sizeof(request), nullptr, 0);
+     RPC_STATUS_ASSERT(status);
++}
++
++static void ggml_backend_rpc_buffer_reset(ggml_backend_buffer_t buffer) {
++    auto * ctx = (ggml_backend_rpc_buffer_context *) buffer->context;
++    std::lock_guard<std::mutex> lock(ctx->constant_inputs_mutex);
++    ctx->constant_inputs.clear();
+ }
+ 
+ static ggml_backend_buffer_i ggml_backend_rpc_buffer_interface = {
+@@ -716,7 +732,7 @@
+     /* .get_tensor_2d   = */ NULL,
+     /* .cpy_tensor      = */ ggml_backend_rpc_buffer_cpy_tensor,
+     /* .clear           = */ ggml_backend_rpc_buffer_clear,
+-    /* .reset           = */ NULL,
++    /* .reset           = */ ggml_backend_rpc_buffer_reset,
+     /* .set_tensor_from_source = */ ggml_backend_rpc_buffer_set_tensor_from_source,
+     /* .get_tensor_source_id   = */ ggml_backend_rpc_buffer_get_tensor_source_id,
+ };
+--- /dev/null
++++ b/ggml/src/ggml-rpc/rpc-input-cache.h
+@@ -0,0 +1,35 @@
++#pragma once
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <unordered_map>
++#include <vector>
++
++// Buffer-local upload knowledge, not a promise inferred solely from a name.
++// The caller serializes mutations with the owning buffer's mutex.
++class rpc_input_cache {
++    std::unordered_map<uint64_t, std::vector<uint8_t>> entries;
++public:
++    bool matches(uint64_t address, const void * data, size_t size) const {
++        const auto found = entries.find(address);
++        return size != 0 && found != entries.end() && found->second.size() == size &&
++            std::memcmp(found->second.data(), data, size) == 0;
++    }
++    void invalidate(uint64_t address, size_t size) {
++        if (size == 0) return;
++        for (auto it = entries.begin(); it != entries.end();) {
++            // Difference comparisons do not wrap at the end of the address space.
++            const bool overlap = address <= it->first ? it->first - address < size
++                : address - it->first < it->second.size();
++            if (overlap) it = entries.erase(it); else ++it;
++        }
++    }
++    void remember(uint64_t address, const void * data, size_t size) {
++        invalidate(address, size);
++        if (size != 0) {
++            const auto * bytes = static_cast<const uint8_t *>(data);
++            entries[address] = std::vector<uint8_t>(bytes, bytes + size);
++        }
++    }
++    void clear() { entries.clear(); }
++};

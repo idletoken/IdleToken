@@ -1,0 +1,68 @@
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -359,6 +359,11 @@ extern "C" {
+     // list, such as the ones the RPC server deserializes. Call after reset and before alloc_graph.
+     GGML_API void                 ggml_backend_sched_assign_leaves(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+ 
++    // Undo expert-pool source redirections after a synchronous compute. Cached RPC graphs must be
++    // stored in this canonical form: the pool's current weight/ids pointers belong only to the graph
++    // most recently split by the scheduler and cannot safely be carried into another cached graph.
++    GGML_API void                 ggml_backend_sched_restore_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
++
+     // Split graph without allocating it
+     GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+ 
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2033,6 +2033,6 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, str
+ // device, so the weight would no longer be a split input and the node would
+ // run on the previous token's slot ids. Put the original sources back first.
+-static void sched_moe_restore_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
++void ggml_backend_sched_restore_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+     if (sched->moe == nullptr || sched->moe->pools.empty()) {
+         return;
+     }
+@@ -2057,7 +2057,7 @@ void ggml_backend_sched_assign_leaves(ggml_backend_sched_t sched, struct ggml_c
+ void ggml_backend_sched_assign_leaves(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+     // restore first: on a re-submitted graph the pool tensor sits where the
+     // weight was, and the weight is unreachable until it is put back
+-    sched_moe_restore_graph(sched, graph);
++    ggml_backend_sched_restore_graph(sched, graph);
+     // "leaf" here means anything this graph does not compute: weights, inputs,
+     // and tensors an earlier graph produced (the rpc-server sees a client
+     // split whose sources include the previous split's outputs, op and all).
+@@ -2125,6 +2125,6 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgr
+ 
+     graph->uid = ggml_graph_next_uid();
+ 
+-    sched_moe_restore_graph(sched, graph);
++    ggml_backend_sched_restore_graph(sched, graph);
+ 
+     // pass 1: assign backends to ops with pre-allocated inputs
+     for (int i = 0; i < graph->n_leafs; i++) {
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -1410,10 +1410,20 @@ ggml_status rpc_server::compute(uint32_t device, ggml_cgraph * graph) {
+         if (prof) {
+             profile_discard_pending();
+         }
++        // alloc_graph may already have redirected MUL_MAT_ID sources into the
++        // expert pool. Do not leave that scheduler-local state in a graph the
++        // RPC cache can later submit after a different graph.
++        ggml_backend_sched_restore_graph(sched, graph);
+         return GGML_STATUS_ALLOC_FAILED;
+     }
+     const clk::time_point t3 = prof ? clk::now() : clk::time_point();
+     const ggml_status status = ggml_backend_sched_graph_compute(sched, graph);
++    // GRAPH_RECOMPUTE keeps several deserialized graphs alive at once. The
++    // expert pools are scheduler-global, so their current weight/ids pointers
++    // describe only the graph just split. Persist each cached graph with its
++    // original sources, before another graph is allowed to replace those
++    // pointers.
++    ggml_backend_sched_restore_graph(sched, graph);
+     if (prof) {
+         if (status == GGML_STATUS_SUCCESS) {
+             profile_close(graph->n_nodes, ms_between(t0, t1), ms_between(t1, t2), ms_between(t2, t3), ms_between(t3, clk::now()));

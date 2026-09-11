@@ -27,7 +27,7 @@ diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
  };
  
  #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
-@@ -878,6 +881,565 @@
+@@ -878,6 +881,720 @@
  #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
  #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
  
@@ -48,6 +48,7 @@ diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
 +#include <memory>
 +#include <string>
 +#include <unordered_map>
++#include <unordered_set>
 +
 +struct sched_moe_pool {
 +    const struct ggml_tensor * weight = nullptr; // the host-resident expert tensor [ne0, ne1, n_expert]
@@ -71,6 +72,7 @@ diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
 +    int backend_id = -1;
 +    ggml_backend_event_t ev = nullptr;           // prefetch completion, recorded on the prefetch backend
 +    bool ev_pending = false;
++    uint64_t served_seq = 0;                     // sched_moe_state::graph_seq of the graph that last served this pool
 +};
 +
 +struct sched_moe_state {
@@ -95,6 +97,17 @@ diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
 +    std::vector<int32_t> pred;
 +    std::vector<float> scores;
 +    int pregate_extra = 0;   // GGML_MOE_PREGATE_EXTRA: experts to prefetch beyond the top-k
++    // GGML_MOE_LAYER_ISSUE=1: when a layer's router ids are read back at its
++    // first expert tensor (gate), issue the misses of its OTHER expert tensors
++    // (up, down) right away on the prefetch stream, so those copies overlap
++    // the gate compute instead of running on the compute stream just before
++    // their own kernels. Exact ids, no prediction.
++    bool layer_issue = false;
++    // one per graph (bumped when a new graph is scanned): a pool whose
++    // served_seq equals it has already been served in this graph, and its
++    // MUL_MAT_ID may still be running — its slots are off limits until the
++    // next graph.
++    uint64_t graph_seq = 0;
 +};
 +
 +// "blk.12.ffn_up_exps.weight" -> 12, else -1
@@ -135,6 +148,10 @@ diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
 +    st->debug = getenv("GGML_MOE_POOL_DEBUG") != nullptr;
 +    const char * extra = getenv("GGML_MOE_PREGATE_EXTRA");
 +    st->pregate_extra = extra ? std::max(0, atoi(extra)) : 0;
++    // on by default since 2026-09-07 (+6–7 % decode on paired Windows test nodes, +13 % on
++    // DGX, byte-identical); GGML_MOE_LAYER_ISSUE=0 switches it off
++    const char * li = getenv("GGML_MOE_LAYER_ISSUE");
++    st->layer_issue = li ? atoi(li) > 0 : true;
 +    return st;
 +}
 +
@@ -224,9 +241,33 @@ diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
 +        const size_t n_w = std::max<size_t>(1, sched->moe->weights.size());
 +        cap = (int) (sched->moe->pool_bytes / n_w / expert_size);
 +    }
-+    // never below what one decode batch needs: n_expert_used experts (the ids
-+    // tensor's rows); a pool that cannot hold a batch would bypass every time
-+    p->cap = (int) std::min<int64_t>(std::max<int>(cap, 8), n_expert);
++    // Honor the caller's byte-exact capacity. The model-specific one-token
++    // floor is n_expert_used (the ids tensor's rows), not a universal number;
++    // an undersized diagnostic pool simply takes the existing staging path.
++    // Never silently allocate more device memory than the caller budgeted.
++    p->cap = (int) std::min<int64_t>(std::max<int>(cap, 1), n_expert);
++    // The shared staging tensor (one full expert tensor, for batches that do
++    // not fit a pool) is taken BEFORE the first pool: pools fill the card, and a
++    // staging allocation that fails later has no way back (the split's copy is
++    // a one-expert placeholder by then). Failing here names the cause.
++    if (sched->moe->staging_buf == nullptr && sched->moe->max_weight_bytes > 0) {
++        const size_t sbytes = sched->moe->max_weight_bytes + 512;
++        sched->moe->staging_buf = ggml_backend_buft_alloc_buffer(buft, sbytes);
++        if (sched->moe->staging_buf == nullptr) {
++            GGML_LOG_WARN("moe-pool: cannot allocate the %zu-byte staging tensor on %s before the first pool; no pools\n",
++                          sbytes, ggml_backend_buft_name(buft));
++            pools[weight->name] = nullptr;
++            return nullptr;
++        }
++        ggml_backend_buffer_clear(sched->moe->staging_buf, 0);
++        sched->moe->staging_backend_id = -1;
++        for (int b = 0; b < sched->n_backends; b++) {
++            if (sched->bufts[b] == buft) {
++                sched->moe->staging_backend_id = b;
++                break;
++            }
++        }
++    }
 +    // 512 B tail: MMQ reads a little past the last expert (see the staging copy)
 +    const size_t bytes = (size_t) p->cap * expert_size + 512;
 +    p->buf = ggml_backend_buft_alloc_buffer(buft, bytes);
@@ -309,6 +350,7 @@ diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
 +
 +// Refresh the map of pre-gate nodes for the graph about to be computed.
 +static void sched_moe_scan_pregate(ggml_backend_sched_t sched) {
++    sched->moe->graph_seq++;   // a new graph: every pool's served_seq is now stale
 +    sched->moe->pregate.clear();
 +    for (int i = 0; i < sched->graph.n_nodes; i++) {
 +        const struct ggml_tensor * t = sched->graph.nodes[i];
@@ -340,6 +382,13 @@ diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
 +static void sched_moe_prefetch_next(ggml_backend_sched_t sched, int layer, ggml_backend_t split_backend, int k) {
 +    auto & st = *sched->moe;
 +    if (layer < 0 || st.pregate.empty()) {
++        return;
++    }
++    // diagnostic: GGML_MOE_PREGATE_NOPREFETCH=1 keeps the graph's pre-gate
++    // nodes but never acts on them, to tell a wrong prediction path from a
++    // graph that computes something different
++    static const bool noprefetch = [] { const char * e = getenv("GGML_MOE_PREGATE_NOPREFETCH"); return e && atoi(e) > 0; }();
++    if (noprefetch) {
 +        return;
 +    }
 +    auto pg_it = st.pregate.find(layer);
@@ -428,6 +477,101 @@ diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
 +    }
 +}
 +
++// Layer-level early issue (GGML_MOE_LAYER_ISSUE=1). The three expert tensors
++// of a layer (gate, up, down) are three splits with one shared ids readback;
++// upstream copies each tensor's missing experts on the compute stream right
++// before that tensor's own MUL_MAT_ID, so nothing overlaps. Here, as soon as
++// the layer's ids are known (its first serve), the misses of the layer's OTHER
++// pools are issued on the prefetch stream and pinned for their coming serve,
++// which then finds them resident and only waits on the event. Decode only
++// (one token), and only for pools that can hold the batch's experts.
++static void sched_moe_issue_layer_siblings(ggml_backend_sched_t sched, const struct ggml_tensor * input,
++                                           const std::vector<ggml_bitset_t> & used_ids, int64_t n_expert_total) {
++    auto & st = *sched->moe;
++    if (!st.layer_issue) {
++        return;
++    }
++    const int layer = sched_moe_layer_of(input->name);
++    if (layer < 0) {
++        return;
++    }
++    int n_used = 0;
++    for (int64_t e = 0; e < n_expert_total; e++) {
++        if (ggml_bitset_get(used_ids.data(), e)) {
++            n_used++;
++        }
++    }
++    for (auto & kv : st.pools) {
++        sched_moe_pool * q = kv.second.get();
++        if (q == nullptr || q->layer != layer || q->weight == nullptr || q->weight == input ||
++            q->backend_id < 0 || q->cap < n_used || q->weight->ne[2] != n_expert_total) {
++            continue;
++        }
++        // Only pools this graph has NOT served yet. A pool served earlier in
++        // this graph (this hook runs at every expert split of the layer, and
++        // gate/up/down order varies by architecture) has its slots pinned for
++        // a MUL_MAT_ID that may still be running on the compute stream —
++        // re-filling them here raced that kernel (DGX Qwen identity broke and
++        // the next token hit "no evictable slot", 2026-09-07).
++        if (q->served_seq == st.graph_seq) {
++            continue;
++        }
++        ggml_backend_t pf = st.prefetch_backend[q->backend_id];
++        if (pf == nullptr) {
++            pf = ggml_backend_dev_init(ggml_backend_get_device(sched->backends[q->backend_id]), nullptr);
++            if (pf == nullptr) {
++                return;
++            }
++            st.prefetch_backend[q->backend_id] = pf;
++        }
++        if (q->ev == nullptr) {
++            q->ev = ggml_backend_event_new(ggml_backend_get_device(pf));
++        }
++        // the coming serve of this pool will be tick+1: mark the slots as used
++        // AND pinned for it, so it treats them as hits and never evicts them
++        const uint64_t next_tick = q->tick + 1;
++        int issued = 0;
++        for (int64_t e = 0; e < n_expert_total; e++) {
++            if (!ggml_bitset_get(used_ids.data(), e)) {
++                continue;
++            }
++            auto w = q->where.find((int32_t) e);
++            if (w != q->where.end()) {
++                q->slot_last[w->second] = next_tick;
++                q->slot_pin[w->second] = next_tick;
++                continue;
++            }
++            int slot = -1;
++            uint64_t oldest = UINT64_MAX;
++            for (int s = 0; s < q->cap; s++) {
++                if (q->slot_pin[s] != next_tick && q->slot_last[s] < oldest) {
++                    oldest = q->slot_last[s];
++                    slot = s;
++                }
++            }
++            if (slot < 0) {
++                break;
++            }
++            if (q->slot_expert[slot] >= 0) {
++                q->where.erase(q->slot_expert[slot]);
++            }
++            q->slot_expert[slot] = (int32_t) e;
++            q->slot_last[slot] = next_tick;
++            q->slot_pin[slot] = next_tick;
++            q->where[(int32_t) e] = slot;
++            ggml_backend_tensor_set_async(pf, &q->pool,
++                (const uint8_t *) q->weight->data + (size_t) e * q->expert_size,
++                (size_t) slot * q->expert_size, q->expert_size);
++            issued++;
++        }
++        if (issued > 0 && q->ev) {
++            ggml_backend_event_record(q->ev, pf);
++            q->ev_pending = true;
++            q->prefetched += issued;
++        }
++    }
++}
++
 +// Serve one MoE weight input of a split from its pool. Returns true when the
 +// split's MUL_MAT_ID now reads the pool and every expert it needs is resident
 +// or in flight; false when the batch needs more experts than the pool holds,
@@ -446,6 +590,7 @@ diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
 +                   "lower GGML_MOE_POOL_BYTES / GGML_MOE_POOL_EXPERTS or free device memory",
 +                   input->name, expert_size);
 +    }
++    p->served_seq = sched->moe->graph_seq;
 +    int n_used = 0;
 +    for (int64_t e = 0; e < n_expert; e++) {
 +        if (ggml_bitset_get(used_ids.data(), e)) {
@@ -459,7 +604,11 @@ diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
 +        // staging view (the per-split copy is only a one-expert placeholder now)
 +        stg = sched_moe_staging(sched, p, input, split_backend_id);
 +        if (stg == nullptr) {
-+            return false;
++            // no way back either: the split's copy is a one-expert placeholder
++            GGML_ABORT("expert pool: cannot allocate the %zu-byte staging tensor for '%s' on %s "
++                       "(a batch used %d experts, the pool holds %d); lower GGML_MOE_POOL_EXPERTS "
++                       "or free device memory",
++                       ggml_nbytes(input) + 512, input->name, ggml_backend_name(split_backend), n_used, p->cap);
 +        }
 +    }
 +    for (int j = 0; j < split->graph.n_nodes; j++) {
@@ -583,7 +732,13 @@ diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
 +    for (int64_t i1 = 0; i1 < nt; i1++) {
 +        for (int64_t i0 = 0; i0 < k; i0++) {
 +            const int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
-+            remap[i1 * k + i0] = p->where.at(id);
++            auto w = p->where.find(id);
++            if (w == p->where.end()) {
++                // an uncaught exception here would abort with no message at all
++                GGML_ABORT("expert pool: expert %d of '%s' is not resident after the miss pass "
++                           "(token %lld, k %lld, cap %d)", id, p->weight->name, (long long) i1, (long long) k, p->cap);
++            }
++            remap[i1 * k + i0] = w->second;
 +        }
 +    }
 +    ggml_backend_tensor_set_async(split_backend, &p->ids, remap.data(), 0, need);
@@ -593,7 +748,7 @@ diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
  static void ggml_backend_sched_split_inputs_grow(struct ggml_backend_sched_split * split) {
      int new_cap = GGML_SCHED_MAX_SPLIT_INPUTS;
      if (split->inputs_capacity > 0) {
-@@ -999,6 +1561,18 @@
+@@ -999,6 +1714,18 @@
              }
              if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                  int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
@@ -612,7 +767,7 @@ diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
                  // check if a backend with higher prio wants to offload the op
                  if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
                      for (int b = 0; b < src_backend_id; b++) {
-@@ -1019,6 +1593,14 @@
+@@ -1019,6 +1746,14 @@
                              return b;
                          }
                      }
@@ -627,7 +782,7 @@ diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
                      if (node_local_moe_source) {
                          GGML_ABORT("node-local RPC MoE tensor '%s' has no GPU "
                                     "on the same RPC endpoint", src->name);
-@@ -1112,6 +1694,60 @@
+@@ -1112,6 +1847,82 @@
  }
  
  // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
@@ -662,21 +817,43 @@ diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
 +    // restore first: on a re-submitted graph the pool tensor sits where the
 +    // weight was, and the weight is unreachable until it is put back
 +    sched_moe_restore_graph(sched, graph);
++    // "leaf" here means anything this graph does not compute: weights, inputs,
++    // and tensors an earlier graph produced (the rpc-server sees a client
++    // split whose sources include the previous split's outputs, op and all).
++    // A tensor's own op says nothing about that, only membership does.
++    std::unordered_set<const struct ggml_tensor *> computed;
++    computed.reserve((size_t) graph->n_nodes * 2);
++    for (int i = 0; i < graph->n_nodes; i++) {
++        computed.insert(graph->nodes[i]);
++    }
 +    for (int i = 0; i < graph->n_nodes; i++) {
 +        struct ggml_tensor * node = graph->nodes[i];
 +        for (int j = 0; j < GGML_MAX_SRC; j++) {
 +            struct ggml_tensor * src = node->src[j];
-+            if (src == NULL || src->op != GGML_OP_NONE || src->view_src != NULL || src->buffer == NULL) {
++            if (src == NULL) {
 +                continue;
 +            }
-+            int * src_backend_id = &tensor_backend_id(src);
-+            if (*src_backend_id != -1) {
++            // a view's placement follows the tensor it views (pass 4), so the
++            // root of the view chain is what needs a backend: a KV cache slice
++            // reaches the graph only as a view of the cache tensor, and the
++            // output GET_ROWS reads a reshape of the last layer's output that
++            // an earlier split computed (both asserted "src_backend_id != -1"
++            // on 2026-09-06 with a 787-token prompt)
++            struct ggml_tensor * leaf = src;
++            while (leaf->view_src != NULL) {
++                leaf = leaf->view_src;
++            }
++            if (leaf->buffer == NULL || computed.count(leaf)) {
++                continue;
++            }
++            int * leaf_backend_id = &tensor_backend_id(leaf);
++            if (*leaf_backend_id != -1) {
 +                continue;
 +            }
 +            for (int b = 0; b < sched->n_backends; b++) {
-+                if (ggml_backend_supports_buft(sched->backends[b], src->buffer->buft)) {
-+                    *src_backend_id = b;
-+                    SET_CAUSE(src, "leaf");
++                if (ggml_backend_supports_buft(sched->backends[b], leaf->buffer->buft)) {
++                    *leaf_backend_id = b;
++                    SET_CAUSE(leaf, "leaf");
 +                    break;
 +                }
 +            }
@@ -688,7 +865,7 @@ diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
  void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
      // reset splits
      sched->n_splits = 0;
-@@ -1133,6 +1769,8 @@
+@@ -1133,6 +1944,8 @@
  
      graph->uid = ggml_graph_next_uid();
  
@@ -697,7 +874,7 @@ diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
      // pass 1: assign backends to ops with pre-allocated inputs
      for (int i = 0; i < graph->n_leafs; i++) {
          struct ggml_tensor * leaf = graph->leafs[i];
-@@ -1372,7 +2010,16 @@
+@@ -1372,7 +2185,16 @@
  
              // check if we should start a new split based on the sources of the current node
              bool need_new_split = false;
@@ -715,7 +892,28 @@ diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
                  for (int j = 0; j < GGML_MAX_SRC; j++) {
                      struct ggml_tensor * src = node->src[j];
                      if (src == NULL) {
-@@ -1460,8 +2107,20 @@
+@@ -1430,6 +2252,20 @@
+ 
+                 size_t src_id = hash_id(src);
+                 const int src_backend_id = sched->hv_tensor_backend_ids[src_id];
++                if (src_backend_id == -1) {
++                    // say which tensor before the abort: graphs that arrive without a leaf
++                    // list (the rpc-server) reach this with an unassigned leaf otherwise
++                    struct ggml_tensor * root = src;
++                    while (root->view_src != NULL) {
++                        root = root->view_src;
++                    }
++                    GGML_LOG_ERROR("%s: unassigned src[%d] '%s' (op %s, buffer %s, view_src %s) of node '%s' (op %s, backend %d); "
++                                   "root '%s' (op %s, buffer %s, backend %d)\n", __func__, j, src->name,
++                                   ggml_op_name(src->op), src->buffer ? ggml_backend_buffer_name(src->buffer) : "NULL",
++                                   src->view_src ? src->view_src->name : "-", node->name, ggml_op_name(node->op),
++                                   tensor_backend_id(node), root->name, ggml_op_name(root->op),
++                                   root->buffer ? ggml_backend_buffer_name(root->buffer) : "NULL", tensor_backend_id(root));
++                }
+                 GGML_ASSERT(src_backend_id != -1); // all inputs should be assigned by now
+ 
+                 if (src->flags & GGML_TENSOR_FLAG_INPUT && sched->n_copies > 1) {
+@@ -1460,8 +2296,20 @@
                      // create a copy of the input in the split's backend
                      if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                          ggml_backend_t backend = sched->backends[cur_backend_id];
@@ -736,7 +934,7 @@ diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
                              ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
                              if (sched->n_copies > 1) {
                                  ggml_set_input(tensor_copy);
-@@ -1658,6 +2317,9 @@
+@@ -1658,6 +2506,9 @@
      ggml_tensor * prev_ids_tensor = nullptr;
      std::vector<int32_t> ids;
      std::vector<ggml_bitset_t> used_ids;
@@ -746,7 +944,7 @@ diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
  
      for (int split_id = 0; split_id < sched->n_splits; split_id++) {
          struct ggml_backend_sched_split * split = &splits[split_id];
-@@ -1689,10 +2351,22 @@
+@@ -1689,10 +2540,22 @@
                  // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
                  ggml_tensor * node = split->graph.nodes[0];
                  const bool node_local_rpc_moe = rpc_can_stream_moe(input->buffer, split_backend);
@@ -770,7 +968,7 @@ diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
                      //|| (node->src[1] == input_cpy && node->op == GGML_OP_ADD_ID) /* GGML_OP_ADD_ID weights are small and not worth splitting */
                      )) {
  
-@@ -1702,7 +2376,7 @@
+@@ -1702,7 +2565,7 @@
                      ggml_backend_synchronize(input_backend);
  
                      // get the ids
@@ -779,7 +977,7 @@ diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
                      ggml_backend_t ids_backend = split_backend;
  
                      // if the ids tensor is also an input of the split, it may not have been copied yet to the split backend
-@@ -1734,6 +2408,20 @@
+@@ -1734,6 +2597,22 @@
                          prev_ids_tensor = ids_tensor;
                      }
  
@@ -787,9 +985,11 @@ diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
 +                        const bool fresh_ids = prev_ids_tensor == ids_tensor && ids_tensor != nullptr;
 +                        if (sched_moe_pool_serve(sched, split, input, input_cpy, ids_tensor, ids, used_ids,
 +                                                 n_expert, expert_size, split_backend, split_backend_id)) {
-+                            // first split of this layer (its ids were just read back): start the
-+                            // next layer's predicted experts on the prefetch stream now
++                            // first split of this layer (its ids were just read back): issue this
++                            // layer's other expert tensors (exact ids) and then the next layer's
++                            // predicted experts on the prefetch stream now
 +                            if (fresh_ids && ids_tensor->ne[1] == 1 && input_id == 0) {
++                                sched_moe_issue_layer_siblings(sched, input, used_ids, n_expert);
 +                                sched_moe_prefetch_next(sched, sched_moe_layer_of(input->name), split_backend,
 +                                                        (int) ids_tensor->ne[0]);
 +                            }
@@ -800,7 +1000,7 @@ diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
                      std::vector<size_t> expert_offsets;
                      std::vector<size_t> expert_sizes;
  
-@@ -1866,6 +2554,7 @@
+@@ -1866,6 +2745,7 @@
  
      const char * GGML_SCHED_DEBUG = getenv("GGML_SCHED_DEBUG");
      sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
@@ -808,7 +1008,7 @@ diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
  
      sched->debug_realloc = 0;
  #ifdef GGML_SCHED_NO_REALLOC
-@@ -1949,6 +2638,7 @@
+@@ -1949,6 +2829,7 @@
      free(sched->context_buffer);
      free(sched->graph.nodes);
      free(sched->graph.leafs);
@@ -816,6 +1016,27 @@ diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
      free(sched);
  }
  
+diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
+--- a/ggml/src/ggml-alloc.c
++++ b/ggml/src/ggml-alloc.c
+@@ -824,8 +824,15 @@
+ static bool ggml_gallocr_reserve_n_impl(
+         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
+     size_t min_hash_size = graph->n_nodes + graph->n_leafs;
+-    // add 25% margin to avoid hash collisions
+-    min_hash_size += min_hash_size / 4;
++    // Twice the graph plus a floor, not upstream's 25 % margin: the allocator
++    // also hashes every node's sources and view roots, and with the expert
++    // pools (patch 0006) a served MUL_MAT_ID reads pool/ids/staging tensors
++    // that are neither nodes nor leaves of the graph. On an rpc-server running
++    // the server-side scheduler with pre-gate prefetch, the 25 % ran out and
++    // ggml_hash_find_or_insert aborted ("fatal error") in
++    // ggml_gallocr_hash_get during load (48 GiB Windows test node, 2026-09-07 16:10, gdb +
++    // linker map). A few hundred KiB more per allocator is nothing.
++    min_hash_size = min_hash_size * 2 + 4096;
+ 
+     // initialize hash table
+     if (galloc->hash_set.size < min_hash_size) {
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
@@ -914,7 +1135,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
      } else {
          buft = tensor->buffer->buft;
      }
-@@ -1077,13 +1109,116 @@
+@@ -1077,13 +1109,121 @@
      return true;
  }
  
@@ -951,7 +1172,12 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +    if (!server_sched) {
 +        return ggml_backend_graph_compute(backends[device], graph);
 +    }
-+    const size_t need = (size_t) graph->n_nodes * 2 + 1024;
++    // Size the scheduler for the largest graph this model will send, not for
++    // this one: every re-creation drops the expert pools cold, and a client
++    // whose ubatch sizes vary (787-token prompt: 512, 275, 1, ...) sent five
++    // successively larger graphs in one benchmark (2026-09-06), so the pools
++    // never warmed up. The hash set costs a few bytes per slot.
++    const size_t need = std::max<size_t>((size_t) graph->n_nodes * 4, 16384) + 4096;
 +    if (sched == nullptr || sched_graph_size < need) {
 +        if (sched) {
 +            ggml_backend_sched_free(sched);
@@ -1032,7 +1258,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
      response.remote_ptr = 0;
      response.remote_size = 0;
      if (buffer != nullptr) {
-@@ -1103,7 +1238,7 @@
+@@ -1103,7 +1243,7 @@
      if (dev_id >= backends.size()) {
          return false;
      }
@@ -1041,7 +1267,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
      size_t alignment = ggml_backend_buft_get_alignment(buft);
      LOG_DBG("[%s] device: %d, alignment: %lu\n", __func__, dev_id, alignment);
      response.alignment = alignment;
-@@ -1115,7 +1250,7 @@
+@@ -1115,7 +1255,7 @@
      if (dev_id >= backends.size()) {
          return false;
      }
@@ -1050,7 +1276,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
      size_t max_size = ggml_backend_buft_get_max_size(buft);
      LOG_DBG("[%s] device: %d, max_size: %lu\n", __func__, dev_id, max_size);
      response.max_size = max_size;
-@@ -1753,7 +1888,7 @@
+@@ -1753,7 +1893,7 @@
              graph->use_counts[hash_pos] = tensor_ptrs.at(id)->use_count;
          }
      }
@@ -1059,7 +1285,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
      GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
      stored_graphs[device].graph = graph;
      return true;
-@@ -1769,7 +1904,7 @@
+@@ -1769,7 +1909,7 @@
      }
      ggml_cgraph * graph = stored_graphs[device].graph;
      LOG_DBG("[%s] device: %u\n", __func__, device);
@@ -1068,7 +1294,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
      GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
      return true;
  }
-@@ -1797,6 +1932,9 @@
+@@ -1797,6 +1937,9 @@
  }
  
  rpc_server::~rpc_server() {
@@ -1078,7 +1304,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
      for (const auto & item : buffers) {
          ggml_backend_buffer_free(item.first);
      }
-@@ -1901,6 +2039,7 @@
+@@ -1901,6 +2044,7 @@
                  }
                  rpc_msg_get_alignment_rsp response;
                  if (!server.get_alignment(request, response)) {
@@ -1086,7 +1312,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
                      return;
                  }
                  if (!send_msg(sock, &response, sizeof(response))) {
-@@ -1915,6 +2054,7 @@
+@@ -1915,6 +2059,7 @@
                  }
                  rpc_msg_get_max_size_rsp response;
                  if (!server.get_max_size(request, response)) {
@@ -1094,7 +1320,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
                      return;
                  }
                  if (!send_msg(sock, &response, sizeof(response))) {
-@@ -2240,7 +2380,24 @@
+@@ -2240,7 +2385,24 @@
      }
      ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
      ggml_backend_rpc_device_context * dev_ctx = (ggml_backend_rpc_device_context *)dev->context;
@@ -1120,7 +1346,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
  }
  
  static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
-@@ -2332,6 +2489,9 @@
+@@ -2332,6 +2494,9 @@
      rpc_msg_device_count_rsp response;
      bool status = send_rpc_cmd(sock, RPC_CMD_DEVICE_COUNT, nullptr, 0, &response, sizeof(response));
      RPC_STATUS_ASSERT(status);
@@ -1130,7 +1356,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
      return response.device_count;
  }
  
-@@ -2387,6 +2547,10 @@
+@@ -2387,6 +2552,10 @@
              /* .reg     = */ ggml_backend_rpc_reg(),
              /* .context = */ dev_ctx,
          };
@@ -1249,3 +1475,109 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
          /*.ubatch      =*/ ubatch,
          /*.gtype       =*/ gtype,
          /*.sched       =*/ sched.get(),
+diff --git a/tools/rpc/rpc-server.cpp b/tools/rpc/rpc-server.cpp
+--- a/tools/rpc/rpc-server.cpp
++++ b/tools/rpc/rpc-server.cpp
+@@ -175,8 +175,74 @@
+     bool                     use_cache   = false;
+     int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
+     std::vector<std::string> devices;
++    // --pinned-probe: measure how much host memory the GPU's host (page-locked)
++    // buffer type can really allocate on this machine, print PINNED_MAX_MIB=N
++    // and exit. IdleToken's planner caps the routed experts it keeps in a
++    // node's RAM at this number (the CUDA host buffer type silently falls back
++    // to pageable memory when pinning fails, which is several times slower).
++    bool                     pinned_probe = false;
+ };
+ 
++static int run_pinned_probe() {
++    const size_t MiB = 1024u * 1024u;
++    ggml_backend_dev_t gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
++    if (!gpu) {
++        fprintf(stderr, "pinned probe: no GPU device; nothing to pin for\n");
++        printf("PINNED_MAX_MIB=0\n");
++        return 0;
++    }
++    ggml_backend_buffer_type_t host = ggml_backend_dev_host_buffer_type(gpu);
++    if (!host) {
++        fprintf(stderr, "pinned probe: %s has no host buffer type (unified memory); unconstrained\n",
++                ggml_backend_dev_name(gpu));
++        printf("PINNED_MAX_MIB=0\n");
++        return 0;
++    }
++    size_t ram_free = 0, ram_total = 0;
++    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++    if (cpu) {
++        ggml_backend_dev_memory(cpu, &ram_free, &ram_total);
++    }
++    if (ram_total == 0) {
++        ram_total = (size_t) 256 << 30;
++    }
++    // A pin that failed comes back as a plain CPU buffer (the fallback inside
++    // the CUDA host buffer type), so the buffer's type is the verdict.
++    auto try_pin = [&](size_t bytes) -> bool {
++        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(host, bytes);
++        if (!buf) {
++            return false;
++        }
++        const bool ok = ggml_backend_buffer_get_type(buf) == host;
++        ggml_backend_buffer_free(buf);
++        return ok;
++    };
++    // Coarse quarters of physical RAM, then bisect to 512 MiB. Each attempt
++    // really locks the pages, so a full probe takes a while; callers cache it.
++    size_t lo = 0, hi = ram_total;
++    const size_t step = ram_total / 4;
++    for (size_t s = step; step > 0 && s <= ram_total; s += step) {
++        if (try_pin(s)) {
++            lo = s;
++        } else {
++            hi = s;
++            break;
++        }
++    }
++    while (hi - lo > 512 * MiB) {
++        const size_t mid = lo + (hi - lo) / 2;
++        if (try_pin(mid)) {
++            lo = mid;
++        } else {
++            hi = mid;
++        }
++    }
++    fprintf(stderr, "pinned probe: %zu MiB of %zu MiB physical RAM can be page-locked for %s\n",
++            lo / MiB, ram_total / MiB, ggml_backend_dev_name(gpu));
++    printf("PINNED_MAX_MIB=%zu\n", lo / MiB);
++    return 0;
++}
++
+ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
+     fprintf(stderr, "Usage: %s [options]\n\n", argv[0]);
+     fprintf(stderr, "options:\n");
+@@ -186,6 +252,7 @@
+     fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
+     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
+     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
++    fprintf(stderr, "      --pinned-probe               print PINNED_MAX_MIB=N (page-lockable host memory) and exit\n");
+     fprintf(stderr, "\n");
+ }
+ 
+@@ -233,6 +300,8 @@
+             }
+         } else if (arg == "-c" || arg == "--cache") {
+             params.use_cache = true;
++        } else if (arg == "--pinned-probe") {
++            params.pinned_probe = true;
+         } else if (arg == "-h" || arg == "--help") {
+             print_usage(argc, argv, params);
+             exit(0);
+@@ -298,6 +367,10 @@
+         return 1;
+     }
+ 
++    if (params.pinned_probe) {
++        return run_pinned_probe();
++    }
++
+     if (params.host != "127.0.0.1") {
+         fprintf(stderr, "\n");
+         fprintf(stderr, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");

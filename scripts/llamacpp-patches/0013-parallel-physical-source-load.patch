@@ -1,0 +1,417 @@
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index c2ae1f6..1a76593 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -94,6 +94,9 @@ extern "C" {
+     // Ask a backend-owned source to populate the tensor without materializing
+     // the bytes in the caller. Returns false when the buffer has no such source.
+     GGML_API bool ggml_backend_tensor_set_from_source(struct ggml_tensor * tensor, size_t offset, size_t size);
++    // Opaque identity shared by tensors which must be read sequentially from
++    // one physical backend source; NULL means no backend-owned source.
++    GGML_API const void * ggml_backend_tensor_source_id(const struct ggml_tensor * tensor);
+     GGML_API void ggml_backend_tensor_set_2d(      struct ggml_tensor * tensor, const void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
+     GGML_API void ggml_backend_tensor_get_2d(const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
+     GGML_API void ggml_backend_tensor_memset(      struct ggml_tensor * tensor,     uint8_t value, size_t offset, size_t size);
+diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
+index f674eb4..8392965 100644
+--- a/ggml/src/ggml-backend-impl.h
++++ b/ggml/src/ggml-backend-impl.h
+@@ -62,6 +62,10 @@ extern "C" {
+         // (optional) populate a tensor from a backend-owned source without
+         // requiring the caller to read or allocate the source bytes
+         bool         (*set_tensor_from_source)(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, size_t offset, size_t size);
++        // (optional) stable identity of that physical source. Buffers backed
++        // by different devices on one RPC endpoint return the same identity,
++        // allowing a loader to keep one sequential queue per machine.
++        const void * (*get_tensor_source_id)(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor);
+     };
+ 
+     struct ggml_backend_buffer {
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 538c334..e309d9d 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -394,6 +394,19 @@ bool ggml_backend_tensor_set_from_source(struct ggml_tensor * tensor, size_t off
+            buf->iface.set_tensor_from_source(buf, tensor, offset, size);
+ }
+ 
++const void * ggml_backend_tensor_source_id(const struct ggml_tensor * tensor) {
++    GGML_ASSERT(tensor);
++    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
++    // mmap-backed local tensors receive their buffer lazily in the model-load
++    // loop. They simply are not backend-source candidates during its prepass.
++    if (buf == NULL) {
++        return NULL;
++    }
++    return buf->iface.get_tensor_source_id != NULL
++        ? buf->iface.get_tensor_source_id(buf, tensor)
++        : NULL;
++}
++
+ void ggml_backend_tensor_get(const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+     GGML_ASSERT(tensor);
+     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 3dbfa77..a1f5781 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -553,6 +553,21 @@ static bool ggml_backend_rpc_buffer_set_tensor_from_source(
+     return true;
+ }
+ 
++static const void * ggml_backend_rpc_buffer_get_tensor_source_id(
++        ggml_backend_buffer_t buffer, const ggml_tensor * tensor) {
++    const char * require_cache = std::getenv("GGML_RPC_REQUIRE_MODEL_CACHE");
++    if (require_cache == nullptr || strcmp(require_cache, "0") == 0 ||
++        !rpc_is_model_tensor_name(tensor->name)) {
++        return nullptr;
++    }
++    const ggml_backend_rpc_buffer_context * ctx =
++        (const ggml_backend_rpc_buffer_context *) buffer->context;
++    /* get_socket() interns one socket per endpoint. GPU and CPU buffers on the
++     * same worker therefore share this identity and cannot create competing
++     * disk queues, while distinct workers may load concurrently. */
++    return ctx->sock.get();
++}
++
+ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+     rpc_tensor rpc_tensor = serialize_tensor(tensor);
+@@ -634,6 +649,7 @@ static ggml_backend_buffer_i ggml_backend_rpc_buffer_interface = {
+     /* .clear           = */ ggml_backend_rpc_buffer_clear,
+     /* .reset           = */ NULL,
+     /* .set_tensor_from_source = */ ggml_backend_rpc_buffer_set_tensor_from_source,
++    /* .get_tensor_source_id   = */ ggml_backend_rpc_buffer_get_tensor_source_id,
+ };
+ 
+ static const char * ggml_backend_rpc_buffer_type_name(ggml_backend_buffer_type_t buft) {
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 6b9a1b9..234da55 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1540,8 +1540,8 @@ bool llama_model_loader::load_all_data(
+ 
+     const char * require_rpc_cache = std::getenv("GGML_RPC_REQUIRE_MODEL_CACHE");
+     const bool prefetch_sparse_local = use_mmap && require_rpc_cache != nullptr && strcmp(require_rpc_cache, "0") != 0;
+-    size_t backend_source_tensors = 0;
+-    size_t backend_source_bytes = 0;
++    size_t sequential_backend_source_tensors = 0;
++    size_t sequential_backend_source_bytes = 0;
+ 
+     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
+         const auto * weight = get_weight(ggml_get_name(cur));
+@@ -1551,21 +1551,27 @@ bool llama_model_loader::load_all_data(
+         }
+ 
+         if (progress_callback) {
+-            if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
++            if (!progress_callback((float) size_done / size_data,
++                                   progress_callback_user_data)) {
+                 return false;
+             }
+         }
+ 
+         size_t n_size = ggml_nbytes(cur);
+ 
+-        /* IdleToken workers own a verified complete GGUF. For an RPC weight,
+-         * ask that backend to populate the tensor by name before touching the
+-         * coordinator's copy. This is the key cold-start invariant: each node
+-         * reads only the weight bytes it actually owns. Tensor validation still
+-         * takes the ordinary local-read path when explicitly requested. */
+-        if (!check_tensors && ggml_backend_tensor_set_from_source(cur, 0, n_size)) {
+-            backend_source_tensors++;
+-            backend_source_bytes += n_size;
++        if (backend_source_members.count(cur) != 0) {
++            continue;
++        }
++
++        /* Preserve the pre-parallel source path for backends which can load a
++         * tensor themselves but do not expose a physical-source identity, and
++         * for mixed contexts deliberately kept off the concurrent path. */
++        ggml_backend_buffer_t source_buffer =
++            cur->view_src ? cur->view_src->buffer : cur->buffer;
++        if (!check_tensors && source_buffer != nullptr &&
++            ggml_backend_tensor_set_from_source(cur, 0, n_size)) {
++            ++sequential_backend_source_tensors;
++            sequential_backend_source_bytes += n_size;
+             size_done += n_size;
+             continue;
+         }
+@@ -1685,14 +1691,6 @@ bool llama_model_loader::load_all_data(
+         size_done += n_size;
+     }
+ 
+-    if (backend_source_tensors > 0) {
+-        LLAMA_LOG_INFO("llama_model_loader: delegated %zu tensors (%.2f GiB) "
+-                       "to backend-owned sources; this process did not read "
+-                       "those weight bytes\n",
+-                       backend_source_tensors,
+-                       (double) backend_source_bytes / (double) GiB);
+-    }
+-
+     // free temporary resources used for async uploads
+     for (auto * event : events) {
+         ggml_backend_event_synchronize(event);
+@@ -1716,8 +1714,22 @@ bool llama_model_loader::load_all_data(
+         throw std::runtime_error("found tensors with invalid data");
+     }
+ 
++    if (sequential_backend_source_tensors > 0) {
++        LLAMA_LOG_INFO("llama_model_loader: delegated %zu tensors (%.2f GiB) "
++                       "to backend-owned sources on the sequential fallback; "
++                       "this process did not read those weight bytes\n",
++                       sequential_backend_source_tensors,
++                       (double) sequential_backend_source_bytes / (double) GiB);
++    }
++
++    return finish_data_loading(progress_callback, progress_callback_user_data);
++}
++
++bool llama_model_loader::finish_data_loading(
++        llama_progress_callback progress_callback,
++        void * progress_callback_user_data) {
+     // check if this is the last call and do final cleanup
+-    if (size_done >= size_data) {
++    if (!data_loading_finished && size_done >= size_data) {
+         // unmap offloaded tensors and metadata
+         if (use_mmap) {
+             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
+@@ -1729,6 +1741,7 @@ bool llama_model_loader::load_all_data(
+                 }
+             }
+         }
++        data_loading_finished = true;
+         if (progress_callback) {
+             // Even though the model is done loading, we still honor
+             // cancellation since we need to free allocations.
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index e9fe359..8146ad8 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -14,6 +14,7 @@
+ #include <map>
+ #include <stdexcept>
+ #include <unordered_map>
++#include <unordered_set>
+ 
+ using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
+ 
+@@ -104,6 +105,11 @@ struct llama_model_loader {
+     size_t size_done = 0;
+     size_t size_data = 0;
+     std::vector<std::pair<size_t, size_t>> mmaps_used;
++    // Populated before per-buffer contexts are loaded. These tensors are being
++    // filled by their physical backend sources in parallel and must not be
++    // read from the coordinator's GGUF by load_all_data().
++    std::unordered_set<ggml_tensor *> backend_source_members;
++    bool data_loading_finished = false;
+ 
+     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
+     struct ggml_backend_buft_comparator {
+@@ -208,6 +214,10 @@ struct llama_model_loader {
+             llama_progress_callback progress_callback,
+             void * progress_callback_user_data);
+ 
++    bool finish_data_loading(
++            llama_progress_callback progress_callback,
++            void * progress_callback_user_data);
++
+     std::string ftype_name() const;
+ 
+     void print_info() const;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 4173bb0..e0124fd 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -24,18 +24,23 @@
+ #include "ggml-cpp.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cassert>
++#include <chrono>
+ #include <cfloat>
+ #include <cstdint>
+ #include <cstring>
+ #include <cmath>
+ #include <functional>
++#include <future>
+ #include <map>
+ #include <numeric>
+ #include <regex>
+ #include <sstream>
+ #include <stdexcept>
+ #include <string>
++#include <thread>
++#include <unordered_set>
+ #include <vector>
+ 
+ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
+@@ -1694,13 +1699,166 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         return true;
+     }
+ 
+-    // load tensor data
++    /* Discover every backend-owned tensor only after all context buffers have
++     * been allocated. Contexts are grouped by buffer type, so starting work
++     * inside load_all_data() serialized one RPC endpoint after another. Start
++     * one ordered queue per physical source here, across ALL contexts, before
++     * the coordinator begins its own local reads. */
++    struct backend_source_job {
++        ggml_tensor * tensor;
++        uint16_t file_idx;
++        size_t file_offset;
++        size_t size;
++    };
++    struct backend_source_context_candidate {
++        ggml_context * ctx;
++        const void * source_id;
++        std::vector<backend_source_job> jobs;
++    };
++    std::vector<backend_source_context_candidate> backend_source_candidates;
++    std::unordered_set<const void *> blocked_backend_sources;
++    std::map<const void *, std::vector<backend_source_job>> backend_source_groups;
++    std::unordered_set<ggml_context *> backend_source_contexts;
++    ml.backend_source_members.clear();
++    if (!ml.check_tensors) {
++        for (const auto & [ctx, _] : ctx_buf_maps) {
++            std::vector<backend_source_job> jobs;
++            std::unordered_set<const void *> context_source_ids;
++            bool has_weights = false;
++            bool all_weights_have_source = true;
++            for (ggml_tensor * tensor = ggml_get_first_tensor(ctx);
++                 tensor != nullptr; tensor = ggml_get_next_tensor(ctx, tensor)) {
++                const auto * weight = ml.get_weight(ggml_get_name(tensor));
++                if (weight == nullptr) {
++                    continue;
++                }
++                has_weights = true;
++                const void * source_id = ggml_backend_tensor_source_id(tensor);
++                if (source_id == nullptr) {
++                    all_weights_have_source = false;
++                    continue;
++                }
++                context_source_ids.insert(source_id);
++                jobs.push_back({
++                    tensor, weight->idx, weight->offs, ggml_nbytes(tensor)
++                });
++            }
++            /* Never access one backend context from the loader thread while a
++             * source task uses it: RPC request/response streams are ordered.
++             * A mixed context blocks every source it touches from concurrent
++             * loading; all of those contexts then use the sequential fallback
++             * together, so no second thread can interleave on the socket. */
++            if (has_weights && all_weights_have_source && context_source_ids.size() == 1) {
++                backend_source_candidates.push_back({
++                    ctx, *context_source_ids.begin(), std::move(jobs)
++                });
++            } else {
++                blocked_backend_sources.insert(
++                    context_source_ids.begin(), context_source_ids.end());
++            }
++        }
++        for (auto & candidate : backend_source_candidates) {
++            if (blocked_backend_sources.count(candidate.source_id) != 0) {
++                continue;
++            }
++            auto & group = backend_source_groups[candidate.source_id];
++            group.insert(group.end(),
++                         candidate.jobs.begin(), candidate.jobs.end());
++            for (const backend_source_job & job : candidate.jobs) {
++                ml.backend_source_members.insert(job.tensor);
++            }
++            backend_source_contexts.insert(candidate.ctx);
++        }
++    }
++
++    std::atomic<size_t> backend_source_bytes_done { 0 };
++    std::vector<std::future<std::pair<size_t, size_t>>> backend_source_results;
++    backend_source_results.reserve(backend_source_groups.size());
++    for (auto & entry : backend_source_groups) {
++        auto jobs = std::move(entry.second);
++        std::sort(jobs.begin(), jobs.end(), [](const backend_source_job & a,
++                                               const backend_source_job & b) {
++            return a.file_idx < b.file_idx ||
++                (a.file_idx == b.file_idx && a.file_offset < b.file_offset);
++        });
++        backend_source_results.emplace_back(std::async(
++            std::launch::async,
++            [jobs = std::move(jobs), &backend_source_bytes_done]() {
++                size_t tensors = 0;
++                size_t bytes = 0;
++                for (const backend_source_job & job : jobs) {
++                    if (!ggml_backend_tensor_set_from_source(
++                            job.tensor, 0, job.size)) {
++                        throw std::runtime_error(format(
++                            "backend source disappeared while loading tensor '%s'",
++                            ggml_get_name(job.tensor)));
++                    }
++                    ++tensors;
++                    bytes += job.size;
++                    backend_source_bytes_done.fetch_add(
++                        job.size, std::memory_order_relaxed);
++                }
++                return std::make_pair(tensors, bytes);
++            }));
++    }
++
++    // Load local tensor data while every physical worker reads its own shard.
+     for (auto & [ctx, buf_map] : ctx_buf_maps) {
++        if (backend_source_contexts.count(ctx) != 0) {
++            continue;
++        }
+         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+             return false;
+         }
+     }
+ 
++    /* If a worker is slower than the coordinator's disk, keep publishing real
++     * aggregate byte progress from this thread while waiting for it. */
++    bool backend_sources_ready = backend_source_results.empty();
++    while (!backend_sources_ready) {
++        backend_sources_ready = true;
++        for (auto & result : backend_source_results) {
++            if (result.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
++                backend_sources_ready = false;
++                break;
++            }
++        }
++        if (!backend_sources_ready) {
++            if (params.progress_callback) {
++                const size_t done = ml.size_done +
++                    backend_source_bytes_done.load(std::memory_order_relaxed);
++                if (!params.progress_callback(
++                        (float) std::min(done, ml.size_data) / ml.size_data,
++                        params.progress_callback_user_data)) {
++                    return false;
++                }
++            }
++            std::this_thread::sleep_for(std::chrono::milliseconds(50));
++        }
++    }
++
++    size_t backend_source_tensors = 0;
++    size_t backend_source_bytes = 0;
++    for (auto & result : backend_source_results) {
++        const auto loaded = result.get();
++        backend_source_tensors += loaded.first;
++        backend_source_bytes += loaded.second;
++    }
++    ml.size_done += backend_source_bytes;
++    ml.backend_source_members.clear();
++    if (backend_source_tensors > 0) {
++        LLAMA_LOG_INFO("llama_model_loader: delegated %zu tensors (%.2f GiB) "
++                       "across %zu parallel physical backend source(s); this "
++                       "process did not read those weight bytes\n",
++                       backend_source_tensors,
++                       backend_source_bytes / 1024.0 / 1024.0 / 1024.0,
++                       backend_source_groups.size());
++    }
++    if (!ml.finish_data_loading(
++            params.progress_callback, params.progress_callback_user_data)) {
++        return false;
++    }
++
+     if (use_mmap_buffer) {
+         for (auto & mapping : ml.mappings) {
+             pimpl->mappings.emplace_back(std::move(mapping));

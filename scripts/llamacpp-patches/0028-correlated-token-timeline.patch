@@ -1,0 +1,556 @@
+Subject: [PATCH] Add opt-in correlated CPU, RPC and CUDA timeline scopes
+
+No collector is loaded unless ITC_TIMELINE_LIBRARY is explicitly set. The
+external diagnostic library records activity; these hooks neither synchronize
+the GPU nor alter graph, transport or cache decisions. RPC sequence counters
+are local-only and add no protocol bytes. Token markers contain task/ordinal
+identifiers, not token values or text.
+
+diff --git a/ggml/include/ggml-timeline.h b/ggml/include/ggml-timeline.h
+new file mode 100644
+index 0000000..6d922c2
+--- /dev/null
++++ b/ggml/include/ggml-timeline.h
+@@ -0,0 +1,46 @@
++#pragma once
++
++#include <cstdint>
++#include <cstdlib>
++#include <cstdio>
++#ifdef _WIN32
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#endif
++
++namespace ggml_timeline {
++struct functions {
++    using begin_fn = uint64_t (*)(const char *, const char *, int64_t, int64_t);
++    using end_fn = void (*)(uint64_t);
++    begin_fn begin = nullptr;
++    end_fn end = nullptr;
++    functions() {
++#ifdef _WIN32
++        const char * path = std::getenv("ITC_TIMELINE_LIBRARY");
++        if (!path || !*path) return;
++        const HMODULE library = LoadLibraryExA(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
++        const auto init = library ? reinterpret_cast<int (*)()>(GetProcAddress(library, "itc_trace_initialize")) : nullptr;
++        begin = library ? reinterpret_cast<begin_fn>(GetProcAddress(library, "itc_trace_begin")) : nullptr;
++        end = library ? reinterpret_cast<end_fn>(GetProcAddress(library, "itc_trace_end")) : nullptr;
++        if (!init || !begin || !end || init() != 1) {
++            std::fprintf(stderr, "timeline: requested diagnostic collector could not start\n");
++            std::abort();
++        }
++#endif
++    }
++};
++inline const functions & api() { static const functions instance; return instance; }
++struct scope {
++    uint64_t id;
++    scope(const char * name, const char * detail = "", int64_t a = 0, int64_t b = 0)
++        : id(api().begin ? api().begin(name, detail, a, b) : 0) {}
++    ~scope() { if (id) api().end(id); }
++    scope(const scope &) = delete;
++    scope & operator=(const scope &) = delete;
++};
++}
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index ab3d4c5..51535c7 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -13,6 +13,7 @@
+ #include "ggml-alloc.h"
+ #include "ggml-impl.h"
+ #include "ggml-moe-copy-budget.h"
++#include "ggml-timeline.h"
+ 
+ #include <assert.h>
+ #include <limits.h>
+@@ -298,6 +299,7 @@ size_t ggml_backend_get_max_size(ggml_backend_t backend) {
+ }
+ 
+ void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
++    ggml_timeline::scope trace("tensor.set_async", tensor->name, size, offset);
+     GGML_ASSERT(backend);
+     GGML_ASSERT(tensor);
+     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
+@@ -312,6 +314,7 @@ void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor *
+ }
+ 
+ void ggml_backend_tensor_get_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
++    ggml_timeline::scope trace("tensor.get_async", tensor->name, size, offset);
+     GGML_ASSERT(backend);
+     GGML_ASSERT(tensor);
+     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
+@@ -368,6 +371,7 @@ void ggml_backend_tensor_get_2d_async(ggml_backend_t backend, const struct ggml_
+ }
+ 
+ void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
++    ggml_timeline::scope trace("tensor.set", tensor->name, size, offset);
+     GGML_ASSERT(tensor);
+     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+     GGML_ASSERT(buf != NULL && "tensor buffer not set");
+@@ -409,6 +413,7 @@ const void * ggml_backend_tensor_source_id(const struct ggml_tensor * tensor) {
+ }
+ 
+ void ggml_backend_tensor_get(const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
++    ggml_timeline::scope trace("tensor.get", tensor->name, size, offset);
+     GGML_ASSERT(tensor);
+     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+     GGML_ASSERT(buf != NULL && "tensor buffer not set");
+@@ -484,6 +489,7 @@ void ggml_backend_tensor_memset(struct ggml_tensor * tensor, uint8_t value, size
+ }
+ 
+ void ggml_backend_synchronize(ggml_backend_t backend) {
++    ggml_timeline::scope trace("backend.synchronize", ggml_backend_name(backend));
+     GGML_ASSERT(backend);
+     if (backend->iface.synchronize == NULL) {
+         return;
+@@ -520,6 +526,8 @@ enum ggml_status ggml_backend_graph_compute(ggml_backend_t backend, struct ggml_
+ }
+ 
+ enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
++    ggml_timeline::scope trace("backend.graph_submit", ggml_backend_name(backend), cgraph->n_nodes);
++    ggml_timeline::scope nodes("backend.graph_nodes", cgraph->n_nodes ? cgraph->nodes[0]->name : "", cgraph->n_nodes);
+     GGML_ASSERT(backend);
+     return backend->iface.graph_compute(backend, cgraph);
+ }
+@@ -570,6 +578,7 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
+ }
+ 
+ void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
++    ggml_timeline::scope trace("tensor.copy_async", src->name, ggml_nbytes(src));
+     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
+ 
+     if (src == dst) {
+@@ -615,6 +624,7 @@ void ggml_backend_event_record(ggml_backend_event_t event, ggml_backend_t backen
+ }
+ 
+ void ggml_backend_event_synchronize(ggml_backend_event_t event) {
++    ggml_timeline::scope trace("backend.event_synchronize");
+     GGML_ASSERT(event);
+     GGML_ASSERT(event->device->iface.event_synchronize);
+ 
+@@ -1745,6 +1755,7 @@ static bool sched_moe_prefetch_prepare(ggml_backend_sched_t sched, int layer,
+ // sibling misses have been queued. Unlike the old implementation, predictions
+ // do not enter the target layer's LRU pool and therefore cannot evict hotspots.
+ static void sched_moe_prefetch_issue(ggml_backend_sched_t sched, int layer) {
++    ggml_timeline::scope trace("moe.predicted_issue", "", layer);
+     auto & st = *sched->moe;
+     if (st.pregate_prepared_layer != layer || st.pregate_prepared_count <= 0) {
+         return;
+@@ -2158,6 +2169,7 @@ static int sched_moe_rolling_promote(ggml_backend_sched_t sched, sched_moe_pool
+ // (one token), and only for pools that can hold the batch's experts.
+ static void sched_moe_issue_layer_siblings(ggml_backend_sched_t sched, const struct ggml_tensor * input,
+                                            const std::vector<ggml_bitset_t> & used_ids, int64_t n_expert_total) {
++    ggml_timeline::scope trace("moe.exact_siblings", input->name);
+     auto & st = *sched->moe;
+     if (!st.layer_issue) {
+         return;
+@@ -2263,6 +2275,7 @@ static bool sched_moe_pool_serve(ggml_backend_sched_t sched, struct ggml_backend
+                                  const struct ggml_tensor * ids_tensor, const std::vector<int32_t> & ids,
+                                  const std::vector<ggml_bitset_t> & used_ids, int64_t n_expert, size_t expert_size,
+                                  ggml_backend_t split_backend, int split_backend_id) {
++    ggml_timeline::scope trace("moe.pool_serve", input->name, expert_size, n_expert);
+     sched_moe_pool * p = sched_moe_pool_get(sched, input, sched->bufts[split_backend_id], expert_size, n_expert);
+     if (p == nullptr) {
+         // the split's copy is only a one-expert placeholder now, so there is
+@@ -2729,6 +2742,7 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
+ // device, so the weight would no longer be a split input and the node would
+ // run on the previous token's slot ids. Put the original sources back first.
+ void ggml_backend_sched_restore_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
++    ggml_timeline::scope trace("scheduler.restore", "", graph->n_nodes);
+     if (sched->moe == nullptr || sched->moe->pools.empty()) {
+         return;
+     }
+@@ -2751,6 +2765,7 @@ void ggml_backend_sched_restore_graph(ggml_backend_sched_t sched, struct ggml_cg
+ }
+ 
+ void ggml_backend_sched_assign_leaves(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
++    ggml_timeline::scope trace("scheduler.assign", "", graph->n_nodes);
+     // restore first: on a re-submitted graph the pool tensor sits where the
+     // weight was, and the weight is unreachable until it is put back
+     ggml_backend_sched_restore_graph(sched, graph);
+@@ -3389,6 +3404,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+ }
+ 
+ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
++    ggml_timeline::scope trace("scheduler.allocate_splits");
+     bool backend_ids_changed = false;
+     for (int i = 0; i < sched->graph.n_nodes; i++) {
+         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
+@@ -3710,6 +3726,7 @@ static void sched_prof_abort_graph(ggml_backend_sched_t sched, struct sched_prof
+ }
+ 
+ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
++    ggml_timeline::scope trace("scheduler.execute");
+     GGML_ASSERT(sched);
+     struct ggml_backend_sched_split * splits = sched->splits;
+ 
+@@ -3730,6 +3747,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         struct ggml_backend_sched_split * split = &splits[split_id];
+         int split_backend_id = split->backend_id;
+         ggml_backend_t split_backend = sched->backends[split_backend_id];
++        ggml_timeline::scope trace_split("scheduler.split", split->graph.n_nodes ? split->graph.nodes[0]->name : "", split_id, split_backend_id);
+         // GPU-side brackets of this split (CUDA only): pre -> mid is the stream's gap
+         // before the split's kernels (its input copies, and idle time while the host
+         // waits or works), mid -> post the kernels themselves
+@@ -3743,6 +3761,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
+             struct ggml_tensor * input = split->inputs[input_id];
+             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
++            ggml_timeline::scope trace_input("scheduler.input", input->name, input_id, split_backend_id);
+ 
+             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+@@ -3818,6 +3837,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+ 
+                     bool ids_just_read = false;
+                     if (ids_tensor != prev_ids_tensor) {
++                        ggml_timeline::scope trace_ids("moe.route_readback", input->name);
+                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
+                         const int moe_layer = sched_moe_layer_of(input->name);
+                         auto * moe_timing = ids_tensor->ne[1] == 1
+@@ -4172,6 +4192,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+ }
+ 
+ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
++    ggml_timeline::scope trace("scheduler.reset");
+     GGML_ASSERT(sched);
+     // reset state for the next run
+     if (!sched->is_reset) {
+@@ -4215,6 +4236,7 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
+ }
+ 
+ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
++    ggml_timeline::scope trace("scheduler.allocate", "", graph->n_nodes);
+     GGML_ASSERT(sched);
+     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
+     GGML_ASSERT(!sched->is_alloc);
+@@ -4254,6 +4276,7 @@ enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, st
+ }
+ 
+ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
++    ggml_timeline::scope trace("scheduler.graph_async", "", graph->n_nodes);
+     GGML_ASSERT(sched);
+     if (!sched->is_reset && !sched->is_alloc) {
+         ggml_backend_sched_reset(sched);
+@@ -4302,6 +4325,7 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
+ }
+ 
+ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
++    ggml_timeline::scope trace("scheduler.synchronize");
+     GGML_ASSERT(sched);
+     for (int i = 0; i < sched->n_backends; i++) {
+         ggml_backend_synchronize(sched->backends[i]);
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index cd77ff9..cc58d85 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -1,6 +1,7 @@
+ #include "ggml-rpc.h"
+ #include "ggml-impl.h"
+ #include "ggml-backend-impl.h"
++#include "ggml-timeline.h"
+ #include "ggml-cpp.h"
+ #include "transport.h"
+ #include "rpc-input-cache.h"
+@@ -353,6 +354,7 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
+ // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
+ // No response
+ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
++    ggml_timeline::scope trace("rpc.client.send", "", cmd, ++sock->timeline_send_seq);
+     if (RPC_WIRE_TRACE) {
+         fprintf(stderr, "[rpc-wire-cmd] cmd=%u tx=%zu\n", (unsigned) cmd, input_size);
+     }
+@@ -372,6 +374,7 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
+ // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
+ // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
+ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
++    ggml_timeline::scope trace("rpc.client.roundtrip", "", cmd, sock->timeline_send_seq + 1);
+     if (!send_rpc_cmd(sock, cmd, input, input_size)) {
+         return false;
+     }
+@@ -946,6 +949,7 @@ static bool graph_payload_equal(const std::vector<uint8_t> & a, const std::vecto
+ }
+ 
+ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
++    ggml_timeline::scope trace("rpc.client.graph", "", cgraph->n_nodes);
+     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+     ggml_backend_dev_t rpc_dev = ggml_backend_get_device(backend);
+     ggml_backend_rpc_device_context * rpc_dev_ctx = (ggml_backend_rpc_device_context *)rpc_dev->context;
+@@ -1435,6 +1439,7 @@ ggml_backend_buffer_type_t rpc_server::device_buft(uint32_t dev_id) {
+ }
+ 
+ ggml_status rpc_server::compute(uint32_t device, ggml_cgraph * graph) {
++    ggml_timeline::scope trace("rpc.server.compute", "", graph->n_nodes, device);
+     typedef std::chrono::steady_clock clk;
+     auto ms_between = [](const clk::time_point & a, const clk::time_point & b) {
+         return std::chrono::duration<double, std::milli>(b - a).count();
+@@ -2416,6 +2421,7 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
+ }
+ 
+ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
++    ggml_timeline::scope trace("rpc.server.graph_new", "", input.size());
+     // serialization format:
+     // | device (4 bytes) | graph_id (8 bytes) | n_nodes (4 bytes) |
+     // | nodes (n_nodes * 8 bytes) | n_tensors (4 bytes) | tensors |
+@@ -2539,6 +2545,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+ }
+ 
+ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
++    ggml_timeline::scope trace("rpc.server.graph_recompute");
+     if (prof) {
+         profile_discard_pending();
+     }
+@@ -2647,6 +2654,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+             GGML_LOG_ERROR("Unknown command: %d\n", cmd);
+             break;
+         }
++        ggml_timeline::scope trace_command("rpc.server.command", "", cmd, ++sock->timeline_recv_seq);
+         switch (cmd) {
+             case RPC_CMD_HELLO: {
+                 // HELLO command is handled above
+diff --git a/ggml/src/ggml-rpc/transport.cpp b/ggml/src/ggml-rpc/transport.cpp
+index 0013455..b4ce84d 100644
+--- a/ggml/src/ggml-rpc/transport.cpp
++++ b/ggml/src/ggml-rpc/transport.cpp
+@@ -1,5 +1,6 @@
+ #include "transport.h"
+ #include "ggml-impl.h"
++#include "ggml-timeline.h"
+ 
+ #ifdef _WIN32
+ #  define WIN32_LEAN_AND_MEAN
+@@ -168,7 +169,11 @@ struct rpc_tls_bio_ctx {
+ static bool rpc_tls_bio_flush(rpc_tls_bio_ctx * bio) {
+     size_t off = 0;
+     while (off < bio->pending.size()) {
+-        ssize_t n = send(bio->fd, (const char *) bio->pending.data() + off, bio->pending.size() - off, 0);
++        ssize_t n;
++        {
++            ggml_timeline::scope trace("socket.send", "", bio->pending.size() - off);
++            n = send(bio->fd, (const char *) bio->pending.data() + off, bio->pending.size() - off, 0);
++        }
+         if (n < 0) {
+             return false;
+         }
+@@ -187,7 +192,11 @@ static int rpc_tls_bio_send(void * ctx, const unsigned char * buf, size_t len) {
+         }
+         return (int) len;
+     }
+-    ssize_t n = send(bio->fd, (const char *) buf, len, 0);
++    ssize_t n;
++    {
++        ggml_timeline::scope trace("socket.send", "", len);
++        n = send(bio->fd, (const char *) buf, len, 0);
++    }
+     if (n < 0) {
+         return MBEDTLS_ERR_NET_SEND_FAILED;
+     }
+@@ -208,7 +217,11 @@ static int rpc_tls_bio_recv(void * ctx, unsigned char * buf, size_t len) {
+     // as soon as any data is available, so this adds no latency.
+     if (bio->rd_pos == bio->rd_buf.size()) {
+         bio->rd_buf.resize(RPC_TLS_READAHEAD_SIZE);
+-        ssize_t n = recv(bio->fd, (char *) bio->rd_buf.data(), bio->rd_buf.size(), 0);
++        ssize_t n;
++        {
++            ggml_timeline::scope trace("socket.receive", "", bio->rd_buf.size());
++            n = recv(bio->fd, (char *) bio->rd_buf.data(), bio->rd_buf.size(), 0);
++        }
+         if (n < 0) {
+             bio->rd_buf.clear();
+             bio->rd_pos = 0;
+@@ -753,6 +766,7 @@ bool socket_t::impl::tls_ensure_active() {
+ }
+ 
+ bool socket_t::impl::tls_send(const void * data, size_t size) {
++    ggml_timeline::scope trace("tls.send", "", size);
+     size_t bytes_sent = 0;
+     tls_bio.corked = true;
+     while (bytes_sent < size) {
+@@ -780,6 +794,7 @@ bool socket_t::impl::tls_send(const void * data, size_t size) {
+ }
+ 
+ bool socket_t::impl::tls_recv(void * data, size_t size) {
++    ggml_timeline::scope trace("tls.receive", "", size);
+     size_t bytes_recv = 0;
+     while (bytes_recv < size) {
+         int ret = mbedtls_ssl_read(&tls_ssl, (unsigned char *) data + bytes_recv, size - bytes_recv);
+@@ -919,10 +934,12 @@ socket_t::socket_t(std::unique_ptr<impl> p) : pimpl(std::move(p)) {}
+ socket_t::~socket_t() = default;
+ 
+ bool socket_t::send_data(const void * data, size_t size) {
++    ggml_timeline::scope trace("transport.send", "", size);
+     return pimpl->send_data(data, size);
+ }
+ 
+ bool socket_t::recv_data(void * data, size_t size) {
++    ggml_timeline::scope trace("transport.receive", "", size);
+     return pimpl->recv_data(data, size);
+ }
+ 
+diff --git a/ggml/src/ggml-rpc/transport.h b/ggml/src/ggml-rpc/transport.h
+index 73b85cc..82fa993 100644
+--- a/ggml/src/ggml-rpc/transport.h
++++ b/ggml/src/ggml-rpc/transport.h
+@@ -11,6 +11,8 @@ static constexpr size_t MAX_CHUNK_SIZE = 1024ull * 1024ull * 1024ull; // 1 GiB
+ static constexpr size_t RPC_CONN_CAPS_SIZE = 24;
+ 
+ struct socket_t {
++    uint64_t timeline_send_seq = 0;
++    uint64_t timeline_recv_seq = 1;
+     ~socket_t();
+ 
+     bool send_data(const void * data, size_t size);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index a1dae46..f1e9bfd 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-context.h"
++#include "ggml-timeline.h"
+ 
+ #include "ggml.h"
+ #include "llama-arch.h"
+@@ -702,6 +703,7 @@ void llama_context::sched_reserve() {
+ }
+ 
+ void llama_context::synchronize() {
++    ggml_timeline::scope trace("llama.synchronize");
+     if (!sched) {
+         return;
+     }
+@@ -1322,6 +1324,7 @@ bool llama_context::set_adapter_cvec(
+ }
+ 
+ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
++    ggml_timeline::scope trace("llama.ubatch", "", ubatch.n_tokens);
+     if (mctx && !mctx->apply()) {
+         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+         ret = GGML_STATUS_FAILED;
+@@ -1354,7 +1357,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+ 
+         //const auto t_start_us = ggml_time_us();
+ 
+-        gf = model.build_graph(gparams);
++        {
++            ggml_timeline::scope trace_build("llama.build_graph", "", ubatch.n_tokens);
++            gf = model.build_graph(gparams);
++        }
+ 
+         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+ 
+@@ -1373,6 +1379,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+ 
+     // set the input data for the input tensors
+     {
++        ggml_timeline::scope trace_inputs("llama.set_inputs", "", ubatch.n_tokens);
+         //const auto t_start_us = ggml_time_us();
+ 
+         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+@@ -1632,6 +1639,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+ }
+ 
+ int llama_context::decode(const llama_batch & batch_inp) {
++    ggml_timeline::scope trace("llama.decode", "", batch_inp.n_tokens);
+     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
+     // so accept either present rather than requiring exactly one.
+     GGML_ASSERT(batch_inp.token || batch_inp.embd);
+@@ -2475,6 +2483,7 @@ llm_graph_params llama_context::graph_params(
+ ggml_status llama_context::graph_compute(
+             ggml_cgraph * gf,
+                    bool   batched) {
++    ggml_timeline::scope trace("llama.graph_compute", "", batched);
+     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
+     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 3564a8c..325fa20 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1,4 +1,5 @@
+ #include "server-context.h"
++#include "ggml-timeline.h"
+ #include "server-chat.h"
+ #include "server-common.h"
+ #include "server-http.h"
+@@ -1779,6 +1780,7 @@ private:
+     }
+ 
+     bool process_token(completion_token_output & result, server_slot & slot) {
++        ggml_timeline::scope trace("server.process_token", "", slot.id, slot.task->id);
+         // remember which tokens were sampled - used for repetition penalties during sampling
+         const std::string token_str = result.text_to_send;
+         slot.sampled = result.tok;
+@@ -1992,6 +1994,7 @@ private:
+     }
+ 
+     void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress, bool is_begin = false) {
++        ggml_timeline::scope trace("server.partial_response", "", slot.id, slot.task->id);
+         auto res = std::make_unique<server_task_result_cmpl_partial>();
+ 
+         res->id    = slot.task->id;
+@@ -2712,6 +2715,7 @@ private:
+ #endif
+ 
+     void update_slots() {
++        ggml_timeline::scope trace("server.cycle");
+ #ifdef DEBUG_TIMINGS
+         static int64_t t_prev = 0;
+         int64_t t_start = ggml_time_us();
+@@ -3566,6 +3570,7 @@ private:
+     // returns true = success ; false = retry with smaller batch size
+     // throw std::runtime_error on fatal error
+     bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
++        ggml_timeline::scope trace("server.decode", "", batch_view.n_tokens, off);
+         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
+ 
+         metrics_pre_decode();
+@@ -3774,12 +3779,14 @@ private:
+             llama_token id;
+             {
+                 scoped_timer timer(t_sampl, n_sampl);
++                ggml_timeline::scope trace_sample("server.sample", "", slot.id, slot.task->id);
+                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+             }
+ 
+             slot.i_batch = -1;
+ 
+             common_sampler_accept(slot.smpl.get(), id, true);
++            { ggml_timeline::scope trace_token("server.token_ready", "", slot.task->id, slot.stats.n_gen + 1); }
+ 
+             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
+             const int64_t t_now = ggml_time_us();
+diff --git a/tools/server/server-queue.cpp b/tools/server/server-queue.cpp
+index 2bcc9bd..cb5017b 100644
+--- a/tools/server/server-queue.cpp
++++ b/tools/server/server-queue.cpp
+@@ -2,6 +2,7 @@
+ #include "server-queue.h"
+ 
+ #include "log.h"
++#include "ggml-timeline.h"
+ 
+ #include <chrono>
+ #include <thread>
+@@ -124,6 +125,7 @@ void server_queue::terminate() {
+ }
+ 
+ bool server_queue::process_new_tasks(bool is_yielding) {
++    ggml_timeline::scope trace("server.queue_tasks", "", is_yielding);
+     while (true) {
+         std::unique_lock<std::mutex> lock(mutex_tasks);
+         if (!running) {
+@@ -330,6 +332,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
+                 break; // process new tasks
+             } else {
+                 // wait for new tasks or timeout for checking sleeping condition
++                ggml_timeline::scope trace_wait("server.queue_wait");
+                 bool res = condition_tasks.wait_for(lock, max_wait_time, [&]{
+                     return (!queue_tasks.empty() || !running);
+                 });

@@ -16,6 +16,7 @@ import { inTauri } from "./platform";
 import type { ClusterApi } from "./pairing";
 import { recordProblem } from "./problems";
 import { useClusterStats, servedModelOf } from "./clusterStats";
+import { fmtQuant } from "./format";
 
 interface ChatMsg {
   role: "user" | "assistant";
@@ -384,6 +385,7 @@ export default function Chat(props: {
   const { t, tErr } = useI18n();
   const [convos, setConvos] = useState<Conversation[]>(loadConversations);
   const [activeId, setActiveId] = useState<string | null>(() => loadConversations()[0]?.id ?? null);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
   const [input, setInput] = useState("");
   // Every conversation with a generation in flight, keyed by conversation id.
   // Until 2026-08-18 this was a single global `busy` flag: one reply at a time,
@@ -906,11 +908,16 @@ export default function Chat(props: {
   // which read as "your conversations are gone".
   return (
     <main
-      className="main chat chat--withbar"
+      className={`main chat chat--withbar${sidebarOpen ? "" : " chat--bar-collapsed"}`}
       hidden={!props.visible}
       aria-hidden={!props.visible}
     >
-      <aside className="chatbar">
+      <aside
+        id="chat-conversation-sidebar"
+        className="chatbar"
+        hidden={!sidebarOpen}
+        aria-label={t("chat.sidebar.label")}
+      >
         {/* Switching and starting conversations stay live during a generation.
             They used to be disabled by `busy`, which on a LAN cluster meant the
             whole sidebar locked up for minutes — you could not read anything
@@ -971,6 +978,20 @@ export default function Chat(props: {
             the coordinator reporting what it loaded, "selected" is this
             machine's setting when the cluster has not said. */}
         <div className="chat__head">
+          <button
+            type="button"
+            className="chatbar__toggle"
+            onClick={() => setSidebarOpen((open) => !open)}
+            aria-controls="chat-conversation-sidebar"
+            aria-expanded={sidebarOpen}
+            aria-label={t(sidebarOpen ? "chat.sidebar.hide" : "chat.sidebar.show")}
+            title={t(sidebarOpen ? "chat.sidebar.hide" : "chat.sidebar.show")}
+          >
+            <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+              <rect x="3.5" y="4" width="17" height="16" rx="2" fill="none" stroke="currentColor" strokeWidth="1.8" />
+              <path d="M9 4v16" fill="none" stroke="currentColor" strokeWidth="1.8" />
+            </svg>
+          </button>
           {/* Display only (2026-08-15 split): chatting happens against
               whatever is running, and switching models is a cluster operation
               that lives on the Cluster page. The chip stopped being a picker —
@@ -981,7 +1002,7 @@ export default function Chat(props: {
           >
             <span className="modelchip__label">{t(served ? "model.serving" : "model.selected")}</span>
             <span className="modelchip__name">{shownModel.label}</span>
-            {shownModel.quant ? <span className="modelchip__quant">{shownModel.quant}</span> : null}
+            {shownModel.quant ? <span className="modelchip__quant">{fmtQuant(shownModel.quant)}</span> : null}
           </div>
         </div>
         <div className="chat__scroll" ref={scrollRef} onScroll={onScroll}>

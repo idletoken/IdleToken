@@ -4,7 +4,7 @@ import { getResourceProvider } from "./provider";
 import { getEngineProvider, type EngineLogLine, type EngineStatus } from "./provider/engine";
 import type { NodeSnapshot, ClusterState } from "./types";
 import { HW_OK, HW_NO_GPU, HW_CC_TOO_LOW, HW_DRIVER_TOO_OLD, HW_VRAM_TOO_SMALL, HW_GPU_UNSUPPORTED, HW_MACOS_SEALED } from "./types";
-import { getModel, getManifest, estimateClusterCapacity, poolVram, poolRam, isMoeModel, pickBestFittingModel, backendOfOs, CLUSTER_MOE_HYBRID_ENABLED, type ModelSpec } from "./models";
+import { getModel, getManifest, estimateClusterCapacity, poolVram, poolRam, clusterCapacityVerdict, hybridRequirements, isMoeModel, moeRamExpertBudget, pickBestFittingModel, backendOfOs, type ModelSpec, type MoeLayoutBudget } from "./models";
 import { resolveLocalWeights, fetchWeights, onFetchProgress, defaultModelDir, cancelFetch, resolveDownload, verifyWeights, isWeightsCancelled, type DownloadTarget } from "./weights";
 import { loadSettings, saveSettings, settingsWerePersisted, effectiveCaps, effectiveCtx, engineTuning, overflowTuning, autoUiScale, contextTiersFor, type AppSettings, type ContextTier, type Tier } from "./settings";
 import { getAuthProvider, type Session } from "./auth";
@@ -15,13 +15,14 @@ import AuthScreen from "./AuthScreen";
 import PairingPanel from "./PairingPanel";
 import Chat from "./Chat";
 import ModelPicker from "./ModelPicker";
+import StartupProgress from "./StartupProgress";
 import WeightsRow, { type WeightsInfo } from "./WeightsRow";
 import { inTauri, getMe, resumeSharingAgent } from "./platform";
 import { identityFrom, type UserIdentity } from "./Avatar";
 import { getPairingProvider, type PairingSnapshot, type ClusterApi, type PeerNode } from "./pairing";
 import { recordProblem } from "./problems";
 import { useClusterStats, servedModelOf, type ClusterStats } from "./clusterStats";
-import { compactCount, ctxLabel, floorGiB1, fmtGiB, pct } from "./format";
+import { compactCount, ctxLabel, fmtGiB, fmtQuant, pct } from "./format";
 import { setAutostart, syncTray, syncWindowPrefs } from "./system";
 
 type Theme = "dark" | "light";
@@ -180,6 +181,39 @@ function TopBar(props: {
 // the probe is supporting detail, so it gets one row; the pixels go to the
 // question that actually matters before pairing — "is my hardware enough,
 // and how far off am I?" (estimateClusterCapacity, engine-estimate mirror).
+interface ModelLayoutJson {
+  expert_bytes_total: number;
+  n_expert: number;
+  n_expert_used: number;
+  expert_bytes_complete: boolean;
+}
+
+const modelLayoutCache = new Map<string, Promise<MoeLayoutBudget>>();
+
+function loadMoeLayout(modelId: string, quant: string, ggufPath: string): Promise<MoeLayoutBudget> {
+  const key = `${modelId}\n${quant}\n${ggufPath}`;
+  const cached = modelLayoutCache.get(key);
+  if (cached) return cached;
+  const pending = import("@tauri-apps/api/core")
+    .then(({ invoke }) => invoke<ModelLayoutJson>("inspect_model_layout", {
+      modelId,
+      quant,
+      ggufPath,
+    }))
+    .then((r) => ({
+      expertBytesTotal: r.expert_bytes_total,
+      nExpert: r.n_expert,
+      nExpertUsed: r.n_expert_used,
+      complete: r.expert_bytes_complete,
+    }))
+    .catch((error) => {
+      modelLayoutCache.delete(key);
+      throw error;
+    });
+  modelLayoutCache.set(key, pending);
+  return pending;
+}
+
 function NodeCapacityCard(props: {
   snap: NodeSnapshot;
   model: ModelSpec;
@@ -189,6 +223,7 @@ function NodeCapacityCard(props: {
   /** The paired machines, each carrying the memory IT measured (roster). More
    *  than one = the verdict is about the pool, not just this machine. */
   peers?: PeerNode[];
+  weights?: WeightsInfo;
 }) {
   const { t } = useI18n();
   const s = props.snap;
@@ -203,42 +238,105 @@ function NodeCapacityCard(props: {
   // now the only answer came from the coordinator refusing afterwards.
   const peers = props.peers ?? [];
   const pool = useMemo(() => poolVram(peers), [peers]);
-  const ramPool = useMemo(() => poolRam(peers), [peers]);
   const clustered = peers.length > 1;
   const isMoe = isMoeModel(props.model.id);
+  // A MoE model may keep routed experts in node-local RAM. Each member first
+  // applies its own hard gates (including Windows' WDDM page-lock ceiling),
+  // then the UI adds those already-capped contributions. Zero for dense
+  // models and unified memory — see moeRamExpertBudget. The deploy buttons
+  // read the same budget through the same function.
+  const ramPool = useMemo(() => poolRam(peers), [peers]);
+  /* A pre-fix Windows sidecar does not report the WDDM-aware field. Do not
+   * silently fall back to all free RAM there: that is precisely the optimistic
+   * estimate this fix removes. Non-Windows builds have no WDDM ceiling and may
+   * retain their historical usable-RAM value during a rolling upgrade. */
+  const localRamExpert = s.ram_expert_usable ?? (s.os === "windows" ? 0 : s.ram_usable);
+  const ramExpert = clustered
+    ? moeRamExpertBudget(props.model.id, ramPool.bytes, false)
+    : moeRamExpertBudget(props.model.id, localRamExpert, s.unified_memory);
   // Backend matters: GLM-5.2's measured workspace is 1.50 GiB on CUDA and
   // 33.25 GiB on Metal. Passing the machine's own OS keeps this card and the
   // deploy buttons reading the same number.
-  const cap = estimateClusterCapacity(props.model, freeMem, props.tier.ctx,
-                                      props.nNodes, props.quant,
-                                      backendOfOs(s.os));
-  // The pooled verdict reuses the same needBytes (it already accounts for the
-  // node count) against the summed memory.
-  const haveBytes = clustered ? pool.bytes : cap.haveBytes;
-  const gpuShort = haveBytes < cap.needBytes;
-  const vramGapBytes = Math.max(0, cap.needBytes - haveBytes);
-  // The exact expert prefix is discovered from the downloaded GGUF at launch.
-  // This UI hint is intentionally only a possibility check; the runtime
-  // planner remains the hard gate and never guesses expert tensor sizes.
-  // The cluster shape is additionally behind the opt-in switch (models.ts):
-  // the card must not promise a placement the coordinator refuses by default.
-  const hybridPossible = isMoe && gpuShort && (
-    clustered
-      ? CLUSTER_MOE_HYBRID_ENABLED && ramPool.complete && ramPool.bytes >= vramGapBytes
-      : !s.unified_memory && s.ram_usable >= vramGapBytes
-  );
-  const short = gpuShort && !hybridPossible;
+  const gpuAvailable = clustered ? pool.bytes : freeMem.vram_usable;
+  const estimateMem = { vram_usable: gpuAvailable };
+  const gpuCap = estimateClusterCapacity(props.model, estimateMem, props.tier.ctx,
+                                         props.nNodes, props.quant,
+                                         backendOfOs(s.os), 0);
+  const gpuOnly = gpuAvailable >= gpuCap.needBytes;
+  // Mode follows the selected resource path, not the architecture label. An
+  // MoE that fits wholly in VRAM is GPU_ONLY and therefore has no RAM row.
+  // Unified-memory machines also have no second pool to display.
+  const hybridMode = isMoe && !gpuOnly && ramExpert > 0 && (clustered || !s.unified_memory);
+  const [cpuName, setCpuName] = useState("");
+  useEffect(() => {
+    let live = true;
+    setCpuName("");
+    if (!hybridMode || !inTauri()) return () => { live = false; };
+    import("@tauri-apps/api/core")
+      .then(({ invoke }) => invoke<string>("cpu_name"))
+      .then((name) => {
+        if (live) setCpuName(name.trim());
+      })
+      .catch(() => {
+        if (live) setCpuName("");
+      });
+    return () => { live = false; };
+  }, [hybridMode]);
+  const [moeLayout, setMoeLayout] = useState<MoeLayoutBudget | null>(null);
+  const [layoutState, setLayoutState] = useState<"waiting" | "loading" | "ready" | "error">("waiting");
+  useEffect(() => {
+    let live = true;
+    setMoeLayout(null);
+    if (!hybridMode || props.weights?.needs || !props.weights?.path || !inTauri()) {
+      setLayoutState("waiting");
+      return () => { live = false; };
+    }
+    setLayoutState("loading");
+    loadMoeLayout(props.model.id, props.quant, props.weights.path)
+      .then((layout) => {
+        if (!live) return;
+        setMoeLayout(layout.complete ? layout : null);
+        setLayoutState(layout.complete ? "ready" : "error");
+      })
+      .catch(() => {
+        if (live) setLayoutState("error");
+      });
+    return () => { live = false; };
+  }, [hybridMode, props.model.id, props.quant, props.weights?.needs, props.weights?.path]);
+  const hybridNeed = hybridMode ? hybridRequirements(gpuCap.needBytes, moeLayout) : null;
+  const pooledVerdict = !hybridMode
+    ? clustered
+      ? clusterCapacityVerdict(gpuCap.needBytes, gpuAvailable, 0, false,
+                               pool.complete, true)
+      : gpuOnly ? "fits" : "short"
+    : !hybridNeed || (clustered && (!pool.complete || !ramPool.complete))
+      ? "unknown"
+      : gpuAvailable < hybridNeed.vramNeedBytes || ramExpert < hybridNeed.ramNeedBytes
+        ? "short"
+        : clustered ? "hybrid-check" : "fits";
+  const short = pooledVerdict === "short";
   // "Cannot tell" beats a wrong "not enough": a member that reported nothing
   // makes the total a lower bound, and only a SHORTFALL can be wrong that way
   // (a total that already covers the model cannot be talked down by adding
-  // more memory to it).
-  const unknown = clustered && !pool.complete && gpuShort;
-  // Never round available memory upward or required memory downward: doing so
-  // can print equal-looking figures beside a real shortfall at the boundary.
-  // `floorGiB1` is shared with the hardware strip's readout so the two cannot
-  // print different numbers for the same bytes.
-  const GBHave = floorGiB1;
-  const GBNeed = (b: number) => Math.ceil((b / 1024 ** 3) * 10) / 10;
+  // more memory to it). With RAM in the sum, an unreported RAM figure counts
+  // the same way for a MoE model.
+  const missingReport = pooledVerdict === "unknown";
+  /* An aggregate MoE sum is only a necessary pre-flight check. Runtime still
+   * performs the exact owner-local admission check at launch; the card keeps
+   * its verdict focused on whether both displayed estimates meet their floors. */
+  // Never round available memory upward or required memory downward. Hybrid
+  // uses two decimals because the measured Windows pair has only ~76 MiB of
+  // expert-RAM headroom: one decimal would print 77.3 beside 77.3 and hide the
+  // very boundary this card is meant to explain. GPU-only keeps the quieter
+  // one-decimal readout used elsewhere.
+  const budgetDigits = hybridMode ? 2 : 1;
+  const budgetScale = 10 ** budgetDigits;
+  const GBHave = (b: number) => (
+    Math.floor((b / 1024 ** 3) * budgetScale) / budgetScale
+  ).toFixed(budgetDigits);
+  const GBNeed = (b: number) => (
+    Math.ceil((b / 1024 ** 3) * budgetScale) / budgetScale
+  ).toFixed(budgetDigits);
   // ONE source for "what is left". This used to recompute
   // `vram_total - vram_used_other` while the capacity line below read
   // `vram_usable`; the two happen to be equal on the machines tested, but they
@@ -246,11 +344,20 @@ function NodeCapacityCard(props: {
   // now reports remaining memory directly (NVML's own `free`), so read that.
   const vFree = fmtGiB(s.vram_usable);
   const vTotal = fmtGiB(s.vram_total);
-  const rFree = fmtGiB(s.ram_usable);
+  const rFree = fmtGiB(localRamExpert);
   const rTotal = fmtGiB(s.ram_total);
-  const ramHave = clustered ? ramPool.bytes : s.ram_usable;
   const total = props.model.totalLayers;
   const ticks = useMemo(() => Array.from({ length: total }), [total]);
+  // Each physical pool gets its own coverage bar. Combining both ratios into
+  // one bar hid which resource was tight and made RAM look interchangeable
+  // with VRAM; Hybrid admission deliberately treats them as separate gates.
+  const gpuNeedBytes = hybridMode ? hybridNeed?.vramNeedBytes : gpuCap.needBytes;
+  const ramNeedBytes = hybridMode ? hybridNeed?.ramNeedBytes : undefined;
+  const coverageLayers = (have: number, need?: number) => need && need > 0
+    ? Math.floor(total * Math.min(1, have / need))
+    : 0;
+  const gpuVisibleLayers = coverageLayers(gpuAvailable, gpuNeedBytes);
+  const ramVisibleLayers = coverageLayers(ramExpert, ramNeedBytes);
   // Hardware floor: the engine decided, the UI only renders the verdict. A
   // blocked machine must SAY SO up front — otherwise the card looks healthy and
   // the failure surfaces much later as a mock fallback or garbage tokens.
@@ -292,61 +399,103 @@ function NodeCapacityCard(props: {
             <span className="track__used" style={{ width: `${pct(s.vram_used_other, s.vram_total)}%` }} />
           </div>
         </div>
-        {isMoe ? (
+        {/* RAM appears only when this selection actually needs Hybrid. A MoE
+            that fits in VRAM is GPU_ONLY and reads exactly like a dense model.
+            The value is the page-lock-aware expert budget, but the label stays
+            ordinary "memory" for people who should not need WDDM vocabulary. */}
+        {hybridMode ? (
+          <div className="nstat nstat--cpu">
+            <span className="nstat__k">{t("node.cpu")}</span>
+            <span className="nstat__v">{cpuName || "—"}</span>
+            <span className="nstat__sub">{s.cpu_count > 0 ? t("node.threads", { n: s.cpu_count }) : ""}</span>
+          </div>
+        ) : null}
+        {hybridMode ? (
           <div className="nstat nstat--bar">
-            <span className="nstat__k">{t("node.ram")}</span>
+            <span className="nstat__k">{t("capacity.availableRam")}</span>
             <span className="nstat__v">
               {rFree.value}
               <span className="unit">/ {rTotal.value} {rTotal.unit}</span>
             </span>
             <div className="track track--mini">
-              <span className="track__usable" style={{ width: `${pct(s.ram_usable, s.ram_total)}%` }} />
-              <span className="track__used" style={{ width: `${pct(s.ram_used_other, s.ram_total)}%` }} />
+              <span className="track__usable" style={{ width: `${pct(localRamExpert, s.ram_total)}%` }} />
+              <span className="track__used" style={{ width: `${pct(s.ram_total - localRamExpert, s.ram_total)}%` }} />
             </div>
           </div>
         ) : null}
       </div>
 
-      {/* Two facts and a bar (2026-08-15; the explanatory sentences are gone —
-          have/need in GB says it, and the tick bar shows how many of the
-          model's layers fit). Red numbers = does not fit. The bar shows in
-          BOTH modes now: the ready-state "compact" variant used to drop it,
-          which read as the graphic disappearing the moment a cluster worked. */}
+      {/* GPU_ONLY has one physical pool. Hybrid has two, so each pool owns its
+          numbers and its own coverage bar; neither is added to the other. */}
       <div className="capacity">
-        <div className="capacity__head">
-          <span className={`capacity__need${gpuShort ? " capacity__gap" : ""}`}>
-            {t("capacity.ratio", { have: GBHave(haveBytes), need: GBNeed(cap.needBytes) })}
-          </span>
-        </div>
-        <div className="spine" role="img" aria-label={t(hybridPossible ? "spine.hybrid" : short ? "spine.no" : "spine.fits")}>
-          {ticks.map((_, i) => (
-            <span key={i} className={`tick${i < cap.hostableLayers ? " tick--on" : ""}`} />
-          ))}
-        </div>
-        {isMoe ? (
-          <p className="capacity__mode">
-            {clustered
-              ? t("capacity.moeCluster", { ram: ramPool.complete ? GBHave(ramHave) : "—" })
-              : s.unified_memory
-                ? t("capacity.moeUnified")
-                : hybridPossible
-                  ? t("capacity.moeHybrid", { ram: GBHave(ramHave) })
-                  : t("capacity.moeGpuFirst", { ram: GBHave(ramHave) })}
-          </p>
+        {!hybridMode ? (
+          <div className="capacity__head">
+            <span className="capacity__mode">{t("capacity.modeGpu")}</span>
+          </div>
         ) : null}
-        {/* The bar is the only thing on this card a glance can read, and
-            unlabelled it is decoration — so one short line names the outcome.
+        <div className={`capacity__resources${hybridMode ? " capacity__resources--headless" : ""}`}>
+          <div className="capacity__resource">
+            <span className="capacity__resource-kind">{t("node.vram")}</span>
+            <div className="capacity__resource-stats">
+              <span className="capacity__resource-stat">
+                <span>{t("capacity.available")}</span>
+                <strong>{GBHave(gpuAvailable)} GB</strong>
+              </span>
+              <span className="capacity__resource-stat">
+                <span>{t(hybridMode ? "capacity.minimum" : "capacity.required")}</span>
+                <strong className={short && (!hybridNeed || gpuAvailable < hybridNeed.vramNeedBytes) ? "capacity__gap" : ""}>
+                  {hybridMode
+                    ? hybridNeed ? `${GBNeed(hybridNeed.vramNeedBytes)} GB` : "—"
+                    : `${GBNeed(gpuCap.needBytes)} GB`}
+                </strong>
+              </span>
+            </div>
+            <div className="spine capacity__spine" role="img" aria-label={`${t("node.vram")} · ${t("capacity.available")} ${GBHave(gpuAvailable)} GB · ${t(hybridMode ? "capacity.minimum" : "capacity.required")} ${gpuNeedBytes ? `${GBNeed(gpuNeedBytes)} GB` : "—"}`}>
+              {ticks.map((_, i) => (
+                <span key={i} className={`tick${i < gpuVisibleLayers ? " tick--on" : ""}`} />
+              ))}
+            </div>
+          </div>
+          {hybridMode ? (
+            <div className="capacity__resource">
+              <span className="capacity__resource-kind">{t("node.ram")}</span>
+              <div className="capacity__resource-stats">
+                <span className="capacity__resource-stat">
+                  <span>{t("capacity.available")}</span>
+                  <strong>{GBHave(ramExpert)} GB</strong>
+                </span>
+                <span className="capacity__resource-stat">
+                  <span>{t("capacity.expertStorage")}</span>
+                  <strong className={short && (!hybridNeed || ramExpert < hybridNeed.ramNeedBytes) ? "capacity__gap" : ""}>
+                    {hybridNeed ? `${GBNeed(hybridNeed.ramNeedBytes)} GB` : "—"}
+                  </strong>
+                </span>
+              </div>
+              <div className="spine capacity__spine" role="img" aria-label={`${t("node.ram")} · ${t("capacity.available")} ${GBHave(ramExpert)} GB · ${t("capacity.expertStorage")} ${ramNeedBytes ? `${GBNeed(ramNeedBytes)} GB` : "—"}`}>
+                {ticks.map((_, i) => (
+                  <span key={i} className={`tick${i < ramVisibleLayers ? " tick--on" : ""}`} />
+                ))}
+              </div>
+            </div>
+          ) : null}
+        </div>
+        {/* The bars are the quickest thing on this card to read; one short line
+            below them names the combined outcome.
             The shortfall side no longer distinguishes one machine from a pool
             (2026-09-01): the head line above already quotes have/need for the
             selected context, and the caveats it used to carry (estimate vs
             runtime admission) said more than the moment needs. */}
         <p className={`capacity__verdict${short ? " capacity__verdict--no" : ""}`}>
-          {unknown
+          {hybridMode && !hybridNeed
+            ? t(layoutState === "loading" ? "spine.hybridReading"
+              : props.weights?.needs ? "spine.hybridDownload"
+              : "spine.hybridUnavailable")
+            : missingReport
             ? t("spine.unknown")
-            : hybridPossible
-              ? t("spine.hybrid")
-              : short
+            : short
               ? t("spine.no")
+              : hybridMode
+                ? t("spine.hybridFits")
               : clustered
                 ? t("spine.clusterFits", { n: peers.length })
                 : t("spine.fits")}
@@ -562,6 +711,7 @@ function ClusterCard(props: {
   onCtxTokensChange: (ctx: ContextTier) => void;
   // Save a pick before any cluster is running.
   onSwitchModel: (modelId: string, quant: string) => void;
+  engineStatus?: EngineStatus | null;
 }) {
   const { t, tErr } = useI18n();
   const [copiedApi, setCopiedApi] = useState(false);
@@ -571,7 +721,11 @@ function ClusterCard(props: {
   // nothing on screen. One operation strip keeps both actions honest.
   const [opErr, setOpErr] = useState<string | null>(null);
   const [leaving, setLeaving] = useState(false);
+  const [startRequested, setStartRequested] = useState(false);
   const snap = props.pair;
+  useEffect(() => {
+    if (!snap?.canStart || snap.phase !== "idle") setStartRequested(false);
+  }, [snap?.canStart, snap?.phase]);
   // Before the early return below: hooks cannot be conditional.
   const stats = useClusterStats(snap?.api ?? null, snap?.source ?? "engine", {
     simModel: {
@@ -593,6 +747,16 @@ function ClusterCard(props: {
   // answering chat. Never let the weaker observation contradict the stronger
   // one.
   const engineState = snap?.phase === "ready" ? "ready" : stats?.engine_state;
+  const startupActive = !!snap && snap.phase !== "idle" && snap.phase !== "ready";
+  const startupLabel = snap?.phase === "probing"
+    ? t("pairing.phase.probing")
+    : snap?.phase === "splitting"
+      ? t("pairing.phase.splitting")
+      : props.engineStatus?.state === "restarting" || engineState === "restarting"
+        ? t("startup.restarting")
+        : props.engineStatus?.state === "starting"
+          ? t("startup.launching")
+          : t("startup.loadingModel");
   const anyError = active && snap.peers.some((p) => p.stage === "error");
   const canServe = props.canServeStandalone !== false;
   // One readiness gate for both deployment paths. `path` matters as well as
@@ -626,12 +790,19 @@ function ClusterCard(props: {
         <div className="cluster-model cluster-model--pick">
           <span className="cluster-model__label">{t("model.selected")}</span>
           <span className="cluster-model__name">{props.settingModelLabel}</span>
-          {props.settingQuant ? <span className="cluster-model__quant">{props.settingQuant}</span> : null}
+          {props.settingQuant ? <span className="cluster-model__quant">{fmtQuant(props.settingQuant)}</span> : null}
           {/* Nothing is running yet, so this pick is free: it writes the
-              setting and the two options below re-read it. */}
-          <button className="linkbtn cluster-model__change" onClick={() => setPickOpen((v) => !v)}>
-            {t("model.change")}
-          </button>
+              setting and the two options below re-read it. Paired, the switch
+              handler ignores picks (a cluster is rebuilt around one model), so
+              the link is replaced by the reason instead of a pick that goes
+              nowhere (2026-09-06). */}
+          {active ? (
+            <span className="cluster-model__paired">{t("model.change.paired")}</span>
+          ) : (
+            <button className="linkbtn cluster-model__change" onClick={() => setPickOpen((v) => !v)}>
+              {t("model.change")}
+            </button>
+          )}
           {pickOpen ? (
             <ModelPicker
               modelId={props.settingModelId}
@@ -816,18 +987,24 @@ function ClusterCard(props: {
               to the precision THIS client launched with — first-hand
               knowledge, but only while the served id matches the setting. */}
           {(served.quant || (served.id === props.settingModelId ? props.settingQuant : "")) ? (
-            <span className="cluster-model__quant">{served.quant || props.settingQuant}</span>
+            <span className="cluster-model__quant">{fmtQuant(served.quant || props.settingQuant)}</span>
           ) : null}
           {/* Running deployments are read-only. Changing model requires an
               explicit cluster exit followed by a fresh start, so no restart
               shortcut is offered here. */}
         </div>
       ) : null}
+      {startupActive ? (
+        <StartupProgress
+          label={startupLabel}
+          detail={snap.peers.length > 1 ? t("startup.clusterDetail") : t("startup.localDetail")}
+        />
+      ) : null}
       {/* Inference-engine health (v2, llamacpp mode): mirrored from the
           coordinator's /health via stats. Chat answers 503 until "ready", so a
           quiet panel over a 503ing API would be a lie; absent on the legacy
           path, where per-peer stages carry the same news. */}
-      {engineState && engineState !== "ready" ? (
+      {engineState && engineState !== "ready" && !startupActive ? (
         <p
           className={`cluster-hint ${
             engineState === "failed" ? "cluster-hint--bad" : "cluster-hint--warn"
@@ -891,8 +1068,6 @@ function ClusterCard(props: {
 
       {anyError ? <p className="cluster-hint cluster-hint--bad">{t("cluster.errorHint")}</p> : null}
 
-      {snap.phase === "loading" ? <p className="cluster-hint">{t("cluster.loadingHint")}</p> : null}
-
       {snap.phase === "idle" && snap.peers.some((p) => p.modelReady === false) ? (
         <p className="cluster-hint">{t("pairing.model.waiting")}</p>
       ) : null}
@@ -901,16 +1076,23 @@ function ClusterCard(props: {
         <div className="cluster-start-actions">
           <button
             className="btn-primary btn-block cluster-start"
+            disabled={startRequested}
             onClick={() => {
               setOpErr(null);
-              getPairingProvider()
+              setStartRequested(true);
+              void getPairingProvider()
                 // The roster may have been created before the adjacent switch
                 // changed. Refresh only overflow at the moment of launch.
                 .start(false, props.weights?.path, overflowTuning(loadSettings()))
-                .catch((e) => setOpErr(tErr(String(e))));
+                .catch((e) => {
+                  setStartRequested(false);
+                  setOpErr(tErr(String(e)));
+                });
             }}
           >
-            {t("pairing.startCluster", { n: snap.peers.length })} →
+            {startRequested
+              ? t("pairing.phase.starting")
+              : `${t("pairing.startCluster", { n: snap.peers.length })} →`}
           </button>
         </div>
       ) : null}
@@ -1051,7 +1233,7 @@ function LocalEngineCard(props: {
             agree — this card can serve an arbitrary local GGUF, where the
             setting's precision would be a guess about someone else's file. */}
         {(stats?.quant || (stats?.model === props.settingModelId ? props.settingQuant : "")) ? (
-          <span className="cluster-model__quant">{stats?.quant || props.settingQuant}</span>
+          <span className="cluster-model__quant">{fmtQuant(stats?.quant || props.settingQuant)}</span>
         ) : null}
         <button className="linkbtn cluster-model__change" onClick={() => setPickOpen((v) => !v)}>
           {t("model.change")}
@@ -1169,8 +1351,11 @@ function Dashboard(props: {
   // the coordinator still performs the authoritative admission. Same function,
   // same backend and same measured workspace the capacity card renders, so the
   // card cannot say "fits" while the buttons point the other way.
+  const standaloneRamExpert = s.ram_expert_usable ?? (s.os === "windows" ? 0 : s.ram_usable);
   const standalone = estimateClusterCapacity(props.model, s, props.tier.ctx, 1,
-                                             props.quant, backendOfOs(s.os));
+                                             props.quant, backendOfOs(s.os),
+                                             moeRamExpertBudget(props.model.id, standaloneRamExpert,
+                                                                s.unified_memory));
   // The generic refusal surface (D2): whatever sentence the engine sent
   // through the JOIN_REFUSED / exit-3 channel, verbatim, where the user is
   // looking. WS-C's "upgrade machine X" (version mismatch) arrives through
@@ -1217,6 +1402,7 @@ function Dashboard(props: {
             ctxTokens={props.ctxTokens}
             onCtxTokensChange={props.onCtxTokensChange}
             onSwitchModel={props.onSwitchModel}
+            engineStatus={props.engStatus}
           />
           )}
         </div>
@@ -1233,6 +1419,7 @@ function Dashboard(props: {
             tier={props.tier}
             nNodes={nNodes}
             peers={props.pair?.peers}
+            weights={props.weights}
           />
           <EngineCard />
         </div>
@@ -1359,7 +1546,7 @@ export default function App() {
    * The file name is the natural key: unique per model+precision, and the same
    * identity the engine's one-writer-per-file guard uses (weights.rs).
    */
-  const [dls, setDls] = useState<Record<string, { have: number; total: number; note?: string }>>({});
+  const [dls, setDls] = useState<Record<string, NonNullable<WeightsInfo["dl"]>>>({});
   /**
    * Why the last attempt for a file stopped — a footnote on its row, never a
    * state. A download that did not finish leaves the machine exactly where it
@@ -1534,14 +1721,28 @@ export default function App() {
         // The event still says which endpoint is serving the bytes, but that
         // stays out of the row on purpose: where the download comes from is an
         // implementation detail the user is not asked to think about.
-        setDls((m) => ({
-          ...m,
-          [id]: {
-            have: p.have ?? m[id]?.have ?? 0,
-            total: p.total ?? m[id]?.total ?? 0,
-            note: p.note ?? m[id]?.note,
-          },
-        }));
+        setDls((m) => {
+          const previous = m[id];
+          const phaseChanged = p.phase !== undefined && p.phase !== previous?.phase;
+          return {
+            ...m,
+            [id]: {
+              have: p.have ?? previous?.have ?? 0,
+              total: p.total ?? previous?.total ?? 0,
+              // A note belongs to one event phase. Keeping the previous note
+              // made "verifying" stick after the next GGUF part had resumed
+              // downloading, which was both misleading and impossible for the
+              // user to distinguish from a second hash pass. Other notices (for
+              // example "server cannot resume") stay visible within their phase.
+              note: p.note ?? (phaseChanged ? undefined : previous?.note),
+              phase: p.phase ?? previous?.phase,
+              phaseHave: p.phaseHave,
+              phaseTotal: p.phaseTotal,
+              part: p.part,
+              parts: p.parts,
+            },
+          };
+        });
       } else if (p.kind === "done" || p.kind === "cancelled" || p.kind === "error") {
         setDls((m) => {
           if (!(id in m)) return m;
@@ -1567,7 +1768,7 @@ export default function App() {
   // ever reach the probe.
   const caps = useMemo(
     () => effectiveCaps(settings, totals),
-    [settings.resourcePreset, settings.maxVramMb, totals]
+    [settings.resourcePreset, settings.maxVramMb, settings.maxRamMb, totals]
   );
   // (The memory-shape argument engineTuning used for resolving the KV "auto"
   // dtype left with the KV selector, 2026-08-25: the coordinator decides the
@@ -1779,7 +1980,13 @@ export default function App() {
    * explicit stop/restart behaviour until that legacy surface is retired. */
   const switchModel = useCallback(
     async (modelId: string, quant: string) => {
-      if (pairSnap && pairSnap.peers.length > 0) return;
+      if (pairSnap && pairSnap.peers.length > 0) {
+        // A paired cluster is rebuilt around one model; the page says so where
+        // the change link would be (2026-09-06: this used to return silently,
+        // and the pick looked like it did nothing).
+        console.warn("model switch ignored: paired with", pairSnap.peers.length, "peer(s)");
+        return;
+      }
       // The setting is written immediately — the radio/picker must reflect the
       // choice now, not after whatever rebuild is currently winding down.
       updateSettings({
@@ -1867,6 +2074,7 @@ export default function App() {
               invoke("pairing_report_memory", {
                 vramFree: s.vram_usable,
                 ramFree: s.ram_usable,
+                ramExpertFree: s.ram_expert_usable ?? (s.os === "windows" ? 0 : s.ram_usable),
                 unifiedMemory: s.unified_memory,
               })
             )
@@ -2076,7 +2284,6 @@ export default function App() {
             ) : view === "settings" ? (
               <SettingsPanel
                 asPage
-                apiBaseUrl={pairSnap?.api?.status === "online" ? pairSnap.api.baseUrl : null}
                 settings={settings}
                 onChange={updateSettings}
                 snap={snap}

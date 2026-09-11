@@ -1,0 +1,40 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1201,7 +1201,7 @@
+     }
+     // The graph allocator has already reserved the real weights, KV/workspace,
+     // and upstream full-tensor staging. The pool owns one separate full-tensor
+-    // staging buffer on each target device; leave another 1 GiB per device
++    // staging buffer on each target device; leave another 512 MiB per device
+     // uncommitted for backend/runtime variance, and include the 512-byte tail
+     // on every per-weight allocation. A scheduler spanning multiple local GPUs
+     // uses the smallest safe slot count instead of assuming one particular card.
+@@ -1262,6 +1262,9 @@
+                       "free=%.2f GiB staging=%.2f GiB\n",
+                       st->backends.size(), cap, (double) reserve / 1073741824.0,
+                       (long long) st->n_expert_used, free_gib, staging_gib);
++        // AUTO is an explicit owner-local GPU-execution contract from the
++        // coordinator, not permission to run the routed experts on the CPU.
++        GGML_ABORT("[RESOURCE_INSUFFICIENT] planned GPU expert cache cannot hold this model's active experts; refusing CPU fallback");
+     }
+     delete st;
+     sched->moe_auto = nullptr;
+@@ -4555,15 +4558,14 @@
+                 (observed == st->expected_weight_count &&
+                  st->weight_hash != st->expected_weight_hash);
+             if (impossible || st->graphs_without_growth >= 32) {
+-                fprintf(stderr, "moe-pool: adaptive cache disabled: accumulated graph expert-weight identity "
++                fprintf(stderr, "moe-pool: adaptive cache rejected: accumulated graph expert-weight identity "
+                               "did not match the GGUF plan (observed %zu/%016llx, planned %llu/%016llx%s)\n",
+                               observed,
+                               (unsigned long long) st->weight_hash,
+                               (unsigned long long) st->expected_weight_count,
+                               (unsigned long long) st->expected_weight_hash,
+                               st->invalid ? ", invalid accounting or no owner GPU" : "");
+-                delete st;
+-                sched->moe_auto = nullptr;
++                GGML_ABORT("[ENGINE_CACHE_PLAN_MISMATCH] owner-local expert graph does not match the admitted GGUF cache plan; refusing CPU fallback");
+             }
+         }
+     }

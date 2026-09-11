@@ -1,0 +1,550 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 3e38d86..4f83627 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -908,6 +908,10 @@ struct ggml_backend_sched {
+     struct sched_moe_auto_state * moe_auto;
+     // per-graph timing of the split loop (GGML_MOE_PROFILE=N), NULL when off
+     struct sched_prof * prof;
++    // Preparation happens before the profiled compute loop. Retain these
++    // pending values so one profile line accounts for the whole scheduler.
++    double prof_split_ms_pending;
++    double prof_alloc_ms_pending;
+ };
+ 
+ #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
+@@ -948,10 +952,15 @@ struct sched_moe_pool {
+     std::vector<uint64_t> slot_last;             // slot -> tick of last use (0 = never)
+     std::vector<uint64_t> slot_pin;              // slot -> tick whose MUL_MAT_ID reads it (never evict then)
+     std::vector<uint8_t>  slot_hot;              // slot is used by the serve in progress: never evict it
++    // CUDA consumes this host memory asynchronously. Keep one stable source
++    // per pool so preparing another weight cannot overwrite an in-flight ids
++    // upload before the backend stream reaches it.
++    std::vector<int32_t> remap;
+     std::unordered_map<int32_t, int> where;      // expert -> slot
+     uint64_t tick = 0, hits = 0, misses = 0, bypassed = 0, prefetched = 0;
+     struct ggml_tensor * node = nullptr;         // the MUL_MAT_ID node last pointed at the pool
+     struct ggml_tensor * orig_ids = nullptr;     // that node's src[2] before the rewrite
++    int64_t n_expert = 0;                        // stable geometry; weight pointers are graph-local
+     int layer = -1;                              // "blk.<layer>." of the weight, -1 if unnamed
+     int backend_id = -1;
+     ggml_backend_event_t ev = nullptr;           // prefetch completion, recorded on the prefetch backend
+@@ -973,7 +982,6 @@ struct sched_moe_state {
+     // one buffer for the whole scheduler, used by one split at a time
+     ggml_backend_buffer_t staging_buf = nullptr;
+     int staging_backend_id = -1;
+-    std::vector<int32_t> remap;
+     // pre-gate prefetch: the graph's "ffn_moe_pregate-<L>" nodes and a second backend
+     // instance per device (its own stream) that carries the prefetch copies
+     std::unordered_map<int, struct ggml_tensor *> pregate;
+@@ -1008,6 +1016,8 @@ struct sched_moe_auto_state {
+     uint64_t expert_bytes = 0;     // one slot across every unique expert tensor
+     int64_t n_expert = INT64_MAX;
+     int64_t n_expert_used = 0;     // widest routed-id row observed in the graph
++    size_t last_weight_count = 0;
++    uint32_t graphs_without_growth = 0;
+     std::unordered_set<std::string> weights;
+     std::unordered_map<int, backend_budget> backends;
+ };
+@@ -1033,20 +1043,6 @@ static int sched_moe_layer_of(const char * name) {
+     return (end != name + 4 && *end == '.' && v >= 0) ? (int) v : -1;
+ }
+ 
+-static void sched_moe_auto_reset(struct sched_moe_auto_state * st) {
+-    if (st == nullptr) {
+-        return;
+-    }
+-    st->ready = false;
+-    st->invalid = false;
+-    st->weight_hash = 0;
+-    st->expert_bytes = 0;
+-    st->n_expert = INT64_MAX;
+-    st->n_expert_used = 0;
+-    st->weights.clear();
+-    st->backends.clear();
+-}
+-
+ static void sched_moe_auto_record(ggml_backend_sched_t sched, const struct ggml_tensor * weight,
+                                   const struct ggml_tensor * node, int backend_id) {
+     sched_moe_auto_state * st = sched->moe_auto;
+@@ -1096,7 +1092,7 @@ static void sched_moe_auto_enable(ggml_backend_sched_t sched) {
+     // uncommitted for backend/runtime variance, and include the 512-byte tail
+     // on every per-weight allocation. A scheduler spanning multiple local GPUs
+     // uses the smallest safe slot count instead of assuming one particular card.
+-    const size_t reserve = 1ull << 30;
++    const size_t reserve = 512ull << 20;
+     int cap = INT_MAX;
+     double free_gib = 0;
+     double staging_gib = 0;
+@@ -1132,13 +1128,21 @@ static void sched_moe_auto_enable(ggml_backend_sched_t sched) {
+     if (sched->moe != nullptr) {
+         GGML_LOG_INFO("moe-pool: adaptive cache enabled after the first complete graph: "
+                       "%d slots/tensor, %zu expert tensors on %zu device(s), %.2f GiB total free, "
+-                      "%.2f GiB staging, 1.00 GiB/device reserve; active from the next graph\n",
+-                      cap, st->weights.size(), st->backends.size(), free_gib, staging_gib);
++                      "%.2f GiB staging, %.2f GiB/device reserve; active from the next graph\n",
++                      cap, st->weights.size(), st->backends.size(), free_gib, staging_gib,
++                      (double) reserve / 1073741824.0);
++        // Do not invalidate or re-split here. llama.cpp may have already
++        // allocated this graph and written its inputs before compute; changing
++        // that allocation from synchronize() (or the compute entry) makes the
++        // just-written pointers stale. The current graph keeps its old plan.
++        // The next naturally rebuilt graph goes through reset/alloc and sees
++        // the pool from the start.
+     } else {
+         GGML_LOG_INFO("moe-pool: adaptive cache not enabled after the first complete graph: "
+                       "%zu target device(s) leave %d slots/tensor after staging and the "
+-                      "1.00 GiB/device reserve (this model needs at least %lld active experts)\n",
+-                      st->backends.size(), cap, (long long) st->n_expert_used);
++                      "%.2f GiB/device reserve (this model needs at least %lld active experts)\n",
++                      st->backends.size(), cap, (double) reserve / 1073741824.0,
++                      (long long) st->n_expert_used);
+     }
+     delete st;
+     sched->moe_auto = nullptr;
+@@ -1264,6 +1268,7 @@ static sched_moe_pool * sched_moe_pool_get(ggml_backend_sched_t sched, const str
+     auto p = std::make_unique<sched_moe_pool>();
+     p->weight = weight;
+     p->expert_size = expert_size;
++    p->n_expert = n_expert;
+     int cap = sched->moe->cap_experts;
+     if (cap <= 0 && sched->moe->pool_bytes > 0) {
+         const size_t n_w = std::max<size_t>(1, sched->moe->weights.size());
+@@ -1755,7 +1760,7 @@ static bool sched_moe_pool_serve(ggml_backend_sched_t sched, struct ggml_backend
+         snprintf(p->ids.name, sizeof(p->ids.name), "%.*s#ids", (int) sizeof(p->ids.name) - 5, input->name);
+         ggml_backend_tensor_alloc(keep, &p->ids, ggml_backend_buffer_get_base(keep));
+     }
+-    auto & remap = sched->moe->remap;
++    auto & remap = p->remap;
+     remap.resize((size_t) k * nt);
+     for (int64_t i1 = 0; i1 < nt; i1++) {
+         for (int64_t i0 = 0; i0 < k; i0++) {
+@@ -1854,6 +1859,48 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
+         return cur_backend_id;
+     }
+ 
++    // A cached RPC graph is re-split with its computed tensors still backed by
++    // the client's pre-allocated GPU buffer. supports_op() rejects its
++    // MUL_MAT_ID while src[0] is the restored host expert weight, even though
++    // the pool split below replaces that source with a device pool before the
++    // backend runs it. Only make this exception for a node that this scheduler
++    // has previously served from a pool; that proves the intended rewrite.
++    bool known_pool_weight = false;
++    if (sched->moe && tensor->op == GGML_OP_MUL_MAT_ID) {
++        for (const auto & kv : sched->moe->pools) {
++            if (!kv.second) {
++                continue;
++            }
++            // The RPC server grows (and therefore rebuilds) its scheduler when
++            // a larger graph shape arrives, while its graph LRU intentionally
++            // keeps smaller pre-allocated graphs. The new scheduler has no
++            // pointer binding for such an older graph yet. An exact managed
++            // weight name plus expert geometry is the stable identity across
++            // those independently deserialized graph arenas.
++            if (tensor->src[0] != nullptr && kv.first == tensor->src[0]->name &&
++                tensor->src[0]->ne[2] > 1 &&
++                tensor->src[0]->ne[2] == kv.second->n_expert &&
++                tensor->src[0]->nb[2] == kv.second->expert_size) {
++                known_pool_weight = true;
++            }
++        }
++    }
++    if (known_pool_weight) {
++        ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
++        for (int b = 0; buffer != nullptr && b < sched->n_backends; b++) {
++            ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
++            const enum ggml_backend_dev_type type = dev
++                ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
++            if ((type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
++                strncmp(ggml_backend_name(sched->backends[b]), "RPC", 3) != 0 &&
++                (sched->bufts[b] == buffer->buft ||
++                 ggml_backend_supports_buft(sched->backends[b], buffer->buft))) {
++                SET_CAUSE(tensor, "1.pool-dst");
++                return b;
++            }
++        }
++    }
++
+     // view_src
+     if (tensor->view_src != NULL) {
+         cur_backend_id = ggml_backend_sched_backend_from_buffer(sched, tensor->view_src, tensor);
+@@ -2081,7 +2128,12 @@ void ggml_backend_sched_assign_leaves(ggml_backend_sched_t sched, struct ggml_cg
+             // an earlier split computed (both asserted "src_backend_id != -1"
+             // on 2026-09-06 with a 787-token prompt)
+             struct ggml_tensor * leaf = src;
++            int view_depth = 0;
+             while (leaf->view_src != NULL) {
++                if (leaf->view_src == leaf || ++view_depth > graph->n_nodes + 1) {
++                    GGML_ABORT("scheduler encountered a cyclic view chain at '%s' while assigning '%s'",
++                               leaf->name, node->name);
++                }
+                 leaf = leaf->view_src;
+             }
+             if (leaf->buffer == NULL || computed.count(leaf)) {
+@@ -2108,8 +2160,6 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+     sched->n_splits = 0;
+     sched->n_graph_inputs = 0;
+     sched->is_reset = false;
+-    sched_moe_auto_reset(sched->moe_auto);
+-
+     struct ggml_init_params params = {
+         /* .mem_size =   */ sched->context_buffer_size,
+         /* .mem_buffer = */ sched->context_buffer,
+@@ -2337,6 +2387,63 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+         GGML_ASSERT(*cur_backend_id != -1);
+     }
+ 
++    // Adaptive sizing must observe host-resident expert weights even before a
++    // pool exists. At decode batch size the normal placement heuristic keeps
++    // MUL_MAT_ID on the CPU, so recording only cross-backend split inputs is a
++    // chicken-and-egg failure: no pool -> no GPU copy -> no observed weights.
++    // Infer the owner GPU from the router or activation source, then fall back
++    // to the first local GPU that supports the operation. RPC CPU weights are
++    // excluded by sched_moe_is_expert_weight(); their pool lives on the worker.
++    if (sched->moe_auto && sched->n_copies == 1) {
++        for (int i = 0; i < graph->n_nodes; i++) {
++            struct ggml_tensor * node = graph->nodes[i];
++            struct ggml_tensor * weight = node->src[0];
++            if (!sched_moe_is_expert_weight(node, weight)) {
++                continue;
++            }
++            int target_backend_id = -1;
++            const int preferred_srcs[] = { 2, 1 };
++            for (int j : preferred_srcs) {
++                struct ggml_tensor * src = node->src[j];
++                if (src == nullptr) {
++                    continue;
++                }
++                const int b = tensor_backend_id(src);
++                if (b < 0 || b >= sched->n_backends ||
++                    strncmp(ggml_backend_name(sched->backends[b]), "RPC", 3) == 0) {
++                    continue;
++                }
++                ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
++                const enum ggml_backend_dev_type type = dev
++                    ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
++                if ((type == GGML_BACKEND_DEVICE_TYPE_GPU ||
++                     type == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
++                    ggml_backend_supports_op(sched->backends[b], node)) {
++                    target_backend_id = b;
++                    break;
++                }
++            }
++            for (int b = 0; b < sched->n_backends && target_backend_id < 0; b++) {
++                if (strncmp(ggml_backend_name(sched->backends[b]), "RPC", 3) == 0) {
++                    continue;
++                }
++                ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
++                const enum ggml_backend_dev_type type = dev
++                    ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
++                if ((type == GGML_BACKEND_DEVICE_TYPE_GPU ||
++                     type == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
++                    ggml_backend_supports_op(sched->backends[b], node)) {
++                    target_backend_id = b;
++                }
++            }
++            if (target_backend_id < 0) {
++                sched->moe_auto->invalid = true;
++                continue;
++            }
++            sched_moe_auto_record(sched, weight, node, target_backend_id);
++        }
++    }
++
+     // pass 5: split graph, find tensors that need to be copied
+     {
+         int i_split = 0;
+@@ -2725,8 +2832,12 @@ struct sched_prof {
+     int64_t graph_batch = 0;    // columns of the first ids readback in the graph
+     uint64_t batch_sum = 0;
+     double wall_ms = 0;
++    double split_ms = 0, alloc_ms = 0;
+     // host waits by site (see compute_splits)
+     sched_prof_site w_input, w_pre, w_weight, w_ids, w_other;
++    // Wall time inside graph_compute_async(), categorized by backend. CUDA
++    // normally only launches here; CPU and RPC normally execute or wait here.
++    sched_prof_site submit_gpu, submit_cpu, submit_rpc, submit_other;
+     uint64_t n_splits = 0, n_expert_splits = 0, n_pool = 0, n_rpc = 0, n_ids = 0;
+     uint64_t staging_bytes = 0; // expert bytes copied by the no-pool path
+     // pool counters, as deltas against the previous graph
+@@ -2825,7 +2936,9 @@ static void sched_prof_reset_window(struct sched_prof * pr) {
+     pr->in_window = 0;
+     pr->batch_sum = 0;
+     pr->wall_ms = 0;
++    pr->split_ms = pr->alloc_ms = 0;
+     pr->w_input = pr->w_pre = pr->w_weight = pr->w_ids = pr->w_other = sched_prof_site();
++    pr->submit_gpu = pr->submit_cpu = pr->submit_rpc = pr->submit_other = sched_prof_site();
+     pr->n_splits = pr->n_expert_splits = pr->n_pool = pr->n_rpc = pr->n_ids = pr->staging_bytes = 0;
+     pr->hits = pr->misses = pr->prefetched = pr->bypassed = pr->miss_bytes = pr->prefetch_bytes = 0;
+     pr->n_gpu = 0;
+@@ -2837,16 +2950,20 @@ static void sched_prof_print(const struct sched_prof * pr) {
+     const double n = (double) std::max<uint64_t>(1, pr->in_window);
+     const double mib = 1048576.0;
+     fprintf(stderr,
+-        "moe-profile g%llu n=%llu batch %.1f wall %.2f ms"
++        "moe-profile g%llu n=%llu batch %.1f prepare %.2f ms (split %.2f alloc %.2f) wall %.2f ms"
+         " | splits %.1f (expert %.1f pool %.1f rpc %.1f gpu-timed %.1f) ids-readback %.1f"
+         " | host-wait %.2f ms: input %.1f/%.2f pre %.1f/%.2f weight %.1f/%.2f ids %.1f/%.2f other %.1f/%.2f"
++        " | submit: gpu %.1f/%.2f cpu %.1f/%.2f rpc %.1f/%.2f other %.1f/%.2f ms"
+         " | pool: hit %.1f miss %.1f (%.1f MiB) prefetch %.1f (%.1f MiB) bypass %.1f staging %.1f MiB"
+         " | gpu: expert-gap %.2f mmid %.2f other-gap %.2f other %.2f ms\n",
+-        (unsigned long long) pr->n_graphs, (unsigned long long) pr->in_window, pr->batch_sum / n, pr->wall_ms / n,
++        (unsigned long long) pr->n_graphs, (unsigned long long) pr->in_window, pr->batch_sum / n,
++        (pr->split_ms + pr->alloc_ms) / n, pr->split_ms / n, pr->alloc_ms / n, pr->wall_ms / n,
+         pr->n_splits / n, pr->n_expert_splits / n, pr->n_pool / n, pr->n_rpc / n, pr->n_gpu / n, pr->n_ids / n,
+         (pr->w_input.ms + pr->w_pre.ms + pr->w_weight.ms + pr->w_ids.ms + pr->w_other.ms) / n,
+         pr->w_input.n / n, pr->w_input.ms / n, pr->w_pre.n / n, pr->w_pre.ms / n,
+         pr->w_weight.n / n, pr->w_weight.ms / n, pr->w_ids.n / n, pr->w_ids.ms / n, pr->w_other.n / n, pr->w_other.ms / n,
++        pr->submit_gpu.n / n, pr->submit_gpu.ms / n, pr->submit_cpu.n / n, pr->submit_cpu.ms / n,
++        pr->submit_rpc.n / n, pr->submit_rpc.ms / n, pr->submit_other.n / n, pr->submit_other.ms / n,
+         pr->hits / n, pr->misses / n, pr->miss_bytes / n / mib, pr->prefetched / n, pr->prefetch_bytes / n / mib,
+         pr->bypassed / n, pr->staging_bytes / n / mib,
+         pr->gpu_expert_gap_ms / n, pr->gpu_expert_ms / n, pr->gpu_other_gap_ms / n, pr->gpu_other_ms / n);
+@@ -2904,6 +3021,10 @@ static void sched_prof_end_graph(ggml_backend_sched_t sched, struct sched_prof *
+         }
+     }
+     pr->wall_ms += sched_prof_ms_since(t_graph);
++    pr->split_ms += sched->prof_split_ms_pending;
++    pr->alloc_ms += sched->prof_alloc_ms_pending;
++    sched->prof_split_ms_pending = 0;
++    sched->prof_alloc_ms_pending = 0;
+     pr->batch_sum += pr->graph_batch;
+     pr->graph_batch = 0;
+     pr->n_graphs++;
+@@ -2922,6 +3043,8 @@ static void sched_prof_abort_graph(ggml_backend_sched_t sched, struct sched_prof
+     pr->ev_used = 0;
+     pr->last_expert_split = -1;
+     pr->graph_batch = 0;
++    sched->prof_split_ms_pending = 0;
++    sched->prof_alloc_ms_pending = 0;
+     sched_prof_reset_window(pr);
+     if (sched->moe) {
+         for (auto & kv : sched->moe->pools) {
+@@ -3166,7 +3289,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             ggml_backend_event_record(pe->mid, split_backend);
+         }
+         if (!sched->callback_eval) {
++            SCHED_PROF_T(t_submit);
+             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
++            if (pr) {
++                ggml_backend_dev_t submit_dev = ggml_backend_get_device(split_backend);
++                const enum ggml_backend_dev_type submit_type = submit_dev
++                    ? ggml_backend_dev_type(submit_dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
++                if (pr->is_rpc[split_backend_id]) {
++                    SCHED_PROF_ADD(submit_rpc, t_submit);
++                } else if (submit_type == GGML_BACKEND_DEVICE_TYPE_GPU ||
++                           submit_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
++                    SCHED_PROF_ADD(submit_gpu, t_submit);
++                } else if (submit_type == GGML_BACKEND_DEVICE_TYPE_CPU) {
++                    SCHED_PROF_ADD(submit_cpu, t_submit);
++                } else {
++                    SCHED_PROF_ADD(submit_other, t_submit);
++                }
++            }
+             if (ec != GGML_STATUS_SUCCESS) {
+                 if (pr) {
+                     sched_prof_abort_graph(sched, pr);
+@@ -3408,11 +3547,25 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
+     sched->cur_copy = sched->next_copy;
+     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
+ 
++    const auto prof_split_begin = sched->prof ? std::chrono::steady_clock::now()
++                                               : std::chrono::steady_clock::time_point();
+     ggml_backend_sched_split_graph(sched, graph);
++    const auto prof_alloc_begin = sched->prof ? std::chrono::steady_clock::now()
++                                               : std::chrono::steady_clock::time_point();
++    if (sched->prof) {
++        sched->prof_split_ms_pending = std::chrono::duration<double, std::milli>(
++            prof_alloc_begin - prof_split_begin).count();
++    }
+ 
+     if (!ggml_backend_sched_alloc_splits(sched)) {
++        sched->prof_split_ms_pending = 0;
++        sched->prof_alloc_ms_pending = 0;
+         return false;
+     }
++    if (sched->prof) {
++        sched->prof_alloc_ms_pending = std::chrono::duration<double, std::milli>(
++            std::chrono::steady_clock::now() - prof_alloc_begin).count();
++    }
+ 
+     sched->is_alloc = true;
+ 
+@@ -3438,18 +3591,37 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
+     }
+ 
+     const enum ggml_status status = ggml_backend_sched_compute_splits(sched);
+-    if (status == GGML_STATUS_SUCCESS && sched->moe_auto && sched_moe_auto_complete(sched->moe_auto)) {
+-        sched->moe_auto->ready = true;
+-    } else if (status == GGML_STATUS_SUCCESS && sched->moe_auto) {
+-        GGML_LOG_WARN("moe-pool: adaptive cache disabled: graph expert-weight identity "
+-                      "did not match the GGUF plan (observed %zu/%016llx, planned %llu/%016llx%s)\n",
+-                      sched->moe_auto->weights.size(),
+-                      (unsigned long long) sched->moe_auto->weight_hash,
+-                      (unsigned long long) sched->moe_auto->expected_weight_count,
+-                      (unsigned long long) sched->moe_auto->expected_weight_hash,
+-                      sched->moe_auto->invalid ? ", accounting overflow" : "");
+-        delete sched->moe_auto;
+-        sched->moe_auto = nullptr;
++    if (status == GGML_STATUS_SUCCESS && sched->moe_auto) {
++        sched_moe_auto_state * st = sched->moe_auto;
++        if (sched_moe_auto_complete(st)) {
++            st->ready = true;
++        } else {
++            const size_t observed = st->weights.size();
++            if (observed == st->last_weight_count) {
++                st->graphs_without_growth++;
++            } else {
++                st->last_weight_count = observed;
++                st->graphs_without_growth = 0;
++            }
++            // RPC and pipeline schedulers may receive disjoint graph fragments;
++            // collect their union instead of rejecting the first fragment.
++            // Fail closed once the union is impossible, or after 32 successful
++            // graphs without discovering another planned weight.
++            const bool impossible = st->invalid || observed > st->expected_weight_count ||
++                (observed == st->expected_weight_count &&
++                 st->weight_hash != st->expected_weight_hash);
++            if (impossible || st->graphs_without_growth >= 32) {
++                GGML_LOG_WARN("moe-pool: adaptive cache disabled: accumulated graph expert-weight identity "
++                              "did not match the GGUF plan (observed %zu/%016llx, planned %llu/%016llx%s)\n",
++                              observed,
++                              (unsigned long long) st->weight_hash,
++                              (unsigned long long) st->expected_weight_count,
++                              (unsigned long long) st->expected_weight_hash,
++                              st->invalid ? ", invalid accounting or no owner GPU" : "");
++                delete st;
++                sched->moe_auto = nullptr;
++            }
++        }
+     }
+     return status;
+ }
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index a983e9e..f208aef 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -88,10 +88,10 @@ enum rpc_cmd {
+ 
+ static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
+ 
+-// IdleToken pre-seeds each worker's tensor cache from its assigned GGUF layer
+-// ranges. Route every tensor through the cache command so a cold cluster start
+-// sends no model payload over RPC; required caches resolve weights by name.
+-const size_t HASH_THRESHOLD = 0;
++// Hash probes are useful for reusable model payloads and very large transfers,
++// but graph inputs change every decode step.  Probing every transient tensor
++// adds a serialized request/response round trip before the data is sent.
++const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
+ 
+ struct rpc_msg_hello_req {
+     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
+@@ -588,7 +588,7 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
+     if (ggml_backend_rpc_buffer_set_tensor_from_source(buffer, tensor, offset, size)) {
+         return;
+     }
+-    if (size > HASH_THRESHOLD) {
++    if (size > HASH_THRESHOLD || rpc_is_model_tensor_name(rpc_tensor.name)) {
+         rpc_msg_set_tensor_hash_req request;
+         request.tensor = rpc_tensor;
+         request.offset = offset;
+@@ -1184,11 +1184,35 @@ public:
+     bool copy_tensor_ranges(const std::vector<uint8_t> & input);
+ 
+     struct stored_graph {
++        struct source_binding {
++            ggml_tensor * tensor = nullptr;
++            std::array<ggml_tensor *, GGML_MAX_SRC> src = {};
++            ggml_tensor * view_src = nullptr;
++        };
++
+         std::vector<uint8_t>   buffer;
+         ggml_cgraph          * graph = nullptr;
++        // The backend scheduler rewrites node sources to temporary input-copy
++        // tensors in its own arena. A cached RPC graph outlives that arena
++        // when a larger graph forces the scheduler to be rebuilt, so retain
++        // and restore the deserialized (wire-canonical) links around every
++        // compute instead of leaving scheduler-owned pointers in the LRU.
++        std::vector<source_binding> sources;
+         uint64_t               last_used = 0;
+     };
+ 
++    static void restore_graph_sources(stored_graph & stored) {
++        for (const stored_graph::source_binding & binding : stored.sources) {
++            if (binding.tensor == nullptr) {
++                continue;
++            }
++            for (int j = 0; j < GGML_MAX_SRC; j++) {
++                binding.tensor->src[j] = binding.src[j];
++            }
++            binding.tensor->view_src = binding.view_src;
++        }
++    }
++
+ private:
+     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
+     bool get_cached_tensor_name(const rpc_tensor & tensor, std::vector<uint8_t> & data);
+@@ -1660,7 +1684,7 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
+     }
+ 
+     const void * data = input.data() + sizeof(rpc_tensor) + sizeof(offset);
+-    if (cache_dir && size > HASH_THRESHOLD) {
++    if (cache_dir && (size > HASH_THRESHOLD || rpc_is_model_tensor_name(in_tensor->name))) {
+         uint64_t hash = fnv_hash((const uint8_t*)data, size);
+         char hash_str[17];
+         snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
+@@ -2402,12 +2426,33 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+             graph->use_counts[hash_pos] = tensor_ptrs.at(id)->use_count;
+         }
+     }
++    stored.graph = graph;
++    /* Backend graph optimizers may rewrite not only graph nodes but also
++     * recursively deserialized source/view tensors (Metal turns Qcur into a
++     * self-view on the optimized split). Snapshot the entire tensor map: a
++     * node-only snapshot still leaves those leaf mutations behind and the
++     * next GRAPH_RECOMPUTE can loop forever while walking the view chain. */
++    stored.sources.clear();
++    stored.sources.reserve(tensor_map.size());
++    for (const auto & entry : tensor_map) {
++        ggml_tensor * tensor = entry.second;
++        if (tensor == nullptr) {
++            continue;
++        }
++        stored_graph::source_binding binding;
++        binding.tensor = tensor;
++        for (int j = 0; j < GGML_MAX_SRC; j++) {
++            binding.src[j] = tensor->src[j];
++        }
++        binding.view_src = tensor->view_src;
++        stored.sources.push_back(binding);
++    }
+     if (prof) {
+         prof->deser_pending_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_deser).count();
+     }
+     ggml_status status = compute(device, graph);
+     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+-    stored.graph = graph;
++    restore_graph_sources(stored);
+     stored.last_used = ++stored_graph_tick;
+     return true;
+ }
+@@ -2427,6 +2472,10 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
+     }
+     stored_graph & stored = found->second;
+     ggml_cgraph * graph = stored.graph;
++    if (stored.sources.empty()) {
++        return false;
++    }
++    restore_graph_sources(stored);
+     stored.last_used = ++stored_graph_tick;
+     LOG_DBG("[%s] device: %u, graph: %" PRIu64 "\n", __func__, device, request.graph_id);
+     if (prof) {
+@@ -2434,6 +2483,7 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
+     }
+     ggml_status status = compute(device, graph);
+     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
++    restore_graph_sources(stored);
+     return true;
+ }
+ 
+

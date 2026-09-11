@@ -144,10 +144,18 @@ ssize_t idletoken_udp_recvfrom(int fd, void *buf, size_t cap,
  * to "127.0.0.1". Returns 0 / -1. */
 int idletoken_local_ipv4(char *out, size_t cap);
 
+/* Numeric IPv4 on this side of an already-connected TCP socket. Unlike
+ * idletoken_local_ipv4(), this answers "which interface reaches THIS peer?"
+ * and therefore remains correct when a VPN owns the Internet default route.
+ * Returns 0 / -1. */
+int idletoken_socket_local_ipv4(int fd, char *out, size_t cap);
+
 /* True when `ip` (numeric IPv4 optionally with a ":port" suffix, or numeric
  * IPv6) belongs to an overlay/VPN network that tensor traffic must NEVER
  * cross (v2 plan hard invariant #3 — Tailscale's 100.64.0.0/10 CGNAT range:
  * MTU 1280 plus packet reorder deadlocked a measured transfer after 353 MB).
+ * Also rejects 198.18.0.0/15, the benchmarking range used by common proxy TUN
+ * adapters rather than a physical LAN.
  * Also matches Tailscale's IPv6 range fd7a:115c:a1e0::/48; other ULA space
  * (fc00::/7) is NOT matched — legitimate LANs use it. Compute traffic goes
  * over the real LAN; discovery/pairing may go anywhere. */

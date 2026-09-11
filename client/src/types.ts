@@ -17,6 +17,14 @@ export interface ProbeJson {
   ram_total: number;
   ram_used_other: number;
   ram_usable: number;
+  /** Host RAM that may be counted as the fast MoE expert tier. On Windows this
+   * is min(ram_usable, WDDM's per-process non-local budget); unified-memory
+   * machines report zero because they have no second pool. Optional only for
+   * compatibility with a pre-fix native sidecar. */
+  ram_expert_usable?: number;
+  /** Whether ram_expert_usable used a cached engine allocation measurement.
+   * False means the Windows value is the WDDM formula fallback. */
+  ram_expert_measured?: boolean;
   disk_avail: number;
   // Hardware floor verdict from the engine (src/common/resource.c
   // `idletoken_hw_check`). 0 = OK; anything else means this machine cannot serve

@@ -8,7 +8,7 @@
 // disk either way, and hiding it would defeat the point of the screen.
 import { useCallback, useEffect, useState } from "react";
 import { useI18n } from "./i18n";
-import { fmtBytes } from "./format";
+import { fmtBytes, fmtQuant } from "./format";
 import { describeGguf } from "./models";
 import { defaultModelDir, deleteWeights, listWeights, type StoredWeights } from "./weights";
 
@@ -44,11 +44,11 @@ export default function StoredModels(props: {
     void load();
   }, [load]);
 
-  const remove = async (file: string) => {
-    setBusy(file);
+  const remove = async (weights: StoredWeights) => {
+    setBusy(weights.file);
     setConfirming(null);
     try {
-      await deleteWeights(dir, file);
+      await deleteWeights(dir, weights.files);
       setError(null);
       await load();
       props.onChanged?.();
@@ -84,7 +84,7 @@ export default function StoredModels(props: {
               <li key={f.file + (f.partial ? ".part" : "")} className="stored__item">
                 <span className="stored__name" title={f.file}>
                   {d ? d.label : f.file}
-                  {d?.quant ? <span className="stored__quant">{d.quant}</span> : null}
+                  {d?.quant ? <span className="stored__quant">{fmtQuant(d.quant)}</span> : null}
                   {/* An unfinished download is worth its own word: it is the one
                       row where deleting throws away progress that would
                       otherwise be resumed rather than re-downloaded. */}
@@ -99,7 +99,7 @@ export default function StoredModels(props: {
                     <button className="linkbtn" onClick={() => setConfirming(null)}>
                       {t("store.keep")}
                     </button>
-                    <button className="linkbtn stored__go" onClick={() => void remove(f.file)}>
+                    <button className="linkbtn stored__go" onClick={() => void remove(f)}>
                       {t("store.confirm")}
                     </button>
                   </span>

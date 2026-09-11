@@ -1,0 +1,21 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -3305,10 +3305,13 @@ ggml_backend_sched_t ggml_backend_sched_new(
+         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
+         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
+ 
+-        if (sched->n_copies > 1) {
+-            for (int c = 0; c < sched->n_copies; c++) {
+-                sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
+-            }
++        // A single-copy scheduler still reuses its input-copy buffers between
++        // consecutive splits. Keep that dependency on the device stream with
++        // an event instead of synchronizing the whole backend on the host
++        // before every reuse. Multi-copy schedulers already used this path;
++        // an unsupported backend returns NULL and retains the old fallback.
++        for (int c = 0; c < sched->n_copies; c++) {
++            sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
+         }
+     }
+ 

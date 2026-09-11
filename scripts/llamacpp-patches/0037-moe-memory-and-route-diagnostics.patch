@@ -1,0 +1,143 @@
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1078,6 +1078,8 @@
+     std::vector<float> scores;
+     bool pinned_readback = false; // isolated diagnostic A/B; no cache-policy change
+     bool mapped_readback = false; // tiny CUDA routing reads only; opt-in diagnostic
++    uint64_t route_trace_graphs = 0; // bounded, explicit cache-policy measurement only
++    std::unordered_map<int, uint64_t> route_trace_last;
+     sched_moe_readback readbacks[GGML_SCHED_MAX_BACKENDS];
+     const float * score_read_ptr = nullptr;
+     int pregate_extra = 0;   // GGML_MOE_PREGATE_EXTRA: experts to prefetch beyond the top-k
+@@ -1227,6 +1229,13 @@
+         fixed = SIZE_MAX - fixed < tails ? SIZE_MAX : fixed + tails;
+         const size_t room = free > fixed ? free - fixed : 0;
+         const uint64_t raw_cap = budget.expert_bytes > 0 ? room / budget.expert_bytes : 0;
++        if (getenv("GGML_MOE_MEMORY_TRACE")) {
++            fprintf(stderr, "moe-memory backend=%d free_bytes=%zu total_bytes=%zu graph_bytes=%zu "
++                            "slot_bytes=%zu staging_bytes=%zu tail_bytes=%zu reserve_bytes=%zu raw_cap=%llu\n",
++                    backend_id, free, total, ggml_gallocr_get_buffer_size(sched->galloc, backend_id),
++                    budget.expert_bytes, budget.staging_bytes, tails, reserve,
++                    (unsigned long long) raw_cap);
++        }
+         const int backend_cap = raw_cap > INT_MAX ? INT_MAX : (int) raw_cap;
+         backend_caps[backend_id] = backend_cap;
+         cap = std::min(cap, backend_cap);
+@@ -1315,6 +1324,15 @@
+     const char * mapped_readback = getenv("GGML_MOE_MAPPED_READBACK");
+     st->mapped_readback = mapped_readback && atoi(mapped_readback) > 0;
+     st->pinned_readback = st->pinned_readback || st->mapped_readback;
++    const char * route_trace = getenv("GGML_MOE_ROUTE_TRACE");
++    if (route_trace) {
++        char * end = nullptr;
++        const unsigned long limit = strtoul(route_trace, &end, 10);
++        if (end == route_trace || *end || limit > 2048) {
++            GGML_ABORT("GGML_MOE_ROUTE_TRACE must be an integer from 0 to 2048 graphs");
++        }
++        st->route_trace_graphs = limit;
++    }
+     if (st->timing.every > 0 || st->pregate_stats_every > 0) {
+         const char * enabled = getenv("GGML_MOE_PREGATE");
+         if (!enabled || atoi(enabled) <= 0) {
+@@ -1830,6 +1848,37 @@
+         }
+     }
+     ggml_backend_tensor_get_async(backend, tensor, data, 0, bytes);
++}
++
++// Record the real selected sets, including small prefill batches that can
++// change cache residency. No scores, activations or prompt text are exported.
++// This is deliberately opt-in and bounded; traced timings are not benchmarks.
++static void sched_moe_trace_routes(ggml_backend_sched_t sched, const ggml_tensor * weight,
++        const std::vector<ggml_bitset_t> & used, int64_t experts, int64_t batch) {
++    if (!sched->moe || !sched->moe->route_trace_graphs ||
++        sched->moe->graph_seq > sched->moe->route_trace_graphs) return;
++    auto & st = *sched->moe;
++    const int layer = sched_moe_layer_of(weight->name);
++    if (layer < 0 || !st.weights.count(weight->name)) return;
++    auto last = st.route_trace_last.find(layer);
++    if (last != st.route_trace_last.end() && last->second == st.graph_seq) return;
++    st.route_trace_last[layer] = st.graph_seq;
++    auto found = st.pools.find(weight->name);
++    const auto * pool = found == st.pools.end() ? nullptr : found->second.get();
++    const int cap = pool ? pool->cap : (int) std::min<int64_t>(st.cap_experts, experts);
++    size_t selected = 0, hits = 0;
++    std::string ids;
++    char number[32];
++    for (int64_t e = 0; e < experts; ++e) {
++        if (!ggml_bitset_get(used.data(), e)) continue;
++        if (selected++) ids += ',';
++        snprintf(number, sizeof(number), "%lld", (long long) e);
++        ids += number;
++        if (pool && pool->where.count((int32_t) e)) ++hits;
++    }
++    fprintf(stderr, "moe-route graph=%llu layer=%d experts=%lld batch=%lld cap=%d selected=%zu hits=%zu ids=%s\n",
++            (unsigned long long) st.graph_seq, layer, (long long) experts,
++            (long long) batch, cap, selected, hits, ids.c_str());
+ }
+ 
+ static bool sched_moe_prefetch_prepare(ggml_backend_sched_t sched, int layer,
+@@ -2451,6 +2500,12 @@
+                 break;
+             }
+             if (q->slot_expert[slot] >= 0) {
++                if (st.route_trace_graphs && st.graph_seq <= st.route_trace_graphs &&
++                    ggml_bitset_get(used_ids.data(), q->slot_expert[slot])) {
++                    fprintf(stderr, "moe-route-evict graph=%llu layer=%d weight=%s victim=%d target=%lld bytes=%zu\n",
++                            (unsigned long long) st.graph_seq, layer, kv.first.c_str(),
++                            q->slot_expert[slot], (long long) e, q->expert_size);
++                }
+                 q->where.erase(q->slot_expert[slot]);
+             }
+             q->slot_expert[slot] = (int32_t) e;
+@@ -4121,6 +4176,7 @@
+                         if (sched->moe && ids_tensor->ne[1] == 1) {
+                             sched_moe_pregate_observe(sched, input, used_ids, n_expert);
+                         }
++                        sched_moe_trace_routes(sched, input, used_ids, n_expert, ids_tensor->ne[1]);
+ 
+                         prev_ids_tensor = ids_tensor;
+                         ids_just_read = true;
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -1312,6 +1312,7 @@
+     // every backend of this server, CPU last; created on first use
+     ggml_backend_sched_t sched = nullptr;
+     size_t sched_graph_size = 0;
++    bool memory_trace_pending = true;
+     ggml_backend_buffer_type_t device_buft(uint32_t dev_id);
+     ggml_status compute(uint32_t device, ggml_cgraph * graph);
+     /* Device ownership is needed for node-local CPU-to-GPU range copies.
+@@ -1528,6 +1529,20 @@
+         return GGML_STATUS_ALLOC_FAILED;
+     }
+     const clk::time_point t3 = prof ? clk::now() : clk::time_point();
++    if (memory_trace_pending && std::getenv("GGML_MOE_MEMORY_TRACE")) {
++        memory_trace_pending = false;
++        for (size_t b = 0; b < backends.size(); ++b) {
++            uint64_t client_bytes = 0;
++            for (const auto & entry : buffers) {
++                if (entry.second == b) client_bytes += ggml_backend_buffer_get_size(entry.first);
++            }
++            size_t free = 0, total = 0;
++            ggml_backend_dev_memory(ggml_backend_get_device(backends[b]), &free, &total);
++            fprintf(stderr, "rpc-moe-memory device=%zu client_bytes=%llu graph_bytes=%zu free_bytes=%zu total_bytes=%zu\n",
++                    b, (unsigned long long) client_bytes,
++                    ggml_backend_sched_get_buffer_size(sched, backends[b]), free, total);
++        }
++    }
+     const ggml_status status = ggml_backend_sched_graph_compute(sched, graph);
+     // GRAPH_RECOMPUTE keeps several deserialized graphs alive at once. The
+     // expert pools are scheduler-global, so their current weight/ids pointers
+@@ -1570,6 +1585,11 @@
+         LOG_DBG("[%s] device: %d, size: %" PRIu64 " -> remote_ptr: %" PRIx64 ", remote_size: %" PRIu64 "\n",
+             __func__, dev_id, request.size, response.remote_ptr, response.remote_size);
+         buffers.emplace(buffer, dev_id);
++        if (std::getenv("GGML_MOE_MEMORY_TRACE")) {
++            fprintf(stderr, "rpc-moe-alloc device=%u request_bytes=%llu allocated_bytes=%llu host=%d\n",
++                    dev_id, (unsigned long long) request.size,
++                    (unsigned long long) response.remote_size, (int) ggml_backend_buffer_is_host(buffer));
++        }
+     } else {
+         LOG_DBG("[%s] device: %d, size: %" PRIu64 " -> failed\n", __func__, dev_id, request.size);
+     }

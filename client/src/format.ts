@@ -9,6 +9,13 @@ export function fmtBytes(b: number): string {
   return `${b} B`;
 }
 
+/** Compact user-facing precision name. Some vendor manifests use the entire
+ * model/file stem as the quant identifier; keep that value for machine-facing
+ * matching while showing only the actual precision in the UI. */
+export function fmtQuant(quant: string): string {
+  return /(?:^|-)MXFP4(?:_MOE)?$/i.test(quant) ? "MXFP4" : quant;
+}
+
 /** GiB to one decimal, ALWAYS ROUNDED DOWN.
  *
  *  Not toFixed(1): rounding 15.674 up to 15.7 in one readout while the capacity

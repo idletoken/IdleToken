@@ -1,0 +1,43 @@
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -4,6 +4,7 @@
+ #include "ggml-cpp.h"
+ #include "transport.h"
+ #include "rpc-input-cache.h"
++#include "rpc-graph-capacity.h"
+ 
+ #include <array>
+ #include <cinttypes>
+@@ -1454,7 +1455,8 @@
+     // whose ubatch sizes vary (787-token prompt: 512, 275, 1, ...) sent five
+     // successively larger graphs in one benchmark (2026-09-06), so the pools
+     // never warmed up. The hash set costs a few bytes per slot.
+-    const size_t need = std::max<size_t>((size_t) graph->n_nodes * 4, 16384) + 4096;
++    const size_t need = rpc_scheduler_graph_capacity((size_t) graph->n_nodes);
++    GGML_ASSERT(need != 0 && "RPC scheduler metadata capacity overflow");
+     if (sched == nullptr || sched_graph_size < need) {
+         if (sched) {
+             ggml_backend_sched_free(sched);
+--- /dev/null
++++ b/ggml/src/ggml-rpc/rpc-graph-capacity.h
+@@ -0,0 +1,20 @@
++#pragma once
++#include <cstddef>
++#include <limits>
++
++// Round scheduler metadata capacity geometrically. Recreating a scheduler
++// drops its expert pools, so small changes in otherwise recurring graphs
++// must not grow capacity one node at a time. This reserves host metadata,
++// not a second GPU graph workspace. Zero means the requested size overflows.
++inline size_t rpc_scheduler_graph_capacity(size_t nodes) {
++    const size_t limit = std::numeric_limits<size_t>::max();
++    if (nodes > (limit - 4096) / 4) return 0;
++    const size_t scaled = nodes * 4;
++    const size_t required = (scaled < 16384 ? 16384 : scaled) + 4096;
++    size_t capacity = 32768;
++    while (capacity < required) {
++        if (capacity > limit / 2) return 0;
++        capacity *= 2;
++    }
++    return capacity;
++}

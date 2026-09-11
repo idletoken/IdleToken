@@ -412,14 +412,9 @@ export function describeGguf(file: string): { label: string; quant?: string } | 
 }
 
 // ---- precision (quant) selection -------------------------------------------
-// Small models expose a precision menu; large MLA-MoE models have one implicit
-// variant. These helpers give the UI a uniform view either way.
-
-// True when the model offers a user-selectable precision menu.
-export function hasQuantChoice(id: string): boolean {
-  const v = getManifest(id).variants;
-  return !!v && v.length > 1;
-}
+// Curated models expose their registered precision rows, even when only one
+// variant is available. Keeping that single row visible makes the actual
+// weight format explicit instead of silently treating it as a default.
 
 // The default precision for a model ("" when it has no explicit menu).
 export function defaultQuant(id: string): string {
@@ -608,6 +603,7 @@ export interface CapacityEstimate {
 export interface NodeMemory {
   vramFree?: number;
   ramFree?: number;
+  ramExpertFree?: number;
   unifiedMemory?: boolean;
 }
 
@@ -637,17 +633,6 @@ export function poolVram(nodes: NodeMemory[]): { bytes: number; complete: boolea
   return { bytes, complete };
 }
 
-/**
- * Cluster MoE Hybrid (routed experts in each owner node's RAM) is OPT-IN until
- * its real-LAN performance gate passes; the coordinator refuses the placement
- * unless IDLETOKEN_CLUSTER_MOE_HYBRID=1 is set on the machine that runs it.
- * This mirrors IDLETOKEN_CLUSTER_MOE_HYBRID_DEFAULT in include/idletoken_plan.h
- * so the resource card never offers a placement the runtime would refuse;
- * scripts/moe_local_gate.sh fails when the two values disagree. Flip both in
- * one commit, together with the evidence in results/.
- */
-export const CLUSTER_MOE_HYBRID_ENABLED = false;
-
 /** Potential node-local MoE expert pool. Unified-memory members contribute no
  * second pool; the runtime also filters out older workers that do not advertise
  * rpc-cpu-v1 and scans the exact GGUF tensor layout before admitting Hybrid. */
@@ -656,7 +641,10 @@ export function poolRam(nodes: NodeMemory[]): { bytes: number; complete: boolean
   let complete = nodes.length > 0;
   for (const n of nodes) {
     if (n.unifiedMemory) continue;
-    const r = n.ramFree ?? 0;
+    /* Use the member's already node-local budget, not raw free RAM. In
+     * particular, every Windows member has its own WDDM fixed reserve; adding
+     * ramFree first and subtracting one reserve for the cluster is wrong. */
+    const r = n.ramExpertFree ?? 0;
     if (r === 0) {
       complete = false;
       continue;
@@ -664,6 +652,103 @@ export function poolRam(nodes: NodeMemory[]): { bytes: number; complete: boolean
     bytes += r;
   }
   return { bytes, complete };
+}
+
+export type ClusterCapacityVerdict = "fits" | "short" | "unknown" | "hybrid-check";
+
+/** Classify only what the pre-flight aggregate can prove. RAM in a MoE cluster
+ * is owner-local: reaching `need` after adding it is a candidate, never proof
+ * that a contiguous per-node layer plan exists. */
+export function clusterCapacityVerdict(
+  needBytes: number,
+  gpuBytes: number,
+  ramExpertBytes: number,
+  isMoe: boolean,
+  gpuComplete = true,
+  ramComplete = true,
+): ClusterCapacityVerdict {
+  if (gpuBytes >= needBytes) return gpuComplete ? "fits" : "unknown";
+  if (isMoe && gpuBytes + ramExpertBytes >= needBytes) return "hybrid-check";
+  if (!gpuComplete || (isMoe && !ramComplete)) return "unknown";
+  return "short";
+}
+
+/**
+ * The RAM this machine adds to its capacity for a MoE model — the
+ * single-machine `--n-cpu-moe` path (hard constraint #6/#7), where routed
+ * experts may live in RAM.
+ *
+ * It is the native probe's node-local expert budget. This normally equals
+ * usable RAM, but Windows caps it at WDDM's per-process NON-LOCAL budget: RAM
+ * can be physically free while cudaHostAlloc can no longer page-lock it.
+ *
+ * Zero when it does not apply: a dense model (GPU_ONLY) or a unified-memory
+ * machine (one pool, nothing to add). For a cluster the caller passes the
+ * roster's pooled RAM (poolRam), which already leaves unified-memory members
+ * out — cluster MoE Hybrid keeps each machine's experts in its own RAM, so
+ * the pool is the sum of what the members can each hold. The coordinator
+ * remains the hard gate at launch, on the real tensor sizes.
+ */
+export function moeRamExpertBudget(modelId: string, ramBytes: number, unified: boolean): number {
+  if (unified || !isMoeModel(modelId)) return 0;
+  return Math.max(0, ramBytes);
+}
+
+/** Exact routed-expert layout read from the selected GGUF's tensor directory.
+ * Hybrid budgeting must not infer this split from parameter counts: different
+ * quantizations can store their expert tensors differently even when the model
+ * architecture is identical. */
+export interface MoeLayoutBudget {
+  expertBytesTotal: number;
+  nExpert: number;
+  nExpertUsed: number;
+  complete: boolean;
+}
+
+export interface HybridRequirements {
+  /** Non-expert resident weights + KV/workspace/node overhead + the smallest
+   * device expert pool that can serve one decode batch. */
+  vramNeedBytes: number;
+  /** The complete routed-expert store kept in system memory. */
+  ramNeedBytes: number;
+  /** Expert bytes included in vramNeedBytes for the one-batch device pool. */
+  transferBytes: number;
+  poolExperts: number;
+}
+
+/** Split a full-GPU requirement into Hybrid's two independent resource pools.
+ *
+ * The minimum device pool is the selected model's routed-expert count for one
+ * token (`n_expert_used`). This is not a universal constant and it is not a
+ * prefetch target: every extra byte of VRAM can retain more experts and reduce
+ * host-to-device traffic. */
+export function hybridRequirements(
+  fullGpuNeedBytes: number,
+  layout: MoeLayoutBudget | null | undefined,
+): HybridRequirements | null {
+  if (
+    !layout?.complete ||
+    !Number.isSafeInteger(fullGpuNeedBytes) ||
+    !Number.isSafeInteger(layout.expertBytesTotal) ||
+    fullGpuNeedBytes <= 0 ||
+    layout.expertBytesTotal <= 0 ||
+    layout.expertBytesTotal > fullGpuNeedBytes ||
+    layout.nExpert <= 0 ||
+    layout.nExpertUsed <= 0 ||
+    layout.nExpertUsed > layout.nExpert
+  ) {
+    return null;
+  }
+  const poolExperts = layout.nExpertUsed;
+  const transferBytes = Math.ceil(
+    (layout.expertBytesTotal * poolExperts) / layout.nExpert,
+  );
+  return {
+    vramNeedBytes: fullGpuNeedBytes - layout.expertBytesTotal + transferBytes,
+    ramNeedBytes: layout.expertBytesTotal,
+    transferBytes,
+    poolExperts,
+  };
 }
 
 // `nNodes`: the known cluster size when paired; pass the nominal typical
@@ -678,7 +763,11 @@ export function estimateClusterCapacity(
   // Which backend the machines run. Not cosmetic: GLM-5.2's measured workspace
   // is 1.50 GiB on CUDA and 33.25 GiB on Metal, so charging the wrong one is a
   // 22x error. Omitted = "unknown" = charge the larger, never the cheaper.
-  backend: NodeBackend = "unknown"
+  backend: NodeBackend = "unknown",
+  // Routed-expert bytes this machine's RAM may take for a MoE model
+  // (moeRamExpertBudget); 0 for everything else. Counted as capacity, never
+  // as a reduction of the need: the model still has to be loaded whole.
+  ramExpertBytes = 0
 ): CapacityEstimate {
   const man = getManifest(model.id);
   const n = Math.max(1, nNodes);
@@ -703,7 +792,7 @@ export function estimateClusterCapacity(
   // Product capacity is GPU-addressable memory only. On unified-memory
   // machines the native probe already reports the GPU working-set budget in
   // vram_usable, so there is still exactly one number to count.
-  const haveBytes = mem.vram_usable;
+  const haveBytes = mem.vram_usable + Math.max(0, ramExpertBytes);
   // Same split basis as plan.c's tensor-split cap: weights, KV and workspace
   // all divide with the layers, so the workspace belongs in the per-layer cost.
   const perLayer =

@@ -1,0 +1,134 @@
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -28,6 +28,7 @@
+ #endif
+ 
+ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
++static const char * RPC_WIRE_TRACE = std::getenv("GGML_MOE_WIRE_TRACE");
+ 
+ #define LOG_DBG(...) \
+     do { if (RPC_DEBUG) GGML_LOG_DEBUG(__VA_ARGS__); } while (0)
+@@ -281,6 +282,11 @@
+     std::shared_ptr<socket_t> sock;
+     void * base_ptr;
+     uint64_t remote_ptr;
++    // Constant graph inputs are read-only after the scheduler uploads them.
++    // Keyed by the exact remote tensor address; this state dies with the
++    // containing remote buffer, so address reuse after buffer free is safe.
++    std::unordered_map<uint64_t, std::pair<size_t, size_t>> constant_inputs;
++    std::mutex constant_inputs_mutex;
+ };
+ 
+ // RPC helper functions
+@@ -346,6 +352,9 @@
+ // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
+ // No response
+ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
++    if (RPC_WIRE_TRACE) {
++        fprintf(stderr, "[rpc-wire-cmd] cmd=%u tx=%zu\n", (unsigned) cmd, input_size);
++    }
+     uint8_t cmd_byte = cmd;
+     if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
+         return false;
+@@ -375,6 +384,9 @@
+     if (!sock->recv_data(output, output_size)) {
+         return false;
+     }
++    if (RPC_WIRE_TRACE) {
++        fprintf(stderr, "[rpc-wire-cmd] cmd=%u rx=%zu\n", (unsigned) cmd, output_size);
++    }
+     return true;
+ }
+ 
+@@ -542,6 +554,23 @@
+            strstr(name, ".weight") != nullptr;
+ }
+ 
++static bool rpc_is_constant_graph_input(const char * name) {
++    if (name == nullptr || name[0] == '\0') {
++        return false;
++    }
++    // The KV-cache rotation input is a Hadamard matrix selected only by its
++    // dimensions. llama_kv_cache::set_input_k_rot() copies the same matrix on
++    // every graph invocation, while graph execution only reads it. RPC tensor
++    // names may carry a scheduler prefix, hence the delimited substring test.
++    return strcmp(name, "attn_inp_k_rot") == 0 ||
++           strstr(name, "#attn_inp_k_rot#") != nullptr;
++}
++
++static bool rpc_constant_input_cache_enabled() {
++    const char * value = std::getenv("GGML_MOE_RPC_CONSTANT_INPUT_CACHE");
++    return value == nullptr || strcmp(value, "0") != 0;
++}
++
+ static bool ggml_backend_rpc_buffer_set_tensor_from_source(
+         ggml_backend_buffer_t buffer, ggml_tensor * tensor,
+         size_t offset, size_t size) {
+@@ -585,6 +614,20 @@
+ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+     rpc_tensor rpc_tensor = serialize_tensor(tensor);
++    const bool constant_input = rpc_constant_input_cache_enabled() &&
++                                rpc_is_constant_graph_input(rpc_tensor.name);
++    if (constant_input) {
++        std::lock_guard<std::mutex> lock(ctx->constant_inputs_mutex);
++        const auto found = ctx->constant_inputs.find(rpc_tensor.data);
++        if (found != ctx->constant_inputs.end() &&
++            found->second.first == offset && found->second.second == size) {
++            if (RPC_WIRE_TRACE) {
++                fprintf(stderr, "[rpc-wire] skip-constant tensor='%s' data=%zu\n",
++                        rpc_tensor.name, size);
++            }
++            return;
++        }
++    }
+     if (ggml_backend_rpc_buffer_set_tensor_from_source(buffer, tensor, offset, size)) {
+         return;
+     }
+@@ -609,6 +652,14 @@
+     memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
+     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
+     RPC_STATUS_ASSERT(status);
++    if (constant_input) {
++        std::lock_guard<std::mutex> lock(ctx->constant_inputs_mutex);
++        ctx->constant_inputs[rpc_tensor.data] = {offset, size};
++    }
++    if (RPC_WIRE_TRACE) {
++        fprintf(stderr, "[rpc-wire] set tensor='%s' data=%zu request=%zu\n",
++                rpc_tensor.name, size, input.size());
++    }
+ }
+ 
+ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+@@ -619,6 +670,10 @@
+     request.size = size;
+     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
+     RPC_STATUS_ASSERT(status);
++    if (RPC_WIRE_TRACE) {
++        fprintf(stderr, "[rpc-wire] get tensor='%s' data=%zu request=%zu\n",
++                request.tensor.name, size, sizeof(request));
++    }
+ }
+ 
+ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+@@ -911,6 +966,10 @@
+         };
+         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
+         RPC_STATUS_ASSERT(status);
++        if (RPC_WIRE_TRACE) {
++            fprintf(stderr, "[rpc-wire] graph-recompute request=%zu cached-graph=%zu\n",
++                    sizeof(request), hit->payload.size());
++        }
+         hit->last_used = ++rpc_dev_ctx->graph_cache_tick;
+         rpc_dev_ctx->last_graph_uid = cgraph->uid;
+         rpc_dev_ctx->last_graph_id = hit->id;
+@@ -920,6 +979,9 @@
+     } else {
+         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
+         RPC_STATUS_ASSERT(status);
++        if (RPC_WIRE_TRACE) {
++            fprintf(stderr, "[rpc-wire] graph-compute request=%zu\n", input.size());
++        }
+         if (rpc_dev_ctx->graph_cache.size() == RPC_GRAPH_CACHE_CAPACITY) {
+             auto oldest = std::min_element(
+                 rpc_dev_ctx->graph_cache.begin(), rpc_dev_ctx->graph_cache.end(),

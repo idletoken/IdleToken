@@ -1,0 +1,38 @@
+diff --git a/ggml/src/ggml-moe-schedule.h b/ggml/src/ggml-moe-schedule.h
+index 302858b..98102a2 100644
+--- a/ggml/src/ggml-moe-schedule.h
++++ b/ggml/src/ggml-moe-schedule.h
+@@ -64,7 +64,7 @@ struct layer {
+ 
+ struct allocation {
+     size_t resident = 0;
+-    size_t rolling = 0;
++    size_t rolling = 0;        // Storage capacity, not a promise to copy every part.
+     size_t rolling_bytes = 0;
+     double copy_budget_ms = 0;
+ };
+@@ -105,16 +105,22 @@ static inline plan make_plan(const std::vector<layer> & layers, size_t budget,
+         const auto & l = layers[i];
+         if (!l.experts || !l.active || l.active > l.experts || l.parts.empty()) return out;
+         for (size_t j = 0; j < i; ++j) if (l.id == layers[j].id) return out;
+-        double cost = 0;
++        double cost = 0, cheapest = std::numeric_limits<double>::infinity();
+         bool measured = std::isfinite(l.window_ms) && l.window_ms >= 0;
+         for (const auto & p : l.parts) {
+             if (!p.bytes) return out;
+             if (!std::isfinite(p.copy_ms) || p.copy_ms <= 0) measured = false;
+             cost += p.copy_ms;
++            cheapest = std::min(cheapest, p.copy_ms);
+         }
+         if (measured && std::isfinite(cost) && cost > 0) {
+             out.layers[i].copy_budget_ms = l.window_ms * headroom;
+-            const double count = std::floor(out.layers[i].copy_budget_ms / cost);
++            double count = std::floor(out.layers[i].copy_budget_ms / cost);
++            // A partial expert is useful too: each matrix is repaired and
++            // consumed independently. Reserve one more slot only if the
++            // residual window fits an actual part. Admission still enforces
++            // the measured TOTAL copy-time budget for every issued part.
++            if (count < (double) l.experts && out.layers[i].copy_budget_ms - count * cost >= cheapest) ++count;
+             wanted[i] = count >= (double) l.experts ? l.experts : (size_t) count;
+         }
+     }

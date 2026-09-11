@@ -1,0 +1,261 @@
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -92,6 +92,9 @@ extern "C" {
+     // "offset" refers to the offset in tensor->data for setting/getting data
+     GGML_API void ggml_backend_tensor_set   (      struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+     GGML_API void ggml_backend_tensor_get   (const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size);
++    // Ask a backend-owned source to populate the tensor without materializing
++    // the bytes in the caller. Returns false when the buffer has no such source.
++    GGML_API bool ggml_backend_tensor_set_from_source(struct ggml_tensor * tensor, size_t offset, size_t size);
+     GGML_API void ggml_backend_tensor_set_2d(      struct ggml_tensor * tensor, const void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
+     GGML_API void ggml_backend_tensor_get_2d(const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
+     GGML_API void ggml_backend_tensor_memset(      struct ggml_tensor * tensor,     uint8_t value, size_t offset, size_t size);
+diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
+--- a/ggml/src/ggml-backend-impl.h
++++ b/ggml/src/ggml-backend-impl.h
+@@ -57,6 +57,9 @@ extern "C" {
+         void         (*clear)        (ggml_backend_buffer_t buffer, uint8_t value);
+         // (optional) reset any internal state due to tensor initialization, such as tensor extras
+         void         (*reset)        (ggml_backend_buffer_t buffer);
++        // (optional) populate a tensor from a backend-owned source without
++        // requiring the caller to read or allocate the source bytes
++        bool         (*set_tensor_from_source)(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, size_t offset, size_t size);
+     };
+ 
+     struct ggml_backend_buffer {
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -380,6 +380,19 @@ void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, siz
+     buf->iface.set_tensor(buf, tensor, data, offset, size);
+ }
+ 
++bool ggml_backend_tensor_set_from_source(struct ggml_tensor * tensor, size_t offset, size_t size) {
++    GGML_ASSERT(tensor);
++    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
++    GGML_ASSERT(buf != NULL && "tensor buffer not set");
++    if (size == 0) {
++        return true;
++    }
++    GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
++    GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
++    return buf->iface.set_tensor_from_source != NULL &&
++           buf->iface.set_tensor_from_source(buf, tensor, offset, size);
++}
++
+ void ggml_backend_tensor_get(const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+     GGML_ASSERT(tensor);
+     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -528,24 +528,42 @@ static bool rpc_is_model_tensor_name(const char * name) {
+            strstr(name, ".weight") != nullptr;
+ }
+ 
++static bool ggml_backend_rpc_buffer_set_tensor_from_source(
++        ggml_backend_buffer_t buffer, ggml_tensor * tensor,
++        size_t offset, size_t size) {
++    const char * require_cache = std::getenv("GGML_RPC_REQUIRE_MODEL_CACHE");
++    if (require_cache == nullptr || strcmp(require_cache, "0") == 0 ||
++        !rpc_is_model_tensor_name(tensor->name)) {
++        return false;
++    }
++    ggml_backend_rpc_buffer_context * ctx =
++        (ggml_backend_rpc_buffer_context *) buffer->context;
++    rpc_msg_set_tensor_hash_req request;
++    request.tensor = serialize_tensor(tensor);
++    request.offset = offset;
++    request.hash = 0; // required name-only lookup on the worker's local GGUF
++    rpc_msg_set_tensor_hash_rsp response;
++    const bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_HASH,
++        &request, sizeof(request), &response, sizeof(response));
++    RPC_STATUS_ASSERT(status);
++    if (!response.result) {
++        GGML_ABORT("required RPC model source miss for tensor '%s' (%zu bytes)",
++                   request.tensor.name, size);
++    }
++    return true;
++}
++
+ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+     rpc_tensor rpc_tensor = serialize_tensor(tensor);
++    if (ggml_backend_rpc_buffer_set_tensor_from_source(buffer, tensor, offset, size)) {
++        return;
++    }
+     if (size > HASH_THRESHOLD) {
+-        const char * require_cache = std::getenv("GGML_RPC_REQUIRE_MODEL_CACHE");
+-        const bool required_model_cache =
+-            require_cache != nullptr && strcmp(require_cache, "0") != 0 &&
+-            rpc_is_model_tensor_name(rpc_tensor.name);
+         rpc_msg_set_tensor_hash_req request;
+         request.tensor = rpc_tensor;
+         request.offset = offset;
+-        /* A required model cache is keyed by the tensor name on the worker.
+-         * Hashing the coordinator's sparse GGUF would pointlessly page through
+-         * every remote tensor before asking for that name. The hash remains
+-         * authoritative for all other cache traffic. */
+-        request.hash = required_model_cache
+-            ? 0
+-            : fnv_hash((const uint8_t*)data, size);
++        request.hash = fnv_hash((const uint8_t*)data, size);
+         rpc_msg_set_tensor_hash_rsp response;
+         bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
+         RPC_STATUS_ASSERT(status);
+@@ -554,10 +574,6 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
+             // the server has the same data, no need to send it
+             return;
+         }
+-        if (required_model_cache) {
+-            GGML_ABORT("required RPC model cache miss for tensor '%s' (%zu bytes)",
+-                       rpc_tensor.name, size);
+-        }
+     }
+     // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
+     size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
+@@ -619,6 +635,7 @@ static ggml_backend_buffer_i ggml_backend_rpc_buffer_interface = {
+     /* .cpy_tensor      = */ ggml_backend_rpc_buffer_cpy_tensor,
+     /* .clear           = */ ggml_backend_rpc_buffer_clear,
+     /* .reset           = */ NULL,
++    /* .set_tensor_from_source = */ ggml_backend_rpc_buffer_set_tensor_from_source,
+ };
+ 
+ static const char * ggml_backend_rpc_buffer_type_name(ggml_backend_buffer_type_t buft) {
+@@ -1574,7 +1591,29 @@ static bool read_cached_file(const fs::path & cache_file, std::vector<uint8_t> &
+ }
+ 
++struct rpc_local_file {
++    fs::path path;
++    int fd = -1;
++    std::mutex mutex;
++
++    explicit rpc_local_file(const fs::path & source) : path(source) {
++#ifdef _WIN32
++        fd = _wopen(path.c_str(), _O_RDONLY | _O_BINARY | _O_SEQUENTIAL);
++#else
++        fd = open(path.c_str(), O_RDONLY);
++#endif
++    }
++    ~rpc_local_file() {
++        if (fd < 0) return;
++#ifdef _WIN32
++        _close(fd);
++#else
++        close(fd);
++#endif
++    }
++};
++
+ struct rpc_local_tensor_source {
+-    fs::path path;
++    std::shared_ptr<rpc_local_file> file;
+     uint64_t offset;
+     uint64_t size;
+ };
+@@ -1650,6 +1688,7 @@ static rpc_local_model_index load_rpc_local_model_index() {
+     struct local_part {
+         fs::path path;
+         uint64_t size = 0;
++        std::shared_ptr<rpc_local_file> file;
+     };
+     std::vector<local_part> parts(n_parts);
+     if (version == 2) {
+@@ -1690,6 +1729,12 @@ static rpc_local_model_index load_rpc_local_model_index() {
+                            i + 1, ec ? UINTMAX_MAX : actual, parts[i].size);
+             return result;
+         }
++        parts[i].file = std::make_shared<rpc_local_file>(parts[i].path);
++        if (parts[i].file->fd < 0) {
++            GGML_LOG_ERROR("[rpc] cannot open local GGUF part %u for direct reads\n",
++                           i + 1);
++            return result;
++        }
+     }
+ 
+     for (uint64_t i = 0; i < n_tensors; ++i) {
+@@ -1717,7 +1762,7 @@ static rpc_local_model_index load_rpc_local_model_index() {
+             (static_cast<uint64_t>(layer) >= layer_lo &&
+              static_cast<uint64_t>(layer) < layer_hi)) {
+             const auto inserted = result.tensors.emplace(
+-                name, rpc_local_tensor_source { parts[part - 1].path, offset, size });
++                name, rpc_local_tensor_source { parts[part - 1].file, offset, size });
+             if (!inserted.second) {
+                 GGML_LOG_ERROR("[rpc] duplicate tensor '%s' in local model index\n",
+                                name.c_str());
+@@ -1754,23 +1799,19 @@ static bool read_rpc_local_tensor(const std::string & name,
+     }
+     const rpc_local_tensor_source & source = found->second;
+     data.resize(static_cast<size_t>(source.size));
++    if (!source.file || source.file->fd < 0) {
++        data.clear();
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(source.file->mutex);
+ #ifdef _WIN32
+-    const int fd = _wopen(source.path.c_str(), _O_RDONLY | _O_BINARY | _O_SEQUENTIAL);
+-    const bool seek_ok = fd >= 0 && source.offset <= INT64_MAX &&
+-                         _lseeki64(fd, static_cast<int64_t>(source.offset), SEEK_SET) >= 0;
++    const bool seek_ok = source.offset <= INT64_MAX &&
++                         _lseeki64(source.file->fd, static_cast<int64_t>(source.offset), SEEK_SET) >= 0;
+ #else
+-    const int fd = open(source.path.c_str(), O_RDONLY);
+-    const bool seek_ok = fd >= 0 && source.offset <= INT64_MAX &&
+-                         lseek(fd, static_cast<off_t>(source.offset), SEEK_SET) >= 0;
++    const bool seek_ok = source.offset <= INT64_MAX &&
++                         lseek(source.file->fd, static_cast<off_t>(source.offset), SEEK_SET) >= 0;
+ #endif
+     if (!seek_ok) {
+-        if (fd >= 0) {
+-#ifdef _WIN32
+-            _close(fd);
+-#else
+-            close(fd);
+-#endif
+-        }
+         data.clear();
+         return false;
+     }
+@@ -1780,19 +1821,14 @@ static bool read_rpc_local_tensor(const std::string & name,
+             std::min<size_t>(data.size() - done, 8U << 20));
+ #ifdef _WIN32
+-        const int n = _read(fd, data.data() + done, chunk);
++        const int n = _read(source.file->fd, data.data() + done, chunk);
+ #else
+-        const ssize_t n = read(fd, data.data() + done, chunk);
++        const ssize_t n = read(source.file->fd, data.data() + done, chunk);
+ #endif
+         if (n <= 0) {
+             break;
+         }
+         done += static_cast<size_t>(n);
+     }
+-#ifdef _WIN32
+-    _close(fd);
+-#else
+-    close(fd);
+-#endif
+     if (done != data.size()) {
+         GGML_LOG_ERROR("[rpc] short read for local GGUF tensor '%s'\n", name.c_str());
+         data.clear();
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1556,6 +1556,16 @@ bool llama_model_loader::load_all_data(
+ 
+         size_t n_size = ggml_nbytes(cur);
+ 
++        /* IdleToken workers own a verified complete GGUF. For an RPC weight,
++         * ask that backend to populate the tensor by name before touching the
++         * coordinator's copy. This is the key cold-start invariant: each node
++         * reads only the weight bytes it actually owns. Tensor validation still
++         * takes the ordinary local-read path when explicitly requested. */
++        if (!check_tensors && ggml_backend_tensor_set_from_source(cur, 0, n_size)) {
++            size_done += n_size;
++            continue;
++        }
++
+         if (use_mmap) {
+             const auto & mapping = mappings.at(weight->idx);
+             ggml_backend_buffer_t buf_mmap = nullptr;

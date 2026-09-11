@@ -7,7 +7,16 @@ import { fmtBytes } from "./format";
 export interface WeightsInfo {
   needs: boolean;
   path: string;
-  dl: { have: number; total: number; note?: string } | null;
+  dl: {
+    have: number;
+    total: number;
+    note?: string;
+    phase?: "probing" | "downloading" | "verifying";
+    phaseHave?: number;
+    phaseTotal?: number;
+    part?: number;
+    parts?: number;
+  } | null;
   /** Bytes of an unfinished copy on disk; the next attempt resumes from it. */
   partialBytes: number;
   /** Why the last attempt stopped. A footnote on the "not here yet" row — not
@@ -47,12 +56,22 @@ export default function WeightsRow(props: { w: WeightsInfo; idle?: "hide" | "sho
 
   if (d) {
     const pct = d.total > 0 ? Math.min(100, Math.round((d.have / d.total) * 100)) : 0;
+    const verifying = d.phase === "verifying"
+      && d.phaseHave !== undefined && d.phaseTotal !== undefined;
+    const phaseMessage = verifying
+      ? t(d.parts && d.parts > 1 ? "weights.verifyingPart" : "weights.verifying", {
+          part: d.part ?? 1,
+          parts: d.parts ?? 1,
+          have: fmtBytes(d.phaseHave ?? 0),
+          total: fmtBytes(d.phaseTotal ?? 0),
+        })
+      : d.note ? tErr(d.note) : "";
     return (
       <span className="wrow" onClick={stop}>
         <span className="wrow__bar"><i style={{ width: `${pct}%` }} /></span>
         <span className="wrow__msg">
           {fmtBytes(d.have)}{d.total > 0 ? ` / ${fmtBytes(d.total)}` : ""}
-          {d.note ? ` · ${tErr(d.note)}` : ""}
+          {phaseMessage ? ` · ${phaseMessage}` : ""}
         </span>
         <button className="linkbtn" onClick={props.w.onCancel}>{t("weights.cancel")}</button>
       </span>

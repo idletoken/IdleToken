@@ -1,0 +1,149 @@
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -13,6 +13,7 @@
+ #include "ggml-alloc.h"
+ #include "ggml-impl.h"
+ #include "ggml-moe-cache-pin.h"
++#include "ggml-moe-inline-ids.h"
+ #include "ggml-moe-copy-budget.h"
+ #include "ggml-moe-schedule.h"
+ #include "ggml-timeline.h"
+@@ -1047,6 +1048,8 @@
+ struct sched_moe_readback {
+     ggml_backend_buffer_t ids = nullptr, scores = nullptr;
+ };
++
++using sched_moe_inline_ids_fn = bool (*)(ggml_backend_t, struct ggml_tensor *, const void *, size_t, size_t);
+ 
+ struct sched_moe_state {
+     int cap_experts = 0;            // GGML_MOE_POOL_EXPERTS: slots per tensor (0 = derive from bytes)
+@@ -1079,6 +1082,9 @@
+     std::vector<float> scores;
+     bool pinned_readback = false; // isolated diagnostic A/B; no cache-policy change
+     bool mapped_readback = false; // tiny CUDA routing reads only; opt-in diagnostic
++    bool inline_ids = false; // tiny slot-id writes through CUDA launch parameters
++    bool inline_ids_initialized[GGML_SCHED_MAX_BACKENDS] = {};
++    sched_moe_inline_ids_fn inline_ids_set[GGML_SCHED_MAX_BACKENDS] = {};
+     uint64_t route_trace_graphs = 0; // bounded, explicit cache-policy measurement only
+     std::unordered_map<int, uint64_t> route_trace_last;
+     sched_moe_readback readbacks[GGML_SCHED_MAX_BACKENDS];
+@@ -1325,6 +1331,8 @@
+     const char * mapped_readback = getenv("GGML_MOE_MAPPED_READBACK");
+     st->mapped_readback = mapped_readback && atoi(mapped_readback) > 0;
+     st->pinned_readback = st->pinned_readback || st->mapped_readback;
++    const char * inline_ids = getenv("GGML_MOE_INLINE_IDS");
++    st->inline_ids = inline_ids && atoi(inline_ids) > 0;
+     const char * route_trace = getenv("GGML_MOE_ROUTE_TRACE");
+     if (route_trace) {
+         char * end = nullptr;
+@@ -2730,7 +2738,28 @@
+             remap[i1 * k + i0] = w->second;
+         }
+     }
+-    ggml_backend_tensor_set_async(split_backend, &p->ids, remap.data(), 0, need);
++    bool inline_written = false;
++    auto & st = *sched->moe;
++    if (st.inline_ids && nt == 1 && (size_t) k <= ggml_moe_inline_ids::capacity) {
++        if (!st.inline_ids_initialized[split_backend_id]) {
++            st.inline_ids_initialized[split_backend_id] = true;
++            const auto dev = ggml_backend_get_device(split_backend);
++            const auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
++            if (reg && strcmp(ggml_backend_reg_name(reg), "CUDA") == 0) {
++                st.inline_ids_set[split_backend_id] = (sched_moe_inline_ids_fn)
++                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_tensor_async_inline_ids");
++                if (!st.inline_ids_set[split_backend_id]) GGML_ABORT("inline MoE ids requested but CUDA helper is unavailable");
++                fprintf(stderr, "moe-inline-ids: device=%s max-ids=%zu by-value-arguments=1\n",
++                        ggml_backend_dev_name(dev), ggml_moe_inline_ids::capacity);
++            }
++        }
++        if (st.inline_ids_set[split_backend_id]) {
++            ggml_timeline::scope trace("moe.inline_ids", p->ids.name, need);
++            inline_written = st.inline_ids_set[split_backend_id](split_backend, &p->ids, remap.data(), 0, need);
++            GGML_ASSERT(inline_written && "validated tiny slot-id upload was rejected");
++        }
++    }
++    if (!inline_written) ggml_backend_tensor_set_async(split_backend, &p->ids, remap.data(), 0, need);
+     return true;
+ }
+ 
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1,6 +1,7 @@
+ #include "ggml-cuda.h"
+ #include "ggml-impl.h"
+ #include "ggml-backend-impl.h"
++#include "ggml-moe-inline-ids.h"
+ 
+ #include "ggml-cuda/allreduce.cuh"
+ #include "ggml-cuda/common.cuh"
+@@ -2468,6 +2469,34 @@
+ }
+ 
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++// Small slot-id updates otherwise queue on the copy engine behind large expert
++// H2D transfers. CUDA copies by-value launch arguments before this call returns;
++// writing them on the compute stream preserves ordering without pinned-memory
++// lifetime rules, another stream, or a host synchronization.
++static __global__ void ggml_cuda_inline_ids_kernel(
++        int32_t * dst, ggml_moe_inline_ids::payload values, size_t count) {
++    if (threadIdx.x < count) dst[threadIdx.x] = values.values[threadIdx.x];
++}
++
++static bool ggml_backend_cuda_set_tensor_async_inline_ids(ggml_backend_t backend,
++        ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
++    ggml_moe_inline_ids::payload values;
++    if (tensor->type != GGML_TYPE_I32 || !ggml_is_contiguous(tensor) ||
++        offset % sizeof(int32_t) != 0 || offset > ggml_nbytes(tensor) ||
++        size > ggml_nbytes(tensor) - offset || !ggml_moe_inline_ids::pack(values, data, size)) {
++        return false;
++    }
++    auto * ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
++    GGML_ASSERT(buf && buf->buft == ggml_backend_cuda_buffer_type(ctx->device));
++    ggml_cuda_set_device(ctx->device);
++    ggml_cuda_timeline::scope timing(ctx->stream(), "inline_ids", tensor->name, size);
++    ggml_cuda_inline_ids_kernel<<<1, ggml_moe_inline_ids::capacity, 0, ctx->stream()>>>(
++        (int32_t *) ((char *) tensor->data + offset), values, size / sizeof(int32_t));
++    CUDA_CHECK(cudaGetLastError());
++    return true;
++}
++
+ // Tiny, explicitly requested routing readbacks need not queue behind expert
+ // H2D traffic on GPUs with one copy engine. Store to mapped pinned host memory
+ // using an SM instead. The caller still performs its existing stream sync;
+@@ -5556,6 +5585,9 @@
+ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+     GGML_UNUSED(reg);
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    if (strcmp(name, "ggml_backend_cuda_set_tensor_async_inline_ids") == 0) {
++        return (void *)ggml_backend_cuda_set_tensor_async_inline_ids;
++    }
+     if (strcmp(name, "ggml_backend_cuda_get_tensor_async_mapped") == 0) {
+         return (void *)ggml_backend_cuda_get_tensor_async_mapped;
+     }
+--- /dev/null
++++ b/ggml/src/ggml-moe-inline-ids.h
+@@ -0,0 +1,23 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++
++namespace ggml_moe_inline_ids {
++// A kernel-argument fast path, not a model/expert-count limit. Larger batches
++// keep the ordinary tensor upload. No asynchronous host pointer is retained.
++constexpr size_t capacity = 64;
++struct payload {
++    int32_t values[capacity];
++};
++
++inline bool pack(payload & out, const void * source, size_t bytes) {
++    if (!source || bytes == 0 || bytes % sizeof(int32_t) != 0 || bytes > sizeof(out.values)) {
++        return false;
++    }
++    out = {};
++    std::memcpy(out.values, source, bytes);
++    return true;
++}
++}

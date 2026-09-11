@@ -1,0 +1,38 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index d3eff58..6a13d47 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1244,7 +1244,7 @@ static void sched_moe_auto_enable(ggml_backend_sched_t sched) {
+         if (sched->moe->schedule) {
+             std::copy(std::begin(backend_caps), std::end(backend_caps), std::begin(sched->moe->initial_caps));
+         }
+-        GGML_LOG_INFO("moe-pool: adaptive cache enabled after the first complete graph: "
++        fprintf(stderr, "moe-pool: adaptive cache enabled after the first complete graph: "
+                       "%d slots/tensor, %zu expert tensors on %zu device(s), %.2f GiB total free, "
+                       "%.2f GiB staging, %.2f GiB/device reserve; active from the next graph\n",
+                       cap, st->weights.size(), st->backends.size(), free_gib, staging_gib,
+@@ -1256,11 +1256,12 @@ static void sched_moe_auto_enable(ggml_backend_sched_t sched) {
+         // The next naturally rebuilt graph goes through reset/alloc and sees
+         // the pool from the start.
+     } else {
+-        GGML_LOG_INFO("moe-pool: adaptive cache not enabled after the first complete graph: "
++        fprintf(stderr, "moe-pool: adaptive cache not enabled after the first complete graph: "
+                       "%zu target device(s) leave %d slots/tensor after staging and the "
+-                      "%.2f GiB/device reserve (this model needs at least %lld active experts)\n",
++                      "%.2f GiB/device reserve (this model needs at least %lld active experts); "
++                      "free=%.2f GiB staging=%.2f GiB\n",
+                       st->backends.size(), cap, (double) reserve / 1073741824.0,
+-                      (long long) st->n_expert_used);
++                      (long long) st->n_expert_used, free_gib, staging_gib);
+     }
+     delete st;
+     sched->moe_auto = nullptr;
+@@ -4554,7 +4555,7 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
+                 (observed == st->expected_weight_count &&
+                  st->weight_hash != st->expected_weight_hash);
+             if (impossible || st->graphs_without_growth >= 32) {
+-                GGML_LOG_WARN("moe-pool: adaptive cache disabled: accumulated graph expert-weight identity "
++                fprintf(stderr, "moe-pool: adaptive cache disabled: accumulated graph expert-weight identity "
+                               "did not match the GGUF plan (observed %zu/%016llx, planned %llu/%016llx%s)\n",
+                               observed,
+                               (unsigned long long) st->weight_hash,

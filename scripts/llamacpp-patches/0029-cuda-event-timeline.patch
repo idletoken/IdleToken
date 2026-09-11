@@ -1,0 +1,493 @@
+Subject: [PATCH] Add opt-in CUDA event brackets with bounded host-clock anchors
+
+Windows diagnostic only, explicitly enabled by ITC_TIMELINE_CUDA_OUTPUT.
+No CUPTI, graph-capture timing nodes, cache-policy or RPC protocol change.
+The first bracket per capture/thread/device synchronizes one anchor event;
+completed events are then queried at existing synchronization points.
+These are stream-operation intervals, not a complete kernel activity trace.
+
+diff --git a/ggml/include/ggml-timeline.h b/ggml/include/ggml-timeline.h
+index 6d922c2..a845214 100644
+--- a/ggml/include/ggml-timeline.h
++++ b/ggml/include/ggml-timeline.h
+@@ -17,8 +17,11 @@ namespace ggml_timeline {
+ struct functions {
+     using begin_fn = uint64_t (*)(const char *, const char *, int64_t, int64_t);
+     using end_fn = void (*)(uint64_t);
++    using clock_fn = uint64_t (*)();
+     begin_fn begin = nullptr;
+     end_fn end = nullptr;
++    clock_fn capture = nullptr;
++    clock_fn clock = nullptr;
+     functions() {
+ #ifdef _WIN32
+         const char * path = std::getenv("ITC_TIMELINE_LIBRARY");
+@@ -27,6 +30,8 @@ struct functions {
+         const auto init = library ? reinterpret_cast<int (*)()>(GetProcAddress(library, "itc_trace_initialize")) : nullptr;
+         begin = library ? reinterpret_cast<begin_fn>(GetProcAddress(library, "itc_trace_begin")) : nullptr;
+         end = library ? reinterpret_cast<end_fn>(GetProcAddress(library, "itc_trace_end")) : nullptr;
++        capture = library ? reinterpret_cast<clock_fn>(GetProcAddress(library, "itc_trace_capture_generation")) : nullptr;
++        clock = library ? reinterpret_cast<clock_fn>(GetProcAddress(library, "itc_trace_clock_ns")) : nullptr;
+         if (!init || !begin || !end || init() != 1) {
+             std::fprintf(stderr, "timeline: requested diagnostic collector could not start\n");
+             std::abort();
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index a99ed1d..ba46bf2 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4,6 +4,7 @@
+ 
+ #include "ggml-cuda/allreduce.cuh"
+ #include "ggml-cuda/common.cuh"
++#include "ggml-cuda/timeline.cuh"
+ #include "ggml-cuda/acc.cuh"
+ #include "ggml-cuda/add-id.cuh"
+ #include "ggml-cuda/arange.cuh"
+@@ -775,24 +776,33 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
++    ggml_cuda_timeline::scope timing(cudaStreamPerThread, "memset", tensor->name, size);
+     CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
++    timing.finish();
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    ggml_cuda_timeline::collect();
+ }
+ 
+ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
++    ggml_cuda_timeline::scope timing(cudaStreamPerThread, "h2d_sync", tensor->name, size);
+     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
++    timing.finish();
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    ggml_cuda_timeline::collect();
+ }
+ 
+ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
++    ggml_cuda_timeline::scope timing(cudaStreamPerThread, "d2h_sync", tensor->name, size);
+     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
++    timing.finish();
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    ggml_cuda_timeline::collect();
+ }
+ 
+ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data,
+@@ -800,9 +810,12 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
++    ggml_cuda_timeline::scope timing(cudaStreamPerThread, "h2d_sync", tensor->name, size * n_copies);
+     CUDA_CHECK(cudaMemcpy2DAsync(
+         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
++    timing.finish();
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    ggml_cuda_timeline::collect();
+ }
+ 
+ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data,
+@@ -810,9 +823,12 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
++    ggml_cuda_timeline::scope timing(cudaStreamPerThread, "d2h_sync", tensor->name, size * n_copies);
+     CUDA_CHECK(cudaMemcpy2DAsync(
+         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
++    timing.finish();
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    ggml_cuda_timeline::collect();
+ }
+ 
+ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+@@ -823,6 +839,7 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
+         // in which case a same-device copy (not a peer copy) is required
+         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
+         const int dst_physical = ggml_cuda_get_physical_device(dst_ctx->device);
++        ggml_cuda_timeline::scope timing(cudaStreamPerThread, "d2d_sync", src->name, ggml_nbytes(src));
+         if (src_physical == dst_physical) {
+             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+         } else {
+@@ -832,7 +849,9 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
+             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(src), cudaStreamPerThread));
+ #endif
+         }
++        timing.finish();
+         CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++        ggml_cuda_timeline::collect();
+         return true;
+     }
+     return false;
+@@ -844,8 +863,11 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
++    ggml_cuda_timeline::scope timing(cudaStreamPerThread, "memset", "buffer_clear", buffer->size);
+     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
++    timing.finish();
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    ggml_cuda_timeline::collect();
+ }
+ 
+ static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
+@@ -2431,6 +2453,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
+ 
+     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+ 
++    ggml_cuda_timeline::scope timing(cuda_ctx->stream(), "h2d", tensor->name, size);
+     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+ }
+ 
+@@ -2440,6 +2463,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
+ 
+     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+ 
++    ggml_cuda_timeline::scope timing(cuda_ctx->stream(), "d2h", tensor->name, size);
+     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+ }
+ 
+@@ -2465,6 +2489,7 @@ static void ggml_backend_cuda_get_tensor_async_mapped(ggml_backend_t backend,
+     cudaPointerAttributes attributes{};
+     CUDA_CHECK(cudaPointerGetAttributes(&attributes, data));
+     GGML_ASSERT(attributes.type == cudaMemoryTypeHost && attributes.devicePointer != nullptr);
++    ggml_cuda_timeline::scope timing(ctx->stream(), "mapped_readback", tensor->name, size);
+     ggml_cuda_mapped_readback_kernel<<<1, 128, 0, ctx->stream()>>>(
+         (volatile uint32_t *) attributes.devicePointer,
+         (const uint32_t *) ((const char *) tensor->data + offset), size / sizeof(uint32_t));
+@@ -2479,6 +2504,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
+ 
+     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+ 
++    ggml_cuda_timeline::scope timing(cuda_ctx->stream(), "h2d", tensor->name, size * n_copies);
+     CUDA_CHECK(cudaMemcpy2DAsync(
+         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+ }
+@@ -2490,6 +2516,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const
+ 
+     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+ 
++    ggml_cuda_timeline::scope timing(cuda_ctx->stream(), "d2h", tensor->name, size * n_copies);
+     CUDA_CHECK(cudaMemcpy2DAsync(
+         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+ }
+@@ -2520,6 +2547,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+         return false;
+     }
+ 
++    ggml_cuda_timeline::scope timing(cuda_ctx_src->stream(), "d2d", src->name, ggml_nbytes(dst));
+     if (backend_src != backend_dst) {
+         // copy on src stream
+         // compare the backing physical devices: distinct virtual devices may share one physical GPU,
+@@ -2557,6 +2585,7 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+ 
+     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
++    ggml_cuda_timeline::collect();
+ 
+     GGML_UNUSED(backend);
+ }
+@@ -4234,7 +4263,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+         if (cuda_graph_update_required) { // Update graph executable
+             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+         }
+-        // Launch graph
++        // Bracket actual execution, never add timing nodes to graph capture.
++        ggml_cuda_timeline::scope timing(cuda_ctx->stream(), "graph",
++            cgraph->n_nodes ? cgraph->nodes[0]->name : "");
+         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+ #else
+         GGML_UNUSED(graph_key);
+@@ -4304,6 +4335,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     }
+ #endif // USE_CUDA_GRAPH
+ 
++    ggml_cuda_timeline::scope uncaptured_timing(cuda_ctx->stream(), "uncaptured_graph",
++        cgraph->n_nodes ? cgraph->nodes[0]->name : "", 0, !use_cuda_graph);
+     if (use_cuda_graph && cuda_graph_update_required) {
+         // Start CUDA graph capture
+         {
+@@ -5388,6 +5421,7 @@ static void ggml_backend_cuda_device_event_free(ggml_backend_dev_t dev, ggml_bac
+ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+     GGML_UNUSED(dev);
+     CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
++    ggml_cuda_timeline::collect();
+ }
+ 
+ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+diff --git a/ggml/src/ggml-cuda/timeline.cuh b/ggml/src/ggml-cuda/timeline.cuh
+new file mode 100644
+index 0000000..6e3d7b4
+--- /dev/null
++++ b/ggml/src/ggml-cuda/timeline.cuh
+@@ -0,0 +1,268 @@
++#pragma once
++
++// Opt-in stream-operation brackets, not CUPTI and not a kernel-activity trace.
++// Record only outside graph capture. Calibrate once per capture/thread/device;
++// otherwise collect completed events at existing synchronization points.
++#include "ggml-timeline.h"
++#include <cstddef>
++
++#if defined(_WIN32) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++#include <cuda_runtime.h>
++#include <atomic>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstdint>
++#include <fcntl.h>
++#include <io.h>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <unordered_map>
++#include <vector>
++
++namespace ggml_cuda_timeline {
++inline void checked(cudaError_t error) {
++    if (error != cudaSuccess) {
++        std::fprintf(stderr, "cuda-event-timeline: %s\n", cudaGetErrorString(error));
++        std::abort();
++    }
++}
++
++inline std::string quoted(const char * s) {
++    std::string out = "\"";
++    for (const unsigned char * p = (const unsigned char *)(s ? s : ""); *p; ++p) {
++        if (*p == '\\' || *p == '"') out += '\\';
++        if (*p < 32) {
++            char escaped[7];
++            std::snprintf(escaped, sizeof(escaped), "\\u%04x", *p);
++            out += escaped;
++        } else out += char(*p);
++    }
++    return out + '"';
++}
++
++struct writer {
++    std::mutex mutex;
++    FILE * file = nullptr;
++    bool enabled = false;
++    uint64_t generation = 0, started = 0, emitted = 0, pending = 0, records = 0;
++    std::atomic<uint64_t> next_id{1};
++
++    void line(const std::string & value) {
++        if (++records > 2000000 || std::fputs(value.c_str(), file) == EOF || std::fputc('\n', file) == EOF) {
++            std::fprintf(stderr, "cuda-event-timeline: record limit or output error\n");
++            std::abort();
++        }
++    }
++    void close_capture() {
++        if (!generation) return;
++        line("{\"kind\":\"capture_stop\",\"capture\":" + std::to_string(generation)
++            + ",\"time\":" + std::to_string(ggml_timeline::api().clock())
++            + ",\"started_spans\":" + std::to_string(started) + ",\"emitted_spans\":" + std::to_string(emitted)
++            + ",\"pending_spans\":" + std::to_string(pending) + ",\"dropped\":0,\"errors\":0}");
++        generation = 0;
++    }
++    writer() {
++        const char * path = std::getenv("ITC_TIMELINE_CUDA_OUTPUT");
++        if (!path || !*path) return;
++        const auto & api = ggml_timeline::api();
++        if (!api.capture || !api.clock) {
++            std::fprintf(stderr, "cuda-event-timeline: compatible host collector is required\n");
++            std::abort();
++        }
++        HANDLE handle = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
++        if (handle == INVALID_HANDLE_VALUE) std::abort();
++        file = _fdopen(_open_osfhandle((intptr_t) handle, _O_WRONLY | _O_BINARY), "wb");
++        if (!file) std::abort();
++        std::setvbuf(file, nullptr, _IOFBF, 1024 * 1024);
++        line("{\"kind\":\"metadata\",\"schema\":1,\"mode\":\"cuda_event_brackets\","
++             "\"clock\":\"host_qpc_bounds_plus_cuda_elapsed\",\"coverage\":\"instrumented_stream_operations_only\","
++             "\"extra_sync\":\"one_anchor_per_capture_thread_device\",\"cupti\":false}");
++        std::fflush(file);
++        enabled = true;
++        // File housekeeping only: the background thread never calls CUDA.
++        std::thread([this] {
++            unsigned ticks = 0;
++            for (;;) {
++                {
++                    std::lock_guard<std::mutex> guard(mutex);
++                    if (generation && ggml_timeline::api().capture() != generation) {
++                        close_capture();
++                        if (std::fflush(file)) std::abort();
++                    } else if (++ticks % 20 == 0 && std::fflush(file)) std::abort();
++                }
++                Sleep(50);
++            }
++        }).detach();
++    }
++    void touch(uint64_t capture) {
++        std::lock_guard<std::mutex> guard(mutex);
++        if (generation == capture) return;
++        close_capture();
++        if (pending) {
++            std::fprintf(stderr, "cuda-event-timeline: pending events crossed a capture boundary\n");
++            std::abort();
++        }
++        generation = capture;
++        started = emitted = 0;
++        line("{\"kind\":\"capture_start\",\"capture\":" + std::to_string(capture)
++            + ",\"time\":" + std::to_string(ggml_timeline::api().clock()) + "}");
++    }
++};
++// Process-lifetime writer: detached housekeeping must not outlive its object.
++inline writer & output() { static writer * instance = new writer; return *instance; }
++
++struct event_pair {
++    cudaEvent_t start = nullptr, end = nullptr;
++    cudaStream_t stream = nullptr;
++    uint64_t id = 0, capture = 0, anchor_id = 0, host_begin = 0, host_end = 0;
++    uint64_t bytes = 0;
++    bool pending = false, ended = false;
++    std::string category, detail;
++};
++struct device_state {
++    int device = -1;
++    uint64_t capture = 0, anchor_id = 0;
++    cudaEvent_t anchor = nullptr;
++    std::vector<std::unique_ptr<event_pair>> pairs;
++};
++// Bounded timing-event pools live with the CUDA primary context/process.
++// Never call a torn-down runtime from thread-local/static destructors.
++inline std::unordered_map<int, device_state> & states() {
++    static thread_local auto * value = new std::unordered_map<int, device_state>;
++    return *value;
++}
++
++inline void collect() {
++    auto & out = output();
++    if (!out.enabled) return;
++    int device = -1;
++    checked(cudaGetDevice(&device));
++    const auto it = states().find(device);
++    if (it == states().end()) return;
++    auto & state = it->second;
++    for (auto & entry : state.pairs) {
++        auto & e = *entry;
++        if (!e.pending || !e.ended) continue;
++        const auto ready = cudaEventQuery(e.end);
++        if (ready == cudaErrorNotReady) {
++            const auto last = cudaGetLastError();
++            if (last != cudaSuccess && last != cudaErrorNotReady) checked(last);
++            continue;
++        }
++        checked(ready);
++        const uint64_t collected = ggml_timeline::api().clock();
++        float first = 0, last = 0;
++        checked(cudaEventElapsedTime(&first, state.anchor, e.start));
++        checked(cudaEventElapsedTime(&last, state.anchor, e.end));
++        if (!std::isfinite(first) || !std::isfinite(last) || first < 0 || last < first) std::abort();
++        char timing[256];
++        std::snprintf(timing, sizeof(timing), ",\"start_ms\":%.9f,\"end_ms\":%.9f", double(first), double(last));
++        std::lock_guard<std::mutex> guard(out.mutex);
++        out.line("{\"kind\":\"cuda_event_span\",\"id\":" + std::to_string(e.id)
++            + ",\"capture\":" + std::to_string(e.capture) + ",\"anchor\":" + std::to_string(e.anchor_id)
++            + ",\"device\":" + std::to_string(device) + ",\"tid\":" + std::to_string(GetCurrentThreadId())
++            + ",\"stream\":" + std::to_string((uintptr_t) e.stream)
++            + ",\"category\":" + quoted(e.category.c_str()) + ",\"detail\":" + quoted(e.detail.c_str())
++            + ",\"bytes\":" + std::to_string(e.bytes) + timing
++            + ",\"host_begin\":" + std::to_string(e.host_begin) + ",\"host_end\":" + std::to_string(e.host_end)
++            + ",\"host_collected\":" + std::to_string(collected) + "}");
++        ++out.emitted;
++        --out.pending;
++        e.pending = false;
++    }
++}
++
++struct scope {
++    event_pair * event = nullptr;
++    scope(cudaStream_t stream, const char * category, const char * detail, size_t bytes = 0, bool use = true) {
++        auto & out = output();
++        if (!use || !out.enabled) return;
++        const uint64_t capture = ggml_timeline::api().capture();
++        if (!capture) return;
++        static const bool supported = [] {
++            int count = 0;
++            checked(cudaGetDeviceCount(&count));
++            if (count != 1) {
++                std::fprintf(stderr, "cuda-event-timeline: this diagnostic requires one visible CUDA device per process\n");
++                std::abort();
++            }
++            return true;
++        }();
++        (void) supported;
++        out.touch(capture);
++        cudaStreamCaptureStatus status;
++        checked(cudaStreamIsCapturing(stream, &status));
++        if (status != cudaStreamCaptureStatusNone) {
++            std::fprintf(stderr, "cuda-event-timeline: instrumentation inside graph capture is unsupported\n");
++            std::abort();
++        }
++        int device = -1;
++        checked(cudaGetDevice(&device));
++        auto & state = states()[device];
++        state.device = device;
++        if (state.capture != capture) {
++            for (const auto & old : state.pairs) if (old->pending) std::abort();
++            if (!state.anchor) checked(cudaEventCreate(&state.anchor));
++            state.capture = capture;
++            state.anchor_id = out.next_id++;
++            const uint64_t lower = ggml_timeline::api().clock();
++            checked(cudaEventRecord(state.anchor, stream));
++            checked(cudaEventSynchronize(state.anchor));
++            const uint64_t upper = ggml_timeline::api().clock();
++            std::lock_guard<std::mutex> guard(out.mutex);
++            out.line("{\"kind\":\"calibration\",\"id\":" + std::to_string(state.anchor_id)
++                + ",\"capture\":" + std::to_string(capture) + ",\"device\":" + std::to_string(device)
++                + ",\"tid\":" + std::to_string(GetCurrentThreadId())
++                + ",\"host_lower\":" + std::to_string(lower) + ",\"host_upper\":" + std::to_string(upper) + "}");
++        }
++        for (auto & candidate : state.pairs) if (!candidate->pending) { event = candidate.get(); break; }
++        if (!event) {
++            if (state.pairs.size() >= 4096) {
++                std::fprintf(stderr, "cuda-event-timeline: pending-event limit exceeded\n");
++                std::abort();
++            }
++            state.pairs.emplace_back(new event_pair);
++            event = state.pairs.back().get();
++            checked(cudaEventCreate(&event->start));
++            checked(cudaEventCreate(&event->end));
++        }
++        event->id = out.next_id++;
++        event->capture = capture;
++        event->anchor_id = state.anchor_id;
++        event->stream = stream;
++        event->category = category;
++        event->detail = detail ? detail : "";
++        event->bytes = bytes;
++        event->pending = true;
++        event->ended = false;
++        {
++            std::lock_guard<std::mutex> guard(out.mutex);
++            ++out.started;
++            ++out.pending;
++        }
++        event->host_begin = ggml_timeline::api().clock();
++        checked(cudaEventRecord(event->start, stream));
++    }
++    void finish() {
++        if (!event || event->ended) return;
++        event->host_end = ggml_timeline::api().clock();
++        checked(cudaEventRecord(event->end, event->stream));
++        event->ended = true;
++    }
++    ~scope() { finish(); }
++    scope(const scope &) = delete;
++    scope & operator=(const scope &) = delete;
++};
++}
++#else
++namespace ggml_cuda_timeline {
++struct scope {
++    scope(cudaStream_t, const char *, const char *, size_t = 0, bool = true) {}
++    void finish() {}
++};
++inline void collect() {}
++}
++#endif

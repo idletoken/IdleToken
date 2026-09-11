@@ -90,8 +90,12 @@ typedef enum {
 typedef struct {
     uint64_t vram_usable;
     uint64_t ram_usable;
-    /* Legacy probe fields retained for roster compatibility. Serving capacity
-     * is GPU-only; neither field contributes to planning. */
+    /* Host memory this node's GPU can page-lock, measured by the engine
+     * (rpc-server --pinned-probe, cached per machine); 0 = not measured. Since
+     * 2026-09-07 the MoE Hybrid planner caps the routed experts a node keeps in
+     * RAM at min(ram_usable, ram_pinnable): the engine holds them in the GPU's
+     * page-locked host buffers and silently falls back to pageable memory,
+     * several times slower, when the lock fails. */
     uint64_t ram_pinnable;
     uint8_t  unified;   /* 1 = unified memory host (vram aliases ram) */
     /* idletoken_node_backend. Derived from the probe's gpu_vendor; unified
@@ -165,25 +169,10 @@ idletoken_mode idletoken_mode_decide(const idletoken_model_spec *model,
                                const idletoken_node_mem *nodes, int n,
                                uint32_t ctx_size, char *why, size_t whylen);
 
-/* Cluster MoE Hybrid — routed experts kept in the OWNER node's RAM and
- * streamed to that node's own GPU — is OPT-IN until its real-LAN performance
- * evidence exists (docs/acceptance-criteria.md G-MOE-LOCAL items 4-5: no
- * expert-sized LAN payload, and no slowdown against the GPU-only baseline).
- * The user's rule is that a new placement may not make anything slower; a
- * path that has not been measured on a real LAN is therefore off by default,
- * and every consumer of the decision reads THIS switch:
- *   - the advisor (idletoken_mode_decide_quant, n > 1),
- *   - the runtime planner (try_cluster_moe_hybrid),
- *   - the coordinator's RPC_ASSIGN capability request (worker CPU device),
- *   - the client's resource card (client/src/models.ts
- *     CLUSTER_MOE_HYBRID_ENABLED mirrors IDLETOKEN_CLUSTER_MOE_HYBRID_DEFAULT;
- *     scripts/moe_local_gate.sh fails when the two disagree).
- * IDLETOKEN_CLUSTER_MOE_HYBRID=1 enables the path for a measured run and =0
- * forces it off; any other value keeps the compiled default. Single-machine
- * MoE Hybrid (`--n-cpu-moe`) is a separate, shipped path and is not affected. */
-#define IDLETOKEN_CLUSTER_MOE_HYBRID_ENV     "IDLETOKEN_CLUSTER_MOE_HYBRID"
-#define IDLETOKEN_CLUSTER_MOE_HYBRID_DEFAULT 0
-int idletoken_cluster_moe_hybrid_enabled(void);
+/* MoE deployment mode is a planner result, not a feature switch. Both a
+ * single machine and a cluster try GPU_ONLY first. Only when the exact
+ * selected context cannot fit in usable VRAM may the planner move the minimum
+ * owner-local routed-expert prefix into that same node's usable RAM. */
 
 /* Resource-proportional contiguous split of model->n_layers across n nodes
  * (callers pass nodes sorted strongest-first). Every node gets ≥1 layer;
@@ -270,6 +259,27 @@ typedef struct {
     uint64_t expert_bytes_per_layer[IDLETOKEN_LLPLAN_MAX_LAYERS];
     uint64_t expert_bytes_total;
     uint8_t  expert_bytes_complete;
+    /* Exact identity of the routed-expert WEIGHT tensors that can enter the
+     * runtime GPU cache. The byte buckets above intentionally also include
+     * bias/scale tensors and GGUF alignment because they describe what
+     * --n-cpu-moe removes from VRAM. The cache, however, serves only the 3-D
+     * weights consumed by MUL_MAT_ID. Count + an order-independent FNV-1a
+     * fingerprint lets the runtime prove it saw that complete set without
+     * equating logical tensor bytes with padded file spans. */
+    uint32_t expert_pool_weight_count_per_layer[IDLETOKEN_LLPLAN_MAX_LAYERS];
+    uint64_t expert_pool_weight_hash_per_layer[IDLETOKEN_LLPLAN_MAX_LAYERS];
+    /* Conservative cache geometry from each pool weight's GGUF file span:
+     * sum ceil(span / expert_count), and largest span. Alignment may make
+     * these slightly larger than the runtime's logical strides, never smaller.
+     * Bias/scales are excluded. No quantization-specific size table is used. */
+    uint64_t expert_pool_slot_bytes_per_layer[IDLETOKEN_LLPLAN_MAX_LAYERS];
+    uint64_t expert_pool_max_tensor_per_layer[IDLETOKEN_LLPLAN_MAX_LAYERS];
+    /* Exact padded GGUF spans for ALL tensors in each block. Hybrid's owner
+     * budget must not average differently quantized blocks. Shared tensors,
+     * headers and file padding are charged conservatively to the coordinator;
+     * these buckets sum to total_bytes when expert_bytes_complete is true. */
+    uint64_t weight_bytes_per_layer[IDLETOKEN_LLPLAN_MAX_LAYERS];
+    uint64_t weight_bytes_shared;
     /* MEASURED graph workspace at the two context tiers — llama.cpp's own
      * no_alloc dry-run (`scripts/measure_model_memory.sh`), NOT an estimate.
      * 0 = not measured for this model; the planner then refuses to guess.
@@ -316,6 +326,15 @@ typedef struct {
      * priced instead of leaving the reader to re-derive it from the quant. */
     uint8_t kv_tier;
 } idletoken_llm_model_size;
+
+/* Owner-local cache geometry for RAM expert layers [lo,hi). On success,
+ * fixed_bytes includes the runtime's 512-MiB reserve, largest full-tensor
+ * staging buffer and allocation tails; slot_bytes covers one expert in
+ * every cached weight. Empty ranges return zero. Invalid/missing geometry
+ * or overflow returns -1. Admission additionally charges top-k slots. */
+int idletoken_llama_moe_cache_budget(const idletoken_llm_model_size *model,
+                                    uint32_t lo, uint32_t hi,
+                                    uint64_t *slot_bytes, uint64_t *fixed_bytes);
 
 /* The measured workspace for `ctx_size` on `backend`
  * (idletoken_node_backend), or 0 when this model has no measurement for it.
@@ -377,7 +396,8 @@ typedef struct {
     /* SINGLE + HYBRID only. The sidecar passes `--n-cpu-moe N`, which keeps
      * expert tensors for blocks [0,N) in host memory while every complete
      * transformer layer and the KV cache remain GPU-offloaded. N is the
-     * smallest prefix whose exact GGUF bytes close the VRAM shortfall. */
+     * smallest prefix whose exact GGUF bytes close the VRAM shortfall,
+     * including mandatory GPU cache/staging space for the RAM experts. */
     uint32_t n_cpu_moe;
     uint64_t cpu_moe_bytes;
     uint64_t gpu_need_bytes;
@@ -395,14 +415,17 @@ typedef struct {
     uint32_t cpu_moe_layer_hi[IDLETOKEN_LLPLAN_MAX_NODES];
     uint64_t cpu_moe_bytes_per_node[IDLETOKEN_LLPLAN_MAX_NODES];
     uint64_t gpu_need_bytes_per_node[IDLETOKEN_LLPLAN_MAX_NODES];
-    /* Expert pool (patch 0006): the device memory left on a node after its
-     * GPU-resident share, handed to the engine as GGML_MOE_POOL_BYTES so that
-     * routed experts stream into an LRU pool instead of whole layers staying
-     * resident. Whenever a node's RAM (with the engine's working-memory
-     * charge) can hold ALL of its layers' experts, the plan spills them all and
-     * the pool gets the freed device memory: an LRU over every layer keeps far
-     * more of what a token needs than a few whole resident layers do
-     * (docs/moe-expert-prefetch-2026-09.md §4.2.1). */
+    /* CLUSTER + HYBRID: output normalization and the vocabulary projection
+     * are explicitly placed on the coordinator. The planner charges the
+     * virtual output-layer slice there instead of on the final worker, so the
+     * runtime can return one hidden vector rather than a vocabulary-sized
+     * logits tensor without bypassing per-node VRAM admission. */
+    uint8_t output_head_local;
+    /* Total cache budget, including its mandatory slots/staging/reserve.
+     * gpu_need_bytes includes the mandatory cache floor; this budget is NOT
+     * an extra allocation to add to gpu_need_bytes. Cache policy must not
+     * enlarge the minimum owner-local RAM prefix chosen for admission.
+     * The engine sizes caches for that prefix from actual post-load VRAM. */
     uint64_t moe_pool_bytes;                                    /* single machine */
     uint64_t moe_pool_bytes_per_node[IDLETOKEN_LLPLAN_MAX_NODES]; /* cluster, by slot */
 

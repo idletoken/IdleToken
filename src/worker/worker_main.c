@@ -13,6 +13,7 @@
 #include "idletoken_model.h"
 #include "idletoken_resource.h"
 #include "idletoken_advise.h"
+#include "idletoken_modelsize.h"
 #include "idletoken_weights.h"
 #include "idletoken_gguf.h"   /* idletoken_gguf_identity — model identity check */
 #include "idletoken_enginever.h"   /* engine version for HELLO (WS-C3) */
@@ -43,7 +44,6 @@ void ds4_gpu_set_moe_cache(uint64_t bytes, uint32_t n_layers);
 #ifdef _WIN32
   #include <winsock2.h>      /* before windows.h */
   #include <windows.h>
-  #include <winioctl.h>      /* StorageDeviceSeekPenaltyProperty */
   #include <bcrypt.h>        /* BCryptGenRandom — link -lbcrypt */
   #include <process.h>       /* _getpid */
   /* Every fd closed in this file is a network socket. */
@@ -274,6 +274,8 @@ static void usage(FILE *out) {
 "  --advise            print which models/precisions THIS machine can run\n"
 "  --advise-json       same as --advise as one line of JSON (for the client)\n"
 "  --advise-peers L    judge this machine PLUS peers; L = vramGiB:ramGiB:unified,...\n"
+"  --model-layout-json ID QUANT GGUF\n"
+"                      inspect exact routed-expert bytes in a downloaded GGUF\n"
 "  --gguf-dir DIR      directory to statvfs() for disk-avail (default: ./)\n"
 "  --max-vram-mb N     cap usable VRAM at N MiB (client setting; 0 = no cap)\n"
 "  --max-ram-mb N      cap usable RAM for node-local MoE experts (0 = no cap)\n"
@@ -395,53 +397,46 @@ static uint64_t worker_moe_cache_budget(void) {
  * other changes (a new driver, a different GPU) are far more likely to leave
  * this ceiling alone than to move it. Failing to read or write the cache only
  * costs time; correctness is unaffected. */
-#ifndef DS4_NO_GPU
-uint64_t ds4_gpu_probe_pinned_max(void);
-
-static void pinnable_cache_path(char *out, size_t cap) {
+/* Since 2026-09-07 the measurement is the engine's own `rpc-server
+ * --pinned-probe` (patch 0006), run and cached by idletoken_engine_pinned_ceiling
+ * — the ds4-era CUDA probe this used to call is shelved. The engine binary is
+ * looked up under `engine_dir` by our name first, upstream's second, the same
+ * way the supervisor finds it. */
+static int worker_find_rpc_server(const char *engine_dir, char *bin, size_t cap) {
+    if (!engine_dir || !engine_dir[0]) return -1;
 #ifdef _WIN32
-    const char *base = getenv("LOCALAPPDATA");
-    if (!base || !base[0]) base = getenv("TEMP");
-    snprintf(out, cap, "%s\\IdleToken-pinned-max.txt", base ? base : ".");
+    const char *names[] = { "idletoken-rpc-server.exe", "ggml-rpc-server.exe" };
 #else
-    const char *base = getenv("XDG_CACHE_HOME");
-    if (base && base[0]) snprintf(out, cap, "%s/idletoken-pinned-max", base);
-    else {
-        const char *home = getenv("HOME");
-        snprintf(out, cap, "%s/.cache/idletoken-pinned-max", home ? home : ".");
+    const char *names[] = { "idletoken-rpc-server", "ggml-rpc-server" };
+#endif
+    struct stat probe;
+    snprintf(bin, cap, "%s/%s", engine_dir, names[0]);
+    if (stat(bin, &probe) != 0) snprintf(bin, cap, "%s/%s", engine_dir, names[1]);
+    if (stat(bin, &probe) != 0) return -1;
+    return 0;
+}
+
+static uint64_t worker_measure_pinnable(const char *engine_dir, uint64_t ram_total) {
+    char bin[1024];
+    uint64_t measured = 0;
+    if (worker_find_rpc_server(engine_dir, bin, sizeof(bin)) == 0)
+        measured = idletoken_engine_pinned_ceiling(bin, ram_total);
+#ifdef _WIN32
+    if (measured == 0) {
+        measured = idletoken_windows_pinnable_budget(ram_total);
+        fprintf(stderr, "idletoken-worker: WARNING: the engine page-lock probe "
+                        "was unavailable; using the Windows WDDM formula fallback "
+                        "%.1f GiB instead of treating the limit as unlimited\n",
+                measured / 1073741824.0);
     }
 #endif
+    return measured;
 }
 
-static uint64_t worker_measure_pinnable(uint64_t ram_total) {
-    char path[512];
-    pinnable_cache_path(path, sizeof(path));
-
-    FILE *f = fopen(path, "r");
-    if (f) {
-        unsigned long long key = 0, val = 0;
-        int n = fscanf(f, "%llu %llu", &key, &val);
-        fclose(f);
-        if (n == 2 && key == (unsigned long long)ram_total && val > 0) {
-            fprintf(stderr, "idletoken-worker: pinned ceiling %.2f GiB (cached)\n",
-                    (double)val / 1073741824.0);
-            return (uint64_t)val;
-        }
-    }
-
-    fprintf(stderr, "idletoken-worker: measuring pinned-memory ceiling once "
-                    "(brief high memory use; result is cached in %s)\n", path);
-    uint64_t got = ds4_gpu_probe_pinned_max();
-    if (got == 0) return 0;   /* not measurable = unknown; callers treat it as unconstrained */
-
-    f = fopen(path, "w");
-    if (f) {
-        fprintf(f, "%llu %llu\n", (unsigned long long)ram_total, (unsigned long long)got);
-        fclose(f);
-    }
-    return got;
-}
-#endif /* !DS4_NO_GPU */
+/* The capability word stays on the wire for protocol compatibility. The
+ * withdrawn patch 0007 must not be advertised: an older coordinator would
+ * otherwise use that flag to bypass the page-lock admission cap. */
+static uint32_t g_engine_flags;
 
 /* The one-line PROF2 dump. It **must be printable periodically**, not only at
  * exit: cross-machine benchmarks are torn down with `Stop-Process -Force`, the
@@ -613,152 +608,6 @@ static int worker_rpc_log_path(char *out, size_t cap, int port) {
     return 0;
 }
 
-/* Keep the pre-seeded tensors beside the configured model directory so a
- * machine with a small system drive can put its shard cache on the large model
- * disk. ggml-rpc-server appends "rpc" to LLAMA_CACHE itself. */
-#ifdef _WIN32
-static int win_drive_is_nonrotational(char drive, int *known) {
-    char device[] = "\\\\.\\C:";
-    device[4] = drive;
-    *known = 0;
-    HANDLE h = CreateFileA(device, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                           NULL, OPEN_EXISTING, 0, NULL);
-    if (h == INVALID_HANDLE_VALUE) return 0;
-    STORAGE_PROPERTY_QUERY q;
-    DEVICE_SEEK_PENALTY_DESCRIPTOR d;
-    DWORD returned = 0;
-    ZeroMemory(&q, sizeof(q));
-    ZeroMemory(&d, sizeof(d));
-    q.PropertyId = StorageDeviceSeekPenaltyProperty;
-    q.QueryType = PropertyStandardQuery;
-    BOOL ok = DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY,
-                              &q, sizeof(q), &d, sizeof(d),
-                              &returned, NULL);
-    CloseHandle(h);
-    if (!ok || returned < sizeof(d)) return 0;
-    *known = 1;
-    return d.IncursSeekPenalty ? 0 : 1;
-}
-#endif
-
-static int worker_rpc_cache_paths(const char *gguf_dir,
-                                  char *root, size_t root_cap,
-                                  char *rpc, size_t rpc_cap) {
-    const char *env = getenv("IDLETOKEN_RPC_CACHE_ROOT");
-    const char *base = (gguf_dir && gguf_dir[0]) ? gguf_dir : ".";
-    int n = -1;
-    if (env && env[0]) {
-        n = snprintf(root, root_cap, "%s", env);
-    }
-#ifdef _WIN32
-    else if (!strcmp(base, ".") || !strcmp(base, "./") || !strcmp(base, ".\\")) {
-        /* A bundled desktop sidecar normally has no configured GGUF directory.
-         * Windows often puts only a few GiB free on C: while a data drive has
-         * hundreds. Select the fixed drive with the most free bytes, then keep
-         * the choice stable at <drive>:\\IdleToken\\model-shards. */
-        DWORD mask = GetLogicalDrives();
-        ULONGLONG best_any = 0, best_fast = 0;
-        char best_any_drive = 0, best_fast_drive = 0;
-        for (char d = 'C'; d <= 'Z'; d++) {
-            if (!(mask & (1u << (d - 'A')))) continue;
-            char dr[4] = { d, ':', '\\', '\0' };
-            if (GetDriveTypeA(dr) != DRIVE_FIXED) continue;
-            /* The RPC cache activates a tensor by HARD-LINKING its
-             * content-addressed file to its name (weights.c,
-             * cache_activate_name). exFAT, the usual format of a large
-             * external SSD, has no hard links, and such a drive is exactly
-             * the one that wins a free-space contest: on 2026-09-05 a
-             * 1.8 TB exFAT drive was selected on the Windows build node
-             * and every cluster formation then died at "cannot activate
-             * local tensor" after fetching the first tensor. Ask the volume
-             * before considering it. */
-            char fsname[32] = "";
-            DWORD fsflags = 0;
-            if (!GetVolumeInformationA(dr, NULL, 0, NULL, NULL, &fsflags,
-                                       fsname, sizeof(fsname)) ||
-                !(fsflags & FILE_SUPPORTS_HARD_LINKS)) {
-                fprintf(stderr, "idletoken-worker: not using %c: for model "
-                                "shards (%s has no hard links)\n",
-                        d, fsname[0] ? fsname : "its filesystem");
-                continue;
-            }
-            ULARGE_INTEGER avail, total, freeb;
-            if (!GetDiskFreeSpaceExA(dr, &avail, &total, &freeb)) continue;
-            if (avail.QuadPart > best_any) {
-                best_any = avail.QuadPart;
-                best_any_drive = d;
-            }
-            int media_known = 0;
-            if (win_drive_is_nonrotational(d, &media_known) && media_known &&
-                avail.QuadPart > best_fast) {
-                best_fast = avail.QuadPart;
-                best_fast_drive = d;
-            }
-        }
-        /* Prefer a non-rotational drive only when it has room. The worker
-         * does not know its layer share yet (that arrives with RPC_ASSIGN),
-         * so use a floor: below 64 GiB free, a fast drive loses to the
-         * largest hard-link-capable one unless it is at least a quarter of
-         * it. On 2026-09-06 a Windows test node picked its 3.8 GiB system NVMe over a
-         * 411 GB USB SSD (USB media is reported as "unknown", so it never
-         * counts as non-rotational) and every shard fetch would have died
-         * on "No space left on device". */
-        if (best_fast_drive && best_fast < 64ULL * 1073741824ULL &&
-            best_fast * 4 < best_any) {
-            fprintf(stderr, "idletoken-worker: %c: is non-rotational but has "
-                            "only %.1f GiB free; using %c: (%.1f GiB) for "
-                            "model shards instead\n",
-                    best_fast_drive, (double)best_fast / 1073741824.0,
-                    best_any_drive, (double)best_any / 1073741824.0);
-            best_fast_drive = 0;
-        }
-        const char best_drive = best_fast_drive ? best_fast_drive : best_any_drive;
-        const ULONGLONG best = best_fast_drive ? best_fast : best_any;
-        if (best_drive) {
-            char parent[32];
-            snprintf(parent, sizeof(parent), "%c:\\IdleToken", best_drive);
-            CreateDirectoryA(parent, NULL);
-            n = snprintf(root, root_cap, "%s\\model-shards", parent);
-            fprintf(stderr, "idletoken-worker: selected %c: for model shards "
-                            "(%.1f GiB free%s)\n", best_drive,
-                    (double)best / 1073741824.0,
-                    best_fast_drive ? ", non-rotational" : "");
-        }
-    }
-#endif
-    if (n < 0) {
-        n = snprintf(root, root_cap, "%s%s.idletoken-llama-cache", base,
-                     (base[strlen(base) - 1] == '/' ||
-                      base[strlen(base) - 1] == '\\') ? "" : "/");
-    }
-    if (n < 0 || (size_t)n >= root_cap) return -1;
-#ifdef _WIN32
-    if (!CreateDirectoryA(root, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
-        fprintf(stderr, "idletoken-worker: cannot create RPC cache root %s "
-                        "(winerr %lu)\n", root,
-                (unsigned long)GetLastError());
-        return -1;
-    }
-#else
-    if (mkdir(root, 0700) != 0 && errno != EEXIST) {
-        fprintf(stderr, "idletoken-worker: cannot create RPC cache root %s: %s\n",
-                root, strerror(errno));
-        return -1;
-    }
-#endif
-    n = snprintf(rpc, rpc_cap, "%s%srpc", root,
-                 (root[strlen(root) - 1] == '/' ||
-                  root[strlen(root) - 1] == '\\') ? "" : "/");
-    if (n < 0 || (size_t)n >= rpc_cap) return -1;
-#ifdef _WIN32
-    if (!CreateDirectoryA(rpc, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
-        return -1;
-#else
-    if (mkdir(rpc, 0700) != 0 && errno != EEXIST) return -1;
-#endif
-    return 0;
-}
-
 /* The rpc-server child's pid, mirrored for signal-time cleanup: a SIGTERM'd
  * worker must not orphan its child. Linux children carry pdeathsig, but macOS
  * has no equivalent — killing the worker there left idletoken-rpc-server holding
@@ -786,6 +635,36 @@ static int rpc_endpoint_up(const char *endpoint) {
     return 1;
 }
 
+/* Stop the supervised rpc-server on purpose (a planned restart with a new
+ * environment, 2026-09-07) and reap it, so the respawn can bind the same
+ * port. Same two-step stop as the supervisor's exit path. */
+static void rpc_child_stop(long long *pid) {
+    if (*pid <= 0) return;
+#ifdef _WIN32
+    if (g_rpc_child_handle) {
+        TerminateProcess(g_rpc_child_handle, 0);
+        if (WaitForSingleObject(g_rpc_child_handle, 2000) == WAIT_TIMEOUT)
+            TerminateProcess(g_rpc_child_handle, 1);
+        WaitForSingleObject(g_rpc_child_handle, INFINITE);
+        CloseHandle(g_rpc_child_handle);
+        g_rpc_child_handle = NULL;
+    }
+#else
+    kill((pid_t)*pid, SIGTERM);
+    int reaped = 0;
+    for (int i = 0; i < 20 && !reaped; i++) {
+        if (waitpid((pid_t)*pid, NULL, WNOHANG) == (pid_t)*pid) reaped = 1;
+        else usleep(100000);
+    }
+    if (!reaped) {
+        kill((pid_t)*pid, SIGKILL);
+        waitpid((pid_t)*pid, NULL, 0);
+    }
+    g_rpc_child_pid = 0;
+#endif
+    *pid = 0;
+}
+
 static int rpc_coord_readable(int fd, int timeout_ms) {
 #ifdef _WIN32
     fd_set rd;
@@ -798,36 +677,6 @@ static int rpc_coord_readable(int fd, int timeout_ms) {
     int pr = poll(&pfd, 1, timeout_ms);
     return pr > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR));
 #endif
-}
-
-typedef struct {
-    int fd;
-    uint64_t request_id;
-    uint64_t last_sent;
-} rpc_cache_progress_ctx;
-
-static void rpc_cache_progress(uint64_t done, uint64_t total, void *opaque) {
-    rpc_cache_progress_ctx *ctx = (rpc_cache_progress_ctx *)opaque;
-    if (!ctx || ctx->fd < 0) return;
-    /* A DSv4 shard has over a thousand tensors. Report coarse progress rather
-     * than turn every small tensor into control-plane chatter. */
-    if (done != total && done - ctx->last_sent < (256ull << 20)) return;
-    uint8_t pay[16];
-    idletoken_buf b;
-    idletoken_buf_init(&b, pay, sizeof(pay));
-    idletoken_buf_put_u64(&b, done);
-    idletoken_buf_put_u64(&b, total);
-    idletoken_msg_header h = {
-        .magic = IDLETOKEN_PROTO_MAGIC,
-        .version = IDLETOKEN_PROTO_VERSION,
-        .msg_type = IDLETOKEN_MSG_RPC_CACHE_PROGRESS,
-        .payload_bytes = b.pos,
-        .request_id = ctx->request_id,
-        .stage_id = 0,
-        .segment_id = IDLETOKEN_SEGMENT_NONE,
-    };
-    if (!b.err && idletoken_send_msg(ctx->fd, &h, pay, b.pos) == 0)
-        ctx->last_sent = done;
 }
 
 static int rpc_send_cache_ready(int fd, uint64_t request_id, int ok,
@@ -904,7 +753,7 @@ static int rpc_spawn(const char *rpc_bin, const char *host, int port,
     snprintf(portstr, sizeof(portstr), "%d", port);
 #ifdef _WIN32
     char cmd[3072];
-    int cn = snprintf(cmd, sizeof(cmd), "\"%s\" -H %s -p %s -d %s -c",
+    int cn = snprintf(cmd, sizeof(cmd), "\"%s\" -H %s -p %s -d %s",
                       rpc_bin, host, portstr, device);
     if (cn < 0 || (size_t)cn >= sizeof(cmd)) {
         fprintf(stderr, "idletoken-worker: rpc-server command line is too long\n");
@@ -979,13 +828,12 @@ static int rpc_spawn(const char *rpc_bin, const char *host, int port,
             dup2(lg, 2);
             if (lg > 2) close(lg);
         }
-        char *cargv[11];
+        char *cargv[10];
         int ca = 0;
         cargv[ca++] = (char *)rpc_bin;
         cargv[ca++] = "-H"; cargv[ca++] = (char *)host;
         cargv[ca++] = "-p"; cargv[ca++] = portstr;
         cargv[ca++] = "-d"; cargv[ca++] = (char *)device;
-        cargv[ca++] = "-c";
         cargv[ca] = NULL;
         execv(rpc_bin, cargv);
         dprintf(2, "idletoken-worker: execv %s: %s\n", rpc_bin, strerror(errno));
@@ -1005,6 +853,7 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
                               uint64_t max_vram_bytes, uint64_t max_ram_bytes,
                               const char *gguf_dir, const char *model_path,
                               const char *shard_repo_override) {
+    (void)shard_repo_override; /* legacy non-RPC option; cluster uses local GGUF */
     if (!engine_dir || !engine_dir[0]) {
         fprintf(stderr, "idletoken-worker: --rpc-supervisor needs --engine-dir "
                         "(or IDLETOKEN_ENGINE_DIR) pointing at the llama.cpp "
@@ -1038,14 +887,12 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
         return 2;
     }
 
-    char rpc_cache_root[1024], rpc_cache_dir[1088];
-    if (worker_rpc_cache_paths(gguf_dir, rpc_cache_root, sizeof(rpc_cache_root),
-                               rpc_cache_dir, sizeof(rpc_cache_dir)) != 0) {
-        fprintf(stderr, "idletoken-worker: cannot prepare the local RPC tensor cache\n");
-        return 2;
+    if (!model_path || !model_path[0]) {
+        fprintf(stderr, "idletoken-worker: [MODEL_NOT_READY] cluster compute "
+                        "requires this machine's complete verified GGUF; "
+                        "--model was not provided\n");
+        return IDLETOKEN_EXIT_JOIN_REFUSED;
     }
-    setenv("LLAMA_CACHE", rpc_cache_root, 1);
-    fprintf(stderr, "idletoken-worker: RPC tensor cache: %s\n", rpc_cache_dir);
 
 #ifndef _WIN32
     signal(SIGTERM, rpc_supervisor_on_signal);
@@ -1086,8 +933,8 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
     }
     if (idletoken_ip_is_overlay(rpc_host)) {
         fprintf(stderr, "idletoken-worker: %s is an overlay address "
-                        "(Tailscale/CGNAT — 100.64.0.0/10 or "
-                        "fd7a:115c:a1e0::/48). Tensor traffic "
+                        "(Tailscale/CGNAT 100.64.0.0/10, proxy TUN "
+                        "198.18.0.0/15, or fd7a:115c:a1e0::/48). Tensor traffic "
                         "must use the real LAN (invariant: compute traffic "
                         "never crosses an overlay — MTU 1280 + packet reorder "
                         "deadlocks it). Pass --rpc-host with this machine's "
@@ -1119,6 +966,15 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
         fprintf(stderr, "idletoken-worker: probe encountered errors; continuing "
                         "with a partial report\n");
     idletoken_resource_apply_caps(&rr, max_vram_bytes, max_ram_bytes);
+    /* How much of that RAM the GPU can page-lock: the planner's cap on the
+     * routed experts this node keeps in RAM (2026-09-07). Measured once by
+     * the engine and cached; 0 = unknown = unconstrained. */
+    rr.ram_pinnable = worker_measure_pinnable(engine_dir, rr.ram_total);
+    g_engine_flags = 0;
+    if (rr.ram_pinnable > 0)
+        fprintf(stderr, "idletoken-worker: page-lock ceiling %.1f GiB "
+                        "is the hard cap for RAM-resident experts\n",
+                rr.ram_pinnable / 1073741824.0);
     {
         char why[256] = "";
         idletoken_hw_status hw = idletoken_hw_check(&rr, why, sizeof(why));
@@ -1222,7 +1078,7 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
     fill_uuid(uuid);
     char worker_version[64];
     /* Keep capability tokens inside the coordinator's 64-byte version field.
-     * The older verbose "rpc-supervisor+..." spelling pushed rpc-cache-v1
+     * The older verbose "rpc-supervisor+..." spelling pushed rpc-gguf-v3
      * past the boundary and made a new worker look incapable after truncation. */
     /* The RPC command-set capabilities describe the ENGINE that will serve
      * (the rpc-server binary in --engine-dir), not this supervisor's build.
@@ -1243,7 +1099,10 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
         engine_node_local == 1 &&
         !rr.unified_memory && strncmp(rpc_device, "CUDA", 4) == 0 &&
         strchr(rpc_device, ',') == NULL;
-    snprintf(worker_version, sizeof(worker_version), "%s (rpc-cache-v1%s%s)",
+    /* rpc-gguf-v3 means the worker also understands RPC_CACHE_PLAN v2's exact
+     * adaptive-slot contract. Keep it distinct so mixed installers fail at
+     * admission instead of reporting a malformed plan after model setup. */
+    snprintf(worker_version, sizeof(worker_version), "%s (rpc-gguf-v3%s%s)",
              IDLETOKEN_WORKER_VERSION,
              engine_node_local == 1 ? " rpcdt-v1" : "",
              rpc_cpu_capable ? " rpc-cpu-v1" : "");
@@ -1352,7 +1211,7 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
         idletoken_buf_put_u32(&rb, (uint32_t)(rr.ram_pinnable >> 20));
         idletoken_buf_put_u64(&rb, rr.disk_avail);
         idletoken_buf_put_u32(&rb, 0);
-        idletoken_buf_put_u32(&rb, 0);
+        idletoken_buf_put_u32(&rb, g_engine_flags);   /* was reserved: engine capability flags */
         idletoken_buf_put_u8 (&rb, 0);
         uint8_t pad7[7] = {0};
         if (idletoken_buf_put_bytes(&rb, pad7, 7) != 0 || rb.err) {
@@ -1464,9 +1323,8 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
     }
 
     /* Admitted. The join deadline comes off here: from this point the socket
-     * carries the supervisor's own protocol, whose silences (a shard fetch, an
-     * idle cluster between heartbeats) are legitimately long and are already
-     * bounded by rpc_coord_readable() and the heartbeat deadline below. */
+     * carries the supervisor protocol. The worker first waits for its layer
+     * plan without starting an engine, then heartbeats bound the live cluster. */
     idletoken_set_recv_timeout(fd, 0);
 
     /* --- spawn + supervise idletoken-rpc-server --------------------------------
@@ -1489,15 +1347,15 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
         return 1;
     }
 
+    /* Do not start an empty rpc-server here. RPC_CACHE_PLAN carries the exact
+     * layer range and MoE mode; starting before those environment variables
+     * are known forces an immediate stop/start cycle on every cluster launch. */
     long long pid = 0;
-    if (rpc_spawn(rpc_bin, rpc_host, rpc_port, active_rpc_device, log_path, &pid) != 0) {
-        close(fd);
-        return 1;
-    }
-    fprintf(stderr, "idletoken-worker: spawned idletoken-rpc-server (pid %lld) on %s "
-                    "(-d %s), log: %s\n", pid, endpoint, active_rpc_device, log_path);
+    fprintf(stderr, "idletoken-worker: waiting for the layer plan before the "
+                    "single rpc-server start on %s (-d %s)\n",
+            endpoint, active_rpc_device);
 
-    int ever_ready = 0, starting = 1, quick_restarts = 0;
+    int ever_ready = 0, starting = 0, quick_restarts = 0;
     long long restart_due_ms = 0, became_ready_ms = 0;
     /* The coordinator sends a HEARTBEAT every 15 s. Silence is meaningful:
      * a coordinator that crashed, hung, or lost the network keeps its socket
@@ -1523,20 +1381,29 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
             if (mh.msg_type == IDLETOKEN_MSG_RPC_CACHE_PLAN) {
                 idletoken_buf cb;
                 idletoken_buf_init(&cb, mp, mh.payload_bytes);
-                uint8_t ver = 0, rsv8 = 0;
-                uint16_t lo = 0, hi = 0, rsv16 = 0;
+                uint8_t ver = 0, moe_mode = 0;
+                uint16_t lo = 0, hi = 0, pool_experts = 0;
+                uint32_t auto_weight_count = 0;
+                uint64_t auto_weight_hash = 0;
                 char repo[384] = "";
                 idletoken_buf_get_u8(&cb, &ver);
-                idletoken_buf_get_u8(&cb, &rsv8);
+                /* v2 carries the exact count + name fingerprint of the host
+                 * expert weights assigned to this node. v1 remains accepted
+                 * and has no adaptive cache, preserving explicit-zero. */
+                idletoken_buf_get_u8(&cb, &moe_mode);
                 idletoken_buf_get_u16(&cb, &lo);
                 idletoken_buf_get_u16(&cb, &hi);
-                idletoken_buf_get_u16(&cb, &rsv16);
+                idletoken_buf_get_u16(&cb, &pool_experts);
+                if (ver == 2) {
+                    idletoken_buf_get_u32(&cb, &auto_weight_count);
+                    idletoken_buf_get_u64(&cb, &auto_weight_hash);
+                }
                 /* _strict: this string is a URL this worker is about to fetch
                  * from. A truncated URL is a different URL, and the truncation
                  * point is chosen by the sender — so silently keeping the first
                  * 383 bytes hands the peer a redirect primitive (CLUS-14). */
                 idletoken_buf_get_str_strict(&cb, repo, sizeof(repo));
-                if (cb.err || ver != 1 || hi < lo || !repo[0]) {
+                if (cb.err || (ver != 1 && ver != 2) || hi < lo || !repo[0]) {
                     fprintf(stderr, "idletoken-worker: malformed RPC_CACHE_PLAN\n");
                     rpc_send_cache_ready(fd, mh.request_id, 0, lo, hi, 0, 0,
                                          "malformed cache plan");
@@ -1557,51 +1424,128 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
                                          "weight source is not an http(s) URL");
                     continue;
                 }
-                const char *fetch_repo =
-                    shard_repo_override && shard_repo_override[0]
-                        ? shard_repo_override : repo;
-                fprintf(stderr, "idletoken-worker: assigned llama.cpp tensor "
-                                "layers [%u,%u); fetching locally from %s\n",
-                        (unsigned)lo, (unsigned)hi, fetch_repo);
-                rpc_cache_progress_ctx pc = {
-                    .fd = fd,
-                    .request_id = mh.request_id,
-                    .last_sent = 0,
-                };
-                uint64_t cached_bytes = 0;
-                unsigned cached_tensors = 0;
-                const int crc = idletoken_rpc_cache_fetch(
-                    fetch_repo, lo, hi, model_path, rpc_cache_dir,
-                    rpc_cache_progress, &pc,
-                    &cached_bytes, &cached_tensors);
+                /* The coordinator supplies only its small tensor index. Check
+                 * it against this node's complete GGUF, then point rpc-server
+                 * at the original files. No tensor is copied to a shard/cache
+                 * directory and no drive is selected on the user's behalf. */
+                char local_idx[1600] = "";
+                uint64_t local_bytes = 0;
+                unsigned local_tensors = 0;
+                const int local_rc = idletoken_rpc_local_prepare(
+                    repo, lo, hi, model_path, local_idx, sizeof(local_idx),
+                    &local_bytes, &local_tensors);
                 char detail[192];
-                if (crc == 0) {
+                if (local_rc != 0) {
                     snprintf(detail, sizeof(detail),
-                             "local shard ready: layers [%u,%u), %u tensors, %.2f GiB",
-                             (unsigned)lo, (unsigned)hi, cached_tensors,
-                             (double)cached_bytes / 1073741824.0);
+                             "local GGUF validation failed for layers [%u,%u)",
+                             (unsigned)lo, (unsigned)hi);
                     fprintf(stderr, "idletoken-worker: %s\n", detail);
-                } else {
-                    snprintf(detail, sizeof(detail),
-                             "local shard fetch failed for layers [%u,%u) from %.96s",
-                             (unsigned)lo, (unsigned)hi, fetch_repo);
-                    fprintf(stderr, "idletoken-worker: %s\n", detail);
+                    if (rpc_send_cache_ready(fd, mh.request_id, 0, lo, hi,
+                                             0, 0, detail) != 0) {
+                        fprintf(stderr, "idletoken-worker: send RPC_CACHE_READY: %s\n",
+                                strerror(errno));
+                        break;
+                    }
+                    continue;
                 }
-                if (rpc_send_cache_ready(fd, mh.request_id, crc == 0,
-                                         lo, hi, cached_bytes, cached_tensors,
+
+                char want_mode[4] = "", want_pool[16] = "";
+                char want_auto_count[16] = "", want_auto_hash[32] = "";
+                char want_layers[32];
+                if (moe_mode == 1 || moe_mode == 2)
+                    snprintf(want_mode, sizeof(want_mode), "%u", (unsigned)moe_mode);
+                if (want_mode[0] && pool_experts > 0)
+                    snprintf(want_pool, sizeof(want_pool), "%u", (unsigned)pool_experts);
+                else if (want_mode[0] && moe_mode == 2 && auto_weight_count > 0) {
+                    snprintf(want_auto_count, sizeof(want_auto_count), "%u",
+                             (unsigned)auto_weight_count);
+                    snprintf(want_auto_hash, sizeof(want_auto_hash), "%llu",
+                             (unsigned long long)auto_weight_hash);
+                }
+                else if (want_mode[0])
+                    snprintf(want_pool, sizeof(want_pool), "0");
+                snprintf(want_layers, sizeof(want_layers), "%u:%u",
+                         (unsigned)lo, (unsigned)hi);
+                const char *cur_mode = getenv("GGML_RPC_NODE_LOCAL_MOE");
+                const char *cur_pool = getenv("GGML_MOE_POOL_EXPERTS");
+                const char *cur_auto_count = getenv("GGML_MOE_AUTO_WEIGHT_COUNT");
+                const char *cur_auto_hash = getenv("GGML_MOE_AUTO_WEIGHT_HASH");
+                const char *cur_model = getenv("GGML_RPC_LOCAL_MODEL");
+                const char *cur_idx = getenv("GGML_RPC_LOCAL_MODEL_INDEX");
+                const char *cur_layers = getenv("GGML_RPC_LOCAL_MODEL_LAYERS");
+                const int changed =
+                    strcmp(cur_mode ? cur_mode : "", want_mode) != 0 ||
+                    strcmp(cur_pool ? cur_pool : "", want_pool) != 0 ||
+                    strcmp(cur_auto_count ? cur_auto_count : "", want_auto_count) != 0 ||
+                    strcmp(cur_auto_hash ? cur_auto_hash : "", want_auto_hash) != 0 ||
+                    strcmp(cur_model ? cur_model : "", model_path) != 0 ||
+                    strcmp(cur_idx ? cur_idx : "", local_idx) != 0 ||
+                    strcmp(cur_layers ? cur_layers : "", want_layers) != 0;
+                if (want_mode[0]) setenv("GGML_RPC_NODE_LOCAL_MOE", want_mode, 1);
+                else unsetenv("GGML_RPC_NODE_LOCAL_MOE");
+                /* The layer-level copy issue of patch 0006 rides with the mode
+                 * (on for every node-local run; +6–7 % decode). */
+                if (want_mode[0]) setenv("GGML_MOE_LAYER_ISSUE", "1", 1);
+                else unsetenv("GGML_MOE_LAYER_ISSUE");
+                if (want_pool[0]) setenv("GGML_MOE_POOL_EXPERTS", want_pool, 1);
+                else unsetenv("GGML_MOE_POOL_EXPERTS");
+                if (want_auto_count[0]) {
+                    setenv("GGML_MOE_AUTO_WEIGHT_COUNT", want_auto_count, 1);
+                    setenv("GGML_MOE_AUTO_WEIGHT_HASH", want_auto_hash, 1);
+                } else {
+                    unsetenv("GGML_MOE_AUTO_WEIGHT_COUNT");
+                    unsetenv("GGML_MOE_AUTO_WEIGHT_HASH");
+                }
+                setenv("GGML_RPC_LOCAL_MODEL", model_path, 1);
+                setenv("GGML_RPC_LOCAL_MODEL_INDEX", local_idx, 1);
+                setenv("GGML_RPC_LOCAL_MODEL_LAYERS", want_layers, 1);
+
+                if (changed && pid > 0) {
+                    fprintf(stderr, "idletoken-worker: stopping rpc-server for "
+                                    "a changed direct-GGUF plan [%u,%u), MoE mode "
+                                    "%s, pool %s\n",
+                            (unsigned)lo, (unsigned)hi,
+                            want_mode[0] ? want_mode : "off",
+                            want_pool[0] ? want_pool :
+                            (want_auto_count[0] ? "post-load verified adaptive" : "none"));
+                    rpc_child_stop(&pid);
+                }
+                if (pid == 0) {
+                    if (rpc_spawn(rpc_bin, rpc_host, rpc_port, active_rpc_device,
+                                  log_path, &pid) != 0) {
+                        fprintf(stderr, "idletoken-worker: planned rpc-server "
+                                        "failed to spawn — giving up\n");
+                        rpc_send_cache_ready(fd, mh.request_id, 0, lo, hi, 0, 0,
+                                             "rpc-server could not be started "
+                                             "for direct local GGUF loading");
+                        break;
+                    }
+                    starting = 1;
+                    became_ready_ms = 0;
+                    fprintf(stderr, "idletoken-worker: spawned idletoken-rpc-server "
+                                    "once with direct GGUF layers [%u,%u) (pid %lld), "
+                                    "log: %s\n",
+                            (unsigned)lo, (unsigned)hi, pid, log_path);
+                }
+
+                snprintf(detail, sizeof(detail),
+                         "local GGUF ready: layers [%u,%u), %u tensors, %.2f GiB, no copy",
+                         (unsigned)lo, (unsigned)hi, local_tensors,
+                         (double)local_bytes / 1073741824.0);
+                fprintf(stderr, "idletoken-worker: %s\n", detail);
+                if (rpc_send_cache_ready(fd, mh.request_id, 1,
+                                         lo, hi, local_bytes, local_tensors,
                                          detail) != 0) {
                     fprintf(stderr, "idletoken-worker: send RPC_CACHE_READY: %s\n",
                             strerror(errno));
                     break;
                 }
-                /* A first seed can take minutes. It is active coordinator work,
-                 * not silence, so restart the heartbeat deadline now. */
                 last_coord_ms = (long long)(now_monotonic_s() * 1000.0);
             }
         }
 
         long long now = (long long)(now_monotonic_s() * 1000.0);
-        if (now - last_coord_ms > coord_silence_limit_ms) {
+        if (ever_ready && now - last_coord_ms > coord_silence_limit_ms) {
             fprintf(stderr, "idletoken-worker: no traffic from the coordinator "
                             "for %llds (it heartbeats every 15s — that machine "
                             "is gone, hung, or the network dropped) — stopping "
@@ -1849,6 +1793,9 @@ int main(int argc, char **argv) {
     int probe_json = 0;
     int advise = 0;       /* --advise: "what can this machine run?" table */
     int advise_json = 0;
+    const char *layout_model = NULL;
+    const char *layout_quant = NULL;
+    const char *layout_gguf = NULL;
     /* --advise-peers: judge a HYPOTHETICAL cluster, not just this machine.
      * Format: "vramGiB:ramGiB:unified,..." per extra machine. Answers the
      * question a user actually asks ("what if I add my other PC?") and lets the
@@ -1885,6 +1832,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--advise"))                      advise = 1;
         else if (!strcmp(a, "--advise-json"))                 advise_json = 1;
         else if (!strcmp(a, "--advise-peers") && i + 1 < argc) advise_peers = argv[++i];
+        else if (!strcmp(a, "--model-layout-json") && i + 3 < argc) {
+            layout_model = argv[++i];
+            layout_quant = argv[++i];
+            layout_gguf = argv[++i];
+        }
         else if (!strcmp(a, "--kv-clear"))                    kv_clear = 1;
         else if (!strcmp(a, "--kv-dir")      && i + 1 < argc) kv_dir = argv[++i];
         else if (!strcmp(a, "--pair-code")   && i + 1 < argc) pair_code   = argv[++i];
@@ -1909,9 +1861,47 @@ int main(int argc, char **argv) {
         return idletoken_kv_clear(kv_dir);
     }
 
-    /* llama.cpp rpc-supervisor mode: pair, receive the TLS PSK, seed this
-     * machine's assigned GGUF tensors into the local content-addressed cache,
-     * then supervise idletoken-rpc-server. There is no legacy INFER loop. */
+    /* Read the selected file's tensor directory for the client's Hybrid
+     * budget card. This is intentionally a native sidecar query: the exact
+     * expert/non-expert split is a property of the GGUF, not something the web
+     * client may reconstruct from a model's advertised parameter count. */
+    if (layout_model) {
+        const idletoken_model_spec *spec = idletoken_model_get(layout_model);
+        if (!spec) {
+            fprintf(stderr, "idletoken-worker: unknown model for layout: %s\n",
+                    layout_model);
+            return 2;
+        }
+        if (!layout_gguf || !layout_gguf[0]) {
+            fprintf(stderr, "idletoken-worker: --model-layout-json needs a GGUF path\n");
+            return 2;
+        }
+        if (layout_quant && !strcmp(layout_quant, "-")) layout_quant = NULL;
+        idletoken_llm_model_size size;
+        char source[512] = "";
+        if (idletoken_model_size_resolve(spec, layout_quant, layout_gguf,
+                                         &size, source, sizeof source) != 0) {
+            fprintf(stderr, "idletoken-worker: could not inspect model layout\n");
+            return 1;
+        }
+        if (!size.expert_bytes_complete) {
+            fprintf(stderr, "idletoken-worker: exact expert layout unavailable: %s\n",
+                    source[0] ? source : layout_gguf);
+        }
+        printf("{\"total_bytes\":%llu,\"expert_bytes_total\":%llu,"
+               "\"n_expert\":%u,\"n_expert_used\":%u,"
+               "\"expert_bytes_complete\":%s}\n",
+               (unsigned long long)size.total_bytes,
+               (unsigned long long)size.expert_bytes_total,
+               size.n_expert, size.n_expert_used,
+               size.expert_bytes_complete ? "true" : "false");
+        return 0;
+    }
+
+    /* llama.cpp rpc-supervisor mode: pair, receive the TLS PSK, validate this
+     * machine's complete GGUF, then let idletoken-rpc-server read assigned
+     * tensors directly from it. There is no model-sized shard cache and no
+     * legacy INFER loop. */
     if (rpc_supervisor) {
         if (rpc_port < 1 || rpc_port > 65535) {
             fprintf(stderr, "idletoken-worker: --rpc-port must be 1..65535\n");
@@ -2000,17 +1990,20 @@ int main(int argc, char **argv) {
         char why[256] = "";
         idletoken_hw_status hw = idletoken_hw_check(&rr, why, sizeof(why));
 
-        /* Zero-init on purpose: `idletoken_node_mem` has a `ram_pinnable` field
-         * that this path never measures (the pinned-memory probe runs later,
-         * and --advise must stay cheap). Leaving it as stack garbage made
-         * idletoken_plan_layers() clamp a discrete node's host share to a
-         * random ceiling — nondeterministic capability advice, no diagnostic.
-         * 0 = unknown/unconstrained, which is what the planner's guard expects. */
+        /* --advise stays cheap and therefore does not run the allocation probe.
+         * Reuse a prior measured result when present; otherwise Windows still
+         * has a known WDDM closed-form fallback. */
         idletoken_node_mem pool[17] = {0};
         int n_pool = 1;
         pool[0].vram_usable  = rr.vram_usable;
         pool[0].ram_usable   = rr.ram_usable;
-        pool[0].ram_pinnable = rr.ram_pinnable;  /* 0 here; picked up free if probe ever measures it */
+#ifdef _WIN32
+        pool[0].ram_pinnable = idletoken_engine_cached_pinned_ceiling(rr.ram_total);
+        if (pool[0].ram_pinnable == 0)
+            pool[0].ram_pinnable = idletoken_windows_pinnable_budget(rr.ram_total);
+#else
+        pool[0].ram_pinnable = 0;  /* no WDDM ceiling; live CUDA probing happens at launch */
+#endif
         pool[0].unified      = rr.unified_memory ? 1u : 0u;
         if (advise_peers && *advise_peers) {
             const char *p = advise_peers;
@@ -2055,6 +2048,13 @@ int main(int argc, char **argv) {
         if (idletoken_resource_probe(&rr, gguf_dir) != 0) {
             fprintf(stderr, "idletoken-worker: probe encountered errors (partial report below)\n");
         }
+        /* A dashboard refresh must never launch the destructive allocation
+         * probe, but it must not discard a result already measured at engine
+         * startup either. This is the difference between the 77.9-GiB formula
+         * estimate and the two Windows nodes' measured 77.34-GiB total. */
+#ifdef _WIN32
+        rr.ram_pinnable = idletoken_engine_cached_pinned_ceiling(rr.ram_total);
+#endif
         idletoken_resource_apply_caps(&rr, max_vram_bytes, max_ram_bytes);
         if (probe_json) idletoken_resource_print_json(&rr);
         else            idletoken_resource_print(&rr);
@@ -2167,14 +2167,16 @@ int main(int argc, char **argv) {
         fprintf(stderr, "idletoken-worker: probe encountered errors; continuing with partial report\n");
     }
     /* HYBRID puts every layer that does not fit in VRAM into pinned memory, so
-     * the real bound on the host-side share is that ceiling, not ram_usable. It
-     * sits far below physical RAM and cannot be derived (see
-     * idletoken_resource.h); it can only be measured, once, and cached.
+     * the real bound on the host-side share is that ceiling, not ram_usable.
+     * Prefer the measured, cached engine probe. On Windows its WDDM mechanism
+     * also has a verified closed-form fallback (idletoken_resource.h), so a
+     * missing probe no longer means "unlimited".
      * Which backend will run is still unknown here (plan_backend waits for
      * ASSIGN_PLAN), so we measure regardless of backend -- after the first time
      * it is just a file read anyway. */
 #ifndef DS4_NO_GPU
-    rr.ram_pinnable = worker_measure_pinnable(rr.ram_total);
+    rr.ram_pinnable = worker_measure_pinnable(engine_dir, rr.ram_total);
+    g_engine_flags = 0;
     /* The cache budget is **not** subtracted from `vram_usable`.
      *
      * `vram_usable` decides how many layers this node accepts, and the cache
@@ -2355,7 +2357,7 @@ int main(int argc, char **argv) {
     idletoken_buf_put_u32(&rb, (uint32_t)(rr.ram_pinnable >> 20));
     idletoken_buf_put_u64(&rb, rr.disk_avail);
     idletoken_buf_put_u32(&rb, 0);                   /* net_link_mbps; v0.1 unknown */
-    idletoken_buf_put_u32(&rb, 0);                   /* reserved */
+    idletoken_buf_put_u32(&rb, g_engine_flags);      /* was reserved: engine capability flags */
     idletoken_buf_put_u8 (&rb, rr.vram_usable >= (10ull << 30) ? 1 : 0);  /* can_run_ds4 rough gate */
     uint8_t pad7[7] = {0};
     if (idletoken_buf_put_bytes(&rb, pad7, 7) != 0 || rb.err) {

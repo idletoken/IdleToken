@@ -6,7 +6,7 @@
   "arch": "gpt-oss",
   "available": true,
   "deployment": "cluster",
-  "min_quant": "MXFP4",
+  "min_quant": "Q4_K_XL",
   "license": "Apache-2.0",
   "marketplace_allowed": true,
   "params_summary": "20.9B total / 3.6B active · 24 layers · 32-expert MoE",
@@ -44,26 +44,65 @@
   "compute_bytes_256k_metal": [0, 0, 0],
   "compute_bytes_1m_metal": [0, 0, 0],
   "chat_template": "gguf",
-  "layer_weight_bytes": 10865888256,
-  "shared_weight_bytes": 1230670080,
-  "default_gguf": "gpt-oss-20b-MXFP4.gguf",
+  "layer_weight_bytes": 10509782016,
+  "shared_weight_bytes": 941103360,
+  "default_gguf": "gpt-oss-20b-Q3_K_S.gguf",
   "sources": [
     {
-      "repo": "ggml-org/gpt-oss-20b-GGUF",
-      "quant": "MXFP4"
+      "repo": "unsloth/gpt-oss-20b-GGUF",
+      "quant": "Q3_K_S"
+    },
+    {
+      "repo": "unsloth/gpt-oss-20b-GGUF",
+      "quant": "Q4_K_XL"
+    },
+    {
+      "repo": "unsloth/gpt-oss-20b-GGUF",
+      "quant": "Q8_0"
+    },
+    {
+      "repo": "unsloth/gpt-oss-20b-GGUF",
+      "quant": "F16"
     }
   ],
-  "default_quant": "MXFP4",
+  "default_quant": "Q3_K_S",
   "variants": [
     {
-      "quant": "MXFP4",
+      "quant": "Q3_K_S",
+      "layer_weight_bytes": 10509782016,
+      "shared_weight_bytes": 941103360,
+      "repo": "unsloth/gpt-oss-20b-GGUF",
+      "gguf": "gpt-oss-20b-Q3_K_S.gguf",
+      "sha256": "8deacd2c5ed46d1a62368c52e44abdb55e32a2aa0e5acea86d18d8258339f17d",
+      "revision": "d449b42d93e1c2c7bda5312f5c25c8fb91dfa9b4"
+    },
+    {
+      "quant": "Q4_K_XL",
+      "layer_weight_bytes": 10628668416,
+      "shared_weight_bytes": 1230670080,
+      "repo": "unsloth/gpt-oss-20b-GGUF",
+      "gguf": "gpt-oss-20b-UD-Q4_K_XL.gguf",
+      "sha256": "10fe673de12c20b74b8d670a9fdf0fd36b43b0a86ffc04daeb175c0a2b98c4f9",
+      "revision": "d449b42d93e1c2c7bda5312f5c25c8fb91dfa9b4"
+    },
+    {
+      "quant": "Q8_0",
       "layer_weight_bytes": 10865888256,
       "shared_weight_bytes": 1230670080,
-      "repo": "ggml-org/gpt-oss-20b-GGUF",
-      "gguf": "gpt-oss-20b-MXFP4.gguf",
-      "sha256": "27cd6c432c7672cb812a92f611cf3ba7bbc35928262bb1e1253ff4ee6ae35901",
-      "revision": "ef9b12f2ff56c69cf32153a02784e7a3c88bf524"
+      "repo": "unsloth/gpt-oss-20b-GGUF",
+      "gguf": "gpt-oss-20b-Q8_0.gguf",
+      "sha256": "bcd455d4034ec02f71a875b46cb17df44a97911d7258291973be4d21f98329f3",
+      "revision": "d449b42d93e1c2c7bda5312f5c25c8fb91dfa9b4"
+    },
+    {
+      "quant": "F16",
+      "layer_weight_bytes": 11463085056,
+      "shared_weight_bytes": 2316545280,
+      "repo": "unsloth/gpt-oss-20b-GGUF",
+      "gguf": "gpt-oss-20b-F16.gguf",
+      "sha256": "4e4f9cd88d6456e4f389e7262eca4a8d565211e2b22ece9ca7a8556168ff3c66",
+      "revision": "d449b42d93e1c2c7bda5312f5c25c8fb91dfa9b4"
     }
   ],
-  "note": "Native MXFP4 MoE weights. Alternating 128-token sliding attention and full attention."
+  "note": "Curated Unsloth quantizations; MoE expert tensors remain MXFP4-derived. Alternating 128-token sliding attention and full attention."
 }

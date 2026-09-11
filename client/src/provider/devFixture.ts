@@ -36,6 +36,9 @@ export const devFixtureProvider: ResourceProvider = {
       ram_total: Math.round(32 * GiB),
       ram_used_other: Math.round(11.4 * GiB),
       ram_usable: ramUsable,
+      // 32 GiB Windows RAM -> 16 GiB shared - 0.75 GiB VidMm margin.
+      ram_expert_usable: Math.min(ramUsable, Math.round(15.25 * GiB)),
+      ram_expert_measured: false,
       disk_avail: Math.round(412 * GiB),
     };
   },
