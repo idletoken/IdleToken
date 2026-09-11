@@ -69,10 +69,8 @@ IdleToken 想做的，就是把这些错开的峰谷连接起来：让闲置的�
 
 ## 🔌 接入第三方
 
-| Base URL | API 密钥 |
-| --- | --- |
-| `http://127.0.0.1:8000` | — |
-| `https://api.idletoken.ai` | 登录后，点击右上角用户头像，进入「火花」→「API 密钥」，点击「新建密钥」。 |
+- **连接自己部署的模型：** `http://127.0.0.1:8000`。模型启动后，即可通过这个本机地址接入。
+- **调用别人分享的模型：** `https://api.idletoken.ai`。登录后，点击右上角用户头像，进入「火花」→「API 密钥」，点击「新建密钥」。
 
 ### 接入 Claude Code
 
@@ -117,9 +115,9 @@ opencode
 
 ## 🧠 模型
 
-IdleToken 提供精选的 Qwen、OpenAI 与 DeepSeek GGUF 文本生成模型。版本化清单位于 [`models/`](models/)；客户端下载权重并完成完整性校验、资源估算和量化精度选择。
+[当前支持的模型列表](models/)
 
-每个入列模型都可在装得下时单机运行，也可由用户选择集群部署。当前不支持多模态输入或任意本地 GGUF 文件。需要其它模型？欢迎[提交 issue](https://github.com/idletoken/IdleToken/issues)。
+需要其它模型？欢迎[提交 issue](https://github.com/idletoken/IdleToken/issues)。
 
 ## 💻 硬件
 
