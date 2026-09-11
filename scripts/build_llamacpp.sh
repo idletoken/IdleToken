@@ -148,7 +148,7 @@ case "$(uname -s)" in
                 DEFAULT_CUDA_ARCHS="75-real;80-real;86-real;87-real;89-real;90-real;100-real;101-real;120"
                 ;;
             aarch64|arm64)
-                DEFAULT_CUDA_ARCHS="121"
+                DEFAULT_CUDA_ARCHS="75-real;80-real;86-real;87-real;88-real;89-real;90-real;100-real;103-real;110-real;120-real;121"
                 ;;
             *)
                 echo "FATAL: unsupported Linux architecture $(uname -m)" >&2
