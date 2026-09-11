@@ -46,30 +46,20 @@ IdleToken 想做的，就是把这些错开的峰谷连接起来：让闲置的�
 
 ## 🚀 两种开始方式
 
-<table>
-<tr>
-<th width="50%" align="center">🖥️ 部署并分享自己的模型</th>
-<th width="50%" align="center">☁️ 调用别人分享的模型</th>
-</tr>
-<tr>
-<td width="50%" valign="top">
-<ol>
-<li><a href="https://github.com/idletoken/IdleToken/releases">下载并安装客户端</a>。</li>
-<li>启动客户端，下载并部署模型。</li>
-<li>打开“外援”按钮，请求别人完成本地排队的任务。</li>
-<li>打开“共享”按钮，帮助别人完成任务。</li>
-</ol>
-</td>
-<td width="50%" valign="top">
-<p>如果你不想自己部署，例如希望在手机、平板或没有受支持 GPU 的电脑上使用 IdleToken，可以直接调用别人分享的模型。</p>
-<ol>
-<li>在 <a href="https://idletoken.ai">idletoken.ai</a> 注册账号。</li>
-<li>在账户中创建 API 密钥。</li>
-<li>将 API 地址和密钥填入任意兼容 Anthropic 或 OpenAI API 的客户端，无需安装桌面客户端。</li>
-</ol>
-</td>
-</tr>
-</table>
+### 🖥️ 部署并分享自己的模型
+
+1. [下载并安装客户端](https://github.com/idletoken/IdleToken/releases)。
+2. 启动客户端，下载并部署模型。
+3. 打开“外援”按钮，请求别人完成本地排队的任务。
+4. 打开“共享”按钮，帮助别人完成任务。
+
+### ☁️ 调用别人分享的模型
+
+如果你不想自己部署，例如希望在手机、平板或没有受支持 GPU 的电脑上使用 IdleToken，可以直接调用别人分享的模型。
+
+1. 在 [idletoken.ai](https://idletoken.ai/register) 注册账号。
+2. 在账户中创建 API 密钥。
+3. 使用 API 调用别人分享的模型。
 
 ## 💬 加入社区
 
