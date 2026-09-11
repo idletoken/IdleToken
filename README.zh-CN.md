@@ -46,9 +46,9 @@ IdleToken 想做的，就是把这些错开的峰谷连接起来：让闲置的�
 
 ## 💬 加入社区
 
-欢迎加入 IdleToken Discord 社区，交流模型部署、局域网组网、客户端接入与项目开发，也可以直接反馈使用中遇到的问题。
+加入 IdleToken Discord，交流使用与开发。
 
-[加入 Discord](https://discord.gg/XbaWCH4t2J)
+[![Discord](https://img.shields.io/badge/Discord-%E5%8A%A0%E5%85%A5%E7%A4%BE%E5%8C%BA-5865F2?logo=discord&logoColor=white)](https://discord.gg/XbaWCH4t2J)
 
 ## 🚀 两种开始方式
 
