@@ -44,6 +44,12 @@ IdleToken 想做的，就是把这些错开的峰谷连接起来：让闲置的�
 
 我们使用“火花”来结算 Token。
 
+## 💬 加入社区
+
+欢迎加入 IdleToken Discord 社区，交流模型部署、局域网组网、客户端接入与项目开发，也可以直接反馈使用中遇到的问题。
+
+[加入 Discord](https://discord.gg/XbaWCH4t2J)
+
 ## 🚀 两种开始方式
 
 ### 🖥️ 部署并分享自己的模型
@@ -60,12 +66,6 @@ IdleToken 想做的，就是把这些错开的峰谷连接起来：让闲置的�
 1. 在 [idletoken.ai](https://idletoken.ai/register) 注册账号。
 2. 在账户中创建 API 密钥。
 3. 使用 API 调用别人分享的模型。
-
-## 💬 加入社区
-
-欢迎加入 IdleToken Discord 社区，交流模型部署、局域网组网、客户端接入与项目开发，也可以直接反馈使用中遇到的问题。
-
-[加入 Discord](https://discord.gg/XbaWCH4t2J)
 
 ## 🔌 接入现有工具
 
