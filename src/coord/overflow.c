@@ -737,6 +737,7 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
                                 const char *tool_choice_json,
                                 size_t tool_choice_len,
                                 const char *ctk_json, size_t ctk_len,
+                                const char *effort, size_t effort_len,
                                 const char *model, const char *quant,
                                 int max_tokens,
                                 int hops_in,
@@ -802,6 +803,7 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
     /* The plaintext, and the only place it exists outside this machine's own
      * memory is nowhere: it is sealed before the socket is opened. */
     size_t inner_cap = messages_len + tools_len + tool_choice_len + ctk_len +
+                       effort_len +
                        strlen(api_key) + (model ? strlen(model) : 0) +
                        (quant ? strlen(quant) : 0) +
                        sizeof prov + 320;
@@ -811,7 +813,7 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
     if (max_tokens > 0)
         inner_len = snprintf(inner, inner_cap,
                              "{\"api_key\":\"%s\",\"model\":\"%s\"%s%s%s,"
-                             "\"messages\":%.*s,\"max_tokens\":%d%s%.*s%s%.*s%s%.*s,"
+                             "\"messages\":%.*s,\"max_tokens\":%d%s%.*s%s%.*s%s%.*s%s%.*s%s,"
                              "\"nonce\":\"%s\",\"issued_at\":%lld,"
                              "\"dispatch_wait_ms\":5000%s}",
                              api_key, model ? model : "",
@@ -827,10 +829,13 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
                              tool_choice_json && tool_choice_len ? tool_choice_json : "",
                              ctk_json && ctk_len ? ",\"chat_template_kwargs\":" : "",
                              (int)ctk_len, ctk_json && ctk_len ? ctk_json : "",
+                             effort && effort_len ? ",\"reasoning_effort\":\"" : "",
+                             (int)effort_len, effort && effort_len ? effort : "",
+                             effort && effort_len ? "\"" : "",
                              nonce_hex, issued_at, prov);
     else
         inner_len = snprintf(inner, inner_cap,
-                             "{\"api_key\":\"%s\",\"model\":\"%s\"%s%s%s,\"messages\":%.*s%s%.*s%s%.*s%s%.*s,"
+                             "{\"api_key\":\"%s\",\"model\":\"%s\"%s%s%s,\"messages\":%.*s%s%.*s%s%.*s%s%.*s%s%.*s%s,"
                              "\"nonce\":\"%s\",\"issued_at\":%lld,"
                              "\"dispatch_wait_ms\":5000%s}",
                              api_key, model ? model : "",
@@ -846,6 +851,9 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
                              tool_choice_json && tool_choice_len ? tool_choice_json : "",
                              ctk_json && ctk_len ? ",\"chat_template_kwargs\":" : "",
                              (int)ctk_len, ctk_json && ctk_len ? ctk_json : "",
+                             effort && effort_len ? ",\"reasoning_effort\":\"" : "",
+                             (int)effort_len, effort && effort_len ? effort : "",
+                             effort && effort_len ? "\"" : "",
                              nonce_hex, issued_at, prov);
     if (inner_len < 0 || (size_t)inner_len >= inner_cap) {
         free(inner);

@@ -1821,6 +1821,13 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
      * wholesale, and the engine reads it. Absent = the consumer did not say,
      * and the model template's own default decides — which is why nothing is
      * synthesised here when the key is missing. */
+    /* The OpenAI-native reasoning level. Same treatment as the kwargs object:
+     * copied through, never interpreted -- the engine reads this key itself
+     * ('none' turns thinking off, any other level reaches the template). */
+    const char *eff_tok = NULL; size_t eff_len = 0;
+    int have_effort = json_str_token((const char *)plain, plain_len,
+                                     "reasoning_effort", &eff_tok, &eff_len) == 0
+                      && eff_len > 0 && eff_len < 32;
     const char *ctk_tok = idletoken_json_obj_get((const char *)plain, plain_len,
                                                  "chat_template_kwargs");
     long ctk_len_raw = (ctk_tok && *ctk_tok == '{')
@@ -1835,7 +1842,8 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
     static char staged[PFX_MAX_BLOCKS][65];
     int staged_n = prefix_hash_messages(msgs_tok, msgs_len, staged, PFX_MAX_BLOCKS);
 
-    size_t creq_cap = msgs_len + model_len + tools_len + choice_len + ctk_len + 192;
+    size_t creq_cap = msgs_len + model_len + tools_len + choice_len + ctk_len
+                      + eff_len + 224;
     char *creq = malloc(creq_cap);
     if (!creq) {
         idletoken_secure_zero(plain, plain_cap);
@@ -1849,14 +1857,17 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
     if (max_tokens > 0)
         snprintf(mt_frag, sizeof mt_frag, ",\"max_tokens\":%d", max_tokens);
     int cl = snprintf(creq, creq_cap,
-                      "{\"model\":\"%.*s\",\"messages\":%.*s%s%s%.*s%s%.*s%s%.*s}",
+                      "{\"model\":\"%.*s\",\"messages\":%.*s%s%s%.*s%s%.*s%s%.*s%s%.*s%s}",
                       (int)model_len, model_tok, (int)msgs_len, msgs_tok, mt_frag,
                       have_req_tools ? ",\"tools\":" : "",
                       (int)tools_len, have_req_tools ? tools_tok : "",
                       choice_len ? ",\"tool_choice\":" : "",
                       (int)choice_len, choice_len ? choice_tok : "",
                       ctk_len ? ",\"chat_template_kwargs\":" : "",
-                      (int)ctk_len, ctk_len ? ctk_tok : "");
+                      (int)ctk_len, ctk_len ? ctk_tok : "",
+                      have_effort ? ",\"reasoning_effort\":\"" : "",
+                      (int)eff_len, have_effort ? eff_tok : "",
+                      have_effort ? "\"" : "");
 
     /* -- forward plaintext to coord over loopback ------------------------- *
      * Deliberately NO "stream":true here: the sealed envelope is a one-shot

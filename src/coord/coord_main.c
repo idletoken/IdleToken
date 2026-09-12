@@ -3304,6 +3304,11 @@ static int coord_overflow_relay(int conn_fd, const idletoken_http_req *req,
      * The span comes from the SAME normalized OpenAI body the local path uses,
      * so an Anthropic caller's `thinking` field has already been translated
      * into this key by apiconv. */
+    const char *eff = NULL;
+    size_t eff_len_sz = 0;
+    if (idletoken_json_obj_str(openai, openai_len, "reasoning_effort",
+                               &eff, &eff_len_sz) != 0
+        || eff_len_sz == 0 || eff_len_sz >= 32) { eff = NULL; eff_len_sz = 0; }
     const char *ctk = idletoken_json_obj_get(openai, openai_len, "chat_template_kwargs");
     long ctk_len = (ctk && *ctk == '{')
         ? idletoken_json_value_len(ctk, openai + openai_len) : 0;
@@ -3318,6 +3323,7 @@ static int coord_overflow_relay(int conn_fd, const idletoken_http_req *req,
                                          tools, (size_t)tools_len,
                                          tool_choice, (size_t)tool_choice_len,
                                          ctk, (size_t)ctk_len,
+                                         eff, eff_len_sz,
                                          coord_model()->id, coord_quant(),
                                          max_tokens,
                                          hops_in, conn_fd, &rep, err, sizeof err);

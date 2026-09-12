@@ -361,6 +361,13 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
                                  * re-spell it. NULL = the caller said nothing
                                  * and the serving model's template decides. */
                                 const char *ctk_json, size_t ctk_len,
+                                /* Optional OpenAI-native `reasoning_effort`
+                                 * from the same request, verbatim. Carried
+                                 * beside the kwargs rather than folded into
+                                 * them: 'none' and a level are different
+                                 * requests, and collapsing them would lose the
+                                 * level. */
+                                const char *effort, size_t effort_len,
                                 const char *model, const char *quant,
                                 int max_tokens,
                                 int hops_in,
