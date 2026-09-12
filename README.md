@@ -110,7 +110,7 @@ To deploy a model on your own machine:
 | **Windows 10/11 · Linux x86_64/arm64** | An NVIDIA GPU from the RTX 20 series or newer (Turing, compute capability 7.5) with 8 GB of VRAM, and a current NVIDIA driver. |
 | **macOS** | An Apple Silicon Mac with 16 GB of unified memory. |
 
-## 🖧 Single-machine and cluster deployment
+## 🖧 Cluster deployment
 
 To run a cluster:
 

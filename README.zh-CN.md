@@ -128,7 +128,7 @@ opencode
 | **Windows 10/11 · Linux x86_64/arm64** | NVIDIA 显卡，RTX 20 系（Turing，计算能力 7.5）及以后，显存 8 GB，并安装当前 NVIDIA 驱动。 |
 | **macOS** | Apple Silicon Mac，统一内存 16 GB。 |
 
-## 🖧 单机与联机
+## 🖧 联机
 
 联机运行方法：
 
