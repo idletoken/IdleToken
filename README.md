@@ -112,16 +112,12 @@ To deploy a model on your own machine:
 
 ## 🖧 Single-machine and cluster deployment
 
-For a single-machine deployment, select a model, quantization, and context, then start it on that computer.
-
-For a cluster deployment:
+To run a cluster:
 
 1. Install the same IdleToken version on every participating computer and make sure they can reach each other over the LAN.
 2. Create a cluster on one computer. Join from the others with the same account or a verification code.
 3. Select the same model, quantization, and context on every computer, and finish downloading the model weights.
 4. When every node reports ready, choose cluster deployment on the creator and start the model. IdleToken detects each node's resources and assigns model layers automatically.
-
-Windows, Linux, and macOS nodes can be mixed in one cluster. Cluster compute traffic does not use VPN or overlay networks such as Tailscale.
 
 ---
 
