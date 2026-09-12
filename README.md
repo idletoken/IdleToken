@@ -107,7 +107,7 @@ To deploy a model on your own machine:
 
 | Platform | Minimum |
 | --- | --- |
-| **Windows 10/11 · Linux x86_64/arm64** | An NVIDIA GPU from the RTX 20 series or newer (Turing, compute capability 7.5) with 8 GB of VRAM, and a current NVIDIA driver. Nothing else to install — the package carries the CUDA runtime it needs. |
+| **Windows 10/11 · Linux x86_64/arm64** | An NVIDIA GPU from the RTX 20 series or newer (Turing, compute capability 7.5) with 8 GB of VRAM, and a current NVIDIA driver. |
 | **macOS** | An Apple Silicon Mac with 16 GB of unified memory. |
 
 More VRAM or unified memory means a larger model, a higher quantization, or a longer context; when one machine is not enough for the model you want, combine several over the LAN. The client estimates what the model, quantization, and context you select require, and checks it again when the model starts, so you do not have to work it out yourself.
