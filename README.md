@@ -130,7 +130,7 @@ Minimum requirements for deploying a model on your own machine:
 
 ## 🖧 Cluster deployment
 
-To run a cluster:
+Our client lets you connect multiple devices into a cluster to deploy large language models. Follow these steps:
 
 1. Install the same IdleToken version on every participating computer and make sure they can reach each other directly over the LAN.
 2. Create a cluster on one computer. Join from the others with the same account or a verification code.
