@@ -103,14 +103,16 @@ Every listed model can run on one machine when it fits or across a cluster when 
 
 ## 💻 Hardware
 
-Resource requirements depend on the selected model, quantization, and context length. The client estimates them from the resources available on the current machine or cluster and checks the selected configuration when the model starts.
+To deploy a model on your own machine:
 
-| Platform | Compute requirements |
+| Platform | Minimum |
 | --- | --- |
-| **Windows 10/11** | NVIDIA GPU with compute capability 7.5 or newer and at least 4 GB VRAM, plus a current driver. CUDA runtime DLLs are included. |
-| **Linux x86_64** | NVIDIA GPU with compute capability 7.5 or newer and at least 4 GB VRAM; driver 570.26+ and CUDA 12.8. |
-| **Linux arm64** | NVIDIA GPU with compute capability 7.5 or newer and at least 4 GB VRAM; driver 580.65+ and CUDA 13.0. |
-| **macOS** | Apple Silicon with enough available unified memory for the selected model, quantization, and context. |
+| **Windows 10/11 · Linux x86_64/arm64** | An NVIDIA GPU from the RTX 20 series or newer (Turing, compute capability 7.5) with 8 GB of VRAM, and a current NVIDIA driver. Linux also needs the CUDA runtime: 12.8 on x86_64, 13.0 on arm64. |
+| **macOS** | An Apple Silicon Mac with 16 GB of unified memory. |
+
+More VRAM or unified memory means a larger model, a higher quantization, or a longer context; when one machine is not enough for the model you want, combine several over the LAN. The client estimates what the model, quantization, and context you select require, and checks it again when the model starts, so you do not have to work it out yourself.
+
+A computer below this bar can still run the client, control a cluster, and call models shared by others.
 
 ## 🖧 Single-machine and cluster deployment
 
