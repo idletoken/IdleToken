@@ -125,7 +125,7 @@ opencode
 
 | 平台 | 最低配置 |
 | --- | --- |
-| **Windows 10/11 · Linux x86_64/arm64** | NVIDIA 显卡，RTX 20 系（Turing，计算能力 7.5）及以后，显存 8 GB，并安装当前 NVIDIA 驱动。Linux 另需 CUDA 运行库：x86_64 为 12.8，arm64 为 13.0。 |
+| **Windows 10/11 · Linux x86_64/arm64** | NVIDIA 显卡，RTX 20 系（Turing，计算能力 7.5）及以后，显存 8 GB，并安装当前 NVIDIA 驱动。Windows 安装包已自带所需的 CUDA 运行库；Linux 需自行安装——x86_64 为 12.8，arm64 为 13.0。 |
 | **macOS** | Apple Silicon Mac，统一内存 16 GB。 |
 
 显存或统一内存越大，可运行的模型越大、量化精度越高、上下文越长；一台机器不够时，可将多台机器通过局域网组成集群。客户端会按所选模型、量化精度和上下文估算资源需求，并在启动模型时再次检查，无需自行计算。
