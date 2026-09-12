@@ -40,7 +40,8 @@ if [ -z "${IDLETOKEN_PLATFORM_VERIFY_KEY_B64:-}" ] && [ -f scripts/platform-veri
     IDLETOKEN_PLATFORM_VERIFY_KEY_B64=$(cat scripts/platform-verify-key.b64)
 fi
 IDLETOKEN_PLATFORM_VERIFY_KEY_B64="${IDLETOKEN_PLATFORM_VERIFY_KEY_B64:-}" \
-make coord worker >/dev/null || fail "make coord worker failed"
+make -B NATIVE_CPU_FLAG=-mcpu=apple-m1 coord worker >/dev/null \
+    || fail "make coord worker failed"
 make -f Makefile.platform >/dev/null || fail "make -f Makefile.platform failed"
 # Ask the binary whether the pin actually took. Passing the variable is not the
 # same as it reaching the object file — the first 0.1.19 macOS bundle set it and
@@ -57,10 +58,41 @@ if ! ./idletoken-coord --overflow-url http://127.0.0.1:1 --overflow-key pin-prob
 fi
 # The pinned llama.cpp is a separate, expensive build; stage_sidecars.sh below
 # hard-fails with the right instructions if it is missing. Do not build it here.
+ENGINE_CACHE="$ROOT/vendor/llama.cpp/build/CMakeCache.txt"
+[ -f "$ENGINE_CACHE" ] || fail "missing llama.cpp CMakeCache.txt; rebuild the release engine"
+grep -Fxq 'GGML_NATIVE:BOOL=OFF' "$ENGINE_CACHE" \
+    || fail "llama.cpp was built for this Mac's CPU; rebuild with GGML_NATIVE=OFF"
+grep -Fxq 'LLAMA_OPENSSL:BOOL=OFF' "$ENGINE_CACHE" \
+    || fail "llama.cpp was built with external OpenSSL; rebuild with LLAMA_OPENSSL=OFF"
+native_flags=$(find "$ROOT/vendor/llama.cpp/build" -type f -name flags.make \
+    -exec grep -H -E -- '(-march|-mcpu)=native' {} + 2>/dev/null || true)
+[ -z "$native_flags" ] \
+    || fail "llama.cpp build flags still contain a builder-native CPU target: $native_flags"
+echo "  engine CPU baseline: portable (GGML_NATIVE=OFF)"
 
 # --- stage sidecars (single source of truth; do not duplicate its logic) ----
 out=$(scripts/stage_sidecars.sh) || { echo "$out"; fail "sidecar staging failed"; }
 echo "$out" | sed 's/^/  /'
+
+# externalBin carries executables only. The coordinator verifies the installed
+# engine against a digest beside it before accepting shared work, so stage the
+# two final-name digest files through tauri.macos.conf.json as well.
+MAC_DIGESTS="$ROOT/client/src-tauri/runtime/macos/engine-digests"
+if [ -L "$MAC_DIGESTS" ] || { [ -e "$MAC_DIGESTS" ] && [ ! -d "$MAC_DIGESTS" ]; }; then
+    fail "unexpected non-directory macOS digest staging path: $MAC_DIGESTS"
+fi
+if [ -d "$MAC_DIGESTS" ]; then
+    rm -rf -- "$MAC_DIGESTS"
+fi
+mkdir -p "$MAC_DIGESTS" || fail "could not create the macOS digest staging directory"
+for b in idletoken-server idletoken-rpc-server; do
+    staged="$ROOT/client/src-tauri/binaries/$b-$TRIPLE"
+    [ -x "$staged" ] || fail "missing staged $b while recording its digest"
+    hash=$(shasum -a 256 "$staged" | awk '{print $1}') \
+        || fail "could not hash staged $b"
+    printf '%s  %s\n' "$hash" "$b" > "$MAC_DIGESTS/$b.sha256" \
+        || fail "could not stage the $b digest"
+done
 
 # --- stage licences (same obligation as build_client_release.sh) ------------
 LIC=client/src-tauri/licenses
@@ -81,9 +113,20 @@ cp -f "$ROOT/vendor/llama.cpp/LICENSE" "$LIC/llamacpp-MIT.txt" \
 cd client || fail "no client/ directory"
 pnpm install >/tmp/client-mac-install.log 2>&1 || fail "pnpm install failed (see /tmp/client-mac-install.log)"
 BUNDLES="${IDLETOKEN_MAC_BUNDLES:-dmg}"
+case "$BUNDLES" in
+    dmg) ;;
+    *) fail "IDLETOKEN_MAC_BUNDLES must be dmg (got '$BUNDLES')" ;;
+esac
 # `tauri build` runs beforeBuildCommand (pnpm build:release) itself — that is
 # what injects the production platform URL into the shipped frontend.
-pnpm tauri build --bundles "$BUNDLES" 2>&1 | tail -25 || fail "tauri build failed"
+BUILD_LOG=$(mktemp /tmp/idletoken-tauri-mac-build.XXXXXX)
+if ! pnpm tauri build --bundles "$BUNDLES" > "$BUILD_LOG" 2>&1; then
+    tail -25 "$BUILD_LOG"
+    rm -f "$BUILD_LOG"
+    fail "tauri build failed"
+fi
+tail -25 "$BUILD_LOG"
+rm -f "$BUILD_LOG"
 
 BDIR=src-tauri/target/release/bundle
 DMG=$(ls -t "$BDIR"/dmg/IdleToken_*.dmg 2>/dev/null | head -1)

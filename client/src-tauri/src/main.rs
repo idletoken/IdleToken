@@ -313,8 +313,20 @@ async fn api_chat(
             .ok_or("malformed HTTP response")?;
         let v: Value =
             serde_json::from_str(payload.trim()).map_err(|e| format!("bad API JSON: {e}"))?;
-        // Anthropic shape: content[0].text; surface engine errors verbatim.
-        if let Some(t) = v["content"][0]["text"].as_str() {
+        // Anthropic shape: the first TEXT block — not content[0], which is the
+        // thinking block whenever the model reasoned (2026-09-12, coordinator
+        // serves thinking by default). Indexing 0 and reading "text" off a
+        // thinking block yields None, and this function then reported a
+        // perfectly good answer as "unexpected API response".
+        if let Some(t) = v["content"]
+            .as_array()
+            .and_then(|blocks| {
+                blocks
+                    .iter()
+                    .find(|b| b["type"] == "text")
+                    .and_then(|b| b["text"].as_str())
+            })
+        {
             return Ok(t.to_string());
         }
         if let Some(err) = v["error"]["message"].as_str() {
@@ -572,6 +584,8 @@ fn api_chat_cancel(id: String) -> bool {
 /// sequence, close-delimited plain HTTP — see engine sse_begin/sse_delta) to
 /// the webview as `api-chat` events tagged with the caller's `id`:
 ///   { id, kind: "delta", text }  per text_delta
+///   { id, kind: "reasoning", text }  per thinking_delta (the model's scratchpad,
+///                                    a separate channel — never the reply text)
 ///   { id, kind: "progress", done, total, reused }  per prefill tick
 ///   { id, kind: "done" }         on message_stop / socket close
 ///   { id, kind: "error", message } on any failure
@@ -624,6 +638,7 @@ async fn api_chat_stream(
         let out = stream_chat_inner(
             &base_url, &messages, &token, &model, max_tokens, &cancel,
             &mut |t| emit("delta", Some(t), None),
+            &mut |t| emit("reasoning", Some(t), None),
             // Prefill progress: "128/512" tokens of the prompt processed. On a
             // LAN cluster this phase is minutes, so it is the difference
             // between a live UI and one that looks hung.
@@ -675,6 +690,7 @@ fn stream_chat_inner(
     max_tokens: Option<u32>,
     cancel: &std::sync::atomic::AtomicBool,
     on_delta: &mut dyn FnMut(&str),
+    on_reasoning: &mut dyn FnMut(&str),
     on_progress: &mut dyn FnMut(u32, u32, u32),
 ) -> Result<(), String> {
     use std::io::{Read, Write};
@@ -839,6 +855,15 @@ fn stream_chat_inner(
                 if v["type"] == "content_block_delta" {
                     if let Some(t) = v["delta"]["text"].as_str() {
                         on_delta(t);
+                    }
+                    // The model's thinking, which arrives in its own block ahead
+                    // of the answer. Kept on a separate channel all the way to
+                    // the transcript: the UI shows it in the collapsed
+                    // "Reasoning" panel, and — the part that matters — it is NOT
+                    // part of the message text, so the next turn does not send
+                    // the scratchpad back as something the model said.
+                    if let Some(t) = v["delta"]["thinking"].as_str() {
+                        on_reasoning(t);
                     }
                 }
                 // A failure partway through: the HTTP status was committed to
@@ -1217,18 +1242,24 @@ mod stream_tests {
         format!("http://127.0.0.1:{port}")
     }
 
-    fn run(script: &'static [u8]) -> (Result<(), String>, String, Vec<(u32, u32, u32)>) {
+    /// `(result, answer text, reasoning text, progress ticks)`. The two texts
+    /// are kept apart here for the same reason they are kept apart on the wire:
+    /// a test that concatenated them could not tell the two channels crossing
+    /// from them working.
+    fn run(script: &'static [u8]) -> (Result<(), String>, String, String, Vec<(u32, u32, u32)>) {
         let url = serve(script);
         let cancel = AtomicBool::new(false);
         let mut text = String::new();
+        let mut reasoning = String::new();
         let mut prog: Vec<(u32, u32, u32)> = Vec::new();
         let msgs = serde_json::json!([{ "role": "user", "content": "hi" }]);
         let out = super::stream_chat_inner(
             &url, &msgs, "", "m", None, &cancel,
             &mut |t| text.push_str(t),
+            &mut |t| reasoning.push_str(t),
             &mut |d, n, r| prog.push((d, n, r)),
         );
-        (out, text, prog)
+        (out, text, reasoning, prog)
     }
 
     const HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n";
@@ -1247,12 +1278,67 @@ mod stream_tests {
             .into_boxed_str(),
         )
         .as_bytes();
-        let (out, text, prog) = run(script);
+        let (out, text, _reasoning, prog) = run(script);
         assert!(out.is_ok(), "{out:?}");
         assert_eq!(text, "hello");
         // The comment must never leak into the reply text, and must be decoded.
         // A cache HIT must be readable as one: 6 of 8 prompt tokens reused.
         assert_eq!(prog, vec![(6, 8, 6), (8, 8, 6)]);
+    }
+
+    #[test]
+    fn thinking_deltas_land_on_their_own_channel() {
+        // The coordinator sends the model's thinking as its own content block,
+        // ahead of the answer (index 0 = thinking, index 1 = text). The two must
+        // not be concatenated: the reply text is what the NEXT turn sends back
+        // as the assistant's words, and a scratchpad in there is the model being
+        // told it said things it only considered.
+        //
+        // These frames are a VERBATIM capture from a real coordinator
+        // (Qwen3.5-0.8B, 2026-09-12; results/reasoning-default-on-20260912.md),
+        // trimmed to two deltas per channel. Hand-written frames here would only
+        // prove that this consumer agrees with whatever this test's author
+        // imagined the emitter sends.
+        let script: &'static [u8] = Box::leak(
+            format!(
+                "{HEAD}\
+                 event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"thinking\",\"thinking\":\"\"}}}}\n\n\
+                 event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"thinking_delta\",\"thinking\":\"Thinking\"}}}}\n\n\
+                 event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"thinking_delta\",\"thinking\":\" Process\"}}}}\n\n\
+                 event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+                 event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n\
+                 event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{{\"type\":\"text_delta\",\"text\":\"There\"}}}}\n\n\
+                 event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{{\"type\":\"text_delta\",\"text\":\" are\"}}}}\n\n\
+                 event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":1}}\n\n\
+                 event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+            )
+            .into_boxed_str(),
+        )
+        .as_bytes();
+        let (out, text, reasoning, _) = run(script);
+        assert!(out.is_ok(), "{out:?}");
+        assert_eq!(text, "There are", "thinking must not reach the reply text");
+        assert_eq!(reasoning, "Thinking Process");
+    }
+
+    #[test]
+    fn a_reply_without_thinking_reports_no_reasoning() {
+        // The other half of the pair: a non-thinking reply must not acquire an
+        // empty reasoning panel, and the text channel must be untouched by the
+        // new branch.
+        let script: &'static [u8] = Box::leak(
+            format!(
+                "{HEAD}\
+                 event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"plain\"}}}}\n\n\
+                 event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+            )
+            .into_boxed_str(),
+        )
+        .as_bytes();
+        let (out, text, reasoning, _) = run(script);
+        assert!(out.is_ok(), "{out:?}");
+        assert_eq!(text, "plain");
+        assert!(reasoning.is_empty(), "got unexpected reasoning: {reasoning:?}");
     }
 
     #[test]
@@ -1268,7 +1354,7 @@ mod stream_tests {
             .into_boxed_str(),
         )
         .as_bytes();
-        let (out, text, _) = run(script);
+        let (out, text, _, _) = run(script);
         assert_eq!(out.unwrap_err(), "cluster prefill failed");
         assert_eq!(text, "partial", "text received before the error must survive");
     }
@@ -1371,6 +1457,7 @@ cluster.\"},\"prompt_tokens\":32984,\"context_size\":32768}";
                 let out = super::stream_chat_inner(
                     &url, &msgs, "", "m", None, &cancel,
                     &mut |t| text.push_str(t),
+                    &mut |_| {},
                     &mut |_, _, _| {},
                 );
                 (out, text)
@@ -1446,6 +1533,7 @@ cluster.\"},\"prompt_tokens\":32984,\"context_size\":32768}";
         let t0 = std::time::Instant::now();
         let out = super::stream_chat_inner(
             &url, &msgs, "", "m", None, &cancel,
+            &mut |_| {},
             &mut |_| {},
             &mut |_, _, _| {},
         );

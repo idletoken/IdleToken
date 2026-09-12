@@ -695,8 +695,10 @@ static int ovf_ensure_key(const char *addr, int *out_unreachable,
 void idletoken_overflow_reply_free(idletoken_overflow_reply *r) {
     if (!r) return;
     free(r->text_escaped);
+    free(r->reasoning_escaped);
     free(r->tool_calls_json);
     r->text_escaped = NULL;
+    r->reasoning_escaped = NULL;
     r->tool_calls_json = NULL;
     r->finish_reason[0] = '\0';
 }
@@ -734,6 +736,7 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
                                 const char *tools_json, size_t tools_len,
                                 const char *tool_choice_json,
                                 size_t tool_choice_len,
+                                const char *ctk_json, size_t ctk_len,
                                 const char *model, const char *quant,
                                 int max_tokens,
                                 int hops_in,
@@ -798,7 +801,7 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
 
     /* The plaintext, and the only place it exists outside this machine's own
      * memory is nowhere: it is sealed before the socket is opened. */
-    size_t inner_cap = messages_len + tools_len + tool_choice_len +
+    size_t inner_cap = messages_len + tools_len + tool_choice_len + ctk_len +
                        strlen(api_key) + (model ? strlen(model) : 0) +
                        (quant ? strlen(quant) : 0) +
                        sizeof prov + 320;
@@ -808,7 +811,7 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
     if (max_tokens > 0)
         inner_len = snprintf(inner, inner_cap,
                              "{\"api_key\":\"%s\",\"model\":\"%s\"%s%s%s,"
-                             "\"messages\":%.*s,\"max_tokens\":%d%s%.*s%s%.*s,"
+                             "\"messages\":%.*s,\"max_tokens\":%d%s%.*s%s%.*s%s%.*s,"
                              "\"nonce\":\"%s\",\"issued_at\":%lld,"
                              "\"dispatch_wait_ms\":5000%s}",
                              api_key, model ? model : "",
@@ -822,10 +825,12 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
                              tool_choice_json && tool_choice_len ? ",\"tool_choice\":" : "",
                              (int)tool_choice_len,
                              tool_choice_json && tool_choice_len ? tool_choice_json : "",
+                             ctk_json && ctk_len ? ",\"chat_template_kwargs\":" : "",
+                             (int)ctk_len, ctk_json && ctk_len ? ctk_json : "",
                              nonce_hex, issued_at, prov);
     else
         inner_len = snprintf(inner, inner_cap,
-                             "{\"api_key\":\"%s\",\"model\":\"%s\"%s%s%s,\"messages\":%.*s%s%.*s%s%.*s,"
+                             "{\"api_key\":\"%s\",\"model\":\"%s\"%s%s%s,\"messages\":%.*s%s%.*s%s%.*s%s%.*s,"
                              "\"nonce\":\"%s\",\"issued_at\":%lld,"
                              "\"dispatch_wait_ms\":5000%s}",
                              api_key, model ? model : "",
@@ -839,6 +844,8 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
                              tool_choice_json && tool_choice_len ? ",\"tool_choice\":" : "",
                              (int)tool_choice_len,
                              tool_choice_json && tool_choice_len ? tool_choice_json : "",
+                             ctk_json && ctk_len ? ",\"chat_template_kwargs\":" : "",
+                             (int)ctk_len, ctk_json && ctk_len ? ctk_json : "",
                              nonce_hex, issued_at, prov);
     if (inner_len < 0 || (size_t)inner_len >= inner_cap) {
         free(inner);
@@ -977,6 +984,14 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
     size_t txt_len = 0;
     const int have_text =
         ovf_str_span((const char *)plain, plain_len, "text", &txt, &txt_len) == 0;
+    /* The borrowed model's thinking. Optional in both directions: an older
+     * platform does not send it, and a provider that did not think has none —
+     * both read as "no thinking shown", never as a wrong answer. */
+    const char *rsn = NULL;
+    size_t rsn_len = 0;
+    const int have_reason =
+        ovf_str_span((const char *)plain, plain_len, "reasoning", &rsn, &rsn_len) == 0
+        && rsn_len > 0;
     const char *tool_calls = idletoken_json_obj_get((const char *)plain, plain_len,
                                                     "tool_calls");
     long tool_calls_len = tool_calls
@@ -1009,6 +1024,17 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
     }
     if (have_text) memcpy(out->text_escaped, txt, txt_len);
     out->text_escaped[have_text ? txt_len : 0] = '\0';
+    if (have_reason) {
+        out->reasoning_escaped = malloc(rsn_len + 1);
+        if (!out->reasoning_escaped) {
+            idletoken_secure_zero(plain, plain_len);
+            free(plain);
+            idletoken_overflow_reply_free(out);
+            OVF_FAIL("out of memory");
+        }
+        memcpy(out->reasoning_escaped, rsn, rsn_len);
+        out->reasoning_escaped[rsn_len] = '\0';
+    }
     if (have_tool_calls) {
         out->tool_calls_json = malloc((size_t)tool_calls_len + 1);
         if (!out->tool_calls_json) {

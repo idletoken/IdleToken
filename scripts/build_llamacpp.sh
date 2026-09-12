@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Fetch, patch and build the pinned llama.cpp engine.
 #
-# Products (static, self-contained — no dylib/DLL soup next to them):
+# Products (static except for operating-system APIs and Linux's redistributable
+# CUDA user-space runtime, which the client release builder bundles privately):
 #   vendor/llama.cpp/build/bin/llama-server       inference + OpenAI API
 #   vendor/llama.cpp/build/bin/ggml-rpc-server    worker-side RPC backend
 #
@@ -149,7 +150,16 @@ COMMON_FLAGS=(
     -DGGML_RPC=ON
     -DGGML_RPC_TLS=ON         # PSK-TLS inside the RPC transport (patch 0001)
     -DBUILD_SHARED_LIBS=OFF
+    # Installers run on other CPUs. A release built on an AVX-512 Xeon or a
+    # recent Apple Silicon generation must not execute builder-specific
+    # instructions before it ever reaches the GPU/Metal backend.
+    -DGGML_NATIVE=OFF
     -DLLAMA_CURL=OFF          # downloads are the coordinator's job
+    # llama-server is reachable only through the coordinator's loopback HTTP
+    # sidecar. Public HTTPS is not a product path, while enabling it links the
+    # macOS binary to a maintainer's Homebrew OpenSSL and breaks clean Macs.
+    # RPC transport TLS is independent and remains pinned to mbedTLS above.
+    -DLLAMA_OPENSSL=OFF
     # The embedded web UI is fetched from a Hugging Face bucket AT BUILD TIME,
     # and when the pinned tag's asset is unreachable upstream silently falls
     # back to `.../resolve/latest/dist.tar.gz` — unpinned bytes inside a pinned
@@ -194,17 +204,24 @@ case "$(uname -s)" in
         case "$(uname -m)" in
             x86_64|amd64)
                 DEFAULT_CUDA_ARCHS="75-real;80-real;86-real;87-real;89-real;90-real;100-real;101-real;120"
+                # Keep the x86 control/CPU path at the architectural baseline.
+                # These are explicit because CMake's defaults differ between
+                # a cold GGML_NATIVE=OFF tree and a warm formerly-native tree.
+                PLATFORM_FLAGS=(-DGGML_CUDA=ON
+                                -DGGML_SSE42=OFF -DGGML_AVX=OFF
+                                -DGGML_AVX2=OFF -DGGML_BMI2=OFF
+                                -DGGML_FMA=OFF -DGGML_F16C=OFF)
                 ;;
             aarch64|arm64)
                 DEFAULT_CUDA_ARCHS="75-real;80-real;86-real;87-real;88-real;89-real;90-real;100-real;103-real;110-real;120-real;121"
+                PLATFORM_FLAGS=(-DGGML_CUDA=ON)
                 ;;
             *)
                 echo "FATAL: unsupported Linux architecture $(uname -m)" >&2
                 exit 1
                 ;;
         esac
-        PLATFORM_FLAGS=(-DGGML_CUDA=ON
-                        -DCMAKE_CUDA_ARCHITECTURES="${IDLETOKEN_CUDA_ARCHS:-$DEFAULT_CUDA_ARCHS}")
+        PLATFORM_FLAGS+=(-DCMAKE_CUDA_ARCHITECTURES="${IDLETOKEN_CUDA_ARCHS:-$DEFAULT_CUDA_ARCHS}")
         NPROC=$(nproc)
         ;;
     *)
@@ -231,9 +248,30 @@ case "$VERSION_LINE" in
     *) echo "FATAL: built version '$VERSION_LINE' does not match pin $PIN_SHA" >&2; exit 1 ;;
 esac
 
+# A release executable may use OS libraries, but never a package manager from
+# the maintainer's machine. This exact bug produced a small DMG whose server
+# worked here only because /opt/homebrew/opt/openssl@3 happened to exist.
+if [ "$(uname -s)" = "Darwin" ]; then
+    command -v otool >/dev/null 2>&1 \
+        || { echo "FATAL: otool is required to audit macOS engine dependencies" >&2; exit 1; }
+    for bin in llama-server ggml-rpc-server; do
+        BAD_DYLIBS=$(otool -L "$BUILD_DIR/bin/$bin" | awk 'NR > 1 { print $1 }' \
+            | grep -Ev '^(/System/Library/|/usr/lib/)' || true)
+        if [ -n "$BAD_DYLIBS" ]; then
+            echo "FATAL: $bin depends on non-system macOS libraries:" >&2
+            printf '%s\n' "$BAD_DYLIBS" >&2
+            exit 1
+        fi
+    done
+    echo "== macOS dependency audit: system frameworks/libraries only"
+fi
+
 {
     echo "upstream $REPO_URL $PIN_SHA"
     echo "version $VERSION_LINE"
+    for arg in "${COMMON_FLAGS[@]}" "${PLATFORM_FLAGS[@]}"; do
+        echo "cmake-arg $arg"
+    done
     for p in ${PATCHES[@]+"${PATCHES[@]}"}; do
         echo "patch $(basename "$p") $(shasum -a 256 "$p" | awk '{print $1}')"
     done

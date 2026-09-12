@@ -188,6 +188,22 @@ int idletoken_admission_local_ok(const char *presented_hex);
  * that is entitled to it. Returns 0 on success. */
 int idletoken_admission_local_marker(char *out, size_t cap);
 
+/* Drop this process's claim on the published channel (see adm_claim_channel).
+ * ONLY for the self-test, which has to play two coordinators inside one
+ * process. A real coordinator holds its claim until it exits, which is the
+ * whole point: the OS releases it even on a crash. */
+void idletoken_admission_release_channel_claim_for_test(void);
+
+/* Rewrite `channel_path` with the key THIS process published, if the file no
+ * longer carries it. For the coordinator to call when a capability failed to
+ * verify: any other coordinator start overwrites that file and then exits with
+ * its key, leaving the serving coordinator's agent minting under a dead one
+ * forever. Returns 1 when it repaired a drift, 0 when the file agreed, -1 when
+ * the module was never armed or the file could not be read/written.
+ *
+ * It never adopts the file's key — see the comment at the definition. */
+int idletoken_admission_republish_if_drifted(const char *channel_path);
+
 /* --- minting and spending -------------------------------------------------
  *
  * `job_id` must be 1..64 chars of [A-Za-z0-9_:-]; anything else is refused

@@ -21,7 +21,8 @@
  * The sealed payload is the platform's normalized InferenceRequest
  * {model, messages:[{role,content}], maxTokens?}; we translate it to the
  * coord's OpenAI-shape /v1/chat/completions request, and wrap
- * choices[0].message.content as {"text":"..."} for the sealed reply.
+ * choices[0].message.content as {"text":"..."} for the sealed reply, with the
+ * model's thinking beside it as "reasoning" when there was any.
  *
  * Registration/heartbeat (optional, when --platform is given): registers via
  * POST /providers {name, pubkey, endpoint} with a JWT bearer token, then
@@ -749,6 +750,11 @@ typedef struct {
      * part of the public service identity below. */
     char origin_id[24];
     int  ctx;          /* per-slot context; 0 = the coordinator did not say */
+    /* Is an engine actually loaded and warm right now (`engine_state:"ready"`)?
+     * NOT part of the published identity -- identity_same() ignores it on
+     * purpose, because "the same service, currently down" is still the same
+     * service. It gates whether we advertise AT ALL, not what we advertise. */
+    int  engine_ready;
 } agent_identity;
 
 /* Minimal JSON string escaper for values WE emit (name, model). */
@@ -1115,6 +1121,13 @@ static uint8_t *http_get_json(const char *addr, const char *path,
  * would still be selling a context too small to serve anyone. */
 #define AGENT_MIN_LIST_CTX 8192
 
+/* How long registration waits for the engine to finish loading, and how often
+ * it re-asks. The bound is generous on purpose: the largest curated models take
+ * minutes to load, and a machine that is merely slow to start is not a machine
+ * that should be refused. */
+#define AGENT_READY_POLL_SECS      2
+#define AGENT_READY_WAIT_MAX_SECS  1800
+
 /**
  * Read the service identity from the coordinator's /idletoken/v1/stats.
  * Returns 0 on success, -1 when the coordinator could not be reached or did
@@ -1153,13 +1166,52 @@ static int coord_identity(const char *coord_addr, agent_identity *out) {
     char *model = json_str_dup(j, rlen, "model");
     char *quant = json_str_dup(j, rlen, "quant");
     char *origin_id = json_str_dup(j, rlen, "overflow_origin_id");
+    /* The coordinator answers /stats while the engine is still loading (it owns
+     * the API port from the moment it starts), so "the coordinator replied" is
+     * NOT "there is an engine to sell". `engine_state` is the coordinator's own
+     * word for that difference (coord_llama_state_name(): ready/starting/
+     * failed/...). An older coordinator does not emit the field at all; absent
+     * means ready, which is exactly the behaviour that preceded this check --
+     * we do not take a machine off the market over a field it never sent. */
+    char *estate = json_str_dup(j, rlen, "engine_state");
     free(resp);
     if (model) snprintf(out->model, sizeof(out->model), "%s", model);
     if (quant) snprintf(out->quant, sizeof(out->quant), "%s", quant);
     if (origin_id) snprintf(out->origin_id, sizeof(out->origin_id), "%s", origin_id);
-    free(model); free(quant); free(origin_id);
+    out->engine_ready = !estate || !strcmp(estate, "ready");
+    free(model); free(quant); free(origin_id); free(estate);
     out->ctx = ctx > 0 ? ctx : 0;
     return out->ctx > 0 ? 0 : -1;
+}
+
+/**
+ * May this machine be advertised right now?
+ *
+ * One probe, one answer, used by both transports before every beat. `*live` is
+ * filled only when the answer is yes, so a caller can never accidentally
+ * re-declare from a reading that says "nothing is running here".
+ *
+ * WHY THIS GATE EXISTS (2026-09-12). The product rule is one sentence: no
+ * engine means not sharing, and not sharing means not on the discovery page.
+ * The client already enforced it at the switch ("start a model before turning
+ * on sharing"), but nothing enforced it afterwards -- and the switch is a
+ * standing setting, so every later launch resumed an agent that outlived the
+ * coordinator it was started next to. Found on two real test machines: both
+ * had a client and this agent running with NO coordinator and NO llama-server
+ * at all, and both were on sale on the public marketplace -- one of them
+ * advertising qwen3.5-35b-a3b@256K that nothing could have served.
+ *
+ * The beat is the right place for it because the beat is what "online" means:
+ * relay's poll and direct mode's heartbeat both refresh `lastBeat`, and the
+ * platform's freshness TTL (60s) then does the rest by itself -- no delisting,
+ * no provider churn, and the listing comes straight back when the engine does.
+ */
+static int engine_sellable(const char *coord_addr, agent_identity *live) {
+    agent_identity probe;
+    if (coord_identity(coord_addr, &probe) != 0) return 0;
+    if (!probe.engine_ready) return 0;
+    *live = probe;
+    return 1;
 }
 
 /* Do two declarations name the same service? All three fields, because all
@@ -1179,41 +1231,62 @@ static void identity_print(const agent_identity *id, char *out, size_t cap) {
 }
 
 /**
- * Refuse to list a coordinator whose slots are too small. Returns 0 to go on,
- * non-zero to exit with that code.
+ * Block until this machine has an engine worth listing, or give up.
+ * Returns 0 with `*live` filled, or an exit code.
  *
- * Retries, because "the coordinator is still loading the model" and "the
- * coordinator serves 4096-token slots" are different facts and the first one
- * looks exactly like the second for the first few seconds after boot. The
- * agent is normally started next to the coordinator, so a startup race is the
- * common case, not the exception.
+ * This is where "no engine means not sharing" is enforced at startup, and it
+ * WAITS rather than refuses because the two states that look alike here are
+ * "the coordinator is still loading a 200 GB model" and "there is no
+ * coordinator" -- and the first one resolves by itself, often minutes later.
+ * The client already promises exactly this ("the agent waits for the
+ * coordinator on port N"), so waiting is also the behaviour users were told.
  *
- * If it still cannot be read after that, we warn loudly and continue. Refusing
- * on "cannot check" would take a machine off the market for a reason we have
- * not established, which is its own kind of dishonesty -- but silence is not an
- * option either, so the operator gets told the check did not happen.
+ * What it must never do is the thing it used to do: give up checking and
+ * register anyway. That warning-and-continue path is how a machine with no
+ * engine at all ended up on sale (see engine_sellable()).
+ *
+ * Bounded, because a wait with no end is indistinguishable from a hang -- the
+ * same reason cluster formation grew one (hard invariant 12).
  */
-static int assert_listable_ctx(const char *coord_addr, agent_identity *id_out) {
-    agent_identity live;
-    int have = -1;
-    for (int attempt = 0; attempt < 5; attempt++) {
-        have = coord_identity(coord_addr, &live);
-        if (have == 0) break;
-        if (attempt == 0)
-            fprintf(stderr, "platform-agent: coordinator at %s is not answering "
-                            "/idletoken/v1/stats yet; waiting for it before listing\n",
-                    coord_addr);
-        sleep(2);
+static int await_sellable_engine(const char *coord_addr, agent_identity *live) {
+    memset(live, 0, sizeof(*live));
+    int ever_answered = 0;
+    for (time_t waited = 0; ; waited += AGENT_READY_POLL_SECS) {
+        agent_identity probe;
+        if (coord_identity(coord_addr, &probe) == 0) {
+            ever_answered = 1;
+            *live = probe;
+            if (probe.engine_ready) return 0;
+        }
+        if (waited >= AGENT_READY_WAIT_MAX_SECS) {
+            fprintf(stderr,
+                    "platform-agent: refuse: %s within %ds.\n"
+                    "  Not registering: listing a machine with no engine behind it "
+                    "sells work nothing can do. Start a model first, then turn "
+                    "sharing on.%s\n",
+                    ever_answered
+                        ? "the coordinator never reported a ready engine"
+                        : "the coordinator never answered /idletoken/v1/stats",
+                    AGENT_READY_WAIT_MAX_SECS,
+                    ever_answered ? " Check the engine log for a load failure." : "");
+            return 4;
+        }
+        if (waited % 30 == 0)
+            fprintf(stderr, "platform-agent: no engine to list yet at %s (%s); "
+                            "waiting before registering (%ds so far)\n",
+                    coord_addr, ever_answered ? "still loading" : "not answering",
+                    (int)waited);
+        sleep(AGENT_READY_POLL_SECS);
     }
-    if (have != 0) {
-        fprintf(stderr, "platform-agent: WARNING: could not read the coordinator's "
-                        "ctx_size, so the %d-token listing floor was NOT checked. "
-                        "If this cluster serves less than %d tokens per slot it will "
-                        "be a poor provider (the platform's smallest context class "
-                        "is %d and it never borrows downward).\n",
-                AGENT_MIN_LIST_CTX, AGENT_MIN_LIST_CTX, AGENT_MIN_LIST_CTX);
-        return 0;
-    }
+}
+
+/**
+ * Refuse to list a coordinator whose slots are too small. Returns 0 to go on,
+ * non-zero to exit with that code. The reading is already established by
+ * await_sellable_engine() -- there is no "could not check" case left.
+ */
+static int assert_listable_ctx(const agent_identity *id_out) {
+    const agent_identity live = *id_out;
     const int ctx = live.ctx;
     if (ctx < AGENT_MIN_LIST_CTX) {
         fprintf(stderr,
@@ -1232,7 +1305,6 @@ static int assert_listable_ctx(const char *coord_addr, agent_identity *id_out) {
                 ctx, AGENT_MIN_LIST_CTX, AGENT_MIN_LIST_CTX, AGENT_MIN_LIST_CTX);
         return 4;
     }
-    if (id_out) *id_out = live;  /* only a VERIFIED declaration is reported */
     return 0;
 }
 
@@ -1271,16 +1343,16 @@ typedef struct {
 #define AGENT_REDECLARE_BACKOFF_MAX_S  900
 
 /**
- * Re-read the coordinator's triple and, if it moved, publish it.
+ * Publish the coordinator's triple if it moved.
  *
- * Deliberately does nothing on a failed read: "the coordinator is restarting"
- * must not be mistaken for "this machine now serves something else". The
- * declaration only ever changes on a reading we actually got.
+ * `live` is a reading the caller actually got (engine_sellable()); this
+ * function is never called on a failed probe, because "the coordinator is
+ * restarting" must not be mistaken for "this machine now serves something
+ * else". The declaration only ever changes on a reading we actually got.
  */
-static void reconcile_identity(agent_registration *reg) {
+static void reconcile_identity(agent_registration *reg, const agent_identity *live_in) {
     if (!reg->provider_id || !reg->jwt) return;
-    agent_identity live;
-    if (coord_identity(reg->coord_addr, &live) != 0) return;   /* nothing established */
+    const agent_identity live = *live_in;
     if (!live.model[0] || !live.quant[0]) {
         char what[224];
         identity_print(&live, what, sizeof(what));
@@ -1477,6 +1549,9 @@ static int platform_heartbeat(const char *platform_addr, const char *jwt,
 
 #define RELAY_WAIT_MS 25000            /* server default; must stay < proxies' idle cuts */
 #define RELAY_BACKOFF_MAX_SECS 30
+/* How often to re-probe while there is no engine. Short enough that coming
+ * back from a model switch costs seconds, not a poll period. */
+#define RELAY_IDLE_RECHECK_SECS 5
 
 /* Shared sealed-envelope data path (defined below with the /infer handler).
  * `job_id` may be NULL on the direct transport, which has no platform-assigned
@@ -1536,13 +1611,35 @@ static void relay_loop(const idletoken_keypair *node, agent_registration *reg) {
     const char *platform_addr = reg->platform_addr;
     const char *jwt           = reg->jwt;
     int backoff = 1;
+    int was_sellable = 1;   /* registration proved an engine was there */
 
     for (;;) {
         /* The poll is this transport's heartbeat, so it is also where the
          * declaration gets checked against what the coordinator is actually
          * running. Before the poll, not after: a poll accepts work for the
-         * triple the platform believes is here. */
-        reconcile_identity(reg);
+         * triple the platform believes is here.
+         *
+         * And when there is no engine, there is no poll: see engine_sellable().
+         * Skipping the poll is both halves of the honest answer at once --
+         * `lastBeat` goes stale (the platform stops listing us) and we stop
+         * claiming jobs we could not run. */
+        agent_identity live;
+        if (!engine_sellable(coord_addr, &live)) {
+            if (was_sellable) {
+                fprintf(stderr, "platform-agent: no engine is running behind this agent "
+                                "(coordinator at %s unreachable or still loading); "
+                                "pausing the relay poll, so this machine drops off the "
+                                "marketplace until it is back.\n", coord_addr);
+                was_sellable = 0;
+            }
+            sleep(RELAY_IDLE_RECHECK_SECS);
+            continue;
+        }
+        if (!was_sellable) {
+            fprintf(stderr, "platform-agent: the engine is back; resuming the relay poll\n");
+            was_sellable = 1;
+        }
+        reconcile_identity(reg, &live);
         /* Rebuilt from the (possibly re-registered) id every iteration —
          * a provider id that moved and a path that did not is a poll that
          * silently stops receiving work. */
@@ -1716,6 +1813,20 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
         ? idletoken_json_value_len(choice_tok, (const char *)plain + plain_len)
         : -1;
     size_t choice_len = choice_len_raw > 0 ? (size_t)choice_len_raw : 0;
+    /* The consumer's thinking switch, forwarded VERBATIM.
+     *
+     * The platform seals it under the key the engine itself reads
+     * (`chat_template_kwargs`), so this agent neither parses nor re-spells it:
+     * it copies the object through, coord passes the OpenAI face through
+     * wholesale, and the engine reads it. Absent = the consumer did not say,
+     * and the model template's own default decides — which is why nothing is
+     * synthesised here when the key is missing. */
+    const char *ctk_tok = idletoken_json_obj_get((const char *)plain, plain_len,
+                                                 "chat_template_kwargs");
+    long ctk_len_raw = (ctk_tok && *ctk_tok == '{')
+        ? idletoken_json_value_len(ctk_tok, (const char *)plain + plain_len)
+        : -1;
+    size_t ctk_len = ctk_len_raw > 0 ? (size_t)ctk_len_raw : 0;
 
     /* Contract hashes for the KV prefix: they must be computed into a staging
      * buffer while `plain` still exists (it is wiped moments from now), and are
@@ -1724,7 +1835,7 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
     static char staged[PFX_MAX_BLOCKS][65];
     int staged_n = prefix_hash_messages(msgs_tok, msgs_len, staged, PFX_MAX_BLOCKS);
 
-    size_t creq_cap = msgs_len + model_len + tools_len + choice_len + 160;
+    size_t creq_cap = msgs_len + model_len + tools_len + choice_len + ctk_len + 192;
     char *creq = malloc(creq_cap);
     if (!creq) {
         idletoken_secure_zero(plain, plain_cap);
@@ -1738,12 +1849,14 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
     if (max_tokens > 0)
         snprintf(mt_frag, sizeof mt_frag, ",\"max_tokens\":%d", max_tokens);
     int cl = snprintf(creq, creq_cap,
-                      "{\"model\":\"%.*s\",\"messages\":%.*s%s%s%.*s%s%.*s}",
+                      "{\"model\":\"%.*s\",\"messages\":%.*s%s%s%.*s%s%.*s%s%.*s}",
                       (int)model_len, model_tok, (int)msgs_len, msgs_tok, mt_frag,
                       have_req_tools ? ",\"tools\":" : "",
                       (int)tools_len, have_req_tools ? tools_tok : "",
                       choice_len ? ",\"tool_choice\":" : "",
-                      (int)choice_len, choice_len ? choice_tok : "");
+                      (int)choice_len, choice_len ? choice_tok : "",
+                      ctk_len ? ",\"chat_template_kwargs\":" : "",
+                      (int)ctk_len, ctk_len ? ctk_tok : "");
 
     /* -- forward plaintext to coord over loopback ------------------------- *
      * Deliberately NO "stream":true here: the sealed envelope is a one-shot
@@ -1872,6 +1985,18 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
     const char *content_tok = NULL; size_t content_len = 0;
     int have_content = json_str_token((const char *)cresp, cresp_len, "content",
                                       &content_tok, &content_len) == 0;
+    /* The model's thinking, when it did any. Travels beside the answer and
+     * never inside it: the platform renders it into `reasoning_content` /
+     * a thinking block, and merging the two here would make the scratchpad
+     * indistinguishable from the reply for every consumer downstream.
+     *
+     * ⚠ `json_key_colon` matches a whole QUOTED key, so the search for
+     * "content" above cannot land on "reasoning_content" — which the engine
+     * emits FIRST. A substring match here would ship the scratchpad as the
+     * answer on every platform request. */
+    const char *reason_tok = NULL; size_t reason_len = 0;
+    int have_reason = json_str_token((const char *)cresp, cresp_len, "reasoning_content",
+                                     &reason_tok, &reason_len) == 0 && reason_len > 0;
     const char *tc_tok = NULL; size_t tc_len = 0;
     int have_tools = json_array_token((const char *)cresp, cresp_len, "tool_calls",
                                       &tc_tok, &tc_len) == 0;
@@ -1930,15 +2055,18 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
     int have_fr = json_str_token((const char *)cresp, cresp_len, "finish_reason",
                                  &fr_tok, &fr_len) == 0 && fr_len < 32;
 
-    size_t reply_cap = content_len + tc_len + 192 + sizeof usage_frag;
+    size_t reply_cap = content_len + reason_len + tc_len + 224 + sizeof usage_frag;
     char *reply = malloc(reply_cap);
     if (!reply) { wipe_free(cresp, cresp_len); free(reply_to); FAIL(500, "oom"); }
     idletoken_mlock(reply, reply_cap);
     char tc_frag_head[24];
     snprintf(tc_frag_head, sizeof tc_frag_head, "%s", have_tools ? ",\"tool_calls\":" : "");
     int rl = snprintf(reply, reply_cap,
-                      "{\"text\":\"%.*s\",\"cache_hit\":%s,\"cached_tokens\":%d%s%s%.*s%s%.*s%s}",
+                      "{\"text\":\"%.*s\"%s%.*s%s,\"cache_hit\":%s,\"cached_tokens\":%d%s%s%.*s%s%.*s%s}",
                       (int)content_len, have_content ? content_tok : "",
+                      have_reason ? ",\"reasoning\":\"" : "",
+                      (int)reason_len, have_reason ? reason_tok : "",
+                      have_reason ? "\"" : "",
                       cache_hit ? "true" : "false", cached_tokens, usage_frag,
                       tc_frag_head, (int)tc_len, have_tools ? tc_tok : "",
                       have_fr ? ",\"finish_reason\":\"" : "",
@@ -2335,18 +2463,23 @@ int main(int argc, char **argv) {
     reg.pubkey_b64 = pubkey_b64; reg.endpoint = endpoint; reg.coord_addr = coord_addr;
     reg.relay = relay;
     if (platform_url) {
-        /* The listing floor, checked before anything is registered or beaten:
-         * a machine that cannot serve 8192 tokens per slot should never appear
-         * on the market at all, not appear and then disappoint. Gated on
-         * platform_url because without it this agent is not listing anything.
-         * Escape hatch on purpose absent -- see §A3 in the cleanup plan; the
-         * decision is that such a machine is not a provider.
+        /* Two gates before anything is registered or beaten, in this order:
          *
-         * It also hands back the coordinator's model and precision, because
-         * this one probe is where the whole declaration comes from. */
-        agent_identity live;  /* all-zero (= undeclared) if it could not be read */
-        memset(&live, 0, sizeof(live));
-        int floor_rc = assert_listable_ctx(coord_addr, &live);
+         *   1. Is there an engine at all? A machine with nothing loaded is not
+         *      a provider -- that is the whole product rule, and waiting for
+         *      one is what the client already tells users happens.
+         *   2. Is its context worth listing? A machine that cannot serve 8192
+         *      tokens per slot should never appear on the market at all, not
+         *      appear and then disappoint. Escape hatch on purpose absent --
+         *      see §A3 in the cleanup plan.
+         *
+         * Gated on platform_url because without it this agent lists nothing.
+         * The probe also hands back the coordinator's model and precision:
+         * this is where the whole declaration comes from. */
+        agent_identity live;
+        int wait_rc = await_sellable_engine(coord_addr, &live);
+        if (wait_rc != 0) { free(pubkey_b64); return wait_rc; }
+        int floor_rc = assert_listable_ctx(&live);
         if (floor_rc != 0) { free(pubkey_b64); return floor_rc; }
         /* The COORDINATOR decides; --model/--quant are assertions only. Falling
          * back to startup flags would re-create the stale-listing bug one
@@ -2421,17 +2554,39 @@ int main(int argc, char **argv) {
     /* Accept loop with a 1s select() tick so heartbeats piggyback on the same
      * single thread (no threads needed — beats are cheap and infrequent). */
     time_t last_beat = 0;   /* 0 → beat immediately (puts us ONLINE at once) */
+    int was_sellable = 1;   /* registration proved an engine was there */
     for (;;) {
         if (reg.provider_id && jwt) {
             time_t now = time(NULL);
             if (now - last_beat >= (time_t)beat_secs) {
                 /* Before the beat, not after: a beat republishes the load of a
                  * machine the platform still believes is serving the old
-                 * triple, and the whole point is that the two agree. */
-                reconcile_identity(&reg);
-                if (platform_heartbeat(platform_addr, jwt, reg.provider_id, coord_addr) != 0)
-                    fprintf(stderr, "platform-agent: heartbeat failed (will retry)\n");
-                last_beat = now;
+                 * triple, and the whole point is that the two agree.
+                 *
+                 * No engine → no beat at all (engine_sellable()), so the
+                 * platform's freshness TTL takes this machine off the shelf
+                 * instead of us selling something nothing can serve. */
+                agent_identity live;
+                if (!engine_sellable(coord_addr, &live)) {
+                    if (was_sellable) {
+                        fprintf(stderr, "platform-agent: no engine is running behind this "
+                                        "agent (coordinator at %s unreachable or still "
+                                        "loading); withholding the heartbeat, so this "
+                                        "machine drops off the marketplace until it is "
+                                        "back.\n", coord_addr);
+                        was_sellable = 0;
+                    }
+                    last_beat = now;
+                } else {
+                    if (!was_sellable) {
+                        fprintf(stderr, "platform-agent: the engine is back; resuming heartbeats\n");
+                        was_sellable = 1;
+                    }
+                    reconcile_identity(&reg, &live);
+                    if (platform_heartbeat(platform_addr, jwt, reg.provider_id, coord_addr) != 0)
+                        fprintf(stderr, "platform-agent: heartbeat failed (will retry)\n");
+                    last_beat = now;
+                }
             }
             /* KV cache state: report whenever there is a new session (the
              * platform expires it after >10 min, so frequent re-reporting buys

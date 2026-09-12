@@ -146,6 +146,29 @@ REM it failed every time with "run scripts\build_llamacpp_win.bat first" —
 REM advice that cannot fix it, because that script had already run.
 set "LLAMA_BIN=%ROOT%\vendor\llama.cpp\build\bin\Release"
 if not exist "%LLAMA_BIN%\llama-server.exe" set "LLAMA_BIN=%ROOT%\vendor\llama.cpp\build\bin"
+set "LLAMA_CMAKE_CACHE=%ROOT%\vendor\llama.cpp\build\CMakeCache.txt"
+if not exist "%LLAMA_CMAKE_CACHE%" (
+    echo CLIENT_RELEASE_FAIL: missing llama.cpp CMakeCache.txt; rebuild the release engine
+    exit /b 1
+)
+findstr /x /c:"GGML_NATIVE:BOOL=OFF" "%LLAMA_CMAKE_CACHE%" >nul
+if errorlevel 1 (
+    echo CLIENT_RELEASE_FAIL: llama.cpp was built for the build PC CPU; rebuild with GGML_NATIVE=OFF
+    exit /b 1
+)
+findstr /x /c:"LLAMA_OPENSSL:BOOL=OFF" "%LLAMA_CMAKE_CACHE%" >nul
+if errorlevel 1 (
+    echo CLIENT_RELEASE_FAIL: llama.cpp was built with external OpenSSL; rebuild with LLAMA_OPENSSL=OFF
+    exit /b 1
+)
+for %%F in (GGML_SSE42 GGML_AVX GGML_AVX2 GGML_BMI2) do (
+    findstr /x /c:"%%F:BOOL=OFF" "%LLAMA_CMAKE_CACHE%" >nul
+    if errorlevel 1 (
+        echo CLIENT_RELEASE_FAIL: x86 release engine does not pin %%F=OFF
+        exit /b 1
+    )
+)
+echo   engine CPU baseline: portable ^(GGML_NATIVE=OFF^)
 if not exist "%ROOT%\client\src-tauri\runtime\windows" mkdir "%ROOT%\client\src-tauri\runtime\windows"
 call :stage_engine llama-server    idletoken-server     || exit /b 1
 call :stage_engine ggml-rpc-server idletoken-rpc-server || exit /b 1
@@ -187,6 +210,13 @@ copy /y "%ROOT%\NOTICE" "%ROOT%\client\src-tauri\licenses\NOTICE.txt" >nul || (
     echo CLIENT_RELEASE_FAIL: cannot stage NOTICE & exit /b 1)
 copy /y "%ROOT%\vendor\ds4\LICENSE" "%ROOT%\client\src-tauri\licenses\ds4-MIT.txt" >nul || (
     echo CLIENT_RELEASE_FAIL: cannot stage the ds4 licence & exit /b 1)
+REM rax.c remains part of the retained ds4 source archive and carries a
+REM separate BSD-3-Clause notice. Keep that notice beside the ds4 MIT text on
+REM Windows, matching the macOS and Linux native packages.
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "$t=[IO.File]::ReadAllText('%ROOT%\vendor\ds4\rax.c'); $m=[regex]::Match($t,'(?s)^/\* Rax.*?\*/'); if(-not $m.Success -or $m.Value -notmatch 'Redistribution and use in source and binary forms'){exit 1}; [IO.File]::WriteAllText('%ROOT%\client\src-tauri\licenses\rax-BSD-3-Clause.txt',$m.Value,(New-Object Text.UTF8Encoding($false)))"
+if errorlevel 1 (
+    echo CLIENT_RELEASE_FAIL: cannot stage the rax licence & exit /b 1)
 copy /y "%ROOT%\vendor\llama.cpp\LICENSE" "%ROOT%\client\src-tauri\licenses\llamacpp-MIT.txt" >nul || (
     echo CLIENT_RELEASE_FAIL: cannot stage the llama.cpp licence & exit /b 1)
 
@@ -232,6 +262,27 @@ for %%D in (cudart64_12.dll cublas64_12.dll cublasLt64_12.dll) do (
     copy /y "%CUDA_RUNTIME_DIR%\%%D" "%ROOT%\client\src-tauri\runtime\windows\%%D" >nul || exit /b 1
     for %%T in ("%CUDA_RUNTIME_DIR%\%%D") do echo   CUDA %%D  %%~zT bytes
 )
+set "CUDA_EULA="
+if defined IDLETOKEN_CUDA_HOME if exist "%IDLETOKEN_CUDA_HOME%\EULA.txt" set "CUDA_EULA=%IDLETOKEN_CUDA_HOME%\EULA.txt"
+if not defined CUDA_EULA if exist "%CUDA_RUNTIME_DIR%\..\EULA.txt" set "CUDA_EULA=%CUDA_RUNTIME_DIR%\..\EULA.txt"
+if not defined CUDA_EULA if exist "%ProgramFiles%\IdleToken\licenses\NVIDIA-CUDA-EULA.txt" set "CUDA_EULA=%ProgramFiles%\IdleToken\licenses\NVIDIA-CUDA-EULA.txt"
+if not defined CUDA_EULA if exist "%LOCALAPPDATA%\IdleToken\licenses\NVIDIA-CUDA-EULA.txt" set "CUDA_EULA=%LOCALAPPDATA%\IdleToken\licenses\NVIDIA-CUDA-EULA.txt"
+if not defined CUDA_EULA (
+    echo CLIENT_RELEASE_FAIL: NVIDIA CUDA EULA not found beside the runtime being redistributed
+    exit /b 1
+)
+findstr /i /c:"cudart.dll" "%CUDA_EULA%" >nul
+if errorlevel 1 (
+    echo CLIENT_RELEASE_FAIL: CUDA EULA does not identify cudart.dll as redistributable
+    exit /b 1
+)
+findstr /i /c:"cublasLt.dll" "%CUDA_EULA%" >nul
+if errorlevel 1 (
+    echo CLIENT_RELEASE_FAIL: CUDA EULA does not identify cublasLt.dll as redistributable
+    exit /b 1
+)
+copy /y "%CUDA_EULA%" "%ROOT%\client\src-tauri\licenses\NVIDIA-CUDA-EULA.txt" >nul || (
+    echo CLIENT_RELEASE_FAIL: cannot stage the NVIDIA CUDA EULA & exit /b 1)
 if not exist "%SystemRoot%\System32\vcomp140.dll" (
     echo CLIENT_RELEASE_FAIL: missing %SystemRoot%\System32\vcomp140.dll ^(required by the pinned llama.cpp engine^)
     exit /b 1

@@ -586,6 +586,41 @@ char *idletoken_anthropic_to_openai(const char *body, size_t len,
         }
     }
 
+    {   /* Anthropic's own thinking switch -> the kwarg the engine reads.
+         *
+         * `thinking` is how this protocol says "think" or "do not", so a client
+         * that sends it (Claude Code does) must be obeyed rather than have it
+         * dropped in translation — which is what happened while this body was
+         * rebuilt field by field, leaving the Anthropic face the only one where
+         * thinking could not be turned off at all.
+         *
+         * budget_tokens is emitted as reasoning_budget_tokens. The caller's
+         * number wins over the coordinator's derived floor by construction:
+         * that one is injected at the FRONT of this object, and the engine's
+         * parser lets the later duplicate win. */
+        const char *tv = idletoken_json_obj_get(body, len, "thinking");
+        const long tvl = (tv && *tv == '{') ? idletoken_json_value_len(tv, end) : -1;
+        const char *ty;
+        size_t tyl;
+        if (tvl > 0 &&
+            idletoken_json_obj_str(tv, (size_t)tvl, "type", &ty, &tyl) == 0) {
+            const int enabled  = (tyl == 7 && memcmp(ty, "enabled", 7) == 0);
+            const int disabled = (tyl == 8 && memcmp(ty, "disabled", 8) == 0);
+            if (enabled || disabled) {
+                sb_cstr(&b, ",\"chat_template_kwargs\":{\"enable_thinking\":");
+                sb_cstr(&b, enabled ? "true}" : "false}");
+            }
+            if (enabled) {
+                const int bt = top_int_field(tv, (size_t)tvl, "budget_tokens", 0);
+                if (bt > 0) {
+                    char rb[56];
+                    snprintf(rb, sizeof(rb), ",\"reasoning_budget_tokens\":%d", bt);
+                    sb_cstr(&b, rb);
+                }
+            }
+        }
+    }
+
     int max_tokens = top_int_field(body, len, "max_tokens", 0);
     if (max_tokens <= 0 && default_max_tokens > 0) max_tokens = default_max_tokens;
     if (max_tokens > 0) {
@@ -749,6 +784,14 @@ char *idletoken_oai_resp_to_anthropic_content(const char *resp, size_t len,
     const char *text = "";
     size_t textl = 0;
     idletoken_json_obj_str(msg, mlen, "content", &text, &textl);
+    /* The thinking that preceded the answer, when the model did any. Anthropic
+     * carries it as a block of its own AHEAD of the text block — the same shape
+     * the engine's own Anthropic face emits, `signature` included: the field
+     * belongs to the block type, and empty is what a local model, with nothing
+     * to cryptographically attest, can honestly put in it. */
+    const char *think = "";
+    size_t thinkl = 0;
+    idletoken_json_obj_str(msg, mlen, "reasoning_content", &think, &thinkl);
 
     sb_t b = {0};
     sb_cstr(&b, "[");
@@ -760,7 +803,14 @@ char *idletoken_oai_resp_to_anthropic_content(const char *resp, size_t len,
         size_t probe = 0;
         have_calls = idletoken_oai_next_tool_call(msg, mlen, &probe, &tc);
     }
+    if (thinkl > 0) {
+        sb_cstr(&b, "{\"type\":\"thinking\",\"thinking\":\"");
+        sb_put(&b, think, thinkl);
+        sb_cstr(&b, "\",\"signature\":\"\"}");
+        n_blocks++;
+    }
     if (textl > 0 || !have_calls) {
+        if (n_blocks) sb_cstr(&b, ",");
         sb_cstr(&b, "{\"type\":\"text\",\"text\":\"");
         sb_put(&b, text, textl);
         sb_cstr(&b, "\"}");

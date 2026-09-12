@@ -32,6 +32,9 @@
 #  include <unistd.h>
 #  define IDLETOKEN_ADM_TLS __thread
 #endif
+/* flock(): POSIX-native, and on Windows the shim in src/platform/win over
+ * LockFileEx (same one ds4's single-process lock file uses). */
+#include <sys/file.h>
 
 /* One process-wide lock, on EVERY platform. Minting and spending are rare (once
  * per dispatched job) and the critical sections are a few hundred bytes of
@@ -252,6 +255,64 @@ static int adm_job_ok(const char *job) {
 /* 0600 on POSIX. On Windows the file inherits the user's profile ACL, which is
  * the same boundary the settings file and the engine log already sit behind;
  * there is no weaker claim being made here than elsewhere in the product. */
+/* Who owns the published channel on this machine.
+ *
+ * The key file is a per-machine singleton but coordinators are per-process, and
+ * every start rolls a new key. So a start that is not going to serve — one that
+ * refuses over resources, a probe, a stray second instance — used to overwrite
+ * the serving coordinator's published key and then exit with it, leaving the
+ * agent beside it minting under a key nobody verifies against. The question
+ * that actually decides whether we may publish is therefore not "am I about to
+ * serve?" (which is scattered across every refusal branch in startup) but "is
+ * somebody already serving here?", and an advisory lock answers exactly that.
+ *
+ * Held for the life of the process and never closed on purpose: the OS drops it
+ * when we exit, so a crashed coordinator leaves nothing to clean up and the next
+ * start claims it cleanly. A sibling `.lock` rather than the key file itself —
+ * on Windows LockFileEx is mandatory, and locking the key would block our own
+ * later rewrite of it.
+ *
+ * Returns 1 when the channel is ours, 0 when another process holds it, -1 when
+ * the lock file itself could not be opened. */
+static int g_adm_lock_fd = -1;
+
+static int adm_claim_channel(const char *channel_path) {
+    char lockpath[480];
+    int fd;
+
+    if (g_adm_lock_fd >= 0) return 1;   /* already claimed by this process */
+    snprintf(lockpath, sizeof lockpath, "%s.lock", channel_path);
+#ifdef _WIN32
+    fd = _open(lockpath, _O_WRONLY | _O_CREAT, _S_IREAD | _S_IWRITE);
+#else
+    fd = open(lockpath, O_WRONLY | O_CREAT, 0600);
+#endif
+    if (fd < 0) return -1;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+#ifdef _WIN32
+        _close(fd);
+#else
+        close(fd);
+#endif
+        return 0;
+    }
+    g_adm_lock_fd = fd;
+    return 1;
+}
+
+/* Drop the claim. Only for the self-test, which has to play both coordinators
+ * inside one process; a real coordinator holds it until it exits. */
+void idletoken_admission_release_channel_claim_for_test(void) {
+    if (g_adm_lock_fd < 0) return;
+    flock(g_adm_lock_fd, LOCK_UN);
+#ifdef _WIN32
+    _close(g_adm_lock_fd);
+#else
+    close(g_adm_lock_fd);
+#endif
+    g_adm_lock_fd = -1;
+}
+
 static int adm_write_private(const char *path, const char *hex, char *err, size_t err_cap) {
     FILE *f;
     int fd;
@@ -346,9 +407,28 @@ int idletoken_admission_init(const char *channel_path, const char *local_path,
         ADM_UNLOCK();
     }
 
-    if (channel_path && channel_path[0] &&
-        adm_write_private(channel_path, g_adm.channel_hex, err, err_cap) != 0)
-        rc = -1;
+    /* Publish only if no other coordinator on this machine already owns the
+     * channel. A start that loses this race is, by construction, not the one
+     * serving, and overwriting here is what stranded the serving coordinator's
+     * agent on a dead key for 18 hours (measured 2026-09-12).
+     *
+     * Losing is NOT fatal: a coordinator with no published key is the benign,
+     * pre-existing state — the agent falls back to the plain origin marker and
+     * its jobs are still served, just unattributed. A STALE key is the fatal
+     * one, so declining to write is the safe side of this choice. */
+    if (channel_path && channel_path[0]) {
+        int claim = adm_claim_channel(channel_path);
+        if (claim == 0) {
+            if (err && err_cap)
+                snprintf(err, err_cap,
+                         "another coordinator on this machine already owns %s — "
+                         "leaving its published key alone", channel_path);
+            rc = -1;
+        } else if (adm_write_private(channel_path, g_adm.channel_hex,
+                                     err, err_cap) != 0) {
+            rc = -1;
+        }
+    }
 
     return rc;
 }
@@ -429,6 +509,55 @@ int idletoken_admission_attach_file_if_changed(const char *channel_path,
     }
     rc = idletoken_admission_attach(hex, err, err_cap);
     idletoken_secure_zero(hex, sizeof hex);
+    return rc == 0 ? 1 : -1;
+}
+
+/* The publisher defends its own publication.
+ *
+ * Every coordinator start rolls a fresh channel key and overwrites the file
+ * (see idletoken_admission_init). A coordinator that starts, publishes, and
+ * then exits — a refusal, a probe, a second instance — therefore leaves behind
+ * a key that died with it, while the coordinator that is actually serving still
+ * holds its own in memory. The agent faithfully re-reads the file and mints
+ * under the dead key, and every dispatched job is refused with
+ * `signature does not verify`. Nothing in the old design ever repaired that:
+ * the file is only ever written at startup, so the state persisted until
+ * somebody restarted the serving coordinator by hand. Measured on a Windows
+ * node 2026-09-12: 18 hours of it, every canary probe refused.
+ *
+ * So: when a capability fails to verify, the serving coordinator checks whether
+ * the file still carries the key it published and rewrites it if not. Paired
+ * with the agent's one-shot re-read-and-retry on 403, a poisoned file costs
+ * nothing — the retry mints under the repaired file and the job goes through.
+ *
+ * Returns 1 when it repaired a drifted file, 0 when the file already agreed,
+ * and -1 when the file could not be read or written (nothing to do about that
+ * here; the caller's refusal already stands).
+ *
+ * ⚠ NOT a place to accept the file's key instead. The key in memory is the one
+ * this process mints and verifies against; adopting a key some other process
+ * wrote is how a capability outlives the replay window that `init` cleared. */
+int idletoken_admission_republish_if_drifted(const char *channel_path) {
+    char hex[IDLETOKEN_ADM_KEYHEX_CAP], mine[IDLETOKEN_ADM_KEYHEX_CAP];
+    int rc;
+
+    if (!channel_path || !channel_path[0]) return -1;
+
+    ADM_LOCK();
+    rc = g_adm.armed ? 0 : -1;
+    if (rc == 0) memcpy(mine, g_adm.channel_hex, sizeof mine);
+    ADM_UNLOCK();
+    if (rc != 0) return -1;             /* nothing published to defend */
+
+    if (adm_read_hex(channel_path, hex, sizeof hex) == 0 &&
+        adm_streq_ct(hex, mine)) {
+        idletoken_secure_zero(hex, sizeof hex);
+        idletoken_secure_zero(mine, sizeof mine);
+        return 0;                       /* the file still says what we published */
+    }
+    idletoken_secure_zero(hex, sizeof hex);
+    rc = adm_write_private(channel_path, mine, NULL, 0);
+    idletoken_secure_zero(mine, sizeof mine);
     return rc == 0 ? 1 : -1;
 }
 
@@ -949,6 +1078,122 @@ int idletoken_admission_selftest(void) {
         AST(idletoken_admission_attach_file_if_changed(
                 "no/such/idletoken-admission.key", err, sizeof err) == -1 && err[0],
             "admission: a missing key file is a named failure, not a silent success");
+
+        /* The other direction: the FILE is newer than the serving process.
+         *
+         * A second coordinator start overwrites the file and exits with its key
+         * (a refusal, a probe). The serving coordinator still holds keyB, so the
+         * agent — which faithfully re-reads the file — mints under a key nobody
+         * verifies against, forever. 2026-09-12: 18 hours of it on a real node.
+         * The serving side has to defend its own publication. */
+        {
+            char keyC[IDLETOKEN_ADM_KEYHEX_CAP], tC[IDLETOKEN_ADM_TICKET_CAP];
+
+            /* We are the serving coordinator, on keyB. */
+            AST(idletoken_admission_attach(keyB, err, sizeof err) == 0,
+                "admission: (the serving coordinator holds keyB)");
+            AST(idletoken_admission_republish_if_drifted(path) == 0,
+                "admission: an AGREEING key file is left alone "
+                "(negative control: repair only fires on real drift)");
+
+            /* A transient coordinator start clobbers the file with keyC. */
+            AST(idletoken_admission_init(path, NULL, err, sizeof err) == 0,
+                "admission: (a second coordinator start overwrites the file)");
+            snprintf(keyC, sizeof keyC, "%s", g_adm.channel_hex);
+            AST(strcmp(keyB, keyC) != 0, "admission: (it published a different key)");
+
+            /* Back to the serving coordinator, which never saw keyC. The agent
+             * reads the file and mints under keyC — refused, as it must be. */
+            AST(idletoken_admission_attach(keyC, err, sizeof err) == 0 &&
+                idletoken_admission_mint("job-J", h1, now, tC, sizeof tC,
+                                         err, sizeof err) == 0,
+                "admission: (the agent mints under whatever the file says)");
+            AST(idletoken_admission_attach(keyB, err, sizeof err) == 0 &&
+                idletoken_admission_consume(tC, h1, now + 1, NULL, 0)
+                    == IDLETOKEN_ADM_BAD_MAC,
+                "admission: a ticket minted under a clobbered file is refused");
+            idletoken_admission_request_end();
+
+            /* Repair: the serving coordinator puts its own key back. */
+            AST(idletoken_admission_republish_if_drifted(path) == 1,
+                "admission: the serving coordinator republishes a DRIFTED file");
+
+            /* Now the agent's side. One process here stands in for both, so put
+             * the module back on keyC first — that IS the agent's state, and
+             * without this step the re-read would be a no-op (it is already on
+             * keyB) and would prove nothing. */
+            AST(idletoken_admission_attach(keyC, err, sizeof err) == 0,
+                "admission: (the agent is still on the clobbered key)");
+            AST(idletoken_admission_attach_file_if_changed(path, err, sizeof err) == 1 &&
+                idletoken_admission_channel_ok(keyB) == 1,
+                "admission: the agent's next re-read lands back on the serving key");
+
+            /* End to end: mint under the repaired file, serving side spends it.
+             * Without this the block would prove the file changed, not that the
+             * two processes agree again. */
+            AST(idletoken_admission_mint("job-K", h1, now, tC, sizeof tC,
+                                         err, sizeof err) == 0 &&
+                idletoken_admission_consume(tC, h1, now + 1, job, sizeof job)
+                    == IDLETOKEN_ADM_OK && !strcmp(job, "job-K"),
+                "admission: after the repair a dispatched job goes through");
+            idletoken_admission_request_end();
+
+            AST(idletoken_admission_republish_if_drifted(
+                    "no/such/dir/idletoken-admission.key") == -1,
+                "admission: an unwritable path is a named failure, not a claimed repair");
+        }
+
+        /* Prevention: a second coordinator must not clobber a live one's key.
+         *
+         * flock() attaches to the open file description, so two separate open()
+         * calls contend even inside one process — which is what lets this test
+         * play "the other coordinator" for real instead of asserting the shape
+         * of the code. */
+        {
+            char lockpath[480], keyD[IDLETOKEN_ADM_KEYHEX_CAP], onfile[IDLETOKEN_ADM_KEYHEX_CAP];
+            int other;
+
+            /* We are the serving coordinator: publish and hold the claim. */
+            idletoken_admission_release_channel_claim_for_test();
+            AST(idletoken_admission_init(path, NULL, err, sizeof err) == 0,
+                "admission: (the serving coordinator publishes and claims the channel)");
+            snprintf(keyD, sizeof keyD, "%s", g_adm.channel_hex);
+
+            /* Another process starts. It cannot take the claim, so init must
+             * refuse to publish, say why, and leave the file alone. */
+            snprintf(lockpath, sizeof lockpath, "%s.lock", path);
+            idletoken_admission_release_channel_claim_for_test();
+#ifdef _WIN32
+            other = _open(lockpath, _O_WRONLY | _O_CREAT, _S_IREAD | _S_IWRITE);
+#else
+            other = open(lockpath, O_WRONLY | O_CREAT, 0600);
+#endif
+            AST(other >= 0 && flock(other, LOCK_EX | LOCK_NB) == 0,
+                "admission: (another coordinator holds the channel claim)");
+            AST(idletoken_admission_init(path, NULL, err, sizeof err) == -1 &&
+                    strstr(err, "already owns") != NULL,
+                "admission: a start that does not own the channel REFUSES to "
+                "publish, and names why");
+            AST(adm_read_hex(path, onfile, sizeof onfile) == 0 &&
+                    !strcmp(onfile, keyD),
+                "admission: the serving coordinator's published key survived it "
+                "(this is the 18-hour outage, prevented)");
+
+            /* Negative control: once the other process lets go, publishing
+             * works again — the claim is a lock, not a latch. */
+            flock(other, LOCK_UN);
+#ifdef _WIN32
+            _close(other);
+#else
+            close(other);
+#endif
+            AST(idletoken_admission_init(path, NULL, err, sizeof err) == 0,
+                "admission: with the channel free, a start publishes normally "
+                "(negative control)");
+            AST(adm_read_hex(path, onfile, sizeof onfile) == 0 &&
+                    strcmp(onfile, keyD) != 0,
+                "admission: and that start's own key is what is on the file now");
+        }
 
         remove(path);
     }

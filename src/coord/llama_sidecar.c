@@ -799,9 +799,13 @@ static int llama_spawn(idletoken_llama *lc) {
     if (lc->grow_dir[0] && !lc->shared)
         snprintf(slotsave_frag, sizeof(slotsave_frag),
                  " --slot-save-path \"%s\"", lc->grow_dir);
+    /* `--reasoning auto` = follow the model's template default; the reasoning
+     * why it is not "off" any more, and what guards the empty-answer failure
+     * instead, is on the POSIX path below. The two spawn paths must not
+     * diverge. */
     int n = snprintf(cmd, sizeof(cmd),
                      "\"%s\" -m \"%s\" %s%s%s%s "
-                     "-ngl %s --fit off%s --reasoning off%s%s%s -np %s%s%s%s",
+                     "-ngl %s --fit off%s --reasoning auto%s%s%s -np %s%s%s%s",
                      lc->bin, lc->gguf, listen_args,
                      lc->shared ? " --no-slots" : "",
                      /* --poll 0 rides with GPU_ONLY (see the struct field);
@@ -968,13 +972,23 @@ static int llama_spawn(idletoken_llama *lc) {
         argv[argc++] = "--load-mode";
         argv[argc++] = "none";
     }
-    /* Reasoning off by default: thinking models (Qwen3.5 etc.) otherwise burn
-     * the whole token budget inside <think> and the visible answer comes back
-     * EMPTY with finish_reason "length" — measured with Qwen3.5-0.8B at
-     * max_tokens 200. An empty reply is a broken product; thinking support is
-     * a future client toggle. Overridable via IDLETOKEN_LLAMA_ARGS (appended
-     * last, so a user-supplied --reasoning wins). */
-    argv[argc++] = "--reasoning"; argv[argc++] = "off";
+    /* Reasoning follows each model's own chat template (2026-09-12, replaces
+     * the blanket "--reasoning off" this line carried since 2026-08).
+     *
+     * Every model on the curated list is a thinking model, so "off" meant
+     * serving all of them in their secondary mode. The failure that motivated
+     * it is real and unchanged — Qwen3.5-0.8B at max_tokens 200 burns the whole
+     * budget inside <think> and the visible answer comes back EMPTY with
+     * finish_reason "length" — but the engine's own cure for that is a THINKING
+     * BUDGET, not a kill switch: llama_openai_upstream_body() injects a
+     * per-request reasoning_budget_tokens so the answer always keeps a share of
+     * max_tokens. "off" was never a whole guard anyway; it is fed to the
+     * template as enable_thinking=false, so a model whose template ignores that
+     * variable kept thinking and kept hitting the same wall.
+     *
+     * Overridable via IDLETOKEN_LLAMA_ARGS (appended last, so a user-supplied
+     * --reasoning wins). */
+    argv[argc++] = "--reasoning"; argv[argc++] = "auto";
     if (lc->ctx_size > 0) { argv[argc++] = "-c"; argv[argc++] = ctxstr; }
     /* Mirrors the Windows yarn_frag above — the two spawn paths must not
      * diverge. Scale is per-SLOT ctx over the trained window: RoPE positions

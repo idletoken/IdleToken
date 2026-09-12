@@ -150,6 +150,12 @@ static int g_shared_mode = 0;
  * it, and tightening the local path is exactly what this feature must not do. */
 static char g_api_unix[320] = "";
 
+/* Where we published our admission channel key, kept so the request path can
+ * repair the file when a capability fails to verify. Empty when there is no
+ * home directory to publish into (the key then lives only in memory and the
+ * agent beside us cannot mint at all — a different, already-reported state). */
+static char g_adm_channel_path[400] = "";
+
 /* P0-3: is the engine binary the one that shipped with this client?
  *
  * The four ways to read a buyer's prompt on the host machine are all cheap
@@ -3289,6 +3295,19 @@ static int coord_overflow_relay(int conn_fd, const idletoken_http_req *req,
     long tool_choice_len = tool_choice
         ? idletoken_json_value_len(tool_choice, openai + openai_len) : 0;
     if (tool_choice_len <= 0) { tool_choice = NULL; tool_choice_len = 0; }
+    /* The thinking switch travels with the borrowed request. Borrowing is
+     * invisible to the local user by design — the answer comes back through
+     * this machine's own API — so a preference that survived the local path
+     * and died on the borrowed one would make "did I get thinking?" depend on
+     * whether somebody else's GPU happened to serve it.
+     *
+     * The span comes from the SAME normalized OpenAI body the local path uses,
+     * so an Anthropic caller's `thinking` field has already been translated
+     * into this key by apiconv. */
+    const char *ctk = idletoken_json_obj_get(openai, openai_len, "chat_template_kwargs");
+    long ctk_len = (ctk && *ctk == '{')
+        ? idletoken_json_value_len(ctk, openai + openai_len) : 0;
+    if (ctk_len <= 2) { ctk = NULL; ctk_len = 0; }
 
     int max_tokens = coord_json_top_int(openai, openai_len, "max_tokens", -1);
     if (max_tokens < 0) max_tokens = g_max_decode > 0 ? g_max_decode : 0;
@@ -3298,6 +3317,7 @@ static int coord_overflow_relay(int conn_fd, const idletoken_http_req *req,
     int rc = idletoken_overflow_exchange(messages, (size_t)messages_len,
                                          tools, (size_t)tools_len,
                                          tool_choice, (size_t)tool_choice_len,
+                                         ctk, (size_t)ctk_len,
                                          coord_model()->id, coord_quant(),
                                          max_tokens,
                                          hops_in, conn_fd, &rep, err, sizeof err);
@@ -3334,20 +3354,30 @@ static int coord_overflow_relay(int conn_fd, const idletoken_http_req *req,
      * this was one ordinary request that happened to take a little longer.
      * rep.text_escaped is already JSON-escaped and is spliced in as-is. */
     const size_t tc_len = rep.tool_calls_json ? strlen(rep.tool_calls_json) : 0;
-    size_t cap = strlen(rep.text_escaped) + tc_len + 768;
+    /* Already-escaped thinking, spliced in like the text. Empty when the
+     * platform sent none (older platform, or a provider that did not think). */
+    const char *rsn = rep.reasoning_escaped ? rep.reasoning_escaped : "";
+    const size_t rsn_len = strlen(rsn);
+    size_t cap = strlen(rep.text_escaped) + rsn_len + tc_len + 768;
     char *body = (char *)malloc(cap);
     int bl = -1;
     if (body) {
         if (is_anthropic) {
             char stop_reason[16] = "max_tokens";
-            size_t oai_cap = strlen(rep.text_escaped) + tc_len + 384;
+            size_t oai_cap = strlen(rep.text_escaped) + rsn_len + tc_len + 384;
             char *oai = (char *)malloc(oai_cap);
             char *content = NULL;
             size_t content_len = 0;
             if (oai) {
+                /* reasoning_content goes into the synthesized OpenAI body on
+                 * purpose: the translation below already knows how to turn it
+                 * into an Anthropic thinking block, so the borrowed path and
+                 * the local one produce the same shape from the same code. */
                 int ol = snprintf(oai, oai_cap,
                     "{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                    "%s%s%s"
                     "\"content\":%s%s%s%s%s},\"finish_reason\":\"%s\"}]}",
+                    rsn_len ? "\"reasoning_content\":\"" : "", rsn, rsn_len ? "\"," : "",
                     rep.tool_calls_json && !rep.text_escaped[0] ? "null" : "\"",
                     rep.tool_calls_json && !rep.text_escaped[0] ? "" : rep.text_escaped,
                     rep.tool_calls_json && !rep.text_escaped[0] ? "" : "\"",
@@ -3377,11 +3407,13 @@ static int coord_overflow_relay(int conn_fd, const idletoken_http_req *req,
                           "{\"id\":\"chatcmpl_idletoken_%llu\",\"object\":\"chat.completion\","
                           "\"created\":%lld,\"model\":\"%s\","
                           "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
+                          "%s%s%s"
                           "\"content\":%s%s%s%s%s},\"finish_reason\":\"%s\"}],"
                           "\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,"
                           "\"total_tokens\":%d},\"cache_hit\":false,\"cached_tokens\":0}",
                           (unsigned long long)req_id, (long long)time(NULL),
                           coord_model()->id,
+                          rsn_len ? "\"reasoning_content\":\"" : "", rsn, rsn_len ? "\"," : "",
                           rep.tool_calls_json && !rep.text_escaped[0] ? "null" : "\"",
                           rep.tool_calls_json && !rep.text_escaped[0] ? "" : rep.text_escaped,
                           rep.tool_calls_json && !rep.text_escaped[0] ? "" : "\"",
@@ -3448,6 +3480,14 @@ typedef struct {
     int  failed;
     char id[48];         /* response id suffix: "%llu" req_id, or "mock" */
     long long created;
+    /* Anthropic content-block bookkeeping (the OpenAI face has no blocks):
+     * blocks are opened LAZILY because whether a thinking block is needed —
+     * and therefore whether the text block is index 0 or index 1 — is only
+     * known when the first delta of each kind arrives. See sse_block_open. */
+    int  blk_open;       /* a content block is currently open */
+    int  blk_thinking;   /* ...and it is a thinking block, not a text one */
+    int  blk_index;      /* index of the open block, or of the next one */
+    int  blk_any;        /* any block at all was opened for this message */
 } idletoken_sse;
 
 static void sse_emitf(idletoken_sse *s, const char *event, const char *fmt, ...) {
@@ -3473,9 +3513,9 @@ static void sse_begin(idletoken_sse *s, int n_input) {
              "\"stop_reason\":null,\"stop_sequence\":null,"
              "\"usage\":{\"input_tokens\":%d,\"output_tokens\":0}}}",
             s->id, coord_model()->id, n_input);
-        sse_emitf(s, "content_block_start",
-            "{\"type\":\"content_block_start\",\"index\":0,"
-             "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}");
+        /* No content_block_start here: see idletoken_sse's block bookkeeping.
+         * A model that thinks first must get its thinking block at index 0,
+         * and nothing yet says whether this one will. */
     } else {
         sse_emitf(s, NULL,
             "{\"id\":\"chatcmpl_idletoken_%s\",\"object\":\"chat.completion.chunk\","
@@ -3486,18 +3526,77 @@ static void sse_begin(idletoken_sse *s, int n_input) {
     }
 }
 
+/* Close the open Anthropic content block, if any, and move the index on. */
+static void sse_block_close(idletoken_sse *s) {
+    if (!s->anthropic || !s->blk_open) return;
+    sse_emitf(s, "content_block_stop",
+        "{\"type\":\"content_block_stop\",\"index\":%d}", s->blk_index);
+    s->blk_open = 0;
+    s->blk_index++;
+}
+
+/* Make sure the open Anthropic block is of the kind asked for, starting one
+ * (and closing the previous) when it is not. Mirrors what the engine's own
+ * Anthropic face emits: thinking first, then text, each its own block. */
+static void sse_block_open(idletoken_sse *s, int thinking) {
+    if (!s->anthropic) return;
+    if (s->blk_open && s->blk_thinking == thinking) return;
+    sse_block_close(s);
+    if (thinking)
+        sse_emitf(s, "content_block_start",
+            "{\"type\":\"content_block_start\",\"index\":%d,"
+             "\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}",
+            s->blk_index);
+    else
+        sse_emitf(s, "content_block_start",
+            "{\"type\":\"content_block_start\",\"index\":%d,"
+             "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
+            s->blk_index);
+    s->blk_open = 1;
+    s->blk_thinking = thinking;
+    s->blk_any = 1;
+}
+
 /* One text delta. `esc` must already be JSON-escaped (json_escape_text). */
 static void sse_delta(idletoken_sse *s, const char *esc) {
     if (!esc[0]) return;
     if (s->anthropic) {
+        sse_block_open(s, 0);
         sse_emitf(s, "content_block_delta",
-            "{\"type\":\"content_block_delta\",\"index\":0,"
-             "\"delta\":{\"type\":\"text_delta\",\"text\":\"%s\"}}", esc);
+            "{\"type\":\"content_block_delta\",\"index\":%d,"
+             "\"delta\":{\"type\":\"text_delta\",\"text\":\"%s\"}}",
+            s->blk_index, esc);
     } else {
         sse_emitf(s, NULL,
             "{\"id\":\"chatcmpl_idletoken_%s\",\"object\":\"chat.completion.chunk\","
              "\"created\":%lld,\"model\":\"%s\","
              "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},"
+                           "\"finish_reason\":null}]}",
+            s->id, s->created, coord_model()->id, esc);
+    }
+}
+
+/* One reasoning delta: the model's thinking, which both protocols carry in a
+ * channel of its own instead of inside the answer — `delta.reasoning_content`
+ * on the OpenAI face (what the engine itself emits, and what the OpenAI-
+ * compatible ecosystem reads), a thinking block on the Anthropic one.
+ *
+ * Keeping it out of `content` is not cosmetic: a client that concatenates
+ * deltas would otherwise paste the scratchpad into the answer, and the next
+ * turn would send that back as if the model had said it. */
+static void sse_delta_reasoning(idletoken_sse *s, const char *esc) {
+    if (!esc[0]) return;
+    if (s->anthropic) {
+        sse_block_open(s, 1);
+        sse_emitf(s, "content_block_delta",
+            "{\"type\":\"content_block_delta\",\"index\":%d,"
+             "\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"%s\"}}",
+            s->blk_index, esc);
+    } else {
+        sse_emitf(s, NULL,
+            "{\"id\":\"chatcmpl_idletoken_%s\",\"object\":\"chat.completion.chunk\","
+             "\"created\":%lld,\"model\":\"%s\","
+             "\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"%s\"},"
                            "\"finish_reason\":null}]}",
             s->id, s->created, coord_model()->id, esc);
     }
@@ -3560,8 +3659,11 @@ static void sse_finish(idletoken_sse *s, int n_input, int n_output, int eos_stop
                        int cached) {
     if (cached < 0) cached = 0;
     if (s->anthropic) {
-        sse_emitf(s, "content_block_stop",
-            "{\"type\":\"content_block_stop\",\"index\":0}");
+        /* A generation that produced nothing at all still owes the client the
+         * shape this path has always sent — one empty text block — rather than
+         * a message with no content blocks. */
+        if (!s->blk_any) sse_block_open(s, 0);
+        sse_block_close(s);
         sse_emitf(s, "message_delta",
             "{\"type\":\"message_delta\","
              "\"delta\":{\"stop_reason\":\"%s\",\"stop_sequence\":null},"
@@ -3742,12 +3844,68 @@ static void sb_cstr(llama_sb *b, const char *s) { sb_put(b, s, strlen(s)); }
  * carries system promotion, non-leading-system demotion, tools / tool_use /
  * tool_result, sampling passthrough and the max_tokens default. */
 
+/* What fraction of a request's max_tokens thinking may spend before the engine
+ * is told to wrap it up: 1/N of it, so at least (N-1)/N survives for the answer.
+ *
+ * The engine's own default is -1, unrestricted, and that is exactly what
+ * produced the measured empty answer: Qwen3.5-0.8B at max_tokens 200 spent all
+ * 200 inside <think> and the visible reply was "" with finish_reason "length".
+ * A budget makes that unreachable by construction — when thinking crosses it
+ * the engine closes the thinking block itself and the remainder goes to the
+ * answer — which is what lets reasoning stay ON by default (llama_sidecar.c).
+ *
+ * This is a floor under the ANSWER, not a judgement about how much thinking is
+ * enough. A caller who wants the engine default back sends its own
+ * "reasoning_budget_tokens": -1, which wins as the later duplicate key. */
+#define IDLETOKEN_REASONING_BUDGET_SHARE 2
+
+/* What the engine writes into the thinking block when that budget runs out.
+ *
+ * NOT optional, and not decoration. Measured on Qwen3.5-0.8B, max_tokens 200,
+ * budget 100, with the engine's default (no message at all): the thinking tag
+ * is closed mid-sentence, the model reads its own truncated scratchpad as the
+ * start of the reply and simply continues it — "3. **Identify the Letter
+ * Count:** ... (Wait, let me spell it out carefully)" went out as the ANSWER.
+ * That is strictly worse than the empty answer the budget exists to prevent:
+ * an empty reply is visibly broken, a fluent continuation of a scratchpad is
+ * not. With this line the same request answers in the shape of an answer.
+ *
+ * It lands inside the thinking block, so the user sees it in the thinking
+ * panel rather than in the reply — which is the honest place for it: the model
+ * really was cut short. */
+#define IDLETOKEN_REASONING_BUDGET_MESSAGE \
+    "\\n\\nI have used up my thinking budget. " \
+    "I will now give the final answer directly."
+
+/**
+ * Below this many max_tokens, thinking is turned OFF rather than budgeted.
+ *
+ * The arithmetic, not a taste: the budget hands thinking max_tokens/2, and the
+ * engine then FORCES the wrap-up message above into the thinking block —
+ * measured at **18 tokens** through the pinned engine's own tokenizer
+ * (Qwen3.5-0.8B, 2026-09-12). So the answer cannot start before
+ * `max_tokens/2 + 18`, and for anything to be left after it, max_tokens must be
+ * at least twice 18 plus room for a sentence. 64 is that, rounded.
+ *
+ * Found on the real platform chain, not by reading: a `max_tokens: 16` request
+ * came back with a well-formed completion whose text was EMPTY — the same
+ * failure the budget exists to prevent, reappearing one scale down
+ * (results/reasoning-default-on-20260912.md §10).
+ *
+ * This is a default for callers who said nothing, NOT an override: it is
+ * injected at the front of the object like everything else here, so a caller
+ * who explicitly asked to think still wins as the later duplicate key and gets
+ * exactly what it asked for.
+ */
+#define IDLETOKEN_REASONING_MIN_MAX_TOKENS 64
+
 /* Upstream body for the OpenAI face: the client's JSON passed through (so
- * sampling parameters survive), with two keys injected at the FRONT of the
+ * sampling parameters survive), with three keys injected at the FRONT of the
  * object — a later duplicate key wins in the engine's parser, so the client's
  * own values still take precedence: stream_options.include_usage so the final
- * SSE chunk carries usage, and a default max_tokens when the client sent none
- * (--max-decode, the same default the cluster path applies).
+ * SSE chunk carries usage, a default max_tokens when the client sent none
+ * (--max-decode, the same default the cluster path applies), and the thinking
+ * budget above.
  * `force_nonstream` appends "stream":false at the END of the object (the
  * later duplicate wins), for the tools one-shot path where the client asked
  * to stream but the upstream request must not. */
@@ -3768,10 +3926,31 @@ static char *llama_openai_upstream_body(const char *body, size_t len,
     if (!empty_obj) {   /* injecting into `{}` would leave a trailing comma */
         if (want_stream)
             sb_cstr(&b, "\"stream_options\":{\"include_usage\":true},");
-        if (g_max_decode > 0 && extract_int_field(body, len, "max_tokens", -1) < 0) {
+        const int mt_req = extract_int_field(body, len, "max_tokens", -1);
+        if (g_max_decode > 0 && mt_req < 0) {
             char mt[48];
             snprintf(mt, sizeof(mt), "\"max_tokens\":%d,", g_max_decode);
             sb_cstr(&b, mt);
+        }
+        /* Derived from the max_tokens this request will ACTUALLY run with: the
+         * client's own, or the default injected just above. Neither present
+         * means the output is unbounded anyway, and an unbounded answer cannot
+         * be starved by thinking — there is nothing to split. */
+        const int mt_eff = mt_req >= 0 ? mt_req : g_max_decode;
+        if (mt_eff > 0 && mt_eff < IDLETOKEN_REASONING_MIN_MAX_TOKENS) {
+            /* No room to think AND answer — see the constant. Ask for the
+             * answer directly rather than spend the whole budget on a
+             * scratchpad the caller will never see. */
+            sb_cstr(&b, "\"chat_template_kwargs\":{\"enable_thinking\":false},");
+        } else if (mt_eff > 0) {
+            char rb[64];
+            snprintf(rb, sizeof(rb), "\"reasoning_budget_tokens\":%d,",
+                     mt_eff / IDLETOKEN_REASONING_BUDGET_SHARE);
+            sb_cstr(&b, rb);
+            /* The two travel together, always: a budget without the message is
+             * a measured way to produce a confident non-answer. */
+            sb_cstr(&b, "\"reasoning_budget_message\":\""
+                        IDLETOKEN_REASONING_BUDGET_MESSAGE "\",");
         }
     }
     if (force_nonstream) {
@@ -4161,6 +4340,14 @@ static void llama_chat_nonstream(int conn_fd, int is_anthropic,
     const char *content = "";
     size_t clen = 0;
     json_raw_str_span(resp, rlen, "content", &content, &clen);
+    /* The thinking that preceded the answer, when the model did any. Its own
+     * key both ways round: the engine puts it in `message.reasoning_content`
+     * rather than inside `content`, and so do we. (`json_value_pos` compares
+     * whole quoted keys, so the search for "content" above cannot land on
+     * "reasoning_content" — and this one cannot land on "content" either.) */
+    const char *rcontent = "";
+    size_t rclen = 0;
+    json_raw_str_span(resp, rlen, "reasoning_content", &rcontent, &rclen);
     const char *fr = NULL;
     size_t frlen = 0;
     int have_fr = json_raw_str_span(resp, rlen, "finish_reason", &fr, &frlen) == 0;
@@ -4202,7 +4389,7 @@ static void llama_chat_nonstream(int conn_fd, int is_anthropic,
         ablocks = idletoken_oai_resp_to_anthropic_content(resp, rlen, sreason,
                                                           sizeof(sreason), &ablen);
 
-    size_t body_cap = clen + ablen + (size_t)tcalls_len + 1024;
+    size_t body_cap = clen + rclen + ablen + (size_t)tcalls_len + 1024;
     char *body = malloc(body_cap);
     if (!body) {
         llama_error_json(conn_fd, 500, "api_error", "out of memory building the response");
@@ -4249,6 +4436,7 @@ static void llama_chat_nonstream(int conn_fd, int is_anthropic,
                        "\"model\":\"%s\","
                        "\"choices\":[{\"index\":0,"
                                       "\"message\":{\"role\":\"assistant\","
+                                                    "%s%.*s%s"
                                                     "\"content\":\"%.*s\"%s%.*s},"
                                       "\"finish_reason\":\"%s\"}],"
                        "\"usage\":{\"prompt_tokens\":%d,"
@@ -4256,7 +4444,10 @@ static void llama_chat_nonstream(int conn_fd, int is_anthropic,
                                    "\"total_tokens\":%d},"
                        "\"cache_hit\":%s,\"cached_tokens\":%d}",
                       (unsigned long long)req_id, (long long)time(NULL),
-                      coord_model()->id, (int)clen, content,
+                      coord_model()->id,
+                      rclen ? "\"reasoning_content\":\"" : "",
+                      (int)rclen, rcontent, rclen ? "\"," : "",
+                      (int)clen, content,
                       tc_field, (int)tcalls_len, tcalls ? tcalls : "",
                       fr_tools ? "tool_calls" : (eos_stop ? "stop" : "length"),
                       up_in, n_out, up_in + n_out,
@@ -4274,6 +4465,20 @@ static void llama_chat_nonstream(int conn_fd, int is_anthropic,
             n_out, eos_stop ? "EOS" : "max_tokens", cached_n, up_in);
     llama_account(up_in, n_out, tps, t0, cached);
     llama_account_ttft_ms(prefill_ms);
+}
+
+/* Re-emit one span lifted out of an engine delta frame. The span is still the
+ * engine's own JSON-escaped text, which is exactly what the emitters take, so
+ * this costs a copy for the NUL and no unescape/re-escape round trip. */
+static void llama_stream_span(idletoken_sse *s, const char *span, size_t slen,
+                              int reasoning) {
+    char *esc = malloc(slen + 1);
+    if (!esc) return;
+    memcpy(esc, span, slen);
+    esc[slen] = '\0';
+    if (reasoning) sse_delta_reasoning(s, esc);
+    else           sse_delta(s, esc);
+    free(esc);
 }
 
 /* Streaming chat: consume the engine's SSE incrementally and re-emit through
@@ -4309,7 +4514,7 @@ static void llama_chat_stream(int conn_fd, int is_anthropic,
         return;
     }
 
-    idletoken_sse s = (idletoken_sse){ conn_fd, is_anthropic, 0, "", 0 };
+    idletoken_sse s = (idletoken_sse){ .fd = conn_fd, .anthropic = is_anthropic };
     snprintf(s.id, sizeof(s.id), "%llu", (unsigned long long)req_id);
     s.created = (long long)time(NULL);
     sse_begin(&s, n_input);
@@ -4352,21 +4557,25 @@ static void llama_chat_stream(int conn_fd, int is_anthropic,
                 } else if (dlen > 0) {
                     const char *span;
                     size_t slen;
+                    /* Thinking rides in delta frames of its own, ahead of the
+                     * answer's. Both are counted: they are output tokens the
+                     * caller is billed for either way, and n_deltas is the
+                     * fallback output count when no usage frame arrives.
+                     *
+                     * TTFT therefore starts at the first token of EITHER kind.
+                     * That is still "when the caller first sees something" —
+                     * thinking is shown, not swallowed — and starting it at the
+                     * first answer token instead would report a reasoning
+                     * model's whole thinking pass as latency. */
+                    if (json_raw_str_span(d, dlen, "reasoning_content", &span, &slen) == 0 &&
+                        slen > 0) {
+                        llama_stream_span(&s, span, slen, 1);
+                        if (n_deltas == 0) llama_account_ttft(t0, now_ms());
+                        n_deltas++;
+                    }
                     if (json_raw_str_span(d, dlen, "content", &span, &slen) == 0 &&
                         slen > 0) {
-                        char *esc = malloc(slen + 1);
-                        if (esc) {
-                            memcpy(esc, span, slen);
-                            esc[slen] = '\0';
-                            sse_delta(&s, esc);
-                            free(esc);
-                        }
-                        /* First token out of the door: that instant, minus
-                         * the start of execution, IS this machine's TTFT.
-                         * Measured where the client would see it rather than
-                         * taken from the engine's timings, because everything
-                         * between (de-chunking, re-emitting) is time the caller
-                         * waits too. */
+                        llama_stream_span(&s, span, slen, 0);
                         if (n_deltas == 0) llama_account_ttft(t0, now_ms());
                         n_deltas++;
                     }
@@ -4448,8 +4657,21 @@ static void coord_overflow_stream_reply(int conn_fd, int is_anthropic,
     snprintf(s.id, sizeof(s.id), "%llu", (unsigned long long)req_id);
     const char *text = rep->text_escaped ? rep->text_escaped : "";
     const size_t text_len = strlen(text);
+    /* The borrowed model's thinking, replayed on its own channel exactly as a
+     * locally generated one would be — borrowing must not be visible in the
+     * shape of the answer. */
+    const char *rsn = rep->reasoning_escaped ? rep->reasoning_escaped : "";
+    const size_t rsn_len = strlen(rsn);
     if (!rep->tool_calls_json) {
         sse_begin(&s, rep->in_tokens);
+        for (size_t i = 0; i < rsn_len && !s.failed; ) {
+            const size_t n = esc_chunk_len(rsn + i, rsn_len - i, 2048);
+            char frame[2049];
+            memcpy(frame, rsn + i, n);
+            frame[n] = '\0';
+            sse_delta_reasoning(&s, frame);
+            i += n;
+        }
         for (size_t i = 0; i < text_len && !s.failed; ) {
             const size_t n = esc_chunk_len(text + i, text_len - i, 2048);
             char frame[2049];
@@ -4486,6 +4708,21 @@ static void coord_overflow_stream_reply(int conn_fd, int is_anthropic,
              "\"usage\":{\"input_tokens\":%d,\"output_tokens\":0}}}",
             s.id, coord_model()->id, rep->in_tokens);
         int idx = 0;
+        if (rsn_len > 0) {
+            sse_emitf(&s, "content_block_start",
+                "{\"type\":\"content_block_start\",\"index\":%d,"
+                 "\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}", idx);
+            for (size_t i = 0; i < rsn_len && !s.failed; ) {
+                size_t n = esc_chunk_len(rsn + i, rsn_len - i, 2048);
+                sse_emitf(&s, "content_block_delta",
+                    "{\"type\":\"content_block_delta\",\"index\":%d,"
+                     "\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"%.*s\"}}",
+                    idx, (int)n, rsn + i);
+                i += n;
+            }
+            sse_emitf(&s, "content_block_stop",
+                "{\"type\":\"content_block_stop\",\"index\":%d}", idx++);
+        }
         if (text_len > 0) {
             sse_emitf(&s, "content_block_start",
                 "{\"type\":\"content_block_start\",\"index\":%d,"
@@ -4528,6 +4765,14 @@ static void coord_overflow_stream_reply(int conn_fd, int is_anthropic,
         sse_emitf(&s, "message_stop", "{\"type\":\"message_stop\"}");
     } else {
         sse_begin(&s, rep->in_tokens);
+        for (size_t i = 0; i < rsn_len && !s.failed; ) {
+            size_t n = esc_chunk_len(rsn + i, rsn_len - i, 2048);
+            char frame[2049];
+            memcpy(frame, rsn + i, n);
+            frame[n] = '\0';
+            sse_delta_reasoning(&s, frame);
+            i += n;
+        }
         for (size_t i = 0; i < text_len && !s.failed; ) {
             size_t n = esc_chunk_len(text + i, text_len - i, 2048);
             char frame[2049];
@@ -4624,6 +4869,11 @@ static void llama_chat_stream_tools(int conn_fd, int is_anthropic,
     const char *text = "";
     size_t textl = 0;
     idletoken_json_obj_str(msg, mlen, "content", &text, &textl);
+    /* Tools are the common case for an agentic client, so this path — not the
+     * live relay above — is where Claude Code's thinking actually comes from. */
+    const char *think = "";
+    size_t thinkl = 0;
+    idletoken_json_obj_str(msg, mlen, "reasoning_content", &think, &thinkl);
     int up_in  = extract_int_field(resp, rlen, "prompt_tokens", n_input);
     int n_out  = extract_int_field(resp, rlen, "completion_tokens", 0);
     double tps = json_double_field(resp, rlen, "predicted_per_second", 0.0);
@@ -4641,7 +4891,7 @@ static void llama_chat_stream_tools(int conn_fd, int is_anthropic,
         free(probe);   /* only wanted the finish_reason mapping */
     }
 
-    idletoken_sse s = (idletoken_sse){ conn_fd, is_anthropic, 0, "", 0 };
+    idletoken_sse s = (idletoken_sse){ .fd = conn_fd, .anthropic = is_anthropic };
     snprintf(s.id, sizeof(s.id), "%llu", (unsigned long long)req_id);
     s.created = (long long)time(NULL);
 
@@ -4658,6 +4908,22 @@ static void llama_chat_stream_tools(int conn_fd, int is_anthropic,
         size_t probe = 0;
         idletoken_tool_call tc;
         int have_calls = idletoken_oai_next_tool_call(msg, mlen, &probe, &tc);
+        if (thinkl > 0) {
+            sse_emitf(&s, "content_block_start",
+                "{\"type\":\"content_block_start\",\"index\":%d,"
+                 "\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}", idx);
+            for (size_t i = 0; i < thinkl && !s.failed; ) {
+                size_t n = esc_chunk_len(think + i, thinkl - i, 2048);
+                sse_emitf(&s, "content_block_delta",
+                    "{\"type\":\"content_block_delta\",\"index\":%d,"
+                     "\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"%.*s\"}}",
+                    idx, (int)n, think + i);
+                i += n;
+            }
+            sse_emitf(&s, "content_block_stop",
+                "{\"type\":\"content_block_stop\",\"index\":%d}", idx);
+            idx++;
+        }
         if (textl > 0 || !have_calls) {
             sse_emitf(&s, "content_block_start",
                 "{\"type\":\"content_block_start\",\"index\":%d,"
@@ -4703,6 +4969,13 @@ static void llama_chat_stream_tools(int conn_fd, int is_anthropic,
         sse_emitf(&s, "message_stop", "{\"type\":\"message_stop\"}");
     } else {
         sse_begin(&s, up_in);      /* role preamble frame */
+        for (size_t i = 0; i < thinkl && !s.failed; ) {
+            size_t n = esc_chunk_len(think + i, thinkl - i, 2048);
+            char frame[2560];
+            snprintf(frame, sizeof(frame), "%.*s", (int)n, think + i);
+            sse_delta_reasoning(&s, frame);
+            i += n;
+        }
         for (size_t i = 0; i < textl && !s.failed; ) {
             size_t n = esc_chunk_len(text + i, textl - i, 2048);
             char frame[2560];
@@ -4783,9 +5056,20 @@ static void llama_chat_route(int conn_fd, const idletoken_http_req *req,
     size_t uplen = 0;
     char *up;
     if (is_anthropic) {
-        up = idletoken_anthropic_to_openai((const char *)req->body, req->body_len,
-                                           want_stream && !tools_oneshot,
-                                           g_max_decode, &uplen);
+        size_t alen = 0;
+        char *aup = idletoken_anthropic_to_openai((const char *)req->body,
+                                                  req->body_len,
+                                                  want_stream && !tools_oneshot,
+                                                  g_max_decode, &alen);
+        /* What the translation returns IS an OpenAI body, so it takes the same
+         * engine-side injections — the thinking budget above in particular.
+         * Without this second pass the Anthropic face would be the one place
+         * where thinking can still eat the whole answer, and that face is
+         * Claude Code. Stream options and max_tokens are already baked in by
+         * the translation, and both injections skip a key that is present, so
+         * the pass adds exactly the budget. */
+        up = aup ? llama_openai_upstream_body(aup, alen, 0, 0, &uplen) : NULL;
+        free(aup);
     } else {
         /* Same demotion rule the Anthropic translation applies: templates
          * accept a system/developer role only in position 0 and RAISE on any
@@ -5095,7 +5379,7 @@ typedef struct {
  * (nothing pending), -1 = error. */
 static int coord_req_begin(coord_req *r, const coord_exec *x) {
     if (!r->sse_started) {
-        r->sse = (idletoken_sse){ r->conn_fd, r->is_anthropic, 0, "", 0 };
+        r->sse = (idletoken_sse){ .fd = r->conn_fd, .anthropic = r->is_anthropic };
         snprintf(r->sse.id, sizeof(r->sse.id), "%llu", (unsigned long long)r->req_id);
         r->sse.created = (long long)time(NULL);
         if (r->want_stream) sse_begin(&r->sse, r->prompt.len);
@@ -5539,6 +5823,22 @@ static void handle_http_request(int conn_fd,
                           "{\"error\":{\"type\":\"permission_error\",\"message\":"
                           "\"admission capability rejected: %s\"}}",
                           idletoken_admission_rc_str(adm_refuse));
+        /* A bad signature is the one refusal that can mean "the published key is
+         * not mine any more": every coordinator start overwrites the channel
+         * file, so a start that then exited (a refusal, a probe, a second
+         * instance) leaves the agent beside us minting under a dead key. Repair
+         * our own publication here and the agent's one-shot re-read-and-retry
+         * lands the very next attempt. Without this the state is terminal —
+         * measured at 18 hours of refused jobs on a Windows node 2026-09-12.
+         *
+         * Only for BAD_SIG, and the refusal still stands: this request is not
+         * retroactively admitted. Anything else (expired, replayed, malformed)
+         * says nothing about the key and must not touch the file. */
+        if (adm_refuse == IDLETOKEN_ADM_BAD_MAC && g_adm_channel_path[0] &&
+            idletoken_admission_republish_if_drifted(g_adm_channel_path) == 1)
+            fprintf(stderr, "coord: admission: the published channel key was not "
+                            "ours (another coordinator start overwrote %s and "
+                            "exited); republished it\n", g_adm_channel_path);
         idletoken_http_send_json(conn_fd, 403, body, (size_t)bl);
         free(req.body);
         return;
@@ -6116,7 +6416,8 @@ static void handle_http_request(int conn_fd,
              * the SSE wire shape (≥2 deltas + trailer) is testable without
              * the 80GB GGUF (scripts/sse_smoke.sh). */
             if (want_stream) {
-                idletoken_sse sse = { conn_fd, is_anthropic, 0, "mock", 0 };
+                idletoken_sse sse = { .fd = conn_fd, .anthropic = is_anthropic,
+                                      .id = "mock" };
                 sse.created = (long long)time(NULL);
                 char full[4352];
                 snprintf(full, sizeof(full), "[IDLETOKEN MOCK ENGINE] echo: %s", esc);
@@ -6478,7 +6779,7 @@ static void handle_http_request(int conn_fd,
      * What this buys: the client gets bytes immediately and a progress tick per
      * chunk, instead of a silent socket for the entire prefill. See
      * sse_prefill_tick for the failure this fixes. */
-    idletoken_sse pre_sse = (idletoken_sse){ conn_fd, is_anthropic, 0, "", 0 };
+    idletoken_sse pre_sse = (idletoken_sse){ .fd = conn_fd, .anthropic = is_anthropic };
     snprintf(pre_sse.id, sizeof(pre_sse.id), "%llu", (unsigned long long)req_id);
     pre_sse.created = (long long)time(NULL);
     if (want_stream) {
@@ -8346,7 +8647,7 @@ static int run_llamacpp_cluster_mode(
         if (ws[n].engine_version[0] == '\0') {
             char why[256];
             snprintf(why, sizeof(why),
-                     "machine %s did not report its llama.cpp engine version — "
+                     "machine %s did not report its llama.cpp engine version -- "
                      "its idletoken-worker build predates the version check. "
                      "Upgrade IdleToken on %s.",
                      ws[n].hostname, ws[n].hostname);
@@ -8358,7 +8659,7 @@ static int run_llamacpp_cluster_mode(
         if (strcmp(ws[n].engine_version, self_ver) != 0) {
             char why[256];
             snprintf(why, sizeof(why),
-                     "machine %s runs llama.cpp %s, this cluster runs %s — "
+                     "machine %s runs llama.cpp %s, this cluster runs %s -- "
                      "upgrade %s so every node runs the same engine build.",
                      ws[n].hostname, ws[n].engine_version, self_ver,
                      ws[n].hostname);
@@ -9342,9 +9643,14 @@ int main(int argc, char **argv) {
                             "back to X-IdleToken-Origin: platform; those jobs are "
                             "still served and never forwarded.\n",
                             aerr[0] ? aerr : "unknown error");
-        else if (adm_chan[0])
+        else if (adm_chan[0]) {
+            /* Remembered so the request path can repair this file: any later
+             * coordinator start overwrites it and exits with its own key, and
+             * the agent beside us would then mint under a dead one forever. */
+            snprintf(g_adm_channel_path, sizeof g_adm_channel_path, "%s", adm_chan);
             fprintf(stderr, "coord: admission: capability channel published to %s "
                             "(0600); local-origin marker at %s\n", adm_chan, adm_local);
+        }
 
         if (pol_env && pol_env[0]) {
             if      (!strcmp(pol_env, "legacy"))     pol = IDLETOKEN_OVF_ORIGIN_LEGACY;
@@ -10208,7 +10514,7 @@ int main(int argc, char **argv) {
         if (ws[n].os_family == IDLETOKEN_OS_MACOS && idletoken_macos_node_sealed()) {
             char why[256];
             snprintf(why, sizeof(why),
-                     "macOS compute nodes are sealed in this build — the Mac line "
+                     "macOS compute nodes are sealed in this build -- the Mac line "
                      "is parked until it has a numerical baseline of its own. Use "
                      "this Mac as a control machine and run compute on Windows or "
                      "Linux nodes.");
@@ -10232,7 +10538,7 @@ int main(int argc, char **argv) {
             char why[256];
             snprintf(why, sizeof(why),
                      "cluster is %s; this node is %s. IdleToken does not support "
-                     "mixed-OS clusters — run all compute nodes on one OS.",
+                     "mixed-OS clusters -- run all compute nodes on one OS.",
                      idletoken_os_family_name(ws[0].os_family),
                      idletoken_os_family_name(ws[n].os_family));
             fprintf(stderr, "coord: refused %s (%s): %s\n",

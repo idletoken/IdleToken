@@ -3,6 +3,10 @@ dist/
 src-tauri/target/
 src-tauri/gen/
 src-tauri/binaries/
+# Platform release scripts stage redistributable runtimes here immediately
+# before bundling. They are build inputs copied from the pinned toolchain, not
+# source files, and must never make an authoritative worktree dirty.
+src-tauri/runtime/
 # Staged by scripts/build_client_release.{sh,bat} from the repo's own LICENSE /
 # NOTICE / vendor licences, so the installer carries them (bundle.resources).
 # Generated, therefore ignored: a committed copy would be a second version of a

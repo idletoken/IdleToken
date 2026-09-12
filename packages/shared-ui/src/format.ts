@@ -19,6 +19,26 @@ export function ctxShort(c?: number): string {
   return c ? (c >= 1_048_576 ? '1M' : `${c / 1024}K`) : '—';
 }
 
+/**
+ * Display identity of a service, mirroring the service tuple without changing
+ * the API model id users send. The context window belongs immediately to the
+ * model name, e.g. opus-5(128K):Q4_K_M.
+ *
+ * EVERY tier is labelled since 2026-09-02, not just 1M. With two windows the
+ * unlabelled case could only mean 256K, so omitting it was unambiguous; with
+ * three it would leave a buyer unable to tell a 128K service from a 256K one —
+ * and the window is one of the two things they filter on. `ctx = 0` is a
+ * pre-2026-08 agent that never declared one; it stays unlabelled because
+ * inventing a number there would be a guess about someone else's machine.
+ *
+ * Shared because two pages render it: the cluster page (what is on sale now)
+ * and the public user page (the recent service records). A buyer who sees the
+ * same service spelled two ways reads it as two different products.
+ */
+export function serviceModelLabel(model: string, quant?: string | null, ctx?: number | null): string {
+  return `${model}${ctx ? `(${ctxShort(ctx)})` : ''}${quant ? `:${quant}` : ''}`;
+}
+
 /** Short latency label: milliseconds -> seconds with one decimal, absent -> em dash. */
 export function latShort(ms: number | null): string {
   return ms != null ? `${(ms / 1000).toFixed(1)}s` : '—';

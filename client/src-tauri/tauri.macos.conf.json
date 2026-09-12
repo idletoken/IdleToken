@@ -1,0 +1,11 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "macOS": {
+      "files": {
+        "MacOS/idletoken-server.sha256": "runtime/macos/engine-digests/idletoken-server.sha256",
+        "MacOS/idletoken-rpc-server.sha256": "runtime/macos/engine-digests/idletoken-rpc-server.sha256"
+      }
+    }
+  }
+}

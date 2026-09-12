@@ -1,0 +1,19 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "linux": {
+      "deb": {
+        "files": {
+          "/usr/lib/IdleToken/cuda": "runtime/linux/cuda/",
+          "/usr/bin": "runtime/linux/engine-digests/"
+        }
+      },
+      "rpm": {
+        "files": {
+          "/usr/lib/IdleToken/cuda": "runtime/linux/cuda/",
+          "/usr/bin": "runtime/linux/engine-digests/"
+        }
+      }
+    }
+  }
+}

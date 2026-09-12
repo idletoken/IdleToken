@@ -21,6 +21,14 @@ import { fmtQuant } from "./format";
 interface ChatMsg {
   role: "user" | "assistant";
   text: string;
+  /** The model's thinking, kept OUT of `text` on purpose.
+   *
+   *  The coordinator sends it on its own channel (a thinking content block),
+   *  and the transcript keeps it on its own field, because `text` is what the
+   *  next turn sends back as the assistant's words — a scratchpad in there
+   *  tells the model it said things it only considered. Shown in the collapsed
+   *  Reasoning panel; never copied by the copy button. */
+  reasoning?: string;
   sim?: boolean; // browser dev-sim reply (labeled, never mistaken for real)
   /** This turn failed. Kept IN the transcript rather than shown as a banner the
    *  next send wipes: the message is the only identification of the failure,
@@ -88,7 +96,12 @@ const newId = () => `c-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
  *  token; the run that was going to fill it did not survive the reload (or the
  *  process was killed). In-flight state is deliberately not persisted, so
  *  without this the transcript ends on a bubble that is permanently about to
- *  start speaking — the "half-generating" residue §5 of the plan forbids. */
+ *  start speaking — the "half-generating" residue §5 of the plan forbids.
+ *
+ *  A turn cut short DURING the thinking pass has reasoning but no text, and is
+ *  dropped too — deliberately. It is still a turn with no reply, the history
+ *  filter would not send it, and keeping it would leave the transcript ending
+ *  on a bubble that only ever shows a scratchpad. */
 function settleTail(msgs: ChatMsg[]): ChatMsg[] {
   const out = [...(msgs ?? [])];
   while (out.length) {
@@ -286,12 +299,22 @@ function Bubble(props: {
 }) {
   const { t } = useI18n();
   const [openReasoning, setOpenReasoning] = useState(false);
-  const { reasoning, answer, thinking } = useMemo(() => splitThink(props.m.text), [props.m.text]);
+  // Two sources, one panel. `m.reasoning` is the coordinator's own channel
+  // (thinking blocks on the wire, never mixed into the reply); splitThink is the
+  // fallback for a model whose template emits <think> tags the engine's parser
+  // does not claim, which leaves them inside the text. Neither is a guess about
+  // what the model meant — both ARE the model's thinking, arriving two ways.
+  const { reasoning: inlineReasoning, answer, thinking } = useMemo(
+    () => splitThink(props.m.text), [props.m.text]);
+  const reasoning = props.m.reasoning || inlineReasoning;
+  // "Thinking…" vs "Reasoning": still live, i.e. thinking has arrived and the
+  // answer has not started.
+  const stillThinking = thinking || (!!props.m.reasoning && props.live && !answer);
 
   if (props.m.role === "user") {
     return <div className="chat-msg__bubble">{props.m.text}</div>;
   }
-  const waiting = props.live && props.last && !props.m.text;
+  const waiting = props.live && props.last && !props.m.text && !props.m.reasoning;
   // Nothing is being generated yet: the request is out and the cluster has not
   // said a word, which on a coordinator that serves one request at a time
   // usually means this turn is behind another one.
@@ -301,7 +324,7 @@ function Bubble(props: {
       {reasoning ? (
         <div className={`think${openReasoning ? " is-open" : ""}`}>
           <button className="think__toggle" onClick={() => setOpenReasoning(!openReasoning)}>
-            {thinking ? t("chat.thinking") : t("chat.reasoning")}
+            {stillThinking ? t("chat.thinking") : t("chat.reasoning")}
             {/* SVG, not "▾": the display font has no triangle glyph, so the
                 text version rendered as a bare dot in the shipped app. */}
             <svg className="think__chev" viewBox="0 0 24 24" width="12" height="12" aria-hidden="true">
@@ -715,15 +738,24 @@ export default function Chat(props: {
               lastPrefill = { done: p.done ?? 0, total: p.total ?? 0, reused: p.reused ?? 0 };
               setPhase("prefill", lastPrefill);
             }
-            if (p.kind === "delta" && p.text) {
+            // Thinking and answer are two channels of the same generation, so
+            // both count as "the cluster started generating" and both count as
+            // output tokens — the model spent them either way, and a tok/s
+            // figure that ignored the thinking pass would divide real tokens by
+            // a time that includes it.
+            if ((p.kind === "delta" || p.kind === "reasoning") && p.text) {
               if (nDeltas === 0) {
                 tFirst = performance.now();
-                setPhase("streaming", null); // prefill is over the moment real text arrives
+                setPhase("streaming", null); // prefill is over the moment real output arrives
               }
               nDeltas++;
+              const toReasoning = p.kind === "reasoning";
               setActiveMsgs((m) => {
                 const out = [...m];
-                out[out.length - 1] = { ...out[out.length - 1], text: out[out.length - 1].text + p.text };
+                const prev = out[out.length - 1];
+                out[out.length - 1] = toReasoning
+                  ? { ...prev, reasoning: (prev.reasoning ?? "") + p.text }
+                  : { ...prev, text: prev.text + p.text };
                 return out;
               }, convoId);
             }
@@ -772,21 +804,32 @@ export default function Chat(props: {
         // the dev channel a place this feature can be hand-tested without a
         // cluster. Nothing here is serialized: the sim has no queue to model.
         const q = [...history].reverse().find((m) => m.role === "user")?.text ?? "";
+        // Thinking first, then the answer — the order and the two-channel shape
+        // a real reasoning model arrives in, so the Reasoning panel is something
+        // this dev channel can actually exercise.
+        const think = `Considering “${q}”…`;
         const reply = `“${q}” ✓`;
         let first = true;
-        for (const ch of reply.split("")) {
-          await new Promise((ok) => setTimeout(ok, 30));
-          if (simStopRef.current.has(reqId)) break; // stop() pressed on this conversation
-          if (first) {
-            first = false;
-            setPhase("streaming", null);
+        const stream = async (s: string, channel: "reasoning" | "text") => {
+          for (const ch of s.split("")) {
+            await new Promise((ok) => setTimeout(ok, 30));
+            if (simStopRef.current.has(reqId)) return false;
+            if (first) {
+              first = false;
+              setPhase("streaming", null);
+            }
+            setActiveMsgs((m) => {
+              const out = [...m];
+              const prev = out[out.length - 1];
+              out[out.length - 1] = channel === "reasoning"
+                ? { ...prev, reasoning: (prev.reasoning ?? "") + ch }
+                : { ...prev, text: prev.text + ch };
+              return out;
+            }, convoId);
           }
-          setActiveMsgs((m) => {
-            const out = [...m];
-            out[out.length - 1] = { ...out[out.length - 1], text: out[out.length - 1].text + ch };
-            return out;
-          }, convoId);
-        }
+          return true;
+        };
+        if (await stream(think, "reasoning")) await stream(reply, "text");
       }
     } catch (e) {
       const raw = String((e as Error)?.message ?? e);

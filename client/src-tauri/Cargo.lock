@@ -1738,7 +1738,7 @@ checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
 name = "idletoken-client"
-version = "0.1.64"
+version = "0.1.66"
 dependencies = [
  "block2",
  "getrandom 0.2.17",

@@ -287,6 +287,11 @@ typedef struct {
      * to re-escape it there would be two chances to disagree about \uXXXX for
      * no gain. malloc'd; free with idletoken_overflow_reply_free. */
     char     *text_escaped;
+    /* The model's thinking, already JSON-escaped like `text_escaped`, when the
+     * platform's provider produced any. NULL = none, which is also what an
+     * older platform (one that does not send the field) yields — the local
+     * user then simply sees no thinking, never a wrong answer. */
+    char     *reasoning_escaped;
     /* Optional OpenAI tool_calls array, brackets included, copied verbatim
      * from the sealed reply. NULL means this was a text-only turn. */
     char     *tool_calls_json;
@@ -349,6 +354,13 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
                                 const char *tools_json, size_t tools_len,
                                 const char *tool_choice_json,
                                 size_t tool_choice_len,
+                                /* Optional `chat_template_kwargs` object from
+                                 * the same request, verbatim. It carries the
+                                 * consumer's thinking switch under the key the
+                                 * ENGINE reads, so nothing along the way has to
+                                 * re-spell it. NULL = the caller said nothing
+                                 * and the serving model's template decides. */
+                                const char *ctk_json, size_t ctk_len,
                                 const char *model, const char *quant,
                                 int max_tokens,
                                 int hops_in,
