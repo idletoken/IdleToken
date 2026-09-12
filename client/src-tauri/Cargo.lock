@@ -1738,10 +1738,14 @@ checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
 name = "idletoken-client"
-version = "0.1.63"
+version = "0.1.64"
 dependencies = [
+ "block2",
  "getrandom 0.2.17",
  "if-addrs",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

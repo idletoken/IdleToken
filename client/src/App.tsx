@@ -6,7 +6,7 @@ import type { NodeSnapshot, ClusterState } from "./types";
 import { HW_OK, HW_NO_GPU, HW_CC_TOO_LOW, HW_DRIVER_TOO_OLD, HW_VRAM_TOO_SMALL, HW_GPU_UNSUPPORTED, HW_MACOS_SEALED } from "./types";
 import { getModel, getManifest, estimateClusterCapacity, poolVram, poolRam, clusterCapacityVerdict, hybridRequirements, isMoeModel, moeRamExpertBudget, pickBestFittingModel, backendOfOs, type ModelSpec, type MoeLayoutBudget } from "./models";
 import { resolveLocalWeights, fetchWeights, onFetchProgress, defaultModelDir, cancelFetch, resolveDownload, verifyWeights, isWeightsCancelled, type DownloadTarget } from "./weights";
-import { loadSettings, saveSettings, settingsWerePersisted, effectiveCaps, effectiveCtx, engineTuning, overflowTuning, autoUiScale, contextTiersFor, type AppSettings, type ContextTier, type Tier } from "./settings";
+import { loadSettings, saveSettings, settingsWerePersisted, effectiveCaps, runtimeResourceBudget, effectiveCtx, engineTuning, overflowTuning, autoUiScale, contextTiersFor, type AppSettings, type ContextTier, type RuntimeResourceBudget, type Tier } from "./settings";
 import { getAuthProvider, type Session } from "./auth";
 import SettingsPanel from "./SettingsPanel";
 import { OverflowToggleButton, ShareToggleButton } from "./PlatformPanel";
@@ -216,6 +216,8 @@ function loadMoeLayout(modelId: string, quant: string, ggufPath: string): Promis
 
 function NodeCapacityCard(props: {
   snap: NodeSnapshot;
+  /** Settings-capped capacity used by the coordinator for this machine. */
+  budget: RuntimeResourceBudget;
   model: ModelSpec;
   quant: string; // selected precision → sizes the weight bytes in the estimate
   tier: { id: number; ctx: number };
@@ -227,16 +229,21 @@ function NodeCapacityCard(props: {
 }) {
   const { t } = useI18n();
   const s = props.snap;
-  // Availability and the UI estimate use the uncapped memory the GPU reports
-  // as free. A user-selected runtime usage cap answers a different question
-  // ("how much may IdleToken consume?") and must not make a 15.7 GiB-free card
-  // claim that only 13.1 GiB is available.
-  const freeMem = { vram_usable: s.vram_usable };
-  // Paired: total what every machine reported and answer for the CLUSTER
-  // (2026-08-15). Each machine measures its own memory and sends it with its
-  // join, so this question was always answerable before pressing Start — until
-  // now the only answer came from the coordinator refusing afterwards.
-  const peers = props.peers ?? [];
+  // Hardware facts above the separator come directly from `s`. Capacity below
+  // it answers the operational question: what the current resource setting
+  // lets IdleToken consume. Replace our roster row locally as well as publishing
+  // it through pairing, so a slider change is reflected without a round trip.
+  const peers = useMemo(() => (props.peers ?? []).map((peer) => peer.self
+    ? {
+        ...peer,
+        vramFree: props.budget.vram_usable,
+        ramFree: props.budget.ram_usable,
+        ramExpertFree: props.budget.ram_expert_usable,
+        unifiedMemory: s.unified_memory,
+      }
+    : peer), [props.peers, props.budget, s.unified_memory]);
+  // Paired: total the runtime budget each machine published and answer for the
+  // CLUSTER. Before pairing, use this machine's settings-capped budget.
   const pool = useMemo(() => poolVram(peers), [peers]);
   const clustered = peers.length > 1;
   const isMoe = isMoeModel(props.model.id);
@@ -253,11 +260,12 @@ function NodeCapacityCard(props: {
   const localRamExpert = s.ram_expert_usable ?? (s.os === "windows" ? 0 : s.ram_usable);
   const ramExpert = clustered
     ? moeRamExpertBudget(props.model.id, ramPool.bytes, false)
-    : moeRamExpertBudget(props.model.id, localRamExpert, s.unified_memory);
+    : moeRamExpertBudget(props.model.id, props.budget.ram_expert_usable,
+                         s.unified_memory);
   // Backend matters: GLM-5.2's measured workspace is 1.50 GiB on CUDA and
   // 33.25 GiB on Metal. Passing the machine's own OS keeps this card and the
   // deploy buttons reading the same number.
-  const gpuAvailable = clustered ? pool.bytes : freeMem.vram_usable;
+  const gpuAvailable = clustered ? pool.bytes : props.budget.vram_usable;
   const estimateMem = { vram_usable: gpuAvailable };
   const gpuCap = estimateClusterCapacity(props.model, estimateMem, props.tier.ctx,
                                          props.nNodes, props.quant,
@@ -346,6 +354,17 @@ function NodeCapacityCard(props: {
   const vTotal = fmtGiB(s.vram_total);
   const rFree = fmtGiB(localRamExpert);
   const rTotal = fmtGiB(s.ram_total);
+  // `vram_*` is the cross-platform scheduler ABI, not necessarily physical
+  // VRAM. Apple Silicon stores its Metal-addressable unified-memory budget in
+  // those fields, so never leak the implementation name into the UI. A mixed
+  // cluster gets a neutral label because its sum may contain both kinds.
+  const acceleratorLabel = t(s.os === "macos" ? "node.chip" : "node.gpu");
+  const localMemoryLabel = t(s.unified_memory ? "node.unifiedMemory" : "node.vram");
+  const capacityMemoryLabel = t(clustered
+    ? "node.computeMemory"
+    : s.unified_memory ? "node.unifiedMemory" : "node.vram");
+  const topUsableBytes = Math.min(s.vram_usable, s.vram_total);
+  const topReservedBytes = Math.max(0, s.vram_total - topUsableBytes);
   const total = props.model.totalLayers;
   const ticks = useMemo(() => Array.from({ length: total }), [total]);
   // Each physical pool gets its own coverage bar. Combining both ratios into
@@ -365,7 +384,7 @@ function NodeCapacityCard(props: {
     s.hw_status === HW_NO_GPU ? t("node.hw.noGpu")
     : s.hw_status === HW_CC_TOO_LOW ? t("node.hw.ccLow")
     : s.hw_status === HW_DRIVER_TOO_OLD ? t("node.hw.driverOld")
-    : s.hw_status === HW_VRAM_TOO_SMALL ? t("node.hw.vramSmall")
+    : s.hw_status === HW_VRAM_TOO_SMALL ? t("node.hw.resourceSmall")
     : s.hw_status === HW_GPU_UNSUPPORTED ? t("node.hw.gpuUnsupported")
     : s.hw_status === HW_MACOS_SEALED ? t("node.hw.macosSealed")
     : "";
@@ -380,23 +399,23 @@ function NodeCapacityCard(props: {
       )}
       <div className="node-strip">
         <div className="nstat nstat--gpu">
-          <span className="nstat__k">{t("node.gpu")}</span>
+          <span className="nstat__k">{acceleratorLabel}</span>
           <span className="nstat__v">{s.gpu_name || "—"}</span>
           <span className="nstat__sub">
-            cc {s.cc_major}.{s.cc_minor}
+            {s.os === "macos" ? "Metal" : `cc ${s.cc_major}.${s.cc_minor}`}
             {s.driver_version ? ` · ${t("node.driver")} ${s.driver_version}` : ""}
             {s.unified_memory ? ` · ${t("node.unified")}` : ""}
           </span>
         </div>
         <div className="nstat nstat--bar">
-          <span className="nstat__k">{t("node.vram")}</span>
+          <span className="nstat__k">{localMemoryLabel}</span>
           <span className="nstat__v">
             {vFree.value}
             <span className="unit">/ {vTotal.value} {vTotal.unit}</span>
           </span>
           <div className="track track--mini">
-            <span className="track__usable" style={{ width: `${pct(s.vram_total - s.vram_used_other, s.vram_total)}%` }} />
-            <span className="track__used" style={{ width: `${pct(s.vram_used_other, s.vram_total)}%` }} />
+            <span className="track__usable" style={{ width: `${pct(topUsableBytes, s.vram_total)}%` }} />
+            <span className="track__used" style={{ width: `${pct(topReservedBytes, s.vram_total)}%` }} />
           </div>
         </div>
         {/* RAM appears only when this selection actually needs Hybrid. A MoE
@@ -425,17 +444,13 @@ function NodeCapacityCard(props: {
         ) : null}
       </div>
 
-      {/* GPU_ONLY has one physical pool. Hybrid has two, so each pool owns its
-          numbers and its own coverage bar; neither is added to the other. */}
+      {/* Each physical pool owns its numbers and coverage bar; neither is
+          added to the other. The hardware divider flows directly into this
+          section — a separate "VRAM only" mode caption repeated the row. */}
       <div className="capacity">
-        {!hybridMode ? (
-          <div className="capacity__head">
-            <span className="capacity__mode">{t("capacity.modeGpu")}</span>
-          </div>
-        ) : null}
-        <div className={`capacity__resources${hybridMode ? " capacity__resources--headless" : ""}`}>
+        <div className="capacity__resources">
           <div className="capacity__resource">
-            <span className="capacity__resource-kind">{t("node.vram")}</span>
+            <span className="capacity__resource-kind">{capacityMemoryLabel}</span>
             <div className="capacity__resource-stats">
               <span className="capacity__resource-stat">
                 <span>{t("capacity.available")}</span>
@@ -450,7 +465,7 @@ function NodeCapacityCard(props: {
                 </strong>
               </span>
             </div>
-            <div className="spine capacity__spine" role="img" aria-label={`${t("node.vram")} · ${t("capacity.available")} ${GBHave(gpuAvailable)} GB · ${t(hybridMode ? "capacity.minimum" : "capacity.required")} ${gpuNeedBytes ? `${GBNeed(gpuNeedBytes)} GB` : "—"}`}>
+            <div className="spine capacity__spine" role="img" aria-label={`${capacityMemoryLabel} · ${t("capacity.available")} ${GBHave(gpuAvailable)} GB · ${t(hybridMode ? "capacity.minimum" : "capacity.required")} ${gpuNeedBytes ? `${GBNeed(gpuNeedBytes)} GB` : "—"}`}>
               {ticks.map((_, i) => (
                 <span key={i} className={`tick${i < gpuVisibleLayers ? " tick--on" : ""}`} />
               ))}
@@ -1315,6 +1330,7 @@ function LocalEngineCard(props: {
 // windows (>=1180px two-column grid) and below it on narrow ones.
 function Dashboard(props: {
   snap: NodeSnapshot;
+  budget: RuntimeResourceBudget;
   model: ModelSpec;
   quant: string;
   tier: { id: number; ctx: number };
@@ -1351,10 +1367,10 @@ function Dashboard(props: {
   // the coordinator still performs the authoritative admission. Same function,
   // same backend and same measured workspace the capacity card renders, so the
   // card cannot say "fits" while the buttons point the other way.
-  const standaloneRamExpert = s.ram_expert_usable ?? (s.os === "windows" ? 0 : s.ram_usable);
-  const standalone = estimateClusterCapacity(props.model, s, props.tier.ctx, 1,
+  const standalone = estimateClusterCapacity(props.model, props.budget, props.tier.ctx, 1,
                                              props.quant, backendOfOs(s.os),
-                                             moeRamExpertBudget(props.model.id, standaloneRamExpert,
+                                             moeRamExpertBudget(props.model.id,
+                                                                props.budget.ram_expert_usable,
                                                                 s.unified_memory));
   // The generic refusal surface (D2): whatever sentence the engine sent
   // through the JOIN_REFUSED / exit-3 channel, verbatim, where the user is
@@ -1414,6 +1430,7 @@ function Dashboard(props: {
           </div>
           <NodeCapacityCard
             snap={s}
+            budget={props.budget}
             model={props.model}
             quant={props.quant}
             tier={props.tier}
@@ -1482,7 +1499,6 @@ export default function App() {
   const [pairSnap, setPairSnap] = useState<PairingSnapshot | null>(null);
   useEffect(() => getPairingProvider().subscribe(setPairSnap), []);
   const [snap, setSnap] = useState<NodeSnapshot | null>(null);
-  const [totals, setTotals] = useState<{ vram_total: number; ram_total: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [nonce, setNonce] = useState(0);
 
@@ -1767,8 +1783,16 @@ export default function App() {
   // see engineTuning(). It used to sit below them, which is why it could only
   // ever reach the probe.
   const caps = useMemo(
-    () => effectiveCaps(settings, totals),
-    [settings.resourcePreset, settings.maxVramMb, settings.maxRamMb, totals]
+    () => effectiveCaps(settings, snap ? {
+      vram_total: snap.vram_total,
+      ram_total: snap.ram_total,
+    } : null),
+    [settings.resourcePreset, settings.maxVramMb, settings.maxRamMb,
+     snap?.vram_total, snap?.ram_total]
+  );
+  const runtimeBudget = useMemo(
+    () => snap ? runtimeResourceBudget(snap, caps) : null,
+    [snap, caps],
   );
   // (The memory-shape argument engineTuning used for resolving the KV "auto"
   // dtype left with the KV selector, 2026-08-25: the coordinator decides the
@@ -2047,10 +2071,9 @@ export default function App() {
     (document.body.style as { zoom?: string }).zoom = String(settings.uiScale || autoScale);
   }, [settings.uiScale, autoScale]);
 
-  // The dashboard probe is deliberately uncapped: "available VRAM" means the
-  // GPU's real current free memory, not the user's IdleToken usage limit. The
-  // limit is still passed to every engine launch through engineTuning(); it
-  // simply no longer falsifies the hardware reading or the reference estimate.
+  // The dashboard probe is deliberately uncapped: the hardware strip shows
+  // real current free memory. runtimeBudget applies the usage setting to the
+  // estimate below the strip and to every deployment decision.
   // We keep the old snapshot visible during a manual re-probe so only the first
   // load shows a spinner.
   useEffect(() => {
@@ -2061,28 +2084,6 @@ export default function App() {
       .then((s) => {
         if (!live) return;
         setSnap(s);
-        setTotals({ vram_total: s.vram_total, ram_total: s.ram_total });
-        // Hand this machine's real free GPU memory to the pairing layer, which
-        // sends it with every join. Each machine measures its own, so the
-        // roster can total the pool and answer "does the model fit on all of
-        // us" BEFORE anyone presses Start — that used to be answerable only by
-        // the coordinator refusing after the fact. Reported in every mode: the
-        // numbers have to be in place before a join is sent.
-        if (inTauri()) {
-          void import("@tauri-apps/api/core")
-            .then(({ invoke }) =>
-              invoke("pairing_report_memory", {
-                vramFree: s.vram_usable,
-                ramFree: s.ram_usable,
-                ramExpertFree: s.ram_expert_usable ?? (s.os === "windows" ? 0 : s.ram_usable),
-                unifiedMemory: s.unified_memory,
-              })
-            )
-            .catch(() => {
-              /* pre-pairing or an older backend: the pool total just stays
-                 incomplete, which the card reports as "cannot tell" */
-            });
-        }
         // First-start selection (B3): the default model used to be hardcoded to
         // DSv4-Flash (80.76 GiB), so the first thing a new user with an 8 GB card
         // saw was "does not fit on one machine, please build a cluster" -- with one
@@ -2106,6 +2107,29 @@ export default function App() {
       live = false;
     };
   }, [nonce]);
+
+  // Publish the same settings-capped budget used by local admission. This runs
+  // after a probe and again whenever either usage slider/preset changes, so
+  // every member contributes an operational budget rather than a raw hardware
+  // figure to the cluster total.
+  useEffect(() => {
+    if (!snap || !runtimeBudget || !inTauri()) return;
+    let live = true;
+    void import("@tauri-apps/api/core")
+      .then(({ invoke }) => live
+        ? invoke("pairing_report_memory", {
+            vramFree: runtimeBudget.vram_usable,
+            ramFree: runtimeBudget.ram_usable,
+            ramExpertFree: runtimeBudget.ram_expert_usable,
+            unifiedMemory: snap.unified_memory,
+          })
+        : undefined)
+      .catch(() => {
+        /* Pre-pairing or an older backend: the pool total remains incomplete,
+           which the card reports as "cannot tell". */
+      });
+    return () => { live = false; };
+  }, [snap, runtimeBudget]);
 
   const updateSettings = (s: AppSettings) => {
     setSettings(s);
@@ -2276,7 +2300,7 @@ export default function App() {
                   {t2("state.retry", lang)}
                 </button>
               </div>
-            ) : !snap ? (
+            ) : !snap || !runtimeBudget ? (
               <div className="center-state">
                 <div className="spinner" />
                 <div className="msg">{t2("state.loading", lang)}</div>
@@ -2299,6 +2323,7 @@ export default function App() {
             ) : view === "cluster" ? (
               <Dashboard
                 snap={snap}
+                budget={runtimeBudget}
                 model={model}
                 quant={settings.quant}
                 tier={{ id: settings.tier || 2, ctx: effectiveCtx(settings) } as Tier}

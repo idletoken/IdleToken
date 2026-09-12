@@ -6,7 +6,6 @@
   "arch": "qwen35moe",
   "available": true,
   "deployment": "cluster",
-  "min_quant": "Q4_K_M",
   "license": "Apache-2.0",
   "params_summary": "397B total / 17B active · 60 layers · hybrid linear attention + 512-expert MoE",
   "n_layers": 60,

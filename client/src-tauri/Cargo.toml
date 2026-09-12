@@ -1,6 +1,6 @@
 [package]
 name = "idletoken-client"
-version = "0.1.63"
+version = "0.1.64"
 description = "IdleToken desktop/mobile client"
 authors = ["IdleToken"]
 edition = "2021"
@@ -62,6 +62,17 @@ tokio = { version = "1", features = ["time"] }
 # line, and putting it in spawn_blocking reads better than spreading async
 # through it (clear code beats peak performance).
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+
+# AppKit's native full-screen transition is asynchronous. Hiding the window
+# before NSWindowDidExitFullScreenNotification leaves its dedicated macOS
+# Space black, so the shell waits for that notification before close-to-tray.
+# These crates are already in Tauri's macOS dependency graph; declaring the
+# narrow surface here lets us use the typed notification API directly.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSWindow"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSNotification", "NSOperation", "NSString", "block2"] }
 
 [features]
 # by default Tauri runs in production mode; `tauri dev` toggles custom-protocol

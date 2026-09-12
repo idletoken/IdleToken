@@ -936,6 +936,54 @@ export function effectiveCaps(
   };
 }
 
+/** The capacity IdleToken may actually plan against after applying the user's
+ * resource-usage setting to a live, uncapped hardware probe. The hardware card
+ * deliberately keeps rendering the original probe; only estimates, deployment
+ * decisions and the cluster roster consume this derived budget. */
+export interface RuntimeResourceBudget {
+  vram_usable: number;
+  ram_usable: number;
+  ram_expert_usable: number;
+}
+
+export function runtimeResourceBudget(
+  resources: {
+    os: "windows" | "linux" | "macos" | "unknown";
+    unified_memory: boolean;
+    vram_usable: number;
+    ram_usable: number;
+    ram_expert_usable?: number;
+  },
+  caps: { maxVramMb: number; maxRamMb: number },
+): RuntimeResourceBudget {
+  const capped = (available: number, maxMb: number) => {
+    const safeAvailable = Number.isFinite(available) ? Math.max(0, available) : 0;
+    const capBytes = Number.isFinite(maxMb) && maxMb > 0
+      ? maxMb * MiB
+      : Number.POSITIVE_INFINITY;
+    return Math.min(safeAvailable, capBytes);
+  };
+  const vramUsable = capped(resources.vram_usable, caps.maxVramMb);
+  const ramUsable = capped(resources.ram_usable, caps.maxRamMb);
+  /* Older Linux/macOS sidecars did not publish the dedicated expert field.
+   * Their ordinary usable RAM remains the conservative compatibility value.
+   * Windows must fail closed because its WDDM page-lock ceiling can be much
+   * smaller than free RAM. Unified memory never gains a second capacity pool. */
+  const rawExpert = Math.max(
+    0,
+    resources.ram_expert_usable
+      ?? (resources.os === "windows" ? 0 : resources.ram_usable),
+  );
+  const ramExpertUsable = resources.unified_memory
+    ? 0
+    : Math.min(rawExpert, ramUsable);
+  return {
+    vram_usable: vramUsable,
+    ram_usable: ramUsable,
+    ram_expert_usable: ramExpertUsable,
+  };
+}
+
 /** Whether settings have ever been saved on this machine. Automatic model
  *  selection on first start happens only when they have **not** -- a model the
  *  user picked deliberately must never be overwritten by what we think fits

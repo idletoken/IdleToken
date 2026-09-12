@@ -2910,24 +2910,7 @@ textarea {
 
 /* capacity guidance under the strip */
 .capacity {
-  padding-top: 14px;
-}
-
-.capacity__head {
-  display: flex;
-  align-items: baseline;
-  gap: 12px;
-  flex-wrap: wrap;
-  margin-bottom: 10px;
-}
-
-.capacity__head .card__label {
-  margin-bottom: 0;
-}
-
-.capacity__need {
-  font-size: 13px;
-  color: var(--ink-dim);
+  padding-top: 0;
 }
 
 .capacity__text {
@@ -2937,29 +2920,17 @@ textarea {
   color: var(--ink-dim);
 }
 
-.capacity__mode {
-  margin: 0;
-  font-size: 11.5px;
-  font-weight: 600;
-  line-height: 1.5;
-  color: var(--ink-dim);
-}
-
 /* Two aligned physical pools, not little nested cards and never one invented
    VRAM+RAM total. The labels stay quiet; the independently comparable numbers
    carry the hierarchy. */
 .capacity__resources {
-  border-top: 1px solid var(--line);
-  border-bottom: 1px solid var(--line);
-}
-
-.capacity__resources--headless {
   border-top: 0;
+  border-bottom: 1px solid var(--line);
 }
 
 .capacity__resource {
   display: grid;
-  grid-template-columns: minmax(58px, 72px) minmax(0, 1fr);
+  grid-template-columns: minmax(88px, 112px) minmax(0, 1fr);
   grid-template-rows: auto auto;
   gap: 8px 14px;
   align-items: stretch;
@@ -4442,13 +4413,72 @@ textarea {
 .topnav__item:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
 .topnav__icon { width: 18px; height: 18px; flex: none; }
 
-/* Compact before any fixed-width chrome can press into its neighbour. Text is
-   visually hidden rather than removed so every icon-only control keeps its
-   accessible name. The breakpoint also covers the 1.1x auto-scale band: CSS
-   zoom consumes layout room while media queries still see the window width. */
-@container (max-width: 1500px) {
-  .topnav__label,
-  .pill__label {
+/* A normal laptop window has room for words once the generous desktop
+   footprints are tightened. The old 1500px breakpoint hid every label here,
+   which turned all three state controls into indistinguishable dots on a
+   Retina MacBook. Keep their names visible and spend horizontal room more
+   deliberately instead. */
+@container (max-width: 1320px) {
+  .topbar__layout,
+  .topbar__primary,
+  .topbar__actions {
+    gap: 10px;
+  }
+
+  .topnav__item {
+    min-width: 88px;
+    padding-inline: 10px;
+    gap: 6px;
+  }
+
+  .pill,
+  .pill--market,
+  .topbar__market-actions .pill {
+    width: 124px;
+    min-width: 124px;
+    max-width: 124px;
+    flex: 0 0 124px;
+    gap: 6px;
+    padding-inline: 9px;
+  }
+
+  .acct__btn {
+    max-width: 128px;
+  }
+
+  .spark-balance-pill {
+    max-width: 108px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+}
+
+/* If both groups no longer fit honestly on one line, give each its own line.
+   This is preferable to removing the words: marketplace and cluster controls
+   use the same status-dot grammar, so their labels carry the actual meaning. */
+@container (max-width: 1160px) {
+  .topbar__layout {
+    flex-wrap: wrap;
+    row-gap: 8px;
+  }
+
+  .topbar__primary,
+  .topbar__actions {
+    width: 100%;
+  }
+
+  .topbar__actions {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    margin-left: 0;
+  }
+}
+
+/* Navigation has distinct pictograms and remains understandable in a truly
+   narrow control window. Status dots do not, so pill labels stay visible and
+   the action row wraps as needed. */
+@container (max-width: 620px) {
+  .topnav__label {
     position: absolute;
     width: 1px;
     height: 1px;
@@ -4466,28 +4496,12 @@ textarea {
     padding: 8px 9px;
   }
 
-  .pill,
-  .pill--market,
-  .topbar__market-actions .pill {
-    width: 36px;
-    min-width: 36px;
-    max-width: 36px;
-    flex: 0 0 36px;
-    padding-inline: 8px;
-  }
-
   .acct__btn {
-    max-width: 160px;
-  }
-
-  .spark-balance-pill {
-    max-width: 128px;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    max-width: 104px;
   }
 }
 
-@container (max-width: 900px) {
+@container (max-width: 420px) {
   .brand__name {
     position: absolute;
     width: 1px;
@@ -4502,32 +4516,6 @@ textarea {
 
   .brand__mark {
     gap: 0;
-  }
-
-  .acct__btn {
-    max-width: 104px;
-  }
-}
-
-/* At phone width there is no honest one-row arrangement for six global
-   actions. Give the action group its own line and let that line wrap instead
-   of allowing flex overflow to stack controls on top of one another. */
-@container (max-width: 700px) {
-  .topbar__layout {
-    flex-wrap: wrap;
-    row-gap: 8px;
-  }
-
-  .topbar__primary,
-  .topbar__actions {
-    width: 100%;
-    gap: 9px;
-  }
-
-  .topbar__actions {
-    flex-wrap: wrap;
-    justify-content: flex-end;
-    margin-left: 0;
   }
 }
 

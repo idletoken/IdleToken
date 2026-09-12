@@ -3,8 +3,10 @@
  *
  * Numbers report what's *actually free for our worker*, after deducting what
  * the system and other processes already use. VRAM carries no margin on top of
- * that measurement (retired 2026-09-01 — idletoken_resource.h says why); RAM
- * still does, because it backs the OS itself. */
+ * that measurement (retired 2026-09-01 — idletoken_resource.h says why).
+ * Windows/Linux host RAM keeps its separate OS reserve. On macOS the kernel's
+ * pressure-aware available percentage already excludes the live working set;
+ * Metal then applies its own working-set ceiling and 512 MiB reserve. */
 
 /* _GNU_SOURCE comes via Makefile. */
 
@@ -263,8 +265,8 @@ static int probe_gpu(idletoken_resource_report *r) {
     r->vram_used_other = 0;   /* see the double-counting note above */
 
     /* The GPU may not keep more resident than Apple recommends, and it may not
-     * use memory the host probe has already ruled out (other processes, the
-     * 4 GiB safety floor, the 70% proportional ceiling). Take the smaller.
+     * use memory the pressure-aware host probe says is currently available.
+     * Take the smaller.
      *
      * The Metal workspace reserve is the ONE reserve left in this file, and it
      * is not the CUDA-style discount that was retired on 2026-09-01 (see
@@ -453,48 +455,62 @@ static int probe_host(idletoken_resource_report *r) {
         r->ram_total = memsize;
     }
 
-    /* macOS has no MemAvailable. Reconstruct what Activity Monitor calls
-     * "Memory Used" from the mach VM counters and treat the rest as available:
+    /* macOS has no Linux-style MemAvailable. `kern.memorystatus_level` is the
+     * system-wide available percentage reported by Apple's `memory_pressure
+     * -Q`: it credits reclaimable file/inactive/purgeable pages and the space
+     * saved by compression. Counting compressed application pages as wholly
+     * occupied, then subtracting another fixed 4 GiB reserve, made a healthy
+     * 16 GiB Mac with 56% available report zero bytes to Metal.
      *
-     *   used = internal (anonymous/app pages)
-     *        - purgeable (app pages the kernel may drop on demand)
-     *        + wired     (unpageable kernel/driver pages)
-     *        + compressed
-     *
-     * File-backed pages (external_page_count) are deliberately NOT counted as
-     * used — they are the page cache, and on this project that matters more
-     * than usual: the GGUF is mmap'd, so at steady state a large share of
-     * "used-looking" memory is our own model file and is reclaimable. Counting
-     * it would make a warm machine look full and refuse work it can do. */
+     * The fixed reserve is not needed on this branch. The percentage already
+     * accounts for the live system/other-process working set; the Metal probe
+     * separately caps it at recommendedMaxWorkingSetSize (11.8 GiB on the M4,
+     * leaving about 4 GiB outside the GPU budget) and reserves 512 MiB more.
+     * If the sysctl ever disappears, reconstruct the same reclaimable classes
+     * from public Mach counters and say so rather than silently reverting to
+     * the old "compressed means unavailable" calculation. */
+    uint64_t ram_available = 0;
     {
-        vm_size_t page_size = 0;
-        if (host_page_size(mach_host_self(), &page_size) != KERN_SUCCESS || page_size == 0)
-            page_size = 16384;   /* Apple Silicon default; sysconf agrees */
+        unsigned int available_pct = 0;
+        size_t pct_len = sizeof(available_pct);
+        if (sysctlbyname("kern.memorystatus_level", &available_pct, &pct_len,
+                         NULL, 0) == 0 && pct_len == sizeof(available_pct) &&
+            available_pct <= 100) {
+            ram_available = (r->ram_total / 100) * available_pct +
+                            ((r->ram_total % 100) * available_pct) / 100;
+        } else {
+            vm_size_t page_size = 0;
+            if (host_page_size(mach_host_self(), &page_size) != KERN_SUCCESS ||
+                page_size == 0)
+                page_size = 16384;   /* Apple Silicon default */
 
-        vm_statistics64_data_t vm;
-        mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
-        if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
-                              (host_info64_t)&vm, &count) != KERN_SUCCESS) {
-            fprintf(stderr, "idletoken-probe: host_statistics64 failed\n");
-            return -1;
+            vm_statistics64_data_t vm;
+            mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+            if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                                  (host_info64_t)&vm, &count) != KERN_SUCCESS) {
+                fprintf(stderr, "idletoken-probe: host_statistics64 failed\n");
+                return -1;
+            }
+
+            uint64_t compressed_savings =
+                vm.total_uncompressed_pages_in_compressor > vm.compressor_page_count
+                    ? vm.total_uncompressed_pages_in_compressor - vm.compressor_page_count
+                    : 0;
+            uint64_t available_pages = (uint64_t)vm.free_count +
+                                       (uint64_t)vm.inactive_count +
+                                       (uint64_t)vm.purgeable_count +
+                                       compressed_savings;
+            uint64_t physical_pages = r->ram_total / (uint64_t)page_size;
+            if (available_pages > physical_pages) available_pages = physical_pages;
+            ram_available = available_pages * (uint64_t)page_size;
+            fprintf(stderr, "idletoken-probe: kern.memorystatus_level unavailable; "
+                            "using Mach reclaimable-page fallback\n");
         }
-
-        uint64_t internal   = (uint64_t)vm.internal_page_count;
-        uint64_t purgeable  = (uint64_t)vm.purgeable_count;
-        uint64_t app_pages  = internal > purgeable ? internal - purgeable : 0;
-        uint64_t used_pages = app_pages + (uint64_t)vm.wire_count +
-                              (uint64_t)vm.compressor_page_count;
-
-        uint64_t used = used_pages * (uint64_t)page_size;
-        if (used > r->ram_total) used = r->ram_total;
-        r->ram_used_other = used;
     }
 
-    if (r->ram_total > r->ram_used_other + IDLETOKEN_RAM_SAFETY_BYTES) {
-        r->ram_usable = r->ram_total - r->ram_used_other - IDLETOKEN_RAM_SAFETY_BYTES;
-    } else {
-        r->ram_usable = 0;
-    }
+    if (ram_available > r->ram_total) ram_available = r->ram_total;
+    r->ram_used_other = r->ram_total - ram_available;
+    r->ram_usable = ram_available;
     ram_apply_os_headroom(r);
     return 0;
 #else
@@ -675,19 +691,19 @@ idletoken_hw_status idletoken_hw_check(const idletoken_resource_report *r,
                 (double)IDLETOKEN_MIN_APPLE_WORKING_SET_BYTES / 1073741824.0);
             return IDLETOKEN_HW_VRAM_TOO_SMALL;
         }
-        SAY("SEALED PATH (" IDLETOKEN_MACOS_UNSEAL_ENV " is set): %s (Metal, %.1f GB "
-            "working set) meets the floor, but no gate covers anything it does.",
+        SAY("%s uses Metal with a unified-memory GPU budget of %.1f GB and meets "
+            "the hardware floor.",
             r->gpu_name, (double)r->vram_total / 1073741824.0);
         return IDLETOKEN_HW_OK;   /* SAY is #undef'd once, at the end of the function */
     }
 
     /* A GPU we recognise as present but have no backend for. Today that is an
-     * Intel Mac: Metal answers, unified memory does not, and the ds4 Metal
-     * kernels assume unified memory. Say so instead of failing at load time. */
+     * Intel Mac: Metal answers, but the supported Mac compute path requires
+     * Apple Silicon unified memory. Say so instead of failing at load time. */
     if (r->gpu_vendor == IDLETOKEN_GPU_VENDOR_UNKNOWN && r->gpu_name[0] != '\0' &&
         r->cc_major == 0 && r->cc_minor == 0) {
-        SAY("%s is not a GPU IdleToken can compute on — it needs either an "
-            "NVIDIA card (RTX 20 series or newer) on Windows or Linux. "
+        SAY("%s is not a GPU IdleToken can compute on — it needs Apple Silicon "
+            "on macOS, or an NVIDIA card (RTX 20 series or newer) on Windows or Linux. "
             "This machine can still run the client and control the cluster.",
             r->gpu_name);
         return IDLETOKEN_HW_GPU_UNSUPPORTED;

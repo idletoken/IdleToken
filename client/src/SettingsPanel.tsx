@@ -619,8 +619,13 @@ export default function SettingsPanel(props: {
           here meant the default install said "Balanced" and "No limit" in the
           same box, one line apart, while 75% was what the engine got.
           Dragging either one takes over as a custom limit (setCap). */}
-      <CapSlider label={t("settings.maxVram")} noCap={t("settings.noCap")} totalBytes={props.snap.vram_total} valueMb={liveCaps.maxVramMb} onChange={(mb) => setCap("maxVramMb", mb)} />
-      <CapSlider label={t("settings.maxRam")} noCap={t("settings.noCap")} totalBytes={props.snap.ram_total} valueMb={liveCaps.maxRamMb} onChange={(mb) => setCap("maxRamMb", mb)} />
+      <CapSlider label={t(props.snap.unified_memory ? "settings.maxUnifiedMemory" : "settings.maxVram")} noCap={t("settings.noCap")} totalBytes={props.snap.vram_total} valueMb={liveCaps.maxVramMb} onChange={(mb) => setCap("maxVramMb", mb)} />
+      {/* Unified-memory machines have one physical pool and cannot use the
+          discrete-GPU MoE RAM fallback. A second RAM cap would describe the
+          same bytes as a separate resource, so only discrete GPUs get it. */}
+      {!props.snap.unified_memory ? (
+        <CapSlider label={t("settings.maxRam")} noCap={t("settings.noCap")} totalBytes={props.snap.ram_total} valueMb={liveCaps.maxRamMb} onChange={(mb) => setCap("maxRamMb", mb)} />
+      ) : null}
     </div>
   );
 

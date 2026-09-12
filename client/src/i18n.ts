@@ -73,7 +73,10 @@ export const STRINGS = {
     "cluster.ready": "Cluster ready",
     "node.thisNode": "This node",
     "node.gpu": "GPU",
+    "node.chip": "Chip",
     "node.vram": "VRAM",
+    "node.computeMemory": "Compute memory",
+    "node.unifiedMemory": "Unified memory",
     "node.ram": "RAM",
     "node.cpu": "CPU",
     "node.threads": "{n} threads",
@@ -86,7 +89,7 @@ export const STRINGS = {
     "node.hw.noGpu": "No NVIDIA GPU detected. Install the NVIDIA driver (or use a machine with an NVIDIA card).",
     "node.hw.ccLow": "This graphics card is too old. IdleToken needs an RTX 20 series card or newer.",
     "node.hw.driverOld": "The NVIDIA driver is too old for this build. Update it and start IdleToken again.",
-    "node.hw.vramSmall": "This card has too little VRAM. IdleToken needs at least 4 GB per machine.",
+    "node.hw.resourceSmall": "This machine does not have enough available resources to run models.",
     "node.hw.gpuUnsupported": "This machine's GPU is not one IdleToken can compute on. It needs an NVIDIA card (Windows/Linux) or Apple Silicon (macOS).",
     // Since the 2026-08-14 pivot Macs ARE compute nodes (llama.cpp Metal), so
     // this status can only come from an OUTDATED engine build that still
@@ -274,7 +277,9 @@ export const STRINGS = {
     "engine.err.refusedSilent":
       "The engine refused to start and gave no reason — open the engine log below.",
     "engine.err.resourceInsufficient":
-      "Insufficient GPU memory; unable to start. Free GPU memory, choose a smaller precision, or add cluster nodes.",
+      "Available resources are insufficient for this model. Free resources, choose a smaller precision, or add cluster nodes.",
+    "engine.err.coordinatorMemoryRequired":
+      "This machine currently has no memory available for the model. To protect the prompt, layer 0 and the embedding table cannot be handed to a remote machine. Free memory here and start again, or create the cluster on a machine with available compute memory.",
     "fixture.badge": "DEV FIXTURE",
     "fixture.title": "Placeholder data",
     "fixture.body": "The client is running outside the engine, so these numbers are a development placeholder — not a real probe.",
@@ -290,6 +295,7 @@ export const STRINGS = {
     "settings.model": "Model downloads",
     "settings.precision": "Precision",
     "settings.maxVram": "Max VRAM",
+    "settings.maxUnifiedMemory": "Max unified memory",
     "settings.maxRam": "Max RAM",
     "settings.noCap": "No limit",
     "settings.appearance": "Appearance",
@@ -389,7 +395,6 @@ export const STRINGS = {
     "cluster.serving": "Serving",
     "cluster.waiting": "Waiting for machines to join",
     "cluster.loadingHint": "First start downloads this machine's model shard — allow a few minutes on a fast network.",
-    "capacity.modeGpu": "GPU only",
     "capacity.available": "Available",
     "capacity.availableRam": "Available memory",
     "capacity.required": "Needed",
@@ -598,7 +603,10 @@ export const STRINGS = {
     "cluster.ready": "集群就绪",
     "node.thisNode": "本机",
     "node.gpu": "显卡",
+    "node.chip": "芯片",
     "node.vram": "显存",
+    "node.computeMemory": "计算内存",
+    "node.unifiedMemory": "统一内存",
     "node.ram": "内存",
     "node.cpu": "CPU",
     "node.threads": "{n} 线程",
@@ -608,7 +616,7 @@ export const STRINGS = {
     "node.hw.noGpu": "没有检测到 NVIDIA 显卡。请先安装 NVIDIA 驱动，或使用一台配备 NVIDIA 显卡的机器。",
     "node.hw.ccLow": "这张显卡型号过旧。IdleToken 需要 RTX 20 系列或更新的显卡。",
     "node.hw.driverOld": "NVIDIA 驱动版本低于本版本所需。请更新驱动后重新启动 IdleToken。",
-    "node.hw.vramSmall": "这张显卡显存太小。IdleToken 每台机器至少需要 4 GB 显存。",
+    "node.hw.resourceSmall": "这台机器可用资源不足，无法运行模型。",
     "node.hw.gpuUnsupported": "这台机器的 GPU 不是 IdleToken 能用来计算的类型。计算节点需要 NVIDIA 显卡（Windows/Linux）或 Apple Silicon（macOS）。",
     "node.hw.macosSealed": "本机引擎版本较旧，还不支持 macOS 计算——现在 Mac 可以用 Metal 跑模型了。更新这台 Mac 上的 IdleToken 即可参与计算；更新前它仍可控制集群、正常聊天。",
     "node.driver": "驱动",
@@ -756,7 +764,8 @@ export const STRINGS = {
     "engine.err.binMissingDev":
       "缺少 idletoken-server 引擎二进制（{detail}）。请先用 scripts/build_llamacpp.sh 构建，再用 scripts/stage_sidecars.sh 放置。",
     "engine.err.refusedSilent": "引擎拒绝启动，且没有给出原因——请查看下方引擎日志。",
-    "engine.err.resourceInsufficient": "显存资源不足，无法启动。请释放显存、降低精度或增加集群节点。",
+    "engine.err.resourceInsufficient": "可用资源不足。请释放资源、降低精度或增加集群节点。",
+    "engine.err.coordinatorMemoryRequired": "本机当前没有可用于模型的内存。为保护提示词，第 0 层和词嵌入表不能交给远程机器。请释放本机内存后重新启动，或改用有可用计算内存的机器创建集群。",
     "fixture.badge": "开发占位",
     "fixture.title": "占位数据",
     "fixture.body": "客户端未连接引擎，这些数字只是开发占位——不是真实探测结果。",
@@ -772,6 +781,7 @@ export const STRINGS = {
     "settings.model": "模型下载管理",
     "settings.precision": "精度",
     "settings.maxVram": "最大显存",
+    "settings.maxUnifiedMemory": "最大统一内存",
     "settings.maxRam": "最大内存",
     "settings.noCap": "不限制",
     "settings.appearance": "外观",
@@ -866,7 +876,6 @@ export const STRINGS = {
     "cluster.serving": "正在服务",
     "cluster.waiting": "等待机器加入",
     "cluster.loadingHint": "首次启动需下载本机的模型分片——视网速可能需要几分钟。",
-    "capacity.modeGpu": "仅显存",
     "capacity.available": "可用",
     "capacity.availableRam": "可用内存",
     "capacity.required": "需要",
@@ -1025,6 +1034,20 @@ const ERROR_KEYS: Record<string, StringKey> = {
   PAIR_MODEL_NOT_READY: "pairing.err.modelNotReady",
 };
 
+/* Older/current native planners send this privacy refusal without a stable
+ * error prefix. Keep diagnostics verbatim, but recognise the one shipped
+ * sentence at the presentation boundary so a Chinese UI does not suddenly
+ * switch to an English paragraph. New unknown engine messages still pass
+ * through untouched. */
+const ENGINE_REFUSAL_PATTERNS: ReadonlyArray<{ prefix: string; key: StringKey }> = [
+  {
+    // engine.rs strips `idletoken-coord: refuse: ` before exposing
+    // refusedReason, so match the sentence the React layer really receives.
+    prefix: "the coordinator machine has no usable compute memory,",
+    key: "engine.err.coordinatorMemoryRequired",
+  },
+];
+
 export const LangContext = createContext<{
   lang: Lang;
   setLang: (l: Lang) => void;
@@ -1040,8 +1063,11 @@ export function useI18n() {
     return s;
   };
   /** Localize a client-error string ("[CODE] detail"). Unknown codes fall back
-   *  to the detail; strings without a code (engine verbatim) pass through. */
+   *  to the detail. Known legacy engine refusals are localized; every other
+   *  unprefixed engine message passes through verbatim. */
   const tErr = (raw: string): string => {
+    const knownRefusal = ENGINE_REFUSAL_PATTERNS.find(({ prefix }) => raw.startsWith(prefix));
+    if (knownRefusal) return t(knownRefusal.key);
     const m = /^\[([A-Z0-9_]+)\]\s*/.exec(raw);
     if (!m) return raw;
     const detail = raw.slice(m[0].length).trim();

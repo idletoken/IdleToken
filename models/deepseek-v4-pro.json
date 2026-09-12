@@ -6,7 +6,6 @@
   "arch": "deepseek4",
   "available": true,
   "deployment": "cluster",
-  "min_quant": "Q4_K_M",
   "license": "MIT",
   "params_summary": "671B · 37B active",
   "release": "0813",

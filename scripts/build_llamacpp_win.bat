@@ -154,6 +154,17 @@ if errorlevel 1 (
 )
 
 REM --- patch -------------------------------------------------------------------
+REM `checkout -f` resets tracked files but leaves files created by a previous
+REM patch replay. Remove only paths that this exact patch series declares as
+REM additions. A broad `git clean` would also erase build caches and unrelated
+REM diagnostics from this ignored checkout.
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "$ErrorActionPreference='Stop'; $src='%SRC_DIR%'; $git='%GIT%'; Get-ChildItem -LiteralPath '%PATCH_DIR%' -Filter '*.patch' | Sort-Object Name | ForEach-Object { $previous=''; Get-Content -LiteralPath $_.FullName | ForEach-Object { $line=$_; if ($previous -eq '--- /dev/null' -and $line.StartsWith('+++ b/')) { $rel=$line.Substring(6); $parts=$rel -split '/'; if ([string]::IsNullOrWhiteSpace($rel) -or [IO.Path]::IsPathRooted($rel) -or $parts -contains '..') { throw ('unsafe added path in patch: ' + $rel) }; $tracked=& $git -C $src ls-files -- $rel; if ($LASTEXITCODE -ne 0) { throw ('git ls-files failed for patch path: ' + $rel) }; if ($tracked) { throw ('patch declares tracked upstream path as new: ' + $rel) }; $target=Join-Path $src ($rel -replace '/', '\'); if (Test-Path -LiteralPath $target -PathType Container) { throw ('patch-owned added path is unexpectedly a directory: ' + $rel) }; Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue }; $previous=$line } }"
+if errorlevel 1 (
+    echo FATAL: could not clear files added by the patch series
+    exit /b 1
+)
+
 REM Lexical order via `dir /on`; there may be zero patches today (the TLS
 REM transport patch lands with WS-A A2) and that must not be an error.
 set "PATCH_COUNT=0"
@@ -165,6 +176,17 @@ for /f "delims=" %%P in ('dir /b /a-d /on "%PATCH_DIR%\*.patch" 2^>nul') do (
         exit /b 1
     )
     set /a PATCH_COUNT+=1
+)
+
+REM LLAMA_BUILD_UI=OFF and LLAMA_USE_PREBUILT_UI=OFF stop new UI assets from
+REM being produced or downloaded, but upstream still embeds an old dist\ cache
+REM when one exists. Remove only the two exact ignored cache directories. Refuse
+REM reparse points so cleanup can never follow a junction outside this checkout.
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "$ErrorActionPreference='Stop'; $dirs=@('%SRC_DIR%\tools\ui\dist','%BUILD_DIR%\tools\ui\dist'); foreach ($dir in $dirs) { if (Test-Path -LiteralPath $dir) { $item=Get-Item -LiteralPath $dir -Force; if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw ('unexpected UI cache path: ' + $dir) }; Write-Output ('== removing stale embedded UI cache: ' + $dir); Remove-Item -LiteralPath $dir -Recurse -Force } }"
+if errorlevel 1 (
+    echo FATAL: could not clear stale embedded UI caches
+    exit /b 1
 )
 
 if "%~1"=="--fetch-only" (
@@ -269,6 +291,7 @@ echo == configuring ^(MSVC + CUDA %IDLETOKEN_CUDA_VER%, archs %IDLETOKEN_CUDA_AR
     -DBUILD_SHARED_LIBS=OFF ^
     -DLLAMA_CURL=OFF ^
     -DLLAMA_BUILD_UI=OFF ^
+    -DLLAMA_USE_PREBUILT_UI=OFF ^
     -DLLAMA_BUILD_TESTS=OFF ^
     -DLLAMA_BUILD_EXAMPLES=OFF ^
     -DLLAMA_BUILD_TOOLS=ON ^

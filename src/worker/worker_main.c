@@ -1677,7 +1677,7 @@ static int run_rpc_supervisor(const char *engine_dir, const char *rpc_host_arg,
     return 0;
 }
 
-#ifdef __APPLE__
+#if defined(__APPLE__) && defined(IDLETOKEN_WITH_DS4) && IDLETOKEN_WITH_DS4
 /* Point the ds4 Metal backend at its shader sources.
  *
  * ds4 compiles the metal/ shader sources at ds4_gpu_init() time and looks for
@@ -1722,7 +1722,7 @@ static void mac_locate_metal_sources(void) {
     fprintf(stderr, "idletoken-worker: ds4 Metal shader sources not found near %s "
                     "— set DS4_METAL_SOURCE_DIR if they live elsewhere\n", real);
 }
-#endif /* __APPLE__ */
+#endif /* __APPLE__ && IDLETOKEN_WITH_DS4 */
 
 int main(int argc, char **argv) {
     /* Tail-able logs while alive: redirected stdio is fully buffered (the
@@ -1731,7 +1731,7 @@ int main(int argc, char **argv) {
      * here — the rpc-supervisor's log is how joins are diagnosed. */
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
-#ifdef __APPLE__
+#if defined(__APPLE__) && defined(IDLETOKEN_WITH_DS4) && IDLETOKEN_WITH_DS4
     mac_locate_metal_sources();
 #endif
 #ifdef __linux__

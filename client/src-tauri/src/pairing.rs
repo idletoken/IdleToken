@@ -856,8 +856,8 @@ struct Inner {
     self_id: String,
     self_host: String,
     self_gpu: String,
-    /// This machine's own scheduler-usable VRAM/RAM, fast expert-RAM budget
-    /// (bytes), and whether it is unified memory, as reported by the UI's probe
+    /// This machine's settings-capped VRAM/RAM and fast expert-RAM budget
+    /// (bytes), plus whether it is unified memory, as reported by the UI
     /// through `pairing_report_memory`. Sent with every join/poll so the roster
     /// can total the pool.
     self_vram_free: u64,
@@ -3570,13 +3570,13 @@ fn approve_coordinator_request(inner: &mut Inner, peer_id: &str) -> Result<(), S
     Ok(())
 }
 
-/// This machine's scheduler-usable memory, from the UI's own probe snapshot.
+/// This machine's runtime memory budget after the UI applies its usage caps.
 ///
-/// Called whenever the probe refreshes, in every mode — the numbers must be in
-/// place BEFORE a join is sent, and the creator's own roster entry is filled
-/// from here too, so one path feeds every member. Cheap and idempotent: it
-/// only writes three byte counts plus the pool kind and refreshes this
-/// machine's roster row.
+/// Called whenever the probe or usage setting changes, in every mode — the
+/// numbers must be in place BEFORE a join is sent, and the creator's own roster
+/// entry is filled from here too, so one path feeds every member. Cheap and
+/// idempotent: it only writes three byte counts plus the pool kind and refreshes
+/// this machine's roster row.
 #[tauri::command]
 pub fn pairing_report_memory(
     app: AppHandle,

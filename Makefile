@@ -41,6 +41,7 @@ else
 endif
 
 CC              ?= cc
+CXX             ?= c++
 CUDA_HOME       ?= /usr/local/cuda
 NVCC            ?= $(CUDA_HOME)/bin/nvcc
 ifeq ($(IDLETOKEN_GPU),metal)
@@ -176,6 +177,7 @@ endif
 # frozen line, not for shipping. tweetnacl is NOT part of this: it is the
 # pairing crypto, needed either way.
 IDLETOKEN_WITH_DS4 ?= 0
+CFLAGS_WORKER += -DIDLETOKEN_WITH_DS4=$(IDLETOKEN_WITH_DS4)
 ifeq ($(IDLETOKEN_WITH_DS4),1)
 ifeq ($(IDLETOKEN_PUBLIC_SOURCE),1)
 $(error IDLETOKEN_WITH_DS4=1 is unavailable in the public source distribution)

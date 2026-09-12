@@ -6,7 +6,6 @@
   "arch": "qwen3",
   "available": true,
   "deployment": "cluster",
-  "min_quant": "Q4_K_M",
   "license": "Apache-2.0",
   "params_summary": "8.2B dense · 36 layers · GQA",
   "n_layers": 36,

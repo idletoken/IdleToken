@@ -9,7 +9,7 @@ import {
   kvBytesForContext,
   poolRam,
 } from "../src/models";
-import { PRODUCT_CONTEXT_CAP, modelCtxMax } from "../src/settings";
+import { PRODUCT_CONTEXT_CAP, modelCtxMax, runtimeResourceBudget } from "../src/settings";
 
 interface OracleCase {
   model: string;
@@ -56,6 +56,66 @@ if (
     "RESOURCE_ESTIMATE_MISMATCH exact 128K/256K/1M product contexts do not respect model ability",
   );
   failures++;
+}
+
+// The hardware strip and the runtime-capacity rows intentionally answer two
+// different questions. These fixtures pin the second one to the exact cap
+// semantics used by DGX/unified Linux, Apple Silicon and discrete Windows.
+{
+  const GiB = 1024 ** 3;
+  const cases = [
+    {
+      label: "DGX unified balanced budget",
+      resources: {
+        os: "linux" as const,
+        unified_memory: true,
+        vram_usable: 115545133056,
+        ram_usable: 115545133056,
+        ram_expert_usable: 0,
+      },
+      caps: { maxVramMb: 91860, maxRamMb: 91860 },
+      want: { vram_usable: 96322191360, ram_usable: 96322191360, ram_expert_usable: 0 },
+    },
+    {
+      label: "Mac unified custom budget",
+      resources: {
+        os: "macos" as const,
+        unified_memory: true,
+        vram_usable: 40 * GiB,
+        ram_usable: 40 * GiB,
+        // A stale sidecar value still cannot create a second unified pool.
+        ram_expert_usable: 20 * GiB,
+      },
+      caps: { maxVramMb: 32 * 1024, maxRamMb: 32 * 1024 },
+      want: { vram_usable: 32 * GiB, ram_usable: 32 * GiB, ram_expert_usable: 0 },
+    },
+    {
+      label: "Windows discrete GPU and expert-RAM budgets",
+      resources: {
+        os: "windows" as const,
+        unified_memory: false,
+        vram_usable: 24 * GiB,
+        ram_usable: 60 * GiB,
+        ram_expert_usable: 32 * GiB,
+      },
+      caps: { maxVramMb: 20 * 1024, maxRamMb: 28 * 1024 },
+      want: { vram_usable: 20 * GiB, ram_usable: 28 * GiB, ram_expert_usable: 28 * GiB },
+    },
+  ];
+  for (const c of cases) {
+    const got = runtimeResourceBudget(c.resources, c.caps);
+    if (
+      got.vram_usable !== c.want.vram_usable ||
+      got.ram_usable !== c.want.ram_usable ||
+      got.ram_expert_usable !== c.want.ram_expert_usable
+    ) {
+      console.error(
+        `RESOURCE_ESTIMATE_MISMATCH ${c.label}: ` +
+        `want=${JSON.stringify(c.want)} client=${JSON.stringify(got)}`,
+      );
+      failures++;
+    }
+  }
 }
 
 function same(label: string, expected: number, actual: number, c: OracleCase): void {

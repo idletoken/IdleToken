@@ -770,13 +770,21 @@ static char *platform_register(const char *platform_addr, const char *jwt,
                                const char *name, const char *pubkey_b64,
                                const char *endpoint, int relay,
                                const agent_identity *want) {
+    /* A marketplace service is a concrete model + precision + context triple.
+     * Refuse defensively here as well as at the coordinator-reading call sites:
+     * an omitted precision must never turn into a wildcard listing. */
+    if (!want->model[0] || !want->quant[0]) {
+        fprintf(stderr, "platform-agent: refuse: marketplace registration needs "
+                        "a concrete model and precision from the running coordinator\n");
+        return NULL;
+    }
     char name_esc[256], ep_esc[512], model_esc[128], quant_esc[64];
     json_escape_into(name_esc, sizeof(name_esc), name);
     json_escape_into(model_esc, sizeof(model_esc), want->model);
     json_escape_into(quant_esc, sizeof(quant_esc), want->quant);
-    /* Precision-aware capability (small-model-design §6.3): a loaded quant is
-     * advertised so the platform only routes matching-precision requests here;
-     * an entry without quant means "any precision".
+    /* Precision-aware capability: the loaded quant is always advertised so
+     * the platform only routes matching-precision requests here. There is no
+     * wildcard/unspecified precision service.
      *
      * `ctx` is the per-slot context and the third element of the SERVICE
      * identity (model + quant + per-slot context): the platform lists one
@@ -794,14 +802,9 @@ static char *platform_register(const char *platform_addr, const char *jwt,
         snprintf(origin_part, sizeof(origin_part),
                  ",\"origin_id\":\"%s\"", want->origin_id);
     char cap[384];
-    if (want->quant[0])
-        snprintf(cap, sizeof(cap),
-                 "\"capacity\":{\"models\":[{\"model\":\"%s\",\"quant\":\"%s\"%s}],\"tiers\":[1]%s}",
-                 model_esc, quant_esc, ctx_part, origin_part);
-    else
-        snprintf(cap, sizeof(cap),
-                 "\"capacity\":{\"models\":[{\"model\":\"%s\"%s}],\"tiers\":[1]%s}",
-                 model_esc, ctx_part, origin_part);
+    snprintf(cap, sizeof(cap),
+             "\"capacity\":{\"models\":[{\"model\":\"%s\",\"quant\":\"%s\"%s}],\"tiers\":[1]%s}",
+             model_esc, quant_esc, ctx_part, origin_part);
     char body[1024];
     int bl;
     if (relay) {
@@ -1248,10 +1251,9 @@ static int assert_listable_ctx(const char *coord_addr, agent_identity *id_out) {
  * fields only, on purpose, so that a cheap high-frequency request can never
  * silently promote a machine to selling a different model (providers.controller.ts,
  * mergeLiveCapacity). Going through registration also means decision 13b is
- * honoured for free: a changed triple becomes a NEW ProviderService with a new
- * id, STANDARD pricing and statistics from zero, while the old one is archived
- * -- and an unchanged triple hits the live row and costs nothing at all, which
- * is what makes it safe to call on every beat.
+ * honoured for free: a changed triple ends the old Provider lifetime and
+ * registers a NEW Provider with new services, STANDARD pricing and clean local
+ * health. Account reputation remains on the platform User.
  * ---------------------------------------------------------------------- */
 
 /* Everything a re-declaration needs, so the two transports' loops can each
@@ -1259,7 +1261,6 @@ static int assert_listable_ctx(const char *coord_addr, agent_identity *id_out) {
 typedef struct {
     const char *platform_addr, *jwt, *name, *pubkey_b64, *endpoint, *coord_addr;
     int         relay;
-    int         pinned;         /* --provider-id: the operator owns the row, not us */
     char       *provider_id;    /* owned here; re-registration may return a new one */
     agent_identity declared;    /* what the platform currently has from this machine */
     time_t      retry_after;    /* backoff after a refused re-registration */
@@ -1280,6 +1281,20 @@ static void reconcile_identity(agent_registration *reg) {
     if (!reg->provider_id || !reg->jwt) return;
     agent_identity live;
     if (coord_identity(reg->coord_addr, &live) != 0) return;   /* nothing established */
+    if (!live.model[0] || !live.quant[0]) {
+        char what[224];
+        identity_print(&live, what, sizeof(what));
+        fprintf(stderr,
+                "platform-agent: refuse: the coordinator now reports an incomplete "
+                "service identity ('%s'). A marketplace service requires an explicit "
+                "model and precision.\n"
+                "  Stopping, because staying up would keep selling a precision this "
+                "machine no longer proves it runs. Restart the coordinator so "
+                "/idletoken/v1/stats reports both model and quant, then turn sharing "
+                "back on.\n",
+                what);
+        exit(4);
+    }
     if (identity_same(&live, &reg->declared)) return;          /* the common case */
 
     char was[224], now[224];
@@ -1301,19 +1316,6 @@ static void reconcile_identity(agent_registration *reg) {
                 "unaffected.\n",
                 now, AGENT_MIN_LIST_CTX, was, was, AGENT_MIN_LIST_CTX);
         exit(4);
-    }
-
-    if (reg->pinned) {
-        /* --provider-id says an operator is driving the row by hand. Re-running
-         * registration would resolve the row by machine key instead and could
-         * land somewhere they did not choose, so say it and leave it alone. */
-        fprintf(stderr,
-                "platform-agent: WARNING: the coordinator now serves '%s' but the "
-                "marketplace still advertises '%s'. Not re-registering, because "
-                "--provider-id pins this row; re-register it yourself or restart "
-                "this agent without --provider-id.\n", now, was);
-        reg->declared = live;   /* said once, not once per beat */
-        return;
     }
 
     const time_t t = time(NULL);
@@ -2145,7 +2147,7 @@ static void usage(FILE *o) {
 "idletoken-platform-agent  cluster-side marketplace agent in front of idletoken-coord\n"
 "Usage: idletoken-platform-agent [--port N] [--coord URL] [--key-file PATH]\n"
 "                             [--platform URL --jwt TOKEN --name NAME]\n"
-"                             [--provider-id ID] [--heartbeat-secs N]\n"
+"                             [--heartbeat-secs N]\n"
 "                             [--endpoint URL] [--relay]\n"
 "\n"
 "  --port N            platform-facing listen port (default 9700; unused in --relay)\n"
@@ -2160,18 +2162,16 @@ static void usage(FILE *o) {
 "  --platform URL      platform gateway; enables registration + heartbeat\n"
 "  --jwt TOKEN         platform JWT (the provider account's bearer token)\n"
 "  --name NAME         provider display name for registration\n"
-"  --provider-id ID    already registered: skip POST /providers, just beat\n"
 "  --heartbeat-secs N  heartbeat interval (default 30; unused in --relay)\n"
 "  --endpoint URL      advertised /infer endpoint (default\n"
 "                      http://127.0.0.1:<port>/infer; set to this machine's\n"
 "                      public URL when registering with a real platform)\n"
 "  --model ID          model this cluster serves, reported in the capacity\n"
-"                      registration so the platform routes matching requests\n"
-"                      (default dsv4-flash — the platform billing id of\n"
-"                      DeepSeek V4 Flash)\n"
-"  --quant Q           precision this cluster loaded (small models, e.g.\n"
-"                      Q4_K_M/Q8_0/BF16); reported so the platform only routes\n"
-"                      matching-precision requests here. Omit = any precision.\n"
+"                      registration. When supplied, it is cross-checked against\n"
+"                      the running coordinator; the coordinator remains authoritative.\n"
+"  --quant Q           precision assertion (e.g. Q4_K_M/Q8_0/BF16), cross-checked\n"
+"                      against the running coordinator. The coordinator must always\n"
+"                      report a concrete precision; wildcard listings are rejected.\n"
 "  --relay             reverse connection mode: no listen port at all; the\n"
 "                      agent dials OUT to the platform (long poll) and jobs\n"
 "                      are pushed back over that connection. Zero home-side\n"
@@ -2204,13 +2204,11 @@ int main(int argc, char **argv) {
     const char *platform_url   = NULL;
     const char *jwt            = NULL;
     const char *name           = "idletoken-cluster";
-    const char *provider_id_in = NULL;
     const char *endpoint_arg   = NULL;
-    /* Platform billing id of the model this cluster serves (multi-model §6).
-     * NOTE: the platform keeps 'dsv4-flash' as DSv4's billing id; the engine
-     * registry id 'deepseek-v4-flash' is normalized gateway-side. */
-    const char *model          = "dsv4-flash";
-    const char *quant          = "";      /* precision (small models); "" = any */
+    /* Optional startup assertions. The running coordinator is the only source
+     * of the marketplace service identity. */
+    const char *model          = "";
+    const char *quant          = "";
     int         beat_secs      = 30;
     int         relay          = 0;
     /* Env fallback first, so an explicit flag still wins. Same pattern as the
@@ -2244,7 +2242,6 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--platform")       && i + 1 < argc) platform_url = argv[++i];
         else if (!strcmp(a, "--jwt")            && i + 1 < argc) jwt = argv[++i];
         else if (!strcmp(a, "--name")           && i + 1 < argc) name = argv[++i];
-        else if (!strcmp(a, "--provider-id")    && i + 1 < argc) provider_id_in = argv[++i];
         else if (!strcmp(a, "--heartbeat-secs") && i + 1 < argc) beat_secs = atoi(argv[++i]);
         else if (!strcmp(a, "--endpoint")       && i + 1 < argc) endpoint_arg = argv[++i];
         else if (!strcmp(a, "--model")          && i + 1 < argc) model = argv[++i];
@@ -2256,12 +2253,11 @@ int main(int argc, char **argv) {
     }
     if (port <= 0 || port > 65535) { fprintf(stderr, "platform-agent: bad --port\n"); return 2; }
     if (beat_secs <= 0) beat_secs = 30;
-    if (platform_url && !jwt && !provider_id_in) {
-        fprintf(stderr, "platform-agent: --platform needs --jwt (and --name), or --provider-id\n");
+    if (platform_url && !jwt) {
+        fprintf(stderr, "platform-agent: --platform needs --jwt and --name\n");
         return 2;
     }
     if (relay && (!platform_url || !jwt)) {
-        /* jwt is mandatory even with --provider-id: every poll authenticates. */
         fprintf(stderr, "platform-agent: --relay needs --platform and --jwt\n");
         return 2;
     }
@@ -2332,12 +2328,12 @@ int main(int argc, char **argv) {
     printf("  key file         : %s\n", key_file ? key_file : "(ephemeral)");
     fflush(stdout);
 
-    /* Register with the platform (unless an existing provider id was given). */
+    /* Register a fresh Provider lifetime with the platform. */
     agent_registration reg;
     memset(&reg, 0, sizeof(reg));
     reg.platform_addr = platform_addr; reg.jwt = jwt; reg.name = name;
     reg.pubkey_b64 = pubkey_b64; reg.endpoint = endpoint; reg.coord_addr = coord_addr;
-    reg.relay = relay; reg.pinned = provider_id_in != NULL;
+    reg.relay = relay;
     if (platform_url) {
         /* The listing floor, checked before anything is registered or beaten:
          * a machine that cannot serve 8192 tokens per slot should never appear
@@ -2352,36 +2348,37 @@ int main(int argc, char **argv) {
         memset(&live, 0, sizeof(live));
         int floor_rc = assert_listable_ctx(coord_addr, &live);
         if (floor_rc != 0) { free(pubkey_b64); return floor_rc; }
-        /* The COORDINATOR decides; --model/--quant only fill in what it did not
-         * say. Anything else re-creates the bug this reconciliation exists to
-         * fix, one restart later. A disagreement is worth a line of its own:
+        /* The COORDINATOR decides; --model/--quant are assertions only. Falling
+         * back to startup flags would re-create the stale-listing bug one
+         * restart later. A disagreement is worth a line of its own:
          * on the machine that produced this fix, `--quant IQ2_XXS` had been
          * true when the agent started and had been wrong ever since. */
-        if (!live.model[0]) snprintf(live.model, sizeof(live.model), "%s", model);
-        else if (strcmp(live.model, model) != 0 && strcmp(model, "dsv4-flash") != 0)
+        if (!live.model[0] || !live.quant[0]) {
+            char what[224];
+            identity_print(&live, what, sizeof(what));
+            fprintf(stderr,
+                    "platform-agent: refuse: the running coordinator reports an "
+                    "incomplete service identity ('%s'). Marketplace registration "
+                    "requires /idletoken/v1/stats to contain both a concrete model "
+                    "and quant; --model/--quant cannot substitute for live state.\n",
+                    what);
+            free(pubkey_b64);
+            return 4;
+        }
+        if (model[0] && strcmp(live.model, model) != 0)
             fprintf(stderr, "platform-agent: the coordinator serves model '%s', not the "
                             "'%s' this agent was started with; declaring the coordinator's\n",
                     live.model, model);
-        if (!live.quant[0]) {
-            snprintf(live.quant, sizeof(live.quant), "%s", quant);
-            if (quant[0])
-                fprintf(stderr, "platform-agent: the coordinator does not report a "
-                                "precision; declaring '%s' from --quant, which nothing "
-                                "cross-checked\n", quant);
-        } else if (quant[0] && strcmp(live.quant, quant) != 0) {
+        if (quant[0] && strcmp(live.quant, quant) != 0) {
             fprintf(stderr, "platform-agent: the coordinator serves precision '%s', not "
                             "the '%s' this agent was started with; declaring the "
                             "coordinator's\n", live.quant, quant);
         }
-        if (provider_id_in) {
-            reg.provider_id = strdup(provider_id_in);
-        } else {
-            reg.provider_id = platform_register(platform_addr, jwt, name, pubkey_b64,
-                                                endpoint, relay, &live);
-            if (!reg.provider_id) {
-                fprintf(stderr, "platform-agent: registration failed; refusing to start\n");
-                return 1;
-            }
+        reg.provider_id = platform_register(platform_addr, jwt, name, pubkey_b64,
+                                            endpoint, relay, &live);
+        if (!reg.provider_id) {
+            fprintf(stderr, "platform-agent: registration failed; refusing to start\n");
+            return 1;
         }
         reg.declared = live;
         char what[224];

@@ -610,8 +610,9 @@ export interface NodeMemory {
 /**
  * Add up what a whole cluster brings (2026-08-15).
  *
- * Every machine measures its own GPU working-set budget and sends it with its
- * join, so the roster already carries the numbers — this just totals VRAM.
+ * Every machine applies its own resource-usage cap to the live probe and sends
+ * that runtime budget with its join, so the roster already carries the numbers
+ * — this just totals GPU-addressable memory.
  * Unified-memory platforms report their one GPU budget in vramFree.
  *
  * `complete` is false when any member reported nothing (an older build). The
@@ -641,7 +642,7 @@ export function poolRam(nodes: NodeMemory[]): { bytes: number; complete: boolean
   let complete = nodes.length > 0;
   for (const n of nodes) {
     if (n.unifiedMemory) continue;
-    /* Use the member's already node-local budget, not raw free RAM. In
+    /* Use the member's settings-capped node-local budget, not raw free RAM. In
      * particular, every Windows member has its own WDDM fixed reserve; adding
      * ramFree first and subtracting one reserve for the cluster is wrong. */
     const r = n.ramExpertFree ?? 0;

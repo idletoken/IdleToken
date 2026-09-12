@@ -30,9 +30,9 @@ export interface PeerNode {
    *  timeout (audit 2.8). Optional so absence (older snapshot shapes) reads as
    *  online — which is what absence used to mean. */
   online?: boolean;
-  /** What this machine brings to the pool, as its OWN uncapped probe measured
-   *  it: real currently-free VRAM in bytes, ordinary usable RAM, the smaller
-   *  fast expert-RAM pool, and
+  /** What this machine lets IdleToken use after its OWN resource setting caps
+   *  the live probe: GPU-addressable bytes, ordinary RAM, the smaller fast
+   *  expert-RAM pool, and
    *  whether the two are one physical pool (Apple Silicon). The wire names
    *  stay vramFree/ramFree for compatibility. Carried by the roster so any member
    *  can total the cluster and answer "does the model fit on all of us" before

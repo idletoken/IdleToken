@@ -17,6 +17,9 @@
 
 use std::sync::Mutex;
 
+#[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, WebviewWindow};
 
@@ -58,24 +61,34 @@ impl Default for Prefs {
     }
 }
 
-/// Managed state: the live prefs plus whether a tray icon actually exists.
+/// Managed state: live prefs, tray health, and the macOS full-screen close
+/// handshake. AppKit moves a native full-screen window into its own Space;
+/// hiding it before the exit animation completes strands that Space as a
+/// black screen.
 #[derive(Default)]
-pub struct SysPrefs(Mutex<Prefs>, Mutex<bool>);
+pub struct SysPrefs {
+    prefs: Mutex<Prefs>,
+    tray_alive: Mutex<bool>,
+    #[cfg(target_os = "macos")]
+    fullscreen_hide_pending: AtomicBool,
+    #[cfg(target_os = "macos")]
+    fullscreen_observer_ready: AtomicBool,
+}
 
 impl SysPrefs {
     pub fn get(&self) -> Prefs {
-        self.0.lock().unwrap().clone()
+        self.prefs.lock().unwrap().clone()
     }
     fn set(&self, p: Prefs) {
-        *self.0.lock().unwrap() = p;
+        *self.prefs.lock().unwrap() = p;
     }
     /// Recorded by `tray::install`: false means tray creation failed (or the
     /// user turned it off), and therefore that hiding the window is forbidden.
     pub fn set_tray_alive(&self, alive: bool) {
-        *self.1.lock().unwrap() = alive;
+        *self.tray_alive.lock().unwrap() = alive;
     }
     pub fn tray_alive(&self) -> bool {
-        *self.1.lock().unwrap()
+        *self.tray_alive.lock().unwrap()
     }
 }
 
@@ -120,11 +133,158 @@ pub fn main_window(app: &AppHandle) -> Option<WebviewWindow> {
 /// are needed — a hidden window that is also minimized comes back invisible if
 /// you only call `show`.
 pub fn show_main(app: &AppHandle) {
+    // A Dock/tray activation can race the asynchronous exit from a native
+    // full-screen Space. In that case the user's latest request is to show the
+    // window, so the exit notification must not hide it afterwards.
+    #[cfg(target_os = "macos")]
+    app.state::<SysPrefs>()
+        .fullscreen_hide_pending
+        .store(false, Ordering::SeqCst);
+
     if let Some(w) = main_window(app) {
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
     }
+}
+
+/// Hide immediately after recording the restored, non-full-screen geometry.
+/// On macOS this is called from the native full-screen-exit notification; on
+/// other platforms it is the ordinary close-to-tray path.
+fn hide_main_now(app: &AppHandle) -> Result<(), String> {
+    remember_geometry(app);
+    let window = main_window(app).ok_or_else(|| "main window is unavailable".to_string())?;
+    window
+        .hide()
+        .map_err(|e| format!("failed to hide main window: {e}"))?;
+    // The webview stays alive while hidden; it shows a one-time "still
+    // running in the tray" notice on this signal.
+    tauri::Emitter::emit(app, "tray:hidden", ())
+        .map_err(|e| format!("failed to emit tray:hidden: {e}"))?;
+    Ok(())
+}
+
+/// Handle a close-to-tray request without hiding a native full-screen macOS
+/// window mid-transition. Returns after scheduling the deferred hide.
+pub fn close_to_tray(app: &AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let state = app.state::<SysPrefs>();
+
+        // A second close event can arrive while AppKit is still animating out
+        // of full screen. It must not fall through to an immediate hide just
+        // because Tauri has already updated its logical full-screen flag.
+        if state.fullscreen_hide_pending.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        let window = main_window(app).ok_or_else(|| "main window is unavailable".to_string())?;
+        if window
+            .is_fullscreen()
+            .map_err(|e| format!("failed to inspect full-screen state: {e}"))?
+        {
+            if !state.fullscreen_observer_ready.load(Ordering::SeqCst) {
+                return Err(
+                    "refusing to hide a full-screen window without the AppKit exit observer"
+                        .to_string(),
+                );
+            }
+
+            state.fullscreen_hide_pending.store(true, Ordering::SeqCst);
+            if let Err(e) = window.set_fullscreen(false) {
+                state.fullscreen_hide_pending.store(false, Ordering::SeqCst);
+                return Err(format!("failed to leave full screen before hiding: {e}"));
+            }
+            eprintln!("idletoken-client: close-to-tray waiting for macOS full-screen exit");
+            return Ok(());
+        }
+    }
+
+    hide_main_now(app)
+}
+
+/// Observe the native completion point of AppKit's asynchronous full-screen
+/// exit. Tauri's logical `is_fullscreen` flag changes when the exit is
+/// requested, before the Space animation is actually done, so it cannot be
+/// used as the completion signal.
+#[cfg(target_os = "macos")]
+pub fn install_fullscreen_exit_observer(app: &AppHandle) -> Result<(), String> {
+    use std::ptr::NonNull;
+
+    use block2::RcBlock;
+    use objc2::runtime::AnyObject;
+    use objc2_app_kit::NSWindowDidExitFullScreenNotification;
+    use objc2_foundation::{NSNotification, NSNotificationCenter};
+
+    let window = main_window(app).ok_or_else(|| "main window is unavailable".to_string())?;
+    let native_window = window
+        .ns_window()
+        .map_err(|e| format!("failed to obtain NSWindow: {e}"))?;
+    let native_window = unsafe {
+        // SAFETY: Tauri documents `ns_window()` as the native NSWindow handle;
+        // Objective-C APIs accept every NSWindow as an AnyObject.
+        native_window
+            .cast::<AnyObject>()
+            .as_ref()
+            .ok_or_else(|| "Tauri returned a null NSWindow".to_string())?
+    };
+
+    let handle = app.clone();
+    let callback: RcBlock<dyn Fn(NonNull<NSNotification>)> =
+        RcBlock::new(move |_notification: NonNull<NSNotification>| {
+            let state = handle.state::<SysPrefs>();
+            if state.fullscreen_hide_pending.load(Ordering::SeqCst) {
+                // Queue one main-loop turn beyond the notification. Tao's
+                // NSWindow delegate restores its normal frame in the same
+                // notification cycle; deferring ensures that restoration is
+                // complete before geometry is read or the window is hidden.
+                // Keeping the pending flag set also lets a racing Dock/tray
+                // activation cancel this hide through `show_main`.
+                let deferred = handle.clone();
+                if let Err(e) = handle.run_on_main_thread(move || {
+                    if deferred
+                        .state::<SysPrefs>()
+                        .fullscreen_hide_pending
+                        .swap(false, Ordering::SeqCst)
+                    {
+                        eprintln!(
+                            "idletoken-client: macOS full-screen exit complete — hiding to tray"
+                        );
+                        if let Err(e) = hide_main_now(&deferred) {
+                            eprintln!(
+                                "idletoken-client: close-to-tray failed after full-screen exit: {e}"
+                            );
+                        }
+                    }
+                }) {
+                    state.fullscreen_hide_pending.store(false, Ordering::SeqCst);
+                    eprintln!(
+                        "idletoken-client: failed to schedule hide after full-screen exit: {e}"
+                    );
+                }
+            }
+        });
+
+    let center = NSNotificationCenter::defaultCenter();
+    let _observer = unsafe {
+        // SAFETY: the notification name and object are the typed AppKit
+        // NSWindow values expected by this API. AppKit posts the notification
+        // on the main thread, and AppHandle is safe to move into the block.
+        center.addObserverForName_object_queue_usingBlock(
+            Some(NSWindowDidExitFullScreenNotification),
+            Some(native_window),
+            None,
+            &callback,
+        )
+    };
+    // Foundation retains the returned observer for the registration lifetime.
+    // The observed NSWindow and the notification center both live until this
+    // process exits, so there is no earlier teardown point to unregister it.
+
+    app.state::<SysPrefs>()
+        .fullscreen_observer_ready
+        .store(true, Ordering::SeqCst);
+    Ok(())
 }
 
 /// Whether the saved position still lands on a monitor that exists.

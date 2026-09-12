@@ -6,7 +6,6 @@
   "arch": "qwen35",
   "available": true,
   "deployment": "cluster",
-  "min_quant": "Q4_K_M",
   "license": "Apache-2.0",
   "params_summary": "9B · 32 layers · hybrid linear attention (Gated DeltaNet 3:1 full)",
   "n_layers": 32,

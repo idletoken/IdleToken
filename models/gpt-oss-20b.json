@@ -6,7 +6,6 @@
   "arch": "gpt-oss",
   "available": true,
   "deployment": "cluster",
-  "min_quant": "Q4_K_XL",
   "license": "Apache-2.0",
   "marketplace_allowed": true,
   "params_summary": "20.9B total / 3.6B active · 24 layers · 32-expert MoE",

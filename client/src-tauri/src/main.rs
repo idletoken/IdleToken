@@ -995,6 +995,20 @@ async fn http_get_json(url: &str) -> Result<Value, String> {
     .map_err(|e| e.to_string())?
 }
 
+/// macOS sends `RunEvent::Reopen` when the user clicks the app's Dock icon.
+///
+/// A close-to-tray window still exists, but AppKit has no default document
+/// window to recreate, so ignoring that event leaves the app active with no
+/// visible UI. Keep this next to the event loop rather than in the tray code:
+/// the Dock is an application activation path, not the status-bar tray icon.
+#[cfg(target_os = "macos")]
+fn handle_macos_reopen(app: &tauri::AppHandle, has_visible_windows: bool) {
+    eprintln!(
+        "idletoken-client: macOS Dock reopen — restoring main window (visible_windows={has_visible_windows})"
+    );
+    window::show_main(app);
+}
+
 fn main() {
     // NVIDIA Linux (DGX, and any GTX/RTX desktop): WebKitGTK's DMA-BUF
     // renderer produces a fully blank window — no error, no log, just white.
@@ -1014,11 +1028,7 @@ fn main() {
         // the OTHER instance's cluster is already serving (seen for real on
         // 2026-08-15: coord ready on 127.0.0.1:8000, UI stuck).
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(w) = app.get_webview_window("main") {
-                let _ = w.show();
-                let _ = w.unminimize();
-                let _ = w.set_focus();
-            }
+            window::show_main(app);
         }))
         .plugin(tauri_plugin_shell::init())
         // Native file dialog for the open-model picker (WS-D1: "any GGUF").
@@ -1052,6 +1062,14 @@ fn main() {
             // there is no tray to bring it back, so it has to know by the time
             // it decides whether to honour "start minimized".
             let handle = app.handle().clone();
+            #[cfg(target_os = "macos")]
+            if let Err(e) = window::install_fullscreen_exit_observer(&handle) {
+                // Fail safe: full-screen close-to-tray will stay visible
+                // instead of risking a black, stranded macOS Space.
+                eprintln!(
+                    "idletoken-client: macOS full-screen close observer unavailable: {e}"
+                );
+            }
             if window::load(&handle).tray_icon {
                 tray::install(&handle);
             }
@@ -1085,12 +1103,9 @@ fn main() {
                     && window::hide_allowed(app)
                 {
                     api.prevent_close();
-                    window::remember_geometry(app);
-                    let _ = window.hide();
-                    // The webview stays alive while hidden; it shows a one-time
-                    // "still running in the tray" notice on this signal (the
-                    // first close-to-tray otherwise looks exactly like a quit).
-                    let _ = tauri::Emitter::emit(app, "tray:hidden", ());
+                    if let Err(e) = window::close_to_tray(app) {
+                        eprintln!("idletoken-client: close-to-tray refused: {e}");
+                    }
                 } else {
                     // Real close: keep the geometry for next launch. (Also the
                     // path taken when the tray is unavailable, which is why
@@ -1154,6 +1169,16 @@ fn main() {
             // client can still orphan it — parent-death detection in the
             // engine is the follow-up for that.)
             match event {
+                // Clicking the Dock icon is not a second launch on macOS, so
+                // the single-instance callback above never sees it. AppKit
+                // reports Reopen instead; restore even when it says a window
+                // is visible, because a minimized window counts differently
+                // across macOS releases and `show_main` is safely idempotent.
+                #[cfg(target_os = "macos")]
+                tauri::RunEvent::Reopen {
+                    has_visible_windows,
+                    ..
+                } => handle_macos_reopen(app, has_visible_windows),
                 tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
                     // Whatever asked for this (Cmd-Q, the session ending, our
                     // own tray Quit), the window must stop trying to hide

@@ -6,7 +6,6 @@
   "arch": "deepseek2",
   "available": true,
   "deployment": "cluster",
-  "min_quant": "Q4_K_M",
   "license": "Modified MIT",
   "params_summary": "1T · 32B active · ~1.8-bit ≈ 240 GB",
   "n_layers": 61,

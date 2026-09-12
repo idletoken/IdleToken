@@ -83,11 +83,56 @@ git -C "$SRC_DIR" checkout -qf "$PIN_SHA"
 shopt -s nullglob
 PATCHES=("$PATCH_DIR"/*.patch)
 shopt -u nullglob
+# `checkout -f` resets tracked paths but deliberately leaves untracked files.
+# Once a patch adds a new source/header, the next build would therefore stop at
+# "already exists in working directory". Remove only paths that this exact
+# patch series declares as additions; never run `git clean`, because build/
+# and unrelated local diagnostics also live in this ignored checkout.
+for p in ${PATCHES[@]+"${PATCHES[@]}"}; do
+    while IFS= read -r rel; do
+        case "$rel" in
+            ""|..|/*|../*|*/..|*/../*)
+                echo "FATAL: unsafe added path '$rel' in $(basename "$p")" >&2
+                exit 1
+                ;;
+        esac
+        if git -C "$SRC_DIR" ls-files --error-unmatch -- "$rel" >/dev/null 2>&1; then
+            echo "FATAL: $(basename "$p") declares tracked upstream path '$rel' as new" >&2
+            exit 1
+        fi
+        if [ -d "$SRC_DIR/$rel" ] && [ ! -L "$SRC_DIR/$rel" ]; then
+            echo "FATAL: patch-owned added path is unexpectedly a directory: $rel" >&2
+            exit 1
+        fi
+        rm -f -- "$SRC_DIR/$rel"
+    done < <(awk '
+        previous == "--- /dev/null" && /^\+\+\+ b\// {
+            sub(/^\+\+\+ b\//, ""); print
+        }
+        { previous = $0 }
+    ' "$p")
+done
 # ${arr[@]+...} form: macOS ships bash 3.2, where expanding an empty array
 # under `set -u` is fatal.
 for p in ${PATCHES[@]+"${PATCHES[@]}"}; do
     echo "== applying $(basename "$p")"
     git -C "$SRC_DIR" apply --verbose "$p"
+done
+
+# Upstream's UI provisioner treats an existing dist/ as a higher-priority
+# input even when both UI build/download switches are OFF. Without clearing
+# these exact ignored cache directories, a repeat build silently embeds the UI
+# from an older run. The product never serves this UI; fail rather than follow
+# an unexpected symlink or remove anything outside the two known cache paths.
+for ui_cache in "$SRC_DIR/tools/ui/dist" "$BUILD_DIR/tools/ui/dist"; do
+    if [ -L "$ui_cache" ] || { [ -e "$ui_cache" ] && [ ! -d "$ui_cache" ]; }; then
+        echo "FATAL: unexpected non-directory UI cache path: $ui_cache" >&2
+        exit 1
+    fi
+    if [ -d "$ui_cache" ]; then
+        echo "== removing stale embedded UI cache: $ui_cache"
+        rm -rf -- "$ui_cache"
+    fi
 done
 
 if [ "${1:-}" = "--fetch-only" ]; then
@@ -111,8 +156,11 @@ COMMON_FLAGS=(
     # engine. On DGX (2026-08-19) the pinned fetch timed out and the fallback
     # then hung the build outright. We never serve that UI anyway: llama-server
     # is loopback-only behind the coordinator, and the product UI is the Tauri
-    # client. Off makes the build hermetic after the git fetch.
+    # client. Both switches are required: LLAMA_BUILD_UI=OFF only disables the
+    # npm build, while LLAMA_USE_PREBUILT_UI otherwise still downloads a bucket
+    # artifact and can fall back from the pinned tag to `latest`.
     -DLLAMA_BUILD_UI=OFF
+    -DLLAMA_USE_PREBUILT_UI=OFF
     -DLLAMA_BUILD_TESTS=OFF
     -DLLAMA_BUILD_EXAMPLES=OFF
     -DLLAMA_BUILD_TOOLS=ON

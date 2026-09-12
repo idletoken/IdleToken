@@ -286,7 +286,7 @@ typedef struct {
     char     hostname[64];
     uint64_t ram_total;
     uint64_t ram_used_other;     /* MemTotal - MemAvailable */
-    uint64_t ram_usable;         /* ram_total - ram_used_other - safety */
+    uint64_t ram_usable;         /* platform-safe currently available bytes */
     /* Measured ceiling on pinned (cudaHostAlloc) host memory; 0 = unknown.
      * Since 2026-09-07 the llama.cpp MoE Hybrid planner caps the routed
      * experts it keeps in a node's RAM at min(ram_usable, ram_pinnable): the

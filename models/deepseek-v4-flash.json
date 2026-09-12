@@ -6,7 +6,6 @@
   "arch": "deepseek4",
   "available": true,
   "deployment": "cluster",
-  "min_quant": "IQ2_XXS",
   "license": "MIT",
   "params_summary": "304B · 13B active · Q2",
   "release": "0731",
