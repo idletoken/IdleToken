@@ -5,14 +5,14 @@
   </picture>
 </p>
 
-<h1 align="center">Share your idle Token.</h1>
+<h1 align="center">Share your idle tokens.</h1>
 
 <p align="center">
-  Run large models locally. Share yours when idle; call someone else's when busy.
+  Run large language models locally. Share yours when idle; use others' when busy.
 </p>
 
 <p align="center">
-  <a href="https://github.com/idletoken/IdleToken/releases">⬇️ Download</a>
+  <a href="https://github.com/idletoken/IdleToken/releases">⬇️ Download the client</a>
   · <a href="https://idletoken.ai">🏠 Project website</a>
   · <a href="README.zh-CN.md">🌐 中文</a>
 </p>
@@ -21,11 +21,11 @@
 
 ## ✨ Why IdleToken
 
-Agent workloads naturally rise and fall. Most of the time, only one or two inference tasks are running. When a complex job arrives, several agents start working at once and compute demand rises sharply in a short period.
+Agents' compute needs naturally rise and fall. Most of the time, only one or two inference tasks are running. For complex tasks, several agents work at once and send many inference requests in a short period.
 
-Device usage has peaks and valleys too: a machine may be busy running a large game, then sit idle when the user steps away or stops using it for the night.
+Device usage has its own peaks and valleys: machines sit idle when users step away or stop using them for the night, yet often lack enough resources when needed, such as when running several applications while also hosting a large language model.
 
-IdleToken connects these offset peaks and valleys, letting idle machines supply compute to agents at peak demand.
+IdleToken aims to connect these offset peaks and valleys, letting idle machines supply compute to agents experiencing peak demand.
 
 <table>
 <tr>
@@ -42,50 +42,37 @@ IdleToken connects these offset peaks and valleys, letting idle machines supply 
 </tr>
 </table>
 
-IdleToken uses Sparks to settle Tokens.
-
-## 🚀 Two ways to start
-
-<table>
-<tr>
-<th width="50%" align="center">🖥️ Deploy and share your own model</th>
-<th width="50%" align="center">☁️ Call a model shared by someone else</th>
-</tr>
-<tr>
-<td width="50%" valign="top">
-<ol>
-<li>Download and install the client. It currently supports Windows 10/11 and Linux x86_64/arm64 with an NVIDIA GPU, plus Apple Silicon Macs.</li>
-<li>Start the client and choose a model, quantization, and context from the built-in list. The client downloads any missing model weights.</li>
-<li>Turn on <strong>Request help</strong> to ask someone else to complete a task waiting locally. Turn on <strong>Share compute</strong> to help others complete their tasks.</li>
-</ol>
-</td>
-<td width="50%" valign="top">
-<p>If you do not want to deploy a model yourself—for example, if you want to use IdleToken from a phone, tablet, or computer without a supported GPU—you can call a model shared by someone else.</p>
-<ol>
-<li>Create an account at <a href="https://idletoken.ai">idletoken.ai</a>.</li>
-<li>Create an API key in your account.</li>
-<li>Enter the API address and key in any Anthropic- or OpenAI-compatible client. No desktop installation is required.</li>
-</ol>
-</td>
-</tr>
-</table>
+We use Sparks to settle token usage.
 
 ## 💬 Join the community
 
-Join the IdleToken Discord community to discuss model deployment, LAN clustering, client integrations, and project development, or to share feedback and ask for help.
+Join the IdleToken Discord to discuss using and developing the project.
 
-[Join Discord](https://discord.gg/XbaWCH4t2J)
+[![Discord](https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/XbaWCH4t2J)
+
+## 🚀 Two ways to start
+
+### 🖥️ Deploy and share your own model
+
+1. [Download and install the client](https://github.com/idletoken/IdleToken/releases).
+2. Start the client, then download and deploy a model.
+3. Turn on **Request help** to ask others to complete tasks queued locally.
+4. Turn on **Share compute** to help others complete their tasks.
+
+### ☁️ Use models shared by others
+
+If you do not want to deploy a model yourself, for example when using IdleToken on a phone, tablet, or computer without a supported GPU, you can use models shared by others directly.
+
+1. Create an account at [idletoken.ai](https://idletoken.ai/register).
+2. Create an API key in your account.
+3. Use the API to access models shared by others.
 
 ## 🔌 Connect existing tools
 
-Both paths above work with existing tools. Connect to the local address when you deploy your own model, or to the IdleToken API when you call a model shared by someone else. Both are compatible with the OpenAI and Anthropic APIs.
+- **Connect to a model you deploy:** `http://127.0.0.1:8000`. Once the model starts, you can connect through this local address.
+- **Use models shared by others:** `https://api.idletoken.ai`. After signing in, click your profile avatar in the top right, open **Sparks** → **API keys**, and click **New key**.
 
-| Usage | Base URL | API key |
-| --- | --- | --- |
-| A model you deploy | `http://127.0.0.1:8000` | Any non-empty value, or your local token if you configured one |
-| A model shared by someone else | `https://api.idletoken.ai` | An API key created in your account |
-
-For example, to call a shared model from Claude Code:
+### Connect Claude Code
 
 ```sh
 export ANTHROPIC_BASE_URL=https://api.idletoken.ai
@@ -95,17 +82,48 @@ claude
 
 `GET /v1/models` returns the model IDs currently available at that address.
 
+### Connect OpenCode
+
+Create `opencode.json` in your project root, replacing `MODEL_ID` with a model ID returned by `GET /v1/models`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "idletoken/MODEL_ID",
+  "provider": {
+    "idletoken": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "IdleToken",
+      "options": {
+        "baseURL": "https://api.idletoken.ai/v1",
+        "apiKey": "{env:IDLETOKEN_API_KEY}"
+      },
+      "models": {
+        "MODEL_ID": {
+          "name": "IdleToken"
+        }
+      }
+    }
+  }
+}
+```
+
+```sh
+export IDLETOKEN_API_KEY='sk-idletoken-********************************'
+opencode
+```
+
 ## 🧠 Models
 
-IdleToken offers a curated list of GGUF text-generation models from Qwen, OpenAI, and DeepSeek. The versioned manifests live in [`models/`](models/); the client handles downloads, integrity checks, resource estimates, and supported quantizations.
+[Currently supported models](models/)
 
-Every listed model can run on one machine when it fits or across a cluster when you choose that deployment. Multimodal input and arbitrary local GGUF files are outside the current scope. To request another model, [open an issue](https://github.com/idletoken/IdleToken/issues).
+Need another model? [Open an issue](https://github.com/idletoken/IdleToken/issues).
 
 ## 💻 Hardware
 
-To deploy a model on your own machine:
+Minimum requirements for deploying a model on your own machine:
 
-| Platform | Minimum |
+| Platform | Minimum requirements |
 | --- | --- |
 | **Windows 10/11 · Linux x86_64/arm64** | An NVIDIA GPU from the RTX 20 series or newer (Turing, compute capability 7.5) with 8 GB of VRAM, and a current NVIDIA driver. |
 | **macOS** | An Apple Silicon Mac with 16 GB of unified memory. |
@@ -114,7 +132,7 @@ To deploy a model on your own machine:
 
 To run a cluster:
 
-1. Install the same IdleToken version on every participating computer and make sure they can reach each other over the LAN.
+1. Install the same IdleToken version on every participating computer and make sure they can reach each other directly over the LAN.
 2. Create a cluster on one computer. Join from the others with the same account or a verification code.
 3. Select the same model, quantization, and context on every computer, and finish downloading the model weights.
 4. When every node reports ready, choose cluster deployment on the creator and start the model. IdleToken detects each node's resources and assigns model layers automatically.
@@ -131,7 +149,7 @@ To run a cluster:
 - macOS: an Apple Silicon Mac and Xcode Command Line Tools
 - Windows: Visual Studio 2022 Build Tools with Desktop development with C++, Windows SDK, CUDA Toolkit 12.8 with Visual Studio Integration, and WinLibs/MinGW providing `gcc` and `windres`
 
-### Clone
+### Get the source
 
 ```sh
 git clone https://github.com/idletoken/IdleToken.git
