@@ -206,4 +206,4 @@ scripts\build_client_release.bat
   · <a href="LICENSE">Apache-2.0 许可</a>
 </p>
 
-<p align="center"><sub>项目基于 <a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a> 与 <a href="https://github.com/tauri-apps/tauri">Tauri</a> 构建；第三方项目致谢见 <a href="NOTICE">NOTICE</a>。</sub></p>
+<p align="center"><sub>第三方项目致谢见 <a href="NOTICE">NOTICE</a>。</sub></p>

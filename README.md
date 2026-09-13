@@ -206,4 +206,4 @@ For installation, pairing, API, or source-build problems, search the [existing i
   · <a href="LICENSE">Apache-2.0 license</a>
 </p>
 
-<p align="center"><sub>Built on <a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a> and <a href="https://github.com/tauri-apps/tauri">Tauri</a>. See <a href="NOTICE">NOTICE</a> for third-party acknowledgements.</sub></p>
+<p align="center"><sub>See <a href="NOTICE">NOTICE</a> for third-party acknowledgements.</sub></p>
