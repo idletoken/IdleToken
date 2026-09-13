@@ -86,6 +86,21 @@ typedef struct {
     const char *quant;             /* "Q4_K_M" etc; matches ASSIGN_PLAN.quant */
     uint64_t layer_weight_bytes;   /* Σ blk.* at this quant */
     uint64_t shared_weight_bytes;  /* embd + output head at this quant */
+    /* MoE only, and MEASURED per quant (scripts/manifest_fill_experts.py reads
+     * the same tensor directory the two numbers above come from).
+     *
+     * Without these the planner could only tell experts from the rest by
+     * scanning the downloaded GGUF, so before a download — exactly when the
+     * user is choosing a model — the resource card quoted a GPU-only total for
+     * a model that would never be placed that way and said nothing about RAM.
+     * A ratio derived from expert counts cannot substitute: dynamic quants give
+     * experts fewer bits than attention, so the share moves with the precision
+     * the user is picking. `expert_max_tensor_bytes` is the largest single
+     * expert tensor, which the graph allocator stages whole.
+     * 0 = dense, or a quant nobody has measured yet: the two-pool estimate is
+     * then unavailable and the card says so rather than inventing it. */
+    uint64_t expert_weight_bytes;
+    uint64_t expert_max_tensor_bytes;
     const char *gguf;              /* default filename for this quant */
 } idletoken_model_variant;
 
@@ -107,6 +122,10 @@ typedef struct {
     uint32_t n_vocab;
     uint16_t n_expert;         /* 0 on dense models */
     uint16_t n_expert_used;    /* routed experts consulted per token */
+    uint16_t moe_first_layer;  /* first block carrying routed experts; some
+                                * architectures keep the first blocks dense.
+                                * Measured with the expert bytes, and the same
+                                * for every quant of one model (architecture). */
 
     uint64_t layer_weight_bytes;   /* Σ all blk.* tensors at the shipped quant */
     uint64_t shared_weight_bytes;  /* embd + output head + mtp — every stage loads */

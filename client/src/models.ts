@@ -717,6 +717,72 @@ export interface HybridRequirements {
   poolExperts: number;
 }
 
+/** What the shipped planner decided, for exactly the roster it was asked about.
+ *
+ *  This is the resource card's source of truth since 2026-09-13. The card used
+ *  to compute its own numbers here in TypeScript; that second arithmetic drifted
+ *  6.2 GiB from the coordinator's on a two-machine MoE Hybrid and said a model
+ *  fits that the coordinator then refused. Making the two agree numerically
+ *  would not have been enough either: an aggregate cannot express the
+ *  constraints that decide (a layer's experts must sit in the RAM of the machine
+ *  that owns that layer; each machine's KV share must sit on its own card), and
+ *  only the planner knows the split. */
+export interface PlannerNode {
+  index: number;
+  label: string;
+  /** Bytes this machine must hold in GPU memory under the plan. */
+  gpu: number;
+  /** Routed-expert bytes this machine keeps in its own RAM (0 = GPU-only). */
+  ram: number;
+  vramUsable: number;
+}
+
+export interface PlannerPlan {
+  /** 0 SINGLE, 1 CLUSTER, 2 REFUSE — idletoken_llplan_kind. */
+  kind: number;
+  /** 0 REFUSE, 1 GPU_ONLY, 2 HYBRID — idletoken_mode. */
+  mode: number;
+  hybrid: boolean;
+  nCpuMoe: number;
+  gpuNeedBytes: number;
+  ramNeedBytes: number;
+  /** false = the GGUF's exact expert layout was unavailable, so a MoE model
+   *  could only be planned GPU-only. The card must not present that as the
+   *  Hybrid answer. */
+  expertLayoutExact: boolean;
+  nodes: PlannerNode[];
+  why: string;
+}
+
+/** idletoken_node_backend. Mirrors IDLETOKEN_BACKEND_OF_OS. */
+export function backendCode(backend: NodeBackend): number {
+  return backend === "cuda" ? 1 : backend === "metal" ? 2 : 0;
+}
+
+/** One `vram:ram:pinnable:unified:backend:label` per machine, COORDINATOR
+ *  FIRST — the planner pins layer 0 to the first entry, and so does the
+ *  coordinator at launch.
+ *
+ *  `ram` carries the probe's already-capped expert budget (Windows applies its
+ *  WDDM page-lock ceiling before publishing it), so `pinnable` is passed as 0,
+ *  which the planner reads as "no further ceiling to apply". */
+export function plannerNodesSpec(
+  nodes: NodeMemory[],
+  backend: NodeBackend,
+  labels?: (string | undefined)[],
+): string {
+  return nodes
+    .map((n, i) => [
+      Math.max(0, Math.floor(n.vramFree ?? 0)),
+      Math.max(0, Math.floor(n.ramExpertFree ?? 0)),
+      0,
+      n.unifiedMemory ? 1 : 0,
+      backendCode(backend),
+      (labels?.[i] ?? `node${i}`).replace(/[,:]/g, "_"),
+    ].join(":"))
+    .join(",");
+}
+
 /** Split a full-GPU requirement into Hybrid's two independent resource pools.
  *
  * The minimum device pool is the selected model's routed-expert count for one
@@ -784,21 +850,27 @@ export function estimateClusterCapacity(
   const kvQuant = quant || defaultQuant(model.id);
   const kvBytes = kvBytesForContext(man, ctx, kvQuant);
   const nodeOverhead = LLAMA_CUDA_CONTEXT_BYTES + LLAMA_NODE_MARGIN_BYTES;
-  // The graph workspace is charged ONCE for the cluster, like weights and KV:
-  // the tensor split divides the graph. Only the CUDA context is per-node.
-  // The precision goes in because it selects the KV cache dtype, and the
-  // workspace differs between cache dtypes on some architectures.
+  // The graph workspace is charged PER NODE, like the CUDA context, matching
+  // llplan_needed() in src/common/plan.c. It used to be charged once for the
+  // cluster on the theory that the tensor split divides the graph; measured on
+  // the pinned engine (2026-09-13) it does not — every device reserves its own
+  // compute buffer, and on GLM-5.2 at 256K two devices reserved 1740 + 1996 MiB
+  // against a 1892 MiB single-device peak. Charging once understated a
+  // two-machine cluster by up to 1.84 GiB, in the direction that admits and
+  // then OOMs. The precision goes in because it selects the KV cache dtype, and
+  // the workspace differs between cache dtypes on some architectures.
   const computeBytes = computeBytesFor(man, ctx, backend, kvQuant);
-  const needBytes = weightBytes + kvBytes + computeBytes + n * nodeOverhead;
+  const needBytes = weightBytes + kvBytes + n * (computeBytes + nodeOverhead);
   // Product capacity is GPU-addressable memory only. On unified-memory
   // machines the native probe already reports the GPU working-set budget in
   // vram_usable, so there is still exactly one number to count.
   const haveBytes = mem.vram_usable + Math.max(0, ramExpertBytes);
-  // Same split basis as plan.c's tensor-split cap: weights, KV and workspace
-  // all divide with the layers, so the workspace belongs in the per-layer cost.
+  // Same split basis as plan.c's tensor-split cap: weights and KV divide with
+  // the layers. The workspace does not (measured 2026-09-13, see above), so it
+  // joins the per-node cost this machine pays before it can host any layer.
   const perLayer =
-    man.n_layers > 0 ? (weightBytes + kvBytes + computeBytes) / man.n_layers : 0;
-  const usableForLayers = haveBytes - nodeOverhead;
+    man.n_layers > 0 ? (weightBytes + kvBytes) / man.n_layers : 0;
+  const usableForLayers = haveBytes - nodeOverhead - computeBytes;
   const hostableLayers =
     perLayer > 0
       ? Math.max(0, Math.min(man.n_layers, Math.floor(usableForLayers / perLayer)))

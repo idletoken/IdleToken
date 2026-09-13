@@ -164,79 +164,79 @@ static const idletoken_model_variant QWEN35_27B_VARIANTS[] = {
 };
 
 static const idletoken_model_variant QWEN35_35B_A3B_VARIANTS[] = {
-    { .quant = "IQ2_XXS", .layer_weight_bytes = 10656955008ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-35B-A3B-UD-IQ2_XXS.gguf" },
-    { .quant = "IQ2_M", .layer_weight_bytes = 11391613568ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-35B-A3B-UD-IQ2_M.gguf" },
-    { .quant = "Q2_K_XL", .layer_weight_bytes = 12156754560ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-35B-A3B-UD-Q2_K_XL.gguf" },
-    { .quant = "IQ3_XXS", .layer_weight_bytes = 13080066688ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-35B-A3B-UD-IQ3_XXS.gguf" },
-    { .quant = "IQ3_S", .layer_weight_bytes = 13583383168ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-35B-A3B-UD-IQ3_S.gguf" },
-    { .quant = "Q3_K_S", .layer_weight_bytes = 15265856128ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-35B-A3B-Q3_K_S.gguf" },
-    { .quant = "Q3_K_M", .layer_weight_bytes = 16356375168ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-35B-A3B-Q3_K_M.gguf" },
-    { .quant = "Q3_K_XL", .layer_weight_bytes = 16601176704ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-35B-A3B-UD-Q3_K_XL.gguf" },
-    { .quant = "IQ4_XS", .layer_weight_bytes = 17486174848ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-35B-A3B-UD-IQ4_XS.gguf" },
-    { .quant = "IQ4_NL", .layer_weight_bytes = 17821719168ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-35B-A3B-UD-IQ4_NL.gguf" },
-    { .quant = "Q4_K_L", .layer_weight_bytes = 20205632160ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-35B-A3B-UD-Q4_K_L.gguf" },
-    { .quant = "Q4_K_S", .layer_weight_bytes = 20673845888ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-35B-A3B-Q4_K_S.gguf" },
-    { .quant = "Qwen3.5-35B-A3B-MXFP4_MOE", .layer_weight_bytes = 21587638912ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-35B-A3B-MXFP4_MOE.gguf" },
-    { .quant = "Q4_K_M", .layer_weight_bytes = 22016023168ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-35B-A3B-Q4_K_M.gguf" },
-    { .quant = "Q4_K_XL", .layer_weight_bytes = 22241950336ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf" },
-    { .quant = "Q5_K_S", .layer_weight_bytes = 24823544448ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-35B-A3B-Q5_K_S.gguf" },
-    { .quant = "Q5_K_M", .layer_weight_bytes = 26249607808ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-35B-A3B-Q5_K_M.gguf" },
-    { .quant = "Q5_K_XL", .layer_weight_bytes = 26385922688ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-35B-A3B-UD-Q5_K_XL.gguf" },
-    { .quant = "Q6_K_S", .layer_weight_bytes = 28515105440ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-35B-A3B-UD-Q6_K_S.gguf" },
-    { .quant = "Q6_K", .layer_weight_bytes = 28852861568ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-35B-A3B-Q6_K.gguf" },
-    { .quant = "Q6_K_XL", .layer_weight_bytes = 32071842432ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-35B-A3B-UD-Q6_K_XL.gguf" },
-    { .quant = "Q8_0", .layer_weight_bytes = 36903139968ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-35B-A3B-Q8_0.gguf" },
-    { .quant = "Q8_K_XL", .layer_weight_bytes = 48688560768ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-35B-A3B-UD-Q8_K_XL.gguf" },
-    { .quant = "BF16", .layer_weight_bytes = 69376637824ull, .shared_weight_bytes = 0ull, .gguf = "BF16/Qwen3.5-35B-A3B-BF16-00001-of-00002.gguf" },
+    { .quant = "IQ2_XXS", .layer_weight_bytes = 10656955008ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 8975810560ull, .expert_max_tensor_bytes = 85983232ull, .gguf = "Qwen3.5-35B-A3B-UD-IQ2_XXS.gguf" },
+    { .quant = "IQ2_M", .layer_weight_bytes = 11391613568ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 9646899200ull, .expert_max_tensor_bytes = 102760448ull, .gguf = "Qwen3.5-35B-A3B-UD-IQ2_M.gguf" },
+    { .quant = "Q2_K_XL", .layer_weight_bytes = 12156754560ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 10408165376ull, .expert_max_tensor_bytes = 142606336ull, .gguf = "Qwen3.5-35B-A3B-UD-Q2_K_XL.gguf" },
+    { .quant = "IQ3_XXS", .layer_weight_bytes = 13080066688ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 10989076480ull, .expert_max_tensor_bytes = 102760448ull, .gguf = "Qwen3.5-35B-A3B-UD-IQ3_XXS.gguf" },
+    { .quant = "IQ3_S", .layer_weight_bytes = 13583383168ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 11492392960ull, .expert_max_tensor_bytes = 115343360ull, .gguf = "Qwen3.5-35B-A3B-UD-IQ3_S.gguf" },
+    { .quant = "Q3_K_S", .layer_weight_bytes = 15265856128ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 12834570240ull, .expert_max_tensor_bytes = 115343360ull, .gguf = "Qwen3.5-35B-A3B-Q3_K_S.gguf" },
+    { .quant = "Q3_K_M", .layer_weight_bytes = 16356375168ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 13925089280ull, .expert_max_tensor_bytes = 142606336ull, .gguf = "Qwen3.5-35B-A3B-Q3_K_M.gguf" },
+    { .quant = "Q3_K_XL", .layer_weight_bytes = 16601176704ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 14046724096ull, .expert_max_tensor_bytes = 184549376ull, .gguf = "Qwen3.5-35B-A3B-UD-Q3_K_XL.gguf" },
+    { .quant = "IQ4_XS", .layer_weight_bytes = 17486174848ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 14931722240ull, .expert_max_tensor_bytes = 142606336ull, .gguf = "Qwen3.5-35B-A3B-UD-IQ4_XS.gguf" },
+    { .quant = "IQ4_NL", .layer_weight_bytes = 17821719168ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 15267266560ull, .expert_max_tensor_bytes = 150994944ull, .gguf = "Qwen3.5-35B-A3B-UD-IQ4_NL.gguf" },
+    { .quant = "Q4_K_L", .layer_weight_bytes = 20205632160ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 18119393280ull, .expert_max_tensor_bytes = 150994944ull, .gguf = "Qwen3.5-35B-A3B-UD-Q4_K_L.gguf" },
+    { .quant = "Q4_K_S", .layer_weight_bytes = 20673845888ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 18119393280ull, .expert_max_tensor_bytes = 150994944ull, .gguf = "Qwen3.5-35B-A3B-Q4_K_S.gguf" },
+    { .quant = "Qwen3.5-35B-A3B-MXFP4_MOE", .layer_weight_bytes = 21587638912ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 18910019584ull, .expert_max_tensor_bytes = 220200960ull, .gguf = "Qwen3.5-35B-A3B-MXFP4_MOE.gguf" },
+    { .quant = "Q4_K_M", .layer_weight_bytes = 22016023168ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 19461570560ull, .expert_max_tensor_bytes = 184549376ull, .gguf = "Qwen3.5-35B-A3B-Q4_K_M.gguf" },
+    { .quant = "Q4_K_XL", .layer_weight_bytes = 22241950336ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 19564331008ull, .expert_max_tensor_bytes = 220200960ull, .gguf = "Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf" },
+    { .quant = "Q5_K_S", .layer_weight_bytes = 24823544448ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 22145925120ull, .expert_max_tensor_bytes = 184549376ull, .gguf = "Qwen3.5-35B-A3B-Q5_K_S.gguf" },
+    { .quant = "Q5_K_M", .layer_weight_bytes = 26249607808ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 23571988480ull, .expert_max_tensor_bytes = 220200960ull, .gguf = "Qwen3.5-35B-A3B-Q5_K_M.gguf" },
+    { .quant = "Q5_K_XL", .layer_weight_bytes = 26385922688ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 23708303360ull, .expert_max_tensor_bytes = 285212672ull, .gguf = "Qwen3.5-35B-A3B-UD-Q5_K_XL.gguf" },
+    { .quant = "Q6_K_S", .layer_weight_bytes = 28515105440ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 26424115200ull, .expert_max_tensor_bytes = 220200960ull, .gguf = "Qwen3.5-35B-A3B-UD-Q6_K_S.gguf" },
+    { .quant = "Q6_K", .layer_weight_bytes = 28852861568ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 26424115200ull, .expert_max_tensor_bytes = 220200960ull, .gguf = "Qwen3.5-35B-A3B-Q6_K.gguf" },
+    { .quant = "Q6_K_XL", .layer_weight_bytes = 32071842432ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 29154607104ull, .expert_max_tensor_bytes = 285212672ull, .gguf = "Qwen3.5-35B-A3B-UD-Q6_K_XL.gguf" },
+    { .quant = "Q8_0", .layer_weight_bytes = 36903139968ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 34225520640ull, .expert_max_tensor_bytes = 285212672ull, .gguf = "Qwen3.5-35B-A3B-Q8_0.gguf" },
+    { .quant = "Q8_K_XL", .layer_weight_bytes = 48688560768ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 44291850240ull, .expert_max_tensor_bytes = 536870912ull, .gguf = "Qwen3.5-35B-A3B-UD-Q8_K_XL.gguf" },
+    { .quant = "BF16", .layer_weight_bytes = 69376637824ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 64424509440ull, .expert_max_tensor_bytes = 536870912ull, .gguf = "BF16/Qwen3.5-35B-A3B-BF16-00001-of-00002.gguf" },
 };
 
 static const idletoken_model_variant QWEN35_122B_A10B_VARIANTS[] = {
-    { .quant = "IQ2_XXS", .layer_weight_bytes = 36637668544ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-122B-A10B-UD-IQ2_XXS.gguf" },
-    { .quant = "IQ2_M", .layer_weight_bytes = 39148942528ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-122B-A10B-UD-IQ2_M.gguf" },
-    { .quant = "Q2_K_XL", .layer_weight_bytes = 41845347520ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-122B-A10B-UD-Q2_K_XL.gguf" },
-    { .quant = "IQ3_XXS", .layer_weight_bytes = 44745020608ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-122B-A10B-UD-IQ3_XXS.gguf" },
-    { .quant = "IQ3_S", .layer_weight_bytes = 46556959936ull, .shared_weight_bytes = 0ull, .gguf = "Qwen3.5-122B-A10B-UD-IQ3_S.gguf" },
-    { .quant = "Q3_K_S", .layer_weight_bytes = 52495013376ull, .shared_weight_bytes = 0ull, .gguf = "Q3_K_S/Qwen3.5-122B-A10B-Q3_K_S-00001-of-00003.gguf" },
-    { .quant = "Q3_K_M", .layer_weight_bytes = 56420881952ull, .shared_weight_bytes = 0ull, .gguf = "Q3_K_M/Qwen3.5-122B-A10B-Q3_K_M-00001-of-00003.gguf" },
-    { .quant = "Q3_K_XL", .layer_weight_bytes = 56970536480ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q3_K_XL/Qwen3.5-122B-A10B-UD-Q3_K_XL-00001-of-00003.gguf" },
-    { .quant = "IQ4_XS", .layer_weight_bytes = 60229510656ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ4_XS/Qwen3.5-122B-A10B-UD-IQ4_XS-00001-of-00003.gguf" },
-    { .quant = "IQ4_NL", .layer_weight_bytes = 61437470208ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ4_NL/Qwen3.5-122B-A10B-UD-IQ4_NL-00001-of-00003.gguf" },
-    { .quant = "Q4_K_S", .layer_weight_bytes = 71705126400ull, .shared_weight_bytes = 0ull, .gguf = "Q4_K_S/Qwen3.5-122B-A10B-Q4_K_S-00001-of-00003.gguf" },
-    { .quant = "MXFP4_MOE", .layer_weight_bytes = 74664408608ull, .shared_weight_bytes = 0ull, .gguf = "MXFP4_MOE/Qwen3.5-122B-A10B-MXFP4_MOE-00001-of-00003.gguf" },
-    { .quant = "Q4_K_M", .layer_weight_bytes = 76536964608ull, .shared_weight_bytes = 0ull, .gguf = "Q4_K_M/Qwen3.5-122B-A10B-Q4_K_M-00001-of-00003.gguf" },
-    { .quant = "Q4_K_XL", .layer_weight_bytes = 77029996032ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q4_K_XL/Qwen3.5-122B-A10B-UD-Q4_K_XL-00001-of-00003.gguf" },
-    { .quant = "Q5_K_S", .layer_weight_bytes = 86385391136ull, .shared_weight_bytes = 0ull, .gguf = "Q5_K_S/Qwen3.5-122B-A10B-Q5_K_S-00001-of-00003.gguf" },
-    { .quant = "Q5_K_M", .layer_weight_bytes = 91519219200ull, .shared_weight_bytes = 0ull, .gguf = "Q5_K_M/Qwen3.5-122B-A10B-Q5_K_M-00001-of-00003.gguf" },
-    { .quant = "Q5_K_XL", .layer_weight_bytes = 91928163840ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q5_K_XL/Qwen3.5-122B-A10B-UD-Q5_K_XL-00001-of-00003.gguf" },
-    { .quant = "Q6_K", .layer_weight_bytes = 101009782432ull, .shared_weight_bytes = 0ull, .gguf = "Q6_K/Qwen3.5-122B-A10B-Q6_K-00001-of-00004.gguf" },
-    { .quant = "Q6_K_XL", .layer_weight_bytes = 112401249920ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q6_K_XL/Qwen3.5-122B-A10B-UD-Q6_K_XL-00001-of-00004.gguf" },
-    { .quant = "Q8_0", .layer_weight_bytes = 129871935104ull, .shared_weight_bytes = 0ull, .gguf = "Q8_0/Qwen3.5-122B-A10B-Q8_0-00001-of-00004.gguf" },
-    { .quant = "Q8_K_XL", .layer_weight_bytes = 170838161152ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q8_K_XL/Qwen3.5-122B-A10B-UD-Q8_K_XL-00001-of-00005.gguf" },
-    { .quant = "BF16", .layer_weight_bytes = 244314011488ull, .shared_weight_bytes = 0ull, .gguf = "BF16/Qwen3.5-122B-A10B-BF16-00001-of-00005.gguf" },
+    { .quant = "IQ2_XXS", .layer_weight_bytes = 36637668544ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 32312918016ull, .expert_max_tensor_bytes = 257949696ull, .gguf = "Qwen3.5-122B-A10B-UD-IQ2_XXS.gguf" },
+    { .quant = "IQ2_M", .layer_weight_bytes = 39148942528ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 34728837120ull, .expert_max_tensor_bytes = 308281344ull, .gguf = "Qwen3.5-122B-A10B-UD-IQ2_M.gguf" },
+    { .quant = "Q2_K_XL", .layer_weight_bytes = 41845347520ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 37415288832ull, .expert_max_tensor_bytes = 427819008ull, .gguf = "Qwen3.5-122B-A10B-UD-Q2_K_XL.gguf" },
+    { .quant = "IQ3_XXS", .layer_weight_bytes = 44745020608ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 39560675328ull, .expert_max_tensor_bytes = 308281344ull, .gguf = "Qwen3.5-122B-A10B-UD-IQ3_XXS.gguf" },
+    { .quant = "IQ3_S", .layer_weight_bytes = 46556959936ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 41372614656ull, .expert_max_tensor_bytes = 346030080ull, .gguf = "Qwen3.5-122B-A10B-UD-IQ3_S.gguf" },
+    { .quant = "Q3_K_S", .layer_weight_bytes = 52495013376ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 46204452864ull, .expert_max_tensor_bytes = 346030080ull, .gguf = "Q3_K_S/Qwen3.5-122B-A10B-Q3_K_S-00001-of-00003.gguf" },
+    { .quant = "Q3_K_M", .layer_weight_bytes = 56420881952ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 50130321408ull, .expert_max_tensor_bytes = 427819008ull, .gguf = "Q3_K_M/Qwen3.5-122B-A10B-Q3_K_M-00001-of-00003.gguf" },
+    { .quant = "Q3_K_XL", .layer_weight_bytes = 56970536480ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 50495225856ull, .expert_max_tensor_bytes = 553648128ull, .gguf = "UD-Q3_K_XL/Qwen3.5-122B-A10B-UD-Q3_K_XL-00001-of-00003.gguf" },
+    { .quant = "IQ4_XS", .layer_weight_bytes = 60229510656ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 53754200064ull, .expert_max_tensor_bytes = 427819008ull, .gguf = "UD-IQ4_XS/Qwen3.5-122B-A10B-UD-IQ4_XS-00001-of-00003.gguf" },
+    { .quant = "IQ4_NL", .layer_weight_bytes = 61437470208ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 54962159616ull, .expert_max_tensor_bytes = 452984832ull, .gguf = "UD-IQ4_NL/Qwen3.5-122B-A10B-UD-IQ4_NL-00001-of-00003.gguf" },
+    { .quant = "Q4_K_S", .layer_weight_bytes = 71705126400ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 65229815808ull, .expert_max_tensor_bytes = 452984832ull, .gguf = "Q4_K_S/Qwen3.5-122B-A10B-Q4_K_S-00001-of-00003.gguf" },
+    { .quant = "MXFP4_MOE", .layer_weight_bytes = 74664408608ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 68004347904ull, .expert_max_tensor_bytes = 660602880ull, .gguf = "MXFP4_MOE/Qwen3.5-122B-A10B-MXFP4_MOE-00001-of-00003.gguf" },
+    { .quant = "Q4_K_M", .layer_weight_bytes = 76536964608ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 70061654016ull, .expert_max_tensor_bytes = 553648128ull, .gguf = "Q4_K_M/Qwen3.5-122B-A10B-Q4_K_M-00001-of-00003.gguf" },
+    { .quant = "Q4_K_XL", .layer_weight_bytes = 77029996032ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 70369935360ull, .expert_max_tensor_bytes = 660602880ull, .gguf = "UD-Q4_K_XL/Qwen3.5-122B-A10B-UD-Q4_K_XL-00001-of-00003.gguf" },
+    { .quant = "Q5_K_S", .layer_weight_bytes = 86385391136ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 79725330432ull, .expert_max_tensor_bytes = 553648128ull, .gguf = "Q5_K_S/Qwen3.5-122B-A10B-Q5_K_S-00001-of-00003.gguf" },
+    { .quant = "Q5_K_M", .layer_weight_bytes = 91519219200ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 84859158528ull, .expert_max_tensor_bytes = 660602880ull, .gguf = "Q5_K_M/Qwen3.5-122B-A10B-Q5_K_M-00001-of-00003.gguf" },
+    { .quant = "Q5_K_XL", .layer_weight_bytes = 91928163840ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 85268103168ull, .expert_max_tensor_bytes = 855638016ull, .gguf = "UD-Q5_K_XL/Qwen3.5-122B-A10B-UD-Q5_K_XL-00001-of-00003.gguf" },
+    { .quant = "Q6_K", .layer_weight_bytes = 101009782432ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 95126814720ull, .expert_max_tensor_bytes = 660602880ull, .gguf = "Q6_K/Qwen3.5-122B-A10B-Q6_K-00001-of-00004.gguf" },
+    { .quant = "Q6_K_XL", .layer_weight_bytes = 112401249920ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 104878571520ull, .expert_max_tensor_bytes = 855638016ull, .gguf = "UD-Q6_K_XL/Qwen3.5-122B-A10B-UD-Q6_K_XL-00001-of-00004.gguf" },
+    { .quant = "Q8_0", .layer_weight_bytes = 129871935104ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 123211874304ull, .expert_max_tensor_bytes = 855638016ull, .gguf = "Q8_0/Qwen3.5-122B-A10B-Q8_0-00001-of-00004.gguf" },
+    { .quant = "Q8_K_XL", .layer_weight_bytes = 170838161152ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 159450660864ull, .expert_max_tensor_bytes = 1610612736ull, .gguf = "UD-Q8_K_XL/Qwen3.5-122B-A10B-UD-Q8_K_XL-00001-of-00005.gguf" },
+    { .quant = "BF16", .layer_weight_bytes = 244314011488ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 231928233984ull, .expert_max_tensor_bytes = 1610612736ull, .gguf = "BF16/Qwen3.5-122B-A10B-BF16-00001-of-00005.gguf" },
 };
 
 static const idletoken_model_variant QWEN35_397B_A17B_VARIANTS[] = {
-    { .quant = "IQ2_XXS", .layer_weight_bytes = 114872940736ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ2_XXS/Qwen3.5-397B-A17B-UD-IQ2_XXS-00001-of-00004.gguf" },
-    { .quant = "IQ2_M", .layer_weight_bytes = 123053144288ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ2_M/Qwen3.5-397B-A17B-UD-IQ2_M-00001-of-00004.gguf" },
-    { .quant = "IQ3_XXS", .layer_weight_bytes = 140333676736ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ3_XXS/Qwen3.5-397B-A17B-UD-IQ3_XXS-00001-of-00004.gguf" },
-    { .quant = "IQ3_S", .layer_weight_bytes = 146373474496ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ3_S/Qwen3.5-397B-A17B-UD-IQ3_S-00001-of-00004.gguf" },
-    { .quant = "Q3_K_S", .layer_weight_bytes = 164323293504ull, .shared_weight_bytes = 0ull, .gguf = "Q3_K_S/Qwen3.5-397B-A17B-Q3_K_S-00001-of-00005.gguf" },
-    { .quant = "Q3_K_M", .layer_weight_bytes = 177409522016ull, .shared_weight_bytes = 0ull, .gguf = "Q3_K_M/Qwen3.5-397B-A17B-Q3_K_M-00001-of-00005.gguf" },
-    { .quant = "Q3_K_XL", .layer_weight_bytes = 178739034432ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q3_K_XL/Qwen3.5-397B-A17B-UD-Q3_K_XL-00001-of-00005.gguf" },
-    { .quant = "IQ4_XS", .layer_weight_bytes = 189735450944ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ4_XS/Qwen3.5-397B-A17B-UD-IQ4_XS-00001-of-00005.gguf" },
-    { .quant = "IQ4_NL", .layer_weight_bytes = 193761982784ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ4_NL/Qwen3.5-397B-A17B-UD-IQ4_NL-00001-of-00005.gguf" },
-    { .quant = "Q4_K_S", .layer_weight_bytes = 227987503520ull, .shared_weight_bytes = 0ull, .gguf = "Q4_K_S/Qwen3.5-397B-A17B-Q4_K_S-00001-of-00006.gguf" },
-    { .quant = "MXFP4_MOE", .layer_weight_bytes = 237353302496ull, .shared_weight_bytes = 0ull, .gguf = "MXFP4_MOE/Qwen3.5-397B-A17B-MXFP4_MOE-00001-of-00006.gguf" },
-    { .quant = "Q4_K_M", .layer_weight_bytes = 244093630912ull, .shared_weight_bytes = 0ull, .gguf = "Q4_K_M/Qwen3.5-397B-A17B-Q4_K_M-00001-of-00006.gguf" },
-    { .quant = "Q4_K_XL", .layer_weight_bytes = 245272148448ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q4_K_XL/Qwen3.5-397B-A17B-UD-Q4_K_XL-00001-of-00006.gguf" },
-    { .quant = "Q5_K_S", .layer_weight_bytes = 276552219168ull, .shared_weight_bytes = 0ull, .gguf = "Q5_K_S/Qwen3.5-397B-A17B-Q5_K_S-00001-of-00007.gguf" },
-    { .quant = "Q5_K_M", .layer_weight_bytes = 293664979584ull, .shared_weight_bytes = 0ull, .gguf = "Q5_K_M/Qwen3.5-397B-A17B-Q5_K_M-00001-of-00008.gguf" },
-    { .quant = "Q5_K_XL", .layer_weight_bytes = 294865599104ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q5_K_XL/Qwen3.5-397B-A17B-UD-Q5_K_XL-00001-of-00008.gguf" },
-    { .quant = "Q6_K", .layer_weight_bytes = 326595345056ull, .shared_weight_bytes = 0ull, .gguf = "Q6_K/Qwen3.5-397B-A17B-Q6_K-00001-of-00008.gguf" },
-    { .quant = "Q6_K_XL", .layer_weight_bytes = 362328980288ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q6_K_XL/Qwen3.5-397B-A17B-UD-Q6_K_XL-00001-of-00009.gguf" },
-    { .quant = "Q8_0", .layer_weight_bytes = 421507365824ull, .shared_weight_bytes = 0ull, .gguf = "Q8_0/Qwen3.5-397B-A17B-Q8_0-00001-of-00010.gguf" },
-    { .quant = "Q8_K_XL", .layer_weight_bytes = 427726568384ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q8_K_XL/Qwen3.5-397B-A17B-UD-Q8_K_XL-00001-of-00010.gguf" },
-    { .quant = "BF16", .layer_weight_bytes = 792961318816ull, .shared_weight_bytes = 0ull, .gguf = "BF16/Qwen3.5-397B-A17B-BF16-00001-of-00017.gguf" },
+    { .quant = "IQ2_XXS", .layer_weight_bytes = 114872940736ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 107709726720ull, .expert_max_tensor_bytes = 687865856ull, .gguf = "UD-IQ2_XXS/Qwen3.5-397B-A17B-UD-IQ2_XXS-00001-of-00004.gguf" },
+    { .quant = "IQ2_M", .layer_weight_bytes = 123053144288ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 115762790400ull, .expert_max_tensor_bytes = 822083584ull, .gguf = "UD-IQ2_M/Qwen3.5-397B-A17B-UD-IQ2_M-00001-of-00004.gguf" },
+    { .quant = "IQ3_XXS", .layer_weight_bytes = 140333676736ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 131868917760ull, .expert_max_tensor_bytes = 822083584ull, .gguf = "UD-IQ3_XXS/Qwen3.5-397B-A17B-UD-IQ3_XXS-00001-of-00004.gguf" },
+    { .quant = "IQ3_S", .layer_weight_bytes = 146373474496ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 137908715520ull, .expert_max_tensor_bytes = 922746880ull, .gguf = "UD-IQ3_S/Qwen3.5-397B-A17B-UD-IQ3_S-00001-of-00004.gguf" },
+    { .quant = "Q3_K_S", .layer_weight_bytes = 164323293504ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 154014842880ull, .expert_max_tensor_bytes = 922746880ull, .gguf = "Q3_K_S/Qwen3.5-397B-A17B-Q3_K_S-00001-of-00005.gguf" },
+    { .quant = "Q3_K_M", .layer_weight_bytes = 177409522016ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 167101071360ull, .expert_max_tensor_bytes = 1140850688ull, .gguf = "Q3_K_M/Qwen3.5-397B-A17B-Q3_K_M-00001-of-00005.gguf" },
+    { .quant = "Q3_K_XL", .layer_weight_bytes = 178739034432ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 168074149888ull, .expert_max_tensor_bytes = 1476395008ull, .gguf = "UD-Q3_K_XL/Qwen3.5-397B-A17B-UD-Q3_K_XL-00001-of-00005.gguf" },
+    { .quant = "IQ4_XS", .layer_weight_bytes = 189735450944ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 179180666880ull, .expert_max_tensor_bytes = 1140850688ull, .gguf = "UD-IQ4_XS/Qwen3.5-397B-A17B-UD-IQ4_XS-00001-of-00005.gguf" },
+    { .quant = "IQ4_NL", .layer_weight_bytes = 193761982784ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 183207198720ull, .expert_max_tensor_bytes = 1207959552ull, .gguf = "UD-IQ4_NL/Qwen3.5-397B-A17B-UD-IQ4_NL-00001-of-00005.gguf" },
+    { .quant = "Q4_K_S", .layer_weight_bytes = 227987503520ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 217432719360ull, .expert_max_tensor_bytes = 1207959552ull, .gguf = "Q4_K_S/Qwen3.5-397B-A17B-Q4_K_S-00001-of-00006.gguf" },
+    { .quant = "MXFP4_MOE", .layer_weight_bytes = 237353302496ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 226442084352ull, .expert_max_tensor_bytes = 1761607680ull, .gguf = "MXFP4_MOE/Qwen3.5-397B-A17B-MXFP4_MOE-00001-of-00006.gguf" },
+    { .quant = "Q4_K_M", .layer_weight_bytes = 244093630912ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 233538846720ull, .expert_max_tensor_bytes = 1476395008ull, .gguf = "Q4_K_M/Qwen3.5-397B-A17B-Q4_K_M-00001-of-00006.gguf" },
+    { .quant = "Q4_K_XL", .layer_weight_bytes = 245272148448ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 234360930304ull, .expert_max_tensor_bytes = 1761607680ull, .gguf = "UD-Q4_K_XL/Qwen3.5-397B-A17B-UD-Q4_K_XL-00001-of-00006.gguf" },
+    { .quant = "Q5_K_S", .layer_weight_bytes = 276552219168ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 265751101440ull, .expert_max_tensor_bytes = 1476395008ull, .gguf = "Q5_K_S/Qwen3.5-397B-A17B-Q5_K_S-00001-of-00007.gguf" },
+    { .quant = "Q5_K_M", .layer_weight_bytes = 293664979584ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 282863861760ull, .expert_max_tensor_bytes = 1761607680ull, .gguf = "Q5_K_M/Qwen3.5-397B-A17B-Q5_K_M-00001-of-00008.gguf" },
+    { .quant = "Q5_K_XL", .layer_weight_bytes = 294865599104ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 283954380800ull, .expert_max_tensor_bytes = 2281701376ull, .gguf = "UD-Q5_K_XL/Qwen3.5-397B-A17B-UD-Q5_K_XL-00001-of-00008.gguf" },
+    { .quant = "Q6_K", .layer_weight_bytes = 326595345056ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 317089382400ull, .expert_max_tensor_bytes = 1761607680ull, .gguf = "Q6_K/Qwen3.5-397B-A17B-Q6_K-00001-of-00008.gguf" },
+    { .quant = "Q6_K_XL", .layer_weight_bytes = 362328980288ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 351348457472ull, .expert_max_tensor_bytes = 4294967296ull, .gguf = "UD-Q6_K_XL/Qwen3.5-397B-A17B-UD-Q6_K_XL-00001-of-00009.gguf" },
+    { .quant = "Q8_0", .layer_weight_bytes = 421507365824ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 410706247680ull, .expert_max_tensor_bytes = 2281701376ull, .gguf = "Q8_0/Qwen3.5-397B-A17B-Q8_0-00001-of-00010.gguf" },
+    { .quant = "Q8_K_XL", .layer_weight_bytes = 427726568384ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 416746045440ull, .expert_max_tensor_bytes = 4294967296ull, .gguf = "UD-Q8_K_XL/Qwen3.5-397B-A17B-UD-Q8_K_XL-00001-of-00010.gguf" },
+    { .quant = "BF16", .layer_weight_bytes = 792961318816ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 773094113280ull, .expert_max_tensor_bytes = 4294967296ull, .gguf = "BF16/Qwen3.5-397B-A17B-BF16-00001-of-00017.gguf" },
 };
 
 static const idletoken_model_variant QWEN35_08B_VARIANTS[] = {
@@ -281,19 +281,19 @@ static const idletoken_model_variant QWEN3_8B_VARIANTS[] = {
  * is token_embd (first stage) + output head (last stage), so getting that
  * split wrong biases the PP plan at both ends of the pipeline. */
 static const idletoken_model_variant DSV4_FLASH_VARIANTS[] = {
-    { .quant = "IQ1_S", .layer_weight_bytes = 82539237024ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ1_S/DeepSeek-V4-Flash-UD-IQ1_S-00001-of-00003.gguf" },
-    { .quant = "IQ1_M", .layer_weight_bytes = 86901313152ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ1_M/DeepSeek-V4-Flash-UD-IQ1_M-00001-of-00003.gguf" },
-    { .quant = "IQ2_XXS", .layer_weight_bytes = 90860736128ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ2_XXS/DeepSeek-V4-Flash-UD-IQ2_XXS-00001-of-00003.gguf" },
-    { .quant = "IQ2_M", .layer_weight_bytes = 90926927488ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ2_M/DeepSeek-V4-Flash-UD-IQ2_M-00001-of-00003.gguf" },
-    { .quant = "Q2_K_XL", .layer_weight_bytes = 96832507552ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q2_K_XL/DeepSeek-V4-Flash-UD-Q2_K_XL-00001-of-00003.gguf" },
-    { .quant = "IQ3_XXS", .layer_weight_bytes = 102999887616ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ3_XXS/DeepSeek-V4-Flash-UD-IQ3_XXS-00001-of-00004.gguf" },
-    { .quant = "IQ3_S", .layer_weight_bytes = 117310852864ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ3_S/DeepSeek-V4-Flash-UD-IQ3_S-00001-of-00004.gguf" },
-    { .quant = "Q3_K_M", .layer_weight_bytes = 129319997216ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q3_K_M/DeepSeek-V4-Flash-UD-Q3_K_M-00001-of-00004.gguf" },
-    { .quant = "Q3_K_XL", .layer_weight_bytes = 129448242976ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q3_K_XL/DeepSeek-V4-Flash-UD-Q3_K_XL-00001-of-00004.gguf" },
-    { .quant = "IQ4_NL", .layer_weight_bytes = 137903959808ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ4_NL/DeepSeek-V4-Flash-UD-IQ4_NL-00001-of-00004.gguf" },
-    { .quant = "IQ4_XS", .layer_weight_bytes = 137903959808ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ4_XS/DeepSeek-V4-Flash-UD-IQ4_XS-00001-of-00004.gguf" },
-    { .quant = "Q4_K_XL", .layer_weight_bytes = 155095240320ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q4_K_XL/DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf" },
-    { .quant = "Q8_K_XL", .layer_weight_bytes = 161869614720ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q8_K_XL/DeepSeek-V4-Flash-UD-Q8_K_XL-00001-of-00005.gguf" },
+    { .quant = "IQ1_S", .layer_weight_bytes = 82539237024ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 75547803648ull, .expert_max_tensor_bytes = 1140850688ull, .gguf = "UD-IQ1_S/DeepSeek-V4-Flash-UD-IQ1_S-00001-of-00003.gguf" },
+    { .quant = "IQ1_M", .layer_weight_bytes = 86901313152ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 79909879808ull, .expert_max_tensor_bytes = 1140850688ull, .gguf = "UD-IQ1_M/DeepSeek-V4-Flash-UD-IQ1_M-00001-of-00003.gguf" },
+    { .quant = "IQ2_XXS", .layer_weight_bytes = 90860736128ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 83869302784ull, .expert_max_tensor_bytes = 1140850688ull, .gguf = "UD-IQ2_XXS/DeepSeek-V4-Flash-UD-IQ2_XXS-00001-of-00003.gguf" },
+    { .quant = "IQ2_M", .layer_weight_bytes = 90926927488ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 83869302784ull, .expert_max_tensor_bytes = 1140850688ull, .gguf = "UD-IQ2_M/DeepSeek-V4-Flash-UD-IQ2_M-00001-of-00003.gguf" },
+    { .quant = "Q2_K_XL", .layer_weight_bytes = 96832507552ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 89774882816ull, .expert_max_tensor_bytes = 1140850688ull, .gguf = "UD-Q2_K_XL/DeepSeek-V4-Flash-UD-Q2_K_XL-00001-of-00003.gguf" },
+    { .quant = "IQ3_XXS", .layer_weight_bytes = 102999887616ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 95613353984ull, .expert_max_tensor_bytes = 1140850688ull, .gguf = "UD-IQ3_XXS/DeepSeek-V4-Flash-UD-IQ3_XXS-00001-of-00004.gguf" },
+    { .quant = "IQ3_S", .layer_weight_bytes = 117310852864ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 109924319232ull, .expert_max_tensor_bytes = 1761607680ull, .gguf = "UD-IQ3_S/DeepSeek-V4-Flash-UD-IQ3_S-00001-of-00004.gguf" },
+    { .quant = "Q3_K_M", .layer_weight_bytes = 129319997216ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 121634816000ull, .expert_max_tensor_bytes = 1761607680ull, .gguf = "UD-Q3_K_M/DeepSeek-V4-Flash-UD-Q3_K_M-00001-of-00004.gguf" },
+    { .quant = "Q3_K_XL", .layer_weight_bytes = 129448242976ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 121634816000ull, .expert_max_tensor_bytes = 1761607680ull, .gguf = "UD-Q3_K_XL/DeepSeek-V4-Flash-UD-Q3_K_XL-00001-of-00004.gguf" },
+    { .quant = "IQ4_NL", .layer_weight_bytes = 137903959808ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 130090532864ull, .expert_max_tensor_bytes = 1761607680ull, .gguf = "UD-IQ4_NL/DeepSeek-V4-Flash-UD-IQ4_NL-00001-of-00004.gguf" },
+    { .quant = "IQ4_XS", .layer_weight_bytes = 137903959808ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 130090532864ull, .expert_max_tensor_bytes = 1761607680ull, .gguf = "UD-IQ4_XS/DeepSeek-V4-Flash-UD-IQ4_XS-00001-of-00004.gguf" },
+    { .quant = "Q4_K_XL", .layer_weight_bytes = 155095240320ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 147169738752ull, .expert_max_tensor_bytes = 1140850688ull, .gguf = "UD-Q4_K_XL/DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf" },
+    { .quant = "Q8_K_XL", .layer_weight_bytes = 161869614720ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 147169738752ull, .expert_max_tensor_bytes = 1140850688ull, .gguf = "UD-Q8_K_XL/DeepSeek-V4-Flash-UD-Q8_K_XL-00001-of-00005.gguf" },
 };
 
 /* Registry order matters only for [0] == default (DSv4-Flash). */
@@ -303,28 +303,28 @@ static const idletoken_model_variant DSV4_FLASH_VARIANTS[] = {
  * llama.cpp reads all of these, including the sub-2-bit ones (the frozen
  * ds4x dequantizer does not, but these models do not run on it). */
 static const idletoken_model_variant GLM52_VARIANTS[] = {
-    { .quant = "IQ1_S", .layer_weight_bytes = 216715360960ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ1_S/GLM-5.2-UD-IQ1_S-00001-of-00006.gguf" },  /* 6 parts, 202 GiB */
-    { .quant = "IQ1_M", .layer_weight_bytes = 228492966624ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ1_M/GLM-5.2-UD-IQ1_M-00001-of-00006.gguf" },  /* 6 parts, 213 GiB */
-    { .quant = "IQ2_XXS", .layer_weight_bytes = 238458632928ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ2_XXS/GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf" },  /* 6 parts, 222 GiB */
-    { .quant = "IQ2_M", .layer_weight_bytes = 238577580768ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ2_M/GLM-5.2-UD-IQ2_M-00001-of-00006.gguf" },  /* 6 parts, 222 GiB */
-    { .quant = "Q2_K_XL", .layer_weight_bytes = 253878401856ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q2_K_XL/GLM-5.2-UD-Q2_K_XL-00001-of-00007.gguf" },  /* 7 parts, 236 GiB */
-    { .quant = "IQ3_XXS", .layer_weight_bytes = 281688431424ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ3_XXS/GLM-5.2-UD-IQ3_XXS-00001-of-00007.gguf" },  /* 7 parts, 262 GiB */
-    { .quant = "IQ3_S", .layer_weight_bytes = 308641029024ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ3_S/GLM-5.2-UD-IQ3_S-00001-of-00008.gguf" },  /* 8 parts, 287 GiB */
-    { .quant = "Q3_K_M", .layer_weight_bytes = 342735510656ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q3_K_M/GLM-5.2-UD-Q3_K_M-00001-of-00009.gguf" },  /* 9 parts, 319 GiB */
-    { .quant = "Q3_K_XL", .layer_weight_bytes = 342965972096ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q3_K_XL/GLM-5.2-UD-Q3_K_XL-00001-of-00009.gguf" },  /* 9 parts, 319 GiB */
-    { .quant = "IQ4_XS", .layer_weight_bytes = 365313223776ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ4_XS/GLM-5.2-UD-IQ4_XS-00001-of-00009.gguf" },  /* 9 parts, 340 GiB */
-    { .quant = "IQ4_NL", .layer_weight_bytes = 372661644384ull, .shared_weight_bytes = 0ull, .gguf = "UD-IQ4_NL/GLM-5.2-UD-IQ4_NL-00001-of-00009.gguf" },  /* 9 parts, 347 GiB */
-    { .quant = "Q4_K_S", .layer_weight_bytes = 436431842432ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q4_K_S/GLM-5.2-UD-Q4_K_S-00001-of-00010.gguf" },  /* 10 parts, 406 GiB */
-    { .quant = "Q4_K_M", .layer_weight_bytes = 465825525088ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q4_K_M/GLM-5.2-UD-Q4_K_M-00001-of-00011.gguf" },  /* 11 parts, 434 GiB */
-    { .quant = "Q4_K_XL", .layer_weight_bytes = 467289111904ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00001-of-00011.gguf" },  /* 11 parts, 435 GiB */
-    { .quant = "Q5_K_S", .layer_weight_bytes = 527259270528ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q5_K_S/GLM-5.2-UD-Q5_K_S-00001-of-00012.gguf" },  /* 12 parts, 491 GiB */
-    { .quant = "Q5_K_M", .layer_weight_bytes = 560830479904ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q5_K_M/GLM-5.2-UD-Q5_K_M-00001-of-00013.gguf" },  /* 13 parts, 522 GiB */
-    { .quant = "Q5_K_XL", .layer_weight_bytes = 562466258496ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q5_K_XL/GLM-5.2-UD-Q5_K_XL-00001-of-00013.gguf" },  /* 13 parts, 524 GiB */
-    { .quant = "Q6_K", .layer_weight_bytes = 625858969376ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q6_K/GLM-5.2-UD-Q6_K-00001-of-00014.gguf" },  /* 14 parts, 583 GiB */
-    { .quant = "Q6_K_XL", .layer_weight_bytes = 684369510240ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q6_K_XL/GLM-5.2-UD-Q6_K_XL-00001-of-00016.gguf" },  /* 16 parts, 637 GiB */
-    { .quant = "Q8_0", .layer_weight_bytes = 801357672256ull, .shared_weight_bytes = 0ull, .gguf = "Q8_0/GLM-5.2-Q8_0-00001-of-00017.gguf" },  /* 17 parts, 746 GiB */
-    { .quant = "Q8_K_XL", .layer_weight_bytes = 819700080736ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q8_K_XL/GLM-5.2-UD-Q8_K_XL-00001-of-00018.gguf" },  /* 18 parts, 763 GiB */
-    { .quant = "BF16", .layer_weight_bytes = 1507988023008ull, .shared_weight_bytes = 0ull, .gguf = "BF16/GLM-5.2-BF16-00001-of-00033.gguf" },  /* 33 parts, 1404 GiB */
+    { .quant = "IQ1_S", .layer_weight_bytes = 216715360960ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 197627215872ull, .expert_max_tensor_bytes = 1711276032ull, .gguf = "UD-IQ1_S/GLM-5.2-UD-IQ1_S-00001-of-00006.gguf" },  /* 6 parts, 202 GiB */
+    { .quant = "IQ1_M", .layer_weight_bytes = 228492966624ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 209404821504ull, .expert_max_tensor_bytes = 1711276032ull, .gguf = "UD-IQ1_M/GLM-5.2-UD-IQ1_M-00001-of-00006.gguf" },  /* 6 parts, 213 GiB */
+    { .quant = "IQ2_XXS", .layer_weight_bytes = 238458632928ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 219370487808ull, .expert_max_tensor_bytes = 1711276032ull, .gguf = "UD-IQ2_XXS/GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf" },  /* 6 parts, 222 GiB */
+    { .quant = "IQ2_M", .layer_weight_bytes = 238577580768ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 219370487808ull, .expert_max_tensor_bytes = 1711276032ull, .gguf = "UD-IQ2_M/GLM-5.2-UD-IQ2_M-00001-of-00006.gguf" },  /* 6 parts, 222 GiB */
+    { .quant = "Q2_K_XL", .layer_weight_bytes = 253878401856ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 234671308800ull, .expert_max_tensor_bytes = 1711276032ull, .gguf = "UD-Q2_K_XL/GLM-5.2-UD-Q2_K_XL-00001-of-00007.gguf" },  /* 7 parts, 236 GiB */
+    { .quant = "IQ3_XXS", .layer_weight_bytes = 281688431424ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 260592107520ull, .expert_max_tensor_bytes = 1711276032ull, .gguf = "UD-IQ3_XXS/GLM-5.2-UD-IQ3_XXS-00001-of-00007.gguf" },  /* 7 parts, 262 GiB */
+    { .quant = "IQ3_S", .layer_weight_bytes = 308641029024ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 287116886016ull, .expert_max_tensor_bytes = 2642411520ull, .gguf = "UD-IQ3_S/GLM-5.2-UD-IQ3_S-00001-of-00008.gguf" },  /* 8 parts, 287 GiB */
+    { .quant = "Q3_K_M", .layer_weight_bytes = 342735510656ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 317567533056ull, .expert_max_tensor_bytes = 2642411520ull, .gguf = "UD-Q3_K_M/GLM-5.2-UD-Q3_K_M-00001-of-00009.gguf" },  /* 9 parts, 319 GiB */
+    { .quant = "Q3_K_XL", .layer_weight_bytes = 342965972096ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 317567533056ull, .expert_max_tensor_bytes = 2642411520ull, .gguf = "UD-Q3_K_XL/GLM-5.2-UD-Q3_K_XL-00001-of-00009.gguf" },  /* 9 parts, 319 GiB */
+    { .quant = "IQ4_XS", .layer_weight_bytes = 365313223776ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 339914784768ull, .expert_max_tensor_bytes = 2642411520ull, .gguf = "UD-IQ4_XS/GLM-5.2-UD-IQ4_XS-00001-of-00009.gguf" },  /* 9 parts, 340 GiB */
+    { .quant = "IQ4_NL", .layer_weight_bytes = 372661644384ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 347263205376ull, .expert_max_tensor_bytes = 2642411520ull, .gguf = "UD-IQ4_NL/GLM-5.2-UD-IQ4_NL-00001-of-00009.gguf" },  /* 9 parts, 347 GiB */
+    { .quant = "Q4_K_S", .layer_weight_bytes = 436431842432ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 410177765376ull, .expert_max_tensor_bytes = 2642411520ull, .gguf = "UD-Q4_K_S/GLM-5.2-UD-Q4_K_S-00001-of-00010.gguf" },  /* 10 parts, 406 GiB */
+    { .quant = "Q4_K_M", .layer_weight_bytes = 465825525088ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 439168794624ull, .expert_max_tensor_bytes = 2642411520ull, .gguf = "UD-Q4_K_M/GLM-5.2-UD-Q4_K_M-00001-of-00011.gguf" },  /* 11 parts, 434 GiB */
+    { .quant = "Q4_K_XL", .layer_weight_bytes = 467289111904ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 440401920000ull, .expert_max_tensor_bytes = 2642411520ull, .gguf = "UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-00001-of-00011.gguf" },  /* 11 parts, 435 GiB */
+    { .quant = "Q5_K_S", .layer_weight_bytes = 527259270528ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 499566772224ull, .expert_max_tensor_bytes = 2642411520ull, .gguf = "UD-Q5_K_S/GLM-5.2-UD-Q5_K_S-00001-of-00012.gguf" },  /* 12 parts, 491 GiB */
+    { .quant = "Q5_K_M", .layer_weight_bytes = 560830479904ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 532710162432ull, .expert_max_tensor_bytes = 3422552064ull, .gguf = "UD-Q5_K_M/GLM-5.2-UD-Q5_K_M-00001-of-00013.gguf" },  /* 13 parts, 522 GiB */
+    { .quant = "Q5_K_XL", .layer_weight_bytes = 562466258496ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 534345940992ull, .expert_max_tensor_bytes = 3422552064ull, .gguf = "UD-Q5_K_XL/GLM-5.2-UD-Q5_K_XL-00001-of-00013.gguf" },  /* 13 parts, 524 GiB */
+    { .quant = "Q6_K", .layer_weight_bytes = 625858969376ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 596883013632ull, .expert_max_tensor_bytes = 3422552064ull, .gguf = "UD-Q6_K/GLM-5.2-UD-Q6_K-00001-of-00014.gguf" },  /* 14 parts, 583 GiB */
+    { .quant = "Q6_K_XL", .layer_weight_bytes = 684369510240ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 654613413888ull, .expert_max_tensor_bytes = 3422552064ull, .gguf = "UD-Q6_K_XL/GLM-5.2-UD-Q6_K_XL-00001-of-00016.gguf" },  /* 16 parts, 637 GiB */
+    { .quant = "Q8_0", .layer_weight_bytes = 801357672256ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 770074214400ull, .expert_max_tensor_bytes = 3422552064ull, .gguf = "Q8_0/GLM-5.2-Q8_0-00001-of-00017.gguf" },  /* 17 parts, 746 GiB */
+    { .quant = "Q8_K_XL", .layer_weight_bytes = 819700080736ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 788193607680ull, .expert_max_tensor_bytes = 6442450944ull, .gguf = "UD-Q8_K_XL/GLM-5.2-UD-Q8_K_XL-00001-of-00018.gguf" },  /* 18 parts, 763 GiB */
+    { .quant = "BF16", .layer_weight_bytes = 1507988023008ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 1449551462400ull, .expert_max_tensor_bytes = 6442450944ull, .gguf = "BF16/GLM-5.2-BF16-00001-of-00033.gguf" },  /* 33 parts, 1404 GiB */
 };
 
 /* Kimi K2.5: measured from the repo named in models/kimi-k2.5.json (HF API,
@@ -333,32 +333,32 @@ static const idletoken_model_variant GLM52_VARIANTS[] = {
  * llama.cpp reads all of these, including the sub-2-bit ones (the frozen
  * ds4x dequantizer does not, but these models do not run on it). */
 static const idletoken_model_variant KIMI_K25_VARIANTS[] = {
-    { .quant = "IQ1_S", .layer_weight_bytes = 210299214240ull, .shared_weight_bytes = 0ull, .gguf = "moonshotai_Kimi-K2.5-IQ1_S/moonshotai_Kimi-K2.5-IQ1_S-00001-of-00006.gguf" },  /* 6 parts, 196 GiB */
-    { .quant = "IQ1_M", .layer_weight_bytes = 219584616864ull, .shared_weight_bytes = 0ull, .gguf = "moonshotai_Kimi-K2.5-IQ1_M/moonshotai_Kimi-K2.5-IQ1_M-00001-of-00006.gguf" },  /* 6 parts, 205 GiB */
-    { .quant = "IQ2_XXS", .layer_weight_bytes = 245277612576ull, .shared_weight_bytes = 0ull, .gguf = "moonshotai_Kimi-K2.5-IQ2_XXS/moonshotai_Kimi-K2.5-IQ2_XXS-00001-of-00007.gguf" },  /* 7 parts, 228 GiB */
-    { .quant = "IQ2_XS", .layer_weight_bytes = 283113380512ull, .shared_weight_bytes = 0ull, .gguf = "moonshotai_Kimi-K2.5-IQ2_XS/moonshotai_Kimi-K2.5-IQ2_XS-00001-of-00008.gguf" },  /* 8 parts, 264 GiB */
-    { .quant = "IQ2_S", .layer_weight_bytes = 283797330528ull, .shared_weight_bytes = 0ull, .gguf = "moonshotai_Kimi-K2.5-IQ2_S/moonshotai_Kimi-K2.5-IQ2_S-00001-of-00008.gguf" },  /* 8 parts, 264 GiB */
-    { .quant = "IQ2_M", .layer_weight_bytes = 322954304224ull, .shared_weight_bytes = 0ull, .gguf = "moonshotai_Kimi-K2.5-IQ2_M/moonshotai_Kimi-K2.5-IQ2_M-00001-of-00009.gguf" },  /* 9 parts, 301 GiB */
-    { .quant = "Q2_K", .layer_weight_bytes = 358637722528ull, .shared_weight_bytes = 0ull, .gguf = "moonshotai_Kimi-K2.5-Q2_K/moonshotai_Kimi-K2.5-Q2_K-00001-of-00010.gguf" },  /* 10 parts, 334 GiB */
-    { .quant = "Q2_K_L", .layer_weight_bytes = 359784602528ull, .shared_weight_bytes = 0ull, .gguf = "moonshotai_Kimi-K2.5-Q2_K_L/moonshotai_Kimi-K2.5-Q2_K_L-00001-of-00010.gguf" },  /* 10 parts, 335 GiB */
-    { .quant = "IQ3_XXS", .layer_weight_bytes = 404581325856ull, .shared_weight_bytes = 0ull, .gguf = "moonshotai_Kimi-K2.5-IQ3_XXS/moonshotai_Kimi-K2.5-IQ3_XXS-00001-of-00011.gguf" },  /* 11 parts, 377 GiB */
-    { .quant = "IQ3_XS", .layer_weight_bytes = 420081867776ull, .shared_weight_bytes = 0ull, .gguf = "moonshotai_Kimi-K2.5-IQ3_XS/moonshotai_Kimi-K2.5-IQ3_XS-00001-of-00011.gguf" },  /* 11 parts, 391 GiB */
-    { .quant = "Q3_K_S", .layer_weight_bytes = 444827360352ull, .shared_weight_bytes = 0ull, .gguf = "moonshotai_Kimi-K2.5-Q3_K_S/moonshotai_Kimi-K2.5-Q3_K_S-00001-of-00012.gguf" },  /* 12 parts, 414 GiB */
-    { .quant = "IQ3_M", .layer_weight_bytes = 466870099264ull, .shared_weight_bytes = 0ull, .gguf = "moonshotai_Kimi-K2.5-IQ3_M/moonshotai_Kimi-K2.5-IQ3_M-00001-of-00013.gguf" },  /* 13 parts, 435 GiB */
-    { .quant = "Q3_K_M", .layer_weight_bytes = 467321920864ull, .shared_weight_bytes = 0ull, .gguf = "moonshotai_Kimi-K2.5-Q3_K_M/moonshotai_Kimi-K2.5-Q3_K_M-00001-of-00013.gguf" },  /* 13 parts, 435 GiB */
-    { .quant = "Q3_K_L", .layer_weight_bytes = 487537745216ull, .shared_weight_bytes = 0ull, .gguf = "moonshotai_Kimi-K2.5-Q3_K_L/moonshotai_Kimi-K2.5-Q3_K_L-00001-of-00013.gguf" },  /* 13 parts, 454 GiB */
-    { .quant = "Q3_K_XL", .layer_weight_bytes = 488565349696ull, .shared_weight_bytes = 0ull, .gguf = "moonshotai_Kimi-K2.5-Q3_K_XL/moonshotai_Kimi-K2.5-Q3_K_XL-00001-of-00013.gguf" },  /* 13 parts, 455 GiB */
-    { .quant = "IQ4_XS", .layer_weight_bytes = 547605634464ull, .shared_weight_bytes = 0ull, .gguf = "moonshotai_Kimi-K2.5-IQ4_XS/moonshotai_Kimi-K2.5-IQ4_XS-00001-of-00014.gguf" },  /* 14 parts, 510 GiB */
-    { .quant = "IQ4_NL", .layer_weight_bytes = 579469909568ull, .shared_weight_bytes = 0ull, .gguf = "moonshotai_Kimi-K2.5-IQ4_NL/moonshotai_Kimi-K2.5-IQ4_NL-00001-of-00016.gguf" },  /* 16 parts, 540 GiB */
-    { .quant = "Q4_K_S", .layer_weight_bytes = 579815480896ull, .shared_weight_bytes = 0ull, .gguf = "moonshotai_Kimi-K2.5-Q4_K_S/moonshotai_Kimi-K2.5-Q4_K_S-00001-of-00016.gguf" },  /* 16 parts, 540 GiB */
-    { .quant = "Q4_K_M", .layer_weight_bytes = 580355550784ull, .shared_weight_bytes = 0ull, .gguf = "moonshotai_Kimi-K2.5-Q4_K_M/moonshotai_Kimi-K2.5-Q4_K_M-00001-of-00016.gguf" },  /* 16 parts, 540 GiB */
-    { .quant = "Q5_K_S", .layer_weight_bytes = 580517834304ull, .shared_weight_bytes = 0ull, .gguf = "moonshotai_Kimi-K2.5-Q5_K_S/moonshotai_Kimi-K2.5-Q5_K_S-00001-of-00016.gguf" },  /* 16 parts, 541 GiB */
-    { .quant = "Q4_K_L", .layer_weight_bytes = 581227179584ull, .shared_weight_bytes = 0ull, .gguf = "moonshotai_Kimi-K2.5-Q4_K_L/moonshotai_Kimi-K2.5-Q4_K_L-00001-of-00016.gguf" },  /* 16 parts, 541 GiB */
-    { .quant = "Q5_K_M", .layer_weight_bytes = 581232893504ull, .shared_weight_bytes = 0ull, .gguf = "moonshotai_Kimi-K2.5-Q5_K_M/moonshotai_Kimi-K2.5-Q5_K_M-00001-of-00016.gguf" },  /* 16 parts, 541 GiB */
-    { .quant = "Q6_K", .layer_weight_bytes = 582178528832ull, .shared_weight_bytes = 0ull, .gguf = "moonshotai_Kimi-K2.5-Q6_K/moonshotai_Kimi-K2.5-Q6_K-00001-of-00016.gguf" },  /* 16 parts, 542 GiB */
-    { .quant = "Q8_0", .layer_weight_bytes = 583710875200ull, .shared_weight_bytes = 0ull, .gguf = "moonshotai_Kimi-K2.5-Q8_0/moonshotai_Kimi-K2.5-Q8_0-00001-of-00016.gguf" },  /* 16 parts, 544 GiB */
-    { .quant = "Q4_0", .layer_weight_bytes = 589765221952ull, .shared_weight_bytes = 0ull, .gguf = "moonshotai_Kimi-K2.5-Q4_0/moonshotai_Kimi-K2.5-Q4_0-00001-of-00016.gguf" },  /* 16 parts, 549 GiB */
-    { .quant = "Q4_1", .layer_weight_bytes = 643155730176ull, .shared_weight_bytes = 0ull, .gguf = "moonshotai_Kimi-K2.5-Q4_1/moonshotai_Kimi-K2.5-Q4_1-00001-of-00017.gguf" },  /* 17 parts, 599 GiB */
+    { .quant = "IQ1_S", .layer_weight_bytes = 210299214240ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 203729928192ull, .expert_max_tensor_bytes = 1233125376ull, .gguf = "moonshotai_Kimi-K2.5-IQ1_S/moonshotai_Kimi-K2.5-IQ1_S-00001-of-00006.gguf" },  /* 6 parts, 196 GiB */
+    { .quant = "IQ1_M", .layer_weight_bytes = 219584616864ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 212978368512ull, .expert_max_tensor_bytes = 1453326336ull, .gguf = "moonshotai_Kimi-K2.5-IQ1_M/moonshotai_Kimi-K2.5-IQ1_M-00001-of-00006.gguf" },  /* 6 parts, 205 GiB */
+    { .quant = "IQ2_XXS", .layer_weight_bytes = 245277612576ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 238609760256ull, .expert_max_tensor_bytes = 1629487104ull, .gguf = "moonshotai_Kimi-K2.5-IQ2_XXS/moonshotai_Kimi-K2.5-IQ2_XXS-00001-of-00007.gguf" },  /* 7 parts, 228 GiB */
+    { .quant = "IQ2_XS", .layer_weight_bytes = 283113380512ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 276396244992ull, .expert_max_tensor_bytes = 1805647872ull, .gguf = "moonshotai_Kimi-K2.5-IQ2_XS/moonshotai_Kimi-K2.5-IQ2_XS-00001-of-00008.gguf" },  /* 8 parts, 264 GiB */
+    { .quant = "IQ2_S", .layer_weight_bytes = 283797330528ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 276396244992ull, .expert_max_tensor_bytes = 1805647872ull, .gguf = "moonshotai_Kimi-K2.5-IQ2_S/moonshotai_Kimi-K2.5-IQ2_S-00001-of-00008.gguf" },  /* 8 parts, 264 GiB */
+    { .quant = "IQ2_M", .layer_weight_bytes = 322954304224ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 315503935488ull, .expert_max_tensor_bytes = 2157969408ull, .gguf = "moonshotai_Kimi-K2.5-IQ2_M/moonshotai_Kimi-K2.5-IQ2_M-00001-of-00009.gguf" },  /* 9 parts, 301 GiB */
+    { .quant = "Q2_K", .layer_weight_bytes = 358637722528ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 350119526400ull, .expert_max_tensor_bytes = 2422210560ull, .gguf = "moonshotai_Kimi-K2.5-Q2_K/moonshotai_Kimi-K2.5-Q2_K-00001-of-00010.gguf" },  /* 10 parts, 334 GiB */
+    { .quant = "Q2_K_L", .layer_weight_bytes = 359784602528ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 350119526400ull, .expert_max_tensor_bytes = 2422210560ull, .gguf = "moonshotai_Kimi-K2.5-Q2_K_L/moonshotai_Kimi-K2.5-Q2_K_L-00001-of-00010.gguf" },  /* 10 parts, 335 GiB */
+    { .quant = "IQ3_XXS", .layer_weight_bytes = 404581325856ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 396361728000ull, .expert_max_tensor_bytes = 2422210560ull, .gguf = "moonshotai_Kimi-K2.5-IQ3_XXS/moonshotai_Kimi-K2.5-IQ3_XXS-00001-of-00011.gguf" },  /* 11 parts, 377 GiB */
+    { .quant = "IQ3_XS", .layer_weight_bytes = 420081867776ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 411687714816ull, .expert_max_tensor_bytes = 2422210560ull, .gguf = "moonshotai_Kimi-K2.5-IQ3_XS/moonshotai_Kimi-K2.5-IQ3_XS-00001-of-00011.gguf" },  /* 11 parts, 391 GiB */
+    { .quant = "Q3_K_S", .layer_weight_bytes = 444827360352ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 435997900800ull, .expert_max_tensor_bytes = 2422210560ull, .gguf = "moonshotai_Kimi-K2.5-Q3_K_S/moonshotai_Kimi-K2.5-Q3_K_S-00001-of-00012.gguf" },  /* 12 parts, 414 GiB */
+    { .quant = "IQ3_M", .layer_weight_bytes = 466870099264ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 458458398720ull, .expert_max_tensor_bytes = 3170893824ull, .gguf = "moonshotai_Kimi-K2.5-IQ3_M/moonshotai_Kimi-K2.5-IQ3_M-00001-of-00013.gguf" },  /* 13 parts, 435 GiB */
+    { .quant = "Q3_K_M", .layer_weight_bytes = 467321920864ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 458458398720ull, .expert_max_tensor_bytes = 3170893824ull, .gguf = "moonshotai_Kimi-K2.5-Q3_K_M/moonshotai_Kimi-K2.5-Q3_K_M-00001-of-00013.gguf" },  /* 13 parts, 435 GiB */
+    { .quant = "Q3_K_L", .layer_weight_bytes = 487537745216ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 479597690880ull, .expert_max_tensor_bytes = 3875536896ull, .gguf = "moonshotai_Kimi-K2.5-Q3_K_L/moonshotai_Kimi-K2.5-Q3_K_L-00001-of-00013.gguf" },  /* 13 parts, 454 GiB */
+    { .quant = "Q3_K_XL", .layer_weight_bytes = 488565349696ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 479597690880ull, .expert_max_tensor_bytes = 3875536896ull, .gguf = "moonshotai_Kimi-K2.5-Q3_K_XL/moonshotai_Kimi-K2.5-Q3_K_XL-00001-of-00013.gguf" },  /* 13 parts, 455 GiB */
+    { .quant = "IQ4_XS", .layer_weight_bytes = 547605634464ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 539051950080ull, .expert_max_tensor_bytes = 2994733056ull, .gguf = "moonshotai_Kimi-K2.5-IQ4_XS/moonshotai_Kimi-K2.5-IQ4_XS-00001-of-00014.gguf" },  /* 14 parts, 510 GiB */
+    { .quant = "IQ4_NL", .layer_weight_bytes = 579469909568ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 570760888320ull, .expert_max_tensor_bytes = 3170893824ull, .gguf = "moonshotai_Kimi-K2.5-IQ4_NL/moonshotai_Kimi-K2.5-IQ4_NL-00001-of-00016.gguf" },  /* 16 parts, 540 GiB */
+    { .quant = "Q4_K_S", .layer_weight_bytes = 579815480896ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 570760888320ull, .expert_max_tensor_bytes = 3170893824ull, .gguf = "moonshotai_Kimi-K2.5-Q4_K_S/moonshotai_Kimi-K2.5-Q4_K_S-00001-of-00016.gguf" },  /* 16 parts, 540 GiB */
+    { .quant = "Q4_K_M", .layer_weight_bytes = 580355550784ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 570760888320ull, .expert_max_tensor_bytes = 3170893824ull, .gguf = "moonshotai_Kimi-K2.5-Q4_K_M/moonshotai_Kimi-K2.5-Q4_K_M-00001-of-00016.gguf" },  /* 16 parts, 540 GiB */
+    { .quant = "Q5_K_S", .layer_weight_bytes = 580517834304ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 570760888320ull, .expert_max_tensor_bytes = 3170893824ull, .gguf = "moonshotai_Kimi-K2.5-Q5_K_S/moonshotai_Kimi-K2.5-Q5_K_S-00001-of-00016.gguf" },  /* 16 parts, 541 GiB */
+    { .quant = "Q4_K_L", .layer_weight_bytes = 581227179584ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 570760888320ull, .expert_max_tensor_bytes = 3170893824ull, .gguf = "moonshotai_Kimi-K2.5-Q4_K_L/moonshotai_Kimi-K2.5-Q4_K_L-00001-of-00016.gguf" },  /* 16 parts, 541 GiB */
+    { .quant = "Q5_K_M", .layer_weight_bytes = 581232893504ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 570760888320ull, .expert_max_tensor_bytes = 3170893824ull, .gguf = "moonshotai_Kimi-K2.5-Q5_K_M/moonshotai_Kimi-K2.5-Q5_K_M-00001-of-00016.gguf" },  /* 16 parts, 541 GiB */
+    { .quant = "Q6_K", .layer_weight_bytes = 582178528832ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 570760888320ull, .expert_max_tensor_bytes = 3170893824ull, .gguf = "moonshotai_Kimi-K2.5-Q6_K/moonshotai_Kimi-K2.5-Q6_K-00001-of-00016.gguf" },  /* 16 parts, 542 GiB */
+    { .quant = "Q8_0", .layer_weight_bytes = 583710875200ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 570760888320ull, .expert_max_tensor_bytes = 3170893824ull, .gguf = "moonshotai_Kimi-K2.5-Q8_0/moonshotai_Kimi-K2.5-Q8_0-00001-of-00016.gguf" },  /* 16 parts, 544 GiB */
+    { .quant = "Q4_0", .layer_weight_bytes = 589765221952ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 581330534400ull, .expert_max_tensor_bytes = 3523215360ull, .gguf = "moonshotai_Kimi-K2.5-Q4_0/moonshotai_Kimi-K2.5-Q4_0-00001-of-00016.gguf" },  /* 16 parts, 549 GiB */
+    { .quant = "Q4_1", .layer_weight_bytes = 643155730176ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 634178764800ull, .expert_max_tensor_bytes = 3523215360ull, .gguf = "moonshotai_Kimi-K2.5-Q4_1/moonshotai_Kimi-K2.5-Q4_1-00001-of-00017.gguf" },  /* 17 parts, 599 GiB */
 };
 
 /* DeepSeek V4 Pro: measured from unsloth/DeepSeek-V4-Pro-0813-GGUF
@@ -376,11 +376,11 @@ static const idletoken_model_variant KIMI_K25_VARIANTS[] = {
  * likewise unsloth's own doing; both totals were re-measured against the HF
  * blob sizes on 2026-08-21 and match to the byte. */
 static const idletoken_model_variant DSV4_PRO_VARIANTS[] = {
-    { .quant = "Q2_K",    .layer_weight_bytes = 569417385408ull, .shared_weight_bytes = 0ull, .gguf = "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00001-of-00037.gguf" },      /* 37 parts, 530 GiB, DevQuasar */
-    { .quant = "Q3_K_M",  .layer_weight_bytes = 748403475872ull, .shared_weight_bytes = 0ull, .gguf = "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00001-of-00061.gguf" },  /* 61 parts, 697 GiB, DevQuasar */
-    { .quant = "Q4_K_XL", .layer_weight_bytes = 849683927055ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00001-of-00020.gguf" },      /* 20 parts, 791 GiB, unsloth */
-    { .quant = "Q8_K_XL", .layer_weight_bytes = 873445601295ull, .shared_weight_bytes = 0ull, .gguf = "UD-Q8_K_XL/DeepSeek-V4-Pro-0813-UD-Q8_K_XL-00001-of-00020.gguf" },      /* 20 parts, 813 GiB, unsloth */
-    { .quant = "Q4_K_M",  .layer_weight_bytes = 950879580768ull, .shared_weight_bytes = 0ull, .gguf = "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00001-of-00076.gguf" },  /* 76 parts, 886 GiB, DevQuasar */
+    { .quant = "Q2_K",    .layer_weight_bytes = 569417385408ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 560125181952ull, .expert_max_tensor_bytes = 3633315840ull, .gguf = "Q2_K/deepseek-ai.DeepSeek-V4-Pro-0813.Q2_K-00001-of-00037.gguf" },      /* 37 parts, 530 GiB, DevQuasar */
+    { .quant = "Q3_K_M",  .layer_weight_bytes = 748403475872ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 736572211200ull, .expert_max_tensor_bytes = 5813305344ull, .gguf = "Q3_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q3_K_M-00001-of-00061.gguf" },  /* 61 parts, 697 GiB, DevQuasar */
+    { .quant = "Q4_K_XL", .layer_weight_bytes = 849683927055ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 822054223872ull, .expert_max_tensor_bytes = 4492099584ull, .gguf = "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00001-of-00020.gguf" },      /* 20 parts, 791 GiB, unsloth */
+    { .quant = "Q8_K_XL", .layer_weight_bytes = 873445601295ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 822054223872ull, .expert_max_tensor_bytes = 4492099584ull, .gguf = "UD-Q8_K_XL/DeepSeek-V4-Pro-0813-UD-Q8_K_XL-00001-of-00020.gguf" },      /* 20 parts, 813 GiB, unsloth */
+    { .quant = "Q4_K_M",  .layer_weight_bytes = 950879580768ull, .shared_weight_bytes = 0ull, .expert_weight_bytes = 935810039808ull, .expert_max_tensor_bytes = 6936330240ull, .gguf = "Q4_K_M/deepseek-ai.DeepSeek-V4-Pro-0813.Q4_K_M-00001-of-00076.gguf" },  /* 76 parts, 886 GiB, DevQuasar */
 };
 
 /* Curated Unsloth gpt-oss quantizations, smallest first. Tensor bytes were
@@ -391,30 +391,38 @@ static const idletoken_model_variant DSV4_PRO_VARIANTS[] = {
 static const idletoken_model_variant GPT_OSS_20B_VARIANTS[] = {
     { .quant = "Q3_K_S", .layer_weight_bytes = 10509782016ull,
       .shared_weight_bytes = 941103360ull,
+      .expert_weight_bytes = 10178887680ull, .expert_max_tensor_bytes = 141004800ull,
       .gguf = "gpt-oss-20b-Q3_K_S.gguf" },
     { .quant = "Q4_K_XL", .layer_weight_bytes = 10628668416ull,
       .shared_weight_bytes = 1230670080ull,
+      .expert_weight_bytes = 10178887680ull, .expert_max_tensor_bytes = 141004800ull,
       .gguf = "gpt-oss-20b-UD-Q4_K_XL.gguf" },
     { .quant = "Q8_0", .layer_weight_bytes = 10865888256ull,
       .shared_weight_bytes = 1230670080ull,
+      .expert_weight_bytes = 10178887680ull, .expert_max_tensor_bytes = 141004800ull,
       .gguf = "gpt-oss-20b-Q8_0.gguf" },
     { .quant = "F16", .layer_weight_bytes = 11463085056ull,
       .shared_weight_bytes = 2316545280ull,
+      .expert_weight_bytes = 10178887680ull, .expert_max_tensor_bytes = 141004800ull,
       .gguf = "gpt-oss-20b-F16.gguf" },
 };
 
 static const idletoken_model_variant GPT_OSS_120B_VARIANTS[] = {
     { .quant = "Q3_K_S", .layer_weight_bytes = 61609494528ull,
       .shared_weight_bytes = 941103360ull,
+      .expert_weight_bytes = 61073326080ull, .expert_max_tensor_bytes = 564019200ull,
       .gguf = "Q3_K_S/gpt-oss-120b-Q3_K_S-00001-of-00002.gguf" },
     { .quant = "Q4_K_XL", .layer_weight_bytes = 61772617728ull,
       .shared_weight_bytes = 1230670080ull,
+      .expert_weight_bytes = 61073326080ull, .expert_max_tensor_bytes = 564019200ull,
       .gguf = "UD-Q4_K_XL/gpt-oss-120b-UD-Q4_K_XL-00001-of-00002.gguf" },
     { .quant = "Q8_0", .layer_weight_bytes = 62143653888ull,
       .shared_weight_bytes = 1230670080ull,
+      .expert_weight_bytes = 61073326080ull, .expert_max_tensor_bytes = 564019200ull,
       .gguf = "Q8_0/gpt-oss-120b-Q8_0-00001-of-00002.gguf" },
     { .quant = "F16", .layer_weight_bytes = 63039449088ull,
       .shared_weight_bytes = 2316545280ull,
+      .expert_weight_bytes = 61073326080ull, .expert_max_tensor_bytes = 564019200ull,
       .gguf = "gpt-oss-120b-F16.gguf" },
 };
 
@@ -914,6 +922,7 @@ static const idletoken_model_spec MODELS[] = {
         .n_vocab  = 154880,
         .n_expert = 256,
         .n_expert_used = 8,
+        .moe_first_layer = 3,   /* the first 3 block(s) are dense */
         .layer_weight_bytes  = 216715360960ull,
         .shared_weight_bytes = 0ull,
         .ctx_max  = 1048576,
@@ -948,6 +957,7 @@ static const idletoken_model_spec MODELS[] = {
         .n_vocab  = 163840,
         .n_expert = 384,
         .n_expert_used = 8,
+        .moe_first_layer = 1,   /* the first 1 block(s) are dense */
         .layer_weight_bytes  = 210299214240ull,
         .shared_weight_bytes = 0ull,
         .ctx_max  = 262144,

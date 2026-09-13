@@ -119,6 +119,26 @@ static idletoken_nodecrypt g_nc_next;
  * byte for byte with the coordinator's session_key_fp(): the N0 gate compares
  * the two ends' log lines, and that comparison is the only evidence that both
  * sides kept the SAME key. */
+/* Emit one JSON string. The planner's sentence is prose the client shows
+ * verbatim, so quotes, backslashes and control characters have to survive the
+ * trip; multi-byte UTF-8 (the em dashes in those sentences) is legal raw. */
+static void plan_json_string(FILE *out, const char *s) {
+    fputc('"', out);
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        switch (*p) {
+            case '"':  fputs("\\\"", out); break;
+            case '\\': fputs("\\\\", out); break;
+            case '\n': fputs("\\n", out);  break;
+            case '\r': fputs("\\r", out);  break;
+            case '\t': fputs("\\t", out);  break;
+            default:
+                if (*p < 0x20) fprintf(out, "\\u%04x", *p);
+                else           fputc(*p, out);
+        }
+    }
+    fputc('"', out);
+}
+
 static void session_key_fp(const uint8_t *key, char out[9]) {
     uint8_t d[32];
     idletoken_sha256_ctx c;
@@ -276,6 +296,11 @@ static void usage(FILE *out) {
 "  --advise-peers L    judge this machine PLUS peers; L = vramGiB:ramGiB:unified,...\n"
 "  --model-layout-json ID QUANT GGUF\n"
 "                      inspect exact routed-expert bytes in a downloaded GGUF\n"
+"  --plan-json ID QUANT GGUF CTX NODES\n"
+"                      run the shipped planner and print its decision as JSON.\n"
+"                      NODES is vram:ram:pinnable:unified:backend[:label] per\n"
+"                      machine, comma-separated, COORDINATOR FIRST. One entry\n"
+"                      plans a single machine, several plan that cluster.\n"
 "  --gguf-dir DIR      directory to statvfs() for disk-avail (default: ./)\n"
 "  --max-vram-mb N     cap usable VRAM at N MiB (client setting; 0 = no cap)\n"
 "  --max-ram-mb N      cap usable RAM for node-local MoE experts (0 = no cap)\n"
@@ -1796,6 +1821,11 @@ int main(int argc, char **argv) {
     const char *layout_model = NULL;
     const char *layout_quant = NULL;
     const char *layout_gguf = NULL;
+    const char *pj_model = NULL;   /* --plan-json: run the shipped planner */
+    const char *pj_quant = NULL;
+    const char *pj_gguf  = NULL;
+    const char *pj_ctx   = NULL;
+    const char *pj_nodes = NULL;
     /* --advise-peers: judge a HYPOTHETICAL cluster, not just this machine.
      * Format: "vramGiB:ramGiB:unified,..." per extra machine. Answers the
      * question a user actually asks ("what if I add my other PC?") and lets the
@@ -1836,6 +1866,13 @@ int main(int argc, char **argv) {
             layout_model = argv[++i];
             layout_quant = argv[++i];
             layout_gguf = argv[++i];
+        }
+        else if (!strcmp(a, "--plan-json") && i + 5 < argc) {
+            pj_model = argv[++i];
+            pj_quant = argv[++i];
+            pj_gguf  = argv[++i];
+            pj_ctx   = argv[++i];
+            pj_nodes = argv[++i];
         }
         else if (!strcmp(a, "--kv-clear"))                    kv_clear = 1;
         else if (!strcmp(a, "--kv-dir")      && i + 1 < argc) kv_dir = argv[++i];
@@ -1895,6 +1932,135 @@ int main(int argc, char **argv) {
                (unsigned long long)size.expert_bytes_total,
                size.n_expert, size.n_expert_used,
                size.expert_bytes_complete ? "true" : "false");
+        return 0;
+    }
+
+    /* Run the SHIPPED planner for the client's resource card.
+     *
+     * The card used to compute its own numbers in TypeScript. That second
+     * arithmetic drifted: on 2026-09-13 it put a cluster's MoE Hybrid need
+     * 6.2 GiB below what the coordinator charged, and told the user a model
+     * fits that the coordinator then refused — the aggregate it showed cannot
+     * express the per-machine constraints that actually decide (a layer's
+     * experts must sit in the RAM of the machine that owns that layer, each
+     * machine's KV share must sit on its own card). There is no gate that
+     * could have caught it either: the parity gate compares only the GPU-only
+     * requirement, because the Hybrid shape has no C counterpart to compare
+     * against. So the card asks the planner instead, and the planner is this
+     * one — the same function the coordinator admits with.
+     *
+     * `--plan-json <model> <quant|-> <gguf|-> <ctx> <nodes>` where nodes is
+     * `vram:ram:pinnable:unified:backend[:label]` per machine, comma-separated,
+     * COORDINATOR FIRST (the planner pins layer 0 there). A single entry is the
+     * single-machine plan, several the cluster plan — the card shows whichever
+     * of the two the user is looking at, which is the point. */
+    if (pj_model) {
+        const idletoken_model_spec *spec = idletoken_model_get(pj_model);
+        if (!spec) {
+            fprintf(stderr, "idletoken-worker: unknown model for plan: %s\n", pj_model);
+            return 2;
+        }
+        if (pj_quant && !strcmp(pj_quant, "-")) pj_quant = NULL;
+        const char *gguf = (pj_gguf && strcmp(pj_gguf, "-")) ? pj_gguf : NULL;
+        const uint32_t ctx = (uint32_t)strtoul(pj_ctx, NULL, 10);
+        if (!idletoken_llama_is_ctx_tier(ctx)) {
+            fprintf(stderr, "idletoken-worker: --plan-json needs a product context "
+                            "tier (131072, 262144 or 1048576), not %s\n", pj_ctx);
+            return 2;
+        }
+        idletoken_llm_model_size size;
+        char source[512] = "";
+        if (idletoken_model_size_resolve(spec, pj_quant, gguf, &size,
+                                         source, sizeof source) != 0) {
+            fprintf(stderr, "idletoken-worker: could not size %s\n", pj_model);
+            return 1;
+        }
+        /* The coordinator picks the KV dtype from the weight precision before
+         * it plans; price the same cache here or the card and the launch
+         * disagree about a term worth GiB at the top context tier. */
+        {
+            int wbits = pj_quant && pj_quant[0]
+                ? idletoken_quant_weight_bits(pj_quant) : 0;
+            if (!wbits && gguf) wbits = idletoken_quant_bits_from_path(gguf);
+            const char *kv = idletoken_llama_kv_type_for_weight(wbits);
+            if (kv && !strcmp(kv, "q4_0")) idletoken_llama_model_kv_scale(&size, 18.0 / 64.0);
+            else if (kv && !strcmp(kv, "q8_0")) idletoken_llama_model_kv_scale(&size, 34.0 / 64.0);
+            idletoken_model_size_set_kv_tier(spec, &size,
+                idletoken_llama_kv_tier_for_weight(wbits));
+        }
+        idletoken_node_mem nodes[IDLETOKEN_LLPLAN_MAX_NODES];
+        memset(nodes, 0, sizeof nodes);
+        int n = 0;
+        for (const char *p = pj_nodes; *p && n < IDLETOKEN_LLPLAN_MAX_NODES; ) {
+            unsigned long long vram = 0, ram = 0, pinnable = 0;
+            unsigned unified = 0, backend = 0;
+            char label[64] = "";
+            if (sscanf(p, "%llu:%llu:%llu:%u:%u:%63[^,]",
+                       &vram, &ram, &pinnable, &unified, &backend, label) < 5 &&
+                sscanf(p, "%llu:%llu:%llu:%u:%u",
+                       &vram, &ram, &pinnable, &unified, &backend) < 5) {
+                fprintf(stderr, "idletoken-worker: --plan-json node %d is not "
+                                "vram:ram:pinnable:unified:backend[:label]\n", n);
+                return 2;
+            }
+            nodes[n].vram_usable  = vram;
+            nodes[n].ram_usable   = ram;
+            nodes[n].ram_pinnable = pinnable;
+            nodes[n].unified      = unified ? 1 : 0;
+            nodes[n].backend      = (uint8_t)backend;
+            snprintf(nodes[n].label, sizeof nodes[n].label, "%s", label);
+            n++;
+            const char *comma = strchr(p, ',');
+            if (!comma) break;
+            p = comma + 1;
+        }
+        if (n < 1) {
+            fprintf(stderr, "idletoken-worker: --plan-json needs at least one node\n");
+            return 2;
+        }
+        idletoken_llama_plan plan;
+        memset(&plan, 0, sizeof plan);
+        /* force_cluster mirrors what the user is looking at: more than one
+         * machine in the list means they are on the cluster card, and the
+         * coordinator would be launched with --force-cluster there. */
+        if (idletoken_plan_llamacpp(&size, nodes, n, 0, ctx, n > 1, &plan) != 0) {
+            fprintf(stderr, "idletoken-worker: planner rejected the inputs\n");
+            return 1;
+        }
+        printf("{\"kind\":%d,\"mode\":%d,\"hybrid\":%s,\"n_cpu_moe\":%u,"
+               "\"gpu_need\":%llu,\"ram_need\":%llu,\"n_nodes\":%d,"
+               "\"expert_layout_exact\":%s,\"estimated\":%s,\"nodes\":[",
+               /* `expert_layout_exact` already tells the caller whether the
+                * expert split was read from the file or spread from the
+                * manifest; plan.estimated is the same fact carried on the plan
+                * itself, and the two must never disagree. */
+               (int)plan.kind, (int)plan.mode,
+               plan.cluster_moe_hybrid ? "true" : "false", plan.n_cpu_moe,
+               (unsigned long long)plan.gpu_need_bytes,
+               (unsigned long long)plan.ram_need_bytes,
+               plan.kind == IDLETOKEN_LLPLAN_CLUSTER ? plan.n_nodes : 1,
+               size.expert_bytes_complete ? "true" : "false",
+               plan.estimated ? "true" : "false");
+        if (plan.kind == IDLETOKEN_LLPLAN_CLUSTER) {
+            for (int i = 0; i < plan.n_nodes; i++)
+                printf("%s{\"index\":%d,\"label\":\"%s\",\"gpu\":%llu,\"ram\":%llu,"
+                       "\"vram_usable\":%llu}",
+                       i ? "," : "", plan.order[i],
+                       nodes[plan.order[i]].label,
+                       (unsigned long long)plan.gpu_need_bytes_per_node[i],
+                       (unsigned long long)plan.cpu_moe_bytes_per_node[i],
+                       (unsigned long long)nodes[plan.order[i]].vram_usable);
+        } else if (plan.kind == IDLETOKEN_LLPLAN_SINGLE) {
+            printf("{\"index\":%d,\"label\":\"%s\",\"gpu\":%llu,\"ram\":%llu,"
+                   "\"vram_usable\":%llu}",
+                   plan.single_node, nodes[plan.single_node].label,
+                   (unsigned long long)plan.gpu_need_bytes,
+                   (unsigned long long)plan.ram_need_bytes,
+                   (unsigned long long)nodes[plan.single_node].vram_usable);
+        }
+        printf("],\"why\":");
+        plan_json_string(stdout, plan.why);
+        printf("}\n");
         return 0;
     }
 

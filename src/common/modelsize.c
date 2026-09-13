@@ -205,13 +205,20 @@ static int add_expert_part(const char *path, uint32_t n_layers,
         int consumed = 0;
         e[i].block = sscanf(t.name, "blk.%u.%n", &block, &consumed) == 1 && consumed > 0
             ? (int)block : -1;
-        if (e[i].block >= 0 && (block >= n_layers || block >= IDLETOKEN_LLPLAN_MAX_LAYERS)) {
-            if (err && err_cap) snprintf(err, err_cap, "tensor %s names an out-of-range block", t.name);
-            free(e);
-            idletoken_gguf_meta_close(m);
-            return -1;
-        }
-        e[i].layer = tensor_is_moe_expert(t.name, &layer) ? (int)layer : -1;
+        /* A block PAST the transformer stack is not a corrupt directory: GLM
+         * and DeepSeek ship a multi-token-prediction block at index n_layer,
+         * and llama.cpp still reports n_layer = 78. Treating it as corruption
+         * failed the whole scan, so GLM-5.2 reported no expert layout at all
+         * and Hybrid refused it on every machine — measured on a real 222 GiB
+         * file, 2026-09-13, `blk.78.attn_k_b.weight names an out-of-range
+         * block`. Its bytes are real and stay charged (to shared, below); what
+         * it must never be is a block the planner hands out or spills, because
+         * the engine does not place it as one. */
+        const int past_stack = e[i].block >= 0 &&
+            (block >= n_layers || block >= IDLETOKEN_LLPLAN_MAX_LAYERS);
+        if (past_stack) e[i].block = -1;   /* charged to shared, below */
+        e[i].layer = !past_stack && tensor_is_moe_expert(t.name, &layer)
+            ? (int)layer : -1;
         if (e[i].layer >= 0 &&
             ((uint32_t)e[i].layer >= n_layers ||
              e[i].layer >= IDLETOKEN_LLPLAN_MAX_LAYERS)) {
@@ -223,7 +230,7 @@ static int add_expert_part(const char *path, uint32_t n_layers,
             return -1;
         }
         unsigned pool_layer = 0;
-        if (tensor_is_moe_pool_weight(&t, n_expert, &pool_layer)) {
+        if (!past_stack && tensor_is_moe_pool_weight(&t, n_expert, &pool_layer)) {
             if (pool_layer >= n_layers ||
                 pool_layer >= IDLETOKEN_LLPLAN_MAX_LAYERS ||
                 pool_count[pool_layer] == UINT32_MAX) {
@@ -347,6 +354,64 @@ static int gguf_expert_layout(const char *path, uint32_t n_layers,
     }
     out->expert_bytes_complete = 1;
     return 0;
+}
+
+/* Spread the manifest's MEASURED expert total over the blocks that have
+ * experts, for the case where no GGUF exists yet.
+ *
+ * The user is choosing a model here, and for a MoE model that choice is about
+ * two pools. Without this the only honest answer before the download was "we
+ * cannot say", and the card instead showed the GPU-only total — a placement
+ * that model will never use — with no RAM figure at all.
+ *
+ * What is measured: the expert total and the largest expert tensor, per quant.
+ * What is assumed: that the blocks carry equal shares. Real files sit within
+ * about 20% of that on dynamic quants, which moves the chosen boundary by a
+ * block or so and leaves the two pool totals close. `expert_bytes_estimated`
+ * carries that caveat to everything downstream; the exact scan always wins
+ * when the file is on disk. */
+static void estimate_expert_layout(const idletoken_model_spec *spec,
+                                   uint64_t layer_bytes, uint64_t shared_bytes,
+                                   uint64_t expert_bytes, uint64_t max_tensor,
+                                   idletoken_llm_model_size *out) {
+    const uint32_t layers = spec->n_layers;
+    const uint32_t first = spec->moe_first_layer < layers ? spec->moe_first_layer : 0;
+    const uint32_t moe_layers = layers - first;
+    if (layers == 0 || layers > IDLETOKEN_LLPLAN_MAX_LAYERS || moe_layers == 0 ||
+        expert_bytes == 0 || expert_bytes >= layer_bytes || spec->n_expert == 0)
+        return;
+
+    /* Blocks first: the Hybrid budget prices each owner's own range, and
+     * expert_buckets_consistent() checks that these buckets plus the shared
+     * bytes are the whole model. Integer remainder goes to the leading blocks
+     * so the sum is exact rather than "exact to within n_layers bytes". */
+    const uint64_t block = layer_bytes / layers;
+    const uint64_t block_rem = layer_bytes % layers;
+    for (uint32_t i = 0; i < layers; i++)
+        out->weight_bytes_per_layer[i] = block + (i < block_rem ? 1 : 0);
+    out->weight_bytes_shared = shared_bytes;
+
+    const uint64_t per = expert_bytes / moe_layers;
+    const uint64_t rem = expert_bytes % moe_layers;
+    for (uint32_t i = first; i < layers; i++) {
+        uint64_t e = per + (i - first < rem ? 1 : 0);
+        /* A block cannot be more expert than it is block. Equal shares of a
+         * near-uniform model never hit this; clamping keeps a mis-measured
+         * manifest from producing buckets the planner would reject outright. */
+        if (e > out->weight_bytes_per_layer[i]) e = out->weight_bytes_per_layer[i];
+        out->expert_bytes_per_layer[i] = e;
+        out->expert_bytes_total += e;
+        /* Pool geometry. The slot is one expert's share of the block, which is
+         * the definition the exact path computes per tensor. The staging
+         * buffer is the measured largest tensor, clamped to this block so the
+         * cache geometry stays self-consistent. The weight COUNT is the usual
+         * gate/up/down triple; it only buys a 512-byte allocation tail each,
+         * so being wrong by one on a fused-projection model costs ~0.5 KiB. */
+        out->expert_pool_slot_bytes_per_layer[i] = (e + spec->n_expert - 1) / spec->n_expert;
+        out->expert_pool_max_tensor_per_layer[i] = max_tensor && max_tensor < e ? max_tensor : e;
+        out->expert_pool_weight_count_per_layer[i] = 3;
+    }
+    out->expert_bytes_estimated = 1;
 }
 
 /* Nearest variant to `bytes`, or NULL when the spec ships no variant menu or
@@ -564,6 +629,10 @@ int idletoken_model_size_resolve(const idletoken_model_spec *spec,
     const idletoken_model_variant *v = idletoken_model_variant_get(spec, quant);
     idletoken_model_weight_bytes(spec, quant, &layer_b, &shared_b);
     out->total_bytes = layer_b + shared_b;
+    if (spec->n_expert > 0)
+        estimate_expert_layout(spec, layer_b, shared_b,
+                               v ? v->expert_weight_bytes : 0,
+                               v ? v->expert_max_tensor_bytes : 0, out);
     const char *resolved = v ? v->quant : "";
     const int quant_honoured = has_quant && v && strcmp(v->quant, quant) == 0;
 

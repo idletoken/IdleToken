@@ -29,19 +29,44 @@
   },
   "moe": {
     "n_expert": 32,
-    "n_expert_used": 4
+    "n_expert_used": 4,
+    "first_layer": 0
   },
   "rope_theta": 150000,
   "split": {
     "boundary_multiple": 0
   },
   "overhead_base_bytes": 1610612736,
-  "compute_bytes_128k_cuda": [423624704, 432097198, 432097198],
-  "compute_bytes_256k_cuda": [0, 0, 0],
-  "compute_bytes_1m_cuda": [0, 0, 0],
-  "compute_bytes_128k_metal": [423624704, 423624704, 423624704],
-  "compute_bytes_256k_metal": [0, 0, 0],
-  "compute_bytes_1m_metal": [0, 0, 0],
+  "compute_bytes_128k_cuda": [
+    423624704,
+    432097198,
+    432097198
+  ],
+  "compute_bytes_256k_cuda": [
+    0,
+    0,
+    0
+  ],
+  "compute_bytes_1m_cuda": [
+    0,
+    0,
+    0
+  ],
+  "compute_bytes_128k_metal": [
+    423624704,
+    423624704,
+    423624704
+  ],
+  "compute_bytes_256k_metal": [
+    0,
+    0,
+    0
+  ],
+  "compute_bytes_1m_metal": [
+    0,
+    0,
+    0
+  ],
   "chat_template": "gguf",
   "layer_weight_bytes": 10509782016,
   "shared_weight_bytes": 941103360,
@@ -73,7 +98,9 @@
       "repo": "unsloth/gpt-oss-20b-GGUF",
       "gguf": "gpt-oss-20b-Q3_K_S.gguf",
       "sha256": "8deacd2c5ed46d1a62368c52e44abdb55e32a2aa0e5acea86d18d8258339f17d",
-      "revision": "d449b42d93e1c2c7bda5312f5c25c8fb91dfa9b4"
+      "revision": "d449b42d93e1c2c7bda5312f5c25c8fb91dfa9b4",
+      "expert_weight_bytes": 10178887680,
+      "expert_max_tensor_bytes": 141004800
     },
     {
       "quant": "Q4_K_XL",
@@ -82,7 +109,9 @@
       "repo": "unsloth/gpt-oss-20b-GGUF",
       "gguf": "gpt-oss-20b-UD-Q4_K_XL.gguf",
       "sha256": "10fe673de12c20b74b8d670a9fdf0fd36b43b0a86ffc04daeb175c0a2b98c4f9",
-      "revision": "d449b42d93e1c2c7bda5312f5c25c8fb91dfa9b4"
+      "revision": "d449b42d93e1c2c7bda5312f5c25c8fb91dfa9b4",
+      "expert_weight_bytes": 10178887680,
+      "expert_max_tensor_bytes": 141004800
     },
     {
       "quant": "Q8_0",
@@ -91,7 +120,9 @@
       "repo": "unsloth/gpt-oss-20b-GGUF",
       "gguf": "gpt-oss-20b-Q8_0.gguf",
       "sha256": "bcd455d4034ec02f71a875b46cb17df44a97911d7258291973be4d21f98329f3",
-      "revision": "d449b42d93e1c2c7bda5312f5c25c8fb91dfa9b4"
+      "revision": "d449b42d93e1c2c7bda5312f5c25c8fb91dfa9b4",
+      "expert_weight_bytes": 10178887680,
+      "expert_max_tensor_bytes": 141004800
     },
     {
       "quant": "F16",
@@ -100,7 +131,9 @@
       "repo": "unsloth/gpt-oss-20b-GGUF",
       "gguf": "gpt-oss-20b-F16.gguf",
       "sha256": "4e4f9cd88d6456e4f389e7262eca4a8d565211e2b22ece9ca7a8556168ff3c66",
-      "revision": "d449b42d93e1c2c7bda5312f5c25c8fb91dfa9b4"
+      "revision": "d449b42d93e1c2c7bda5312f5c25c8fb91dfa9b4",
+      "expert_weight_bytes": 10178887680,
+      "expert_max_tensor_bytes": 141004800
     }
   ],
   "note": "Curated Unsloth quantizations; MoE expert tensors remain MXFP4-derived. Alternating 128-token sliding attention and full attention."

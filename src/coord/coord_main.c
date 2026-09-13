@@ -8896,6 +8896,20 @@ static int run_llamacpp_cluster_mode(
         close(lfd);
         return 3;
     }
+    /* An estimated expert layout is for the client's resource card, never for
+     * a launch: the per-layer split is spread from a manifest total, so a plan
+     * built on it can place a block's experts where the file does not have
+     * them. Weights are an admission precondition, so this should be
+     * unreachable — which is exactly why it is checked rather than assumed. */
+    if (lplan.estimated) {
+        fprintf(stderr, "idletoken-coord: refusing to start on an ESTIMATED "
+                        "expert layout — the GGUF was not readable, so the "
+                        "Hybrid split would be guessed. Verify the model "
+                        "download and start again.\n");
+        for (int i = 0; i < n; i++) close(ws[i].fd);
+        close(lfd);
+        return 3;
+    }
     if (lplan.kind == IDLETOKEN_LLPLAN_SINGLE) {
         fprintf(stderr, "coord: releasing %d paired worker(s) — the model fits "
                         "this machine and clustering would only add round-trip "
@@ -9082,8 +9096,10 @@ static int run_llamacpp_cluster_mode(
                 close(lfd);
                 return 1;
             }
-            /* The cache budget includes its required floor. Charge fixed
-             * staging/tails once before converting the remainder to slots. */
+            /* The budget is the VRAM left over after admission. Charge the
+             * pool's own fixed staging/tails/reserve once before converting
+             * the remainder to slots; too little leftover yields zero slots,
+             * which is the honest "no pool on this node". */
             const uint64_t room = coord_moe_pool_room(
                 lplan.moe_pool_bytes_per_node[s], fixed_bytes);
             const uint64_t cap = slot_bytes > 0 ? room / slot_bytes : 0;
@@ -9099,7 +9115,7 @@ static int run_llamacpp_cluster_mode(
                                      !pool_overridden;
             fprintf(stderr, "coord: expert pool on node %u: planner estimates %u of %u "
                             "experts per tensor (%u RAM-expert layers, %.2f GiB total cache budget, "
-                            "%.2f GiB GPU need including its cache floor, %.2f GiB of experts in RAM)%s%s\n",
+                            "%.2f GiB GPU need, %.2f GiB of experts in RAM)%s%s\n",
                     s, planned_cap, msize->n_expert, spilled,
                     (double)lplan.moe_pool_bytes_per_node[s] / 1073741824.0,
                     (double)lplan.gpu_need_bytes_per_node[s] / 1073741824.0,
@@ -10054,6 +10070,14 @@ int main(int argc, char **argv) {
             }
             if (lplan.kind == IDLETOKEN_LLPLAN_REFUSE) {
                 fprintf(stderr, "idletoken-coord: %s\n", lplan.why);
+                return 3;
+            }
+            if (lplan.estimated) {   /* see the cluster path for why */
+                fprintf(stderr, "idletoken-coord: refusing to start on an "
+                                "ESTIMATED expert layout — the GGUF was not "
+                                "readable, so the Hybrid split would be "
+                                "guessed. Verify the model download and start "
+                                "again.\n");
                 return 3;
             }
             fprintf(stderr, "coord: scheduler: %s\n", lplan.why);

@@ -4,7 +4,7 @@ import { getResourceProvider } from "./provider";
 import { getEngineProvider, type EngineLogLine, type EngineStatus } from "./provider/engine";
 import type { NodeSnapshot, ClusterState } from "./types";
 import { HW_OK, HW_NO_GPU, HW_CC_TOO_LOW, HW_DRIVER_TOO_OLD, HW_VRAM_TOO_SMALL, HW_GPU_UNSUPPORTED, HW_MACOS_SEALED } from "./types";
-import { getModel, getManifest, estimateClusterCapacity, poolVram, poolRam, clusterCapacityVerdict, hybridRequirements, isMoeModel, moeRamExpertBudget, pickBestFittingModel, backendOfOs, type ModelSpec, type MoeLayoutBudget } from "./models";
+import { getModel, getManifest, estimateClusterCapacity, poolVram, poolRam, clusterCapacityVerdict, hybridRequirements, isMoeModel, moeRamExpertBudget, pickBestFittingModel, backendOfOs, plannerNodesSpec, type ModelSpec, type MoeLayoutBudget, type PlannerPlan, type ClusterCapacityVerdict } from "./models";
 import { resolveLocalWeights, fetchWeights, onFetchProgress, defaultModelDir, cancelFetch, resolveDownload, verifyWeights, isWeightsCancelled, type DownloadTarget } from "./weights";
 import { loadSettings, saveSettings, settingsWerePersisted, effectiveCaps, runtimeResourceBudget, effectiveCtx, engineTuning, overflowTuning, autoUiScale, contextTiersFor, type AppSettings, type ContextTier, type RuntimeResourceBudget, type Tier } from "./settings";
 import { getAuthProvider, type Session } from "./auth";
@@ -188,6 +188,79 @@ interface ModelLayoutJson {
   expert_bytes_complete: boolean;
 }
 
+interface PlanJson {
+  kind: number;
+  mode: number;
+  hybrid: boolean;
+  n_cpu_moe: number;
+  gpu_need: number;
+  ram_need: number;
+  expert_layout_exact: boolean;
+  nodes: { index: number; label: string; gpu: number; ram: number; vram_usable: number }[];
+  why: string;
+}
+
+const planCache = new Map<string, Promise<PlannerPlan>>();
+
+/** Ask the shipped planner. Cached on the exact question, because the card
+ *  re-renders while a resource slider moves and each miss forks a sidecar. */
+function loadPlan(modelId: string, quant: string, ggufPath: string, ctx: number,
+                  nodesSpec: string): Promise<PlannerPlan> {
+  const key = `${modelId}\n${quant}\n${ggufPath}\n${ctx}\n${nodesSpec}`;
+  const cached = planCache.get(key);
+  if (cached) return cached;
+  const pending = import("@tauri-apps/api/core")
+    .then(({ invoke }) => invoke<PlanJson>("plan_resources", {
+      modelId, quant, ggufPath, ctx, nodes: nodesSpec,
+    }))
+    .then((r) => ({
+      kind: r.kind,
+      mode: r.mode,
+      hybrid: r.hybrid,
+      nCpuMoe: r.n_cpu_moe,
+      gpuNeedBytes: r.gpu_need,
+      ramNeedBytes: r.ram_need,
+      expertLayoutExact: r.expert_layout_exact,
+      nodes: (r.nodes ?? []).map((n) => ({
+        index: n.index, label: n.label, gpu: n.gpu, ram: n.ram,
+        vramUsable: n.vram_usable,
+      })),
+      why: r.why,
+    }))
+    .catch((error) => {
+      planCache.delete(key);
+      throw error;
+    });
+  planCache.set(key, pending);
+  return pending;
+}
+
+/** The planner's answer for one question, debounced and cached.
+ *
+ * A hook rather than an effect inside the card, because the card is not the
+ * only surface that must not disagree with the coordinator: the deployment
+ * buttons decide which path leads from the same verdict (hard constraint #8 —
+ * "the card cannot say fits while the buttons point the other way"). Both call
+ * this, and identical questions share one answer through `planCache`. */
+function usePlan(modelId: string, quant: string, ggufPath: string, ctx: number,
+                 nodesSpec: string): [PlannerPlan | null, "idle" | "loading" | "error"] {
+  const [plan, setPlan] = useState<PlannerPlan | null>(null);
+  const [state, setState] = useState<"idle" | "loading" | "error">("idle");
+  useEffect(() => {
+    let live = true;
+    setPlan(null);
+    if (!inTauri()) { setState("idle"); return () => { live = false; }; }
+    setState("loading");
+    const timer = setTimeout(() => {
+      loadPlan(modelId, quant, ggufPath, ctx, nodesSpec)
+        .then((p) => { if (live) { setPlan(p); setState("idle"); } })
+        .catch(() => { if (live) setState("error"); });
+    }, 150);   /* a slider drag must not fork a sidecar per frame */
+    return () => { live = false; clearTimeout(timer); };
+  }, [modelId, quant, ggufPath, ctx, nodesSpec]);
+  return [plan, state];
+}
+
 const modelLayoutCache = new Map<string, Promise<MoeLayoutBudget>>();
 
 function loadMoeLayout(modelId: string, quant: string, ggufPath: string): Promise<MoeLayoutBudget> {
@@ -271,10 +344,46 @@ function NodeCapacityCard(props: {
                                          props.nNodes, props.quant,
                                          backendOfOs(s.os), 0);
   const gpuOnly = gpuAvailable >= gpuCap.needBytes;
+  /* The planner answers for exactly the roster the user is looking at: this
+   * machine alone on the single-machine card, every member on the cluster one.
+   * Its numbers replace the TypeScript estimate that used to live here — see
+   * PlannerPlan in models.ts for what that estimate got wrong. The estimate
+   * survives only as the browser-mode fallback below, where no sidecar exists. */
+  const nodesSpec = useMemo(
+    () => plannerNodesSpec(clustered ? peers : [{
+      vramFree: props.budget.vram_usable,
+      ramFree: props.budget.ram_usable,
+      ramExpertFree: props.budget.ram_expert_usable,
+      unifiedMemory: s.unified_memory,
+    }], backendOfOs(s.os),
+    clustered ? peers.map((p) => p.hostname) : [s.hostname]),
+    [clustered, peers, props.budget, s.unified_memory, s.os, s.hostname]);
+  const planGguf = props.weights?.needs ? "" : (props.weights?.path ?? "");
+  const [plan, planState] = usePlan(props.model.id, props.quant, planGguf,
+                                    props.tier.ctx, nodesSpec);
+
   // Mode follows the selected resource path, not the architecture label. An
   // MoE that fits wholly in VRAM is GPU_ONLY and therefore has no RAM row.
   // Unified-memory machines also have no second pool to display.
-  const hybridMode = isMoe && !gpuOnly && ramExpert > 0 && (clustered || !s.unified_memory);
+  /* Estimate-derived mode, used only until the planner answers (and in browser
+   * mode, where there is no sidecar). Once it has, the planner's own mode wins:
+   * whether routed experts go to RAM is its decision, not a UI guess. */
+  const estimateHybridMode =
+    isMoe && !gpuOnly && ramExpert > 0 && (clustered || !s.unified_memory);
+  /* A refused plan has mode REFUSE, but a MoE refusal IS about a Hybrid
+   * placement — and the RAM row is the half of the card that says which pool
+   * ran out. Reading only `mode` hid it exactly when it matters: DeepSeek-V4
+   * on one 15.7 GiB machine showed a lone video-memory bar and no mention of
+   * the 74.42 GiB of experts that is the actual reason.
+   *
+   * Whether the row EXISTS is this question — MoE, and a second pool that
+   * could hold experts — and not whether the planner could size it. Before the
+   * GGUF is on disk it cannot (the exact expert buckets are in the file), and
+   * that is precisely when the row must still say "RAM matters here, we cannot
+   * price it yet" rather than vanish. The numbers below stay the planner's. */
+  const refusedHybrid = plan !== null && plan.kind === 2 && isMoe &&
+    ramExpert > 0 && (clustered || !s.unified_memory);
+  const hybridMode = plan ? plan.mode === 2 || refusedHybrid : estimateHybridMode;
   const [cpuName, setCpuName] = useState("");
   useEffect(() => {
     let live = true;
@@ -311,8 +420,16 @@ function NodeCapacityCard(props: {
       });
     return () => { live = false; };
   }, [hybridMode, props.model.id, props.quant, props.weights?.needs, props.weights?.path]);
+  /* Totals to display: the planner's own per-machine figures, added up. The
+   * per-machine feasibility has already been decided by the planner, so the
+   * verdict below comes from its decision and never from comparing these two
+   * sums — an aggregate that fits can still have no workable split. */
+  const planGpuNeed = plan
+    ? (plan.nodes.length ? plan.nodes.reduce((a, n) => a + n.gpu, 0) : plan.gpuNeedBytes)
+    : undefined;
+  const planRamNeed = plan ? plan.ramNeedBytes : undefined;
   const hybridNeed = hybridMode ? hybridRequirements(gpuCap.needBytes, moeLayout) : null;
-  const pooledVerdict = !hybridMode
+  const estimateVerdict: ClusterCapacityVerdict = !hybridMode
     ? clustered
       ? clusterCapacityVerdict(gpuCap.needBytes, gpuAvailable, 0, false,
                                pool.complete, true)
@@ -322,6 +439,11 @@ function NodeCapacityCard(props: {
       : gpuAvailable < hybridNeed.vramNeedBytes || ramExpert < hybridNeed.ramNeedBytes
         ? "short"
         : clustered ? "hybrid-check" : "fits";
+  const pooledVerdict: ClusterCapacityVerdict = plan
+    ? (plan.kind === 2 ? "short" : "fits")
+    : planState === "loading" || planState === "error"
+      ? "unknown"
+      : estimateVerdict;
   const short = pooledVerdict === "short";
   // "Cannot tell" beats a wrong "not enough": a member that reported nothing
   // makes the total a lower bound, and only a SHORTFALL can be wrong that way
@@ -370,13 +492,34 @@ function NodeCapacityCard(props: {
   // Each physical pool gets its own coverage bar. Combining both ratios into
   // one bar hid which resource was tight and made RAM look interchangeable
   // with VRAM; Hybrid admission deliberately treats them as separate gates.
-  const gpuNeedBytes = hybridMode ? hybridNeed?.vramNeedBytes : gpuCap.needBytes;
-  const ramNeedBytes = hybridMode ? hybridNeed?.ramNeedBytes : undefined;
+  const gpuNeedBytes = planGpuNeed !== undefined
+    ? planGpuNeed
+    : hybridMode ? hybridNeed?.vramNeedBytes : gpuCap.needBytes;
+  const ramNeedBytes = planRamNeed !== undefined
+    ? planRamNeed
+    : hybridMode ? hybridNeed?.ramNeedBytes : undefined;
   const coverageLayers = (have: number, need?: number) => need && need > 0
     ? Math.floor(total * Math.min(1, have / need))
     : 0;
   const gpuVisibleLayers = coverageLayers(gpuAvailable, gpuNeedBytes);
   const ramVisibleLayers = coverageLayers(ramExpert, ramNeedBytes);
+  /* Each figure is marked short by ITS OWN pool, not by the plan's verdict.
+   * Painting both amber whenever anything was short undid what the two rows
+   * are for: on the machine that prompted this, video memory covered its
+   * 10.69 GiB and only expert RAM was 28 GiB over, yet both numbers read as
+   * the problem. Hybrid admits the two pools through separate gates; the card
+   * says which gate closed. */
+  const gpuOver = gpuNeedBytes !== undefined && gpuAvailable < gpuNeedBytes;
+  const ramOver = ramNeedBytes !== undefined && ramNeedBytes > 0 &&
+    ramExpert < ramNeedBytes;
+  /* A refusal neither bar explains is the SPLIT: machines can hold the bytes
+   * between them and still have no boundary that works (layer 0 is pinned, a
+   * layer's experts may only use its owner's RAM). Marking both then is
+   * honest — leaving a card that reads "everything fits" under a "not enough"
+   * verdict is not. */
+  const splitShort = short && !gpuOver && !ramOver;
+  const gpuShort = gpuOver || splitShort;
+  const ramShort = ramOver || splitShort;
   // Hardware floor: the engine decided, the UI only renders the verdict. A
   // blocked machine must SAY SO up front — otherwise the card looks healthy and
   // the failure surfaces much later as a mock fallback or garbage tokens.
@@ -458,10 +601,12 @@ function NodeCapacityCard(props: {
               </span>
               <span className="capacity__resource-stat">
                 <span>{t(hybridMode ? "capacity.minimum" : "capacity.required")}</span>
-                <strong className={short && (!hybridNeed || gpuAvailable < hybridNeed.vramNeedBytes) ? "capacity__gap" : ""}>
-                  {hybridMode
-                    ? hybridNeed ? `${GBNeed(hybridNeed.vramNeedBytes)} GB` : "—"
-                    : `${GBNeed(gpuCap.needBytes)} GB`}
+                <strong className={gpuShort ? "capacity__gap" : ""}>
+                  {planGpuNeed !== undefined
+                    ? `${GBNeed(planGpuNeed)} GB`
+                    : hybridMode
+                      ? hybridNeed ? `${GBNeed(hybridNeed.vramNeedBytes)} GB` : "—"
+                      : inTauri() ? "—" : `${GBNeed(gpuCap.needBytes)} GB`}
                 </strong>
               </span>
             </div>
@@ -481,8 +626,10 @@ function NodeCapacityCard(props: {
                 </span>
                 <span className="capacity__resource-stat">
                   <span>{t("capacity.expertStorage")}</span>
-                  <strong className={short && (!hybridNeed || ramExpert < hybridNeed.ramNeedBytes) ? "capacity__gap" : ""}>
-                    {hybridNeed ? `${GBNeed(hybridNeed.ramNeedBytes)} GB` : "—"}
+                  <strong className={ramShort ? "capacity__gap" : ""}>
+                    {planRamNeed !== undefined
+                      ? `${GBNeed(planRamNeed)} GB`
+                      : hybridNeed ? `${GBNeed(hybridNeed.ramNeedBytes)} GB` : "—"}
                   </strong>
                 </span>
               </div>
@@ -501,7 +648,10 @@ function NodeCapacityCard(props: {
             selected context, and the caveats it used to carry (estimate vs
             runtime admission) said more than the moment needs. */}
         <p className={`capacity__verdict${short ? " capacity__verdict--no" : ""}`}>
-          {hybridMode && !hybridNeed
+          {/* "We cannot tell yet" applies to the ESTIMATE's inputs only. Once
+              the planner has answered, it has answered — a missing local GGUF
+              layout must not blank a verdict that no longer depends on it. */}
+          {hybridMode && !ramNeedBytes
             ? t(layoutState === "loading" ? "spine.hybridReading"
               : props.weights?.needs ? "spine.hybridDownload"
               : "spine.hybridUnavailable")
@@ -1364,14 +1514,38 @@ function Dashboard(props: {
   const nNodes = props.pair && props.pair.peers.length > 0 ? props.pair.peers.length : 1;
   // Does the model fit THIS machine alone (N=1)? Only the primary-button
   // emphasis reads it; both deployment entries stay clickable regardless, and
-  // the coordinator still performs the authoritative admission. Same function,
-  // same backend and same measured workspace the capacity card renders, so the
-  // card cannot say "fits" while the buttons point the other way.
+  // the coordinator still performs the authoritative admission.
+  //
+  // Ask the PLANNER, the same one the capacity card asks, or the card can say
+  // "not enough" while the buttons lead with single-machine (hard constraint
+  // #8). The estimate below cannot answer this for a MoE model: it counts
+  // expert RAM as plain capacity, so a machine whose shortfall is KV — which
+  // may never leave video memory — reads as "fits" to it and as a refusal to
+  // the planner. Unpaired, this is the card's own question and the answer is
+  // already in the cache; paired, the card asks about the roster and this asks
+  // about this machine, which is two sidecar runs on a model change.
+  const soloSpec = useMemo(
+    () => plannerNodesSpec([{
+      vramFree: props.budget.vram_usable,
+      ramFree: props.budget.ram_usable,
+      ramExpertFree: props.budget.ram_expert_usable,
+      unifiedMemory: s.unified_memory,
+    }], backendOfOs(s.os), [s.hostname]),
+    [props.budget, s.unified_memory, s.os, s.hostname]);
+  const [soloPlan] = usePlan(props.model.id, props.quant,
+                             props.weights?.needs ? "" : (props.weights?.path ?? ""),
+                             props.tier.ctx, soloSpec);
+  // Browser mode has no sidecar, and the moment before the planner answers has
+  // no verdict at all: fall back to the estimate rather than leading with a
+  // path we have not checked.
   const standalone = estimateClusterCapacity(props.model, props.budget, props.tier.ctx, 1,
                                              props.quant, backendOfOs(s.os),
                                              moeRamExpertBudget(props.model.id,
                                                                 props.budget.ram_expert_usable,
                                                                 s.unified_memory));
+  const fitsStandalone = soloPlan
+    ? soloPlan.kind !== 2        /* REFUSE */
+    : standalone.gapBytes === 0;
   // The generic refusal surface (D2): whatever sentence the engine sent
   // through the JOIN_REFUSED / exit-3 channel, verbatim, where the user is
   // looking. WS-C's "upgrade machine X" (version mismatch) arrives through
@@ -1404,7 +1578,7 @@ function Dashboard(props: {
           ) : (
           <ClusterCard
             pair={props.pair}
-            fitsStandalone={standalone.gapBytes === 0}
+            fitsStandalone={fitsStandalone}
             canServeStandalone={(s.hw_status ?? HW_OK) === HW_OK}
             onServeStandalone={props.onServeStandalone}
             weights={props.weights}

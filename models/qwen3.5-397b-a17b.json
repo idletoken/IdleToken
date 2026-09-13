@@ -50,7 +50,8 @@
     "shared_expert_ff": 1024,
     "gating": "softmax",
     "weights_norm": true,
-    "shared_expert_gate": "sigmoid"
+    "shared_expert_gate": "sigmoid",
+    "first_layer": 0
   },
   "rope_theta": 10000000,
   "split": {
@@ -118,7 +119,9 @@
           "bytes": 15104674784,
           "sha256": "3c88fd4339745b7753548689b13c2bf2bbe12a352a1b1e680bbb18e8f5a25880"
         }
-      ]
+      ],
+      "expert_weight_bytes": 107709726720,
+      "expert_max_tensor_bytes": 687865856
     },
     {
       "quant": "IQ2_M",
@@ -144,7 +147,9 @@
           "bytes": 23470944640,
           "sha256": "81facb9989d46c9f179d9491de9988a63a70ee3207b93b562eb73a70ef7d3938"
         }
-      ]
+      ],
+      "expert_weight_bytes": 115762790400,
+      "expert_max_tensor_bytes": 822083584
     },
     {
       "quant": "IQ3_XXS",
@@ -170,7 +175,9 @@
           "bytes": 41521835200,
           "sha256": "5ae2a4a994810f90fce832a9b8f147f936b2012984027cd0a0145eae83a82b18"
         }
-      ]
+      ],
+      "expert_weight_bytes": 131868917760,
+      "expert_max_tensor_bytes": 822083584
     },
     {
       "quant": "IQ3_S",
@@ -196,7 +203,9 @@
           "bytes": 46536539264,
           "sha256": "39f1936428ed4d4c5520829e15b0c6d7e89bda39f0974cbd4789732a24ef0b63"
         }
-      ]
+      ],
+      "expert_weight_bytes": 137908715520,
+      "expert_max_tensor_bytes": 922746880
     },
     {
       "quant": "Q3_K_S",
@@ -227,7 +236,9 @@
           "bytes": 15240952320,
           "sha256": "7d886078b4301a3fa48eac06d76810d715635c7da2c6273ba53a25025f64132d"
         }
-      ]
+      ],
+      "expert_weight_bytes": 154014842880,
+      "expert_max_tensor_bytes": 922746880
     },
     {
       "quant": "Q3_K_M",
@@ -258,7 +269,9 @@
           "bytes": 28046794784,
           "sha256": "81884da3958656eaa1fd78c676d843e6293fc3e6cdbaec07e47cf01fadf2b67b"
         }
-      ]
+      ],
+      "expert_weight_bytes": 167101071360,
+      "expert_max_tensor_bytes": 1140850688
     },
     {
       "quant": "Q3_K_XL",
@@ -289,7 +302,9 @@
           "bytes": 30144210880,
           "sha256": "3194dd0b39ee0cc8e8364643a497235639b466968bc83d3a63102ba566f4fefe"
         }
-      ]
+      ],
+      "expert_weight_bytes": 168074149888,
+      "expert_max_tensor_bytes": 1476395008
     },
     {
       "quant": "IQ4_XS",
@@ -320,7 +335,9 @@
           "bytes": 41645081888,
           "sha256": "b68ee186931ae5d6541757a45bfdcfbacfc89034553d2d39246251faa14fc3b0"
         }
-      ]
+      ],
+      "expert_weight_bytes": 179180666880,
+      "expert_max_tensor_bytes": 1140850688
     },
     {
       "quant": "IQ4_NL",
@@ -351,7 +368,9 @@
           "bytes": 44665521856,
           "sha256": "9a45aff2abe50991cb60fd29cf972c40816bdc66ceef253839a6efb35c617220"
         }
-      ]
+      ],
+      "expert_weight_bytes": 183207198720,
+      "expert_max_tensor_bytes": 1207959552
     },
     {
       "quant": "Q4_K_S",
@@ -387,7 +406,9 @@
           "bytes": 31353965920,
           "sha256": "fce891e71cd1752a9ceca9400fca5bd68fd1294953ebed3f31c22d955d366041"
         }
-      ]
+      ],
+      "expert_weight_bytes": 217432719360,
+      "expert_max_tensor_bytes": 1207959552
     },
     {
       "quant": "MXFP4_MOE",
@@ -423,7 +444,9 @@
           "bytes": 40193763264,
           "sha256": "8822ead204281c6e3fbfa84059a7246fbf877a899a29860e56b5a37cde78038c"
         }
-      ]
+      ],
+      "expert_weight_bytes": 226442084352,
+      "expert_max_tensor_bytes": 1761607680
     },
     {
       "quant": "Q4_K_M",
@@ -459,7 +482,9 @@
           "bytes": 45642707040,
           "sha256": "d3bf93bb9fe007910ae9c0fd130d7776d7c6149635c9e7f158312308beb9b754"
         }
-      ]
+      ],
+      "expert_weight_bytes": 233538846720,
+      "expert_max_tensor_bytes": 1476395008
     },
     {
       "quant": "Q4_K_XL",
@@ -495,7 +520,9 @@
           "bytes": 46863528320,
           "sha256": "dde51f1fa49600ad9168a99fa6d72fcc3537a60df09972af07ffae94b0328edf"
         }
-      ]
+      ],
+      "expert_weight_bytes": 234360930304,
+      "expert_max_tensor_bytes": 1761607680
     },
     {
       "quant": "Q5_K_S",
@@ -536,7 +563,9 @@
           "bytes": 31918310208,
           "sha256": "0b67c6c06cbf0227ffe9ab8d3453808fe5ecb17676bb2a6e48a9a156e48da357"
         }
-      ]
+      ],
+      "expert_weight_bytes": 265751101440,
+      "expert_max_tensor_bytes": 1476395008
     },
     {
       "quant": "Q5_K_M",
@@ -582,7 +611,9 @@
           "bytes": 1480868160,
           "sha256": "4bbade915bb05436822b36a088710a90d9da5a7b0f2a5621a978b79a366be35f"
         }
-      ]
+      ],
+      "expert_weight_bytes": 282863861760,
+      "expert_max_tensor_bytes": 1761607680
     },
     {
       "quant": "Q5_K_XL",
@@ -628,7 +659,9 @@
           "bytes": 1480868160,
           "sha256": "4bbade915bb05436822b36a088710a90d9da5a7b0f2a5621a978b79a366be35f"
         }
-      ]
+      ],
+      "expert_weight_bytes": 283954380800,
+      "expert_max_tensor_bytes": 2281701376
     },
     {
       "quant": "Q6_K",
@@ -674,7 +707,9 @@
           "bytes": 34235187616,
           "sha256": "2092241676533c799862ec78d4035af4402907df5822fac13f4109584336a214"
         }
-      ]
+      ],
+      "expert_weight_bytes": 317089382400,
+      "expert_max_tensor_bytes": 1761607680
     },
     {
       "quant": "Q6_K_XL",
@@ -725,7 +760,9 @@
           "bytes": 15470435488,
           "sha256": "d3bda566119958dafead0c385a5499d4af8da0a4080a4a9887c830b71f475530"
         }
-      ]
+      ],
+      "expert_weight_bytes": 351348457472,
+      "expert_max_tensor_bytes": 4294967296
     },
     {
       "quant": "Q8_0",
@@ -781,7 +818,9 @@
           "bytes": 30241843040,
           "sha256": "a0aaf48579fcef07f8e12f97c7378553c0ba77149ac6bcf60cb663ffcfa27ca1"
         }
-      ]
+      ],
+      "expert_weight_bytes": 410706247680,
+      "expert_max_tensor_bytes": 2281701376
     },
     {
       "quant": "Q8_K_XL",
@@ -837,7 +876,9 @@
           "bytes": 37262735616,
           "sha256": "b4ecbbec353c6b6bba6d04d18bac218e832937d9cb833c1c06faa20a09649ef9"
         }
-      ]
+      ],
+      "expert_weight_bytes": 416746045440,
+      "expert_max_tensor_bytes": 4294967296
     },
     {
       "quant": "BF16",
@@ -928,7 +969,9 @@
           "bytes": 37036116608,
           "sha256": "28fdfe3cfb5efe93c0feba3324b4b5bf62663cb8a4c5b13f7a9e933d4e7e8519"
         }
-      ]
+      ],
+      "expert_weight_bytes": 773094113280,
+      "expert_max_tensor_bytes": 4294967296
     }
   ],
   "default_quant": "IQ2_XXS",

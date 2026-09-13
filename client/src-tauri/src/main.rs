@@ -201,6 +201,66 @@ async fn advise_capability(app: tauri::AppHandle) -> Result<Value, String> {
     serde_json::from_str::<Value>(line).map_err(|e| format!("bad advise JSON: {e}"))
 }
 
+/// Ask the SHIPPED planner what it would do, for the resource card.
+///
+/// The card used to compute its own numbers in TypeScript. That second
+/// arithmetic drifted — on 2026-09-13 it put a cluster's MoE Hybrid need
+/// 6.2 GiB under what the coordinator charged and told the user a model fits
+/// that the coordinator then refused. An aggregate computed in the UI also
+/// cannot express the constraints that decide (a layer's experts must sit in
+/// the RAM of the machine that owns that layer; each machine's KV share must
+/// sit on its own card), so making the two agree numerically would not have
+/// been enough. The card asks the planner instead, and gets back the same
+/// decision the coordinator will make, per machine.
+///
+/// `nodes` is one `vram:ram:pinnable:unified:backend[:label]` per machine,
+/// coordinator first. One entry asks for the single-machine plan, several for
+/// that cluster's plan — the card passes whichever the user is looking at.
+#[tauri::command]
+async fn plan_resources(
+    app: tauri::AppHandle,
+    model_id: String,
+    quant: String,
+    gguf_path: String,
+    ctx: u32,
+    nodes: String,
+) -> Result<Value, String> {
+    if model_id.trim().is_empty() || nodes.trim().is_empty() {
+        return Err("model id and at least one node are required".into());
+    }
+    let sidecar = app
+        .shell()
+        .sidecar("idletoken-worker")
+        .map_err(|e| format!("sidecar not found (bundle binaries/idletoken-worker): {e}"))?;
+    let blank = |s: &str| if s.trim().is_empty() { "-".to_string() } else { s.trim().to_string() };
+    let output = sidecar
+        .args([
+            "--plan-json",
+            model_id.trim(),
+            &blank(&quant),
+            &blank(&gguf_path),
+            &ctx.to_string(),
+            nodes.trim(),
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("failed to run the planner: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "worker exited with {}: {}",
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('{'))
+        .ok_or_else(|| format!("no JSON in planner output: {stdout}"))?;
+    serde_json::from_str::<Value>(line).map_err(|e| format!("bad planner JSON: {e}"))
+}
+
 /// Inspect the exact routed-expert byte layout of the selected, downloaded
 /// GGUF. The browser cannot read arbitrary local files, and reimplementing the
 /// GGUF tensor parser in TypeScript would give the resource card a second truth
@@ -1144,6 +1204,7 @@ fn main() {
             cpu_name,
             advise_capability,
             inspect_model_layout,
+            plan_resources,
             api_chat,
             api_chat_stream,
             api_stats,

@@ -397,9 +397,14 @@ export const STRINGS = {
     "cluster.loadingHint": "First start downloads this machine's model shard — allow a few minutes on a fast network.",
     "capacity.available": "Available",
     "capacity.availableRam": "Available memory",
-    "capacity.required": "Needed",
-    "capacity.minimum": "Minimum needed",
-    "capacity.expertStorage": "Expert storage needed",
+    /* Every requirement figure says "estimated" (2026-09-13, owner's ruling).
+     * The numbers come from the planner the coordinator admits with, but they
+     * are still a prediction of runtime memory, and a user who picked a model
+     * on a figure that later refuses should have been told that up front. The
+     * available side carries no marker: it is measured. */
+    "capacity.required": "Needed (estimated)",
+    "capacity.minimum": "Minimum needed (estimated)",
+    "capacity.expertStorage": "Expert storage needed (estimated)",
     "stats.requests": "requests served",
     "stats.tokens": "tokens",
     "stats.ctx": "context",
@@ -878,9 +883,9 @@ export const STRINGS = {
     "cluster.loadingHint": "首次启动需下载本机的模型分片——视网速可能需要几分钟。",
     "capacity.available": "可用",
     "capacity.availableRam": "可用内存",
-    "capacity.required": "需要",
-    "capacity.minimum": "最低需要",
-    "capacity.expertStorage": "存储专家需要",
+    "capacity.required": "需要（预估）",
+    "capacity.minimum": "最低需要（预估）",
+    "capacity.expertStorage": "专家存储需要（预估）",
     "stats.requests": "次请求",
     "stats.tokens": "词元",
     "stats.ctx": "上下文",

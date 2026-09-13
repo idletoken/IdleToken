@@ -259,6 +259,15 @@ typedef struct {
     uint64_t expert_bytes_per_layer[IDLETOKEN_LLPLAN_MAX_LAYERS];
     uint64_t expert_bytes_total;
     uint8_t  expert_bytes_complete;
+    /* Same buckets, but SPREAD EVENLY from the manifest's measured total
+     * because no GGUF was on disk (2026-09-13). The total and the largest
+     * expert tensor are measured; only the per-layer split is assumed, and
+     * real files vary by ~20% around it on dynamic quants. Enough to tell a
+     * user which pool a model will need before they download 80 GB, not enough
+     * to run on: a plan built from these is marked `estimated` and the
+     * coordinator refuses to launch one. Never set together with
+     * `expert_bytes_complete`. */
+    uint8_t  expert_bytes_estimated;
     /* Exact identity of the routed-expert WEIGHT tensors that can enter the
      * runtime GPU cache. The byte buckets above intentionally also include
      * bias/scale tensors and GGUF alignment because they describe what
@@ -379,6 +388,10 @@ uint64_t idletoken_llama_working_set(const idletoken_llm_model_size *model);
 typedef struct {
     idletoken_llplan_kind kind;
     idletoken_mode mode;       /* GPU_ONLY, or locality-preserving MoE HYBRID */
+    /* This plan used an ESTIMATED expert layout (see expert_bytes_estimated):
+     * good enough to show on the resource card before the weights exist, not
+     * good enough to start an engine on. The coordinator refuses it. */
+    uint8_t estimated;
 
     /* SINGLE: the chosen node (index into the caller's nodes[]). */
     int single_node;
@@ -400,6 +413,17 @@ typedef struct {
      * including mandatory GPU cache/staging space for the RAM experts. */
     uint32_t n_cpu_moe;
     uint64_t cpu_moe_bytes;
+    /* What this plan needs from each physical pool, kept apart because Hybrid
+     * admits them through two independent gates.
+     *
+     * ON A REFUSAL these still carry the REFUSED placement's two halves
+     * (2026-09-13): a MoE refusal describes a Hybrid split, so the GPU figure
+     * is what would stay in video memory with the experts moved out, and the
+     * RAM figure is what host memory would have to hold. Leaving ram_need at 0
+     * and gpu_need at the GPU-only total told the client's resource card there
+     * was no RAM side at all, so a Hybrid-shaped refusal rendered as a single
+     * 84 GiB video-memory bar for a placement that needs ~10. A non-MoE
+     * refusal keeps ram_need = 0, which is the honest "there is no RAM side". */
     uint64_t gpu_need_bytes;
     uint64_t ram_need_bytes;
 
@@ -421,11 +445,17 @@ typedef struct {
      * runtime can return one hidden vector rather than a vocabulary-sized
      * logits tensor without bypassing per-node VRAM admission. */
     uint8_t output_head_local;
-    /* Total cache budget, including its mandatory slots/staging/reserve.
-     * gpu_need_bytes includes the mandatory cache floor; this budget is NOT
-     * an extra allocation to add to gpu_need_bytes. Cache policy must not
-     * enlarge the minimum owner-local RAM prefix chosen for admission.
-     * The engine sizes caches for that prefix from actual post-load VRAM. */
+    /* VRAM left over after admission, i.e. what an expert pool may use.
+     *
+     * Since 2026-09-13 the post-load pool is NOT an admission cost (the engine
+     * creates it after the first complete graph from the VRAM free then, and
+     * runs without it otherwise), so `gpu_need_bytes` excludes its floor and
+     * this is the plain remainder. A value below the floor means "no pool on
+     * this node" — coord_moe_pool_room() turns it into zero slots. Cache policy
+     * must not enlarge the minimum owner-local RAM prefix chosen for
+     * admission. In mode 2 the coordinator sends no slot count at all and the
+     * engine sizes the pool from its own measured free VRAM; this figure is
+     * then a planner estimate for the log, not a control. */
     uint64_t moe_pool_bytes;                                    /* single machine */
     uint64_t moe_pool_bytes_per_node[IDLETOKEN_LLPLAN_MAX_NODES]; /* cluster, by slot */
 
@@ -434,7 +464,10 @@ typedef struct {
     uint64_t hard_need_bytes;    /* what must be resident (KV + per-node overhead) */
     uint64_t working_set_bytes;  /* what memory should cache for full speed */
 
-    char why[512];        /* human-readable decision / refusal reason */
+    /* Human-readable decision / refusal reason. A cluster refusal for an MoE
+     * model has to fit the GPU-only shortfall, the reason MoE Hybrid could not
+     * close it, and the context tier that would, which does not fit in 512. */
+    char why[896];
 } idletoken_llama_plan;
 
 /* Mirror llama.cpp's LLAMA_SPLIT_MODE_LAYER placement for one contiguous
