@@ -18,6 +18,12 @@ llama.cpp — IdleToken distributes a modified version of this inference engine.
     licenses/llamacpp-MIT.txt inside the installers
     Upstream: https://github.com/ggml-org/llama.cpp
 
+Tauri — the application framework used by IdleToken's client.
+    Copyright (c) 2017 - Present Tauri Apps Contributors
+    Apache License 2.0 OR MIT License — full texts in the upstream
+    LICENSE_APACHE-2.0 and LICENSE_MIT files
+    Upstream: https://github.com/tauri-apps/tauri
+
 Mbed TLS (v3.6.7) — the TLS implementation used by IdleToken's transport patch
     for the ggml RPC link. Not vendored here either: the patched llama.cpp
     build pulls it through CMake FetchContent and links it statically, so it is
