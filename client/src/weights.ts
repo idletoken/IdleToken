@@ -14,6 +14,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { mmprojLocalName } from "./models";
 import type { ModelManifest, SplitPart } from "./models";
 import { inTauri } from "./platform";
 
@@ -33,6 +34,21 @@ export interface DownloadTarget {
   /** Split GGUF: the parts after `file`. Empty = single-file. The engine is
    *  handed `file`; every part must nonetheless land complete and verified. */
   parts: SplitPart[];
+  /** Local file name, when it must differ from the remote one. Absent = save
+   *  under `file`.
+   *
+   *  Weights never need this: their names already carry the model
+   *  (`Qwen3.5-9B-UD-IQ2_XXS.gguf`). Vision towers do — NINE curated models
+   *  publish theirs as `mmproj-F16.gguf`, all different files, and one model
+   *  folder cannot hold two files of the same name. */
+  saveAs?: string;
+}
+
+/** The name this target has ON DISK. Every question about the local file —
+ *  is it there, hash it, download progress, cancel — must ask under this name,
+ *  never `file` (which is where it came from). */
+export function targetLocalName(t: DownloadTarget): string {
+  return t.saveAs || t.file;
 }
 
 /**
@@ -78,6 +94,88 @@ export function resolveDownload(man: ModelManifest, quant?: string): DownloadTar
   const whole = layer + shared;
   const expectBytes = partBytes > 0 ? Math.max(0, whole - partBytes) : whole;
   return { repo, file, expectBytes, sha256, revision, parts };
+}
+
+/**
+ * The vision tower as a download target, or null for a text-only model.
+ *
+ * A SECOND file, not another part of the weights: parts are the continuation
+ * files of one split GGUF that the engine finds by name, whereas the tower is
+ * an independent file passed on its own flag (--mmproj). Folding it into
+ * `parts` would also corrupt the first part's size, which is computed as
+ * "whole minus declared parts".
+ *
+ * It is quantisation-independent — one tower serves every precision of the
+ * model — so this takes no `quant`.
+ *
+ * It is hash-pinned like the weights and for the same reason (hard constraint
+ * #14): it is a file downloaded from the internet that the engine loads into
+ * the process serving the user's prompts.
+ */
+export function resolveMmprojDownload(man: ModelManifest): DownloadTarget | null {
+  const mm = man.mmproj;
+  if (!mm || !mm.repo || !mm.gguf) return null;
+  return {
+    repo: mm.repo,
+    file: mm.gguf,
+    // Prefixed with the model id, because the REMOTE name is not unique: nine
+    // models ship `mmproj-F16.gguf`, every one a different file. Under the
+    // remote name they share one path, so two vision models can never both be
+    // ready and every switch re-downloads up to 900 MB. qwen3.5-27b and
+    // qwen3.8-27b are 448 bytes apart, which the `>=` completeness test cannot
+    // tell apart at all — only the hash gate catches that one, one step later.
+    // The rule itself lives in models.ts: the stored-file list needs the same
+    // answer, and two copies of a naming rule is how the file stops being found.
+    saveAs: mmprojLocalName(man),
+    expectBytes: mm.bytes ?? 0,
+    sha256: mm.sha256 ?? "",
+    revision: mm.revision ?? "",
+    parts: [],
+  };
+}
+
+/**
+ * Where this machine's vision tower is, or "" when there is none.
+ *
+ * PRESENCE, not verification — exactly the rule `resolveLocalWeights` uses for
+ * the weights (`needsDownload: !complete`). The hash gate still applies, one
+ * step later and in one place: `prepareWeights` verifies the tower before
+ * anything is allowed to start (hard constraint #14 is unchanged).
+ *
+ * ⚠ It used to demand `complete && verified` here too, and that was wrong in a
+ * way the user saw immediately: `verified` reads a MARKER the client writes
+ * after its own download, never the file itself. A tower that arrived any other
+ * way — copied in, fetched by a script — has no marker, so a file sitting right
+ * there in the model folder was reported as "needs one more file". Presence and
+ * provenance are different questions, and this one is about presence.
+ */
+export async function mmprojLocalPath(
+  modelDir: string,
+  man: ModelManifest,
+): Promise<string> {
+  const t = resolveMmprojDownload(man);
+  if (!t) return "";
+  try {
+    const dir = modelDir || (await defaultModelDir());
+    // The local name, not the remote one — see DownloadTarget.saveAs.
+    const local = targetLocalName(t);
+    let st = await weightsState(dir, local, t.expectBytes, t.sha256);
+    // A miss may be a tower this client downloaded under the shared remote
+    // name, back when every vision model wrote to that one path. Claim it by
+    // rename (marker check only, no hashing — see weights_adopt) so upgrading
+    // does not announce that a file sitting in the folder is missing.
+    if (!st.complete && local !== t.file) {
+      const moved = await invoke<boolean>("weights_adopt", {
+        destDir: dir, from: t.file, to: local,
+        expectBytes: t.expectBytes, expectSha256: t.sha256,
+      }).catch(() => false);
+      if (moved) st = await weightsState(dir, local, t.expectBytes, t.sha256);
+    }
+    return st.complete ? st.path : "";
+  } catch {
+    // A failed probe is "no tower to offer", never a guessed path.
+    return "";
+  }
 }
 
 export interface WeightsState {
@@ -204,6 +302,7 @@ export async function fetchWeights(args: {
       expectSha256: args.target.sha256,
       revision: args.target.revision,
       parts: args.target.parts,
+      saveAs: args.target.saveAs ?? "",
       endpoints: args.endpoints ?? [],
     });
   } catch (e) {

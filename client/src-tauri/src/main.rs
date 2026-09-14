@@ -1234,6 +1234,7 @@ fn main() {
             weights::weights_verify,
             weights::weights_default_dir,
             weights::weights_state,
+            weights::weights_adopt,
             weights::weights_cancel,
             weights::weights_list,
             weights::weights_delete,

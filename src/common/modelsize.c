@@ -536,6 +536,16 @@ int idletoken_model_size_resolve(const idletoken_model_spec *spec,
         out->compute_bytes_256k_metal = spec->compute_bytes_256k_metal[tier];
         out->compute_bytes_1m_metal   = spec->compute_bytes_1m_metal[tier];
     }
+    /* The vision tower, straight from the registry: its size is a property of
+     * the model, not of the weight precision or the KV tier (one tower serves
+     * every quant in the menu). 0 here for a text-only model, which is what
+     * makes the planner's single extra term a no-op for them.
+     *
+     * ⚠ This charges the tower whenever the MODEL has one, even if this launch
+     * will not load it. That is the safe direction: a plan sized without it
+     * cannot be run with it, whereas a plan sized with it merely leaves a few
+     * hundred MiB unused on a text-only run of a vision model. */
+    out->mmproj_bytes = spec->mmproj ? spec->mmproj->bytes : 0;
     if (spec->kv_kind == IDLETOKEN_KV_HYBRID) {
         const uint32_t iv = spec->full_attn_interval ? spec->full_attn_interval : 1;
         const uint64_t n_full = ((uint64_t)spec->n_layers + iv - 1) / iv;

@@ -128,6 +128,31 @@ export interface ModelManifest {
   moe?: { n_expert: number; n_expert_used: number };
   overhead_base_bytes: number;
   default_gguf: string;
+  /** The vision tower, present exactly on the models whose upstream is
+   *  image-text-to-text. Absent = text-only, and that is a statement about the
+   *  model rather than about our curation: DeepSeek V4, GLM-5.2 and GPT-OSS
+   *  publish no mmproj anywhere.
+   *
+   *  ONE per model, not per precision — the tower does not follow the weight
+   *  quantisation the user picked, and every Qwen3.5 from 0.8B to 397B-A17B
+   *  ships the same 27-layer tower (the 0.8B a 12-layer one, 2B/4B a 24-layer).
+   *  Its `bytes` therefore does not scale with the model: on qwen3.5-2b the
+   *  tower is 87% of the weights, on qwen3.5-27b it is 11%. Resource estimates
+   *  must add it to the COORDINATOR's node only — the tower runs whole on one
+   *  local device (see idletoken_model_mmproj in the C header for why it can
+   *  never be placed remotely). */
+  mmproj?: {
+    repo: string;
+    gguf: string;
+    bytes: number;
+    sha256: string;
+    revision: string;
+    /** GGUF clip.projector_type; the pinned engine implements
+     *  `qwen3vl_merger` and `kimik25`. */
+    projector_type: string;
+    vision_layers: number;
+    vision_embd: number;
+  };
   // Content hash of default_gguf for models WITHOUT a variants table (the
   // large MLA-MoE family). Variant models carry the hash per variant instead.
   sha256?: string;
@@ -373,6 +398,25 @@ export function isMoeModel(id: string): boolean {
 }
 
 /**
+ * The file name this model's vision tower takes ON DISK, or "" when the model
+ * has none.
+ *
+ * Deliberately NOT the name the repo publishes it under: nine curated models
+ * publish theirs as `mmproj-F16.gguf`, all different files, and the model
+ * folder is flat — under the remote name they would share one path, so two
+ * vision models could never both be ready and every switch between them would
+ * re-download up to 900 MB. (The pair that makes a size check useless: the two
+ * 27B towers are 448 bytes apart.)
+ *
+ * Lives here, next to the manifests, because two places need the same answer —
+ * the downloader (weights.ts) and the stored-file list below.
+ */
+export function mmprojLocalName(man: ModelManifest): string {
+  const mm = man.mmproj;
+  return mm && mm.gguf ? `${man.id}-${mm.gguf}` : "";
+}
+
+/**
  * Put a human name on a GGUF file found on disk.
  *
  * Searches every manifest AND every variant, not just the models currently
@@ -401,6 +445,13 @@ export function describeGguf(file: string): { label: string; quant?: string } | 
     for (const part of m.parts ?? []) {
       if (leaf(part.file) === want) return { label: m.label };
     }
+    // The vision tower, which is this model's file even though no precision
+    // owns it. Matched on the LOCAL name only: the remote one is shared by nine
+    // models, so naming a model for it would be a guess with eight ways to be
+    // wrong. A tower still sitting under the old shared name therefore lists as
+    // a plain file name — honest, and it is the one the user may want to delete.
+    const tower = mmprojLocalName(m);
+    if (tower && leaf(tower) === want) return { label: `${m.label} · vision tower` };
   }
   // Engine-produced layer shards ("L26-38.gguf": layers 26 through 38 of a
   // model, written by the weight-sharding tooling). They are not models and
@@ -860,7 +911,17 @@ export function estimateClusterCapacity(
   // then OOMs. The precision goes in because it selects the KV cache dtype, and
   // the workspace differs between cache dtypes on some architectures.
   const computeBytes = computeBytesFor(man, ctx, backend, kvQuant);
-  const needBytes = weightBytes + kvBytes + n * (computeBytes + nodeOverhead);
+  // The vision tower, charged ONCE for the cluster rather than per node —
+  // mirrors llplan_needed() in src/common/plan.c, and the parity gate compares
+  // the two. Once because it cannot be split (the pinned engine's tools/mtmd
+  // has no tensor_split / n_gpu_layers / rpc) and it is pinned to the
+  // coordinator's own device, so exactly one copy exists on one known machine.
+  // 0 for a text-only model. It does not scale with the model, so on the small
+  // end it dominates: 637 MiB on qwen3.5-2b, whose default-precision weights
+  // are 733 MiB.
+  const mmprojBytes = man.mmproj?.bytes ?? 0;
+  const needBytes =
+    weightBytes + kvBytes + n * (computeBytes + nodeOverhead) + mmprojBytes;
   // Product capacity is GPU-addressable memory only. On unified-memory
   // machines the native probe already reports the GPU working-set budget in
   // vram_usable, so there is still exactly one number to count.

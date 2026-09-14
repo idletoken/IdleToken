@@ -64,6 +64,11 @@ export interface SelfInfo {
   // Empty = not ready. Cluster joiners also keep a complete local GGUF; the
   // worker imports only its assigned tensors from that file.
   modelPath?: string;
+  // This machine's local mmproj (vision tower), as resolved and hash-verified
+  // alongside the weights. Empty = text-only model, or a vision model whose
+  // tower the user has not downloaded — the coordinator then starts text-only
+  // and says so, rather than serving a multimodal model blind.
+  mmprojPath?: string;
   // Settings-derived engine tuning (API bind/token, inter-stage port,
   // discovery port). Omitted = the Rust side's defaults (the historical
   // hard-coded ports). See settings.engineTuning().
@@ -500,6 +505,7 @@ class EnginePairing implements PairingProvider {
       hostname: self.hostname,
       gpu: self.gpu,
       modelPath: self.modelPath ?? "",
+      mmprojPath: self.mmprojPath ?? "",
       tuning: self.tuning ?? null,
     });
   }
@@ -510,6 +516,7 @@ class EnginePairing implements PairingProvider {
       hostname: self.hostname,
       gpu: self.gpu,
       modelPath: self.modelPath ?? "",
+      mmprojPath: self.mmprojPath ?? "",
       tuning: self.tuning ?? null,
     });
   }
@@ -520,6 +527,7 @@ class EnginePairing implements PairingProvider {
       hostname: self.hostname,
       gpu: self.gpu,
       modelPath: self.modelPath ?? "",
+      mmprojPath: self.mmprojPath ?? "",
       tuning: self.tuning ?? null,
       account: true,
     });
@@ -531,6 +539,7 @@ class EnginePairing implements PairingProvider {
       hostname: self.hostname,
       gpu: self.gpu,
       modelPath: self.modelPath ?? "",
+      mmprojPath: self.mmprojPath ?? "",
       tuning: self.tuning ?? null,
       account: true,
     });

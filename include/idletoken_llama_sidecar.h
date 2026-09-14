@@ -114,7 +114,27 @@ typedef struct idletoken_llama idletoken_llama;   /* opaque; one per sidecar */
  * (created 0700) for slot save/restore files across a context-ladder restart
  * (idletoken_llama_grow below). When set AND the sidecar is NOT shared, the
  * engine gets `--slot-save-path grow_dir`. Shared mode ignores it entirely:
- * --no-slots stays, and a buyer's KV never touches the provider's disk. */
+ * --no-slots stays, and a buyer's KV never touches the provider's disk.
+ *
+ * `vision`: the model's vision tower, or NULL for a text-only model (and for a
+ * vision model whose tower is not on disk — the caller decides that and says so
+ * in the log; this layer does not guess). Passing one WITHOUT a device is
+ * refused rather than defaulted, for the reason in the struct. */
+typedef struct {
+    /* Path to the mmproj GGUF, already hash-verified by the caller. */
+    const char *mmproj_path;
+    /* The LOCAL device the tower must run on ("CUDA0", "MTL0", ...). Required.
+     *
+     * There is no sane default to fall back to: the engine's own choice is
+     * ggml_backend_init_by_type(GPU) -> first REGISTERED GPU, and llama.cpp
+     * registers RPC devices ahead of local ones, so "unset" means "encode this
+     * user's image on whichever machine happens to be first in the cluster".
+     * The tower cannot be split either (no tensor_split/n_gpu_layers/rpc
+     * anywhere in tools/mtmd), so one local device is the only placement that
+     * exists. See results/multimodal-model-survey-20260914.md. */
+    const char *device;
+} idletoken_llama_vision;
+
 idletoken_llama *idletoken_llama_start(const char *bin, const char *gguf,
                                        int port, const char *engine_sock,
                                        uint32_t ctx_size, uint32_t yarn_orig_ctx,
@@ -124,6 +144,7 @@ idletoken_llama *idletoken_llama_start(const char *bin, const char *gguf,
                                        const char *cluster_args,
                                        const char *log_path, int shared,
                                        const char *grow_dir,
+                                       const idletoken_llama_vision *vision,
                                        char *err, size_t err_cap);
 
 /* Restart the engine with a LARGER per-slot context. Not a crash: the child is

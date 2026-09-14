@@ -104,6 +104,50 @@ typedef struct {
     const char *gguf;              /* default filename for this quant */
 } idletoken_model_variant;
 
+/* The vision tower (mmproj) of a model whose upstream is image-text-to-text.
+ *
+ * Why it is a SEPARATE file and not a variant: the tower is quantisation- and
+ * size-independent. Every Qwen3.5 from 0.8B to 397B-A17B ships the SAME 27-layer
+ * tower (the 0.8B a 12-layer one, the 2B/4B a 24-layer one), and it does not
+ * change when the user picks a different weight precision. Its size is set by
+ * the tower's own geometry — layers x width^2, not the language model's scale.
+ *
+ * Why it is a POINTER: NULL means "this model has no vision side at all"
+ * (DeepSeek V4, GLM-5.2, GPT-OSS -- upstream is text-generation and no mmproj
+ * exists anywhere). That is a different statement from "vision exists but we
+ * have not measured it", which cannot happen here: a row either carries
+ * measured bytes+sha256 or it carries nothing.
+ *
+ * PLACEMENT IS NOT NEGOTIABLE (2026-09-14): the tower runs whole, on ONE device.
+ * The pinned engine has no tensor-split, no n_gpu_layers and no RPC path for it
+ * -- `tools/mtmd/` does not mention any of the three. clip.cpp picks its device
+ * with ggml_backend_init_by_type(GPU), which returns the FIRST registered GPU,
+ * and llama.cpp registers RPC devices ahead of local ones. So without an
+ * explicit override an image's pixels would be encoded on somebody else's
+ * machine -- the same class of leak as running layer 0 away from the embedding
+ * table (privacy hard constraint #10), and worse, because pixels need no
+ * reconstruction. The coordinator therefore pins MTMD_BACKEND_DEVICE to a local
+ * device when it launches the sidecar. Never let this default.
+ *
+ * Bytes and sha256 come from the HF API at the pinned `revision`, the geometry
+ * from the mmproj GGUF header itself (scripts/measure_gguf.py --meta).
+ * results/multimodal-model-survey-20260914.md carries the full survey. */
+typedef struct {
+    const char *repo;           /* HF repo -- always the same repo as the weights */
+    const char *gguf;           /* file name, e.g. "mmproj-F16.gguf" */
+    const char *sha256;         /* lowercase hex; hard gate, same as the weights */
+    const char *revision;       /* HF commit the two above were measured at */
+    /* GGUF `clip.projector_type`. Recorded because it, not the model id, is what
+     * decides whether the pinned engine can load the tower at all: the pin
+     * (b10502) implements `qwen3vl_merger` and `kimik25`. A future model whose
+     * tower names something else needs an engine bump, which is its own
+     * decision (hard constraint #1) and must not ride along with a listing. */
+    const char *projector_type;
+    uint64_t    bytes;          /* file size == what the tower occupies once resident */
+    uint16_t    vision_layers;  /* count of v.blk.* */
+    uint32_t    vision_embd;    /* clip.vision.embedding_length */
+} idletoken_model_mmproj;
+
 typedef struct {
     const char *id;            /* stable id, e.g. "deepseek-v4-flash" */
     const char *label;         /* human name for logs/UI */
@@ -193,6 +237,11 @@ typedef struct {
     const char *default_gguf;  /* default filename when --model-path is absent;
                                 * mirrors variants[default_variant].gguf */
 
+    /* Vision tower, or NULL for a text-only model. See idletoken_model_mmproj.
+     * One per model, NOT per variant: the tower does not follow the weight
+     * precision the user picked. */
+    const idletoken_model_mmproj *mmproj;
+
     /* Selectable precisions. When n_variants==0 the scalar *_weight_bytes /
      * default_gguf above ARE the single implicit variant (unchanged behaviour
      * for DSv4/GLM/Kimi). When present, variants[default_variant] mirrors the
@@ -214,6 +263,16 @@ const idletoken_model_spec *idletoken_model_default(void);
  * caller already named. Index order is the table order in model.c. */
 int idletoken_model_count(void);
 const idletoken_model_spec *idletoken_model_at(int index);
+
+/* Does this model have a vision tower? Safe on NULL.
+ *
+ * The ONLY sanctioned way to ask. A caller must never decide this from the id,
+ * the family or the architecture: `qwen35` covers both Qwen3.5 (vision) and
+ * Qwen3.8 (vision), while `deepseek2` covers Kimi-K2.5 (vision) and nothing
+ * else in the list, and `qwen3` (Qwen3-8B, retired) has none. The tower's
+ * presence is a property of the weights we ship, which is exactly what the
+ * registry row records. */
+int idletoken_model_has_vision(const idletoken_model_spec *m);
 
 /* Resolve a precision by quant name (e.g. "Q8_0"). Returns the matching
  * variant, or the model's default variant when `quant` is NULL/unknown, or

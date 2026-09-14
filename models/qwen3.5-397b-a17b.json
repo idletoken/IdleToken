@@ -978,6 +978,16 @@
   "layer_weight_bytes": 114872940736,
   "shared_weight_bytes": 0,
   "default_gguf": "UD-IQ2_XXS/Qwen3.5-397B-A17B-UD-IQ2_XXS-00001-of-00004.gguf",
+  "mmproj": {
+    "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",
+    "gguf": "mmproj-F16.gguf",
+    "bytes": 918166240,
+    "sha256": "906de10b2bec29942a8e2003397fa2348cbb5c47b24efc4f6e224529a2d96404",
+    "revision": "da33c16fa4440f831149fcf53b98a22bc07785e5",
+    "projector_type": "qwen3vl_merger",
+    "vision_layers": 27,
+    "vision_embd": 1152
+  },
   "sources": [
     {
       "repo": "unsloth/Qwen3.5-397B-A17B-GGUF",

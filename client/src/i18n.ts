@@ -19,6 +19,7 @@ export const STRINGS = {
     "weights.downloading": "Downloading weights",
     "weights.download": "Download weights",
     "weights.ready": "Ready in the model folder",
+    "weights.visionNeeded": "Model ready — image support needs one more file",
     "weights.cancel": "Cancel",
     // No "Download failed" string any more (2026-08-13): an unfinished download
     // leaves the machine without the weights, which is what `weights.needed` /
@@ -421,6 +422,10 @@ export const STRINGS = {
     "chat.placeholder": "Message your cluster…",
     "chat.new": "New chat",
     "chat.stop": "Stop",
+    "chat.attach": "Attach an image",
+    "model.vision": "Images",
+    "model.vision.hint": "This model can read images you attach.",
+    "chat.attachRemove": "Remove this image",
     "chat.noConvos": "No conversations yet.",
     "chat.untitled": "New chat",
     "chat.delete": "Delete this chat",
@@ -569,6 +574,7 @@ export const STRINGS = {
     "weights.downloading": "正在下载权重",
     "weights.download": "下载权重",
     "weights.ready": "当前模型目录下已就绪",
+    "weights.visionNeeded": "模型已就绪 — 图片支持还需要一个文件",
     "weights.cancel": "取消",
     "weights.partial": "已下载 {have}，可从此处继续",
     "weights.err.noSource":
@@ -902,6 +908,10 @@ export const STRINGS = {
     "chat.placeholder": "向你的集群发送消息…",
     "chat.new": "新对话",
     "chat.stop": "停止生成",
+    "chat.attach": "添加图片",
+    "model.vision": "图片",
+    "model.vision.hint": "该模型可以读取你添加的图片。",
+    "chat.attachRemove": "移除这张图片",
     "chat.noConvos": "还没有对话。",
     "chat.untitled": "新对话",
     "chat.delete": "删除这个对话",

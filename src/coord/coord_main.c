@@ -107,6 +107,36 @@
  * (multi-model design §3.3). */
 static const idletoken_model_spec *g_model;
 
+/* Path to the model's vision tower (--mmproj-path / IDLETOKEN_MMPROJ), or ""
+ * when the caller supplied none. Only meaningful for a model whose registry row
+ * has an mmproj; for anything else a non-empty value here is a refusal, since
+ * it would mean the caller thinks this text-only model can see.
+ *
+ * Empty on a VISION model is not an error: the tower is a separate download and
+ * a coordinator may legitimately come up before it exists. What is forbidden is
+ * doing that silently — startup logs the downgrade in words, the engine then
+ * answers image requests with its own refusal, and nothing pretends the picture
+ * was read (hard constraint #11). */
+static char g_mmproj_path[1024];
+
+/* THIS machine's first compute device, by the engine's own naming.
+ *
+ * Two callers, and they must agree: the cluster device list puts this name
+ * first so layer 0 stays with the embedding table (privacy hard constraint
+ * #10), and the sidecar pins the vision tower to it so an image is encoded
+ * here rather than wherever llama.cpp happens to register a GPU first. Two
+ * copies of this rule would be two chances to drift apart on the one machine
+ * where IDLETOKEN_LLAMA_DEVICE is set. */
+static const char *coord_local_device_name(void) {
+    const char *dev = getenv("IDLETOKEN_LLAMA_DEVICE");
+    if (dev && dev[0]) return dev;
+#ifdef __APPLE__
+    return "MTL0";
+#else
+    return "CUDA0";
+#endif
+}
+
 /* Cluster salt + the token-encryption key derived from it (proto v7,
  * docs/inter-node-encryption.md §3). Minted once per coordinator run, shipped
  * in every ASSIGN_PLAN. Stays all-zero when there is no pairing psk, and then
@@ -7568,6 +7598,47 @@ static int run_llamacpp_mode(const char *llama_bin, const char *llama_gguf,
     /* Every path serves exactly the selected window it advertises. */
     if (g_ctx_display == 0) g_ctx_display = ctx_size;
 
+    /* The vision tower.
+     *
+     * THE PATH DECIDES, NOT THE REGISTRY. A supplied --mmproj-path is used,
+     * full stop. The registry is only consulted to notice the opposite case —
+     * a model known to have a tower, launched without one — which is worth a
+     * loud line because it silently downgrades what this machine can serve.
+     *
+     * Why it must be this way round (found on real hardware 2026-09-14, after
+     * the unit gates were all green): the PRODUCT path does not pass
+     * --model-id. pairing.rs launches with --llama-gguf alone, so the
+     * coordinator builds an auto manifest from the GGUF header, and an auto
+     * manifest has no mmproj field — it cannot, the tower is a different file.
+     * An earlier version of this block refused to start whenever the registry
+     * did not know about a tower, which would have rejected EVERY vision
+     * deployment in the product while passing every test. A registry that says
+     * "no tower" is, on that path, only saying "I was not told".
+     *
+     * Handing over a projector that does not belong to this model is not
+     * unchecked either: the engine loads it and fails loudly (clip_model_loader
+     * validates the tensors), which is the right place for that judgement.
+     *
+     * The device is never left to the engine: see idletoken_llama_vision. */
+    idletoken_llama_vision vision = {0};
+    const idletoken_llama_vision *vision_arg = NULL;
+    if (g_mmproj_path[0]) {
+        vision.mmproj_path = g_mmproj_path;
+        vision.device = coord_local_device_name();
+        vision_arg = &vision;
+        printf("  vision      : %s on %s%s%s\n",
+               g_mmproj_path, vision.device,
+               idletoken_model_has_vision(g_model) ? " — " : "",
+               idletoken_model_has_vision(g_model)
+                   ? g_model->mmproj->projector_type : "");
+    } else if (idletoken_model_has_vision(g_model)) {
+        fprintf(stderr,
+                "idletoken-coord: %s has a vision tower (%s) but none was "
+                "given (--mmproj-path / IDLETOKEN_MMPROJ) — serving TEXT "
+                "ONLY; image requests will be refused by the engine\n",
+                g_model->id, g_model->mmproj->gguf);
+    }
+
     char err[256] = "";
     g_llama = idletoken_llama_start(llama_bin, llama_gguf, llama_port,
                                     engine_sock, ctx_size, yarn_orig,
@@ -7575,6 +7646,7 @@ static int run_llamacpp_mode(const char *llama_bin, const char *llama_gguf,
                                     n_cpu_moe,
                                     ngl_arg, cluster_args, log_path, g_shared_mode,
                                     NULL,
+                                    vision_arg,
                                     err, sizeof(err));
     if (!g_llama) {
         fprintf(stderr, "idletoken-coord: could not start the inference engine: %s\n",
@@ -8946,14 +9018,7 @@ static int run_llamacpp_cluster_mode(
         return 1;
     }
 
-    const char *local_dev = getenv("IDLETOKEN_LLAMA_DEVICE");
-    if (!local_dev || !local_dev[0]) {
-#ifdef __APPLE__
-        local_dev = "MTL0";
-#else
-        local_dev = "CUDA0";
-#endif
-    }
+    const char *local_dev = coord_local_device_name();
 
     char rpc_list[1024] = "", dev_list[1024] = "", split_list[1024] = "";
     char override_list[4096] = "";
@@ -9499,6 +9564,11 @@ int main(int argc, char **argv) {
      * quoting). */
     const char *llama_bin  = getenv("IDLETOKEN_LLAMA_SERVER_BIN");
     const char *llama_gguf = getenv("IDLETOKEN_LLAMA_GGUF");
+    {   /* Same env fallback as the two above, for the same reason (the Tauri
+         * sidecar passes paths without shell quoting). --mmproj-path wins. */
+        const char *mp = getenv("IDLETOKEN_MMPROJ");
+        if (mp && mp[0]) snprintf(g_mmproj_path, sizeof(g_mmproj_path), "%s", mp);
+    }
     int         llama_port = 18099;
     if (getenv("IDLETOKEN_SHARED") && atoi(getenv("IDLETOKEN_SHARED")) != 0)
         g_shared_mode = 1;
@@ -9531,6 +9601,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--model-id")    && i + 1 < argc) model_id    = argv[++i];
         else if (!strcmp(a, "--model-path")  && i + 1 < argc) model_path  = argv[++i];
         else if (!strcmp(a, "--gguf-dir")    && i + 1 < argc) gguf_dir    = argv[++i];
+        else if (!strcmp(a, "--mmproj-path") && i + 1 < argc)
+            snprintf(g_mmproj_path, sizeof(g_mmproj_path), "%s", argv[++i]);
         else if (!strcmp(a, "--quant")       && i + 1 < argc) quant       = argv[++i];
         else if (!strcmp(a, "--n-predict")   && i + 1 < argc) n_predict   = atoi(argv[++i]);
         else if (!strcmp(a, "--max-decode")  && i + 1 < argc) max_decode  = atoi(argv[++i]);

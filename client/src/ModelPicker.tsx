@@ -26,6 +26,7 @@ import {
   AVAILABLE_MODELS,
   MODEL_BRANDS,
   defaultQuant,
+  getManifest,
   quantOptions,
   shortModelLabel,
 } from "./models";
@@ -370,6 +371,18 @@ export default function ModelPicker(props: {
                     {/* Parameter counts cut 2026-08-26 (owner's call): "1T ·
                         32B active" does not help the pick; the name and the
                         fit chip do. */}
+                    {/* Vision is a capability that changes what you can ASK,
+                        which is exactly the decision this list is for. Read
+                        from the manifest's tower rather than the family name:
+                        `qwen35` covers models with and without one. Ten of the
+                        sixteen have it, so the chip marks the ones that do and
+                        stays silent otherwise -- a "text only" badge on six
+                        rows would be noise. */}
+                    {getManifest(m.id)?.mmproj ? (
+                      <span className="modelpick__vision" title={t("model.vision.hint")}>
+                        {t("model.vision")}
+                      </span>
+                    ) : null}
                     {/* Can these machines actually run it — the advisor's verdict.
                         Since 2026-08-21 this chip is the ONLY place it appears:
                         the capability table was cut to four columns and the

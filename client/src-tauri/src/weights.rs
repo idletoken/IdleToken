@@ -498,6 +498,63 @@ fn validate_weight_relative(file: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// Move a vision tower downloaded before towers had model-scoped names onto the
+/// name this model now looks for. Returns true when something was renamed.
+///
+/// Called on the miss path of the presence probe, so the upgrade does not tell
+/// a user with the file already on disk that they "need one more file" -- the
+/// exact sentence that has been wrong twice before on this feature.
+///
+/// **Identity comes from the MARKER, never from a hash computed here.** This
+/// runs on a UI path where a 900 MB hash would be a freeze, and the marker is
+/// already the proof that this exact file passed the gate: it is written only
+/// after a full hash matched. No marker (hand-copied file, older client) means
+/// no rename -- the download path adopts that one, where hashing is expected
+/// and has a progress bar.
+///
+/// Nothing is ever deleted or overwritten. Under the shared remote name the
+/// file may belong to any of nine models, and a wrong guess here would destroy
+/// another model's tower.
+#[tauri::command]
+pub fn weights_adopt(
+    dest_dir: String,
+    from: String,
+    to: String,
+    expect_bytes: u64,
+    expect_sha256: String,
+) -> bool {
+    if from == to || expect_bytes == 0 || expect_sha256.is_empty() {
+        return false;
+    }
+    let (Ok(rel_from), Ok(rel_to)) = (validate_weight_relative(&from), validate_weight_relative(&to))
+    else {
+        return false;
+    };
+    let root = PathBuf::from(&dest_dir);
+    let (src, dst) = (root.join(rel_from), root.join(rel_to));
+    // Never overwrite: whatever is already under the new name is this model's
+    // tower by construction, and it is the one that has been checked.
+    if dst.exists() {
+        return false;
+    }
+    // Exact size. The two 27B towers are 448 bytes apart, so `>=` would let one
+    // stand in for the other right up to the hash gate.
+    if fs::metadata(&src).map(|m| m.len()).unwrap_or(0) != expect_bytes {
+        return false;
+    }
+    match fs::read_to_string(marker_of(&src)) {
+        Ok(mk) if mk.trim().eq_ignore_ascii_case(&expect_sha256) => {}
+        _ => return false,
+    }
+    if fs::rename(&src, &dst).is_err() {
+        return false;
+    }
+    // The marker travels with the file it certifies; leaving it behind would
+    // bless whatever lands under the old name next.
+    let _ = fs::rename(marker_of(&src), marker_of(&dst));
+    true
+}
+
 fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut s = path.as_os_str().to_os_string();
     s.push(suffix);
@@ -646,6 +703,10 @@ pub async fn weights_fetch(
     revision: String,
     endpoints: Vec<String>,
     parts: Vec<SplitPart>,
+    // Local name for the FIRST file when it must differ from the remote one
+    // (see fetch_inner). Absent/empty keeps the remote name. Split parts are
+    // never renamed: llama.cpp finds them by their own names next to part 1.
+    save_as: Option<String>,
 ) -> Result<(), String> {
     // One download per id, enforced here. `register` used to just drop the old
     // entry and keep going, so a second call left the first task running —
@@ -661,8 +722,16 @@ pub async fn weights_fetch(
                 .into(),
         );
     }
-    // Same file under a different id: still two writers on one .part.
-    let part = part_of(&PathBuf::from(&dest_dir).join(&file));
+    // Same file under a different id: still two writers on one .part. Keyed on
+    // the LOCAL name, because that is what `.part` is derived from -- under the
+    // remote name two different models' towers (both `mmproj-F16.gguf`) would
+    // look like one transfer and the second would be refused as a duplicate.
+    let local_first = save_as.clone().unwrap_or_default();
+    let part = part_of(&PathBuf::from(&dest_dir).join(if local_first.is_empty() {
+        file.as_str()
+    } else {
+        local_first.as_str()
+    }));
     if is_active_part(&part) {
         return Err(
             "these weights are already being downloaded by another task — wait for it to finish or cancel it first"
@@ -690,6 +759,7 @@ pub async fn weights_fetch(
         // The denominator is the sum of what the manifest declares. A part with
         // an unknown size contributes its server-reported length once it starts,
         // so the total can only get more accurate, never wrong-and-stuck.
+        let save_local = save_as.clone().unwrap_or_default();
         let declared_total: u64 = all.iter().map(|(_, b, _)| *b).sum();
         let done_before = std::sync::Arc::new(Mutex::new(0u64));
         let mut out: Result<String, String> = Err("no parts to download".into());
@@ -704,16 +774,23 @@ pub async fn weights_fetch(
                     all.len() as u64,
                 ));
             };
+            // Only part 1 may be renamed; the continuation files must keep the
+            // names the loader derives from it.
+            let local = if idx == 0 { save_local.as_str() } else { "" };
             out = fetch_inner(
-                &id2, &repo, pfile, &dest_dir, *pbytes, psha, &revision, &endpoints,
-                &cancel, &emit,
+                &id2, &repo, pfile, local, &dest_dir, *pbytes, psha, &revision,
+                &endpoints, &cancel, &emit,
             );
             match &out {
                 // Only the FIRST part's path is reported as the result: that is
                 // the file the engine is handed, and llama.cpp finds the rest by
                 // name in the same directory.
                 Ok(_) => {
-                    let landed = fs::metadata(PathBuf::from(&dest_dir).join(pfile))
+                    // Measured under the name it landed on -- part 1 may have
+                    // been renamed, and probing the remote name there would
+                    // silently fall back to the declared size.
+                    let landed_name = if idx == 0 && !local.is_empty() { local } else { pfile.as_str() };
+                    let landed = fs::metadata(PathBuf::from(&dest_dir).join(landed_name))
                         .map(|m| m.len())
                         .unwrap_or(*pbytes);
                     *done_before.lock().unwrap() = base + landed;
@@ -723,9 +800,11 @@ pub async fn weights_fetch(
                 Err(_) => break,
             }
         }
+        // Report the path the file actually landed on, not the remote name —
+        // this string is what the caller hands the engine.
         let out = out.map(|_| {
             PathBuf::from(&dest_dir)
-                .join(&file)
+                .join(if save_local.is_empty() { file.as_str() } else { save_local.as_str() })
                 .to_string_lossy()
                 .into_owned()
         });
@@ -968,6 +1047,18 @@ fn fetch_inner(
     id: &str,
     repo: &str,
     file: &str,
+    // Local file name, when it must differ from the remote one. Empty = save
+    // under `file`, which is what every weight download does.
+    //
+    // The vision towers need it: NINE curated models publish theirs as
+    // `mmproj-F16.gguf` in their own repo, all different files (195 MB to
+    // 927 MB, every digest distinct). Saving them under the remote name puts
+    // them all on one path, so two vision models can never both be ready and
+    // switching between them re-downloads up to 900 MB every time. Worse,
+    // qwen3.5-27b and qwen3.8-27b differ by 448 bytes and the completeness
+    // test is `on_disk >= expected` -- the wrong tower reads as present until
+    // the hash gate catches it one step later.
+    save_as: &str,
     dest_dir: &str,
     expect_bytes: u64,
     expect_sha256: &str,
@@ -983,7 +1074,10 @@ fn fetch_inner(
     let revision = if revision.is_empty() { "main" } else { revision };
     let dir = PathBuf::from(dest_dir);
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create the download directory {dest_dir}: {e}"))?;
-    let final_path = dir.join(file);
+    // The REMOTE name (`file`) still addresses the repo; only the local path
+    // changes. Keeping the two separate is the whole point of `save_as`.
+    let local_name = if save_as.is_empty() { file } else { save_as };
+    let final_path = dir.join(local_name);
     let part_path = part_of(&final_path);
 
     // A complete copy already present is used -- downloaded by the script, or
@@ -993,6 +1087,43 @@ fn fetch_inner(
         if m.len() > 0 && (expect_bytes == 0 || m.len() >= expect_bytes) {
             ensure_final_verified(&final_path, expect_sha256, id, cancel, emit)?;
             return Ok(final_path.to_string_lossy().into_owned());
+        }
+    }
+
+    // A tower downloaded by an older client sits under the REMOTE name, which
+    // is where every vision model used to put its own. Adopt it -- rename, no
+    // transfer -- but only on an exact hash match, which is proof it is this
+    // model's tower and not one of the eight others called `mmproj-F16.gguf`.
+    //
+    // On a mismatch the file is left exactly where it is. It belongs to some
+    // other model, whose own download will adopt it in turn; deleting it here
+    // would make "fetch A" quietly destroy B's tower.
+    if !save_as.is_empty() && !expect_sha256.is_empty() {
+        let legacy = dir.join(file);
+        // Exact size, not `>=`: the two 27B towers are 448 bytes apart, so a
+        // loose comparison would send a 900 MB file through the hash for
+        // nothing on every switch.
+        let legacy_len = fs::metadata(&legacy).map(|m| m.len()).unwrap_or(0);
+        if legacy != final_path && expect_bytes > 0 && legacy_len == expect_bytes {
+            let adopt = match fs::read_to_string(marker_of(&legacy)) {
+                // Its own marker already answers the question; no second pass
+                // over 900 MB.
+                Ok(mk) if mk.trim().eq_ignore_ascii_case(expect_sha256) => true,
+                _ => match file_sha256(&legacy, id, cancel, emit) {
+                    Ok(got) => got.eq_ignore_ascii_case(expect_sha256),
+                    // A cancel during the hash is still a cancel: falling
+                    // through here would start the very transfer the user just
+                    // stopped. Any other read failure just means "cannot
+                    // adopt", and the normal download takes over.
+                    Err(e) if cancel.load(Ordering::SeqCst) => return Err(e),
+                    Err(_) => false,
+                },
+            };
+            if adopt && fs::rename(&legacy, &final_path).is_ok() {
+                let _ = fs::remove_file(marker_of(&legacy));
+                let _ = fs::write(marker_of(&final_path), format!("{expect_sha256}\n"));
+                return Ok(final_path.to_string_lossy().into_owned());
+            }
         }
     }
 
@@ -1492,6 +1623,148 @@ mod integrity_tests {
         promote_verified(&part, &fin, ABC, "t", &cancel, &no_emit).unwrap();
         assert!(fin.exists() && !part.exists());
         assert_eq!(fs::read_to_string(marker_of(&fin)).unwrap().trim(), ABC);
+    }
+
+    /// An unreachable endpoint, so "it reached the network" is a visible
+    /// failure rather than a slow test that quietly downloads something.
+    fn nowhere() -> Vec<String> {
+        vec!["http://127.0.0.1:1".to_string()]
+    }
+
+    #[test]
+    fn a_tower_under_the_old_remote_name_is_adopted_not_re_downloaded() {
+        // What the user hits after upgrading: the tower is already there, under
+        // the name every vision model used to share.
+        let d = tmpdir();
+        fs::write(d.join("mmproj-F16.gguf"), b"abc").unwrap();
+        let cancel = AtomicBool::new(false);
+        let got = fetch_inner(
+            "t", "repo/x", "mmproj-F16.gguf", "qwen3.5-9b-mmproj-F16.gguf",
+            d.to_str().unwrap(), 3, ABC, "", &nowhere(), &cancel, &no_emit,
+        )
+        .expect("a matching local file must be adopted without any transfer");
+        assert_eq!(PathBuf::from(&got), d.join("qwen3.5-9b-mmproj-F16.gguf"));
+        assert!(!d.join("mmproj-F16.gguf").exists(), "adopted, so moved -- not left as a 900 MB orphan");
+        assert_eq!(fs::read_to_string(marker_of(&PathBuf::from(&got))).unwrap().trim(), ABC);
+    }
+
+    #[test]
+    fn another_models_tower_under_the_same_name_is_left_alone() {
+        // Same name, same length, one byte different -- i.e. one of the eight
+        // other `mmproj-F16.gguf` files. Fetching this model must not consume
+        // it, and above all must not delete it.
+        let d = tmpdir();
+        fs::write(d.join("mmproj-F16.gguf"), b"abd").unwrap();
+        let cancel = AtomicBool::new(false);
+        let r = fetch_inner(
+            "t", "repo/x", "mmproj-F16.gguf", "qwen3.5-9b-mmproj-F16.gguf",
+            d.to_str().unwrap(), 3, ABC, "", &nowhere(), &cancel, &no_emit,
+        );
+        assert!(r.is_err(), "with no adoptable file and no network there is nothing to return");
+        assert!(d.join("mmproj-F16.gguf").exists(), "fetching one model must never destroy another's tower");
+        assert!(!d.join("qwen3.5-9b-mmproj-F16.gguf").exists());
+    }
+
+    #[test]
+    fn weights_are_never_adopted_from_another_name() {
+        // Negative control for the gate itself: with no save_as there is no
+        // second path to look at, so this must not quietly pick up a
+        // same-length file that happens to be sitting nearby.
+        let d = tmpdir();
+        fs::write(d.join("other.gguf"), b"abc").unwrap();
+        let cancel = AtomicBool::new(false);
+        let r = fetch_inner(
+            "t", "repo/x", "wanted.gguf", "",
+            d.to_str().unwrap(), 3, ABC, "", &nowhere(), &cancel, &no_emit,
+        );
+        assert!(r.is_err());
+        assert!(d.join("other.gguf").exists());
+        assert!(!d.join("wanted.gguf").exists());
+    }
+
+    /// The upgrade case: the tower is on disk under the shared remote name,
+    /// with the marker this client wrote when it downloaded it.
+    fn legacy_tower(d: &Path, bytes: &[u8], marker: &str) {
+        fs::write(d.join("mmproj-F16.gguf"), bytes).unwrap();
+        fs::write(marker_of(&d.join("mmproj-F16.gguf")), format!("{marker}\n")).unwrap();
+    }
+
+    #[test]
+    fn adopt_claims_a_marked_tower_and_takes_its_marker_along() {
+        let d = tmpdir();
+        legacy_tower(&d, b"abc", ABC);
+        assert!(weights_adopt(
+            d.to_string_lossy().into(), "mmproj-F16.gguf".into(),
+            "qwen3.5-9b-mmproj-F16.gguf".into(), 3, ABC.into(),
+        ));
+        assert!(d.join("qwen3.5-9b-mmproj-F16.gguf").exists());
+        assert!(!d.join("mmproj-F16.gguf").exists());
+        assert!(!marker_of(&d.join("mmproj-F16.gguf")).exists(),
+            "a marker left behind would bless the next file under that name");
+        assert_eq!(
+            fs::read_to_string(marker_of(&d.join("qwen3.5-9b-mmproj-F16.gguf"))).unwrap().trim(),
+            ABC
+        );
+    }
+
+    #[test]
+    fn adopt_refuses_a_tower_whose_marker_names_another_model() {
+        // Same name, same length, verified as something else: one of the eight
+        // other `mmproj-F16.gguf` files. Must be left exactly where it is.
+        let d = tmpdir();
+        let other = "0000000000000000000000000000000000000000000000000000000000000000";
+        legacy_tower(&d, b"abd", other);
+        assert!(!weights_adopt(
+            d.to_string_lossy().into(), "mmproj-F16.gguf".into(),
+            "qwen3.5-9b-mmproj-F16.gguf".into(), 3, ABC.into(),
+        ));
+        assert!(d.join("mmproj-F16.gguf").exists());
+        assert!(!d.join("qwen3.5-9b-mmproj-F16.gguf").exists());
+    }
+
+    #[test]
+    fn adopt_refuses_an_unmarked_file() {
+        // No marker = no proof, and this path must never hash: it runs on the
+        // UI thread's probe. The download path adopts this one instead.
+        let d = tmpdir();
+        fs::write(d.join("mmproj-F16.gguf"), b"abc").unwrap();
+        assert!(!weights_adopt(
+            d.to_string_lossy().into(), "mmproj-F16.gguf".into(),
+            "qwen3.5-9b-mmproj-F16.gguf".into(), 3, ABC.into(),
+        ));
+        assert!(d.join("mmproj-F16.gguf").exists());
+    }
+
+    #[test]
+    fn adopt_refuses_on_a_size_mismatch_and_never_overwrites() {
+        let d = tmpdir();
+        legacy_tower(&d, b"abc", ABC);
+        // Wrong declared size: the two 27B towers are 448 bytes apart, so this
+        // check has to be exact.
+        assert!(!weights_adopt(
+            d.to_string_lossy().into(), "mmproj-F16.gguf".into(),
+            "qwen3.5-9b-mmproj-F16.gguf".into(), 4, ABC.into(),
+        ));
+        // And a destination that already exists is never replaced.
+        fs::write(d.join("qwen3.5-9b-mmproj-F16.gguf"), b"keep").unwrap();
+        assert!(!weights_adopt(
+            d.to_string_lossy().into(), "mmproj-F16.gguf".into(),
+            "qwen3.5-9b-mmproj-F16.gguf".into(), 3, ABC.into(),
+        ));
+        assert_eq!(fs::read(d.join("qwen3.5-9b-mmproj-F16.gguf")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn adopt_refuses_to_leave_the_model_folder() {
+        let d = tmpdir();
+        legacy_tower(&d, b"abc", ABC);
+        for bad in ["../escaped.gguf", "/etc/passwd.gguf", "sub/../../x.gguf"] {
+            assert!(!weights_adopt(
+                d.to_string_lossy().into(), "mmproj-F16.gguf".into(),
+                bad.into(), 3, ABC.into(),
+            ), "{bad} must be refused");
+        }
+        assert!(d.join("mmproj-F16.gguf").exists());
     }
 
     #[test]

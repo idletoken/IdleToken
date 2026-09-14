@@ -334,6 +334,25 @@ typedef struct {
      * is already reduced. Kept so a log line can state the configuration it
      * priced instead of leaving the reader to re-derive it from the quant. */
     uint8_t kv_tier;
+    /* The vision tower, in bytes, or 0 for a text-only model (and for a vision
+     * model launched without its tower, which serves text and says so).
+     *
+     * Charged ONCE for the whole cluster, NOT per node — the opposite of the
+     * workspace above, and for a concrete reason rather than a convention: the
+     * tower cannot be split (the pinned engine's tools/mtmd has no
+     * tensor_split, no n_gpu_layers and no rpc path) and it is pinned to the
+     * coordinator's own device so an image is never encoded on someone else's
+     * machine. One copy exists, on one known machine.
+     *
+     * It does not scale with the model, so on the small end it is most of the
+     * budget: the tower is 87% of qwen3.5-2b's weights at its default
+     * precision and 11% of qwen3.5-27b's. Leaving it out understates a 2B
+     * vision launch by ~640 MiB in the admit-then-OOM direction.
+     *
+     * Measured, never derived: it is the mmproj file's own size, recorded in
+     * models/<id>.json and the C registry from the HF API at a pinned revision
+     * (results/multimodal-model-survey-20260914.md). */
+    uint64_t mmproj_bytes;
 } idletoken_llm_model_size;
 
 /* Owner-local cache geometry for RAM expert layers [lo,hi). On success,

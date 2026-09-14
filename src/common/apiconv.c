@@ -296,6 +296,131 @@ static int flatten_text_content(sb_t *tsb, const char *cv, const char *end) {
     return pieces;
 }
 
+/* Does this content array hold anything that is NOT plain text or a tool block?
+ *
+ * The question is deliberately "not text", not "is an image". Until 2026-09-14
+ * flatten_text_content() kept `type == "text"` and dropped everything else on
+ * the floor, so an Anthropic image block vanished between the client and the
+ * engine and the model answered, fluently and confidently, about a picture it
+ * had never received. An empty reply looks broken; that does not.
+ *
+ * So anything unrecognised now travels instead of being discarded. Images are
+ * translated below; a `document` (PDF) or any future block type is passed
+ * through verbatim, and the ENGINE names it —
+ * "unsupported content[].type" (server-common.cpp) — which the coordinator
+ * turns into a 400. The engine is the authority on what it can consume, and a
+ * refusal with a reason beats a silent deletion every time. */
+static int content_has_nontext_block(const char *cv, const char *end) {
+    if (!cv || *cv != '[') return 0;
+    size_t it = 0;
+    const char *el;
+    long el_len;
+    while (arr_next(cv, end, &it, &el, &el_len)) {
+        if (*el != '{') continue;
+        const char *ty;
+        size_t tyl;
+        if (idletoken_json_obj_str(el, (size_t)el_len, "type", &ty, &tyl) != 0)
+            continue;
+        if (tyl == 4 && memcmp(ty, "text", 4) == 0) continue;
+        /* Handled by their own emitters, not by the content array. */
+        if (tyl == 8 && memcmp(ty, "tool_use", 8) == 0) continue;
+        if (tyl == 11 && memcmp(ty, "tool_result", 11) == 0) continue;
+        return 1;
+    }
+    return 0;
+}
+
+/* Anthropic content blocks -> an OpenAI content PART ARRAY, in the order the
+ * caller wrote them.
+ *
+ * Order is not cosmetic: "what is in this picture?" before an image and after
+ * it are different prompts, and every vision template positions the image
+ * marker where the block sits. Joining text first and appending images would
+ * quietly rewrite the user's message.
+ *
+ * Anthropic image sources come in two shapes and both map onto one OpenAI
+ * `image_url`:
+ *   base64 -> "data:<media_type>;base64,<data>"   (the common case: pasted
+ *             screenshots, Claude Code attachments)
+ *   url    -> the url as given
+ * Spans come straight from the parser, still JSON-escaped, so they are copied
+ * rather than re-escaped -- re-escaping would double every backslash in a URL.
+ * Base64 payloads are large (a few hundred KiB of image becomes a few hundred
+ * thousand characters); the builder grows, and nothing here copies twice. */
+static void emit_content_parts(sb_t *b, const char *cv, const char *end) {
+    sb_cstr(b, "[");
+    int n = 0;
+    size_t it = 0;
+    const char *el;
+    long el_len;
+    while (arr_next(cv, end, &it, &el, &el_len)) {
+        if (*el != '{') continue;
+        const char *ty;
+        size_t tyl;
+        if (idletoken_json_obj_str(el, (size_t)el_len, "type", &ty, &tyl) != 0)
+            continue;
+        if (tyl == 8 && memcmp(ty, "tool_use", 8) == 0) continue;
+        if (tyl == 11 && memcmp(ty, "tool_result", 11) == 0) continue;
+
+        if (tyl == 4 && memcmp(ty, "text", 4) == 0) {
+            const char *tx;
+            size_t txl;
+            if (idletoken_json_obj_str(el, (size_t)el_len, "text", &tx, &txl) != 0)
+                continue;
+            if (n++) sb_cstr(b, ",");
+            sb_cstr(b, "{\"type\":\"text\",\"text\":\"");
+            sb_put(b, tx, txl);
+            sb_cstr(b, "\"}");
+            continue;
+        }
+
+        if (tyl == 5 && memcmp(ty, "image", 5) == 0) {
+            const char *src = idletoken_json_obj_get(el, (size_t)el_len, "source");
+            long srcl = src ? idletoken_json_value_len(src, el + el_len) : 0;
+            if (!src || *src != '{' || srcl <= 0) continue;
+            const char *st;
+            size_t stl;
+            const int is_b64 =
+                idletoken_json_obj_str(src, (size_t)srcl, "type", &st, &stl) == 0 &&
+                stl == 6 && memcmp(st, "base64", 6) == 0;
+            if (is_b64) {
+                const char *mt, *da;
+                size_t mtl, dal;
+                if (idletoken_json_obj_str(src, (size_t)srcl, "media_type",
+                                           &mt, &mtl) != 0 ||
+                    idletoken_json_obj_str(src, (size_t)srcl, "data",
+                                           &da, &dal) != 0)
+                    continue;
+                if (n++) sb_cstr(b, ",");
+                sb_cstr(b, "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:");
+                sb_put(b, mt, mtl);
+                sb_cstr(b, ";base64,");
+                sb_put(b, da, dal);
+                sb_cstr(b, "\"}}");
+            } else {
+                const char *u;
+                size_t ul;
+                if (idletoken_json_obj_str(src, (size_t)srcl, "url", &u, &ul) != 0)
+                    continue;
+                if (n++) sb_cstr(b, ",");
+                sb_cstr(b, "{\"type\":\"image_url\",\"image_url\":{\"url\":\"");
+                sb_put(b, u, ul);
+                sb_cstr(b, "\"}}");
+            }
+            continue;
+        }
+
+        /* Anything else, verbatim, for the engine to accept or name. */
+        if (n++) sb_cstr(b, ",");
+        sb_put(b, el, (size_t)el_len);
+    }
+    /* A block array that produced no part at all would emit `"content":[]`,
+     * which some templates render as an empty turn. One empty text part keeps
+     * the message well-formed without inventing words. */
+    if (!n) sb_cstr(b, "{\"type\":\"text\",\"text\":\"\"}");
+    sb_cstr(b, "]");
+}
+
 int idletoken_body_has_tools(const char *body, size_t len) {
     if (!body || len == 0) return 0;
     const char *v = idletoken_json_obj_get(body, len, "tools");
@@ -405,7 +530,17 @@ static int emit_block_message(sb_t *b, const char *role, size_t rl,
             (*n_msgs)++;
             emitted++;
         }
-        if (text_pieces > 0) {
+        /* Images (and anything else non-text) force the ARRAY form of
+         * `content`; a pure-text turn keeps the flat string it has always
+         * had, so nothing about existing text traffic changes shape.
+         *
+         * `has_media` also has to override the `text_pieces > 0` gate below:
+         * a message that is nothing but an image has no text pieces at all,
+         * and under the old gate the whole turn was dropped -- which is how
+         * an image-only question used to come back as "missing or empty
+         * 'messages'/'content'". */
+        const int has_media = content_has_nontext_block(cv, end);
+        if (text_pieces > 0 || has_media) {
             /* Demote a non-leading system role to user (see header). */
             const int demote = (*n_msgs > 0 && rl == 6 &&
                                 memcmp(role, "system", 6) == 0);
@@ -413,9 +548,15 @@ static int emit_block_message(sb_t *b, const char *role, size_t rl,
             sb_cstr(b, "{\"role\":\"");
             if (demote) sb_cstr(b, "user");
             else        sb_put(b, role, rl);
-            sb_cstr(b, "\",\"content\":\"");
-            if (tsb.p) sb_put(b, tsb.p, tsb.len);
-            sb_cstr(b, "\"}");
+            sb_cstr(b, "\",\"content\":");
+            if (has_media) {
+                emit_content_parts(b, cv, end);
+            } else {
+                sb_cstr(b, "\"");
+                if (tsb.p) sb_put(b, tsb.p, tsb.len);
+                sb_cstr(b, "\"");
+            }
+            sb_cstr(b, "}");
             (*n_msgs)++;
             emitted++;
         }

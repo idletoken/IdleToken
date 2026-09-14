@@ -468,9 +468,13 @@ static uint64_t llplan_needed(const idletoken_llm_model_size *model,
     need = sat_add_u64(need,
         sat_mul_u64((uint64_t)n_nodes,
                     idletoken_llama_compute_bytes(model, ctx_size, backend)));
-    return sat_add_u64(need,
+    need = sat_add_u64(need,
         sat_mul_u64((uint64_t)n_nodes,
                     idletoken_llama_node_overhead(model->total_bytes)));
+    /* The vision tower: once, not per node. It is indivisible and lives on the
+     * coordinator's device (see idletoken_llm_model_size.mmproj_bytes). Zero
+     * for a text-only model, so this line changes nothing for them. */
+    return sat_add_u64(need, model->mmproj_bytes);
 }
 
 uint64_t idletoken_llama_hard_need(const idletoken_llm_model_size *model,
@@ -484,9 +488,12 @@ uint64_t idletoken_llama_hard_need(const idletoken_llm_model_size *model,
     uint64_t need = sat_add_u64(idletoken_llama_kv_bytes(model, ctx_size),
         sat_mul_u64((uint64_t)n_nodes,
                     idletoken_llama_compute_bytes(model, ctx_size, backend)));
-    return sat_add_u64(need,
+    need = sat_add_u64(need,
         sat_mul_u64((uint64_t)n_nodes,
                     idletoken_llama_node_overhead(model->total_bytes)));
+    /* Resident like the KV cache: the tower is loaded into device memory, not
+     * mmap'd. Once for the cluster, on the coordinator. */
+    return sat_add_u64(need, model->mmproj_bytes);
 }
 
 uint64_t idletoken_llama_working_set(const idletoken_llm_model_size *model) {
@@ -944,8 +951,15 @@ static int try_cluster_moe_hybrid(const idletoken_llm_model_size *model,
                  * KV follows the layer share. Graph peak is not additive by
                  * layer: a short range can still contain its largest operation.
                  * Charge the measured whole-model peak per owner. */
+                /* The vision tower rides with the shared weights: both are
+                 * carried by slot 0 alone (order[0] is the coordinator) and
+                 * neither divides with the layers. Without it a vision MoE
+                 * would be admitted ~0.9 GiB short of what the coordinator
+                 * actually loads — and the four vision MoE models are exactly
+                 * the ones that reach this Hybrid path. */
                 const uint64_t weights = sat_add_u64(weight_prefix[hi] - weight_prefix[lo],
-                    slot == 0 ? model->weight_bytes_shared : 0);
+                    slot == 0 ? sat_add_u64(model->weight_bytes_shared,
+                                            model->mmproj_bytes) : 0);
                 uint64_t gpu = sat_add_u64(overhead, sat_add_u64(weights,
                     sat_add_u64(graph_bytes, mul_div_ceil_u64(kv_all, count, layers))));
                 const uint64_t gpu_base = gpu;
@@ -1745,6 +1759,13 @@ static int plan_llamacpp_inner(const idletoken_llm_model_size *model,
     for (int i = 0; i < n; i++)
         out->gpu_need_bytes_per_node[i] = sat_add_u64(per_node_oh,
             (uint64_t)(out->tensor_split[i] * (double)slice_all));
+    /* The vision tower is indivisible and lives on the coordinator, which is
+     * slot 0 by construction (order[0] = coordinator). The cluster TOTAL above
+     * already carries it through llplan_needed(); without this line the
+     * per-machine figures would not add up to it, and the card would understate
+     * the one machine that actually loads the tower. */
+    out->gpu_need_bytes_per_node[0] = sat_add_u64(out->gpu_need_bytes_per_node[0],
+                                                  model->mmproj_bytes);
 
     if (coord_usable >= need1) {
         /* The user explicitly selected a cluster even though the model fits

@@ -60,6 +60,16 @@
     1485423247
   ],
   "default_gguf": "moonshotai_Kimi-K2.5-IQ1_S/moonshotai_Kimi-K2.5-IQ1_S-00001-of-00006.gguf",
+  "mmproj": {
+    "repo": "bartowski/moonshotai_Kimi-K2.5-GGUF",
+    "gguf": "mmproj-moonshotai_Kimi-K2.5-f16.gguf",
+    "bytes": 952572160,
+    "sha256": "9261f190d7b8561fc69f70d2bbbc533d5975704f19c6d2b08fa8ac6c133ec78c",
+    "revision": "5b64e856ff9f4d062857d952451f38219dff1382",
+    "projector_type": "kimik25",
+    "vision_layers": 27,
+    "vision_embd": 1152
+  },
   "chat_template": "gguf",
   "sources": [
     {

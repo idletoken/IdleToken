@@ -16,11 +16,24 @@ import { inTauri } from "./platform";
 import type { ClusterApi } from "./pairing";
 import { recordProblem } from "./problems";
 import { useClusterStats, servedModelOf } from "./clusterStats";
+import { attachmentFromFile, splitDataUrl, type Attachment } from "./images";
+import { getManifest } from "./models";
 import { fmtQuant } from "./format";
 
 interface ChatMsg {
   role: "user" | "assistant";
   text: string;
+  /** Pictures attached to this turn, as data: URLs.
+   *
+   *  `images` is the ORIGINAL bytes and is deliberately NOT persisted (see
+   *  persist() below): a couple of phone screenshots would push the whole
+   *  history past the localStorage quota, and a quota-exceeded setItem throws,
+   *  which loses every conversation rather than one image.
+   *  `thumbs` is the downscaled copy that survives a reload, and is what a
+   *  reloaded turn replays with — a lower-resolution picture beats asking the
+   *  model to answer follow-ups about one it can no longer see. */
+  images?: string[];
+  thumbs?: string[];
   /** The model's thinking, kept OUT of `text` on purpose.
    *
    *  The coordinator sends it on its own channel (a thinking content block),
@@ -312,7 +325,22 @@ function Bubble(props: {
   const stillThinking = thinking || (!!props.m.reasoning && props.live && !answer);
 
   if (props.m.role === "user") {
-    return <div className="chat-msg__bubble">{props.m.text}</div>;
+    // Thumbnails, not the originals: after a reload the originals are gone by
+    // design (see ChatMsg), and showing the small copy in both cases keeps one
+    // rendering path instead of two that differ only by session age.
+    const pics = props.m.thumbs ?? [];
+    return (
+      <div className="chat-msg__bubble">
+        {pics.length ? (
+          <div className="chat-msg__pics">
+            {pics.map((src, i) => (
+              <img className="chat-msg__pic" key={i} src={src} alt="" />
+            ))}
+          </div>
+        ) : null}
+        {props.m.text}
+      </div>
+    );
   }
   const waiting = props.live && props.last && !props.m.text && !props.m.reasoning;
   // Nothing is being generated yet: the request is out and the cluster has not
@@ -504,7 +532,16 @@ export default function Chat(props: {
   const flushStore = useRef(() => {
     lastWriteRef.current = Date.now();
     try {
-      localStorage.setItem(STORE_KEY, JSON.stringify(convosRef.current.slice(0, MAX_CONVOS)));
+      // Full-size images are stripped before the write, never after: they are
+      // the one field that can be megabytes, and setItem past the quota THROWS
+      // — so keeping them would trade "this picture is not in my history" for
+      // "none of my conversations are". The thumbnail stays, so the turn still
+      // shows what was sent and still replays with a picture.
+      const persisted = convosRef.current.slice(0, MAX_CONVOS).map((c) => ({
+        ...c,
+        msgs: c.msgs.map(({ images: _drop, ...m }) => m),
+      }));
+      localStorage.setItem(STORE_KEY, JSON.stringify(persisted));
     } catch {
       /* storage full/blocked: history is a convenience, chatting still works */
     }
@@ -654,7 +691,9 @@ export default function Chat(props: {
 
   const send = async () => {
     const q = input.trim();
-    if (!q || !online || !props.api) return;
+    // A picture on its own is a question ("what is this?"), so an empty box
+    // with attachments still sends. Only nothing-at-all is refused.
+    if ((!q && pending.length === 0) || !online || !props.api) return;
     // Sending from a fresh window creates the conversation.
     let id = activeId;
     if (!id || !convos.some((c) => c.id === id)) {
@@ -665,8 +704,54 @@ export default function Chat(props: {
     }
     if (!canGenerate(id)) return;
     setInput("");
-    const history = [...(convos.find((c) => c.id === id)?.msgs ?? []), { role: "user" as const, text: q }];
+    const turn: ChatMsg = { role: "user", text: q };
+    if (pending.length) {
+      turn.images = pending.map((a) => a.full);
+      turn.thumbs = pending.map((a) => a.thumb);
+      setPending([]);
+      setAttachError("");
+    }
+    const history = [...(convos.find((c) => c.id === id)?.msgs ?? []), turn];
     await generate(id, history);
+  };
+
+  /** Does the model being served have a vision tower?
+   *
+   *  Read from the manifest, never guessed from the id or the family: `qwen35`
+   *  covers models with and without one, and the answer is a property of the
+   *  weights we ship. False hides the attach button entirely rather than
+   *  offering one that can only ever produce an engine-side refusal. */
+  const canSeeImages = !!getManifest(props.modelId)?.mmproj;
+
+  /** Pictures staged for the next turn. Cleared by send(), so a half-composed
+   *  attachment never leaks into an unrelated conversation. */
+  const [pending, setPending] = useState<Attachment[]>([]);
+  const [attachError, setAttachError] = useState("");
+  const fileRef = useRef<HTMLInputElement | null>(null);
+
+  // Switching conversations drops anything staged but unsent. A picture picked
+  // while reading thread A, then sent from thread B, is a surprise the user did
+  // not ask for — and one they would only notice after it was sent.
+  useEffect(() => {
+    setPending([]);
+    setAttachError("");
+  }, [activeId]);
+
+  const addFiles = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    const added: Attachment[] = [];
+    const failed: string[] = [];
+    for (const f of Array.from(files)) {
+      try {
+        added.push(await attachmentFromFile(f));
+      } catch (e) {
+        // Named individually: "3 files failed" tells the user nothing about
+        // which one to replace.
+        failed.push(e instanceof Error ? e.message : String(e));
+      }
+    }
+    if (added.length) setPending((p) => [...p, ...added]);
+    setAttachError(failed.join("; "));
   };
 
   /** Stream one assistant reply into `convoId`, whose transcript becomes
@@ -724,7 +809,23 @@ export default function Chat(props: {
         // from a reply it never gave.
         const wire = history
           .filter((m) => !m.error && (m.role === "user" || m.text))
-          .map((m) => ({ role: m.role, content: m.text }));
+          .map((m) => {
+            // Pictures first, then the words, because that is the order the
+            // user composed them in and every vision template places the image
+            // marker where the block sits. `images` (this session) before
+            // `thumbs` (reloaded history) — see ChatMsg.
+            const pics = m.images?.length ? m.images : m.thumbs ?? [];
+            if (!pics.length) return { role: m.role, content: m.text };
+            const blocks: unknown[] = [];
+            for (const url of pics) {
+              const parts = splitDataUrl(url);
+              blocks.push(parts
+                ? { type: "image", source: { type: "base64", media_type: parts.mediaType, data: parts.data } }
+                : { type: "image", source: { type: "url", url } });
+            }
+            if (m.text) blocks.push({ type: "text", text: m.text });
+            return { role: m.role, content: blocks };
+          });
         const t0 = performance.now();
         let tFirst = 0;
         let nDeltas = 0;
@@ -1138,7 +1239,60 @@ export default function Chat(props: {
           </div>
         ) : (
         <div className="chat__composer">
+          {/* Staged pictures live ABOVE the box, not inside it: the box grows
+              with the text and a thumbnail row inside would fight it. */}
+          {pending.length > 0 || attachError ? (
+            <div className="composer__attachments">
+              {pending.map((a, i) => (
+                <span className="composer__thumb" key={`${a.name}-${i}`} title={a.name}>
+                  <img src={a.thumb} alt={a.name} />
+                  <button
+                    className="composer__thumbx"
+                    onClick={() => setPending((p) => p.filter((_, j) => j !== i))}
+                    title={t("chat.attachRemove")}
+                    aria-label={t("chat.attachRemove")}
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+              {attachError ? (
+                <span className="composer__attacherr">{attachError}</span>
+              ) : null}
+            </div>
+          ) : null}
           <div className="composer">
+            {canSeeImages ? (
+              <>
+                <input
+                  ref={fileRef}
+                  type="file"
+                  accept="image/png,image/jpeg,image/webp,image/gif"
+                  multiple
+                  hidden
+                  onChange={(e) => {
+                    void addFiles(e.target.files);
+                    // Reset so picking the SAME file twice in a row still fires
+                    // change — otherwise the second attempt looks like a dead
+                    // button.
+                    e.target.value = "";
+                  }}
+                />
+                <button
+                  className="composer__btn composer__btn--attach"
+                  disabled={liveHere}
+                  onClick={() => fileRef.current?.click()}
+                  title={t("chat.attach")}
+                  aria-label={t("chat.attach")}
+                >
+                  <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                    <path d="M21 11.5l-8.6 8.6a5 5 0 0 1-7-7l8.6-8.6a3.3 3.3 0 0 1 4.7 4.7l-8.6 8.6a1.7 1.7 0 0 1-2.4-2.4l8-8"
+                          fill="none" stroke="currentColor" strokeWidth="2"
+                          strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                </button>
+              </>
+            ) : null}
             <textarea
               ref={taRef}
               className="composer__input"
@@ -1180,7 +1334,7 @@ export default function Chat(props: {
             ) : (
               <button
                 className="composer__btn"
-                disabled={!input.trim()}
+                disabled={!input.trim() && pending.length === 0}
                 onClick={() => send()}
                 title={t("tryit.send")}
                 aria-label={t("tryit.send")}

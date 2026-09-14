@@ -22,6 +22,14 @@ export interface WeightsInfo {
   /** Why the last attempt stopped. A footnote on the "not here yet" row — not
    *  a state of its own. */
   lastError: string | null;
+  /** The vision tower is missing while the WEIGHTS are present.
+   *
+   *  A separate flag rather than folding into `needs`, because the two say
+   *  different things and `needs` owns the sentence "not in the model folder
+   *  yet". Folding them (2026-09-14, first cut of the vision work) made a
+   *  machine that HAD the model report that it did not — the user's own words:
+   *  "明明有,但却说没有". The model is there; one extra file is not. */
+  visionNeeds?: boolean;
   onDownload: () => void;
   onCancel: () => void;
 }
@@ -98,6 +106,25 @@ export default function WeightsRow(props: { w: WeightsInfo; idle?: "hide" | "sho
         </span>
         <button className="linkbtn" onClick={props.w.onDownload}>
           {partial ? t("weights.resume") : t("weights.download")}
+        </button>
+      </span>
+    );
+  }
+  // Weights present, tower absent. Deliberately AFTER the `needs` branch: when
+  // both are missing the weights are the bigger, more important download and
+  // one row cannot lead with both.
+  if (props.w.visionNeeds) {
+    // Deliberately NOT hidden by `idle="hide"`. That flag suppresses the
+    // RESTING states — "ready", "not downloaded yet" — on hosts that only want
+    // live progress. A missing tower is not a resting state: it is the only
+    // place the user is told a file is needed and the only control that
+    // fetches it. Hiding it here left the row blank and the download
+    // unreachable (caught on the real client, 2026-09-14).
+    return (
+      <span className="wrow" onClick={stop}>
+        <span className="wrow__msg">{t("weights.visionNeeded")}</span>
+        <button className="linkbtn" onClick={props.w.onDownload}>
+          {t("weights.download")}
         </button>
       </span>
     );

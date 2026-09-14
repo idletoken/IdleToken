@@ -426,6 +426,118 @@ static const idletoken_model_variant GPT_OSS_120B_VARIANTS[] = {
       .gguf = "gpt-oss-120b-F16.gguf" },
 };
 
+/* ── Vision towers (mmproj) ──────────────────────────────────────────────────
+ *
+ * Ten of the sixteen models in this registry are image-text-to-text upstream,
+ * and the main GGUF we already serve IS the multimodal weight: it carries
+ * M-RoPE sections and a chat template that renders
+ * <|vision_start|><|image_pad|><|vision_end|>. The only thing that was ever
+ * missing is the tower below, which lives in the same HF repo and which the
+ * manifests simply did not list (2026-09-14; the survey and every byte here are
+ * in results/multimodal-model-survey-20260914.md).
+ *
+ * WHY F16 AND NOT F32/BF16/Q8_0. The towers ship in up to four precisions. F32
+ * is an UP-CONVERSION of a BF16 release -- twice the bytes for no information,
+ * which the precision-menu rule already rejects for weights. Between the two
+ * 16-bit files (they differ by 0.4%) F16 is chosen because it is a first-class
+ * citizen on every target backend, while BF16 needs conversion on pre-Ampere
+ * CUDA. Kimi additionally offers Q8_0, 295 MiB cheaper: NOT taken, because the
+ * standing instruction is that a model with vision upstream must not be shipped
+ * degraded, and the tower is the one part where a quantisation artefact lands
+ * on the whole image rather than on one token.
+ *
+ * The bytes ARE the VRAM cost: the tower loads whole onto one device.
+ * Sizes below are the file sizes at the pinned revision, from the HF API. */
+
+static const idletoken_model_mmproj QWEN35_08B_MMPROJ = {
+    .repo = "unsloth/Qwen3.5-0.8B-GGUF", .gguf = "mmproj-F16.gguf",
+    .sha256 = "56e4c6cfe73b0c82e3e82bc518d7591997e61d81f723fc41a586f4fa69ea2453",
+    .revision = "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+    .projector_type = "qwen3vl_merger",
+    .bytes = 204987232ull, .vision_layers = 12, .vision_embd = 768,
+};
+
+static const idletoken_model_mmproj QWEN35_2B_MMPROJ = {
+    .repo = "unsloth/Qwen3.5-2B-GGUF", .gguf = "mmproj-F16.gguf",
+    .sha256 = "7035e9cb8d7c6a9681d07eef9a364783e86ea4cd73faab2eabb4f43a101830c7",
+    .revision = "f6d5376be1edb4d416d56da11e5397a961aca8ae",
+    .projector_type = "qwen3vl_merger",
+    .bytes = 668227264ull, .vision_layers = 24, .vision_embd = 1024,
+};
+
+static const idletoken_model_mmproj QWEN35_4B_MMPROJ = {
+    .repo = "unsloth/Qwen3.5-4B-GGUF", .gguf = "mmproj-F16.gguf",
+    .sha256 = "cd88edcf8d031894960bb0c9c5b9b7e1fea6ebee02b9f7ce925a00d12891f864",
+    .revision = "e87f176479d0855a907a41277aca2f8ee7a09523",
+    .projector_type = "qwen3vl_merger",
+    .bytes = 672423616ull, .vision_layers = 24, .vision_embd = 1024,
+};
+
+static const idletoken_model_mmproj QWEN35_9B_MMPROJ = {
+    .repo = "unsloth/Qwen3.5-9B-GGUF", .gguf = "mmproj-F16.gguf",
+    .sha256 = "f70dc3509053962b0d0d3ee8a7eacebf5d60aa560cad78254ae8698516ae029f",
+    .revision = "3885219b6810b007914f3a7950a8d1b469d598a5",
+    .projector_type = "qwen3vl_merger",
+    .bytes = 918166080ull, .vision_layers = 27, .vision_embd = 1152,
+};
+
+static const idletoken_model_mmproj QWEN35_27B_MMPROJ = {
+    .repo = "unsloth/Qwen3.5-27B-GGUF", .gguf = "mmproj-F16.gguf",
+    .sha256 = "458bc46d8f275866fde5d88c9c554d9d462a6e8e3a028090d9850e17ab6a1217",
+    .revision = "3221f178a6b842d04f1fb42f1c413534adcc0a6a",
+    .projector_type = "qwen3vl_merger",
+    .bytes = 927607040ull, .vision_layers = 27, .vision_embd = 1152,
+};
+
+static const idletoken_model_mmproj QWEN35_35B_A3B_MMPROJ = {
+    .repo = "unsloth/Qwen3.5-35B-A3B-GGUF", .gguf = "mmproj-F16.gguf",
+    .sha256 = "a516ab92e8240da4734d68352bdfba84c16e830ee40010b8fac80d69c77272ff",
+    .revision = "bc014a17be43adabd7066b7a86075ff935c6a4e2",
+    .projector_type = "qwen3vl_merger",
+    .bytes = 899283648ull, .vision_layers = 27, .vision_embd = 1152,
+};
+
+static const idletoken_model_mmproj QWEN35_122B_A10B_MMPROJ = {
+    .repo = "unsloth/Qwen3.5-122B-A10B-GGUF", .gguf = "mmproj-F16.gguf",
+    .sha256 = "691af71bd41d437ce4a1d989f589c4b492237d702b33819ed8f897f9fae6e725",
+    .revision = "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
+    .projector_type = "qwen3vl_merger",
+    .bytes = 908724960ull, .vision_layers = 27, .vision_embd = 1152,
+};
+
+static const idletoken_model_mmproj QWEN35_397B_A17B_MMPROJ = {
+    .repo = "unsloth/Qwen3.5-397B-A17B-GGUF", .gguf = "mmproj-F16.gguf",
+    .sha256 = "906de10b2bec29942a8e2003397fa2348cbb5c47b24efc4f6e224529a2d96404",
+    .revision = "da33c16fa4440f831149fcf53b98a22bc07785e5",
+    .projector_type = "qwen3vl_merger",
+    .bytes = 918166240ull, .vision_layers = 27, .vision_embd = 1152,
+};
+
+/* Pinned at the manifest's revision (990216c), NOT at the repo's current main:
+ * the weights this registry describes were measured there. The tower's bytes
+ * and digest happen to be identical at both commits -- checked, not assumed --
+ * but pairing a new digest with old weights is exactly the drift this field
+ * exists to prevent. */
+static const idletoken_model_mmproj QWEN38_27B_MMPROJ = {
+    .repo = "unsloth/Qwen3.8-27B-GGUF", .gguf = "mmproj-F16.gguf",
+    .sha256 = "cbb841a9ee0636b2ec172f5bb8df2ea8dfeb01e90fe7c6126581d662a0b4e43e",
+    .revision = "990216cf312573f2ac4060279848e0f4237600c7",
+    .projector_type = "qwen3vl_merger",
+    .bytes = 927607488ull, .vision_layers = 27, .vision_embd = 1152,
+};
+
+/* Kimi takes a different route into the language model: its main GGUF is
+ * `deepseek2` and carries NO M-RoPE sections, so vision tokens are laid in
+ * flat rather than positioned in 2-D. Different projector, same contract. */
+static const idletoken_model_mmproj KIMI_K25_MMPROJ = {
+    .repo = "bartowski/moonshotai_Kimi-K2.5-GGUF",
+    .gguf = "mmproj-moonshotai_Kimi-K2.5-f16.gguf",
+    .sha256 = "9261f190d7b8561fc69f70d2bbbc533d5975704f19c6d2b08fa8ac6c133ec78c",
+    .revision = "5b64e856ff9f4d062857d952451f38219dff1382",
+    .projector_type = "kimik25",
+    .bytes = 952572160ull, .vision_layers = 27, .vision_embd = 1152,
+};
+
 static const idletoken_model_spec MODELS[] = {
 
     {
@@ -557,6 +669,7 @@ static const idletoken_model_spec MODELS[] = {
         .compute_bytes_256k_metal = { 512753664ull, 781482721ull, 781482721ull },
         .compute_bytes_1m_metal = { 1115915551ull, 1116198666ull, 1116198666ull },
         .default_gguf = "Qwen3.5-0.8B-UD-IQ2_XXS.gguf",
+        .mmproj = &QWEN35_08B_MMPROJ,
         .variants = QWEN35_08B_VARIANTS,
         .n_variants = sizeof(QWEN35_08B_VARIANTS) / sizeof(QWEN35_08B_VARIANTS[0]),
         .default_variant = 0,      /* IQ2_XXS */
@@ -592,6 +705,7 @@ static const idletoken_model_spec MODELS[] = {
         .compute_bytes_256k_metal = { 516947968ull, 516947968ull, 516947968ull },
         .compute_bytes_1m_metal = { 1124167844ull, 1124440474ull, 1124440474ull },
         .default_gguf = "Qwen3.5-2B-UD-IQ2_XXS.gguf",
+        .mmproj = &QWEN35_2B_MMPROJ,
         .variants = QWEN35_2B_VARIANTS,
         .n_variants = sizeof(QWEN35_2B_VARIANTS) / sizeof(QWEN35_2B_VARIANTS[0]),
         .default_variant = 0,
@@ -634,6 +748,7 @@ static const idletoken_model_spec MODELS[] = {
         .compute_bytes_256k_metal = { 519045120ull, 787774177ull, 787774177ull },
         .compute_bytes_1m_metal = { 1157743247ull, 1149239296ull, 1148977152ull },
         .default_gguf = "Qwen3.5-4B-UD-IQ2_XXS.gguf",
+        .mmproj = &QWEN35_4B_MMPROJ,
         .variants = QWEN35_4B_VARIANTS,
         .n_variants = sizeof(QWEN35_4B_VARIANTS) / sizeof(QWEN35_4B_VARIANTS[0]),
         .default_variant = 0,      /* IQ2_XXS */
@@ -671,6 +786,7 @@ static const idletoken_model_spec MODELS[] = {
         .compute_bytes_256k_metal = { 525336576ull, 525336576ull, 525336576ull },
         .compute_bytes_1m_metal = { 1174520463ull, 1174803579ull, 1174803579ull },
         .default_gguf = "Qwen3.5-9B-UD-IQ2_XXS.gguf",
+        .mmproj = &QWEN35_9B_MMPROJ,
         .variants = QWEN35_9B_VARIANTS,
         .n_variants = sizeof(QWEN35_9B_VARIANTS) / sizeof(QWEN35_9B_VARIANTS[0]),
         .default_variant = 0,
@@ -710,6 +826,7 @@ static const idletoken_model_spec MODELS[] = {
         .compute_bytes_256k_metal = { 797987308ull, 798259937ull, 798259937ull },
         .compute_bytes_1m_metal = { 1224873083ull, 1212447457ull, 1212447457ull },
         .default_gguf = "Qwen3.5-27B-UD-IQ2_XXS.gguf",
+        .mmproj = &QWEN35_27B_MMPROJ,
         .variants = QWEN35_27B_VARIANTS,
         .n_variants = sizeof(QWEN35_27B_VARIANTS) / sizeof(QWEN35_27B_VARIANTS[0]),
         .default_variant = 0,
@@ -759,6 +876,7 @@ static const idletoken_model_spec MODELS[] = {
         .compute_bytes_256k_metal = { 797987308ull, 798259937ull, 798259937ull },
         .compute_bytes_1m_metal = { 1224873083ull, 1212447457ull, 1212447457ull },
         .default_gguf = "Qwen3.8-27B-UD-IQ1_S.gguf",
+        .mmproj = &QWEN38_27B_MMPROJ,
         .variants = QWEN38_27B_VARIANTS,
         .n_variants = sizeof(QWEN38_27B_VARIANTS) / sizeof(QWEN38_27B_VARIANTS[0]),
         .default_variant = 0,
@@ -797,6 +915,7 @@ static const idletoken_model_spec MODELS[] = {
         .compute_bytes_256k_metal = { 516947968ull, 516947968ull, 516947968ull },
         .compute_bytes_1m_metal = { 1146135511ull, 1146408141ull, 1146408141ull },
         .default_gguf = "Qwen3.5-35B-A3B-UD-IQ2_XXS.gguf",
+        .mmproj = &QWEN35_35B_A3B_MMPROJ,
         .variants = QWEN35_35B_A3B_VARIANTS,
         .n_variants = sizeof(QWEN35_35B_A3B_VARIANTS) / sizeof(QWEN35_35B_A3B_VARIANTS[0]),
         .default_variant = 0,
@@ -833,6 +952,7 @@ static const idletoken_model_spec MODELS[] = {
         .compute_bytes_256k_metal = { 521142272ull, 521142272ull, 521142272ull },
         .compute_bytes_1m_metal = { 1194370007ull, 1207676436ull, 1207613522ull },
         .default_gguf = "Qwen3.5-122B-A10B-UD-IQ2_XXS.gguf",
+        .mmproj = &QWEN35_122B_A10B_MMPROJ,
         .variants = QWEN35_122B_A10B_VARIANTS,
         .n_variants = sizeof(QWEN35_122B_A10B_VARIANTS) / sizeof(QWEN35_122B_A10B_VARIANTS[0]),
         .default_variant = 0,
@@ -870,6 +990,7 @@ static const idletoken_model_spec MODELS[] = {
         .compute_bytes_256k_metal = { 793793004ull, 794065633ull, 794065633ull },
         .compute_bytes_1m_metal = { 1247847383ull, 1248130499ull, 1248130499ull },
         .default_gguf = "UD-IQ2_XXS/Qwen3.5-397B-A17B-UD-IQ2_XXS-00001-of-00004.gguf",
+        .mmproj = &QWEN35_397B_A17B_MMPROJ,
         .variants = QWEN35_397B_A17B_VARIANTS,
         .n_variants = sizeof(QWEN35_397B_A17B_VARIANTS) / sizeof(QWEN35_397B_A17B_VARIANTS[0]),
         .default_variant = 0,
@@ -973,6 +1094,7 @@ static const idletoken_model_spec MODELS[] = {
         .compute_bytes_256k_metal = { 679435305ull, 679372390ull, 679330447ull },
         .compute_bytes_1m_metal = { 1485528105ull, 1485465190ull, 1485423247ull },
         .default_gguf = "moonshotai_Kimi-K2.5-IQ1_S/moonshotai_Kimi-K2.5-IQ1_S-00001-of-00006.gguf",
+        .mmproj = &KIMI_K25_MMPROJ,
         .variants = KIMI_K25_VARIANTS,
         .n_variants = sizeof(KIMI_K25_VARIANTS) / sizeof(KIMI_K25_VARIANTS[0]),
         .default_variant = 0,
@@ -1099,6 +1221,10 @@ int idletoken_model_may_cluster(const idletoken_model_spec *m, char *why, size_t
                      m->label, m->id);
     }
     return 0;
+}
+
+int idletoken_model_has_vision(const idletoken_model_spec *m) {
+    return (m && m->mmproj && m->mmproj->gguf && m->mmproj->gguf[0]) ? 1 : 0;
 }
 
 const idletoken_model_variant *idletoken_model_variant_get(const idletoken_model_spec *m,

@@ -81,6 +81,21 @@ struct idletoken_llama {
                                * only busy-wait — measured 11.9 spinning cores
                                * on a fully-offloaded 5060 Ti). */
     uint32_t n_cpu_moe;       /* single-machine MoE Hybrid: --n-cpu-moe N */
+    /* Vision tower, or "" for a text-only model / a vision model whose tower is
+     * not on disk yet. Passed as --mmproj; the engine turns image input on only
+     * when it loads (server-context.cpp: allow_image = mtmd_support_vision). */
+    char mmproj[1024];
+    /* Which device the tower runs on — ALWAYS a local one, never an RPC device.
+     *
+     * Not a tuning knob: clip.cpp picks its device with
+     * ggml_backend_init_by_type(GPU), which returns the FIRST REGISTERED GPU,
+     * and llama.cpp registers RPC devices ahead of local ones. Leave this empty
+     * in a cluster and the image's pixels get encoded on a stranger's machine —
+     * the same leak as running layer 0 away from the embedding table, except
+     * the payload needs no reconstruction at all. The tower is also indivisible
+     * (tools/mtmd/ has no tensor_split, no n_gpu_layers, no rpc), so "pin it
+     * locally" is the only placement that exists, not a preference. */
+    char vision_device[32];
     char grow_dir[300];       /* legacy sidecar-test hook; product passes "" */
     char sock_path[256];      /* AF_UNIX path, or "" for TCP loopback */
     char endpoint[300];       /* "127.0.0.1:<port>" | "unix:<sock_path>" */
@@ -799,14 +814,27 @@ static int llama_spawn(idletoken_llama *lc) {
     if (lc->grow_dir[0] && !lc->shared)
         snprintf(slotsave_frag, sizeof(slotsave_frag),
                  " --slot-save-path \"%s\"", lc->grow_dir);
+    /* Vision tower. Same fragment on the POSIX path below; the two spawn paths
+     * must not diverge. */
+    char mmproj_frag[1040];
+    mmproj_frag[0] = '\0';
+    if (lc->mmproj[0])
+        snprintf(mmproj_frag, sizeof(mmproj_frag), " --mmproj \"%s\"", lc->mmproj);
+    /* Pin the tower to a LOCAL device before the child is created. Inherited by
+     * the child in private mode; shared mode filters the environment, so the
+     * filter below lets this one name through explicitly. Setting it on our own
+     * process is harmless — the coordinator never reads it, and every spawn
+     * overwrites it with the value for that launch. */
+    if (lc->mmproj[0] && lc->vision_device[0])
+        SetEnvironmentVariableA("MTMD_BACKEND_DEVICE", lc->vision_device);
     /* `--reasoning auto` = follow the model's template default; the reasoning
      * why it is not "off" any more, and what guards the empty-answer failure
      * instead, is on the POSIX path below. The two spawn paths must not
      * diverge. */
     int n = snprintf(cmd, sizeof(cmd),
-                     "\"%s\" -m \"%s\" %s%s%s%s "
+                     "\"%s\" -m \"%s\"%s %s%s%s%s "
                      "-ngl %s --fit off%s --reasoning auto%s%s%s -np %s%s%s%s",
-                     lc->bin, lc->gguf, listen_args,
+                     lc->bin, lc->gguf, mmproj_frag, listen_args,
                      lc->shared ? " --no-slots" : "",
                      /* --poll 0 rides with GPU_ONLY (see the struct field);
                       * same on the POSIX path — the two must not diverge. */
@@ -858,6 +886,14 @@ static int llama_spawn(idletoken_llama *lc) {
         for (LPCH p = all; *p; p += strlen(p) + 1) {
             /* An entry may begin with '=' (the per-drive cwd variables Windows
              * keeps, e.g. "=C:=C:\path"); those are not ours to judge. */
+            /* MTMD_BACKEND_DEVICE survives this filter without an exception of
+             * its own: the filter only DROPS names in the engine namespace
+             * (LLAMA_/GGML_/HF_), and MTMD_ is not one of them, so the copy
+             * below keeps it. Said out loud because it matters and is easy to
+             * break — extend the namespace predicate to MTMD_ and the vision
+             * tower silently moves to whichever device registers first, an RPC
+             * one in a cluster, and ONLY in shared mode, i.e. only while
+             * holding somebody else's image. llama_sidecar_test covers it. */
             if (p[0] != '=' && llama_env_is_engine_namespace(p) &&
                 strncmp(p, "GGML_RPC_PSK=", 13) != 0 &&
                 strncmp(p, "GGML_RPC_REQUIRE_MODEL_CACHE=", 29) != 0 &&
@@ -925,6 +961,14 @@ static int llama_spawn(idletoken_llama *lc) {
     int argc = 0;
     argv[argc++] = lc->bin;
     argv[argc++] = "-m";        argv[argc++] = lc->gguf;
+    /* Vision tower. Loading it is what flips the engine's allow_image on, so a
+     * model with a tower on disk serves images and one without says so in
+     * words (server-common.cpp: "image input is not supported"). Same fragment
+     * on the Windows path above; the two spawn paths must not diverge. */
+    if (lc->mmproj[0]) {
+        argv[argc++] = "--mmproj";
+        argv[argc++] = lc->mmproj;
+    }
     /* Never reachable from the LAN: the coordinator's api_token gate must
      * remain the only gate. Shared mode goes one further and leaves the IP
      * stack entirely — the engine picks AF_UNIX off a `--host` ending in .sock
@@ -1053,6 +1097,12 @@ static int llama_spawn(idletoken_llama *lc) {
         prctl(PR_SET_PDEATHSIG, SIGKILL);
 #endif
         if (lc->shared) llama_scrub_env();
+        /* AFTER the scrub, and set here rather than inherited, so neither the
+         * scrub nor the coordinator's own environment can decide where a user's
+         * image gets encoded. Empty device name is not a silent default: the
+         * caller is refused before we get here (idletoken_llama_start). */
+        if (lc->mmproj[0] && lc->vision_device[0])
+            setenv("MTMD_BACKEND_DEVICE", lc->vision_device, 1);
         /* child: engine output goes to its own log file, not our stderr */
         int lg = open(lc->log_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
         if (lg >= 0) {
@@ -1545,7 +1595,22 @@ idletoken_llama *idletoken_llama_start(const char *bin, const char *gguf,
                                        const char *cluster_args,
                                        const char *log_path, int shared,
                                        const char *grow_dir,
+                                       const idletoken_llama_vision *vision,
                                        char *err, size_t err_cap) {
+    /* A tower without a device is refused, never defaulted. The default would
+     * be the engine's own first-registered GPU, which in a cluster is a remote
+     * one — see idletoken_llama_vision. Failing loudly here means the mistake
+     * is a startup error on the developer's screen instead of an image
+     * silently encoded on somebody else's machine. */
+    if (vision && vision->mmproj_path && vision->mmproj_path[0] &&
+        !(vision->device && vision->device[0])) {
+        if (err_cap)
+            snprintf(err, err_cap,
+                     "vision tower given without a local device to pin it to "
+                     "(refusing: the engine would place it on the first "
+                     "registered GPU, which is a remote RPC device in a cluster)");
+        return NULL;
+    }
     idletoken_llama *lc = calloc(1, sizeof(*lc));
     if (!lc) {
         if (err_cap) snprintf(err, err_cap, "out of memory");
@@ -1553,6 +1618,11 @@ idletoken_llama *idletoken_llama_start(const char *bin, const char *gguf,
     }
     snprintf(lc->bin, sizeof(lc->bin), "%s", bin);
     snprintf(lc->gguf, sizeof(lc->gguf), "%s", gguf);
+    if (vision && vision->mmproj_path && vision->mmproj_path[0]) {
+        snprintf(lc->mmproj, sizeof(lc->mmproj), "%s", vision->mmproj_path);
+        snprintf(lc->vision_device, sizeof(lc->vision_device), "%s",
+                 vision->device);
+    }
     if (cluster_args)
         snprintf(lc->cluster_args, sizeof(lc->cluster_args), "%s", cluster_args);
     snprintf(lc->ngl_arg, sizeof(lc->ngl_arg), "%s",

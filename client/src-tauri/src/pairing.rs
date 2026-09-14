@@ -875,6 +875,14 @@ struct Inner {
     /// cache and loads only that slice; inference RPC then carries graphs and
     /// activations, not model payloads.
     model_path: String,
+    /// The vision tower for `model_path`, or "" for a text-only model.
+    ///
+    /// Passed in from the front end rather than derived here: the manifests
+    /// live on the JS side (models/*.json) and a second model registry in Rust
+    /// is exactly the kind of copy this repo keeps getting bitten by. Guessing
+    /// it from the directory would be worse than either — a model whose tower
+    /// was downloaded twice (F16 and BF16) has two candidates and no rule.
+    mmproj_path: String,
     engine_started: bool,
     /// Account-mode pairing (integration plan 3.3): the "code" is a secret
     /// derived on the JS side from stable account material (platform user id +
@@ -951,6 +959,7 @@ impl Default for Pairing {
             phase: "idle".into(),
             coord_ip: None,
             model_path: String::new(),
+            mmproj_path: String::new(),
             engine_started: false,
             account_mode: false,
             last_error: None,
@@ -1274,6 +1283,7 @@ fn apply_roster(inner: &mut Inner, v: &Value) -> RosterEffect {
     }
     if inner.tuning.model_id != old_model || inner.tuning.quant != old_quant {
         inner.model_path.clear();
+        inner.mmproj_path.clear();
     }
     let cluster_model = inner.tuning.model_id.clone();
     let cluster_quant = inner.tuning.quant.clone();
@@ -1656,7 +1666,7 @@ fn secret_env(tuning: &Tuning) -> Vec<(String, String)> {
 /// tensor index (and an old-client compatibility source), while current workers
 /// seed only their assigned tensors from their own complete local GGUF.
 fn materialize_engine(app: &AppHandle) {
-    let (is_coord, coord_ip, remote_workers, model_path, engine_code, tuning) = {
+    let (is_coord, coord_ip, remote_workers, model_path, mmproj_path, engine_code, tuning) = {
         let pairing = app.state::<Pairing>();
         let mut inner = pairing.0.lock().unwrap();
         if inner.engine_started {
@@ -1670,6 +1680,7 @@ fn materialize_engine(app: &AppHandle) {
             inner.coord_ip.clone().unwrap_or_default(),
             remote_workers,
             inner.model_path.clone(),
+            inner.mmproj_path.clone(),
             inner.engine_code.clone(),
             inner.tuning.clone(),
         )
@@ -1745,6 +1756,18 @@ fn materialize_engine(app: &AppHandle) {
         };
         coord_args.push("--api-unix".into());
         coord_args.push(coord_socket);
+        // The vision tower. Empty for a text-only model, and also for a vision
+        // model whose tower the user declined to download — the coordinator
+        // then says so at startup and the engine refuses image requests in its
+        // own words. What it will not do is quietly serve a multimodal model
+        // blind, which is what happened before any of this existed.
+        //
+        // The coordinator pins it to a LOCAL device itself; there is nothing to
+        // pass here about placement, and nothing a caller could usefully say.
+        if !mmproj_path.trim().is_empty() {
+            coord_args.push("--mmproj-path".into());
+            coord_args.push(mmproj_path.trim().to_string());
+        }
         // The user's "Resource usage" caps, which reached the WORKER (line
         // ~925) and not the coordinator until 2026-08-21. On a single machine
         // the coordinator budgets from its own probe rather than from a
@@ -3245,6 +3268,7 @@ pub fn pairing_create(
     hostname: String,
     gpu: String,
     model_path: Option<String>,
+    mmproj_path: Option<String>,
     tuning: Option<Tuning>,
     account: Option<bool>,
 ) -> Result<(), String> {
@@ -3273,6 +3297,7 @@ pub fn pairing_create(
         inner.phase = "idle".into();
         inner.coord_ip = None;
         inner.model_path = model_path.clone();
+        inner.mmproj_path = mmproj_path.clone().unwrap_or_default();
         inner.engine_started = false;
         inner.last_error = None;
         inner.required_model = None;
@@ -3341,6 +3366,7 @@ pub fn pairing_join(
     hostname: String,
     gpu: String,
     model_path: Option<String>,
+    mmproj_path: Option<String>,
     tuning: Option<Tuning>,
     account: Option<bool>,
 ) -> Result<(), String> {
@@ -3361,6 +3387,7 @@ pub fn pairing_join(
         inner.phase = "idle".into();
         inner.coord_ip = None;
         inner.model_path = model_path.unwrap_or_default();
+        inner.mmproj_path = mmproj_path.unwrap_or_default();
         inner.engine_started = false;
         inner.last_error = None;
         inner.required_model = None;
@@ -3763,7 +3790,7 @@ pub fn headless_pair(app: &AppHandle, spec: &str) {
     eprintln!("[pairing] headless {op} code={code} as={name}");
     match op {
         "create" => {
-            let _ = pairing_create(app.clone(), app.state(), code, name, "headless".into(), model_opt, tuning_opt, None);
+            let _ = pairing_create(app.clone(), app.state(), code, name, "headless".into(), model_opt, None, tuning_opt, None);
             // Auto-start once a second machine joins (mirrors pairing-auto-start).
             let app2 = app.clone();
             std::thread::spawn(move || loop {
@@ -3780,7 +3807,7 @@ pub fn headless_pair(app: &AppHandle, spec: &str) {
             });
         }
         "join" => {
-            let _ = pairing_join(app.clone(), app.state(), code, name, "headless".into(), model_opt, tuning_opt, None);
+            let _ = pairing_join(app.clone(), app.state(), code, name, "headless".into(), model_opt, None, tuning_opt, None);
         }
         _ => eprintln!("[pairing] headless: unknown op '{op}'"),
     }

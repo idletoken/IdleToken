@@ -81,6 +81,16 @@
   "layer_weight_bytes": 10656955008,
   "shared_weight_bytes": 0,
   "default_gguf": "Qwen3.5-35B-A3B-UD-IQ2_XXS.gguf",
+  "mmproj": {
+    "repo": "unsloth/Qwen3.5-35B-A3B-GGUF",
+    "gguf": "mmproj-F16.gguf",
+    "bytes": 899283648,
+    "sha256": "a516ab92e8240da4734d68352bdfba84c16e830ee40010b8fac80d69c77272ff",
+    "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
+    "projector_type": "qwen3vl_merger",
+    "vision_layers": 27,
+    "vision_embd": 1152
+  },
   "sources": [
     {
       "repo": "unsloth/Qwen3.5-35B-A3B-GGUF",

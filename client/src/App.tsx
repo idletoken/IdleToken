@@ -5,7 +5,7 @@ import { getEngineProvider, type EngineLogLine, type EngineStatus } from "./prov
 import type { NodeSnapshot, ClusterState } from "./types";
 import { HW_OK, HW_NO_GPU, HW_CC_TOO_LOW, HW_DRIVER_TOO_OLD, HW_VRAM_TOO_SMALL, HW_GPU_UNSUPPORTED, HW_MACOS_SEALED } from "./types";
 import { getModel, getManifest, estimateClusterCapacity, poolVram, poolRam, clusterCapacityVerdict, hybridRequirements, isMoeModel, moeRamExpertBudget, pickBestFittingModel, backendOfOs, plannerNodesSpec, type ModelSpec, type MoeLayoutBudget, type PlannerPlan, type ClusterCapacityVerdict } from "./models";
-import { resolveLocalWeights, fetchWeights, onFetchProgress, defaultModelDir, cancelFetch, resolveDownload, verifyWeights, isWeightsCancelled, type DownloadTarget } from "./weights";
+import { resolveLocalWeights, fetchWeights, onFetchProgress, defaultModelDir, cancelFetch, resolveDownload, resolveMmprojDownload, mmprojLocalPath, targetLocalName, weightsState, verifyWeights, isWeightsCancelled, type DownloadTarget } from "./weights";
 import { loadSettings, saveSettings, settingsWerePersisted, effectiveCaps, runtimeResourceBudget, effectiveCtx, engineTuning, overflowTuning, autoUiScale, contextTiersFor, type AppSettings, type ContextTier, type RuntimeResourceBudget, type Tier } from "./settings";
 import { getAuthProvider, type Session } from "./auth";
 import SettingsPanel from "./SettingsPanel";
@@ -980,7 +980,7 @@ function ClusterCard(props: {
           {/* Downloading is a property of the selected model+precision, not of
               either deployment path. Keep one control and one progress bar
               here so local and cluster never narrate the same transfer twice. */}
-          {props.weights && (props.weights.needs || props.weights.dl) ? (
+          {props.weights && (props.weights.needs || props.weights.visionNeeds || props.weights.dl) ? (
             <WeightsRow w={props.weights} idle="show" />
           ) : null}
         </div>
@@ -1720,6 +1720,8 @@ export default function App() {
   // the weights. Resolution now has three real paths; see resolveLocalWeights in
   // weights.ts.
   const [weightsPath, setWeightsPath] = useState("");
+  /** Verified vision tower for the selected model; "" = none to offer. */
+  const [mmprojPath, setMmprojPath] = useState("");
   const [needsWeights, setNeedsWeights] = useState(false);
   // Bytes of an unfinished copy on disk. The download resumes from it, so this
   // is the difference between "4.7 GB to fetch" and "600 MB to go".
@@ -1754,12 +1756,14 @@ export default function App() {
       setNeedsWeights(r.needsDownload);
       setPartialBytes(r.haveBytes);
       setSelFile(resolveDownload(getManifest(settings.modelId), settings.quant)?.file ?? "");
+      setMmprojPath(await mmprojLocalPath(settings.modelDir, getManifest(settings.modelId)));
     } catch {
       // A failed probe must not block the UI: treat it as "needs downloading", and
       // the user gets the real error when they press download.
       setWeightsPath("");
       setNeedsWeights(true);
       setPartialBytes(0);
+      setMmprojPath("");
     }
   }, [settings.modelDir, settings.modelId, settings.quant]);
 
@@ -2023,6 +2027,44 @@ export default function App() {
         throw e;
       }
     }
+    // The vision tower, held to the same bar as the weights (hard constraint
+    // #14): present, complete, and hash-verified before anything is allowed to
+    // start. It is a second file rather than another part — one tower serves
+    // every precision — so it gets its own state/verify pass.
+    //
+    // A model with a tower is NOT downgraded silently when the file is missing
+    // and `fetchMissing` is false: the caller (creation preflight) already
+    // treats a missing weight file as "not ready", and the tower is part of
+    // what this model is. Serving it text-only is a decision for a human, made
+    // by declining the download, not something to slide past them.
+    const mmTarget = resolveMmprojDownload(manifest);
+    if (mmTarget) {
+      const dir = settings.modelDir || (await defaultModelDir());
+      // Everything below asks about the LOCAL file, so it asks under the local
+      // name — nine models publish their tower as `mmproj-F16.gguf` and one
+      // folder holds one of those.
+      const mmFile = targetLocalName(mmTarget);
+      let st = await weightsState(dir, mmFile, mmTarget.expectBytes, mmTarget.sha256);
+      if ((!st.complete || !st.verified) && fetchMissing) {
+        if (!(await startDownload(mmFile, mmTarget))) {
+          throw new Error(`[WEIGHTS_NOT_DOWNLOADED] ${modelId} ${mmFile}`);
+        }
+        st = await weightsState(dir, mmFile, mmTarget.expectBytes, mmTarget.sha256);
+      }
+      if (!st.complete) {
+        throw new Error(`[WEIGHTS_NOT_DOWNLOADED] ${modelId} ${mmFile}`);
+      }
+      if (!st.verified) {
+        try {
+          await verifyWeights({
+            id: mmFile, destDir: dir, file: mmFile, sha256: mmTarget.sha256,
+          });
+        } catch (e) {
+          bumpWeights();
+          throw e;
+        }
+      }
+    }
     return r.path;
   }, [settings.modelDir, settings.modelId, settings.quant, bumpWeights, startDownload]);
 
@@ -2104,20 +2146,52 @@ export default function App() {
   // The selected model's one weight state. The Cluster page renders it once,
   // directly under the model choice; deployment buttons consume readiness but
   // do not each grow their own copy of the download control.
-  const weightsInfo = useMemo<WeightsInfo>(
-    () => ({
+  const weightsInfo = useMemo<WeightsInfo>(() => {
+    const mmTarget = resolveMmprojDownload(getManifest(settings.modelId));
+    // Progress, errors and cancellation are keyed by the file on disk — see
+    // targetLocalName.
+    const mmFile = mmTarget ? targetLocalName(mmTarget) : "";
+    // A vision model is not "ready" until its tower is here too. Without this
+    // the row would say ready, the coordinator would start TEXT ONLY, and the
+    // user would find out by attaching a picture and being refused — the
+    // download control is the place to say it, not the failure.
+    // NOT folded into `needs`: that flag owns the sentence "not in the model
+    // folder yet", and a machine that has the weights but not the tower would
+    // then be told it has no model. Reported separately so the row can say the
+    // true thing.
+    const towerMissing = !!mmTarget && !mmprojPath;
+    return {
       needs: needsWeights,
+      visionNeeds: towerMissing && !needsWeights,
       path: weightsPath,
-      dl: dls[selFile] ?? null,
+      // Whichever of the two files is moving. They are downloaded one after
+      // the other, so at most one has progress at a time and the row still
+      // represents "one job" the way it was designed to.
+      dl: dls[selFile] ?? (mmTarget ? dls[mmFile] ?? null : null),
       partialBytes,
-      lastError: dlErrors[selFile] ?? null,
+      lastError: dlErrors[selFile] ?? (mmTarget ? dlErrors[mmFile] ?? null : null),
       onDownload: () => {
-        const target = resolveDownload(getManifest(settings.modelId), settings.quant);
-        if (target) void startDownload(target.file, target);
+        void (async () => {
+          // Only touch the weights when they are actually missing. Re-running
+          // the fetch path over a complete model is not a no-op: it re-hashes
+          // the file, which is minutes on a large one — and the user pressed
+          // this to fetch the part that is missing.
+          if (needsWeights) {
+            const target = resolveDownload(getManifest(settings.modelId), settings.quant);
+            if (target) await startDownload(target.file, target);
+          }
+          // Weights first, tower second: the tower is useless on its own, and
+          // a cancelled weight download should not leave a stray 900 MB file.
+          if (mmTarget && !mmprojPath) await startDownload(mmFile, mmTarget);
+        })();
       },
-      onCancel: () => cancelDownloadFor(selFile),
-    }),
-    [needsWeights, weightsPath, dls, dlErrors, selFile, partialBytes, cancelDownloadFor, startDownload, settings.modelId, settings.quant]
+      onCancel: () => {
+        cancelDownloadFor(selFile);
+        if (mmTarget) cancelDownloadFor(mmFile);
+      },
+    };
+  },
+    [needsWeights, weightsPath, mmprojPath, dls, dlErrors, selFile, partialBytes, cancelDownloadFor, startDownload, settings.modelId, settings.quant]
   );
 
   /**
@@ -2151,10 +2225,18 @@ export default function App() {
       // the cluster" launches a coordinator with no overflow flags — seen
       // live on a Windows compute node (2026-08-21): the panel promised the borrow settings
       // would apply on the next engine start, and the next start ignored them.
+      // ensureWeights() above already downloaded AND hash-verified the tower
+      // when this model has one, so this resolves to a path or to "" — it never
+      // triggers a surprise transfer of its own.
+      const mm = await mmprojLocalPath(
+        loadSettings().modelDir,
+        getManifest(over?.modelId ?? settings.modelId),
+      );
       await getPairingProvider().create({
         hostname: snap.hostname,
         gpu: snap.gpu_name,
         modelPath: path,
+        mmprojPath: mm,
         tuning: engineTuning(over ? { ...loadSettings(), ...over } : loadSettings(), caps),
       });
       // allowSolo: this IS the one-machine flow. Without it the engine's
@@ -2551,6 +2633,7 @@ export default function App() {
             hostname: snap.hostname,
             gpu: snap.gpu_name,
             modelPath: weightsPath,
+            mmprojPath,
             // From storage, not state — same staleness as serveStandalone.
             tuning: engineTuning(loadSettings(), caps),
           }}
