@@ -461,10 +461,15 @@ function NodeCapacityCard(props: {
   // one-decimal readout used elsewhere.
   const budgetDigits = hybridMode ? 2 : 1;
   const budgetScale = 10 ** budgetDigits;
-  const GBHave = (b: number) => (
+  /* GiB, like every other memory readout in this client (see format.ts) and
+   * like the engine's own log. These two divide by 1024^3 and used to print
+   * "GB", so the strip above a capacity row said 15.6 GiB and the row itself
+   * said 15.60 GB for the same bytes — one quantity, two unit names, on one
+   * card. The arithmetic was never wrong; only the label was. */
+  const GiBHave = (b: number) => (
     Math.floor((b / 1024 ** 3) * budgetScale) / budgetScale
   ).toFixed(budgetDigits);
-  const GBNeed = (b: number) => (
+  const GiBNeed = (b: number) => (
     Math.ceil((b / 1024 ** 3) * budgetScale) / budgetScale
   ).toFixed(budgetDigits);
   // ONE source for "what is left". This used to recompute
@@ -597,20 +602,20 @@ function NodeCapacityCard(props: {
             <div className="capacity__resource-stats">
               <span className="capacity__resource-stat">
                 <span>{t("capacity.available")}</span>
-                <strong>{GBHave(gpuAvailable)} GB</strong>
+                <strong>{GiBHave(gpuAvailable)} GiB</strong>
               </span>
               <span className="capacity__resource-stat">
                 <span>{t(hybridMode ? "capacity.minimum" : "capacity.required")}</span>
                 <strong className={gpuShort ? "capacity__gap" : ""}>
                   {planGpuNeed !== undefined
-                    ? `${GBNeed(planGpuNeed)} GB`
+                    ? `${GiBNeed(planGpuNeed)} GiB`
                     : hybridMode
-                      ? hybridNeed ? `${GBNeed(hybridNeed.vramNeedBytes)} GB` : "—"
-                      : inTauri() ? "—" : `${GBNeed(gpuCap.needBytes)} GB`}
+                      ? hybridNeed ? `${GiBNeed(hybridNeed.vramNeedBytes)} GiB` : "—"
+                      : inTauri() ? "—" : `${GiBNeed(gpuCap.needBytes)} GiB`}
                 </strong>
               </span>
             </div>
-            <div className="spine capacity__spine" role="img" aria-label={`${capacityMemoryLabel} · ${t("capacity.available")} ${GBHave(gpuAvailable)} GB · ${t(hybridMode ? "capacity.minimum" : "capacity.required")} ${gpuNeedBytes ? `${GBNeed(gpuNeedBytes)} GB` : "—"}`}>
+            <div className="spine capacity__spine" role="img" aria-label={`${capacityMemoryLabel} · ${t("capacity.available")} ${GiBHave(gpuAvailable)} GiB · ${t(hybridMode ? "capacity.minimum" : "capacity.required")} ${gpuNeedBytes ? `${GiBNeed(gpuNeedBytes)} GiB` : "—"}`}>
               {ticks.map((_, i) => (
                 <span key={i} className={`tick${i < gpuVisibleLayers ? " tick--on" : ""}`} />
               ))}
@@ -622,18 +627,18 @@ function NodeCapacityCard(props: {
               <div className="capacity__resource-stats">
                 <span className="capacity__resource-stat">
                   <span>{t("capacity.available")}</span>
-                  <strong>{GBHave(ramExpert)} GB</strong>
+                  <strong>{GiBHave(ramExpert)} GiB</strong>
                 </span>
                 <span className="capacity__resource-stat">
                   <span>{t("capacity.expertStorage")}</span>
                   <strong className={ramShort ? "capacity__gap" : ""}>
                     {planRamNeed !== undefined
-                      ? `${GBNeed(planRamNeed)} GB`
-                      : hybridNeed ? `${GBNeed(hybridNeed.ramNeedBytes)} GB` : "—"}
+                      ? `${GiBNeed(planRamNeed)} GiB`
+                      : hybridNeed ? `${GiBNeed(hybridNeed.ramNeedBytes)} GiB` : "—"}
                   </strong>
                 </span>
               </div>
-              <div className="spine capacity__spine" role="img" aria-label={`${t("node.ram")} · ${t("capacity.available")} ${GBHave(ramExpert)} GB · ${t("capacity.expertStorage")} ${ramNeedBytes ? `${GBNeed(ramNeedBytes)} GB` : "—"}`}>
+              <div className="spine capacity__spine" role="img" aria-label={`${t("node.ram")} · ${t("capacity.available")} ${GiBHave(ramExpert)} GiB · ${t("capacity.expertStorage")} ${ramNeedBytes ? `${GiBNeed(ramNeedBytes)} GiB` : "—"}`}>
                 {ticks.map((_, i) => (
                   <span key={i} className={`tick${i < ramVisibleLayers ? " tick--on" : ""}`} />
                 ))}

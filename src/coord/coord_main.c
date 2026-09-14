@@ -9945,6 +9945,43 @@ int main(int argc, char **argv) {
              * run had to reverse-engineer from a byte count. */
             fprintf(stderr, "coord: budget from: %s\n", budget_src);
 
+            /* The vision tower, charged by THE SAME rule the sidecar launch
+             * uses further down: the PATH decides, not the registry.
+             *
+             * idletoken_model_size_resolve() takes the tower's bytes from
+             * `spec->mmproj`, and only a CURATED row has one. The product path
+             * does not pass --model-id — pairing.rs launches with --llama-gguf
+             * alone — so `g_model` is an auto manifest built from the GGUF
+             * header, and model_auto.c has no mmproj field to fill. Admission
+             * therefore charged ZERO for a tower that --mmproj-path then loaded
+             * onto the very same card. Measured on a Windows test node
+             * 2026-09-14: the
+             * client's resource card planned --n-cpu-moe 26 for
+             * Qwen3.5-35B-A3B Q4_K_M @256K while this coordinator launched 24,
+             * the difference being the 858 MiB tower nobody billed. The
+             * direction is admit-then-OOM, and the tower is 87% of the weights
+             * on qwen3.5-2b, where that gap is the whole decision.
+             *
+             * Reading the file also settles the mirror case the registry got
+             * wrong the other way: a vision model started WITHOUT a tower
+             * ("serving TEXT ONLY") used to pay for one it never loads. */
+            msize.mmproj_bytes = 0;
+            if (g_mmproj_path[0]) {
+                struct stat mst;
+                if (stat(g_mmproj_path, &mst) != 0 || !S_ISREG(mst.st_mode)) {
+                    fprintf(stderr,
+                            "idletoken-coord: cannot size the vision tower %s: "
+                            "%s\n", g_mmproj_path, strerror(errno));
+                    return 2;
+                }
+                msize.mmproj_bytes = (uint64_t)mst.st_size;
+                fprintf(stderr,
+                        "coord: vision tower: %.2f GiB charged to this "
+                        "machine's GPU budget (%s)\n",
+                        (double)msize.mmproj_bytes / 1073741824.0,
+                        g_mmproj_path);
+            }
+
             /* A quantized KV cache (IDLETOKEN_KV_CACHE_TYPE/_V) genuinely fits
              * more context, so the planner must price KV at the dtype the
              * sidecar will actually spawn with — a plan at f16 prices would

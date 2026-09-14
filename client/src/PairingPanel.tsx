@@ -31,7 +31,10 @@ function PeerRow(props: {
   const { t } = useI18n();
   const p = props.peer;
   const showMoeResources = isMoeModel(props.snapshot.modelId ?? "");
-  const mem = (bytes?: number) => bytes ? `${floorGiB1(bytes)} GB` : "—";
+  // GiB, not GB: floorGiB1 divides by 1024^3 and every other memory readout in
+  // the client names that unit (format.ts). Labelling it "GB" here put two unit
+  // names on one quantity across the pairing panel and the resource card.
+  const mem = (bytes?: number) => bytes ? `${floorGiB1(bytes)} GiB` : "—";
   const hasRange = p.layerLo !== undefined && p.layerHi !== undefined;
   // Explicit false only: older snapshots (and the dev-sim before the field)
   // omit `online`, and absence has always meant "fine".

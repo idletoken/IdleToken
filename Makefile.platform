@@ -14,7 +14,7 @@
 
 CC       ?= cc
 CFLAGS   ?= -O2 -std=c99 -Wall -Wextra
-INCLUDES := -Iinclude -Ivendor/tweetnacl -Ivendor/blake2
+INCLUDES := -Iinclude -Ivendor/tweetnacl -Ivendor/blake2 -Ivendor/puff
 LDLIBS   :=
 
 # The agent spawns one thread per connection (see the concurrency section in
@@ -46,6 +46,8 @@ OBJS := $(BUILD)/tweetnacl.o \
         $(BUILD)/b64.o \
         $(BUILD)/apiconv.o \
         $(BUILD)/admission.o \
+        $(BUILD)/deflate_wire.o \
+        $(BUILD)/puff.o \
         $(BUILD)/platform_agent.o
 
 .PHONY: all clean
@@ -94,7 +96,16 @@ $(BUILD)/apiconv.o: src/common/apiconv.c include/idletoken_apiconv.h | $(BUILD)
 $(BUILD)/admission.o: src/common/admission.c include/idletoken_admission.h include/idletoken_sha256.h include/idletoken_privacy.h | $(BUILD)
 	$(CC) $(CFLAGS) -D_GNU_SOURCE $(INCLUDES) -c -o $@ $<
 
-$(BUILD)/platform_agent.o: src/tools/platform_agent.c include/idletoken_sodium_seal.h include/idletoken_privacy.h include/idletoken_net.h include/idletoken_http.h include/idletoken_b64.h include/idletoken_apiconv.h include/idletoken_admission.h $(VERSION_HEADER) | $(BUILD)
+# Inflate for deflated sealed payloads. Only the decompressor is vendored: the
+# platform compresses (Node's zlib), the agent decompresses, so there is one
+# implementation of the format on our side, not two.
+$(BUILD)/puff.o: vendor/puff/puff.c vendor/puff/puff.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
+
+$(BUILD)/deflate_wire.o: src/common/deflate_wire.c include/idletoken_deflate_wire.h include/idletoken_privacy.h vendor/puff/puff.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
+
+$(BUILD)/platform_agent.o: src/tools/platform_agent.c include/idletoken_sodium_seal.h include/idletoken_privacy.h include/idletoken_net.h include/idletoken_http.h include/idletoken_b64.h include/idletoken_apiconv.h include/idletoken_admission.h include/idletoken_deflate_wire.h $(VERSION_HEADER) | $(BUILD)
 	$(CC) $(CFLAGS) -D_GNU_SOURCE $(INCLUDES) -include $(VERSION_HEADER) -c -o $@ $<
 
 $(BIN): $(OBJS)

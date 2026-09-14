@@ -15,6 +15,8 @@ import type { NodeSnapshot } from "./types";
 import type { Session } from "./auth";
 import StoredModels from "./StoredModels";
 import { exportableSettings } from "./diagnostics";
+import { RELEASES_URL } from "./links";
+import { currentVersionStanding } from "./release";
 
 type Theme = "dark" | "light";
 const MiB = 1024 ** 2;
@@ -31,7 +33,9 @@ const L = (b: Bi, lang: Lang) => b[lang];
 type FieldType =
   | "toggle" | "select" | "text" | "password" | "number" | "slider" | "time" | "note" | "action"
   /** Full-width block: the model folder's contents, with a Delete per file. */
-  | "stored-models";
+  | "stored-models"
+  /** One quiet line: "version X is available". Renders nothing when it is not. */
+  | "version-note";
 interface Field {
   key?: keyof AppSettings;
   type: FieldType;
@@ -282,6 +286,13 @@ const CATEGORIES: Category[] = [
       // file.
       { label: { en: "About", zh: "关于" }, fields: [
         { type: "note", label: { en: `IdleToken client ${APP_VERSION}`, zh: `IdleToken 客户端 ${APP_VERSION}` } },
+        // One line, no badge, no dot, no dialog — and absent entirely when
+        // there is nothing newer or nothing is known (2026-09-14). Most people
+        // here are running a single machine, where an old build can only affect
+        // them; interrupting that to sell an upgrade is the tax this product is
+        // supposed to not charge. The place a version genuinely blocks
+        // something is the sharing switch, and that is where it is said.
+        { type: "version-note" },
         // Said wrong until 2026-08-13 ("MIT-licensed"). IdleToken is
         // **Apache-2.0** — LICENSE, NOTICE and the README have always said so.
         // The third-party inventory (llama.cpp, ds4, both MIT) was cut from
@@ -298,6 +309,61 @@ const CATEGORIES: Category[] = [
     ],
   },
 ];
+
+/**
+ * "Version X is available" — or nothing at all.
+ *
+ * The entire update story on a machine that is not sharing (2026-09-14). There
+ * is no dialog, no badge, no "Later" button and no install path: the link opens
+ * the official release page in a browser, and the person downloads an installer
+ * the same way they got this one. Nothing in the client fetches, verifies or
+ * installs anything, which is exactly the boundary the retired in-app updater
+ * crossed and this deliberately does not.
+ *
+ * Renders NOTHING in three cases, all of them on purpose: no platform
+ * configured, the platform unreachable, or the published version not strictly
+ * newer than this build. "You are up to date" is never shown — the platform's
+ * number comes from whenever the gateway was last deployed and can honestly lag
+ * a release, so an under-report is silence and an over-report would be a false
+ * all-clear about a fix somebody needs.
+ */
+function VersionNote() {
+  const { t } = useI18n();
+  const [newer, setNewer] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    // Fire and forget. A failure here is not an error to report: it means the
+    // machine is offline or has no platform, and neither is a fact about the
+    // build's age.
+    void currentVersionStanding().then((s) => { if (alive) setNewer(s.newerVersion); });
+    return () => { alive = false; };
+  }, []);
+
+  if (!newer) return null;
+
+  const open = async () => {
+    if (inTauri()) {
+      const { open: openUrl } = await import("@tauri-apps/plugin-shell");
+      await openUrl(RELEASES_URL);
+    } else {
+      window.open(RELEASES_URL, "_blank", "noopener,noreferrer");
+    }
+  };
+
+  return (
+    <p className="about-line">
+      {t("update.available", { version: newer })}{" "}
+      <a
+        href={RELEASES_URL}
+        onClick={(e) => { e.preventDefault(); void open(); }}
+        rel="noreferrer noopener"
+      >
+        {t("update.openDownloads")}
+      </a>
+    </p>
+  );
+}
 
 // The "Advanced · coming soon" roadmap shelf is deleted outright (2026-08-15;
 // it had been hidden from the nav since 2026-08-11). AppSettings keys and
@@ -468,6 +534,7 @@ export default function SettingsPanel(props: {
     const tag = f.reserved ? <span className="reserved-tag">{t("settings.reservedTag")}</span> : null;
 
     if (f.type === "note") return <p key={i} className="about-line">{label}</p>;
+    if (f.type === "version-note") return <VersionNote key={i} />;
     if (f.type === "stored-models")
       return <StoredModels key={i} modelDir={s.modelDir} onChanged={props.onWeightsChanged} />;
     if (f.type === "action") {

@@ -1,6 +1,9 @@
 import { useEffect, useState } from "react";
 import { useI18n } from "./i18n";
+import { useDialog } from "./useDialog";
 import { loadSettings, saveSettings } from "./settings";
+import { RELEASES_URL } from "./links";
+import { currentVersionStanding } from "./release";
 import {
   agentStart,
   agentStop,
@@ -16,6 +19,65 @@ function publishMarketplaceChange(): void {
   window.dispatchEvent(new CustomEvent(MARKETPLACE_CHANGED));
 }
 
+/**
+ * This build is too old to be listed on the marketplace.
+ *
+ * Its own class rather than a message string because it is the one failure here
+ * that has a REMEDY the user can act on, so it gets a dialog with a link rather
+ * than a tooltip. Everything else the toggle can fail with — no session, agent
+ * would not start, coordinator not ready — is either transient or already
+ * explained elsewhere.
+ */
+class VersionTooOldToShare extends Error {
+  constructor(readonly installed: string, readonly floor: string) {
+    super(`client ${installed} is below the marketplace floor ${floor}`);
+    this.name = "VersionTooOldToShare";
+  }
+}
+
+/**
+ * Shown when someone turns sharing on from a build below the listing floor.
+ *
+ * The copy has one job beyond "download this": say that nothing else is
+ * affected. A person who reads "your version is too old" on a machine that has
+ * been happily running a 200 GB model all week will otherwise conclude the
+ * whole product just stopped working, and that conclusion is wrong — the floor
+ * is about serving strangers and nothing else.
+ */
+function ShareVersionBlockedDialog(
+  { installed, floor, onClose }: { installed: string; floor: string; onClose: () => void },
+) {
+  const { t } = useI18n();
+  const ref = useDialog(onClose);
+  const open = async () => {
+    if (inTauri()) {
+      const { open: openUrl } = await import("@tauri-apps/plugin-shell");
+      await openUrl(RELEASES_URL);
+    } else {
+      window.open(RELEASES_URL, "_blank", "noopener,noreferrer");
+    }
+  };
+  return (
+    <div className="modal-scrim" onClick={onClose}>
+      <div ref={ref} className="modal modal--auth" role="dialog" aria-modal="true"
+           onClick={(e) => e.stopPropagation()}>
+        <div className="modal__head">
+          <h2>{t("update.share.title")}</h2>
+          <button className="iconbtn" onClick={onClose} aria-label={t("a11y.close")}>✕</button>
+        </div>
+        <p>{t("update.share.body", { installed, floor })}</p>
+        <p className="field__hint">{t("update.share.unaffected")}</p>
+        <div className="modal__actions">
+          <button className="btn btn--primary" onClick={() => void open()}>
+            {t("update.openDownloads")}
+          </button>
+          <button className="btn" onClick={onClose}>{t("update.share.notNow")}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /** Provider-side control: accept other users' work and earn Sparks. */
 export function ShareToggleButton({
   serviceReady,
@@ -28,6 +90,7 @@ export function ShareToggleButton({
   const [on, setOn] = useState(() => loadSettings().providerEnabled);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [blocked, setBlocked] = useState<VersionTooOldToShare | null>(null);
 
   useEffect(() => {
     const sync = () => setOn(loadSettings().providerEnabled);
@@ -66,6 +129,21 @@ export function ShareToggleButton({
         saveSettings({ ...loadSettings(), providerEnabled: false });
         setOn(false);
       } else {
+        // The one moment a version genuinely blocks something, and the one
+        // moment it is fair to say so (2026-09-14). Turning sharing ON is the
+        // user stepping out to serve strangers — nothing of theirs is running
+        // yet, they are actively doing this, and the gateway is about to refuse
+        // the registration anyway. Catching it here turns an opaque 426 in a
+        // headless agent's log into a sentence with a download link.
+        //
+        // Everything else in this client stays unconditional. There is no
+        // version check on starting a cluster, loading a model, or serving the
+        // local API, and there must not be: an old build there can only affect
+        // the person who chose to run it.
+        const standing = await currentVersionStanding();
+        if (standing.belowShareFloor) {
+          throw new VersionTooOldToShare(standing.installed, standing.shareFloor!);
+        }
         const scheme = /^cluster-\d+$/;
         const stored = loadSettings().providerName;
         let providerName = stored && scheme.test(stored) ? stored : "";
@@ -94,6 +172,10 @@ export function ShareToggleButton({
     } catch (e) {
       const msg = String((e as Error)?.message ?? e);
       setErr(msg);
+      // The one failure with a remedy gets a dialog. It is also the only one
+      // raised BEFORE the agent was asked to start, so there is nothing to
+      // unwind — the rollback below is for a start that got partway.
+      if (e instanceof VersionTooOldToShare) setBlocked(e);
       if (!on) {
         try { await agentStop(); } catch { /* already stopped */ }
         saveSettings({ ...loadSettings(), providerEnabled: false });
@@ -110,16 +192,25 @@ export function ShareToggleButton({
   const active = on && serviceReady;
 
   return (
-    <button
-      className={`pill pill--market pill--${active ? "ready" : "standalone"}`}
-      disabled={busy}
-      onClick={() => void toggle()}
-      aria-pressed={active}
-      title={!serviceReady ? t("share.needService") : err ?? t(active ? "share.on" : "share.off")}
-    >
-      <span className="pill__dot" />
-      <span className="pill__label">{busy ? "…" : t(active ? "share.on" : "share.off")}</span>
-    </button>
+    <>
+      <button
+        className={`pill pill--market pill--${active ? "ready" : "standalone"}`}
+        disabled={busy}
+        onClick={() => void toggle()}
+        aria-pressed={active}
+        title={!serviceReady ? t("share.needService") : err ?? t(active ? "share.on" : "share.off")}
+      >
+        <span className="pill__dot" />
+        <span className="pill__label">{busy ? "…" : t(active ? "share.on" : "share.off")}</span>
+      </button>
+      {blocked ? (
+        <ShareVersionBlockedDialog
+          installed={blocked.installed}
+          floor={blocked.floor}
+          onClose={() => setBlocked(null)}
+        />
+      ) : null}
+    </>
   );
 }
 

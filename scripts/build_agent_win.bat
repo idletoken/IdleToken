@@ -42,7 +42,7 @@ for /f "usebackq delims=" %%V in (`%POWERSHELL% -NoProfile -Command "$p = Conver
 if not defined IDLETOKEN_CLIENT_VERSION goto :fail
 >"%VERSION_HEADER%" echo #define IDLETOKEN_CLIENT_VERSION "%IDLETOKEN_CLIENT_VERSION%"
 
-set CF=-O2 -std=gnu11 -Wall -Wextra -D_GNU_SOURCE -Iinclude -Ivendor/tweetnacl -Ivendor/blake2 -Isrc/platform/win -include src/platform/win/win_compat.h -include %VERSION_HEADER%
+set CF=-O2 -std=gnu11 -Wall -Wextra -D_GNU_SOURCE -Iinclude -Ivendor/tweetnacl -Ivendor/blake2 -Ivendor/puff -Isrc/platform/win -include src/platform/win/win_compat.h -include %VERSION_HEADER%
 
 echo === crypto ===> agent_build.log
 gcc -c vendor/tweetnacl/tweetnacl.c %CF% -o a_tweetnacl.o >> agent_build.log 2>&1
@@ -84,11 +84,17 @@ gcc -c src/common/admission.c %CF% -o a_admission.o >> agent_build.log 2>&1
 if errorlevel 1 goto :fail
 
 echo === agent ===>> agent_build.log
+REM Inflate for deflated sealed payloads. Only the decompressor is built: the
+REM platform compresses (Node zlib), the agent decompresses.
+gcc -c vendor/puff/puff.c %CF% -o a_puff.o >> agent_build.log 2>&1
+if errorlevel 1 goto :fail
+gcc -c src/common/deflate_wire.c %CF% -o a_deflate_wire.o >> agent_build.log 2>&1
+if errorlevel 1 goto :fail
 gcc -c src/tools/platform_agent.c %CF% -o a_platform_agent.o >> agent_build.log 2>&1
 if errorlevel 1 goto :fail
 
 echo === link ===>> agent_build.log
-gcc -static-libgcc -o idletoken-platform-agent.exe a_platform_agent.o a_sodium_seal.o a_privacy.o a_tweetnacl.o a_blake2b.o a_net.o a_http.o a_b64.o a_apiconv.o a_admission.o a_win_compat.o a_utf8_manifest.o -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic -lws2_32 -lbcrypt >> agent_build.log 2>&1
+gcc -static-libgcc -o idletoken-platform-agent.exe a_platform_agent.o a_sodium_seal.o a_privacy.o a_tweetnacl.o a_blake2b.o a_net.o a_http.o a_b64.o a_apiconv.o a_admission.o a_puff.o a_deflate_wire.o a_win_compat.o a_utf8_manifest.o -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic -lws2_32 -lbcrypt >> agent_build.log 2>&1
 if errorlevel 1 goto :fail
 
 echo AGENT_WIN_OK

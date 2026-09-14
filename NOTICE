@@ -59,6 +59,14 @@ vendor/blake2/ — BLAKE2b (RFC 7693), unkeyed one-shot subset
     Samuel Neves and Jean-Philippe Aumasson.
     Upstream: https://github.com/BLAKE2/BLAKE2
 
+vendor/puff/ — puff, the small reference DEFLATE decompressor from zlib.
+    Linked into idletoken-platform-agent, which is the only inflater of a
+    deflated sealed job. Chosen over linking zlib itself because this is a
+    few hundred lines with no allocation and no build-system reach.
+    Copyright (C) 2002-2013 Mark Adler. zlib licence; its full text is in the
+    header of vendor/puff/puff.h, which ships with the source.
+    Upstream: https://github.com/madler/zlib (contrib/puff)
+
 Model weights are NOT distributed with this software. IdleToken downloads
 GGUF files published by their respective authors; those files carry their
 own licenses (DeepSeek-V4-Flash-0731 is MIT, per its model card).

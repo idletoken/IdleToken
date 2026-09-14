@@ -44,6 +44,8 @@
 #include "idletoken_apiconv.h"
 #include "idletoken_admission.h"   /* prove to the coordinator that this job is
                                     * platform work (threat register PROV-28) */
+#include "idletoken_deflate_wire.h"  /* the platform may deflate a job before
+                                      * sealing it; we are the only inflater */
 
 /* Release builds inject this from client/package.json.  There is deliberately
  * no fallback: a hand-maintained default would let one of the three platform
@@ -54,6 +56,12 @@
 
 #define IDLETOKEN_VERSION_HTTP_HEADER \
     "X-IdleToken-Version: " IDLETOKEN_CLIENT_VERSION "\r\n"
+
+/* Ceiling on an inflated request, checked before a byte is allocated. The
+ * platform's own HTTP body budget is 8 MB, so nothing honest comes close;
+ * twice that leaves room for the envelope's own framing without leaving the
+ * ceiling to the sender's arithmetic. */
+#define IDLETOKEN_MAX_INFLATED_REQUEST (16u * 1024u * 1024u)
 
 #include <errno.h>
 #include <signal.h>
@@ -599,17 +607,89 @@ static int json_int_field(const char *json, size_t len, const char *key, int dfl
  * Authorization: Bearer header (for the platform control plane).
  * ====================================================================== */
 
+/* How long a response may go with NO bytes at all before we call it a stall.
+ *
+ * Deliberately separate from the caller's timeout, which bounds how long we
+ * wait for the server to start answering (the relay long poll parks for 25 s by
+ * design). Once the headers are in, the answer is on its way and the only
+ * question left is whether it is still moving — a different question, so it
+ * gets its own budget. A relay job for an agentic request is hundreds of KB,
+ * and this link was measured (2026-09-13, tcpdump on the DGX node) carrying
+ * 111 KB in 117 s with gaps of up to 24 s between packets. One budget for both
+ * questions meant a body that paused slightly longer than the poll's own
+ * timeout got cut short, and cut short SILENTLY: the read loop could not tell a
+ * timeout from the end of the response. */
+#define HTTP_BODY_IDLE_SECS 120
+
+/* Operational override, in seconds. A link slower than the one we measured can
+ * raise it; G-AGENT-TRUNCATED-JOB lowers it so a stall takes seconds to provoke
+ * instead of minutes. Nothing reads this in normal operation. */
+static int http_body_idle_secs(void) {
+    const char *e = getenv("IDLETOKEN_HTTP_BODY_IDLE_S");
+    int v = e ? atoi(e) : 0;
+    return v > 0 ? v : HTTP_BODY_IDLE_SECS;
+}
+
+/* Arm (or re-arm) the receive timeout on an open socket. */
+static void http_set_rcv_timeout(int fd, int secs) {
+    /* Winsock's SO_RCVTIMEO takes a DWORD of milliseconds, not a struct
+     * timeval — passing the timeval silently sets a nonsense timeout (its
+     * first 4 bytes read as milliseconds). */
+#ifdef _WIN32
+    DWORD to = (DWORD)secs * 1000u;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof(to));
+#else
+    struct timeval to = { secs, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
+#endif
+}
+
+/* `Content-Length: N` out of a response header block; -1 when absent or
+ * unparsable (then EOF is the only framing we have, as before). Matched
+ * case-insensitively and only at the start of a line: the field name is ours to
+ * read, not ours to dictate, and `X-Foo-Content-Length:` is not it. */
+/* long long, not long: `long` is 32 bits on Windows (LLP64), which made the
+ * overflow guard below a shift past the width of its own type — undefined, and
+ * folded by GCC into a bound that rejected every real length. The whole check
+ * then reported "no Content-Length" on the one platform this bug was found on
+ * (2026-09-13; caught by running the oracle on Windows, not by reading it). */
+static long long http_content_length(const uint8_t *hdr, size_t len) {
+    static const char key[] = "content-length:";
+    const size_t klen = sizeof(key) - 1;
+    for (size_t i = 0; i + klen < len; i++) {
+        if (i && hdr[i - 1] != '\n') continue;
+        size_t j = 0;
+        while (j < klen && (uint8_t)(hdr[i + j] | 0x20) == (uint8_t)key[j]) j++;
+        if (j != klen) continue;
+        size_t p = i + klen;
+        while (p < len && (hdr[p] == ' ' || hdr[p] == '\t')) p++;
+        long long v = 0; int digits = 0;
+        while (p < len && hdr[p] >= '0' && hdr[p] <= '9') {
+            if (v > (1LL << 40)) return -1;     /* absurd; treat as unparsable */
+            v = v * 10 + (hdr[p] - '0'); p++; digits++;
+        }
+        return digits ? v : -1;
+    }
+    return -1;
+}
+
 /* POST `body` as JSON to addr("host:port")+path. Returns malloc'd response
  * body (caller frees), sets *out_len and *out_status; NULL on I/O error.
  * timeout_secs > 0 arms SO_RCVTIMEO/SO_SNDTIMEO so a dead platform link can't
  * hang a relay long-poll forever (0 = block indefinitely, e.g. slow coord
- * inference where the caller owns pacing). */
+ * inference where the caller owns pacing).
+ *
+ * `out_truncated` (optional) is how a caller says it wants to see a body that
+ * arrived incomplete. Pass NULL — as everything but the relay poll does — and
+ * an incomplete body is a failed request (NULL return), because a fragment of
+ * JSON is indistinguishable from the whole thing once it reaches a parser. */
 static uint8_t *http_request_json(const char *method,
                                   const char *addr, const char *path,
                                   const char *bearer, const char *extra_hdr,
                                   const uint8_t *body, size_t body_len,
                                   int *out_status, size_t *out_len,
-                                  int timeout_secs) {
+                                  int timeout_secs, int *out_truncated) {
+    if (out_truncated) *out_truncated = 0;
     /* "unix:<path>" is the shared-mode transport to the coordinator. The agent
      * opens the platform's envelope, so everything it sends onward is the
      * buyer's plaintext; on loopback TCP that is readable with one tcpdump by
@@ -620,16 +700,12 @@ static uint8_t *http_request_json(const char *method,
                      : idletoken_connect_tcp(addr);
     if (fd < 0) return NULL;
     if (timeout_secs > 0) {
-        /* Winsock's SO_RCVTIMEO/SO_SNDTIMEO take a DWORD of milliseconds, not
-         * a struct timeval — passing the timeval silently sets a nonsense
-         * timeout (its first 4 bytes read as milliseconds). */
+        http_set_rcv_timeout(fd, timeout_secs);
 #ifdef _WIN32
         DWORD to = (DWORD)timeout_secs * 1000u;
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof(to));
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&to, sizeof(to));
 #else
         struct timeval to = { timeout_secs, 0 };
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &to, sizeof(to));
 #endif
     }
@@ -658,8 +734,17 @@ static uint8_t *http_request_json(const char *method,
         idletoken_close_fd(fd); return NULL;
     }
 
-    /* Read the whole response until EOF (Connection: close). */
+    /* Read the headers, then exactly as many body bytes as the server said it
+     * was sending. "Read until EOF" is only correct when the transfer really
+     * ended, and from inside this loop a stalled socket looks exactly like a
+     * finished one — so the old version returned short bodies as successes.
+     * On 2026-09-13 that turned a slow link into a false accusation: the relay
+     * job's `sealed_request` lost its closing quote mid-flight and this agent
+     * reported the PLATFORM as having omitted the field. */
     size_t cap = 8192, len = 0;
+    size_t hdr_end = 0;              /* offset of the first body byte; 0 = unseen */
+    long long content_len = -1;
+    int truncated = 0;
     uint8_t *buf = malloc(cap);
     if (!buf) { idletoken_close_fd(fd); return NULL; }
     for (;;) {
@@ -677,8 +762,32 @@ static uint8_t *http_request_json(const char *method,
          * identical to read() for sockets on POSIX, so one spelling serves
          * both platforms. */
         ssize_t r = recv(fd, (char *)buf + len, 4096, 0);
-        if (r > 0) { len += (size_t)r; continue; }
-        if (r < 0 && errno == EINTR) continue;
+        if (r > 0) {
+            /* The blank line can straddle two reads, so rescan the last three
+             * bytes we already had. */
+            size_t scan_from = (!hdr_end && len > 3) ? len - 3 : len;
+            len += (size_t)r;
+            if (!hdr_end) {
+                for (size_t i = scan_from; i + 3 < len; i++) {
+                    if (buf[i]=='\r' && buf[i+1]=='\n' && buf[i+2]=='\r' && buf[i+3]=='\n') {
+                        hdr_end = i + 4;
+                        content_len = http_content_length(buf, hdr_end);
+                        /* The waiting is over; what is left is transfer. */
+                        if (timeout_secs > 0) http_set_rcv_timeout(fd, http_body_idle_secs());
+                        break;
+                    }
+                }
+            }
+            /* Framed by Content-Length: stop at the last declared byte instead
+             * of waiting for a FIN that a keep-alive server will not send. */
+            if (hdr_end && content_len >= 0 && len - hdr_end >= (size_t)content_len) break;
+            continue;
+        }
+        if (r == 0) break;               /* the peer closed: a real end of body */
+#ifndef _WIN32
+        if (errno == EINTR) continue;    /* a signal, not a failure */
+#endif
+        truncated = 1;                   /* idle timeout, reset, or socket error */
         break;
     }
     idletoken_close_fd(fd);
@@ -687,23 +796,30 @@ static uint8_t *http_request_json(const char *method,
     int status = 0;
     if (len > 12 && memcmp(buf, "HTTP/1.", 7) == 0)
         status = (buf[9]-'0')*100 + (buf[10]-'0')*10 + (buf[11]-'0');
-    if (status < 100) { free(buf); return NULL; }
+    if (status < 100 || !hdr_end) { free(buf); return NULL; }
 
-    /* Split headers/body at CRLFCRLF; return the body only. */
-    uint8_t *sep = NULL;
-    for (size_t i = 0; i + 3 < len; i++) {
-        if (buf[i]=='\r' && buf[i+1]=='\n' && buf[i+2]=='\r' && buf[i+3]=='\n') {
-            sep = buf + i + 4; break;
-        }
+    size_t blen = len - hdr_end;
+    /* Fewer bytes than the server announced is a body cut short, whether or not
+     * the socket bothered to tell us why. */
+    if (content_len >= 0 && blen < (size_t)content_len) truncated = 1;
+    if (truncated)
+        fprintf(stderr, "platform-agent: %s %s: read %zu of %lld announced "
+                        "body bytes\n", method, path, blen, content_len);
+    if (truncated && !out_truncated) {
+        fprintf(stderr, "platform-agent: the reply to %s %s was cut short in "
+                        "transit (%zu of %lld body bytes); failing the request "
+                        "instead of parsing the fragment\n",
+                method, path, blen, content_len);
+        free(buf); return NULL;
     }
-    if (!sep) { free(buf); return NULL; }
-    size_t blen = len - (size_t)(sep - buf);
+
     uint8_t *body_out = malloc(blen ? blen : 1);
     if (!body_out) { free(buf); return NULL; }
-    memcpy(body_out, sep, blen);
+    memcpy(body_out, buf + hdr_end, blen);
     free(buf);
     if (out_status) *out_status = status;
     if (out_len) *out_len = blen;
+    if (out_truncated) *out_truncated = truncated;
     return body_out;
 }
 
@@ -832,6 +948,26 @@ static char *platform_register(const char *platform_addr, const char *jwt,
         fprintf(stderr, "platform-agent: register: platform %s unreachable\n", platform_addr);
         return NULL;
     }
+    if (status == 426) {
+        /* The marketplace listing floor (DIST-07). Worth its own message
+         * because the generic one above prints a JSON body into a log that,
+         * on a headless node, nobody reads -- and because the plain reading
+         * of "426 Upgrade Required" is "the software stopped working", which
+         * is wrong. Nothing about this machine is broken: it serves its owner
+         * exactly as before. What it may not do is take work from strangers,
+         * who have no way to see which build answered them. */
+        fprintf(stderr,
+                "platform-agent: this build (%s) is too old to be listed on the marketplace.\n"
+                "platform-agent:   Nothing else is affected -- the coordinator, your cluster and\n"
+                "platform-agent:   the local API keep working, and no data was touched.\n"
+                "platform-agent:   Install the current release and start sharing again:\n"
+                "platform-agent:   https://github.com/idletoken/IdleToken/releases/latest\n"
+                "platform-agent:   Platform said: %.*s\n",
+                IDLETOKEN_CLIENT_VERSION,
+                (int)(rlen > 512 ? 512 : rlen), (const char *)resp);
+        free(resp);
+        return NULL;
+    }
     if (status != 200 && status != 201) {
         fprintf(stderr, "platform-agent: register: platform said %d: %.*s\n",
                 status, (int)(rlen > 512 ? 512 : rlen), (const char *)resp);
@@ -855,7 +991,21 @@ static uint8_t *http_post_json(const char *addr, const char *path, const char *b
      * not inherit a platform-only compatibility header. */
     return http_request_json("POST", addr, path, bearer,
                              IDLETOKEN_VERSION_HTTP_HEADER, body, body_len,
-                             out_status, out_len, timeout_secs);
+                             out_status, out_len, timeout_secs, NULL);
+}
+
+/* The relay poll's variant, and the only caller that wants to see an
+ * incomplete body. Its response is the one big enough for a stalled link to
+ * cut short, and the one where the fragment is still worth something: the job
+ * id sits at the front of it, so we can tell the platform to give the job to
+ * somebody else instead of leaving the buyer waiting for a timeout. */
+static uint8_t *http_post_json_framed(const char *addr, const char *path, const char *bearer,
+                                      const uint8_t *body, size_t body_len,
+                                      int *out_status, size_t *out_len, int timeout_secs,
+                                      int *out_truncated) {
+    return http_request_json("POST", addr, path, bearer,
+                             IDLETOKEN_VERSION_HTTP_HEADER, body, body_len,
+                             out_status, out_len, timeout_secs, out_truncated);
 }
 
 /* The forward into the local coordinator, marked as platform-dispatched.
@@ -1075,7 +1225,7 @@ static uint8_t *http_post_json_platform(const char *addr, const char *path,
         resp = http_request_json("POST", addr, path,
                                  g_coord_token[0] ? g_coord_token : NULL,
                                  hdrs,
-                                 body, body_len, out_status, out_len, timeout_secs);
+                                 body, body_len, out_status, out_len, timeout_secs, NULL);
         if (attempt > 0 || !coord_refused_admission(*out_status, resp, *out_len))
             return resp;
         fprintf(stderr, "platform-agent: the coordinator refused this job's "
@@ -1093,7 +1243,7 @@ static uint8_t *http_post_json_platform(const char *addr, const char *path,
 static uint8_t *http_get_json(const char *addr, const char *path,
                               int *out_status, size_t *out_len, int timeout_secs) {
     return http_request_json("GET", addr, path, NULL, NULL, NULL, 0,
-                             out_status, out_len, timeout_secs);
+                             out_status, out_len, timeout_secs, NULL);
 }
 
 /* ----------------------------------------------------------------------
@@ -1506,8 +1656,14 @@ static int coord_stats_json(const char *coord_addr, char *out, size_t out_cap) {
         snprintf(origin_field, sizeof(origin_field),
                  "\"origin_id\":\"%s\",", origin_id);
     free(origin_id);
+    /* `accepts_deflate` is this build saying it can inflate a sealed payload.
+     * Unconditional, because the inflater is linked in — the platform must
+     * never deflate for an agent that did not say this, and the only honest
+     * way to say it is to be able to do it. An older agent simply omits it and
+     * keeps receiving plain JSON. */
     int n = snprintf(out, out_cap,
-        "{\"seq_slots_by_ctx\":{\"%d\":%d},\"avg_service_ms\":{\"%d\":%d},%s%s"
+        "{\"accepts_deflate\":true,"
+        "\"seq_slots_by_ctx\":{\"%d\":%d},\"avg_service_ms\":{\"%d\":%d},%s%s"
         "%s\"queue_depth\":%d,\"max_ctx_tokens\":%d}",
         ctx, slots > 0 ? slots : 1, ctx, svc_ms > 0 ? svc_ms : 0, ttft_field,
         shared_field, origin_field, qdepth, ctx);
@@ -1521,8 +1677,8 @@ static int platform_heartbeat(const char *platform_addr, const char *jwt,
     char path[256];
     int pn = snprintf(path, sizeof(path), "/providers/%s/heartbeat", provider_id);
     if (pn < 0 || (size_t)pn >= sizeof(path)) return -1;
-    char body[512] = "{}";
-    char stats[400];
+    char body[640] = "{}";
+    char stats[512];
     if (coord_stats_json(coord_addr, stats, sizeof(stats)) == 0) {
         int bn = snprintf(body, sizeof(body), "{\"capacity\":%s}", stats);
         if (bn < 0 || (size_t)bn >= sizeof(body)) snprintf(body, sizeof(body), "{}");
@@ -1661,8 +1817,8 @@ static void relay_loop(const idletoken_keypair *node, agent_registration *reg) {
          * A coordinator that cannot be probed yields an empty stats string and
          * the poll goes out exactly as it did before: the wait, and nothing
          * claimed. */
-        char poll_body[512];
-        char stats[400];
+        char poll_body[640];
+        char stats[512];
         int pbl;
         if (coord_stats_json(coord_addr, stats, sizeof(stats)) == 0)
             pbl = snprintf(poll_body, sizeof(poll_body),
@@ -1672,11 +1828,14 @@ static void relay_loop(const idletoken_keypair *node, agent_registration *reg) {
         if (pbl < 0 || (size_t)pbl >= sizeof(poll_body))
             pbl = snprintf(poll_body, sizeof(poll_body), "{\"wait_ms\":%d}", RELAY_WAIT_MS);
 
-        int status = 0; size_t rlen = 0;
-        /* Socket timeout comfortably above the server's hold time. */
-        uint8_t *resp = http_post_json(platform_addr, path, jwt,
-                                       (const uint8_t *)poll_body, (size_t)pbl,
-                                       &status, &rlen, RELAY_WAIT_MS / 1000 + 15);
+        int status = 0; size_t rlen = 0; int truncated = 0;
+        /* Socket timeout comfortably above the server's hold time. Once the job
+         * starts arriving the transfer gets its own, longer idle budget
+         * (HTTP_BODY_IDLE_SECS) — see http_request_json. */
+        uint8_t *resp = http_post_json_framed(platform_addr, path, jwt,
+                                              (const uint8_t *)poll_body, (size_t)pbl,
+                                              &status, &rlen, RELAY_WAIT_MS / 1000 + 15,
+                                              &truncated);
         if (!resp || status < 200 || status >= 300) {
             fprintf(stderr, "platform-agent: relay poll %s (http %d); retry in %ds\n",
                     resp ? "rejected" : "unreachable", status, backoff);
@@ -1691,6 +1850,25 @@ static void relay_loop(const idletoken_keypair *node, agent_registration *reg) {
         /* {"job_id":null} (idle timeout) → just poll again. */
         char *job_id = json_str_dup((const char *)resp, rlen, "job_id");
         if (!job_id) { free(resp); continue; }
+
+        /* A job that only half arrived is not a job we can run, but it IS one
+         * the platform is still holding open for us, and the id at the front of
+         * the fragment is enough to hand it back. Saying so immediately lets the
+         * request fail over to another provider; staying quiet would make the
+         * buyer wait out the platform's job timeout, and parsing the fragment is
+         * what used to make us report the platform's envelope as malformed. */
+        if (truncated) {
+            fprintf(stderr, "platform-agent: relay job=%s arrived cut short "
+                            "(%zu bytes) — this machine's link to the platform "
+                            "stalled. Handing the job back so it can go "
+                            "elsewhere.\n", job_id, rlen);
+            relay_post_result(platform_addr, jwt, reg->provider_id, job_id, NULL,
+                              "job body was cut short in transit "
+                              "(this provider's link to the platform stalled)", 502);
+            free(job_id);
+            free(resp);
+            continue;
+        }
 
         /* The poll response body IS the sealed envelope (same keys as the
          * direct /infer body) — feed it straight to the shared path. */
@@ -1778,6 +1956,29 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
         idletoken_munlock(plain, plain_cap); free(plain);
         free(reply_to);
         FAIL(400, "cannot open sealed request (wrong key or corrupt)");
+    }
+
+    /* -- inflate, when the platform deflated it before sealing ------------ *
+     * Inside the envelope is the first place the marker can be seen, which is
+     * the point: the wire JSON is unchanged and nothing outside this box ever
+     * sees which shape was used. The platform only deflates for an agent that
+     * advertised `accepts_deflate`, so arriving here with a marker means this
+     * build asked for it. */
+    if (idletoken_wire_is_deflated(plain, plain_len)) {
+        uint8_t *raw = NULL; size_t raw_len = 0;
+        int irc = idletoken_wire_inflate(plain, plain_len, &raw, &raw_len,
+                                         IDLETOKEN_MAX_INFLATED_REQUEST);
+        /* The compressed copy is plaintext too — wipe it before it is freed,
+         * exactly like the buffer it is replacing. */
+        idletoken_secure_zero(plain, plain_cap);
+        idletoken_munlock(plain, plain_cap);
+        free(plain);
+        if (irc != 0) {
+            free(reply_to);
+            FAIL(400, "cannot inflate the opened request");
+        }
+        plain = raw; plain_cap = raw_len; plain_len = raw_len;
+        idletoken_mlock(plain, plain_cap);
     }
 
     /* -- translate InferenceRequest → OpenAI chat request ----------------- *
@@ -2281,6 +2482,81 @@ static void ignore_sigpipe(void) {
 #endif
 }
 
+/* ----------------------------------------------------------------------
+ * --version-status: the headless half of version management.
+ *
+ * Scope, stated up front (2026-09-14): this is a QUERY. It downloads nothing,
+ * verifies nothing and installs nothing, and no shipped code path calls it.
+ * It exists so that an unattended deployment -- a systemd timer, a scheduled
+ * task, an Ansible check -- has one supported way to ask "does this machine
+ * still qualify to sell?" without scraping a log or parsing an HTTP error.
+ * The desktop client answers the same question in its own UI; a headless node
+ * has no UI, and inventing a private JSON contract later, under pressure, is
+ * how two answers to one question get shipped.
+ *
+ * The unattended UPDATER that would consume this is deliberately not built.
+ * When it is, the shape it wants already exists: `winget upgrade` or
+ * `brew upgrade --cask` gated on this exit code, with no update logic of our
+ * own. See `distributionChannels` in scripts/release-channels.json, where each
+ * channel is listed as explicitly unavailable rather than omitted.
+ *
+ * Contract (do not narrow it without changing the docs that quote it):
+ *   stdout   one JSON object, one line, always -- even on failure.
+ *   exit 0   this build may be listed on the marketplace.
+ *   exit 3   below the floor. The refuse-with-a-reason code used elsewhere in
+ *            this project; the machine is fine, it just cannot sell.
+ *   exit 1   could not determine (platform unreachable, malformed answer).
+ *            NOT the same as exit 3: an updater that treats "I could not ask"
+ *            as "you are too old" will reinstall the world every time the
+ *            network hiccups.
+ */
+static int version_status(const char *platform_addr) {
+    int status = 0; size_t rlen = 0;
+    uint8_t *resp = platform_addr
+        ? http_get_json(platform_addr, "/release/client", &status, &rlen, 10)
+        : NULL;
+    char *current = NULL, *minimum = NULL;
+    if (resp && status >= 200 && status < 300) {
+        current = json_str_dup((const char *)resp, rlen, "currentVersion");
+        minimum = json_str_dup((const char *)resp, rlen, "minimumSupportedVersion");
+    }
+    free(resp);
+
+    if (!minimum) {
+        printf("{\"installed\":\"%s\",\"current\":null,\"minimum\":null,"
+               "\"listable\":null,\"newer_available\":null,"
+               "\"error\":\"could not read the published release policy\"}\n",
+               IDLETOKEN_CLIENT_VERSION);
+        free(current);
+        return 1;
+    }
+
+    /* Compare major.minor.patch only; a build suffix never changes standing. */
+    unsigned a[3] = {0,0,0}, b[3] = {0,0,0}, c[3] = {0,0,0};
+    int have_installed = sscanf(IDLETOKEN_CLIENT_VERSION, "%u.%u.%u", &a[0], &a[1], &a[2]) == 3;
+    int have_min = sscanf(minimum, "%u.%u.%u", &b[0], &b[1], &b[2]) == 3;
+    int have_cur = current && sscanf(current, "%u.%u.%u", &c[0], &c[1], &c[2]) == 3;
+
+    int listable = 1, newer = 0;
+    for (int i = 0; i < 3 && have_installed && have_min; i++) {
+        if (a[i] != b[i]) { listable = a[i] > b[i]; break; }
+    }
+    for (int i = 0; i < 3 && have_installed && have_cur; i++) {
+        if (a[i] != c[i]) { newer = a[i] < c[i]; break; }
+    }
+    /* An unparseable floor is not a floor: refusing on a string we could not
+     * read would take a healthy machine off the market over a typo. */
+    if (!have_installed || !have_min) listable = 1;
+
+    printf("{\"installed\":\"%s\",\"current\":", IDLETOKEN_CLIENT_VERSION);
+    if (have_cur) printf("\"%u.%u.%u\"", c[0], c[1], c[2]); else printf("null");
+    printf(",\"minimum\":\"%u.%u.%u\",\"listable\":%s,\"newer_available\":%s}\n",
+           b[0], b[1], b[2], listable ? "true" : "false", newer ? "true" : "false");
+    free(current);
+    free(minimum);
+    return listable ? 0 : 3;
+}
+
 static void usage(FILE *o) {
     fprintf(o,
 "idletoken-platform-agent  cluster-side marketplace agent in front of idletoken-coord\n"
@@ -2317,6 +2593,11 @@ static void usage(FILE *o) {
 "                      network config (no port forward, no router setup).\n"
 "                      Requires --platform and --jwt. Poll doubles as the\n"
 "                      heartbeat. Same sealed envelope as direct mode.\n"
+"  --version-status    print one line of JSON describing this build's standing\n"
+"                      and exit: 0 = may be listed, 3 = below the marketplace\n"
+"                      floor, 1 = could not ask. Needs --platform. Downloads,\n"
+"                      verifies and installs nothing; it is a query for\n"
+"                      unattended deployments that have no UI to show it in.\n"
 "  -h, --help          this help\n");
 }
 
@@ -2350,6 +2631,7 @@ int main(int argc, char **argv) {
     const char *quant          = "";
     int         beat_secs      = 30;
     int         relay          = 0;
+    int         version_status_only = 0;
     /* Env fallback first, so an explicit flag still wins. Same pattern as the
      * coordinator's own --api-token: the Tauri supervisor passes secrets
      * without putting them through shell argument quoting. */
@@ -2386,9 +2668,27 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--model")          && i + 1 < argc) model = argv[++i];
         else if (!strcmp(a, "--quant")          && i + 1 < argc) quant = argv[++i];
         else if (!strcmp(a, "--relay"))                          relay = 1;
+        else if (!strcmp(a, "--version-status"))                 version_status_only = 1;
         else if (!strcmp(a, "--selftest"))                       return agent_selftest();
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(stdout); return 0; }
         else { fprintf(stderr, "platform-agent: unknown arg: %s\n\n", a); usage(stderr); return 2; }
+    }
+    /* Answered and done, before anything else is set up. Deliberately BEFORE
+     * the --platform/--jwt pairing rule below: asking what the published floor
+     * is needs no credential (the endpoint is public), and requiring a JWT to
+     * ask "am I too old" would make the check impossible in exactly the
+     * unattended setting it is for. */
+    if (version_status_only) {
+        char vs_addr[256];
+        if (!platform_url) {
+            fprintf(stderr, "platform-agent: --version-status needs --platform\n");
+            return 2;
+        }
+        if (url_to_addr(platform_url, vs_addr, sizeof(vs_addr)) != 0) {
+            fprintf(stderr, "platform-agent: bad --platform URL: %s\n", platform_url);
+            return 2;
+        }
+        return version_status(vs_addr);
     }
     if (port <= 0 || port > 65535) { fprintf(stderr, "platform-agent: bad --port\n"); return 2; }
     if (beat_secs <= 0) beat_secs = 30;

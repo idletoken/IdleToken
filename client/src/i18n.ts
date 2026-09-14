@@ -539,20 +539,28 @@ export const STRINGS = {
     "time.hour": "{n} h ago",
     "time.day": "{n} d ago",
     "time.never": "never",
-    // Update prompt. "Could not check" is a separate string from "up to date"
-    // on purpose — telling someone they are current when the feed was
-    // unreachable is how machines stay months behind believing otherwise.
-    "update.title": "Version {version} is available",
-    "update.from": "You are running {current}",
-    "update.betaChannel": "beta channel",
-    "update.later": "Later",
-    "update.install": "Update now",
-    "update.retry": "Try again",
-    "update.installing": "Installing — IdleToken will restart. The cluster stops while it does.",
-    "update.failed": "Update failed:",
-    "update.checking": "Checking…",
-    "update.upToDate": "You are on the latest version ({current})",
-    "update.checkFailed": "Could not check for updates:",
+    // Version notice (2026-09-14). These replace the string table of the in-app
+    // updater removed on 2026-09-02, which had gone on sitting here with no
+    // code referencing any of it.
+    //
+    // Note what is deliberately absent: there is no "up to date", no "checking"
+    // and no "check failed". This build never claims to be current — the
+    // platform's number comes from whenever the gateway was last deployed and
+    // can honestly lag a release, and "you are on the latest version" said on
+    // stale information is how a machine sits months behind believing
+    // otherwise. Either there is something newer to mention, or nothing is
+    // shown at all.
+    "update.available": "Version {version} is available.",
+    "update.openDownloads": "Open the download page",
+    // The sharing switch refusing a build below the marketplace floor. This is
+    // the ONLY place a version blocks anything, so it is also the only place
+    // that has to explain that nothing else is affected.
+    "update.share.title": "Sharing needs a newer version",
+    "update.share.body": "This machine runs {installed}. Listing on the marketplace needs {floor} or newer.",
+    "update.share.unaffected":
+      "Nothing else is affected: single machine, clusters and the local API all keep working. " +
+      "The version requirement exists only for serving other people, who cannot see which build answered them.",
+    "update.share.notNow": "Not now",
     // Tray menu. Kept short: on Windows this is a right-click menu in the
     // notification area, not a place for sentences.
     "tray.open": "Open IdleToken",
@@ -991,17 +999,13 @@ export const STRINGS = {
     "time.hour": "{n} 小时前",
     "time.day": "{n} 天前",
     "time.never": "从未",
-    "update.title": "有新版本 {version}",
-    "update.from": "当前版本 {current}",
-    "update.betaChannel": "测试通道",
-    "update.later": "稍后",
-    "update.install": "立即更新",
-    "update.retry": "重试",
-    "update.installing": "正在安装——IdleToken 会重启，期间集群停止服务。",
-    "update.failed": "更新失败：",
-    "update.checking": "检查中…",
-    "update.upToDate": "已是最新版本（{current}）",
-    "update.checkFailed": "无法检查更新：",
+    "update.available": "新版本 {version} 已发布。",
+    "update.openDownloads": "前往下载页",
+    "update.share.title": "分享需要较新的版本",
+    "update.share.body": "本机是 {installed}，挂到市场上需要 {floor} 或更新的版本。",
+    "update.share.unaffected":
+      "其他功能不受影响：单机、联机、本机 API 全部照常工作。版本要求只用于向其他人提供服务——他们看不出是哪个版本回答了他们。",
+    "update.share.notNow": "以后再说",
     "tray.open": "打开 IdleToken",
     "tray.quit": "退出 IdleToken",
     "tray.statusIdle": "IdleToken — 未在服务",
