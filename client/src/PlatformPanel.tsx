@@ -5,18 +5,54 @@ import { loadSettings, saveSettings } from "./settings";
 import { RELEASES_URL } from "./links";
 import { currentVersionStanding } from "./release";
 import {
+  agentLogs,
   agentStart,
+  agentStatus,
   agentStop,
   createApiKey,
   getProviders,
   inTauri,
+  onAgentLog,
+  onAgentStatus,
   platformGate,
+  type AgentLogLine,
+  type AgentStatus,
 } from "./platform";
 
 const MARKETPLACE_CHANGED = "idletoken:marketplace-settings-changed";
 
 function publishMarketplaceChange(): void {
   window.dispatchEvent(new CustomEvent(MARKETPLACE_CHANGED));
+}
+
+/**
+ * The agent's own explanation for why it is not selling, or null.
+ *
+ * Reads the lines the agent already prints; nothing new is invented and no
+ * status is guessed. Two shapes exist in the wild and both must be caught: the
+ * generic `register: platform said <code>: {json}` that every build has, and
+ * the multi-line block a 0.1.78+ agent prints for the marketplace floor.
+ *
+ * When the line carries a server JSON body, the server's `message` is what is
+ * shown — it is written for a person ("...must be stable version X or newer.
+ * Your machine keeps working for your own use either way"), while the envelope
+ * around it is not. Pasting raw JSON into a tooltip is the same failure as
+ * saying nothing, one step later.
+ */
+function agentRefusal(l: AgentLogLine): string | null {
+  const line = l.line.replace(/^\[platform-agent\]\s*/, "").trim();
+  if (!/register:|cannot be listed|too old to be listed|refus/i.test(line)) return null;
+  const brace = line.indexOf("{");
+  if (brace >= 0) {
+    try {
+      const body = JSON.parse(line.slice(brace));
+      if (typeof body?.message === "string" && body.message) return body.message.slice(0, 400);
+    } catch {
+      // Not JSON after all, or truncated by the ring buffer. Fall through to
+      // the raw line, which is still the agent's own sentence.
+    }
+  }
+  return line.replace(/^platform-agent:\s*/, "").slice(0, 400) || null;
 }
 
 /**
@@ -91,11 +127,48 @@ export function ShareToggleButton({
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [blocked, setBlocked] = useState<VersionTooOldToShare | null>(null);
+  const [agent, setAgent] = useState<AgentStatus | null>(null);
+  const [agentErr, setAgentErr] = useState<string | null>(null);
 
   useEffect(() => {
     const sync = () => setOn(loadSettings().providerEnabled);
     window.addEventListener(MARKETPLACE_CHANGED, sync);
     return () => window.removeEventListener(MARKETPLACE_CHANGED, sync);
+  }, []);
+
+  // Watch the agent itself, not just the stored preference (2026-09-15).
+  //
+  // Until now this pill was `providerEnabled && serviceReady` — the user's
+  // saved choice and the LOCAL engine. Neither says whether the thing that
+  // actually sells anything is alive. A 0.1.76 client with the switch on sat
+  // green all evening while its agent registered, was refused 426 by the
+  // marketplace floor, and exited; the machine was on nobody's discovery page
+  // and the interface never said a word.
+  //
+  // The version case now has its own check before the agent is even started,
+  // but that only closed one instance of the shape. An agent can also die on an
+  // expired session, a registration rate limit, a suspended account or no
+  // network at all, and every one of those used to look exactly like success.
+  useEffect(() => {
+    if (!inTauri()) return;
+    let alive = true;
+    void agentStatus().then((s) => { if (alive) setAgent(s); }).catch(() => { /* not running yet */ });
+    void agentLogs(60).then((ls) => {
+      if (!alive) return;
+      const last = ls.map(agentRefusal).filter(Boolean).pop();
+      if (last) setAgentErr(last);
+    }).catch(() => { /* no ring buffer yet */ });
+    const offStatus = onAgentStatus((s) => {
+      setAgent(s);
+      // A clean start clears the previous run's complaint; leaving it would
+      // explain a healthy agent with a stale reason.
+      if (s.state === "running") setAgentErr(null);
+    });
+    const offLog = onAgentLog((l) => {
+      const why = agentRefusal(l);
+      if (why) setAgentErr(why);
+    });
+    return () => { alive = false; offStatus(); offLog(); };
   }, []);
 
   if (!inTauri()) return null;
@@ -188,8 +261,22 @@ export function ShareToggleButton({
   };
 
   // The setting records the user's persistent choice. Green is reserved for
-  // a choice that can actually serve work right now.
-  const active = on && serviceReady;
+  // a choice that can actually serve work right now — which means the agent is
+  // up, not merely that the switch is on and the local engine loaded.
+  //
+  // `starting` and `restarting` are deliberately NOT down: the supervisor is
+  // mid-attempt and calling that a failure would flicker red on every ordinary
+  // start. Unknown (null, e.g. the status call has not answered yet) is not
+  // down either — this pill reports what it knows and never guesses.
+  const agentDown = on && (agent?.state === "stopped" || agent?.state === "crashed");
+  const active = on && serviceReady && !agentDown;
+  const title = !serviceReady
+    ? t("share.needService")
+    : agentDown
+      // The agent's own sentence when we have one. It is the only thing that
+      // knows WHY, and the whole point of this pill is not to swallow it.
+      ? `${t("share.agentDown")}${agentErr ? `\n\n${agentErr}` : ""}`
+      : err ?? t(active ? "share.on" : "share.off");
 
   return (
     <>
@@ -198,7 +285,7 @@ export function ShareToggleButton({
         disabled={busy}
         onClick={() => void toggle()}
         aria-pressed={active}
-        title={!serviceReady ? t("share.needService") : err ?? t(active ? "share.on" : "share.off")}
+        title={title}
       >
         <span className="pill__dot" />
         <span className="pill__label">{busy ? "…" : t(active ? "share.on" : "share.off")}</span>

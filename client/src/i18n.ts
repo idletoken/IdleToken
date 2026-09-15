@@ -334,6 +334,10 @@ export const STRINGS = {
     "spark.balance.unit": "Sparks",
     "spark.balance.unknown": "Sparks —",
     "spark.balance.failed": "Temporarily unavailable",
+    // Shown IN THE PILL when the balance request failed, so that a dead link
+    // does not look like one that is still loading. The tooltip carries the
+    // underlying message.
+    "spark.balance.unavailable": "Sparks ⚠",
     "spark.balance.open": "Open Personal → Sparks in the portal",
     "platform.providers": "My providers",
     "platform.providers.empty": "No provider registered yet — turn sharing on above and this cluster is registered automatically.",
@@ -561,6 +565,11 @@ export const STRINGS = {
       "Nothing else is affected: single machine, clusters and the local API all keep working. " +
       "The version requirement exists only for serving other people, who cannot see which build answered them.",
     "update.share.notNow": "Not now",
+    // Sharing is switched on but the agent that actually sells is not running.
+    // Deliberately says what is NOT happening ("nobody can reach it") rather
+    // than only naming a component: the person reading this wants to know
+    // whether their machine is earning, not which process died.
+    "share.agentDown": "Sharing is on, but the marketplace agent is not running — this machine is not listed and cannot receive work.",
     // Tray menu. Kept short: on Windows this is a right-click menu in the
     // notification area, not a place for sentences.
     "tray.open": "Open IdleToken",
@@ -837,6 +846,7 @@ export const STRINGS = {
     "spark.balance.unit": "火花",
     "spark.balance.unknown": "火花 —",
     "spark.balance.failed": "暂时无法获取",
+    "spark.balance.unavailable": "火花 ⚠",
     "spark.balance.open": "打开门户“个人 → 火花”",
     "platform.providers": "我的算力节点",
     "platform.providers.empty": "尚未注册算力节点——在上方开启共享后，本集群会自动注册。",
@@ -1006,6 +1016,7 @@ export const STRINGS = {
     "update.share.unaffected":
       "其他功能不受影响：单机、联机、本机 API 全部照常工作。版本要求只用于向其他人提供服务——他们看不出是哪个版本回答了他们。",
     "update.share.notNow": "以后再说",
+    "share.agentDown": "分享已打开，但市场代理没有在运行——这台机器没有上架，也收不到任务。",
     "tray.open": "打开 IdleToken",
     "tray.quit": "退出 IdleToken",
     "tray.statusIdle": "IdleToken — 未在服务",

@@ -4977,3 +4977,12 @@ textarea {
 [data-theme="dark"] .spark-balance-pill { color: var(--electric-2); }
 .spark-balance-pill:hover { border-color: var(--amber); }
 .spark-balance-pill:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+/* The balance could not be fetched. Muted rather than alarming: the machine is
+   working fine, one read failed — and the same amber as a healthy pill would
+   make a broken link look like a number that is merely still arriving. */
+.spark-balance-pill--failed {
+  border-color: color-mix(in srgb, var(--ink) 22%, var(--line));
+  background: var(--surface);
+  color: color-mix(in srgb, var(--ink) 62%, transparent);
+}
+.spark-balance-pill--failed:hover { border-color: color-mix(in srgb, var(--ink) 40%, var(--line)); }
