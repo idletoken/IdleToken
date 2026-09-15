@@ -72,15 +72,27 @@ IdleToken 想做的，就是把这些错开的峰谷连接起来：让闲置的�
 - **连接自己部署的模型：** `http://127.0.0.1:8000`。模型启动后，即可通过这个本机地址接入。
 - **调用别人分享的模型：** `https://api.idletoken.ai`。登录后，点击右上角用户头像，进入「火花」→「API 密钥」，点击「新建密钥」。
 
-### 接入 Claude Code
+### 接入 DeepSeek Harness
 
-```sh
-export ANTHROPIC_BASE_URL=https://api.idletoken.ai
-export ANTHROPIC_API_KEY='sk-idletoken-********************************'
-claude
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（`dsh`）通过自定义服务商接入 IdleToken。在 `$DSH_HOME/settings.yaml`（默认为 `~/.dsh/settings.yaml`）中添加以下配置，将 `MODEL_ID` 替换为 `GET /v1/models` 返回的模型 ID：
+
+```yaml
+llm-pi-ai:
+  providers:
+    idletoken:
+      api: openai-completions
+      baseURL: https://api.idletoken.ai/v1
+      apiKeyEnv: IDLETOKEN_API_KEY
+      models:
+        - id: MODEL_ID
 ```
 
-`GET /v1/models` 返回对应地址当前可用的模型 ID。
+```sh
+export IDLETOKEN_API_KEY='sk-idletoken-********************************'
+npx @deepseek-ai/dsh web
+```
+
+Web 界面默认打开 `http://127.0.0.1:3080`，在 `idletoken` 服务商下选择模型即可。手动添加的模型默认按纯文本处理，视觉模型需要在其 `id` 旁补一行 `input: [text, image]`。
 
 ### 接入 OpenCode
 

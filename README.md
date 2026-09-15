@@ -72,15 +72,27 @@ If you do not want to deploy a model yourself, for example when using IdleToken 
 - **Connect to a model you deploy:** `http://127.0.0.1:8000`. Once the model starts, you can connect through this local address.
 - **Use models shared by others:** `https://api.idletoken.ai`. After signing in, click your profile avatar in the top right, open **Sparks** → **API keys**, and click **New key**.
 
-### Connect Claude Code
+### Connect DeepSeek Harness
 
-```sh
-export ANTHROPIC_BASE_URL=https://api.idletoken.ai
-export ANTHROPIC_API_KEY='sk-idletoken-********************************'
-claude
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`) reaches IdleToken through a custom provider. Add one to `$DSH_HOME/settings.yaml` (`~/.dsh/settings.yaml` by default), replacing `MODEL_ID` with a model ID returned by `GET /v1/models`:
+
+```yaml
+llm-pi-ai:
+  providers:
+    idletoken:
+      api: openai-completions
+      baseURL: https://api.idletoken.ai/v1
+      apiKeyEnv: IDLETOKEN_API_KEY
+      models:
+        - id: MODEL_ID
 ```
 
-`GET /v1/models` returns the model IDs currently available at that address.
+```sh
+export IDLETOKEN_API_KEY='sk-idletoken-********************************'
+npx @deepseek-ai/dsh web
+```
+
+The Web UI opens at `http://127.0.0.1:3080`; pick the model under the `idletoken` provider. A model added by hand is treated as text-only, so give a vision model `input: [text, image]` next to its `id`.
 
 ### Connect OpenCode
 
