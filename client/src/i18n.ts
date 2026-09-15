@@ -560,10 +560,10 @@ export const STRINGS = {
     // the ONLY place a version blocks anything, so it is also the only place
     // that has to explain that nothing else is affected.
     "update.share.title": "Sharing needs a newer version",
-    "update.share.body": "This machine runs {installed}. Listing on the marketplace needs {floor} or newer.",
-    "update.share.unaffected":
-      "Nothing else is affected: single machine, clusters and the local API all keep working. " +
-      "The version requirement exists only for serving other people, who cannot see which build answered them.",
+    "update.share.yours": "Installed",
+    "update.share.needed": "Needed to share",
+    "update.share.body": "Install the current release, then turn sharing on again.",
+    "update.share.unaffected": "Nothing else is affected: running locally and the local API keep working.",
     "update.share.notNow": "Not now",
     // Sharing is switched on but the agent that actually sells is not running.
     // Deliberately says what is NOT happening ("nobody can reach it") rather
@@ -1012,9 +1012,10 @@ export const STRINGS = {
     "update.available": "新版本 {version} 已发布。",
     "update.openDownloads": "前往下载页",
     "update.share.title": "分享需要较新的版本",
-    "update.share.body": "本机是 {installed}，挂到市场上需要 {floor} 或更新的版本。",
-    "update.share.unaffected":
-      "其他功能不受影响：单机、联机、本机 API 全部照常工作。版本要求只用于向其他人提供服务——他们看不出是哪个版本回答了他们。",
+    "update.share.yours": "当前版本",
+    "update.share.needed": "分享所需",
+    "update.share.body": "安装新版本后，重新打开分享即可。",
+    "update.share.unaffected": "其他功能不受影响：本地独立运行、本机 API 全部照常工作。",
     "update.share.notNow": "以后再说",
     "share.agentDown": "分享已打开，但市场代理没有在运行——这台机器没有上架，也收不到任务。",
     "tray.open": "打开 IdleToken",

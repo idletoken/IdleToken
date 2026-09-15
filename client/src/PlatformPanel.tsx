@@ -95,19 +95,33 @@ function ShareVersionBlockedDialog(
   };
   return (
     <div className="modal-scrim" onClick={onClose}>
-      <div ref={ref} className="modal modal--auth" role="dialog" aria-modal="true"
+      <div ref={ref} className="modal modal--share-version" role="dialog" aria-modal="true"
            onClick={(e) => e.stopPropagation()}>
         <div className="modal__head">
           <h2>{t("update.share.title")}</h2>
           <button className="iconbtn" onClick={onClose} aria-label={t("a11y.close")}>✕</button>
         </div>
-        <p>{t("update.share.body", { installed, floor })}</p>
-        <p className="field__hint">{t("update.share.unaffected")}</p>
-        <div className="modal__actions">
-          <button className="btn btn--primary" onClick={() => void open()}>
+        {/* The two versions side by side. A sentence with numbers buried in it
+            makes the reader parse; two labelled values make the gap the first
+            thing they see, which is the whole content of this dialog. */}
+        <div className="share-version__versions">
+          <div className="share-version__cell">
+            <span className="share-version__label">{t("update.share.yours")}</span>
+            <span className="share-version__value">{installed}</span>
+          </div>
+          <span className="share-version__arrow" aria-hidden="true">→</span>
+          <div className="share-version__cell share-version__cell--need">
+            <span className="share-version__label">{t("update.share.needed")}</span>
+            <span className="share-version__value">{floor}</span>
+          </div>
+        </div>
+        <p className="share-version__lead">{t("update.share.body")}</p>
+        <p className="share-version__note">{t("update.share.unaffected")}</p>
+        <div className="modal__foot">
+          <button className="btn-secondary" onClick={onClose}>{t("update.share.notNow")}</button>
+          <button className="btn-primary" onClick={() => void open()}>
             {t("update.openDownloads")}
           </button>
-          <button className="btn" onClick={onClose}>{t("update.share.notNow")}</button>
         </div>
       </div>
     </div>
@@ -134,6 +148,32 @@ export function ShareToggleButton({
     const sync = () => setOn(loadSettings().providerEnabled);
     window.addEventListener(MARKETPLACE_CHANGED, sync);
     return () => window.removeEventListener(MARKETPLACE_CHANGED, sync);
+  }, []);
+
+  // Check at STARTUP, not only when the switch is clicked (2026-09-15).
+  //
+  // `providerEnabled` is persisted, so a client that was sharing yesterday comes
+  // up with the switch already on and nothing re-asks whether it still may. On
+  // a machine whose version fell below the floor overnight that meant a green
+  // switch selling nothing, and the refusal only appeared if the user happened
+  // to toggle it off and on again — which is not a thing anyone does to find
+  // out whether they are earning.
+  //
+  // Below the floor the switch is turned OFF, not merely greyed: it cannot
+  // serve, so leaving it on would be recording an intention the product cannot
+  // honour. The dialog says what happened and how to get back.
+  useEffect(() => {
+    if (!inTauri() || !loadSettings().providerEnabled) return;
+    let alive = true;
+    void currentVersionStanding().then((s) => {
+      if (!alive || !s.belowShareFloor) return;
+      void agentStop().catch(() => { /* may never have started */ });
+      saveSettings({ ...loadSettings(), providerEnabled: false });
+      setOn(false);
+      publishMarketplaceChange();
+      setBlocked(new VersionTooOldToShare(s.installed, s.shareFloor!));
+    });
+    return () => { alive = false; };
   }, []);
 
   // Watch the agent itself, not just the stored preference (2026-09-15).

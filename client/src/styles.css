@@ -758,6 +758,68 @@ textarea {
   gap: 10px;
 }
 
+/* ---- sharing blocked by the marketplace version floor --------------------- */
+/* The dialog's whole content is a gap between two numbers, so the numbers get
+   the layout and the prose gets out of the way. Uses the same surface, line and
+   radius tokens as every other panel — this is a normal product state, not an
+   error, and styling it like an alert would overstate what happened. */
+.modal--share-version { max-width: 420px; }
+
+.share-version__versions {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+  margin: 0 0 18px;
+}
+
+.share-version__cell {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 11px 13px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+
+/* The version they need is the actionable half, so it carries the accent the
+   rest of the product uses for "this is the thing to act on". */
+.share-version__cell--need {
+  background: color-mix(in srgb, var(--amber) 7%, var(--surface));
+  border-color: color-mix(in srgb, var(--amber) 34%, var(--line));
+}
+
+.share-version__label {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.share-version__value {
+  font: 600 17px/1 var(--font-mono);
+  color: var(--ink);
+}
+
+.share-version__cell--need .share-version__value { color: var(--electric-ink); }
+[data-theme="dark"] .share-version__cell--need .share-version__value { color: var(--electric-2); }
+
+.share-version__arrow {
+  align-self: center;
+  color: var(--ink-faint);
+  font-size: 15px;
+}
+
+.share-version__lead { margin: 0 0 10px; }
+
+.share-version__note {
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 /* ---- update prompt ------------------------------------------------------- */
 .update__meta {
   margin: 4px 0 0;
