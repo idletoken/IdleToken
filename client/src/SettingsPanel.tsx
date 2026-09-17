@@ -383,7 +383,9 @@ function visibleCategories(): Category[] {
 // ---- panel -----------------------------------------------------------------
 export default function SettingsPanel(props: {
   settings: AppSettings;
-  onChange: (s: AppSettings) => void;
+  onChange: (s: AppSettings) => void | Promise<void>;
+  autostartBusy?: boolean;
+  autostartError?: string | null;
   snap: NodeSnapshot;
   theme: Theme;
   onTheme: (t: Theme) => void;
@@ -422,7 +424,10 @@ export default function SettingsPanel(props: {
   // the dialog App opens, so there is nothing to report back here.
   const fileRef = useRef<HTMLInputElement>(null);
   const s = props.settings;
-  const set = <K extends keyof AppSettings>(k: K, v: AppSettings[K]) => props.onChange({ ...s, [k]: v });
+  const change = (next: AppSettings) => Promise.resolve(props.onChange(next));
+  const set = <K extends keyof AppSettings>(k: K, v: AppSettings[K]) => {
+    void change({ ...s, [k]: v }).catch(() => { /* The field displays the OS error. */ });
+  };
 
   // Model-folder editing. The draft is committed on blur/Enter rather than per
   // keystroke — see the field for why. It re-syncs when the stored value
@@ -471,7 +476,7 @@ export default function SettingsPanel(props: {
     resourcePreset: "custom",
   });
 
-  const runAction = (a: Field["action"]) => {
+  const runAction = async (a: Field["action"]) => {
     if (a === "export") {
       // A-P2-1: through the same allowlist the diagnostics bundle uses.
       // "Export settings" wrote the file the user then mails to someone, and
@@ -489,8 +494,8 @@ export default function SettingsPanel(props: {
       fileRef.current?.click();
     } else if (a === "clearData") {
       if (confirm(lang === "zh" ? "确定清除本机全部 IdleToken 数据？" : "Clear all IdleToken data on this machine?")) {
+        try { await change({ ...DEFAULT_SETTINGS }); } catch { return; }
         localStorage.clear();
-        props.onChange({ ...DEFAULT_SETTINGS });
         saveSettings(DEFAULT_SETTINGS);
         location.reload();
       }
@@ -502,7 +507,8 @@ export default function SettingsPanel(props: {
     f.text().then((txt) => {
       try {
         const parsed = JSON.parse(txt);
-        props.onChange({ ...DEFAULT_SETTINGS, ...parsed });
+        // Importing a file does not grant permission to register at login.
+        void change({ ...DEFAULT_SETTINGS, ...parsed, autostart: s.autostart }).catch(() => {});
       } catch {
         /* ignore malformed */
       }
@@ -530,7 +536,8 @@ export default function SettingsPanel(props: {
   const renderField = (f: Field, i: number) => {
     if (f.showIf && !f.showIf(s)) return null;
     const label = f.label ? L(f.label, lang) : "";
-    const hint = f.hint ? L(f.hint, lang) : undefined;
+    const hint = f.key === "autostart" && props.autostartError
+      ? props.autostartError : f.hint ? L(f.hint, lang) : undefined;
     const tag = f.reserved ? <span className="reserved-tag">{t("settings.reservedTag")}</span> : null;
 
     if (f.type === "note") return <p key={i} className="about-line">{label}</p>;
@@ -555,7 +562,7 @@ export default function SettingsPanel(props: {
     const val = s[key];
     // Reserved = not wired engine/OS-side yet: keep visible (roadmap honesty)
     // but disabled — an editable control that does nothing is a broken promise.
-    const dis = !!f.reserved;
+    const dis = !!f.reserved || (key === "autostart" && (!!props.autostartBusy || !inTauri()));
     if (f.type === "toggle") control = <Toggle checked={val as boolean} disabled={dis} onChange={(v) => set(key, v as AppSettings[typeof key])} label={label} />;
     else if (f.type === "select")
       control = (
@@ -776,7 +783,7 @@ export default function SettingsPanel(props: {
                   {sec.fields.map((f, i) => renderField(f, i))}
                 </div>
               ))}
-              <button className="linkbtn" onClick={() => props.onChange({ ...DEFAULT_SETTINGS })}>{t("settings.reset")}</button>
+              <button className="linkbtn" onClick={() => { void change({ ...DEFAULT_SETTINGS }).catch(() => {}); }}>{t("settings.reset")}</button>
             </>
           )}
         </div>

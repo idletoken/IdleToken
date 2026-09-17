@@ -11,20 +11,32 @@
 #      elevated and where firewall changes are ordinary — instead of at
 #      runtime, where they were neither.
 #
-# WHY THE INSTALL LOCATION MOVED
-#
-# Running from %LOCALAPPDATA% is one of the strongest "this is malware"
-# heuristics Windows has, because that is where software that cannot ask for
-# admin puts itself. We were an unsigned binary in AppData that spawns child
-# processes, listens on the LAN and calls netsh. Defender's behaviour engine
-# flagged the coordinator as Behavior:Win32/DefenseEvasion.A!ml on a real
-# cluster run (2026-09-02) and blocked it. This does not fix that on its own —
-# only a code-signing certificate does — but it removes two of the inputs.
+# Installation operations use Windows Restart Manager and Firewall COM APIs.
+# The small helper is built, versioned and signed with the other first-party
+# executables. It is extracted to the installer's private temporary directory;
+# it never registers a service or runs after the installer exits.
+!define IDLETOKEN_HELPER_SOURCE "${__FILEDIR__}\..\runtime\windows\idletoken-installer-helper.exe"
+
+!macro IDLETOKEN_EXTRACT_HELPER
+  InitPluginsDir
+  Push $R9
+  StrCpy $R9 $OUTDIR
+  SetOutPath "$PLUGINSDIR"
+  File /oname=idletoken-installer-helper.exe "${IDLETOKEN_HELPER_SOURCE}"
+  SetOutPath $R9
+  Pop $R9
+!macroend
 
 !macro IDLETOKEN_STOP_RUNNING_PROCESSES HOOK_NAME
-  DetailPrint "Stopping running IdleToken processes..."
-  nsExec::ExecToLog `powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$names=@('idletoken-client','idletoken-coord','idletoken-worker','idletoken-platform-agent','idletoken-server','idletoken-rpc-server'); Get-Process -Name 'idletoken-client' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 250; Get-Process -Name $$names -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; $$deadline=(Get-Date).AddSeconds(20); do { $$remaining=Get-Process -Name $$names -ErrorAction SilentlyContinue; if (-not $$remaining) { Start-Sleep -Milliseconds 500; exit 0 }; Start-Sleep -Milliseconds 250 } while ((Get-Date) -lt $$deadline); exit 1"`
+  !insertmacro IDLETOKEN_EXTRACT_HELPER
+  DetailPrint "Closing running IdleToken applications..."
+  Push $R9
+  SetShellVarContext current
+  StrCpy $R9 "$LOCALAPPDATA\IdleToken"
+  SetShellVarContext all
+  nsExec::ExecToLog '"$PLUGINSDIR\idletoken-installer-helper.exe" --stop "$INSTDIR" "$R9"'
   Pop $0
+  Pop $R9
   StrCmp $0 "0" idletoken_processes_stopped_${HOOK_NAME}
   MessageBox MB_OK|MB_ICONSTOP "IdleToken could not stop its running inference processes. Close IdleToken and try the installation again." /SD IDOK
   Abort
@@ -60,34 +72,15 @@ idletoken_per_user_removed:
 idletoken_no_per_user_install:
 !macroend
 
-# Inbound rules for the executables that actually accept LAN connections.
-#
-# Program rules, not port rules: the ports are chosen at runtime (the API port
-# is a setting, worker and RPC ports are assigned per cluster), so a port list
-# is a list that goes stale. A program rule covers whatever that program binds.
-#
-# profile=private,domain and NOT public. The old runtime code used profile=any,
-# which opens the machine on untrusted networks too — a home cluster is a
-# private network by definition, and "any" was a convenience nobody asked for.
-#
-# idletoken-server.exe is absent on purpose: it binds loopback only (hard
-# constraint 5). So is the platform agent, which only makes outbound calls.
-!macro IDLETOKEN_ADD_FIREWALL_RULE RULE_LABEL EXE_NAME
-  # Chinese Windows emits localized netsh output in CP936. ExecToLog treated
-  # those bytes as another code page and painted mojibake into the installer's
-  # details pane. We only consume the exit code, so keep localized subprocess
-  # output out of the Unicode NSIS UI entirely.
-  nsExec::Exec `netsh advfirewall firewall delete rule name="IdleToken ${RULE_LABEL}"`
-  Pop $0
-  nsExec::Exec `netsh advfirewall firewall add rule name="IdleToken ${RULE_LABEL}" dir=in action=allow program="$INSTDIR\${EXE_NAME}" enable=yes profile=private,domain`
+# Compute rules are restricted to TCP/UDP as required and local subnets.
+# Pairing retains its private-network route options. Public-network profiles
+# are never enabled. Uninstallation removes only this installation's rules.
+!macro IDLETOKEN_FIREWALL OPERATION
+  !insertmacro IDLETOKEN_EXTRACT_HELPER
+  nsExec::ExecToLog '"$PLUGINSDIR\idletoken-installer-helper.exe" --firewall-${OPERATION} "$INSTDIR"'
   Pop $0
   StrCmp $0 "0" +2 0
-  DetailPrint "Warning: could not add the firewall rule for ${EXE_NAME}. Cluster mode may need it added by hand."
-!macroend
-
-!macro IDLETOKEN_DELETE_FIREWALL_RULE RULE_LABEL
-  nsExec::Exec `netsh advfirewall firewall delete rule name="IdleToken ${RULE_LABEL}"`
-  Pop $0
+  DetailPrint "Warning: IdleToken firewall configuration could not be updated. Cluster connections may require administrator attention."
 !macroend
 
 !macro NSIS_HOOK_PREINSTALL
@@ -97,10 +90,7 @@ idletoken_no_per_user_install:
 
 !macro NSIS_HOOK_POSTINSTALL
   DetailPrint "Allowing IdleToken through Windows Firewall on private networks..."
-  !insertmacro IDLETOKEN_ADD_FIREWALL_RULE "coordinator" "idletoken-coord.exe"
-  !insertmacro IDLETOKEN_ADD_FIREWALL_RULE "worker" "idletoken-worker.exe"
-  !insertmacro IDLETOKEN_ADD_FIREWALL_RULE "compute node" "idletoken-rpc-server.exe"
-  !insertmacro IDLETOKEN_ADD_FIREWALL_RULE "app" "idletoken-client.exe"
+  !insertmacro IDLETOKEN_FIREWALL install
   # Give the all-users shortcut an explicit icon source. Depending on an empty
   # IconLocation made Explorer keep the generic white icon after an in-place
   # upgrade even though the executable's embedded icon was valid. Recreating
@@ -116,8 +106,5 @@ idletoken_no_per_user_install:
 !macroend
 
 !macro NSIS_HOOK_POSTUNINSTALL
-  !insertmacro IDLETOKEN_DELETE_FIREWALL_RULE "coordinator"
-  !insertmacro IDLETOKEN_DELETE_FIREWALL_RULE "worker"
-  !insertmacro IDLETOKEN_DELETE_FIREWALL_RULE "compute node"
-  !insertmacro IDLETOKEN_DELETE_FIREWALL_RULE "app"
+  !insertmacro IDLETOKEN_FIREWALL remove
 !macroend

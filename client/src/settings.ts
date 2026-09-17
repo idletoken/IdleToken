@@ -444,7 +444,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   notifyDownload: true,
   notifySound: true,
 
-  closeToTray: true,
+  closeToTray: false,
   startMinimized: false,
   rememberWindow: true,
   trayIcon: true,

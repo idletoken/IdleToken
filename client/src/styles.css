@@ -296,6 +296,11 @@ textarea {
   box-shadow: 0 0 0 4px rgba(22, 163, 74, 0.18);
 }
 
+/* Keep the state indicator's color while the pending action is locked. */
+.pill--share:disabled {
+  opacity: 1;
+}
+
 /* icon buttons */
 .iconbtn {
   font-family: var(--font-mono);

@@ -1,10 +1,8 @@
-//! System tray presence: the app keeps serving after its window is closed.
+//! System tray presence for users who choose background operation.
 //!
-//! A node in this product is a background service — it holds model layers in
-//! VRAM, answers API requests and stays in a cluster. Quitting it because
-//! someone pressed the window's X is wrong, and so is leaving no way back to
-//! the UI. The tray is that way back, plus a place to read the cluster's state
-//! without opening anything.
+//! A serving node can hold model layers in VRAM and answer API requests after
+//! its window closes if the user enabled that preference. The tray provides a
+//! way back to the UI and a place to read cluster state without opening it.
 //!
 //! The menu is rebuilt from the front end (`tray_sync`) rather than translated
 //! here: the language and the engine's state both live over there, and a

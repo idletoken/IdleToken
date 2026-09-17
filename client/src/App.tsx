@@ -17,13 +17,14 @@ import Chat from "./Chat";
 import ModelPicker from "./ModelPicker";
 import StartupProgress from "./StartupProgress";
 import WeightsRow, { type WeightsInfo } from "./WeightsRow";
-import { inTauri, getMe, resumeSharingAgent } from "./platform";
+import { inTauri, getMe } from "./platform";
 import { identityFrom, type UserIdentity } from "./Avatar";
 import { getPairingProvider, type PairingSnapshot, type ClusterApi, type PeerNode } from "./pairing";
 import { recordProblem } from "./problems";
 import { useClusterStats, servedModelOf, type ClusterStats } from "./clusterStats";
 import { compactCount, ctxLabel, fmtGiB, fmtQuant, pct } from "./format";
-import { setAutostart, syncTray, syncWindowPrefs } from "./system";
+import { setAutostart, getAutostart, syncTray, syncWindowPrefs } from "./system";
+import { createAutostartController } from "./autostart";
 
 type Theme = "dark" | "light";
 
@@ -1630,6 +1631,9 @@ export default function App() {
   const [theme, setTheme] = usePersisted<Theme>("idletoken.theme", "light");
   const [lang, setLang] = usePersisted<Lang>("idletoken.lang", "en");
   const [settings, setSettings] = useState<AppSettings>(() => loadSettings());
+  const [autostartBusy, setAutostartBusy] = useState(false);
+  const [autostartError, setAutostartError] = useState<string | null>(null);
+  const autostartController = useRef<ReturnType<typeof createAutostartController> | null>(null);
   // Automatic first-start model selection happens once: the probe re-runs when
   // the VRAM cap changes, and a re-run must not override the choice again.
   const firstRun = useRef(true);
@@ -1704,17 +1708,6 @@ export default function App() {
       live = false;
       un();
     };
-  }, []);
-
-  // The provider switch is a STANDING choice: turned on once, it holds across
-  // launches. Until 0.1.10 nothing restarted the agent after a client restart,
-  // so the panel showed "on" over a machine that had quietly stopped earning.
-  // Errors go to the console only: the resume has no owner watching it, and
-  // the sharing panel's own status line is where a broken agent is explained.
-  useEffect(() => {
-    resumeSharingAgent()
-      .then((r) => { if (r === "started") console.info("sharing agent resumed"); })
-      .catch((e) => console.error("sharing agent resume:", e));
   }, []);
 
   // --- Getting the weights in place (B1/B2) --------------------------------
@@ -2392,9 +2385,15 @@ export default function App() {
     return () => { live = false; };
   }, [snap, runtimeBudget]);
 
-  const updateSettings = (s: AppSettings) => {
-    setSettings(s);
-    saveSettings(s);
+  const updateSettings = async (s: AppSettings) => {
+    const startupChanged = s.autostart !== settings.autostart;
+    // Other controls remain usable while the OS applies a startup change.
+    const next = { ...s, autostart: settings.autostart };
+    setSettings(next);
+    saveSettings(next);
+    if (startupChanged && autostartController.current) {
+      await autostartController.current.set(s.autostart);
+    }
   };
 
   // The local llama.cpp engine's API, shaped like the cluster's so chat and
@@ -2442,14 +2441,32 @@ export default function App() {
     void syncWindowPrefs(settings);
   }, [settings.trayIcon, settings.closeToTray, settings.startMinimized, settings.rememberWindow]);
 
-  // Settings are the source of truth for "launch at login", and this enforces
-  // them on the OS every launch — self-healing when something else (an
-  // uninstall/reinstall, a cleanup tool) removed the entry behind our back.
+  // Observe system changes, including a Task Manager disable. Only an explicit
+  // Settings action may write the startup registration; persisted preferences
+  // must never undo the user's choice in the OS.
   useEffect(() => {
-    void setAutostart(settings.autostart).catch(() => {
-      /* the OS refused; the setting stays as the user's intent */
+    const controller = createAutostartController({
+      read: getAutostart,
+      write: setAutostart,
+      state: (autostart) => setSettings((previous) => {
+        if (previous.autostart === autostart) return previous;
+        const next = { ...previous, autostart };
+        saveSettings(next);
+        return next;
+      }),
+      busy: setAutostartBusy,
+      error: setAutostartError,
     });
-  }, [settings.autostart]);
+    autostartController.current = controller;
+    const refresh = () => { void controller.refresh(); };
+    refresh();
+    window.addEventListener("focus", refresh);
+    return () => {
+      window.removeEventListener("focus", refresh);
+      controller.dispose();
+      autostartController.current = null;
+    };
+  }, []);
 
   // Tray menu text + the one line of status it shows. Rebuilt on language and
   // on cluster changes rather than translated in Rust — the language and the
@@ -2571,6 +2588,8 @@ export default function App() {
                 asPage
                 settings={settings}
                 onChange={updateSettings}
+                autostartBusy={autostartBusy}
+                autostartError={autostartError}
                 snap={snap}
                 theme={theme}
                 onTheme={setTheme}

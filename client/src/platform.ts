@@ -40,6 +40,7 @@ export interface ProviderInfo {
   name: string;
   endpoint: string;
   status: string; // ONLINE | OFFLINE | SUSPENDED
+  online: boolean; // computed by the gateway from the current heartbeat
   listed: boolean; // whether it is listed on the marketplace (off by default; only then can others call it and earn credits)
   /**
    * Why the PLATFORM took it off the market, when it did (e.g. the version
@@ -227,6 +228,7 @@ export interface AgentStatus {
   startedAt: number | null;
   restarts: number;
   lastExitCode: number | null;
+  refusedReason?: string | null;
 }
 
 export interface AgentLogLine {
@@ -341,44 +343,6 @@ export async function agentStart(opts: {
 export async function agentStop(): Promise<void> {
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("platform_agent_stop");
-}
-
-/** Resume lending on launch. The provider switch is a STANDING choice: the
- *  user made it once, and every later launch on this machine keeps sharing
- *  without being asked again — until 0.1.10 a restarted client showed the
- *  switch on while no agent ran, so the machine silently stopped earning.
- *  Called from App's mount effect (Tauri only).
- *
- *  Deliberately quiet about the cases it cannot act on: signed out or no
- *  platform URL means the agent CANNOT register (it needs the JWT), and the
- *  sharing panel already explains both states to the user. An agent that is
- *  already running or restarting is left alone — this resumes, it never
- *  restarts. */
-export async function resumeSharingAgent(): Promise<string> {
-  if (!inTauri()) return "skipped: not the desktop app";
-  const s = loadSettings();
-  if (!s.providerEnabled) return "skipped: sharing is off";
-  const gate = platformGate();
-  if (!gate.ok) return `skipped: ${gate.reason}`;
-  const st = await agentStatus();
-  if (st.state === "running" || st.state === "starting" || st.state === "restarting")
-    return "skipped: agent already up";
-  // The EXACT name this machine registered under (see ShareToggleButton):
-  // the gateway dedupes by (account, name), so resuming under a different
-  // spelling would register a second provider row for the same machine. No
-  // name yet = sharing was never toggled on this identity scheme; the next
-  // manual toggle mints one, and resuming under a guess would be worse.
-  if (!s.providerName) return "skipped: no provider identity yet";
-  await agentStart({
-    platformUrl: gate.url,
-    jwt: gate.session.token,
-    name: s.providerName,
-    coordApiPort: s.apiPort || 8000,
-    coordToken: s.apiToken,
-    modelId: s.modelId,
-    quant: s.quant,
-  });
-  return "started";
 }
 
 export async function agentStatus(): Promise<AgentStatus> {

@@ -53,7 +53,7 @@ impl Default for Prefs {
     fn default() -> Self {
         Self {
             tray_icon: true,
-            close_to_tray: true,
+            close_to_tray: false,
             start_minimized: false,
             remember_window: true,
             geometry: None,

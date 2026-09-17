@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useI18n } from "./i18n";
 import { useDialog } from "./useDialog";
 import { loadSettings, saveSettings } from "./settings";
@@ -17,44 +17,17 @@ import {
   platformGate,
   setLocalOverflow,
   setProviderListed,
-  type AgentLogLine,
-  type AgentStatus,
 } from "./platform";
+
+import {
+  agentProviderId, agentRefusal, sharingObservation, waitForSharing,
+  type AgentRegistration, type SharingObservation, type SharingPhase,
+} from "./sharingState";
 
 const MARKETPLACE_CHANGED = "idletoken:marketplace-settings-changed";
 
 function publishMarketplaceChange(): void {
   window.dispatchEvent(new CustomEvent(MARKETPLACE_CHANGED));
-}
-
-/**
- * The agent's own explanation for why it is not selling, or null.
- *
- * Reads the lines the agent already prints; nothing new is invented and no
- * status is guessed. Two shapes exist in the wild and both must be caught: the
- * generic `register: platform said <code>: {json}` that every build has, and
- * the multi-line block a 0.1.78+ agent prints for the marketplace floor.
- *
- * When the line carries a server JSON body, the server's `message` is what is
- * shown — it is written for a person ("...must be stable version X or newer.
- * Your machine keeps working for your own use either way"), while the envelope
- * around it is not. Pasting raw JSON into a tooltip is the same failure as
- * saying nothing, one step later.
- */
-function agentRefusal(l: AgentLogLine): string | null {
-  const line = l.line.replace(/^\[platform-agent\]\s*/, "").trim();
-  if (!/register:|cannot be listed|too old to be listed|refus/i.test(line)) return null;
-  const brace = line.indexOf("{");
-  if (brace >= 0) {
-    try {
-      const body = JSON.parse(line.slice(brace));
-      if (typeof body?.message === "string" && body.message) return body.message.slice(0, 400);
-    } catch {
-      // Not JSON after all, or truncated by the ring buffer. Fall through to
-      // the raw line, which is still the agent's own sentence.
-    }
-  }
-  return line.replace(/^platform-agent:\s*/, "").slice(0, 400) || null;
 }
 
 /**
@@ -130,307 +103,219 @@ function ShareVersionBlockedDialog(
   );
 }
 
-/** Provider-side control: accept other users' work and earn Sparks. */
-export function ShareToggleButton({
-  serviceReady,
-  onNeedLogin,
-}: {
+/** Provider-side control: off -> opening -> confirmed sharing. */
+export function ShareToggleButton({ serviceReady, onNeedLogin }: {
   serviceReady: boolean;
   onNeedLogin?: () => void;
 }) {
-  const { t } = useI18n();
+  const { t, tErr } = useI18n();
   const [on, setOn] = useState(() => loadSettings().providerEnabled);
+  const [phase, setPhase] = useState<SharingPhase>("off");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [blocked, setBlocked] = useState<VersionTooOldToShare | null>(null);
-  const [agent, setAgent] = useState<AgentStatus | null>(null);
-  const [agentErr, setAgentErr] = useState<string | null>(null);
-  /**
-   * What the MARKETPLACE says about this machine — the only authority on
-   * whether it is actually on sale. `null` = not asked yet / could not ask.
-   */
-  const [shelf, setShelf] = useState<{ listed: boolean; reason: string | null } | null>(null);
-
-  useEffect(() => {
-    const sync = () => setOn(loadSettings().providerEnabled);
-    window.addEventListener(MARKETPLACE_CHANGED, sync);
-    return () => window.removeEventListener(MARKETPLACE_CHANGED, sync);
-  }, []);
-
-  // Check at STARTUP, not only when the switch is clicked (2026-09-15).
-  //
-  // `providerEnabled` is persisted, so a client that was sharing yesterday comes
-  // up with the switch already on and nothing re-asks whether it still may. On
-  // a machine whose version fell below the floor overnight that meant a green
-  // switch selling nothing, and the refusal only appeared if the user happened
-  // to toggle it off and on again — which is not a thing anyone does to find
-  // out whether they are earning.
-  //
-  // Below the floor the switch is turned OFF, not merely greyed: it cannot
-  // serve, so leaving it on would be recording an intention the product cannot
-  // honour. The dialog says what happened and how to get back.
-  useEffect(() => {
-    if (!inTauri() || !loadSettings().providerEnabled) return;
-    let alive = true;
-    // force: an admission decision is never served from the advisory cache.
-    void currentVersionStanding(true).then((s) => {
-      if (!alive || !s.belowShareFloor) return;
-      void agentStop().catch(() => { /* may never have started */ });
-      saveSettings({ ...loadSettings(), providerEnabled: false });
-      setOn(false);
-      publishMarketplaceChange();
-      setBlocked(new VersionTooOldToShare(s.installed, s.shareFloor!));
-    });
-    return () => { alive = false; };
-  }, []);
-
-  // Watch the agent itself, not just the stored preference (2026-09-15).
-  //
-  // Until now this pill was `providerEnabled && serviceReady` — the user's
-  // saved choice and the LOCAL engine. Neither says whether the thing that
-  // actually sells anything is alive. A 0.1.76 client with the switch on sat
-  // green all evening while its agent registered, was refused 426 by the
-  // marketplace floor, and exited; the machine was on nobody's discovery page
-  // and the interface never said a word.
-  //
-  // The version case now has its own check before the agent is even started,
-  // but that only closed one instance of the shape. An agent can also die on an
-  // expired session, a registration rate limit, a suspended account or no
-  // network at all, and every one of those used to look exactly like success.
-  useEffect(() => {
-    if (!inTauri()) return;
-    let alive = true;
-    void agentStatus().then((s) => { if (alive) setAgent(s); }).catch(() => { /* not running yet */ });
-    void agentLogs(60).then((ls) => {
-      if (!alive) return;
-      const last = ls.map(agentRefusal).filter(Boolean).pop();
-      if (last) setAgentErr(last);
-    }).catch(() => { /* no ring buffer yet */ });
-    const offStatus = onAgentStatus((s) => {
-      setAgent(s);
-      // A clean start clears the previous run's complaint; leaving it would
-      // explain a healthy agent with a stale reason.
-      if (s.state === "running") setAgentErr(null);
-    });
-    const offLog = onAgentLog((l) => {
-      const why = agentRefusal(l);
-      if (why) setAgentErr(why);
-    });
-    return () => { alive = false; offStatus(); offLog(); };
-  }, []);
-
-  // Ask the marketplace whether this machine is actually on sale (2026-09-16).
-  //
-  // Everything else this pill could look at is local: a saved preference, the
-  // local engine, a live agent process. All three can be perfectly healthy on a
-  // machine the platform has taken off the market — which is exactly what the
-  // version floor does, and what a suspension, a rate limit or a manual unlist
-  // do too. The switch is not only a switch, it is the status light for "am I
-  // selling?", and only the platform knows the answer.
-  //
-  // Polled rather than pushed because delisting happens platform-side, on the
-  // agent's next keep-alive, with nothing flowing back to this process.
-  useEffect(() => {
-    if (!inTauri()) return;
-    let alive = true;
-    const read = () => {
-      if (!loadSettings().providerEnabled) { setShelf(null); return; }
-      void getProviders().then((ps) => {
-        if (!alive) return;
-        const mine = ps.find((p) => p.name === loadSettings().providerName);
-        // No row at all is not "listed: false" — it is "the platform has never
-        // heard of this machine", which is what a refused registration looks
-        // like. Both are "not selling", and neither may show green.
-        setShelf(mine ? { listed: mine.listed, reason: mine.unlistedReason ?? null } : { listed: false, reason: null });
-      }).catch(() => { /* offline or signed out: claim nothing */ });
-    };
-    // A read triggered by the switch itself runs BEFORE the machine is on sale:
-    // flipping it only starts the agent, and registering is a round trip after
-    // that. One read at that instant sees no row — correctly, for another second
-    // or two — and the next steady read is 30 s away, so the pill stayed dark on
-    // a machine that had in fact registered and listed within seconds.
-    //
-    // Dark reads as "sharing failed", and the reasonable response to that is to
-    // flip the switch off and on again. That mints a fresh provider identity
-    // every time (registrations are one-shot) and restarts the same wait, so the
-    // display is what keeps the loop going. Measured 2026-09-16: four identities
-    // in five minutes, every one of them registered and listed by the platform.
-    //
-    // So a change is followed by a short burst of re-reads that stops as soon as
-    // the platform answers. The steady poll is unchanged and still owns the
-    // other direction — delisting happens platform-side with nothing flowing
-    // back here, and no burst can be scheduled for an event we never hear about.
-    let burst: ReturnType<typeof setTimeout>[] = [];
-    const clearBurst = () => { burst.forEach(clearTimeout); burst = []; };
-    const readSoon = () => {
-      clearBurst();
-      read();
-      burst = [1_000, 2_500, 5_000, 9_000, 15_000].map((ms) => setTimeout(read, ms));
-    };
-
-    read();
-    const timer = setInterval(read, 30_000);
-    window.addEventListener(MARKETPLACE_CHANGED, readSoon);
-    const offStatus = onAgentStatus(() => readSoon());
-    return () => {
-      alive = false;
-      clearInterval(timer);
-      clearBurst();
-      window.removeEventListener(MARKETPLACE_CHANGED, readSoon);
-      offStatus();
-    };
-  }, []);
-
-  if (!inTauri()) return null;
+  const busyRef = useRef(false);
+  const resumed = useRef(false);
+  const confirmed = useRef(false);
+  const registration = useRef<AgentRegistration | null>(null);
+  const observation = useRef<SharingObservation | null>(null);
+  const operation = useRef<AbortController | null>(null);
+  const monitor = useRef<AbortController | null>(null);
+  const ready = useRef(serviceReady);
+  ready.current = serviceReady;
   const gate = platformGate();
-  if (!gate.ok) {
-    if (gate.reason === "no-url") {
-      return (
-        <button className="pill pill--market pill--standalone" disabled title={t("platform.err.noUrl")}>
-          <span className="pill__dot" /><span className="pill__label">{t("share.off")}</span>
-        </button>
-      );
-    }
-    return (
-      <button
-        className="pill pill--market pill--standalone"
-        onClick={() => { if (serviceReady) onNeedLogin?.(); }}
-        title={serviceReady ? t("share.needLogin") : t("share.needService")}
-      >
-        <span className="pill__dot" /><span className="pill__label">{t("share.off")}</span>
-      </button>
-    );
-  }
 
-  const toggle = async () => {
-    if (busy || !serviceReady) return;
-    setBusy(true);
-    setErr(null);
+  useEffect(() => () => {
+    operation.current?.abort();
+    monitor.current?.abort();
+  }, []);
+
+  const read = async (signal: AbortSignal): Promise<SharingObservation> => {
+    signal.throwIfAborted();
+    const [logs, providers] = await Promise.all([agentLogs(500), getProviders()]);
+    // Read liveness AFTER the network round trip: it may have exited meanwhile.
+    const agent = await agentStatus();
+    signal.throwIfAborted();
+    const next = sharingObservation(agent, logs, providers, registration.current, ready.current);
+    registration.current = next.registration;
+    observation.current = next;
+    return next;
+  };
+
+  const stop = async () => {
+    const provider = observation.current?.provider;
     try {
-      if (on) {
-        // Unlist BEFORE stopping the agent, and best-effort: the platform must
-        // stop sending strangers here the moment the user says stop, not 60
-        // seconds later when the heartbeat ages out — that window could only
-        // produce failed requests against an agent that had already gone. It
-        // must not be able to block turning sharing off, though, so a platform
-        // that cannot be reached costs the old behaviour and nothing more.
-        try {
-          const mine = (await getProviders()).find((p) => p.name === loadSettings().providerName);
-          if (mine?.listed) await setProviderListed(mine.id, false);
-        } catch { /* offline or signed out: the heartbeat timeout still covers it */ }
-        await agentStop();
-        saveSettings({ ...loadSettings(), providerEnabled: false });
-        setOn(false);
-        setShelf(null);
-      } else {
-        // The one moment a version genuinely blocks something, and the one
-        // moment it is fair to say so (2026-09-14). Turning sharing ON is the
-        // user stepping out to serve strangers — nothing of theirs is running
-        // yet, they are actively doing this, and the gateway is about to refuse
-        // the registration anyway. Catching it here turns an opaque 426 in a
-        // headless agent's log into a sentence with a download link.
-        //
-        // Everything else in this client stays unconditional. There is no
-        // version check on starting a cluster, loading a model, or serving the
-        // local API, and there must not be: an old build there can only affect
-        // the person who chose to run it.
-        const standing = await currentVersionStanding(true);
-        if (standing.belowShareFloor) {
-          throw new VersionTooOldToShare(standing.installed, standing.shareFloor!);
-        }
-        const scheme = /^cluster-\d+$/;
-        const stored = loadSettings().providerName;
-        let providerName = stored && scheme.test(stored) ? stored : "";
-        if (!providerName) {
-          const taken = new Set((await getProviders()).map((p) => p.name));
-          let n = 1;
-          while (taken.has(`cluster-${n}`)) n++;
-          providerName = `cluster-${n}`;
-        }
+      if (provider?.listed) await setProviderListed(provider.id, false);
+    } catch { /* An unreachable gateway still ages out the stopped heartbeat. */ }
+    await agentStop();
+    confirmed.current = false;
+    registration.current = null;
+    observation.current = null;
+    saveSettings({ ...loadSettings(), providerEnabled: false });
+    setOn(false);
+    setPhase("off");
+    publishMarketplaceChange();
+  };
+
+  const start = async (restore = false) => {
+    if (busyRef.current || !ready.current || !gate.ok) return;
+    busyRef.current = true;
+    setBusy(true);
+    monitor.current?.abort();
+    const attempt = new AbortController();
+    operation.current = attempt;
+    setErr(null);
+    setBlocked(null);
+    setPhase("opening");
+    try {
+      // Manual activation and startup restoration use the SAME admission path.
+      const standing = await currentVersionStanding(true);
+      attempt.signal.throwIfAborted();
+      if (standing.belowShareFloor) {
+        throw new VersionTooOldToShare(standing.installed, standing.shareFloor!);
+      }
+      let providerName = loadSettings().providerName;
+      if (!/^cluster-\d+$/.test(providerName)) {
+        const taken = new Set((await getProviders()).map((p) => p.name));
+        let n = 1;
+        while (taken.has(`cluster-${n}`)) n++;
+        providerName = `cluster-${n}`;
+      }
+      attempt.signal.throwIfAborted();
+      const status = await agentStatus();
+      if (!restore || !["running", "starting", "restarting"].includes(status.state)) {
+        registration.current = null;
+        observation.current = null;
         const s = loadSettings();
         await agentStart({
-          platformUrl: gate.url,
-          jwt: gate.session.token,
-          name: providerName,
-          coordApiPort: s.apiPort || 8000,
-          coordToken: s.apiToken,
-          modelId: s.modelId,
-          quant: s.quant,
+          platformUrl: gate.url, jwt: gate.session.token, name: providerName,
+          coordApiPort: s.apiPort || 8000, coordToken: s.apiToken,
+          modelId: s.modelId, quant: s.quant,
         });
-        // Provider identity belongs only to lending. Request-help credentials
-        // are created and controlled by the adjacent independent button.
-        saveSettings({ ...loadSettings(), providerEnabled: true, providerName });
-        setOn(true);
       }
+      const result = await waitForSharing(() => read(attempt.signal), { signal: attempt.signal });
+      attempt.signal.throwIfAborted();
+      confirmed.current = true;
+      saveSettings({ ...loadSettings(), providerEnabled: true, providerName: result.provider!.name });
+      setOn(true);
+      setPhase("sharing");
       publishMarketplaceChange();
     } catch (e) {
-      const msg = String((e as Error)?.message ?? e);
-      setErr(msg);
-      // The one failure with a remedy gets a dialog. It is also the only one
-      // raised BEFORE the agent was asked to start, so there is nothing to
-      // unwind — the rollback below is for a start that got partway.
-      if (e instanceof VersionTooOldToShare) setBlocked(e);
-      if (!on) {
-        try { await agentStop(); } catch { /* already stopped */ }
-        saveSettings({ ...loadSettings(), providerEnabled: false });
-        setOn(false);
-        publishMarketplaceChange();
+      // A failed attempt cannot keep registering behind an "off" button.
+      await stop();
+      if (!attempt.signal.aborted) {
+        if (e instanceof VersionTooOldToShare) setBlocked(e);
+        else setErr(tErr(String((e as Error)?.message ?? e)));
       }
     } finally {
+      if (operation.current === attempt) operation.current = null;
+      busyRef.current = false;
       setBusy(false);
     }
   };
 
-  // The setting records the user's persistent choice. Green is reserved for
-  // a choice that can actually serve work right now — which means the agent is
-  // up, not merely that the switch is on and the local engine loaded.
-  //
-  // `starting` and `restarting` are deliberately NOT down: the supervisor is
-  // mid-attempt and calling that a failure would flicker red on every ordinary
-  // start. Unknown (null, e.g. the status call has not answered yet) is not
-  // down either — this pill reports what it knows and never guesses.
-  const agentDown = on && (agent?.state === "stopped" || agent?.state === "crashed");
-  // Green means SELLING, and the marketplace is the only thing that knows.
-  //
-  // Not `on` (a saved wish), not `serviceReady` (the local engine), not merely
-  // a live agent: a machine can have all three and be unlisted. `shelf === null`
-  // — not asked yet, offline, signed out — is NOT green either, because this
-  // pill states a fact and has no business guessing one. That also removes the
-  // startup flash where an agent that had never come up showed green until its
-  // status arrived.
-  const active = on && serviceReady && !agentDown && shelf?.listed === true;
-  const title = !serviceReady
-    ? t("share.needService")
-    : agentDown
-      // The agent's own sentence when we have one. It is the only thing that
-      // knows WHY, and the whole point of this pill is not to swallow it.
-      ? `${t("share.agentDown")}${agentErr ? `\n\n${agentErr}` : ""}`
-      // Unlisted BY THE PLATFORM, with its reason. This is the case that used
-      // to be invisible: switch on, agent up, nothing on sale.
-      : on && shelf && !shelf.listed
-        ? `${t("share.notListed")}${shelf.reason ? `\n\n${shelf.reason}` : ""}`
-        : err ?? t(active ? "share.on" : "share.off");
+  // Check at STARTUP, including a sign-in that happens after the app mounted.
+  // Waiting for the local service avoids racing App's old fire-and-forget resume.
+  const sessionToken = gate.ok ? gate.session.token : "";
+  useEffect(() => {
+    if (!inTauri() || !serviceReady || !sessionToken || resumed.current) return;
+    resumed.current = true;
+    if (loadSettings().providerEnabled) void start(true);
+  }, [serviceReady, sessionToken]);
 
+  useEffect(() => {
+    if (!inTauri() || !on || busy || !confirmed.current) return;
+    const watch = new AbortController();
+    monitor.current = watch;
+    let checking = false;
+    const check = async () => {
+      if (checking || busyRef.current || watch.signal.aborted) return;
+      checking = true;
+      try {
+        await waitForSharing(() => read(watch.signal), {
+          signal: watch.signal,
+          pending: () => { if (!watch.signal.aborted) setPhase("opening"); },
+        });
+        if (!watch.signal.aborted) setPhase("sharing");
+      } catch (e) {
+        if (!watch.signal.aborted) {
+          // Retrying from the off label must START, never toggle a stale wish off.
+          busyRef.current = true;
+          setBusy(true);
+          try {
+            await stop();
+            setErr(tErr(String((e as Error)?.message ?? e)));
+          } finally { busyRef.current = false; setBusy(false); }
+        }
+      } finally { checking = false; }
+    };
+    const timer = setInterval(() => void check(), 5_000);
+    const offStatus = onAgentStatus(() => void check());
+    const offLog = onAgentLog((log) => {
+      if (agentProviderId(log.line) || agentRefusal(log)) void check();
+    });
+    void check();
+    return () => {
+      watch.abort();
+      clearInterval(timer);
+      offStatus();
+      offLog();
+    };
+  }, [on, busy]);
+
+  if (!inTauri()) return null;
+  const opening = phase === "opening";
+  const active = phase === "sharing";
+  const title = err ?? (!serviceReady ? t("share.needService")
+    : !gate.ok ? t(gate.reason === "no-url" ? "platform.err.noUrl" : "share.needLogin")
+    : t(opening ? "share.opening" : active ? "share.on" : "share.off"));
+  const toggle = async () => {
+    if (busyRef.current || opening) return;
+    if (!gate.ok) { if (serviceReady) onNeedLogin?.(); return; }
+    if (!active) { await start(); return; }
+    busyRef.current = true;
+    setBusy(true);
+    monitor.current?.abort();
+    try { await stop(); }
+    catch (e) { setErr(tErr(String((e as Error)?.message ?? e))); }
+    finally { busyRef.current = false; setBusy(false); }
+  };
   return (
     <>
       <button
-        className={`pill pill--market pill--${active ? "ready" : "standalone"}`}
-        disabled={busy}
+        className={`pill pill--market pill--share pill--${active ? "ready" : "standalone"}`}
+        data-share-state={phase}
+        disabled={busy || opening || (!gate.ok && gate.reason === "no-url")}
         onClick={() => void toggle()}
         aria-pressed={active}
+        aria-busy={busy || opening}
+        aria-label={t(opening ? "share.opening" : active ? "share.on" : "share.off")}
         title={title}
       >
         <span className="pill__dot" />
-        <span className="pill__label">{busy ? "…" : t(active ? "share.on" : "share.off")}</span>
+        <span className="pill__label">{opening ? "…" : t(active ? "share.on" : "share.off")}</span>
       </button>
-      {blocked ? (
-        <ShareVersionBlockedDialog
-          installed={blocked.installed}
-          floor={blocked.floor}
-          onClose={() => setBlocked(null)}
-        />
-      ) : null}
+      {blocked ? <ShareVersionBlockedDialog installed={blocked.installed} floor={blocked.floor}
+        onClose={() => setBlocked(null)} /> : null}
+      {err ? <ShareFailureDialog message={err} onClose={() => setErr(null)} /> : null}
     </>
+  );
+}
+
+function ShareFailureDialog({ message, onClose }: { message: string; onClose: () => void }) {
+  const { t } = useI18n();
+  const ref = useDialog(onClose);
+  return (
+    <div className="modal-scrim" onClick={onClose}>
+      <div ref={ref} className="modal" role="alertdialog" aria-modal="true"
+        aria-labelledby="share-failure-title" onClick={(e) => e.stopPropagation()}>
+        <div className="modal__head"><h2 id="share-failure-title">{t("share.failed")}</h2></div>
+        <p>{message}</p>
+        <div className="modal__foot"><button className="btn-primary" onClick={onClose}>
+          {t("a11y.close")}
+        </button></div>
+      </div>
+    </div>
   );
 }
 

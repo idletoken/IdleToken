@@ -44,6 +44,9 @@ fn app_quit(app: tauri::AppHandle) {
 fn autostart_set(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
     use tauri_plugin_autostart::ManagerExt;
     let manager = app.autolaunch();
+    if manager.is_enabled().map_err(|e| e.to_string())? == enabled {
+        return Ok(());
+    }
     if enabled {
         manager.enable().map_err(|e| e.to_string())
     } else {
@@ -55,9 +58,9 @@ fn autostart_set(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
 /// can differ (another tool cleared the registry key, the .desktop file was
 /// removed), and the honest answer is the one the OS gives.
 #[tauri::command]
-fn autostart_get(app: tauri::AppHandle) -> bool {
+fn autostart_get(app: tauri::AppHandle) -> Result<bool, String> {
     use tauri_plugin_autostart::ManagerExt;
-    app.autolaunch().is_enabled().unwrap_or(false)
+    app.autolaunch().is_enabled().map_err(|e| e.to_string())
 }
 
 /// The CPU's marketing name, for the dashboard's CPU tile (the engine probe
@@ -1213,10 +1216,9 @@ fn main() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Closing the window is not quitting. A node holds model layers in
-            // VRAM and answers API requests; pressing X while a cluster is
-            // serving must not take it down, and on Windows in particular the
-            // X button is how most people put an app away.
+            // Continuing to serve after closing the window is an explicit
+            // preference. New installations close normally; existing users
+            // who chose background operation retain their preference.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let app = window.app_handle();
                 let prefs = app.state::<window::SysPrefs>().get();

@@ -16,10 +16,12 @@ REM therefore overridden to nothing.
 REM
 REM Contract: prints CLIENT_RELEASE_OK or CLIENT_RELEASE_FAIL: <reason>.
 REM
-REM There is no updater artifact and no signing since 2026-09-02 (user ruling):
+REM There is no updater artifact or updater signing since 2026-09-02:
 REM the product has no in-app updater, so a release is the installer alone.
 REM IDLETOKEN_DEFER_UPDATER_SIGNING and the deferred-signing dance it named are
 REM gone with it.
+REM Optional Windows Authenticode signing is a separate release identity step;
+REM see windows_sign.ps1 and IDLETOKEN_WINDOWS_SIGNING.
 setlocal enabledelayedexpansion
 cd /d "%~dp0.."
 set ROOT=%CD%
@@ -183,18 +185,16 @@ copy /y "%LLAMA_BIN%\%1.exe" "%ROOT%\client\src-tauri\binaries\%2-%TRIPLE%.exe" 
     echo CLIENT_RELEASE_FAIL: could not stage %1.exe as %2 & exit /b 1)
 copy /y "%LLAMA_BIN%\%1.exe" "%ROOT%\client\src-tauri\binaries\%2-%ALT_TRIPLE%.exe" >nul || (
     echo CLIENT_RELEASE_FAIL: could not stage %1.exe as %2 for alternate target & exit /b 1)
-REM externalBin carries only the executable. Shared-mode integrity checks the
-REM installed engine against a digest beside it, so bundle that digest as an
-REM explicit root resource under the FINAL installed sidecar name.
-powershell -NoProfile -Command ^
-  "$h=(Get-FileHash '%ROOT%\client\src-tauri\binaries\%2-%TRIPLE%.exe' -Algorithm SHA256).Hash.ToLower(); Set-Content -Encoding ascii '%ROOT%\client\src-tauri\runtime\windows\%2.exe.sha256' ($h + '  %2.exe')"
-if errorlevel 1 (
-    echo CLIENT_RELEASE_FAIL: could not record the %2.exe engine digest
-    exit /b 1
-)
 exit /b 0
 
 :engines_staged
+
+REM Complete first-party identity/signatures before recording engine hashes.
+powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%ROOT%\scripts\windows_release_prepare.ps1" -RepoRoot "%ROOT%" -TargetTriple "%TRIPLE%"
+if errorlevel 1 (
+    echo CLIENT_RELEASE_FAIL: Windows identity, installer helper or signing preparation failed
+    exit /b 1
+)
 
 REM --- licences ----------------------------------------------------------
 REM Apache-2.0 section 4(d) requires our NOTICE to travel with a BINARY
@@ -319,9 +319,17 @@ REM metadata, including the Windows account name of the build machine. Map the
 REM users-root prefix to a neutral path before compiling anything that ships.
 for %%I in ("%USERPROFILE%\..") do set "IDLETOKEN_BUILD_USERS_ROOT=%%~fI"
 set "RUSTFLAGS=%RUSTFLAGS% --remap-path-prefix=%IDLETOKEN_BUILD_USERS_ROOT%=C:\build-users"
-cargo %RUST_TOOLCHAIN% tauri build --bundles nsis --config "{\"build\":{\"beforeBuildCommand\":\"\"}}"
+cargo %RUST_TOOLCHAIN% tauri build --bundles nsis --config "%ROOT%\build\windows-release\tauri-config.json"
 if errorlevel 1 (
     echo CLIENT_RELEASE_FAIL: tauri build failed
+    exit /b 1
+)
+
+REM Verify the actual archive, including final signed engine hashes and runtime.
+for /f "delims=" %%V in ('powershell -NoProfile -Command "(ConvertFrom-Json -InputObject ([IO.File]::ReadAllText('%ROOT%\client\package.json'))).version"') do set "IDLETOKEN_PACKAGE_VERSION=%%V"
+powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%ROOT%\scripts\windows_package_gate.ps1" -RepoRoot "%ROOT%" -Installer "%ROOT%\client\src-tauri\target\release\bundle\nsis\IdleToken_%IDLETOKEN_PACKAGE_VERSION%_x64-setup.exe" -ReportPath "%ROOT%\build\windows-release\package-verification.json"
+if errorlevel 1 (
+    echo CLIENT_RELEASE_FAIL: final installer verification failed
     exit /b 1
 )
 
