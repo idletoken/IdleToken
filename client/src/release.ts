@@ -93,15 +93,28 @@ export function versionStanding(
   };
 }
 
-const CACHE_MS = 6 * 60 * 60 * 1000;
+/**
+ * How long the ADVISORY reading may be reused.
+ *
+ * Short, and deliberately not a decision input. The six hours this used to be
+ * were sized for the Settings line ("a newer version exists"), which is true —
+ * but the same cache was also answering "may this machine go on the market?",
+ * and on 2026-09-16 that produced exactly the failure the check exists to
+ * prevent: the floor moved to 0.1.81, a 0.1.80 client that had read the policy
+ * earlier still believed the floor was 0.1.79, so the sharing switch went green
+ * with no dialog, the agent started, the gateway refused its registration with
+ * 426, and the interface said nothing. An admission decision may not be served
+ * from a cache; see `currentVersionStanding(true)` at both decision points.
+ */
+const CACHE_MS = 15 * 60 * 1000;
 let cached: { at: number; policy: ReleasePolicy | null } | null = null;
 
 /**
  * Read the published policy. Public endpoint, no session required.
  *
- * Cached for six hours and never retried on a schedule: this is a line of text
- * in a settings page, not a service. Every failure resolves to null, because
- * "the platform is unreachable" must not become "your client is out of date".
+ * `force` skips the cache and is REQUIRED for anything that decides whether
+ * this machine may be listed. Every failure resolves to null, because "the
+ * platform is unreachable" must not become "your client is out of date".
  */
 export async function fetchReleasePolicy(force = false): Promise<ReleasePolicy | null> {
   if (!force && cached && Date.now() - cached.at < CACHE_MS) return cached.policy;

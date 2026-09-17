@@ -693,6 +693,15 @@ export default function SettingsPanel(props: {
       {!props.snap.unified_memory ? (
         <CapSlider label={t("settings.maxRam")} noCap={t("settings.noCap")} totalBytes={props.snap.ram_total} valueMb={liveCaps.maxRamMb} onChange={(mb) => setCap("maxRamMb", mb)} />
       ) : null}
+      {/* This one genuinely cannot take effect until the next start, and
+          saying so is the difference between "my change did nothing" and "my
+          change is queued": llama.cpp allocates the window and the weights in
+          one block at load time and cannot resize either while running, so a
+          new cap describes the NEXT model, never the one in memory. Unlike the
+          sharing and overflow switches — which are flags read per request and
+          have no business waiting for a restart — this limit is consumed once,
+          by an allocation that has already happened. */}
+      <p className="setting-hint">{t("settings.resource.nextStart")}</p>
     </div>
   );
 

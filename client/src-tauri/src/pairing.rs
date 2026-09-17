@@ -140,8 +140,21 @@ pub struct Tuning {
     // to start at all if overflow is asked for without an api_token -- which is
     // why these travel together with it rather than through a separate channel.
     //
-    // Empty url = do not enable. There is deliberately no boolean: a flag and a
-    // credential that can disagree is a flag that will.
+    // Credentials and the switch are separate (2026-09-16), the way `--shared`
+    // already is. This used to read "empty url = do not enable, there is
+    // deliberately no boolean: a flag and a credential that can disagree is a
+    // flag that will" — and the price of that rule was that switching borrowing
+    // OFF did nothing until the model was restarted, because the coordinator
+    // had been handed no credentials it could be told to stop using. A user who
+    // turned borrowing off went on borrowing, and went on paying.
+    //
+    // The disagreement the old rule feared is closed on the engine side rather
+    // than by withholding the key: with the flag off nothing is borrowed even
+    // though the key is present, and switching on without a key is REFUSED
+    // (idletoken_overflow_set_enabled) instead of silently becoming true. The
+    // flag is the decision, the key is only the capability.
+    #[serde(default)]
+    overflow_enabled: bool,
     #[serde(default)]
     overflow_url: String,
     #[serde(default)]
@@ -171,19 +184,18 @@ pub struct OverflowTuning {
 }
 
 fn apply_overflow_tuning(tuning: &mut Tuning, latest: OverflowTuning) {
-    if latest.enabled {
-        tuning.overflow_url = latest.overflow_url;
-        tuning.overflow_key = latest.overflow_key;
-        tuning.overflow_wait_s = latest.overflow_wait_s;
-        tuning.overflow_daily_cap_milli = latest.overflow_daily_cap_milli;
-    } else {
-        // The boolean is authoritative. Never let a stale key or URL turn an
-        // off switch into a partially configured forwarding path.
-        tuning.overflow_url.clear();
-        tuning.overflow_key.clear();
-        tuning.overflow_wait_s = 0;
-        tuning.overflow_daily_cap_milli = 0;
-    }
+    // The credentials go over whenever the account has them, switched on or
+    // not. That is what makes the switch a switch: the coordinator holds the
+    // capability and is told, at any moment, whether to use it.
+    //
+    // The boolean is still authoritative — it is carried explicitly now instead
+    // of being spelled as an absent URL, so that "off" can also be said to a
+    // coordinator that is already running.
+    tuning.overflow_enabled = latest.enabled;
+    tuning.overflow_url = latest.overflow_url;
+    tuning.overflow_key = latest.overflow_key;
+    tuning.overflow_wait_s = latest.overflow_wait_s;
+    tuning.overflow_daily_cap_milli = latest.overflow_daily_cap_milli;
 }
 
 fn default_true() -> bool {
@@ -226,6 +238,7 @@ impl Default for Tuning {
             prefer_coordinator: false,
             same_subnet_only: false,
             bind_nic: String::new(),
+            overflow_enabled: false,
             overflow_url: String::new(),
             overflow_key: String::new(),
             overflow_wait_s: 0,
@@ -1621,6 +1634,12 @@ fn overflow_args(tuning: &Tuning) -> Vec<String> {
     if tuning.overflow_daily_cap_milli > 0 {
         v.push("--overflow-daily-cap".into());
         v.push(tuning.overflow_daily_cap_milli.to_string());
+    }
+    // Configured but starting OFF. The coordinator holds the key and forwards
+    // nothing until it is told to; `api_overflow_set` is what tells it, with no
+    // model reload in between.
+    if !tuning.overflow_enabled {
+        v.push("--overflow-off".into());
     }
     v
 }
@@ -3989,6 +4008,7 @@ mod pairing_settings_tests {
         assert!(overflow_args(&tuning(|t| t.overflow_url = "http://p".into())).is_empty());
         assert!(overflow_args(&tuning(|t| t.overflow_key = "sk".into())).is_empty());
         let t = tuning(|t| {
+            t.overflow_enabled = true;   // the switch; the pair below is the capability
             t.overflow_url = "http://p".into();
             t.overflow_key = "sk".into();
             t.overflow_wait_s = 5;
@@ -3999,6 +4019,13 @@ mod pairing_settings_tests {
             vec!["--overflow-url", "http://p",
                  "--overflow-wait-s", "5", "--overflow-daily-cap", "2500"]
         );
+        // Half a pair stays half a pair whatever the switch says: an enabled
+        // flag with no key must still send nothing, because the coordinator
+        // would refuse to start rather than run without one.
+        assert!(overflow_args(&tuning(|t| {
+            t.overflow_enabled = true;
+            t.overflow_url = "http://p".into();
+        })).is_empty());
         // A cap of 0 means no additional local ceiling and needs no flag.
         let no_cap = tuning(|t| {
             t.overflow_url = "http://p".into();
@@ -4035,9 +4062,19 @@ mod pairing_settings_tests {
         assert_eq!(t.max_vram_mb, 8192, "launch routing must not alter resource caps");
         assert_eq!(t.max_ram_mb, 16384, "launch routing must not alter resource caps");
 
-        // Off is an explicit backend decision. Even stale credentials in the
-        // payload must not revive a choice captured when the roster was made.
-        let off_with_stale_credentials: OverflowTuning = serde_json::from_value(serde_json::json!({
+        assert!(t.overflow_enabled, "an enabled payload must arrive switched on");
+
+        // Off keeps the credentials and says so in the flag (2026-09-16).
+        //
+        // This used to assert the opposite — that the URL and key were wiped —
+        // on the reasoning that a flag and a credential which can disagree is a
+        // flag that will. The cost was that "off" could only be said at launch:
+        // a coordinator handed no credentials has nothing it can be told to
+        // stop using, so switching borrowing off left it borrowing, and paying,
+        // until the model was restarted. Credentials are the capability now and
+        // the flag is the decision, exactly as `--shared` is always passed and
+        // the sharing decision made later.
+        let off_with_credentials: OverflowTuning = serde_json::from_value(serde_json::json!({
             "enabled": false,
             "overflowUrl": "http://stale-platform",
             "overflowKey": "stale-key",
@@ -4045,11 +4082,24 @@ mod pairing_settings_tests {
             "overflowDailyCapMilli": 9999,
         }))
         .expect("the explicit off payload must deserialize");
-        apply_overflow_tuning(&mut t, off_with_stale_credentials);
-        assert!(t.overflow_url.is_empty());
-        assert!(t.overflow_key.is_empty());
-        assert_eq!(t.overflow_wait_s, 0);
-        assert_eq!(t.overflow_daily_cap_milli, 0);
+        apply_overflow_tuning(&mut t, off_with_credentials);
+        assert!(!t.overflow_enabled, "off must be carried as the flag");
+        assert_eq!(t.overflow_url, "http://stale-platform");
+        assert_eq!(t.overflow_key, "stale-key");
+
+        // And the flag is what reaches the coordinator: credentials present,
+        // forwarding off. Without `--overflow-off` the engine would start
+        // borrowing the moment it came up.
+        let args = overflow_args(&t);
+        assert!(args.iter().any(|a| a == "--overflow-url"),
+            "the capability must be handed over even while switched off");
+        assert!(args.iter().any(|a| a == "--overflow-off"),
+            "off must be spelled to the coordinator, not implied by a missing URL");
+
+        t.overflow_enabled = true;
+        let on_args = overflow_args(&t);
+        assert!(!on_args.iter().any(|a| a == "--overflow-off"),
+            "switched on, nothing tells the coordinator to stay off");
     }
 
     /// The bug that shipped as 0.1.4 (2026-08-21): the client handed the

@@ -788,6 +788,24 @@ pub(crate) fn engine_platform_url(url: &str) -> String {
     trimmed.trim_end_matches('/').to_string()
 }
 
+/// Where the agent should reach the relay, given an optional entry point the
+/// platform named for this machine.
+///
+/// Why an override exists at all: a relay job carries the whole request, and an
+/// image request is megabytes of it. The agent reads that body under a transfer
+/// budget and hands the job back if the body has not arrived in time, so the
+/// platform still has time to place it elsewhere. On a path with high RTT and
+/// packet loss that budget turns "slow" into a hard, repeatable failure — the
+/// same picture succeeds or is handed back depending on the minute. A regional
+/// entry point terminates the TCP connection near the machine, which raises the
+/// bytes that fit inside one budget by roughly 3x (measured 2026-09-16).
+///
+/// Scope is deliberately narrow: this moves the AGENT only. The control plane
+/// (sign-in, heartbeat, catalog) keeps its direct TLS path — those are hundreds
+/// of bytes, they are nowhere near any transfer budget, and routing them
+/// through one more hop would buy nothing while widening what that hop sees.
+///
+
 #[tauri::command]
 pub fn platform_agent_start(
     app: AppHandle,
@@ -803,7 +821,8 @@ pub fn platform_agent_start(
     if platform_url.is_empty() {
         return Err("[PLATFORM_URL_EMPTY] platform URL is empty — set it in Settings first".into());
     }
-    // The agent has no TLS client; give it the gateway's plaintext spelling.
+    // The agent has no TLS client; give it the gateway's plaintext spelling,
+    // unless the platform named a regional entry point for this machine.
     let platform_url = engine_platform_url(&platform_url);
     if jwt.trim().is_empty() {
         return Err("[PLATFORM_NO_SESSION] not signed in to the platform (no session token)".into());
@@ -1160,6 +1179,9 @@ mod engine_platform_url_tests {
         assert_eq!(engine_platform_url("https://api.idletoken.ai:443"),
                    "http://api.idletoken.ai:8080");
     }
+
+
+
 
     #[test]
     fn http_and_lan_urls_pass_through() {

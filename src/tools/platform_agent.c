@@ -630,6 +630,48 @@ static int http_body_idle_secs(void) {
     return v > 0 ? v : HTTP_BODY_IDLE_SECS;
 }
 
+/* Ceiling on the WHOLE body, not on one quiet moment in it.
+ *
+ * The idle budget above asks "is it still moving?" — and on 2026-09-15 a link
+ * answered yes for twenty minutes while moving 1.3 KB per 70 s. Every recv()
+ * returned a few bytes and re-armed the idle timer, so a 410 KB job neither
+ * arrived nor was handed back; the buyer simply waited until something else
+ * gave up. **A budget that only catches a stopped link does not catch a
+ * crawling one**, and crawling is the failure this link actually produces.
+ *
+ * The number has to sit BELOW the platform's own job timeout, or handing the
+ * job back is a gesture nobody receives: a body budget equal to that timeout
+ * fires at the exact instant the platform gives up on its own — the buyer gets
+ * the generic "relay job timed out" and the seller never learns that the thing
+ * wrong with their machine is the uplink. Raise it only together with the
+ * platform's job timeout; the two are a pair.
+ *
+ * **480 s, paired with `PROVIDER_TIMEOUT_MS=600000` (2026-09-16).** The earlier
+ * 180 s was sized against text-only relay jobs of a few hundred KB. An image
+ * request is megabytes, and on the link measured that day (40–80 KB/s to the
+ * platform) 180 s admits only ~7–14 MB — so an ordinary phone photo landed
+ * right on the edge and the SAME picture was carried or handed back depending
+ * on the minute. That is the worst shape a limit can have: it reads as "images
+ * are broken" rather than "this uplink is slow", and it cost a full debugging
+ * session to tell the two apart (the tell was that the LARGEST request
+ * succeeded while smaller ones failed).
+ *
+ * 480 s admits ~19–38 MB on that same link, which covers the platform's own
+ * 32 MB body ceiling — the largest request it will accept at all — on the
+ * slower of the two paths available to a machine.
+ *
+ * A long total budget is only safe because the idle budget above is separate
+ * and short: a transfer that has genuinely stopped is caught in 120 s no matter
+ * what this says, so this number binds only while bytes are actually arriving.
+ * It buys patience with a slow link, not tolerance for a dead one. */
+#define HTTP_BODY_TOTAL_SECS 480
+
+static int http_body_total_secs(void) {
+    const char *e = getenv("IDLETOKEN_HTTP_BODY_TOTAL_S");
+    int v = e ? atoi(e) : 0;
+    return v > 0 ? v : HTTP_BODY_TOTAL_SECS;
+}
+
 /* Arm (or re-arm) the receive timeout on an open socket. */
 static void http_set_rcv_timeout(int fd, int secs) {
     /* Winsock's SO_RCVTIMEO takes a DWORD of milliseconds, not a struct
@@ -673,6 +715,167 @@ static long long http_content_length(const uint8_t *hdr, size_t len) {
     return -1;
 }
 
+/* ======================================================================
+ * Outbound HTTP proxy
+ *
+ * Why this exists at all: on a machine whose owner has configured a proxy,
+ * every OTHER part of the product already uses it — the desktop client is
+ * reqwest, which reads these variables — while this process opens a raw
+ * socket and does not. The result is one machine leaving by two different
+ * routes, and the one carrying the megabytes takes the worse of them. That
+ * was observed on 2026-09-17: the same host, in the same second, was
+ * classified as two different regions depending on which of its own
+ * components was asking, and the owner had every reason to believe their
+ * proxy covered both.
+ *
+ * A proxy in the operating-system sense is opt-in per program. A tunnel that
+ * captures the routing table is not. Reading these variables is how a program
+ * opts in, so this is not a new policy — it is this process finally obeying
+ * the policy the machine was already configured with.
+ *
+ * Deliberately NOT supported: SOCKS. Saying so out loud once beats treating a
+ * socks5:// URL as though it named an HTTP proxy, which would produce a
+ * connection that fails in a way nobody could read.
+ * ====================================================================== */
+
+typedef struct {
+    char host_port[256];   /* the proxy's own "host:port" */
+    char auth_b64[512];    /* base64("user:pass"), "" when the URL carried none */
+} agent_proxy;
+
+/* Loopback is never proxied, whatever the environment says.
+ *
+ * Two independent reasons, either one sufficient. The address on the other end
+ * is this machine's own coordinator, so there is no route for a proxy to
+ * improve. And a local HTTP proxy that intercepts loopback has been measured
+ * (see the known-traps list) swallowing the end-of-stream signal on server-sent
+ * events, which hangs the caller forever — a proxy cannot help here and can
+ * certainly hurt. */
+static int addr_is_loopback(const char *addr) {
+    return strncmp(addr, "127.", 4) == 0
+        || strncmp(addr, "localhost:", 10) == 0
+        || strcmp(addr, "localhost") == 0
+        || strncmp(addr, "[::1]", 5) == 0
+        || strncmp(addr, "::1", 3) == 0;
+}
+
+static const char *env_any(const char *const *names) {
+    for (; *names; names++) {
+        const char *v = getenv(*names);
+        if (v && *v) return v;
+    }
+    return NULL;
+}
+
+/* Does NO_PROXY exempt this address? Suffix match on the host part, plus the
+ * "*" catch-all, which is how curl and every runtime spell "never proxy". */
+static int no_proxy_covers(const char *addr) {
+    static const char *const names[] = { "NO_PROXY", "no_proxy", NULL };
+    const char *np = env_any(names);
+    if (!np) return 0;
+
+    char host[256];
+    size_t n = 0;
+    for (const char *p = addr; *p && *p != ':' && n + 1 < sizeof(host); p++) host[n++] = *p;
+    host[n] = '\0';
+
+    for (const char *p = np; *p; ) {
+        while (*p == ',' || *p == ' ' || *p == '\t') p++;
+        const char *start = p;
+        while (*p && *p != ',') p++;
+        size_t len = (size_t)(p - start);
+        while (len && (start[len - 1] == ' ' || start[len - 1] == '\t')) len--;
+        if (len == 1 && start[0] == '*') return 1;
+        if (len && len <= n) {
+            /* Suffix match, and only on a label boundary: "example.com" must
+             * not exempt "notexample.com". */
+            const char *tail = host + (n - len);
+            size_t i = 0;
+            while (i < len && (tail[i] | 0x20) == (start[i] | 0x20)) i++;
+            if (i == len && (n == len || tail[-1] == '.' || start[0] == '.')) return 1;
+        }
+    }
+    return 0;
+}
+
+/* Resolve the configured proxy once. Returns 0 when there is none to use.
+ *
+ * Order follows curl's, because that is the order the people who set these
+ * variables already expect. Only plaintext HTTP proxies are understood, which
+ * is exactly enough: this process speaks plaintext HTTP by design. */
+static int agent_proxy_resolve(agent_proxy *out) {
+    static const char *const names[] = {
+        "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", NULL
+    };
+    const char *url = env_any(names);
+    if (!url) return 0;
+
+    if (strncmp(url, "socks", 5) == 0) {
+        static int said = 0;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "platform agent: %s names a SOCKS proxy, which this "
+                            "process does not speak; connecting directly. Set "
+                            "HTTP_PROXY to an http:// proxy to route through it.\n", url);
+        }
+        return 0;
+    }
+    if (strncmp(url, "http://", 7) == 0) url += 7;
+    else if (strstr(url, "://")) {
+        static int said = 0;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "platform agent: proxy %s has a scheme this process "
+                            "does not speak; connecting directly.\n", url);
+        }
+        return 0;
+    }
+
+    /* [user:pass@]host[:port] */
+    const char *at = strrchr(url, '@');
+    memset(out, 0, sizeof(*out));
+    if (at) {
+        size_t clen = (size_t)(at - url);
+        char creds[256];
+        if (clen >= sizeof(creds)) return 0;
+        memcpy(creds, url, clen); creds[clen] = '\0';
+        char *b64 = idletoken_b64_encode((const uint8_t *)creds, clen);
+        if (b64) {
+            snprintf(out->auth_b64, sizeof(out->auth_b64), "%s", b64);
+            free(b64);
+        }
+        url = at + 1;
+    }
+
+    size_t n = 0;
+    while (url[n] && url[n] != '/' && n + 1 < sizeof(out->host_port)) n++;
+    if (!n) return 0;
+    memcpy(out->host_port, url, n); out->host_port[n] = '\0';
+    if (!strchr(out->host_port, ':')) {
+        /* A proxy URL without a port is legal and means 80. Spelling it here
+         * keeps the connect helper from having to guess. */
+        size_t l = strlen(out->host_port);
+        if (l + 3 < sizeof(out->host_port)) memcpy(out->host_port + l, ":80", 4);
+    }
+    return 1;
+}
+
+/* The proxy to use for one destination, or NULL to connect directly.
+ * Resolved once per process; the environment does not change under us. */
+static const agent_proxy *http_proxy_for(const char *addr) {
+    static agent_proxy px;
+    static int resolved = 0;   /* 0 = not yet, 1 = have one, -1 = none */
+    if (!resolved) {
+        resolved = agent_proxy_resolve(&px) ? 1 : -1;
+        if (resolved == 1)
+            fprintf(stderr, "platform agent: routing platform traffic through "
+                            "proxy %s (loopback excluded)\n", px.host_port);
+    }
+    if (resolved != 1) return NULL;
+    if (addr_is_loopback(addr) || no_proxy_covers(addr)) return NULL;
+    return &px;
+}
+
 /* POST `body` as JSON to addr("host:port")+path. Returns malloc'd response
  * body (caller frees), sets *out_len and *out_status; NULL on I/O error.
  * timeout_secs > 0 arms SO_RCVTIMEO/SO_SNDTIMEO so a dead platform link can't
@@ -696,8 +899,29 @@ static uint8_t *http_request_json(const char *method,
      * the owner of this machine. Same dispatch shape as the sidecar's engine
      * link, so there is one idiom to learn, not two. */
     int is_unix = strncmp(addr, "unix:", 5) == 0;
+    const agent_proxy *px = is_unix ? NULL : http_proxy_for(addr);
     int fd = is_unix ? idletoken_connect_unix(addr + 5)
-                     : idletoken_connect_tcp(addr);
+                     : idletoken_connect_tcp(px ? px->host_port : addr);
+    if (fd < 0 && px) {
+        /* The proxy was named but could not be reached. Go direct rather than
+         * take the machine offline: these variables outlive the program that
+         * set them — a proxy left configured in the user's environment while
+         * its process is not running has already been seen here, and it broke
+         * every request this agent made. Direct still works; it is only slower.
+         *
+         * Loud, once. "No silent fallback" forbids the silence, not the
+         * fallback, and the owner needs to know their proxy is not in the path
+         * because that is a fact about their machine, not about ours. */
+        static int said = 0;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "platform agent: proxy %s is not reachable; "
+                            "connecting directly to %s. Traffic is NOT going "
+                            "through the proxy.\n", px->host_port, addr);
+        }
+        px = NULL;
+        fd = idletoken_connect_tcp(addr);
+    }
     if (fd < 0) return NULL;
     if (timeout_secs > 0) {
         http_set_rcv_timeout(fd, timeout_secs);
@@ -715,18 +939,36 @@ static uint8_t *http_request_json(const char *method,
         int an = snprintf(auth, sizeof(auth), "Authorization: Bearer %s\r\n", bearer);
         if (an < 0 || (size_t)an >= sizeof(auth)) { idletoken_close_fd(fd); return NULL; }
     }
-    char head[1536];
+    char pauth[640] = "";
+    if (px && px->auth_b64[0]) {
+        int pn = snprintf(pauth, sizeof(pauth), "Proxy-Authorization: Basic %s\r\n", px->auth_b64);
+        if (pn < 0 || (size_t)pn >= sizeof(pauth)) { idletoken_close_fd(fd); return NULL; }
+    }
+    /* Through a proxy the request line carries the absolute URL; direct, it
+     * carries the path alone. No CONNECT tunnel is needed or wanted: this
+     * process speaks plaintext HTTP, so the proxy can forward it as an ordinary
+     * request. (The privacy that would otherwise argue for a tunnel is already
+     * in the body — every payload is a sealed envelope.) */
+    char target[1024];
+    if (px) {
+        int tn = snprintf(target, sizeof(target), "http://%s%s", addr, path);
+        if (tn < 0 || (size_t)tn >= sizeof(target)) { idletoken_close_fd(fd); return NULL; }
+    } else {
+        int tn = snprintf(target, sizeof(target), "%s", path);
+        if (tn < 0 || (size_t)tn >= sizeof(target)) { idletoken_close_fd(fd); return NULL; }
+    }
+    char head[2560];
     int hn = snprintf(head, sizeof(head),
                       "%s %s HTTP/1.1\r\n"
                       "Host: %s\r\n"
                       "Content-Type: application/json\r\n"
                       "Content-Length: %zu\r\n"
-                      "%s%s"
+                      "%s%s%s"
                       "Connection: close\r\n\r\n",
                       /* A socket path is not a host name; send a name the
                        * server will accept (cpp-httplib and our own parser
                        * both ignore which). */
-                      method, path, is_unix ? "localhost" : addr, body_len, auth,
+                      method, target, is_unix ? "localhost" : addr, body_len, pauth, auth,
                       extra_hdr ? extra_hdr : "");
     if (hn < 0 || (size_t)hn >= sizeof(head)) { idletoken_close_fd(fd); return NULL; }
     if (idletoken_sendall(fd, head, (size_t)hn) < 0 ||
@@ -744,7 +986,8 @@ static uint8_t *http_request_json(const char *method,
     size_t cap = 8192, len = 0;
     size_t hdr_end = 0;              /* offset of the first body byte; 0 = unseen */
     long long content_len = -1;
-    int truncated = 0;
+    int truncated = 0;               /* 1 = stopped/cut, 2 = moving but too slow */
+    time_t body_start = 0;           /* when the headers ended; 0 = not yet */
     uint8_t *buf = malloc(cap);
     if (!buf) { idletoken_close_fd(fd); return NULL; }
     for (;;) {
@@ -773,6 +1016,7 @@ static uint8_t *http_request_json(const char *method,
                         hdr_end = i + 4;
                         content_len = http_content_length(buf, hdr_end);
                         /* The waiting is over; what is left is transfer. */
+                        body_start = time(NULL);
                         if (timeout_secs > 0) http_set_rcv_timeout(fd, http_body_idle_secs());
                         break;
                     }
@@ -781,6 +1025,14 @@ static uint8_t *http_request_json(const char *method,
             /* Framed by Content-Length: stop at the last declared byte instead
              * of waiting for a FIN that a keep-alive server will not send. */
             if (hdr_end && content_len >= 0 && len - hdr_end >= (size_t)content_len) break;
+            /* "Still moving" is not "going to arrive". Without this, a link
+             * dribbling a few bytes per minute re-arms the idle budget forever
+             * and the job is never delivered AND never handed back. */
+            if (timeout_secs > 0 && body_start &&
+                (long)(time(NULL) - body_start) >= (long)http_body_total_secs()) {
+                truncated = 2;
+                break;
+            }
             continue;
         }
         if (r == 0) break;               /* the peer closed: a real end of body */
@@ -800,11 +1052,21 @@ static uint8_t *http_request_json(const char *method,
 
     size_t blen = len - hdr_end;
     /* Fewer bytes than the server announced is a body cut short, whether or not
-     * the socket bothered to tell us why. */
-    if (content_len >= 0 && blen < (size_t)content_len) truncated = 1;
-    if (truncated)
+     * the socket bothered to tell us why. Do NOT clobber a 2 already set above:
+     * a body that ran out of time is also short, and "too slow" is the more
+     * specific and more actionable of the two readings. */
+    if (!truncated && content_len >= 0 && blen < (size_t)content_len) truncated = 1;
+    if (truncated) {
+        /* The rate is the whole diagnosis for a seller whose link is the
+         * problem — "it failed" sends them looking at the software. */
+        long secs = body_start ? (long)(time(NULL) - body_start) : 0;
         fprintf(stderr, "platform-agent: %s %s: read %zu of %lld announced "
-                        "body bytes\n", method, path, blen, content_len);
+                        "body bytes in %lds (%.2f KB/s) — %s\n",
+                method, path, blen, content_len, secs,
+                secs > 0 ? (double)blen / 1024.0 / (double)secs : 0.0,
+                truncated == 2 ? "still arriving, but too slow to finish in time"
+                               : "the transfer stopped");
+    }
     if (truncated && !out_truncated) {
         fprintf(stderr, "platform-agent: the reply to %s %s was cut short in "
                         "transit (%zu of %lld body bytes); failing the request "
@@ -1858,13 +2120,22 @@ static void relay_loop(const idletoken_keypair *node, agent_registration *reg) {
          * buyer wait out the platform's job timeout, and parsing the fragment is
          * what used to make us report the platform's envelope as malformed. */
         if (truncated) {
+            /* Two different things to tell the seller, and only one of them is
+             * "your link dropped": a link that is merely too slow keeps working
+             * for small jobs, so naming it precisely is the difference between
+             * "my machine is broken" and "my uplink cannot carry big requests". */
+            const int too_slow = (truncated == 2);
             fprintf(stderr, "platform-agent: relay job=%s arrived cut short "
                             "(%zu bytes) — this machine's link to the platform "
-                            "stalled. Handing the job back so it can go "
-                            "elsewhere.\n", job_id, rlen);
+                            "%s. Handing the job back so it can go "
+                            "elsewhere.\n", job_id, rlen,
+                    too_slow ? "is too slow to carry a job this size" : "stalled");
             relay_post_result(platform_addr, jwt, reg->provider_id, job_id, NULL,
-                              "job body was cut short in transit "
-                              "(this provider's link to the platform stalled)", 502);
+                              too_slow
+                                ? "job body was cut short in transit (this "
+                                  "provider's link is too slow to carry a job this size)"
+                                : "job body was cut short in transit "
+                                  "(this provider's link to the platform stalled)", 502);
             free(job_id);
             free(resp);
             continue;

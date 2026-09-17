@@ -123,6 +123,12 @@ int idletoken_http_sse_event(int conn_fd, const char *event,
  * with the rest because it, too, crosses binaries: the coordinator serves it
  * and the agent calls it. */
 #define IDLETOKEN_PATH_ADMIT       IDLETOKEN_NS "/platform/admit"
+/* Switch borrowing on or off on a running coordinator. Crosses binaries the
+ * same way: the client owns the preference, the coordinator owns the flag that
+ * the busy path reads once per request. Before this existed the preference only
+ * reached the engine as a start-up argument, so a user who switched borrowing
+ * off went on borrowing — and paying — until the model was restarted. */
+#define IDLETOKEN_PATH_OVERFLOW    IDLETOKEN_NS "/overflow"
 /* What this coordinator will and will not do with a prompt, as ENFORCED rather
  * than as displayed. Read by the client so a disclosure panel quotes the
  * engine instead of quoting itself (threat register HOST-06). */

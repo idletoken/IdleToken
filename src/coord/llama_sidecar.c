@@ -74,6 +74,28 @@ struct idletoken_llama {
     char extra_args[1024];    /* IDLETOKEN_LLAMA_ARGS copy, split at spawn */
     char kv_type[12];         /* IDLETOKEN_KV_CACHE_TYPE (validated); "" = f16 default */
     char kv_type_v[12];       /* IDLETOKEN_KV_CACHE_TYPE_V; "" = follow kv_type */
+    /* Speculative decoding, passed as --spec-type. DEFAULT "ngram-mod"
+     * (2026-09-16, user decision; results/mtp-speculative-ab-20260916.md).
+     *
+     * Why this one and nothing else. It drafts by matching patterns already in
+     * the context, so it costs NO weights, NO second context and no device
+     * memory at all — which is why it needs no term in plan.c, no manifest
+     * field, no per-precision gate, and nothing new lands on a remote node in a
+     * cluster. Measured on Qwen3.8-27B UD-Q2_K_XL at 128K: 6.8x on a
+     * from-scratch answer, 14x when the answer echoes a supplied file, 1.7x on
+     * prose, with output BYTE-IDENTICAL to the unaccelerated run.
+     *
+     * The alternatives were measured in the same session and are not enabled:
+     * `draft-mtp` buys less and costs 1.46 GiB plus a per-node accounting shape
+     * the planner does not have; `ngram-cache` is a small NEGATIVE on the task
+     * it should suit; `ngram-map-k4v` is noise. Do not treat "n-gram" as one
+     * thing — the five variants differ by an order of magnitude.
+     *
+     * ⚠ Do NOT try to turn this off through IDLETOKEN_LLAMA_ARGS: llama.cpp's
+     * --spec-type handler APPENDS to a list (common/arg.cpp), so a second
+     * --spec-type adds a type instead of replacing ours. IDLETOKEN_SPEC_TYPE is
+     * the off switch ("none"/"off"/"" = pass no flag at all). */
+    char spec_type[32];
     int  shared;              /* serving OTHER people's requests — see below */
     int  gpu_only;            /* every layer and KV allocation fits the GPU
                                * working-set budget (Hybrid sets this false);
@@ -831,9 +853,15 @@ static int llama_spawn(idletoken_llama *lc) {
      * why it is not "off" any more, and what guards the empty-answer failure
      * instead, is on the POSIX path below. The two spawn paths must not
      * diverge. */
+    /* Speculative decoding (default ngram-mod — see the struct field). Same
+     * fragment on the POSIX path below; the two spawn paths must not diverge. */
+    char spec_frag[48];
+    spec_frag[0] = '\0';
+    if (lc->spec_type[0])
+        snprintf(spec_frag, sizeof(spec_frag), " --spec-type %s", lc->spec_type);
     int n = snprintf(cmd, sizeof(cmd),
                      "\"%s\" -m \"%s\"%s %s%s%s%s "
-                     "-ngl %s --fit off%s --reasoning auto%s%s%s -np %s%s%s%s",
+                     "-ngl %s --fit off%s --reasoning auto%s%s%s%s -np %s%s%s%s",
                      lc->bin, lc->gguf, mmproj_frag, listen_args,
                      lc->shared ? " --no-slots" : "",
                      /* --poll 0 rides with GPU_ONLY (see the struct field);
@@ -842,6 +870,7 @@ static int llama_spawn(idletoken_llama *lc) {
                      slotsave_frag,
                      lc->ngl_arg,
                      moe_frag,
+                     spec_frag,
                      lc->ctx_size > 0 ? " -c " : "",
                      lc->ctx_size > 0 ? ctxstr : "",
                      yarn_frag,
@@ -1033,6 +1062,12 @@ static int llama_spawn(idletoken_llama *lc) {
      * Overridable via IDLETOKEN_LLAMA_ARGS (appended last, so a user-supplied
      * --reasoning wins). */
     argv[argc++] = "--reasoning"; argv[argc++] = "auto";
+    /* Speculative decoding (default ngram-mod — see the struct field). Mirrors
+     * spec_frag on the Windows path above; the two must not diverge. */
+    if (lc->spec_type[0]) {
+        argv[argc++] = "--spec-type";
+        argv[argc++] = lc->spec_type;
+    }
     if (lc->ctx_size > 0) { argv[argc++] = "-c"; argv[argc++] = ctxstr; }
     /* Mirrors the Windows yarn_frag above — the two spawn paths must not
      * diverge. Scale is per-SLOT ctx over the trained window: RoPE positions
@@ -1689,6 +1724,26 @@ idletoken_llama *idletoken_llama_start(const char *bin, const char *gguf,
      * deny-list would leak the next time upstream adds a logging flag).
      * The refusal is PRINTED: "no output" cannot be told apart from "never
      * read the variable" — see G-SHARED-2 in docs/shared-mode-plan-2026-08.md. */
+    /* Speculative decoding: on by default, for every model and every precision
+     * (see the struct field for what was measured and why this variant).
+     * Shared mode keeps it — it changes speed, not output, and the engine
+     * re-samples every drafted position from the target model, so a draft can
+     * only ever be slower, never wrong. The escape hatch stays available in
+     * shared mode for the same reason; unlike IDLETOKEN_LLAMA_ARGS it cannot
+     * name a logging flag, it only picks among the engine's own draft types. */
+    {
+        const char *st = getenv("IDLETOKEN_SPEC_TYPE");
+        if (!st) st = "ngram-mod";
+        if (strcmp(st, "none") != 0 && strcmp(st, "off") != 0 && st[0]) {
+            if (strlen(st) >= sizeof(lc->spec_type)) {
+                if (err_cap)
+                    snprintf(err, err_cap, "IDLETOKEN_SPEC_TYPE is too long: %s", st);
+                free(lc);
+                return NULL;
+            }
+            snprintf(lc->spec_type, sizeof(lc->spec_type), "%s", st);
+        }
+    }
     const char *extra = getenv("IDLETOKEN_LLAMA_ARGS");
     if (extra && extra[0] && lc->shared) {
         fprintf(stderr, "coord: shared mode: IDLETOKEN_LLAMA_ARGS ignored "

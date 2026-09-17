@@ -6042,6 +6042,55 @@ static void handle_http_request(int conn_fd,
         return;
     }
 
+    /* POST /idletoken/v1/overflow {"enabled":true|false} — switch borrowing
+     * without restarting the model.
+     *
+     * `idletoken_overflow_enabled()` is read once per busy request, so this was
+     * always a live variable; until 2026-09-16 the only writer was start-up.
+     * The visible cost was on the OFF side: the switch went dark in the client,
+     * the coordinator kept forwarding, and the user kept paying until the next
+     * model load. Sharing never had this problem because `--shared` is passed
+     * unconditionally and the decision is made at request time; this is the
+     * same move for borrowing.
+     *
+     * Loopback-only like the rest of the API, plus the Origin gate so a page in
+     * a browser cannot flip somebody's spending on. No API token requirement:
+     * turning borrowing OFF must keep working when everything else is broken. */
+    if (!strcmp(req.method, "POST") && !strcmp(req.path, IDLETOKEN_PATH_OVERFLOW)) {
+        if (!api_origin_ok(&req)) {
+            static const char nob[] =
+                "{\"error\":{\"type\":\"permission_error\",\"message\":"
+                "\"borrowing is not switched from browser requests\"}}";
+            idletoken_http_send_json(conn_fd, 403, nob, sizeof(nob) - 1);
+            free(req.body);
+            return;
+        }
+        /* Fixed shape, no general parser — the house idiom. Absent, malformed
+         * or anything other than a literal `true` reads as OFF: the safe
+         * interpretation of a request we did not understand is the one that
+         * does not spend the user's money. */
+        const char *ev = req.body
+            ? json_value_pos((const char *)req.body, req.body_len, "enabled") : NULL;
+        const int want_on = ev && (size_t)(ev - (const char *)req.body) + 4 <= req.body_len
+                            && !memcmp(ev, "true", 4);
+        char oerr[200] = "";
+        char out[320];
+        int n;
+        if (idletoken_overflow_set_enabled(want_on, oerr, sizeof oerr) != 0) {
+            n = snprintf(out, sizeof out,
+                         "{\"error\":{\"type\":\"invalid_request_error\","
+                         "\"message\":\"%s\"}}", oerr[0] ? oerr : "cannot switch borrowing on");
+            idletoken_http_send_json(conn_fd, 409, out, n < 0 ? 0 : (size_t)n);
+            free(req.body);
+            return;
+        }
+        n = snprintf(out, sizeof out, "{\"enabled\":%s}",
+                     idletoken_overflow_enabled() ? "true" : "false");
+        idletoken_http_send_json(conn_fd, 200, out, n < 0 ? 0 : (size_t)n);
+        free(req.body);
+        return;
+    }
+
     /* GET /idletoken/v1/stats — serving counters for the client dashboard.
      * Exempt from the API token gate like /health: numbers only, no content. */
     if (!strcmp(req.method, "GET") && !strcmp(req.path, IDLETOKEN_PATH_STATS)) {
@@ -9580,6 +9629,13 @@ int main(int argc, char **argv) {
     const char *ovf_key = getenv("IDLETOKEN_OVERFLOW_KEY");
     long        ovf_wait_s = 0;
     long        ovf_daily_cap = 0;   /* module default: no coordinator-side cap */
+    /* Credentials and the switch are separate, the way `--shared` already is
+     * (2026-09-16). The client hands over the account's overflow key whenever
+     * it has one and says here whether borrowing starts on, so turning it off
+     * later is a flag flip rather than a model reload. Defaults to on so a
+     * hand-built command line that passes a URL and key behaves as it always
+     * did. */
+    int         ovf_start_enabled = 1;
     /* Per-machine usage caps (the client's "this machine's usage" sliders,
      * wire-to-B2): cap what the probe reports before planning, same contract
      * as the worker's --max-vram-mb/--max-ram-mb. 0 = uncapped. */
@@ -9655,6 +9711,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--overflow-key")      && i + 1 < argc) ovf_key = argv[++i];
         else if (!strcmp(a, "--overflow-wait-s")   && i + 1 < argc) ovf_wait_s = atol(argv[++i]);
         else if (!strcmp(a, "--overflow-daily-cap")&& i + 1 < argc) ovf_daily_cap = atol(argv[++i]);
+        else if (!strcmp(a, "--overflow-off"))                      ovf_start_enabled = 0;
         else if (!strcmp(a, "--max-vram-mb")      && i + 1 < argc) max_vram_mb = atol(argv[++i]);
         else if (!strcmp(a, "--max-ram-mb")       && i + 1 < argc) max_ram_mb  = atol(argv[++i]);
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(stdout); return 0; }
@@ -9808,6 +9865,7 @@ int main(int argc, char **argv) {
             (long long)ovf_wait_s * 1000,
             (long long)ovf_daily_cap,
             api_token && api_token[0] ? 1 : 0,
+            ovf_start_enabled,
         };
         char oerr[320];
         if (idletoken_overflow_configure(&ocfg, oerr, sizeof oerr) != 0) {

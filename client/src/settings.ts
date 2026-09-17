@@ -316,6 +316,7 @@ export interface AppSettings {
   // (code-mode pairing still works). Set = email auth against the platform.
   platformUrl: string;
 
+
   // ---- privacy protection (docs/privacy-design.md, gate G-PRIV) ----
   // Envelope encryption to the provider's cluster: workers only see hidden
   // states, never your text. On the marketplace the platform sees plaintext
@@ -735,6 +736,19 @@ export function loadSettings(): AppSettings {
   }
 }
 
+/**
+ * The address the client should talk to: the regional one when the platform's
+ * directory has named it for this account, otherwise the address this build was
+ * made with. Empty means no platform at all (local identity).
+ *
+ * Lives here rather than in platform.ts because auth.ts needs it too, and
+ * auth.ts cannot import platform.ts -- platform.ts already imports auth.ts.
+ */
+export function apiBase(): string {
+  const s = loadSettings();
+  return s.platformUrl.trim().replace(/\/+$/, "");
+}
+
 export function saveSettings(s: AppSettings): void {
   localStorage.setItem(KEY, JSON.stringify(s));
 }
@@ -839,10 +853,15 @@ export function overflowTuning(s: AppSettings): OverflowTuning {
   const enabled = s.overflowEnabled && !!s.overflowKey;
   return {
     enabled,
-    // Keep credentials empty in the off state as defence in depth; Rust also
-    // enforces `enabled` so a stale or hand-written payload cannot route.
-    overflowUrl: enabled ? s.platformUrl.trim().replace(/\/+$/, "") : "",
-    overflowKey: enabled ? s.overflowKey : "",
+    // The capability travels whenever the account has it, switched on or not
+    // (2026-09-16). Withholding it in the off state read as defence in depth,
+    // but its real effect was that "off" could only be said at launch: a
+    // coordinator holding no key has nothing it can be told to stop using, so
+    // turning borrowing off left the machine borrowing — and paying — until the
+    // model was restarted. `enabled` is still enforced in Rust and again in the
+    // engine, where switching on without a key is refused rather than assumed.
+    overflowUrl: s.overflowKey ? s.platformUrl.trim().replace(/\/+$/, "") : "",
+    overflowKey: s.overflowKey,
     // Start shared-compute attempts as soon as this request enters the local queue.
     overflowWaitS: 0,
     overflowDailyCapMilli: OVERFLOW_UNCAPPED_MILLI,

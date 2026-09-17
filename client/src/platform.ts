@@ -10,7 +10,7 @@
 // In a plain browser (no Tauri) the console API still works — it is ordinary
 // fetch — but agent control is unavailable and the UI must say so honestly
 // (same philosophy as the DEV FIXTURE badge).
-import { loadSettings } from "./settings";
+import { apiBase, loadSettings } from "./settings";
 import { getAuthProvider, type Session } from "./auth";
 import { platformRequest, replyJson } from "./platformHttp";
 import { AGENT_TOKEN_KEY, getSecret, setSecret } from "./secrets";
@@ -41,6 +41,13 @@ export interface ProviderInfo {
   endpoint: string;
   status: string; // ONLINE | OFFLINE | SUSPENDED
   listed: boolean; // whether it is listed on the marketplace (off by default; only then can others call it and earn credits)
+  /**
+   * Why the PLATFORM took it off the market, when it did (e.g. the version
+   * floor). Absent when the owner unlisted it themselves, and absent on older
+   * gateways. The field was always sent; this type simply did not declare it,
+   * so the one sentence explaining a dark switch could not reach the user.
+   */
+  unlistedReason?: string | null;
   lastBeat: string | null;
   createdAt: string;
 }
@@ -59,8 +66,9 @@ export type PlatformGate =
   | { ok: true; url: string; session: Session }
   | { ok: false; reason: "no-url" | "no-session" | "local-session" };
 
+
 export function platformGate(): PlatformGate {
-  const url = loadSettings().platformUrl.trim();
+  const url = apiBase();
   if (!url) return { ok: false, reason: "no-url" };
   const session = getAuthProvider().currentSession();
   if (!session) return { ok: false, reason: "no-session" };
@@ -89,6 +97,11 @@ async function req<T>(path: string, init?: { method?: string; body?: string }): 
     // the reader to different places, and the old message named neither.
     throw new Error(`network: can't reach the platform server (${e instanceof Error ? e.message : e})`);
   }
+  return handleReply<T>(res, path);
+}
+
+/** Turn a reply into a value or an error. */
+function handleReply<T>(res: any, path: string): T {
   if (res.status === 401) {
     // The gateway rejected the session token (expired or revoked). Keeping the
     // dead session makes every panel show `HTTP 401: invalid token` forever
@@ -112,6 +125,37 @@ async function req<T>(path: string, init?: { method?: string; body?: string }): 
 
 export function getMe(): Promise<PlatformMe> {
   return req<PlatformMe>("/me");
+}
+
+/**
+ * Tell the RUNNING coordinator whether to borrow.
+ *
+ * The engine reads this flag once per busy request, so the switch takes effect
+ * on the next one — no model reload. Best-effort by design: the stored
+ * preference is what a future coordinator starts from, so a coordinator that is
+ * not up yet has nothing to be told and nothing is lost by failing quietly.
+ */
+export async function setLocalOverflow(enabled: boolean): Promise<void> {
+  if (!inTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  const baseUrl = `http://127.0.0.1:${loadSettings().apiPort || 8000}`;
+  await invoke("api_overflow_set", { baseUrl, enabled });
+}
+
+/**
+ * List or unlist ONE machine — this one — on the marketplace.
+ *
+ * Turning sharing off used to stop the agent and nothing else, which left the
+ * row `listed` and let the platform keep routing strangers to a machine whose
+ * agent had gone until its heartbeat aged out (BEAT_TTL_MS, 60s). Those
+ * requests could only fail. Unlisting says it immediately instead of waiting
+ * for a timeout to imply it.
+ */
+export function setProviderListed(id: string, listed: boolean): Promise<ProviderInfo> {
+  return req<ProviderInfo>(`/providers/${encodeURIComponent(id)}/listing`, {
+    method: "POST",
+    body: JSON.stringify({ listed }),
+  });
 }
 
 export function getProviders(): Promise<ProviderInfo[]> {
@@ -258,6 +302,8 @@ export async function agentCredential(fallbackJwt: string): Promise<string> {
   }
   return fallbackJwt;
 }
+
+
 
 export async function agentStart(opts: {
   platformUrl: string;

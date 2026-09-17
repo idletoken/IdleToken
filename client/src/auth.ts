@@ -7,7 +7,7 @@
 //     for account-mode pairing (machines signed in to the same account find
 //     each other) and the marketplace.
 // The selector picks by the `platformUrl` setting; the UI is unchanged.
-import { loadSettings } from "./settings";
+import { apiBase, loadSettings } from "./settings";
 import { SESSION_KEY, clearAllSecrets, clearSecret, getSecret, setSecret } from "./secrets";
 import { platformRequest, replyJson } from "./platformHttp";
 
@@ -308,7 +308,10 @@ class CloudAuthProvider implements AuthProvider {
 // identity (fully offline; code-mode pairing still works). Reads settings lazily
 // so a URL change takes effect on the next auth action without a restart.
 export function getAuthProvider(): AuthProvider {
-  const url = loadSettings().platformUrl.trim();
+  // Follows the regional address once the directory has named one: the two
+  // regions do not share a session secret, so authenticating against the
+  // wrong one fails even with correct credentials.
+  const url = apiBase();
   return url ? new CloudAuthProvider(url) : localAuthProvider;
 }
 

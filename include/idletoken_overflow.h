@@ -123,6 +123,13 @@ typedef struct {
     long long   wait_ms;          /* forward only when the estimated wait is at least this */
     long long   daily_cap_milli;  /* > 0 explicit stop-loss; <= 0 means no local cap */
     int         api_token_set;    /* retained config field; tokenless loopback is supported */
+    /* Whether forwarding starts ON. Configuring and switching on are two
+     * different things (2026-09-16): the coordinator is given the credentials
+     * whenever the account has them, exactly as it is always given `--shared`,
+     * and this flag decides whether they are used. That is what makes
+     * `idletoken_overflow_set_enabled` able to answer immediately instead of
+     * asking the user to restart a model to change a boolean. */
+    int         start_enabled;
 } idletoken_overflow_cfg;
 
 /* Turn overflow on. Returns 0, or -1 with a reason in `err` and overflow left
@@ -134,6 +141,18 @@ int idletoken_overflow_configure(const idletoken_overflow_cfg *cfg,
                                  char *err, size_t err_cap);
 
 int idletoken_overflow_enabled(void);
+
+/* Turn forwarding on or off while the coordinator is running.
+ *
+ * `idletoken_overflow_enabled()` is read once per request on the busy path, so
+ * this was always a live variable in everything but name — until 2026-09-16 the
+ * only writer was startup, which meant a user who switched borrowing OFF kept
+ * borrowing (and kept spending) until the model was restarted. Off is the
+ * direction that costs money, and off is unconditional here.
+ *
+ * On requires credentials: with none configured there is nothing to turn on,
+ * and this returns -1 rather than pretending. Returns 0 on success. */
+int idletoken_overflow_set_enabled(int on, char *err, size_t err_cap);
 
 /* Where borrowed requests are sent, verbatim, or "" when overflow is off.
  *

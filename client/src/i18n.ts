@@ -313,6 +313,7 @@ export const STRINGS = {
     "tier.4.name": "Long doc",
     "tier.5.name": "Extreme",
     "settings.resource": "This machine's usage",
+    "settings.resource.nextStart": "A changed limit applies the next time a model starts.",
     "preset.conservative": "Conservative",
     "preset.balanced": "Balanced",
     "preset.max": "Max",
@@ -360,7 +361,9 @@ export const STRINGS = {
     "platform.overflow.needLogin": "Sign in to route unfinished local requests to another user's machine.",
     "platform.overflow.needService": "Start a model before turning on Request help.",
     "platform.overflow.hint":
-      "While a request waits locally, IdleToken keeps looking for an available provider. It remains queued locally if nobody is free. Changes apply the next time the model starts.",
+      "While a request waits locally, IdleToken keeps looking for an available provider. It remains queued locally if nobody is free. The switch takes effect immediately — no need to restart the model.",
+    "platform.overflow.notReady":
+      "Requesting outside help is on, but it cannot route right now — the sign-in or the key it pays with is missing. Sign in and switch it on again.",
     "platform.share.notReady": "This machine's cluster isn't ready yet. You can still turn sharing on — the agent waits for the coordinator on port {port}.",
     "platform.share.browser": "Sharing needs the desktop app; this is the browser dev build.",
     // The engine reads the borrowing settings once, at start. Same words as a
@@ -570,6 +573,7 @@ export const STRINGS = {
     // than only naming a component: the person reading this wants to know
     // whether their machine is earning, not which process died.
     "share.agentDown": "Sharing is on, but the marketplace agent is not running — this machine is not listed and cannot receive work.",
+    "share.notListed": "Sharing is on and the agent is running, but the marketplace has this machine unlisted, so it is receiving no work. Turn sharing off and on again to re-list it once the cause below is resolved.",
     // Tray menu. Kept short: on Windows this is a right-click menu in the
     // notification area, not a place for sentences.
     "tray.open": "Open IdleToken",
@@ -826,6 +830,7 @@ export const STRINGS = {
     "tier.4.name": "长文档",
     "tier.5.name": "极限",
     "settings.resource": "本机资源占用",
+    "settings.resource.nextStart": "改动的上限在模型下次启动时生效。",
     "preset.conservative": "保守",
     "preset.balanced": "均衡",
     "preset.max": "全力",
@@ -868,7 +873,9 @@ export const STRINGS = {
     "platform.overflow.needLogin": "登录后才能把本地来不及完成的请求路由给其他用户。",
     "platform.overflow.needService": "启动模型后才能开启外援",
     "platform.overflow.hint":
-      "请求会继续在本地排队，同时持续寻找可用外援；暂时没有外援也不会拒绝。更改在模型下次启动时生效。",
+      "请求会继续在本地排队，同时持续寻找可用外援；暂时没有外援也不会拒绝。开关立即生效，不需要重启模型。",
+    "platform.overflow.notReady":
+      "「请求外援」已打开，但现在派不出去——登录状态或用于付费的密钥不在了。重新登录后再打开一次即可。",
     "platform.share.notReady": "本机集群尚未就绪。仍可开启——代理会等待端口 {port} 上的协调者。",
     "platform.share.browser": "共享功能需要桌面应用；当前是浏览器开发环境。",
     "platform.share.restart": "请求外援在引擎下次启动时生效。如需立即生效，请重启集群。",
@@ -1018,6 +1025,7 @@ export const STRINGS = {
     "update.share.unaffected": "其他功能不受影响：本地独立运行、本机 API 全部照常工作。",
     "update.share.notNow": "以后再说",
     "share.agentDown": "分享已打开，但市场代理没有在运行——这台机器没有上架，也收不到任务。",
+    "share.notListed": "分享已打开、代理也在运行，但市场把这台机器摘牌了，所以它收不到任何任务。下面的原因解决之后，把分享关掉再打开一次即可重新上架。",
     "tray.open": "打开 IdleToken",
     "tray.quit": "退出 IdleToken",
     "tray.statusIdle": "IdleToken — 未在服务",

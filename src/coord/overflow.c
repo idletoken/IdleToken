@@ -344,9 +344,20 @@ int idletoken_overflow_configure(const idletoken_overflow_cfg *cfg,
         ? cfg->daily_cap_milli : IDLETOKEN_OVF_DEFAULT_DAILY_CAP_MILLI;
     g_ovf.day = ovf_today();
     g_ovf.spent_milli = 0;
-    g_ovf.on = 1;
+    /* Configured is not the same as on. The credentials are handed over
+     * whenever the account has them; this flag says whether to use them, and
+     * idletoken_overflow_set_enabled can move it later without a restart. */
+    g_ovf.on = cfg->start_enabled ? 1 : 0;
+    const int started_on = g_ovf.on;
     long long cap = g_ovf.daily_cap_milli, wait = g_ovf.wait_ms;
     pthread_mutex_unlock(&g_ovf_mu);
+
+    if (!started_on) {
+        fprintf(stderr, "coord: overflow: configured but OFF — platform %s, "
+                        "verify key %s. Borrowing can be switched on without "
+                        "restarting this model.\n", cfg->url, src);
+        return 0;
+    }
 
     if (cap > 0)
         fprintf(stderr, "coord: overflow: on — platform %s, verify key %s, "
@@ -386,6 +397,36 @@ int idletoken_overflow_enabled(void) {
     int on = g_ovf.on;
     pthread_mutex_unlock(&g_ovf_mu);
     return on;
+}
+
+int idletoken_overflow_set_enabled(int on, char *err, size_t err_cap) {
+    if (err && err_cap) err[0] = '\0';
+    pthread_mutex_lock(&g_ovf_mu);
+    /* OFF is unconditional and cannot fail. It is the direction that stops
+     * money being spent, so it must not depend on configuration being valid,
+     * on the platform being reachable, or on anything else being true. */
+    if (!on) {
+        const int was = g_ovf.on;
+        g_ovf.on = 0;
+        pthread_mutex_unlock(&g_ovf_mu);
+        if (was) fprintf(stderr, "coord: overflow: switched OFF; no further "
+                                 "requests will be borrowed\n");
+        return 0;
+    }
+    /* ON needs something to turn on. Without credentials this would be a
+     * boolean claiming a capability the process does not have. */
+    if (!g_ovf.url[0] || !g_ovf.api_key[0]) {
+        pthread_mutex_unlock(&g_ovf_mu);
+        if (err && err_cap)
+            snprintf(err, err_cap, "overflow has no platform URL or account key "
+                                   "on this coordinator");
+        return -1;
+    }
+    const int was = g_ovf.on;
+    g_ovf.on = 1;
+    pthread_mutex_unlock(&g_ovf_mu);
+    if (!was) fprintf(stderr, "coord: overflow: switched ON\n");
+    return 0;
 }
 
 void idletoken_overflow_spend_today(long long *spent_milli, long long *cap_milli) {
@@ -1269,7 +1310,8 @@ int idletoken_overflow_selftest(void) {
         /* 127.0.0.1:1 refuses instantly, so the "unreachable platform" branch
          * is exercised without a DNS lookup or a timeout in a unit test. */
         idletoken_overflow_cfg cfg = { "http://127.0.0.1:1", "sk-test",
-                                       0, 0, /*api_token_set=*/0 };
+                                       0, 0, /*api_token_set=*/0,
+                                       /*start_enabled=*/1 };
         /* The old RULE 2 assertion lived here: "without a local API token,
          * overflow refuses to switch on". Inverted on 2026-08-21 — a machine
          * with no token must now be able to switch sharing on, because that is
@@ -1445,6 +1487,57 @@ int idletoken_overflow_selftest(void) {
             "overflow: switched off, nothing forwards");
         memset(&g_ovf, 0, sizeof g_ovf);
         g_ovf_policy = IDLETOKEN_OVF_ORIGIN_CAPABILITY;
+    }
+
+    /* ---- switching without a restart (2026-09-16) ------------------------
+     * `idletoken_overflow_enabled()` is read once per busy request, so this was
+     * always a live variable; until now the only writer was start-up. The cost
+     * fell on the OFF side: a user who switched borrowing off kept borrowing,
+     * and kept paying, until the model was restarted.
+     *
+     * Written against the state directly where configure() would need a trust
+     * anchor, so these hold in a pinned and an unpinned build alike. */
+    {
+        char serr[200];
+
+        /* OFF must never depend on anything. No credentials, no platform, no
+         * anchor — it still has to stop. */
+        pthread_mutex_lock(&g_ovf_mu);
+        g_ovf.url[0] = '\0'; g_ovf.api_key[0] = '\0'; g_ovf.on = 1;
+        pthread_mutex_unlock(&g_ovf_mu);
+        OST(idletoken_overflow_set_enabled(0, serr, sizeof serr) == 0 &&
+            idletoken_overflow_enabled() == 0,
+            "overflow: switching OFF succeeds with nothing configured");
+
+        /* ON without credentials would be a boolean claiming a capability the
+         * process does not have. */
+        OST(idletoken_overflow_set_enabled(1, serr, sizeof serr) == -1 &&
+            idletoken_overflow_enabled() == 0 &&
+            strstr(serr, "no platform URL") != NULL,
+            "overflow: switching ON with nothing configured is refused, with a reason");
+
+        /* Configured and on are two different states — that separation is what
+         * lets the client hand over the key whenever the account has one (as it
+         * always hands over --shared) and still start with borrowing off. */
+        pthread_mutex_lock(&g_ovf_mu);
+        snprintf(g_ovf.url, sizeof g_ovf.url, "%s", "http://127.0.0.1:1");
+        snprintf(g_ovf.api_key, sizeof g_ovf.api_key, "%s", "sk-test");
+        g_ovf.on = 0;
+        pthread_mutex_unlock(&g_ovf_mu);
+        OST(idletoken_overflow_enabled() == 0,
+            "overflow: credentials present does not by itself mean borrowing is on");
+
+        OST(idletoken_overflow_set_enabled(1, serr, sizeof serr) == 0 &&
+            idletoken_overflow_enabled() == 1,
+            "overflow: with credentials it switches ON in place, without a restart");
+
+        OST(idletoken_overflow_set_enabled(0, serr, sizeof serr) == 0 &&
+            idletoken_overflow_enabled() == 0,
+            "overflow: and OFF again, which is the direction that stops spending");
+
+        pthread_mutex_lock(&g_ovf_mu);
+        g_ovf.url[0] = '\0'; g_ovf.api_key[0] = '\0'; g_ovf.on = 0;
+        pthread_mutex_unlock(&g_ovf_mu);
     }
 
     free(good); free(swapped); free(tampered); free(expired); free(nodomain);

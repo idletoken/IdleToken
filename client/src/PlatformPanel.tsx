@@ -15,6 +15,8 @@ import {
   onAgentLog,
   onAgentStatus,
   platformGate,
+  setLocalOverflow,
+  setProviderListed,
   type AgentLogLine,
   type AgentStatus,
 } from "./platform";
@@ -143,6 +145,11 @@ export function ShareToggleButton({
   const [blocked, setBlocked] = useState<VersionTooOldToShare | null>(null);
   const [agent, setAgent] = useState<AgentStatus | null>(null);
   const [agentErr, setAgentErr] = useState<string | null>(null);
+  /**
+   * What the MARKETPLACE says about this machine — the only authority on
+   * whether it is actually on sale. `null` = not asked yet / could not ask.
+   */
+  const [shelf, setShelf] = useState<{ listed: boolean; reason: string | null } | null>(null);
 
   useEffect(() => {
     const sync = () => setOn(loadSettings().providerEnabled);
@@ -165,7 +172,8 @@ export function ShareToggleButton({
   useEffect(() => {
     if (!inTauri() || !loadSettings().providerEnabled) return;
     let alive = true;
-    void currentVersionStanding().then((s) => {
+    // force: an admission decision is never served from the advisory cache.
+    void currentVersionStanding(true).then((s) => {
       if (!alive || !s.belowShareFloor) return;
       void agentStop().catch(() => { /* may never have started */ });
       saveSettings({ ...loadSettings(), providerEnabled: false });
@@ -211,6 +219,68 @@ export function ShareToggleButton({
     return () => { alive = false; offStatus(); offLog(); };
   }, []);
 
+  // Ask the marketplace whether this machine is actually on sale (2026-09-16).
+  //
+  // Everything else this pill could look at is local: a saved preference, the
+  // local engine, a live agent process. All three can be perfectly healthy on a
+  // machine the platform has taken off the market — which is exactly what the
+  // version floor does, and what a suspension, a rate limit or a manual unlist
+  // do too. The switch is not only a switch, it is the status light for "am I
+  // selling?", and only the platform knows the answer.
+  //
+  // Polled rather than pushed because delisting happens platform-side, on the
+  // agent's next keep-alive, with nothing flowing back to this process.
+  useEffect(() => {
+    if (!inTauri()) return;
+    let alive = true;
+    const read = () => {
+      if (!loadSettings().providerEnabled) { setShelf(null); return; }
+      void getProviders().then((ps) => {
+        if (!alive) return;
+        const mine = ps.find((p) => p.name === loadSettings().providerName);
+        // No row at all is not "listed: false" — it is "the platform has never
+        // heard of this machine", which is what a refused registration looks
+        // like. Both are "not selling", and neither may show green.
+        setShelf(mine ? { listed: mine.listed, reason: mine.unlistedReason ?? null } : { listed: false, reason: null });
+      }).catch(() => { /* offline or signed out: claim nothing */ });
+    };
+    // A read triggered by the switch itself runs BEFORE the machine is on sale:
+    // flipping it only starts the agent, and registering is a round trip after
+    // that. One read at that instant sees no row — correctly, for another second
+    // or two — and the next steady read is 30 s away, so the pill stayed dark on
+    // a machine that had in fact registered and listed within seconds.
+    //
+    // Dark reads as "sharing failed", and the reasonable response to that is to
+    // flip the switch off and on again. That mints a fresh provider identity
+    // every time (registrations are one-shot) and restarts the same wait, so the
+    // display is what keeps the loop going. Measured 2026-09-16: four identities
+    // in five minutes, every one of them registered and listed by the platform.
+    //
+    // So a change is followed by a short burst of re-reads that stops as soon as
+    // the platform answers. The steady poll is unchanged and still owns the
+    // other direction — delisting happens platform-side with nothing flowing
+    // back here, and no burst can be scheduled for an event we never hear about.
+    let burst: ReturnType<typeof setTimeout>[] = [];
+    const clearBurst = () => { burst.forEach(clearTimeout); burst = []; };
+    const readSoon = () => {
+      clearBurst();
+      read();
+      burst = [1_000, 2_500, 5_000, 9_000, 15_000].map((ms) => setTimeout(read, ms));
+    };
+
+    read();
+    const timer = setInterval(read, 30_000);
+    window.addEventListener(MARKETPLACE_CHANGED, readSoon);
+    const offStatus = onAgentStatus(() => readSoon());
+    return () => {
+      alive = false;
+      clearInterval(timer);
+      clearBurst();
+      window.removeEventListener(MARKETPLACE_CHANGED, readSoon);
+      offStatus();
+    };
+  }, []);
+
   if (!inTauri()) return null;
   const gate = platformGate();
   if (!gate.ok) {
@@ -238,9 +308,20 @@ export function ShareToggleButton({
     setErr(null);
     try {
       if (on) {
+        // Unlist BEFORE stopping the agent, and best-effort: the platform must
+        // stop sending strangers here the moment the user says stop, not 60
+        // seconds later when the heartbeat ages out — that window could only
+        // produce failed requests against an agent that had already gone. It
+        // must not be able to block turning sharing off, though, so a platform
+        // that cannot be reached costs the old behaviour and nothing more.
+        try {
+          const mine = (await getProviders()).find((p) => p.name === loadSettings().providerName);
+          if (mine?.listed) await setProviderListed(mine.id, false);
+        } catch { /* offline or signed out: the heartbeat timeout still covers it */ }
         await agentStop();
         saveSettings({ ...loadSettings(), providerEnabled: false });
         setOn(false);
+        setShelf(null);
       } else {
         // The one moment a version genuinely blocks something, and the one
         // moment it is fair to say so (2026-09-14). Turning sharing ON is the
@@ -253,7 +334,7 @@ export function ShareToggleButton({
         // version check on starting a cluster, loading a model, or serving the
         // local API, and there must not be: an old build there can only affect
         // the person who chose to run it.
-        const standing = await currentVersionStanding();
+        const standing = await currentVersionStanding(true);
         if (standing.belowShareFloor) {
           throw new VersionTooOldToShare(standing.installed, standing.shareFloor!);
         }
@@ -309,14 +390,26 @@ export function ShareToggleButton({
   // start. Unknown (null, e.g. the status call has not answered yet) is not
   // down either — this pill reports what it knows and never guesses.
   const agentDown = on && (agent?.state === "stopped" || agent?.state === "crashed");
-  const active = on && serviceReady && !agentDown;
+  // Green means SELLING, and the marketplace is the only thing that knows.
+  //
+  // Not `on` (a saved wish), not `serviceReady` (the local engine), not merely
+  // a live agent: a machine can have all three and be unlisted. `shelf === null`
+  // — not asked yet, offline, signed out — is NOT green either, because this
+  // pill states a fact and has no business guessing one. That also removes the
+  // startup flash where an agent that had never come up showed green until its
+  // status arrived.
+  const active = on && serviceReady && !agentDown && shelf?.listed === true;
   const title = !serviceReady
     ? t("share.needService")
     : agentDown
       // The agent's own sentence when we have one. It is the only thing that
       // knows WHY, and the whole point of this pill is not to swallow it.
       ? `${t("share.agentDown")}${agentErr ? `\n\n${agentErr}` : ""}`
-      : err ?? t(active ? "share.on" : "share.off");
+      // Unlisted BY THE PLATFORM, with its reason. This is the case that used
+      // to be invisible: switch on, agent up, nothing on sale.
+      : on && shelf && !shelf.listed
+        ? `${t("share.notListed")}${shelf.reason ? `\n\n${shelf.reason}` : ""}`
+        : err ?? t(active ? "share.on" : "share.off");
 
   return (
     <>
@@ -373,6 +466,10 @@ export function OverflowToggleButton({
       try {
         saveSettings({ ...loadSettings(), overflowEnabled: false });
         setOn(false);
+        // Tell the coordinator now. OFF is the direction that spends money, so
+        // it must not wait for the next model start — which is what it used to
+        // do, silently, while the switch read as off.
+        await setLocalOverflow(false).catch(() => { /* not running yet: the preference covers it */ });
         publishMarketplaceChange();
       } catch (e) {
         setErr(String((e as Error)?.message ?? e));
@@ -398,6 +495,11 @@ export function OverflowToggleButton({
         })).apiKey;
       saveSettings({ ...loadSettings(), overflowEnabled: true, overflowKey: key, overflowWaitS: 0 });
       setOn(true);
+      // A coordinator started while this was off already holds the key and is
+      // simply not using it, so switching on lands on the next busy request.
+      // One that predates the key (or is not running) starts from the stored
+      // preference instead — hence best-effort rather than a failure.
+      await setLocalOverflow(true).catch(() => { /* older coordinator: next start covers it */ });
       publishMarketplaceChange();
     } catch (e) {
       setErr(String((e as Error)?.message ?? e));
@@ -429,9 +531,16 @@ export function OverflowToggleButton({
     );
   }
 
+  // Green means THIS CAN ROUTE RIGHT NOW, not "the preference is on"
+  // (2026-09-16, same rule as the sharing pill).
+  //
   // An enabled overflow preference cannot route anything until the local
-  // service is ready to receive the request in the first place.
-  const active = on && serviceReady;
+  // service is ready to receive the request in the first place — and it also
+  // cannot route without a live session or the key it pays with. Signing out,
+  // or a settings file that lost the key, used to leave this green while every
+  // borrowed request would have failed.
+  const routable = gate.ok && !!loadSettings().overflowKey;
+  const active = on && serviceReady && routable;
 
   return (
     <button
@@ -439,7 +548,13 @@ export function OverflowToggleButton({
       disabled={busy}
       onClick={() => void toggle()}
       aria-pressed={active}
-      title={!serviceReady ? t("platform.overflow.needService") : err ?? t("platform.overflow.hint")}
+      title={
+        !serviceReady
+          ? t("platform.overflow.needService")
+          : on && !routable
+            ? t("platform.overflow.notReady")
+            : err ?? t("platform.overflow.hint")
+      }
     >
       <span className="pill__dot" />
       <span className="pill__label">

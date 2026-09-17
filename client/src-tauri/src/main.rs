@@ -410,6 +410,21 @@ async fn api_chat(
 /// throwing away a complete response it had already buffered. Three copies of
 /// that same loop existed here; this is the one they now share.
 fn engine_get_json_blocking(base_url: &str, path: &str) -> Result<Value, String> {
+    engine_request_json_blocking(base_url, "GET", path, None)
+}
+
+/// One request to the LOCAL coordinator, method and body included.
+///
+/// Was GET-only until 2026-09-16, when switching borrowing on and off stopped
+/// being a start-up argument and became something the running coordinator is
+/// told. Reading the reply is identical either way, so the two share it rather
+/// than growing a second copy of the Content-Length handling.
+fn engine_request_json_blocking(
+    base_url: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> Result<Value, String> {
     use std::io::{Read, Write};
     let host_port = base_url
         .trim()
@@ -417,10 +432,15 @@ fn engine_get_json_blocking(base_url: &str, path: &str) -> Result<Value, String>
         .ok_or_else(|| format!("unsupported API url (need http://): {base_url}"))?
         .trim_end_matches('/')
         .to_string();
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n",
-        host = host_port.split(':').next().unwrap_or(&host_port),
-    );
+    let host = host_port.split(':').next().unwrap_or(&host_port).to_string();
+    let req = match body {
+        None => format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"),
+        Some(b) => format!(
+            "{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\n\
+             Content-Length: {len}\r\nConnection: close\r\n\r\n{b}",
+            len = b.as_bytes().len(),
+        ),
+    };
     let mut stream = std::net::TcpStream::connect(&host_port)
         .map_err(|e| format!("connect {host_port}: {e}"))?;
     stream
@@ -603,6 +623,23 @@ async fn api_stats(base_url: String) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || engine_get_json_blocking(&base_url, "/idletoken/v1/stats"))
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// Switch borrowing on or off on the RUNNING coordinator.
+///
+/// `idletoken_overflow_enabled()` is read once per busy request, so this was
+/// always a live variable — but until 2026-09-16 the only writer was the
+/// coordinator's command line, which meant a user who switched borrowing off
+/// kept borrowing, and kept paying, until the model was restarted. The switch
+/// is a switch now, the way the sharing one already was.
+#[tauri::command]
+async fn api_overflow_set(base_url: String, enabled: bool) -> Result<Value, String> {
+    let body = format!("{{\"enabled\":{enabled}}}");
+    tauri::async_runtime::spawn_blocking(move || {
+        engine_request_json_blocking(&base_url, "POST", "/idletoken/v1/overflow", Some(&body))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// In-flight chat streams: id -> cancel flag. A generation can run for minutes;
@@ -1208,6 +1245,7 @@ fn main() {
             api_chat,
             api_chat_stream,
             api_stats,
+            api_overflow_set,
             api_capability,
             api_chat_cancel,
             platform_http,
