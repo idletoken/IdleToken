@@ -8,6 +8,9 @@ $ErrorActionPreference = 'Stop'
 $file = Get-Item -LiteralPath $Path
 if ($Version -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') { throw 'Windows file version must have three or four numeric components.' }
 if ($OriginalFilename -notmatch '^idletoken-[a-z-]+\.exe$') { throw 'Unexpected IdleToken executable name.' }
+if ($Description -notmatch '^IdleToken(?: |$)' -or $Description -match '(?i)llama|ggml') {
+    throw 'Windows file descriptions must use IdleToken product names without backend branding.'
+}
 $v = $file.VersionInfo
 if ($v.ProductName -eq 'IdleToken' -and $v.CompanyName -eq 'IdleToken' -and
     $v.FileDescription -eq $Description -and $v.FileVersion -eq $Version -and

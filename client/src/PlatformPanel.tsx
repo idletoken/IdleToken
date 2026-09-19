@@ -20,7 +20,8 @@ import {
 } from "./platform";
 
 import {
-  agentProviderId, agentRefusal, sharingObservation, waitForSharing,
+  agentProviderId, agentRefusal, isSharing, sharingFailure, SharingStoppedError,
+  sharingObservation, waitForSharing,
   type AgentRegistration, type SharingObservation, type SharingPhase,
 } from "./sharingState";
 
@@ -103,7 +104,7 @@ function ShareVersionBlockedDialog(
   );
 }
 
-/** Provider-side control: off -> opening -> confirmed sharing. */
+/** Confirm activation once; observation outages preserve the enabled intent. */
 export function ShareToggleButton({ serviceReady, onNeedLogin }: {
   serviceReady: boolean;
   onNeedLogin?: () => void;
@@ -118,7 +119,6 @@ export function ShareToggleButton({ serviceReady, onNeedLogin }: {
   const resumed = useRef(false);
   const confirmed = useRef(false);
   const registration = useRef<AgentRegistration | null>(null);
-  const observation = useRef<SharingObservation | null>(null);
   const operation = useRef<AbortController | null>(null);
   const monitor = useRef<AbortController | null>(null);
   const ready = useRef(serviceReady);
@@ -132,25 +132,26 @@ export function ShareToggleButton({ serviceReady, onNeedLogin }: {
 
   const read = async (signal: AbortSignal): Promise<SharingObservation> => {
     signal.throwIfAborted();
-    const [logs, providers] = await Promise.all([agentLogs(500), getProviders()]);
-    // Read liveness AFTER the network round trip: it may have exited meanwhile.
-    const agent = await agentStatus();
+    const lookup = await getProviders().then((providers) => ({ providers, error: null as unknown }))
+      .catch((error: unknown) => ({ providers: [], error }));
+    // Read identity and liveness AFTER the network round trip: the agent may
+    // have exited or registered a new lifetime while the request was in flight.
+    const [logs, agent] = await Promise.all([agentLogs(500), agentStatus()]);
     signal.throwIfAborted();
-    const next = sharingObservation(agent, logs, providers, registration.current, ready.current);
+    const next = sharingObservation(agent, logs, lookup.providers, registration.current, ready.current);
+    next.platformError = lookup.error;
     registration.current = next.registration;
-    observation.current = next;
     return next;
   };
 
   const stop = async () => {
-    const provider = observation.current?.provider;
+    const providerId = registration.current?.providerId;
     try {
-      if (provider?.listed) await setProviderListed(provider.id, false);
+      if (providerId) await setProviderListed(providerId, false);
     } catch { /* An unreachable gateway still ages out the stopped heartbeat. */ }
     await agentStop();
     confirmed.current = false;
     registration.current = null;
-    observation.current = null;
     saveSettings({ ...loadSettings(), providerEnabled: false });
     setOn(false);
     setPhase("off");
@@ -167,7 +168,10 @@ export function ShareToggleButton({ serviceReady, onNeedLogin }: {
     setErr(null);
     setBlocked(null);
     setPhase("opening");
+    let continuing = false;
     try {
+      // A surviving agent must not be killed by a startup observation outage.
+      if (restore) continuing = ["running", "starting", "restarting"].includes((await agentStatus()).state);
       // Manual activation and startup restoration use the SAME admission path.
       const standing = await currentVersionStanding(true);
       attempt.signal.throwIfAborted();
@@ -185,7 +189,6 @@ export function ShareToggleButton({ serviceReady, onNeedLogin }: {
       const status = await agentStatus();
       if (!restore || !["running", "starting", "restarting"].includes(status.state)) {
         registration.current = null;
-        observation.current = null;
         const s = loadSettings();
         await agentStart({
           platformUrl: gate.url, jwt: gate.session.token, name: providerName,
@@ -201,11 +204,17 @@ export function ShareToggleButton({ serviceReady, onNeedLogin }: {
       setPhase("sharing");
       publishMarketplaceChange();
     } catch (e) {
-      // A failed attempt cannot keep registering behind an "off" button.
-      await stop();
       if (!attempt.signal.aborted) {
-        if (e instanceof VersionTooOldToShare) setBlocked(e);
-        else setErr(tErr(String((e as Error)?.message ?? e)));
+        if (continuing && !(e instanceof VersionTooOldToShare) && !(e instanceof SharingStoppedError)) {
+          confirmed.current = true;
+          setOn(true);
+          setPhase("reconnecting");
+        } else {
+          // A failed new attempt cannot register behind an "off" button.
+          await stop();
+          if (e instanceof VersionTooOldToShare) setBlocked(e);
+          else setErr(tErr(String((e as Error)?.message ?? e)));
+        }
       }
     } finally {
       if (operation.current === attempt) operation.current = null;
@@ -232,14 +241,16 @@ export function ShareToggleButton({ serviceReady, onNeedLogin }: {
       if (checking || busyRef.current || watch.signal.aborted) return;
       checking = true;
       try {
-        await waitForSharing(() => read(watch.signal), {
-          signal: watch.signal,
-          pending: () => { if (!watch.signal.aborted) setPhase("opening"); },
-        });
-        if (!watch.signal.aborted) setPhase("sharing");
+        const result = await read(watch.signal);
+        const terminal = sharingFailure(result);
+        if (terminal) throw terminal;
+        if (!watch.signal.aborted) setPhase(isSharing(result) ? "sharing" : "reconnecting");
       } catch (e) {
         if (!watch.signal.aborted) {
-          // Retrying from the off label must START, never toggle a stale wish off.
+          if (!(e instanceof SharingStoppedError)) {
+            setPhase("reconnecting");
+            return;
+          }
           busyRef.current = true;
           setBusy(true);
           try {
@@ -266,13 +277,18 @@ export function ShareToggleButton({ serviceReady, onNeedLogin }: {
   if (!inTauri()) return null;
   const opening = phase === "opening";
   const active = phase === "sharing";
+  const label = opening ? "share.opening" : phase === "reconnecting" ? "share.reconnecting"
+    : active ? "share.on" : "share.off";
   const title = err ?? (!serviceReady ? t("share.needService")
     : !gate.ok ? t(gate.reason === "no-url" ? "platform.err.noUrl" : "share.needLogin")
-    : t(opening ? "share.opening" : active ? "share.on" : "share.off"));
+    : t(label));
   const toggle = async () => {
     if (busyRef.current || opening) return;
-    if (!gate.ok) { if (serviceReady) onNeedLogin?.(); return; }
-    if (!active) { await start(); return; }
+    if (!on) {
+      if (!gate.ok) { if (serviceReady) onNeedLogin?.(); return; }
+      await start();
+      return;
+    }
     busyRef.current = true;
     setBusy(true);
     monitor.current?.abort();
@@ -285,15 +301,15 @@ export function ShareToggleButton({ serviceReady, onNeedLogin }: {
       <button
         className={`pill pill--market pill--share pill--${active ? "ready" : "standalone"}`}
         data-share-state={phase}
-        disabled={busy || opening || (!gate.ok && gate.reason === "no-url")}
+        disabled={busy || opening || (!on && !gate.ok && gate.reason === "no-url")}
         onClick={() => void toggle()}
-        aria-pressed={active}
+        aria-pressed={on}
         aria-busy={busy || opening}
-        aria-label={t(opening ? "share.opening" : active ? "share.on" : "share.off")}
+        aria-label={t(label)}
         title={title}
       >
         <span className="pill__dot" />
-        <span className="pill__label">{opening ? "…" : t(active ? "share.on" : "share.off")}</span>
+        <span className="pill__label">{opening ? "…" : t(label)}</span>
       </button>
       {blocked ? <ShareVersionBlockedDialog installed={blocked.installed} floor={blocked.floor}
         onClose={() => setBlocked(null)} /> : null}

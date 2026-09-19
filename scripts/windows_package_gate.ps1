@@ -36,6 +36,11 @@ try {
             -not $info.FileDescription -or $info.FileVersion -notmatch ('^' + [regex]::Escape($version) + '(\.0)?$')) {
             throw "Missing or stale executable identity: $name"
         }
+        if ($info.FileDescription -notmatch '^IdleToken(?: |$)' -or
+            (@($info.FileDescription, $info.ProductName, $info.CompanyName, $info.InternalName,
+                $info.OriginalFilename) -join ' ') -match '(?i)llama|ggml') {
+            throw "Executable display identity must use IdleToken product names without backend branding: $name"
+        }
         $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
         if ($signed -and ($signature.Status -ne 'Valid' -or
             $signature.SignerCertificate.Subject -cne $env:IDLETOKEN_WINDOWS_SIGNER_SUBJECT -or

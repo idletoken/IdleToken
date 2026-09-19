@@ -1970,6 +1970,45 @@ static int platform_heartbeat(const char *platform_addr, const char *jwt,
 /* How often to re-probe while there is no engine. Short enough that coming
  * back from a model switch costs seconds, not a poll period. */
 #define RELAY_IDLE_RECHECK_SECS 5
+#define RELAY_HEARTBEAT_SECS 15
+
+/* Job transfer, prefill and result upload can each exceed the platform's 60s
+ * freshness window. Keep heartbeats independent of that serial data path.
+ * Only copied identity fields are shared: reconcile_identity owns/frees the
+ * registration's provider_id on the poll thread. */
+typedef struct {
+    pthread_mutex_t mutex;
+    const char *platform_addr, *jwt, *coord_addr;
+    char provider_id[128];
+    agent_identity declared;
+} relay_heartbeat_state;
+
+static void relay_heartbeat_update(relay_heartbeat_state *state,
+                                    const agent_registration *reg) {
+    pthread_mutex_lock(&state->mutex);
+    snprintf(state->provider_id, sizeof(state->provider_id), "%s", reg->provider_id);
+    state->declared = reg->declared;
+    pthread_mutex_unlock(&state->mutex);
+}
+
+static void *relay_heartbeat_loop(void *arg) {
+    relay_heartbeat_state *state = arg;
+    for (;;) {
+        sleep(RELAY_HEARTBEAT_SECS);
+        char provider_id[sizeof(state->provider_id)];
+        agent_identity declared, live;
+        pthread_mutex_lock(&state->mutex);
+        memcpy(provider_id, state->provider_id, sizeof(provider_id));
+        declared = state->declared;
+        pthread_mutex_unlock(&state->mutex);
+        /* A busy engine remains ready. A stopped/replaced engine must not
+         * refresh the old service, even while a relay request is blocked. */
+        if (!engine_sellable(state->coord_addr, &live) || !identity_same(&live, &declared)) continue;
+        if (platform_heartbeat(state->platform_addr, state->jwt, provider_id, state->coord_addr) != 0)
+            fprintf(stderr, "platform-agent: relay heartbeat failed; retrying independently of the active job\n");
+    }
+    return NULL;
+}
 
 /* Shared sealed-envelope data path (defined below with the /infer handler).
  * `job_id` may be NULL on the direct transport, which has no platform-assigned
@@ -2031,8 +2070,23 @@ static void relay_loop(const idletoken_keypair *node, agent_registration *reg) {
     int backoff = 1;
     int was_sellable = 1;   /* registration proved an engine was there */
 
+    relay_heartbeat_state heartbeat = {
+        .mutex = PTHREAD_MUTEX_INITIALIZER,
+        .platform_addr = platform_addr, .jwt = jwt, .coord_addr = coord_addr,
+    };
+    relay_heartbeat_update(&heartbeat, reg);
+    pthread_t heartbeat_thread;
+    int thread_rc = pthread_create(&heartbeat_thread, NULL, relay_heartbeat_loop, &heartbeat);
+    if (thread_rc != 0) {
+        fprintf(stderr, "platform-agent: refuse: cannot start relay heartbeat thread: %s\n", strerror(thread_rc));
+        exit(1);
+    }
+    pthread_detach(heartbeat_thread);
+    /* relay_loop never returns; heartbeat and its borrowed immutable addresses
+     * have process lifetime. No network call holds heartbeat.mutex. */
+
     for (;;) {
-        /* The poll is this transport's heartbeat, so it is also where the
+        /* The poll also refreshes this transport's heartbeat, so it is where the
          * declaration gets checked against what the coordinator is actually
          * running. Before the poll, not after: a poll accepts work for the
          * triple the platform believes is here.
@@ -2058,13 +2112,21 @@ static void relay_loop(const idletoken_keypair *node, agent_registration *reg) {
             was_sellable = 1;
         }
         reconcile_identity(reg, &live);
+        relay_heartbeat_update(&heartbeat, reg);
+        if (!identity_same(&live, &reg->declared)) {
+            /* Re-registration was refused or is backing off. Polling would
+             * refresh the old service and accept work for the wrong triple. */
+            sleep(RELAY_IDLE_RECHECK_SECS);
+            continue;
+        }
         /* Rebuilt from the (possibly re-registered) id every iteration —
          * a provider id that moved and a path that did not is a poll that
          * silently stops receiving work. */
         char path[256];
         snprintf(path, sizeof(path), "/providers/%s/relay/poll", reg->provider_id);
 
-        /* The poll IS the heartbeat on this transport, so the live load has to
+        /* The poll also updates the heartbeat on this transport, so live load
+         * has to
          * ride along with it — rebuilt every iteration because that is the
          * point of it (queue depth and service time change between polls).
          *
@@ -3100,7 +3162,7 @@ int main(int argc, char **argv) {
         identity_print(&live, what, sizeof(what));
         printf("  serving          : %s\n", what);
         if (relay)
-            printf("  provider id      : %s  (poll = heartbeat)\n", reg.provider_id);
+            printf("  provider id      : %s  (relay; independent heartbeat every %ds)\n", reg.provider_id, RELAY_HEARTBEAT_SECS);
         else
             printf("  provider id      : %s  (heartbeat every %ds)\n", reg.provider_id, beat_secs);
         fflush(stdout);

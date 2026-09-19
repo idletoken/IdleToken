@@ -1,6 +1,6 @@
 import type { AgentLogLine, AgentStatus, ProviderInfo } from "./platform";
 
-export type SharingPhase = "off" | "opening" | "sharing";
+export type SharingPhase = "off" | "opening" | "reconnecting" | "sharing";
 export interface AgentRegistration { startedAt: number; providerId: string }
 export interface SharingObservation {
   agent: AgentStatus;
@@ -8,6 +8,7 @@ export interface SharingObservation {
   registration: AgentRegistration | null;
   refusal: string | null;
   serviceReady: boolean;
+  platformError?: unknown;
 }
 
 export function agentRefusal({ line }: AgentLogLine): string | null {
@@ -52,8 +53,24 @@ export function sharingObservation(
 }
 
 export function isSharing(s: SharingObservation): boolean {
-  return s.serviceReady && s.agent.state === "running"
+  return !s.platformError && s.serviceReady && s.agent.state === "running"
     && s.provider?.listed === true && s.provider.online === true;
+}
+
+/** Only positive evidence can stop an enabled service; a failed read cannot. */
+export class SharingStoppedError extends Error {}
+
+export function sharingFailure(s: SharingObservation): SharingStoppedError | null {
+  if (s.agent.state === "stopped" || s.agent.state === "crashed") {
+    return new SharingStoppedError(s.refusal || "[SHARE_AGENT_STOPPED] The sharing agent stopped.");
+  }
+  if (!s.platformError && s.provider && !s.provider.listed) {
+    return new SharingStoppedError(s.provider.unlistedReason || "[SHARE_NOT_LISTED] The platform did not list this service.");
+  }
+  if (!s.platformError && s.provider && ["SUSPENDED", "BLACKLISTED"].includes(s.provider.status)) {
+    return new SharingStoppedError(s.provider.unlistedReason || "[SHARE_SUSPENDED] The platform suspended this service.");
+  }
+  return null;
 }
 
 /** Spawning a process starts an attempt; listing with a fresh heartbeat ends it. */
@@ -78,13 +95,9 @@ export async function waitForSharing(
     options.signal.throwIfAborted();
     if (s) {
       if (isSharing(s)) return s;
-      if (s.agent.state === "stopped" || s.agent.state === "crashed") {
-        throw new Error(s.refusal || "[SHARE_AGENT_STOPPED] The sharing agent stopped before the service became available.");
-      }
-      if (s.provider && !s.provider.listed) {
-        throw new Error(s.provider.unlistedReason || "[SHARE_NOT_LISTED] The platform did not list this service.");
-      }
-      failure = s.refusal ? new Error(s.refusal) : null;
+      const terminal = sharingFailure(s);
+      if (terminal) throw terminal;
+      failure = s.platformError || (s.refusal ? new Error(s.refusal) : null);
     }
     options.pending?.();
     if (now() >= deadline) {

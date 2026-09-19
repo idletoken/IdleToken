@@ -3,8 +3,8 @@ REM Native Windows build of the marketplace agent (idletoken-platform-agent.exe)
 REM
 REM Mirrors Makefile.platform, which already declares Windows support (bcrypt
 REM for BCryptGenRandom) but needs a POSIX shell to run. The agent is pure
-REM portable C — vendored TweetNaCl + BLAKE2b, sockets, HTTP — no CUDA, no
-REM threads, so this is a straight compile.
+REM portable C — vendored TweetNaCl + BLAKE2b, sockets, HTTP and pthreads —
+REM no CUDA. winpthread is linked statically below.
 REM
 REM Without it the Windows installer had to ship *something* under the agent's
 REM name (Tauri fails the bundle on a missing externalBin) and the Platform

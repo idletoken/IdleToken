@@ -35,8 +35,8 @@ try {
         'idletoken-coord' = 'IdleToken Inference Coordinator'
         'idletoken-worker' = 'IdleToken LAN Compute Supervisor'
         'idletoken-platform-agent' = 'IdleToken Service Sharing Agent'
-        'idletoken-server' = 'IdleToken Local Inference Engine (llama.cpp)'
-        'idletoken-rpc-server' = 'IdleToken LAN Compute Service (llama.cpp)'
+        'idletoken-server' = 'IdleToken Local Inference Engine'
+        'idletoken-rpc-server' = 'IdleToken LAN Compute Service'
         'idletoken-installer-helper' = 'IdleToken Installation Maintenance'
     }
     $provider = $env:IDLETOKEN_WINDOWS_SIGNING
