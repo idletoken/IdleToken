@@ -96,7 +96,8 @@ export IDLETOKEN_API_KEY='sk-idletoken-********************************'
 npx @deepseek-ai/dsh web
 ```
 
-The Web UI opens at `http://127.0.0.1:3080`; pick the model under the `idletoken` provider. A model added by hand is treated as text-only, so give a vision model `input: [text, image]` next to its `id`.
+The Web UI opens at `http://127.0.0.1:3080`; pick the model under the
+`idletoken` provider. IdleToken's current catalog is text-only.
 
 ### Connect OpenCode
 
@@ -183,7 +184,9 @@ make -f Makefile.platform
 ./scripts/build_client_release.sh
 ```
 
-Installers are written below `client/src-tauri/target/release/bundle/deb/` and `client/src-tauri/target/release/bundle/rpm/`.
+Installers are written below `client/src-tauri/target/release/bundle/deb/` and
+`client/src-tauri/target/release/bundle/rpm/`. On x86_64, the same command also
+writes an Arch Linux package below `client/src-tauri/target/release/bundle/arch/`.
 
 ### macOS
 

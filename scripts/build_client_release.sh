@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build the installable desktop client on a Linux compute node (.deb + .rpm).
+# Build the installable desktop client on a Linux compute node (.deb, .rpm,
+# and an x86_64 Arch Linux .pkg.tar.zst).
 #
 # The engine and the client are two processes (design philosophy 17), but the
 # *installer* has to carry both: Tauri ships the engine binaries as sidecars.
@@ -308,17 +309,45 @@ fi
 #
 # Linux releases are native package-manager installers only. Keep this list
 # fail closed so a stale environment cannot quietly resurrect AppImage or an
-# updater artifact in a public release.
-BUNDLES="${IDLETOKEN_BUNDLES:-deb,rpm}"
-case ",$BUNDLES," in
-    ,deb,|,rpm,|,deb,rpm,|,rpm,deb,) ;;
-    *) fail "IDLETOKEN_BUNDLES must contain only deb and/or rpm (got '$BUNDLES')" ;;
+# updater artifact in a public release. Arch Linux itself supports x86_64; the
+# aarch64 release lane therefore remains deb/rpm only.
+case "$TRIPLE" in
+    x86_64-unknown-linux-gnu)  DEFAULT_BUNDLES=deb,rpm,arch ;;
+    aarch64-unknown-linux-gnu) DEFAULT_BUNDLES=deb,rpm ;;
 esac
+BUNDLES="${IDLETOKEN_BUNDLES:-$DEFAULT_BUNDLES}"
+WANT_DEB=0
+WANT_RPM=0
+WANT_ARCH=0
+IFS=',' read -r -a REQUESTED_BUNDLES <<< "$BUNDLES"
+[ "${#REQUESTED_BUNDLES[@]}" -gt 0 ] || fail "IDLETOKEN_BUNDLES is empty"
+for bundle in "${REQUESTED_BUNDLES[@]}"; do
+    case "$bundle" in
+        deb)  [ "$WANT_DEB" -eq 0 ] || fail "IDLETOKEN_BUNDLES contains duplicate deb";  WANT_DEB=1 ;;
+        rpm)  [ "$WANT_RPM" -eq 0 ] || fail "IDLETOKEN_BUNDLES contains duplicate rpm";  WANT_RPM=1 ;;
+        arch) [ "$WANT_ARCH" -eq 0 ] || fail "IDLETOKEN_BUNDLES contains duplicate arch"; WANT_ARCH=1 ;;
+        *) fail "IDLETOKEN_BUNDLES accepts only deb, rpm, and arch (got '$bundle' in '$BUNDLES')" ;;
+    esac
+done
+[ "$WANT_DEB" -eq 1 ] || [ "$WANT_RPM" -eq 1 ] || [ "$WANT_ARCH" -eq 1 ] \
+    || fail "IDLETOKEN_BUNDLES selects no package"
+if [ "$WANT_ARCH" -eq 1 ] && [ "$TRIPLE" != x86_64-unknown-linux-gnu ]; then
+    fail "Arch Linux release packages are x86_64 only (host target is $TRIPLE)"
+fi
+
+# Tauri does not have an ALPM bundler. The Arch package is produced from the
+# exact Debian payload, so request an internal deb even for an arch-only build.
+TAURI_BUNDLES=""
+append_tauri_bundle() {
+    if [ -n "$TAURI_BUNDLES" ]; then TAURI_BUNDLES="$TAURI_BUNDLES,$1"; else TAURI_BUNDLES=$1; fi
+}
+if [ "$WANT_DEB" -eq 1 ] || [ "$WANT_ARCH" -eq 1 ]; then append_tauri_bundle deb; fi
+[ "$WANT_RPM" -eq 1 ] && append_tauri_bundle rpm
 # ⚠ not `| tail`: the pipe exit code is tail's, and a bundler that failed
 # AFTER producing the .deb sailed through as CLIENT_RELEASE_OK (hit 2026-08-15;
 # same trap as the repo-wide "never read an exit code through a pipe" rule).
 BUILD_LOG=$(mktemp /tmp/idletoken-tauri-build.XXXXXX)
-if ! pnpm tauri build --bundles "$BUNDLES" > "$BUILD_LOG" 2>&1; then
+if ! pnpm tauri build --bundles "$TAURI_BUNDLES" > "$BUILD_LOG" 2>&1; then
     tail -30 "$BUILD_LOG"; rm -f "$BUILD_LOG"
     fail "tauri build failed"
 fi
@@ -327,13 +356,38 @@ tail -30 "$BUILD_LOG"; rm -f "$BUILD_LOG"
 # --- report artifacts -----------------------------------------------------
 BDIR="src-tauri/target/release/bundle"
 [ -d "$BDIR" ] || fail "no bundle directory at $BDIR"
-found=0
+CLIENT_VERSION=$(awk -F'"' '/^ *"version":/{print $4; exit}' package.json)
+[ -n "$CLIENT_VERSION" ] || fail "could not read the client version from package.json"
+case "$TRIPLE" in
+    x86_64-unknown-linux-gnu)
+        DEB_ARCH=amd64
+        RPM_ARCH=x86_64
+        ;;
+    aarch64-unknown-linux-gnu)
+        DEB_ARCH=arm64
+        RPM_ARCH=aarch64
+        ;;
+esac
+CURRENT_DEB="$BDIR/deb/IdleToken_${CLIENT_VERSION}_${DEB_ARCH}.deb"
+CURRENT_RPM="$BDIR/rpm/IdleToken-${CLIENT_VERSION}-1.${RPM_ARCH}.rpm"
+CURRENT_ARCH="$BDIR/arch/idletoken-bin-${CLIENT_VERSION}-1-x86_64.pkg.tar.zst"
+
+if [ "$WANT_ARCH" -eq 1 ]; then
+    [ -f "$CURRENT_DEB" ] || fail "the Arch build has no current Debian payload at $CURRENT_DEB"
+    "$ROOT/scripts/build_arch_package.sh" "$ROOT/client/$CURRENT_DEB" "$ROOT/client/$BDIR/arch" \
+        || fail "Arch package build failed"
+    [ -f "$CURRENT_ARCH" ] || fail "Arch package builder reported success but $CURRENT_ARCH is missing"
+fi
+
 echo "--- artifacts ---"
-while IFS= read -r f; do
-    found=1
+ARTIFACTS=()
+[ "$WANT_DEB" -eq 1 ] && ARTIFACTS+=("$CURRENT_DEB")
+[ "$WANT_RPM" -eq 1 ] && ARTIFACTS+=("$CURRENT_RPM")
+[ "$WANT_ARCH" -eq 1 ] && ARTIFACTS+=("$CURRENT_ARCH")
+for f in "${ARTIFACTS[@]}"; do
+    [ -f "$f" ] || fail "requested package is missing: $f"
     printf '%s  %s  %s\n' "$(sha256sum "$f" | cut -c1-16)" "$(du -h "$f" | cut -f1)" "$ROOT/client/$f"
-done < <(find "$BDIR" -type f \( -name '*.deb' -o -name '*.rpm' \) | sort)
-[ "$found" = 1 ] || fail "bundler produced no Linux package"
+done
 
 # No automatic provenance, signature, updater archive or feed is emitted here.
 # The release contract is the native installer files listed above, and only

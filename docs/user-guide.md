@@ -42,14 +42,14 @@ silently fall back to CPU inference.
 
 - The client offers an adapted model catalog. It does not accept arbitrary
   local model paths or Hugging Face URLs.
-- Models marked with image support can accept pictures; other models accept
-  text only.
-- Context choices are 128K, 256K, and 1M. A new installation selects 128K by
-  default, and the client shows only the windows supported by the chosen model.
+- The current catalog contains text-generation models only. Image input is not
+  supported.
+- The default context is exactly 256K. Models that support it also offer an
+  explicit 1M option. Startup never silently shortens the selected window.
 - Both **On this machine only** and **Across several machines** remain visible.
-  The client emphasizes local execution when the model is estimated to fit on
-  this machine; otherwise it emphasizes clustering. You can still choose the
-  other path when the device meets its hardware requirements.
+  Multi-machine execution is the default primary action, without a
+  "recommended" label. A capacity warning does not disable either choice, and
+  an explicit multi-machine choice never silently falls back to local mode.
 - The capacity card is a preflight estimate. Startup performs the final check.
 
 ## 2. Install IdleToken
@@ -65,6 +65,11 @@ Download the package matching your operating system and CPU architecture from
 | Debian / Ubuntu arm64 | `IdleToken_<version>_arm64.deb` |
 | RPM-based Linux x86_64 | `IdleToken-<version>-1.x86_64.rpm` |
 | RPM-based Linux arm64 | `IdleToken-<version>-1.aarch64.rpm` |
+| Arch Linux x86_64 | `idletoken-bin-<version>-1-x86_64.pkg.tar.zst` |
+
+Source support and Release assets are published separately. If the current
+Release page does not list the Arch artifact, that release does not yet have a
+project-built Arch installer; use the source-build instructions in the README.
 
 ### Windows
 
@@ -110,11 +115,19 @@ sudo rpm -Uvh IdleToken-<version>-1.x86_64.rpm
 sudo rpm -Uvh IdleToken-<version>-1.aarch64.rpm
 ```
 
+Arch Linux (x86_64):
+
+```sh
+sudo pacman -U ./idletoken-bin-<version>-1-x86_64.pkg.tar.zst
+```
+
 Linux packages include the required user-space CUDA runtime libraries. You only
 need a compatible NVIDIA driver. The packages require glibc 2.39 or newer; the
-package manager refuses installation when that requirement is not met. Official
-Linux installers are available as `.deb` and `.rpm`; other distributions require
-a build from the public repository.
+package manager refuses installation when that requirement is not met. The
+Linux release lane supports `.deb`, `.rpm`, and an x86_64 Arch Linux
+`.pkg.tar.zst`; an installer is published only when that asset appears on its
+Release page. Arch Linux ARM is not an official release target; other
+distributions require a build from the public repository.
 
 IdleToken has no in-app updater. To upgrade, download and install the newer
 native package over the existing installation.
@@ -159,8 +172,8 @@ Private-cluster inference still runs on your machines and LAN.
 
 1. Open **Cluster**.
 2. Choose a model and precision under **Selected**.
-3. Choose a 128K, 256K, or 1M context window. Only windows supported by the
-   model appear. A larger window generally requires more VRAM or unified memory.
+3. Keep the default 256K context, or enable 1M when the model supports it. A 1M
+   window generally requires more VRAM or unified memory.
 4. Review the capacity card.
 
 ![Resource estimate for a selected model](images/guide/04-capacity.png)
@@ -174,21 +187,19 @@ Private-cluster inference still runs on your machines and LAN.
 ### Download the model files
 
 If the selected model is not ready, choose **Download weights** and wait for the
-download and hash verification to finish. Models with image support also
-download a vision file. Every compute node in a multi-machine deployment needs
-a complete copy of the model files.
+download and hash verification to finish. Every compute node in a multi-machine
+deployment needs a complete copy of the model file.
 
 ### Choose local or multi-machine execution
 
-- Choose **Run it here** for the simplest path with no LAN RPC.
-- Choose **Create a cluster** to combine several machines. The next dialog also
-  lets this machine join an existing cluster.
+- **Create a cluster** is the default primary action and combines several
+  machines. The next dialog also lets this machine join an existing cluster.
+- Choose **Run it here** when you explicitly want the no-LAN-RPC local path.
 
-The primary-button styling is only a hint based on the current estimate; it
-does not choose for you. If startup finds insufficient resources, the client
-shows `[RESOURCE_INSUFFICIENT]` with the required and available amounts. Lower
-the precision, choose a shorter context, free memory, or add compute nodes and
-try again.
+The capacity estimate only warns; it does not disable either action. Startup
+performs the hard resource check for the exact selected context. If it reports
+`[RESOURCE_INSUFFICIENT]`, lower the precision, switch from 1M to 256K when
+applicable, free memory, or add compute nodes and try again.
 
 ### Chat
 
@@ -196,10 +207,8 @@ When the status becomes **Ready**, open **Chat** and send a message.
 
 ![A text conversation with the Reasoning section collapsed](images/guide/04-chat.png)
 
-Model reasoning appears in a collapsed **Reasoning** section. When the current
-model supports images, an image button appears beside the composer. It accepts
-PNG, JPEG, WebP, and GIF files. If the button is absent, the current model is
-text-only.
+Model reasoning appears in a collapsed **Reasoning** section. The current
+catalog and chat composer are text-only.
 
 ## 5. Build a LAN cluster
 
@@ -360,10 +369,9 @@ or `GET /catalog` to see models and precisions with an online service.
 
 ### The model cannot start
 
-- Confirm that weights and the vision file, when required, finished downloading
-  and passed verification.
+- Confirm that the weights finished downloading and passed verification.
 - Use the capacity card and error details to free VRAM or RAM, select a lower
-  precision, or choose a shorter context.
+  precision, or switch from 1M to 256K when applicable.
 - For a cluster, check whether the error identifies an offline or mismatched
   member.
 

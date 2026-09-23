@@ -96,7 +96,8 @@ export IDLETOKEN_API_KEY='sk-idletoken-********************************'
 npx @deepseek-ai/dsh web
 ```
 
-Web 界面默认打开 `http://127.0.0.1:3080`，在 `idletoken` 服务商下选择模型即可。手动添加的模型默认按纯文本处理，视觉模型需要在其 `id` 旁补一行 `input: [text, image]`。
+Web 界面默认打开 `http://127.0.0.1:3080`，在 `idletoken` 服务商下选择模型即可。
+IdleToken 当前的精选列表只支持文本。
 
 ### 接入 OpenCode
 
@@ -183,7 +184,9 @@ make -f Makefile.platform
 ./scripts/build_client_release.sh
 ```
 
-安装包位于 `client/src-tauri/target/release/bundle/deb/` 和 `client/src-tauri/target/release/bundle/rpm/`。
+安装包位于 `client/src-tauri/target/release/bundle/deb/` 和
+`client/src-tauri/target/release/bundle/rpm/`。在 x86_64 上，同一命令还会把 Arch Linux
+安装包写入 `client/src-tauri/target/release/bundle/arch/`。
 
 ### macOS
 

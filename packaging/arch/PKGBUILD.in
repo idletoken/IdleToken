@@ -1,0 +1,45 @@
+# Maintainer: IdleToken <support@idletoken.ai>
+
+pkgname=idletoken-bin
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc='Local AI inference and private LAN compute clusters'
+arch=('x86_64')
+url='https://idletoken.ai'
+license=('Apache-2.0')
+depends=(
+  'ca-certificates'
+  'curl>=7.68'
+  'dbus'
+  'duktape>=2.7'
+  'gcc-libs'
+  'glib2>=2.72'
+  'glibc>=2.39'
+  'gsettings-desktop-schemas'
+  'gtk3'
+  'hicolor-icon-theme'
+  'libayatana-appindicator'
+  'librsvg'
+  'webkit2gtk-4.1'
+)
+optdepends=('nvidia-utils: NVIDIA driver user-space libraries for compute nodes')
+provides=("idletoken=${pkgver}")
+conflicts=('idletoken')
+options=('!debug' '!strip')
+source=('@DEB_NAME@')
+noextract=('@DEB_NAME@')
+sha256sums=('@DEB_SHA256@')
+
+package() {
+  local data_member
+  data_member=$(ar t "${srcdir}/@DEB_NAME@" | awk '/^data\.tar/{print; exit}')
+  if [[ -z ${data_member} ]]; then
+    printf 'IdleToken Debian payload has no data archive\n' >&2
+    return 1
+  fi
+
+  # The Debian package has already passed the release payload gates. Preserve
+  # it byte-for-byte so the Arch package cannot acquire a different engine,
+  # CUDA runtime, digest, licence set, or desktop integration.
+  ar p "${srcdir}/@DEB_NAME@" "${data_member}" | bsdtar -xf - -C "${pkgdir}"
+}
