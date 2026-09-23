@@ -176,6 +176,36 @@ def serve(server):
         server.shutdown(); server.server_close(); thread.join(timeout=1)
 
 
+def local_ipv4_candidates():
+    """Return assigned non-loopback addresses before route-selected tunnels.
+
+    A transparent proxy can install a default route through a synthetic
+    198.18/15 interface.  Binding that point-to-point address succeeds, but a
+    connection to it is routed into the tunnel instead of back to the local
+    test server.  Hostname resolution normally exposes the machine's assigned
+    LAN addresses, so prefer those and keep the route lookup as a fallback for
+    hosts whose name resolves only to loopback.
+    """
+    candidates = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None,
+                                       socket.AF_INET, socket.SOCK_STREAM):
+            address = info[4][0]
+            if not address.startswith('127.') and address != '0.0.0.0' and address not in candidates:
+                candidates.append(address)
+    except socket.gaierror:
+        pass
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route:
+            route.connect(('192.0.2.1', 9))
+            address = route.getsockname()[0]
+        if not address.startswith('127.') and address != '0.0.0.0' and address not in candidates:
+            candidates.append(address)
+    except OSError:
+        pass
+    return candidates
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('probe')
@@ -265,20 +295,32 @@ def main():
             run('socks5-remote-dns', 'http://unresolvable.invalid:8080/ok',
                 env={'NO_PROXY': '', 'ALL_PROXY': 'socks5h://127.0.0.1:%d' % proxy_port})
             assert SocksProxy.calls[-1] == ('unresolvable.invalid', 8080)
-    # Select a local non-loopback address without sending a packet. First prove
-    # it is reachable directly; otherwise a failed proxy test proves nothing.
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route:
-        route.connect(('192.0.2.1', 9))
-        local_ip = route.getsockname()[0]
-    assert not local_ip.startswith('127.')
-    with serve(Server((local_ip, 0), Handler)) as port, socket.socket() as refused:
-        refused.bind(('127.0.0.1', 0))  # reserve a port without accepting connections
-        url = 'http://%s:%d/ok' % (local_ip, port)
-        run('direct-positive-control-for-proxy-failure', url)
-        before = len(Handler.calls)
-        run('dead-proxy-no-direct-fallback', url, False,
-            env={'NO_PROXY': '', 'HTTP_PROXY': 'http://127.0.0.1:%d' % refused.getsockname()[1]})
-        assert len(Handler.calls) == before, 'failed proxy leaked a direct request'
+    # First prove a local non-loopback address is reachable directly; otherwise
+    # a failed proxy test proves nothing. Try every assigned address because a
+    # transparent proxy may make its point-to-point address look like the
+    # default route while connections to that address never loop back locally.
+    local_error = None
+    for local_ip in local_ipv4_candidates():
+        try:
+            server = Server((local_ip, 0), Handler)
+        except OSError as error:
+            local_error = error
+            continue
+        with serve(server) as port, socket.socket() as refused:
+            refused.bind(('127.0.0.1', 0))  # reserve a port without accepting connections
+            url = 'http://%s:%d/ok' % (local_ip, port)
+            try:
+                run('direct-positive-control-for-proxy-failure', url)
+            except AssertionError as error:
+                local_error = error
+                continue
+            before = len(Handler.calls)
+            run('dead-proxy-no-direct-fallback', url, False,
+                env={'NO_PROXY': '', 'HTTP_PROXY': 'http://127.0.0.1:%d' % refused.getsockname()[1]})
+            assert len(Handler.calls) == before, 'failed proxy leaked a direct request'
+            break
+    else:
+        raise AssertionError(('no directly reachable non-loopback IPv4 address', local_error))
     class V6Server(Server):
         address_family = socket.AF_INET6
     with serve(V6Server(('::1', 0), Handler)) as port:

@@ -706,21 +706,28 @@ static uint8_t *http_request_json(const char *method,
     char url[4096];
     if (idletoken_platform_url(unix_socket ? "http://localhost" : addr, path, url, sizeof(url))) return NULL;
     int receipt = out_truncated && strstr(path, "/relay/poll");
+    /* Only the two data-plane calls may outlive the caller's short control
+     * timeout: poll can receive a large sealed job and result can upload a
+     * large sealed answer. Registration, heartbeat and delivery ACKs are
+     * small control messages. If one of those peers sends headers plus a
+     * byte and then stalls, it must still finish inside timeout_secs instead
+     * of inheriting the 120-second large-body idle allowance. */
+    int bulk_transfer = strstr(path, "/relay/poll") || strstr(path, "/relay/result");
     idletoken_platform_http_request request = {
         .url = url, .method = method, .bearer = bearer, .headers = extra_hdr,
         .unix_socket = unix_socket, .cancelled = g_request_cancelled, .cancel_context = g_cancel_context,
         .body = body, .body_len = body_len, .connect_ms = 10000,
         .headers_ms = timeout_secs * 1000,
-        /* No whole-transfer wall clock from `timeout_secs`. It bounds how long
-         * the server may take to START answering once the upload has left this
-         * process (the socket-timeout semantics it always had). Deriving a
+        /* Bulk data-plane calls have no whole-transfer wall clock from
+         * `timeout_secs`; for them it bounds only how long the server may take
+         * to START answering after the upload leaves this process. Deriving a
          * total from it gave the sealed-result POST a 10-30 s cap on the whole
          * upload: on a 40-80 KB/s uplink that is under 800 KB, so an image
          * reply the buyer had already paid for was cut, retried from byte 0
          * and cut again until the job expired -- while every LAN test passed.
-         * The upload is bounded by the body budgets below; the job's own
+         * Their upload is bounded by the body budgets below; the job's own
          * expiry still caps everything through the clamp that follows. */
-        .total_ms = 0,
+        .total_ms = timeout_secs && !bulk_transfer ? timeout_secs * 1000 : 0,
         .body_idle_ms = timeout_secs ? http_body_idle_secs() * 1000 : 0,
         .body_total_ms = timeout_secs ? http_body_total_secs() * 1000 : 0,
         .max_response = 64u * 1024u * 1024u, .receipt = receipt,
