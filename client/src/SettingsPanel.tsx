@@ -602,9 +602,9 @@ export default function SettingsPanel(props: {
           model picker offers "Download weights" in place when the selected
           model+precision is not in the model folder yet. Settings keeps the
           storage half (the folder, what it holds, deleting). */}
-      {/* Context is selected on the cluster page beside the model: exact 256K
-          by default, or explicit 1M. It is a service identity decision rather
-          than an advanced tuning knob. */}
+      {/* Context is selected on the cluster page beside the model: exact 128K
+          by default, or explicit 256K / 1M. It is a service identity decision
+          rather than an advanced tuning knob. */}
       {/* Storage: the folder the download manager writes into, and what it
           holds. Moved here from "Cluster & API" (2026-08-15 reorg) — it
           belongs next to the downloads it serves, not under cluster plumbing.

@@ -22,8 +22,8 @@
 #include "idletoken_model.h"
 #include "idletoken_plan.h"
 
-/* Product contexts are exact 256K (default) and 1M (explicit opt-in), capped
- * by the model's declared ability. There is no automatic smaller tier. */
+/* Product contexts are exact 128K (default), 256K, and 1M, capped by the
+ * model's declared ability. There is no automatic fallback to a smaller tier. */
 /* One row per (model, precision). Raised from 128 on 2026-08-15, when the
  * catalogue stopped listing "the three or four quants we measured" and started
  * listing every precision the upstream repos publish (~140 rows today). A cap

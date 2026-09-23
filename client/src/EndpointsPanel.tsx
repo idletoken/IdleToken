@@ -15,12 +15,10 @@
 //
 // 2026-08-21: cut to the address and nothing else (user's call). The API key
 // row and the three explanatory paragraphs (Authorization header, key-less
-// installs, the NO_PROXY warning) are gone.
-// ⚠ The key itself is NOT gone — a fresh install still mints `apiToken`, hands
-// it to the coordinator, and the coordinator still answers 401 without it. It
-// now lives only in the settings file. If "Claude Code gets 401 and there is no
-// way to find out why" comes back as a report, that is this change, and the fix
-// is to stop minting the token for a loopback-only API — not to re-add prose.
+// installs, the NO_PROXY warning) are gone. Fresh installs now leave
+// `apiToken` empty because the API is loopback-only and rejects browser Origin
+// requests. An operator can still set a token explicitly, and the coordinator
+// then enforces it.
 import { useState } from "react";
 import { useI18n, type Lang } from "./i18n";
 import type { AppSettings } from "./settings";

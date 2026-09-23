@@ -53,8 +53,8 @@ export function asContextTier(v: unknown): ContextTier {
 }
 
 // ---- context bounded by the model -----------------------------------------
-// `tier` is stored-schema compatibility only. Runtime context is now exactly
-// 256K or the explicit 1M opt-in; the coordinator never silently sizes down.
+// `tier` is stored-schema compatibility only. Runtime context comes from the
+// explicit 128K / 256K / 1M picker; the coordinator never silently sizes down.
 export const MODEL_DEFAULT_TIER = 0;
 
 /** The window this model would really launch for the requested tier: the tier
@@ -345,7 +345,7 @@ export const OVERFLOW_UNCAPPED_MILLI = 0;
 export const DEFAULT_SETTINGS: AppSettings = {
   modelId: DEFAULT_MODEL_ID,
   quant: defaultQuant(DEFAULT_MODEL_ID),
-  // Exact 256K by default. Long context is a separate explicit service choice.
+  // Exact 128K by default. 256K and 1M are explicit service choices.
   tier: MODEL_DEFAULT_TIER,
   ctxTokens: DEFAULT_CONTEXT_TOKENS,
   // Full power by default (2026-08-15, was "balanced"): the product's whole
@@ -772,8 +772,8 @@ export function saveSettings(s: AppSettings): void {
 //                       adopt it via the roster broadcast)
 //   quant             → coord `--quant` (selected precision; "" = the model's
 //                       default variant. Joiners adopt it via the roster too)
-//   ctxSize           → coord `--ctx-size` (exact 256K or explicit 1M; feeds
-//                       GPU admission and KV sizing without a fallback ladder)
+//   ctxSize           → coord `--ctx-size` (exact 128K, 256K, or 1M; feeds GPU
+//                       admission and KV sizing without a fallback ladder)
 // Settings without a real engine implementation (KV size/TTL/eviction,
 // sampling defaults, ...) are deliberately NOT carried here —
 // they stay `reserved` in the panel instead of being silently dropped.
@@ -909,8 +909,8 @@ export function engineTuning(
     discoveryPort: s.discoveryPort || 14099,
     modelId: s.modelId || DEFAULT_MODEL_ID,
     quant: s.quant ?? "",
-    // Exact selected service window: 256K by default or explicit 1M. Runtime
-    // may refuse it for insufficient VRAM but never silently reduces it.
+    // Exact selected service window: 128K by default, or explicit 256K / 1M.
+    // Runtime may refuse it for insufficient VRAM but never silently reduces it.
     ctxSize: effectiveCtx(s),
     // Always empty (2026-08-25): the coordinator's auto rule decides the KV
     // dtype where the memory plan is made, so the plan and the engine's

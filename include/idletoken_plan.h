@@ -582,7 +582,7 @@ int idletoken_llama_kv_tier_of_name(const char *name);
 const char *idletoken_llama_kv_type_for_weight(int weight_bits);
 
 /* Legacy diagnostic rounding helper. Product startup uses the exact selected
- * 262144 or 1048576 tokens; it never walks this tier list automatically. */
+ * 131072, 262144, or 1048576 tokens; it never walks this list automatically. */
 uint32_t idletoken_llama_ctx_display_tier(uint32_t max_ctx);
 
 /* GPU-addressable serving pool, exposed so coordinator and planner cannot

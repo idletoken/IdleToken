@@ -248,9 +248,9 @@ static const char *coord_llama_state_name(void) {
  * IDLETOKEN_LLAMA_SLOTS escape hatch can override it. */
 static int g_llama_slots = 1;
 /* Exact selected context, reported unchanged in stats and service identity.
- * It is 256K by default or 1M after explicit opt-in and never grows or shrinks
- * at runtime. g_llama_gpu_only carries the sole supported mode into the
- * sidecar so --poll 0 is applied. */
+ * It is 128K by default, or an explicit 256K / 1M, and never grows or shrinks
+ * at runtime. g_llama_gpu_only carries the sole supported mode into the sidecar
+ * so --poll 0 is applied. */
 static uint32_t g_ctx_display;
 static int      g_llama_gpu_only;
 
@@ -6819,7 +6819,7 @@ static void handle_http_request(int conn_fd,
      * chats are fine") is impossible to interpret from the old message.
      *
      * Switching models makes it arrive sooner: ctx_size is clamped to the
-     * lesser of the model's ability and the current 256K product ceiling at
+     * lesser of the model's ability and the selected product context at
      * startup, so the same conversation that fitted before can stop fitting
      * after a switch, with nothing on screen connecting the two events.
      *
@@ -7597,9 +7597,9 @@ static int llama_resolve_quant(const char *quant, const char *llama_gguf) {
 }
 
 /* The context the coordinator may GRANT for a model: its trained/curated
- * ability capped by today's 256K product policy. Higher native/YaRN metadata
- * stays in the registry for a future long-context decision, but default and
- * explicit client launches are clamped here so estimation and runtime agree. */
+ * ability capped by the largest supported product tier. Higher native/YaRN
+ * metadata stays in the registry, while client launches are clamped here so
+ * estimation and runtime agree. */
 static uint32_t model_ctx_ceiling(const idletoken_model_spec *m) {
     return idletoken_llama_product_ctx_ceiling(m);
 }
@@ -10448,9 +10448,9 @@ int main(int argc, char **argv) {
                                                  rendezvous, &msize, &me);
             }
 
-            /* Runtime serves one exact product context. 256K is the default;
-             * an explicit 1M request stays 1M. The planner either admits that
-             * exact window or refuses it, with no context ladder. */
+            /* Runtime serves one exact product context. 128K is the default;
+             * explicit 256K / 1M requests stay exact. The planner either admits
+             * that window or refuses it, with no context ladder. */
             const uint32_t ctx_ask = ctx_size ? ctx_size : IDLETOKEN_DEFAULT_CONTEXT_TOKENS;
             uint32_t ctx_capped = ctx_ask;
             if (ctx_capped > model_ctx_ceiling(g_model)) {
