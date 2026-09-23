@@ -250,6 +250,38 @@ static void put_num_field(sb_t *b, const char *body, size_t len,
     sb_put(b, v, (size_t)vl);
 }
 
+char *idletoken_sampling_fields(const char *body, size_t len, size_t *out_len) {
+    /* The engine's thinking budget rides here so a local caller's
+     * `reasoning_budget_tokens` survives a borrow: it is a plain number (or -1
+     * for "no budget"), so it seals like any other sampling control, with no
+     * change to overflow.c's format string. The gateway's sealed allowlist is
+     * derived from THIS list (sealed-envelope-contract.spec.ts), so adding it
+     * here is what makes the platform accept it on the borrowed leg. */
+    static const char *keys[] = { "temperature", "top_p", "top_k", "min_p",
+        "repeat_penalty", "presence_penalty", "frequency_penalty", "seed", "stop",
+        "response_format", "logit_bias", "reasoning_budget_tokens" };
+    sb_t b = {0};
+    if (out_len) *out_len = 0;
+    for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) {
+        const char *v = idletoken_json_obj_get(body, len, keys[i]);
+        if (!v) continue;
+        long vl = idletoken_json_value_len(v, body + len);
+        if (vl == 4 && memcmp(v, "null", 4) == 0) continue;
+        int object_control = strcmp(keys[i], "response_format") == 0 || strcmp(keys[i], "logit_bias") == 0;
+        if (vl <= 0 || (object_control ? *v != '{' : strcmp(keys[i], "stop") == 0
+            ? (*v != '"' && *v != '[') : !span_is_number(v, vl))) {
+            if (b.p) { memset(b.p, 0, b.len); free(b.p); }
+            return NULL;
+        }
+        sb_cstr(&b, ",\""); sb_cstr(&b, keys[i]); sb_cstr(&b, "\":");
+        sb_put(&b, v, (size_t)vl);
+    }
+    if (b.oom) { if (b.p) memset(b.p, 0, b.len); free(b.p); return NULL; }
+    if (!b.p) b.p = calloc(1, 1);
+    if (out_len) *out_len = b.len;
+    return b.p;
+}
+
 static int top_int_field(const char *body, size_t len, const char *key, int dflt) {
     const char *v = idletoken_json_obj_get(body, len, key);
     if (!v) return dflt;
@@ -745,7 +777,8 @@ char *idletoken_anthropic_to_openai(const char *body, size_t len,
         size_t tyl;
         if (tvl > 0 &&
             idletoken_json_obj_str(tv, (size_t)tvl, "type", &ty, &tyl) == 0) {
-            const int enabled  = (tyl == 7 && memcmp(ty, "enabled", 7) == 0);
+            const int enabled  = (tyl == 7 && memcmp(ty, "enabled", 7) == 0) ||
+                                 (tyl == 8 && memcmp(ty, "adaptive", 8) == 0);
             const int disabled = (tyl == 8 && memcmp(ty, "disabled", 8) == 0);
             if (enabled || disabled) {
                 sb_cstr(&b, ",\"chat_template_kwargs\":{\"enable_thinking\":");
@@ -759,6 +792,23 @@ char *idletoken_anthropic_to_openai(const char *body, size_t len,
                     sb_cstr(&b, rb);
                 }
             }
+        }
+    }
+
+    {   /* Current Claude Code supplies effort in output_config. Carry it
+         * through the same engine field used by OpenAI clients. */
+        const char *config = idletoken_json_obj_get(body, len, "output_config");
+        const long config_len = config && *config == '{'
+            ? idletoken_json_value_len(config, end) : -1;
+        const char *effort; size_t effort_len;
+        if (config_len > 0 && idletoken_json_obj_str(config, (size_t)config_len,
+                "effort", &effort, &effort_len) == 0 &&
+            ((effort_len == 3 && (!memcmp(effort, "low", 3) || !memcmp(effort, "max", 3))) ||
+             (effort_len == 4 && !memcmp(effort, "high", 4)) ||
+             (effort_len == 6 && !memcmp(effort, "medium", 6)))) {
+            sb_cstr(&b, ",\"reasoning_effort\":\"");
+            sb_put(&b, effort, effort_len);
+            sb_cstr(&b, "\"");
         }
     }
 

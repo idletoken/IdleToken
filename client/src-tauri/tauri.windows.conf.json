@@ -7,6 +7,7 @@
       "licenses/ds4-MIT.txt": "licenses/ds4-MIT.txt",
       "licenses/rax-BSD-3-Clause.txt": "licenses/rax-BSD-3-Clause.txt",
       "licenses/llamacpp-MIT.txt": "licenses/llamacpp-MIT.txt",
+      "licenses/curl.txt": "licenses/curl.txt",
       "licenses/NVIDIA-CUDA-EULA.txt": "licenses/NVIDIA-CUDA-EULA.txt",
       "licenses/gcc-14.2.0-GPL-3.0.txt": "licenses/gcc-14.2.0-GPL-3.0.txt",
       "licenses/gcc-runtime-exception-3.1.txt": "licenses/gcc-runtime-exception-3.1.txt",

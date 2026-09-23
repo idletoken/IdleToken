@@ -1231,28 +1231,45 @@ int idletoken_llama_log_fit_failed(const char *text) {
     return strstr(text, "failed to fit params to free device memory") != NULL;
 }
 
-/* Read whatever the child appended since the last poll and look for conditions
- * the coordinator must refuse over. Called with the mutex held. Line-oriented:
- * a trailing partial line is left for the next poll rather than half-matched. */
+/* Disk opens can pause for seconds under filesystem/antivirus pressure. Never
+ * hold the state mutex during log I/O: the HTTP accept loop reads fatal/state
+ * snapshots under that same mutex. Snapshot the child identity and cursor,
+ * scan outside the lock, then publish only if that child is still current.
+ * A partial line is left for the next poll rather than half-matched. */
 static void llama_scan_log(idletoken_llama *lc) {
-    if (!lc->log_path[0] || lc->fatal[0]) return;
+    pthread_mutex_lock(&lc->mu);
+    if (lc->stop || lc->pid <= 0 || !lc->log_path[0] || lc->fatal[0]) {
+        pthread_mutex_unlock(&lc->mu);
+        return;
+    }
+    const long long pid = lc->pid, spawned_ms = lc->spawned_ms, begin = lc->log_off;
+    pthread_mutex_unlock(&lc->mu);
+
     FILE *f = fopen(lc->log_path, "rb");
     if (!f) return;                       /* not written yet — nothing to read */
-    if (fseek(f, (long)lc->log_off, SEEK_SET) != 0) { fclose(f); return; }
+#ifdef _WIN32
+    int seek_error = _fseeki64(f, begin, SEEK_SET);
+#else
+    int seek_error = fseeko(f, (off_t)begin, SEEK_SET);
+#endif
+    if (seek_error != 0) { fclose(f); return; }
 
+    long long offset = begin;
+    char fatal[sizeof lc->fatal] = "";
     char line[1024];
-    while (fgets(line, sizeof(line), f)) {
+    /* Do not chase a continuously growing log forever and starve supervision. */
+    while (offset - begin < (1 << 20) && fgets(line, sizeof(line), f)) {
         const size_t n = strlen(line);
         if (n == 0) break;
         if (line[n - 1] != '\n' && n < sizeof(line) - 1)
             break;   /* the child is mid-line; re-read it whole next time */
-        lc->log_off += (long long)n;
+        offset += (long long)n;
         if (!idletoken_llama_log_fit_failed(line)) continue;
 
         /* Placement is locked for both single and cluster execution. Reaching
          * this line is a runtime confirmation that the exact GPU-only service
          * does not fit; no environment escape hatch may turn it into paging. */
-        snprintf(lc->fatal, sizeof(lc->fatal),
+        snprintf(fatal, sizeof fatal,
                  "[RESOURCE_INSUFFICIENT] the inference engine could not fit this model into free "
                  "device memory and started anyway (its log: \"%s\"). Serving "
                  "in that state makes the GPU driver page video memory out to "
@@ -1262,11 +1279,22 @@ static void llama_scan_log(idletoken_llama *lc) {
                  "users, or add a machine to the cluster.",
                  line);
         /* Trim the copied engine line to one line's worth of noise. */
-        for (char *p = lc->fatal; *p; p++) if (*p == '\n' || *p == '\r') *p = ' ';
-        fprintf(stderr, "coord: llama-sidecar: %s\n", lc->fatal);
+        for (char *p = fatal; *p; p++) if (*p == '\n' || *p == '\r') *p = ' ';
         break;
     }
     fclose(f);
+
+    int published = 0;
+    pthread_mutex_lock(&lc->mu);
+    if (!lc->stop && lc->pid == pid && lc->spawned_ms == spawned_ms && lc->log_off == begin) {
+        lc->log_off = offset;
+        if (fatal[0] && !lc->fatal[0]) {
+            memcpy(lc->fatal, fatal, sizeof fatal);
+            published = 1;
+        }
+    }
+    pthread_mutex_unlock(&lc->mu);
+    if (published) fprintf(stderr, "coord: llama-sidecar: %s\n", fatal);
 }
 
 /* Terminate the current child from INSIDE the monitor thread (shutdown() does
@@ -1301,6 +1329,7 @@ static void llama_kill_child(idletoken_llama *lc) {
 static void *llama_monitor(void *arg) {
     idletoken_llama *lc = (idletoken_llama *)arg;
     for (;;) {
+        llama_scan_log(lc);
         pthread_mutex_lock(&lc->mu);
         if (lc->stop) { pthread_mutex_unlock(&lc->mu); return NULL; }
 
@@ -1310,7 +1339,6 @@ static void *llama_monitor(void *arg) {
          * reported a condition we must not serve gets stopped here, and the
          * state latches FAILED so nothing restarts it into the same wall.
          * Runs before the reap so the kill below is not read as a crash. */
-        if (lc->pid > 0 && !lc->fatal[0]) llama_scan_log(lc);
         if (lc->fatal[0] && lc->state != IDLETOKEN_LLAMA_FAILED) {
             llama_kill_child(lc);
             lc->state = IDLETOKEN_LLAMA_FAILED;

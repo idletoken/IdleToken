@@ -34,7 +34,9 @@ use serde_json::Value;
 pub struct Secrets(Mutex<Option<BTreeMap<String, String>>>);
 
 fn store_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok()?;
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
     if home.is_empty() {
         return None;
     }
@@ -57,8 +59,12 @@ fn store_path() -> Option<PathBuf> {
 }
 
 fn read_all() -> BTreeMap<String, String> {
-    let Some(p) = store_path() else { return BTreeMap::new() };
-    let Ok(text) = std::fs::read_to_string(p) else { return BTreeMap::new() };
+    let Some(p) = store_path() else {
+        return BTreeMap::new();
+    };
+    let Ok(text) = std::fs::read_to_string(p) else {
+        return BTreeMap::new();
+    };
     serde_json::from_str(&text).unwrap_or_default()
 }
 
@@ -77,7 +83,9 @@ fn write_all(map: &BTreeMap<String, String>) -> Result<(), String> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut f = opts.open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut f = opts
+        .open(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     // An existing file keeps its old mode through `open`, so tighten it too.
     #[cfg(unix)]
     {
@@ -101,13 +109,19 @@ fn with_store<T>(state: &Secrets, f: impl FnOnce(&mut BTreeMap<String, String>) 
 /// `platformGate`) are synchronous and are called during render.
 #[tauri::command]
 pub fn secrets_load(state: tauri::State<'_, Secrets>) -> Value {
-    with_store(&state, |m| serde_json::to_value(m.clone()).unwrap_or_else(|_| Value::Object(Default::default())))
+    with_store(&state, |m| {
+        serde_json::to_value(m.clone()).unwrap_or_else(|_| Value::Object(Default::default()))
+    })
 }
 
 /// Store one credential. An empty value removes it, so "sign out" and "store
 /// nothing" cannot drift apart.
 #[tauri::command]
-pub fn secrets_set(state: tauri::State<'_, Secrets>, key: String, value: String) -> Result<(), String> {
+pub fn secrets_set(
+    state: tauri::State<'_, Secrets>,
+    key: String,
+    value: String,
+) -> Result<(), String> {
     with_store(&state, |m| {
         if value.is_empty() {
             m.remove(&key);
@@ -151,7 +165,11 @@ mod tests {
         // Not asserting the exact path (it depends on HOME), only that it is
         // inside the per-user IdleToken directory and not a temp/shared one.
         if let Some(p) = store_path() {
-            assert!(p.ends_with(".idletoken/client-secrets.json"), "{}", p.display());
+            assert!(
+                p.ends_with(".idletoken/client-secrets.json"),
+                "{}",
+                p.display()
+            );
         }
     }
 }

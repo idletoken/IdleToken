@@ -1,0 +1,125 @@
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -641,19 +641,11 @@
+ }
+ 
+ void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
+-    @autoreleasepool {
+-        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+-        id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+-
+-        ggml_metal_event_encode_wait(ev, cmd_buf);
+-
+-        [cmd_buf commit];
+-
+-        [ctx->cmd_bufs_ext addObject:cmd_buf];
+-        ctx->cmd_buf_last = cmd_buf;
+-
+-        [cmd_buf retain];
+-    }
++    // An unsignaled shared-event wait can time out on the GPU while an earlier
++    // command is still computing successfully. Wait on the host before any
++    // dependent operation is submitted, preserving the event dependency and
++    // the existing bounded, fail-closed event completion check.
++    ggml_metal_device_event_synchronize(ctx->dev, ev);
+ }
+ 
+ ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx) {
+
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -1489,6 +1489,22 @@
+         std::vector<ggml_tensor *> fused_nodes_to_verify = fusion_test_nodes();
+         if (fused_nodes_to_verify.size() == 0 && run_whole_graph()) {
+             fused_nodes_to_verify.push_back(out);
++        }
++        if (getenv("IDLETOKEN_METAL_EVENT_TEST")) {
++            ggml_backend_event_t event = ggml_backend_event_new(ggml_backend_get_device(backend1));
++            GGML_ASSERT(event);
++            const int repeats = 4;
++            for (int repeat = 0; repeat < repeats; ++repeat) {
++                GGML_ASSERT(ggml_backend_graph_compute_async(backend1, gf) == GGML_STATUS_SUCCESS);
++                ggml_backend_event_record(event, backend1);
++                if (!getenv("IDLETOKEN_METAL_EVENT_SKIP_WAIT")) {
++                    ggml_backend_event_wait(backend1, event);
++                }
++            }
++            ggml_backend_event_synchronize(event);
++            ggml_backend_synchronize(backend1);
++            ggml_backend_event_free(event);
++            fprintf(stderr, "METAL_EVENT_TEST_COMPLETED repeats=%d\n", repeats);
+         }
+         const bool cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
+                                                                run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
+@@ -7089,7 +7105,9 @@
+             }
+             ggml_tensor * t;
+             if (is_view) {
+-                ggml_tensor * t0 = ggml_new_tensor_4d(ctx, type, ne_perm[0], 2*ne_perm[1], ne_perm[2], ne_perm[3]);
++                ggml_tensor * t0 = getenv("IDLETOKEN_METAL_EVENT_TEST")
++                    ? ggml_new_tensor_4d(ctx, type, ne_perm[0], ne_perm[1], std::max<int64_t>(262144, ne_perm[2]), ne_perm[3])
++                    : ggml_new_tensor_4d(ctx, type, ne_perm[0], 2*ne_perm[1], ne_perm[2], ne_perm[3]);
+                 t = ggml_view_4d(ctx, t0, ne_perm[0], ne_perm[1], ne_perm[2], ne_perm[3], t0->nb[1], t0->nb[2], t0->nb[3], 0);
+             } else {
+                 t = ggml_new_tensor_4d(ctx, type, ne_perm[0], ne_perm[1], ne_perm[2], ne_perm[3]);
+@@ -7136,9 +7154,19 @@
+         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
+         ggml_flash_attn_ext_add_sinks(out, s);
+         ggml_flash_attn_ext_set_prec (out, prec);
++        const int chain = getenv("IDLETOKEN_METAL_EVENT_TEST") && kv == 262144 ? 6 : 1;
++        for (int layer = 1; layer < chain; ++layer) {
++            ggml_tensor * next_q = ggml_permute(ctx, out, 0, 2, 1, 3);
++            out = ggml_flash_attn_ext(ctx, next_q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
++            ggml_flash_attn_ext_add_sinks(out, s);
++            ggml_flash_attn_ext_set_prec(out, prec);
++        }
+         ggml_set_name(out, "out");
+-
+         return out;
++    }
++
++    bool run_whole_graph() override {
++        return getenv("IDLETOKEN_METAL_EVENT_TEST") != nullptr;
+     }
+ 
+     void initialize_tensors(ggml_context * ctx) override {
+@@ -7147,7 +7175,18 @@
+                 // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
+                 init_tensor_uniform(t, -10.0f, 10.0f);
+             } else if (strcmp(t->name, "m") == 0) {
+-                init_tensor_kq_mask(t);
++                if (getenv("IDLETOKEN_METAL_EVENT_TEST")) {
++                    std::vector<ggml_fp16_t> data(t->ne[0] * t->ne[1]);
++                    for (int64_t query = 0; query < t->ne[1]; ++query) {
++                        for (int64_t key = 0; key < t->ne[0]; ++key) {
++                            data[query*t->ne[0] + key] = ggml_fp32_to_fp16(
++                                key <= t->ne[0] - t->ne[1] + query ? 0.0f : -INFINITY);
++                        }
++                    }
++                    ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(ggml_fp16_t));
++                } else {
++                    init_tensor_kq_mask(t);
++                }
+             } else {
+                 init_tensor_uniform(t);
+             }
+@@ -8265,6 +8304,19 @@
+ // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
++    // Opt-in regression: long successful compute followed by an event wait.
++    // The production Qwen3.5 layout uses a full 256K Q8 cache and causal mask.
++    // Six dependent attention operations keep the command busy long enough to
++    // expose GPU event-wait timeouts; the existing CPU oracle checks its data.
++    if (const char * value = getenv("IDLETOKEN_METAL_EVENT_TEST")) {
++        const int64_t kv = std::stoll(value);
++        GGML_ASSERT(kv == 4096 || kv == 262144);
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {4, 1}, kv, 512,
++                                                       true, false, 0, 0, GGML_PREC_F32,
++                                                       GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
++        return test_cases;
++    }
++
+     std::default_random_engine rng(0);
+ 
+     // unary ops

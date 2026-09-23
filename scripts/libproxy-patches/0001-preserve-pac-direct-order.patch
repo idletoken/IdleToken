@@ -1,0 +1,25 @@
+From: IdleToken maintainers
+Subject: Preserve explicit DIRECT entries and their order in PAC results
+
+libproxy 0.5.4 parses only METHOD SERVER pairs, discarding DIRECT when a
+proxy is also present. This breaks explicitly configured fallback and can
+also force traffic through a proxy when DIRECT was first. Keep DIRECT as
+an ordinary ordered entry; do not invent fallback for failed PAC scripts.
+
+--- a/src/backend/px-manager.c
++++ b/src/backend/px-manager.c
+@@ -479,6 +479,13 @@
+   for (int idx = 0; idx < g_strv_length (proxies_split); idx++) {
+     char *line = g_strstrip (proxies_split[idx]);
++    g_auto (GStrv) word_split = NULL;
++    /* DIRECT has no server argument and must retain its PAC position. */
++    if (g_ascii_strcasecmp (line, "DIRECT") == 0) {
++      px_strv_builder_add_proxy (builder, "direct://");
++      continue;
++    }
++
+-    g_auto (GStrv) word_split = g_strsplit (line, " ", -1);
++    word_split = g_strsplit (line, " ", -1);
+ 
+     /* Check for syntax "METHOD SERVER" */
+     if (g_strv_length (word_split) == 2) {

@@ -7,10 +7,20 @@ use tauri_plugin_shell::ShellExt;
 
 mod engine;
 mod pairing;
+mod platform_network;
 mod secrets;
 mod tray;
 mod weights;
 mod window;
+
+/// The header every platform request advertises its client version under. Named
+/// (not a literal at the call site) so the DIST-07 source contract can prove the
+/// tag is present; mirrors `IDLETOKEN_VERSION_HEADER` in client/src/platformHttp.ts
+/// and `IDLETOKEN_VERSION_HTTP_HEADER` in the C agent. Used only by the mobile
+/// direct-reqwest path; desktop reaches the platform through the agent helper,
+/// which stamps the same header itself (platform_network::request).
+#[cfg_attr(not(mobile), allow(dead_code))]
+const IDLETOKEN_VERSION_HEADER: &str = "X-IdleToken-Version";
 
 /// Set once a quit has been decided (tray "Quit", the front end's quit path,
 /// or an OS-level exit request). It is what tells the window's close handler
@@ -235,7 +245,13 @@ async fn plan_resources(
         .shell()
         .sidecar("idletoken-worker")
         .map_err(|e| format!("sidecar not found (bundle binaries/idletoken-worker): {e}"))?;
-    let blank = |s: &str| if s.trim().is_empty() { "-".to_string() } else { s.trim().to_string() };
+    let blank = |s: &str| {
+        if s.trim().is_empty() {
+            "-".to_string()
+        } else {
+            s.trim().to_string()
+        }
+    };
     let output = sidecar
         .args([
             "--plan-json",
@@ -435,7 +451,11 @@ fn engine_request_json_blocking(
         .ok_or_else(|| format!("unsupported API url (need http://): {base_url}"))?
         .trim_end_matches('/')
         .to_string();
-    let host = host_port.split(':').next().unwrap_or(&host_port).to_string();
+    let host = host_port
+        .split(':')
+        .next()
+        .unwrap_or(&host_port)
+        .to_string();
     let req = match body {
         None => format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"),
         Some(b) => format!(
@@ -449,7 +469,9 @@ fn engine_request_json_blocking(
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(10)))
         .ok();
-    stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| e.to_string())?;
 
     let mut raw: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -517,105 +539,70 @@ struct PlatformResponse {
     body: String,
 }
 
-const IDLETOKEN_VERSION_HEADER: &str = "X-IdleToken-Version";
-
-fn platform_request_builder(
-    client: &reqwest::blocking::Client,
-    method: reqwest::Method,
-    url: reqwest::Url,
-) -> reqwest::blocking::RequestBuilder {
-    // Compatibility metadata only.  CARGO_PKG_VERSION is the package version
-    // Cargo compiled into this exact binary; the release gate keeps it aligned
-    // with package.json and tauri.conf.json.  A modified client can copy it, so
-    // the gateway must never treat this header as authentication or attestation.
-    client
-        .request(method, url)
-        .header(IDLETOKEN_VERSION_HEADER, env!("CARGO_PKG_VERSION"))
-}
-
 #[tauri::command]
 async fn platform_http(
+    app: tauri::AppHandle,
     method: String,
     url: String,
     body: Option<String>,
     bearer: Option<String>,
+    timeout_ms: Option<u64>,
 ) -> Result<PlatformResponse, String> {
-    // Not a general-purpose fetch hole punched through the CSP: the scheme must
-    // be https, with plain http allowed only for a loopback host so a developer
-    // can point at a gateway on their own machine. The webview loads nothing but
-    // this app's own bundled assets, so the realistic threat is small — but
-    // "the frontend can ask the native side to talk to any host" is worth not
-    // being true for the sake of two lines.
-    let parsed = reqwest::Url::parse(&url).map_err(|e| format!("bad platform URL: {e}"))?;
-    let host = parsed.host_str().unwrap_or("");
-    let local = host == "localhost" || host == "127.0.0.1" || host == "::1";
-    if parsed.scheme() != "https" && !(parsed.scheme() == "http" && local) {
-        return Err(format!("refusing a non-HTTPS platform request to {host}"));
+    let url = platform_network::validate_url(&url)?;
+    reqwest::Method::from_bytes(method.as_bytes()).map_err(|_| "invalid HTTP method")?;
+    #[cfg(desktop)]
+    {
+        let command = app
+            .shell()
+            .sidecar("idletoken-platform-agent")
+            .map_err(|_| "bundled network helper is missing; reinstall IdleToken")?;
+        platform_network::request(command.into(), method, url, body, bearer, timeout_ms).await
     }
-
-    tauri::async_runtime::spawn_blocking(move || {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(20))
-            .build()
-            .map_err(|e| e.to_string())?;
-        let m = reqwest::Method::from_bytes(method.as_bytes())
-            .map_err(|_| format!("bad HTTP method {method}"))?;
-        let mut req = platform_request_builder(&client, m, parsed);
-        if let Some(t) = bearer {
-            req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {t}"));
-        }
-        if let Some(b) = body {
-            req = req.header(reqwest::header::CONTENT_TYPE, "application/json").body(b);
-        }
-        let res = req.send().map_err(|e| e.to_string())?;
-        let status = res.status().as_u16();
-        // A body that cannot be read is not a status we can report honestly, so
-        // it is an error rather than an empty string — an empty body means the
-        // caller sees "the server sent no token", which would be a lie.
-        let body = res.text().map_err(|e| e.to_string())?;
-        Ok(PlatformResponse { status, body })
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-#[cfg(test)]
-mod platform_http_tests {
-    #[test]
-    fn native_platform_requests_use_the_compiled_cargo_version() {
-        let client = reqwest::blocking::Client::new();
-        let request = super::platform_request_builder(
-            &client,
-            reqwest::Method::POST,
-            reqwest::Url::parse("https://idletoken.ai/providers/p-1/heartbeat").unwrap(),
-        )
-        .build()
-        .unwrap();
-        assert_eq!(
-            request
-                .headers()
-                .get(super::IDLETOKEN_VERSION_HEADER)
-                .and_then(|v| v.to_str().ok()),
-            Some(env!("CARGO_PKG_VERSION")),
-        );
-
-        // Drift check against the browser build's existing release metadata,
-        // not a second handwritten version constant.
-        let package: serde_json::Value =
-            serde_json::from_str(include_str!("../../package.json")).unwrap();
-        assert_eq!(
-            package.get("version").and_then(|value| value.as_str()),
-            Some(env!("CARGO_PKG_VERSION")),
-        );
+    #[cfg(mobile)]
+    {
+        // Mobile control builds do not ship executable compute sidecars.
+        // Preserve their existing native request path; desktop parity evidence
+        // must not be reported as mobile PAC/certificate-store validation.
+        let _ = app;
+        tauri::async_runtime::spawn_blocking(move || {
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_millis(
+                    timeout_ms.unwrap_or(20_000).clamp(1, 120_000),
+                ))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|_| "could not initialize platform transport")?;
+            let method = reqwest::Method::from_bytes(method.as_bytes())
+                .map_err(|_| "invalid HTTP method")?;
+            let mut request = client
+                .request(method, url)
+                .header(IDLETOKEN_VERSION_HEADER, env!("CARGO_PKG_VERSION"));
+            if let Some(token) = bearer {
+                request = request.bearer_auth(token);
+            }
+            if let Some(body) = body {
+                request = request
+                    .header("Content-Type", "application/json")
+                    .body(body);
+            }
+            let response = request.send().map_err(|_| "platform connection failed")?;
+            let status = response.status().as_u16();
+            let body = response.text().map_err(|_| "incomplete platform reply")?;
+            Ok(PlatformResponse { status, body })
+        })
+        .await
+        .map_err(|_| "platform request task failed".to_string())?
     }
 }
 
 /// The cluster's capability table (engine `GET /idletoken/v1/capability`).
 #[tauri::command]
 async fn api_capability(base_url: String) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || engine_get_json_blocking(&base_url, "/idletoken/v1/capability"))
-        .await
-        .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        engine_get_json_blocking(&base_url, "/idletoken/v1/capability")
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// GET the cluster's serving counters (engine `GET /idletoken/v1/stats`) for the
@@ -623,9 +610,11 @@ async fn api_capability(base_url: String) -> Result<Value, String> {
 /// plain LAN HTTP without CORS headers.
 #[tauri::command]
 async fn api_stats(base_url: String) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || engine_get_json_blocking(&base_url, "/idletoken/v1/stats"))
-        .await
-        .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        engine_get_json_blocking(&base_url, "/idletoken/v1/stats")
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Switch borrowing on or off on the RUNNING coordinator.
@@ -736,7 +725,12 @@ async fn api_chat_stream(
             );
         };
         let out = stream_chat_inner(
-            &base_url, &messages, &token, &model, max_tokens, &cancel,
+            &base_url,
+            &messages,
+            &token,
+            &model,
+            max_tokens,
+            &cancel,
             &mut |t| emit("delta", Some(t), None),
             &mut |t| emit("reasoning", Some(t), None),
             // Prefill progress: "128/512" tokens of the prompt processed. On a
@@ -830,7 +824,9 @@ fn stream_chat_inner(
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(READ_SLICE_S)))
         .ok();
-    stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| e.to_string())?;
 
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
     let mut headers_done = false;
@@ -858,7 +854,12 @@ fn stream_chat_inner(
             // with a tick per prefill chunk, so silence this long means the
             // cluster really did stall — say that, in words, instead of
             // surfacing "os error 10060", which is what the user actually saw.
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
                 // One quiet slice is normal (a queued turn is silent until the
                 // coordinator reaches it). Only the ACCUMULATED silence counts
                 // against the liveness ceiling; going back round the loop is
@@ -937,11 +938,18 @@ fn stream_chat_inner(
                     }
                     continue;
                 }
-                let Some(data) = line.strip_prefix("data: ") else { continue };
+                let Some(data) = line.strip_prefix("data: ") else {
+                    continue;
+                };
                 // OpenAI's terminator is a sentinel, not JSON, so it has to be
                 // matched before the parse.
-                if data.trim() == "[DONE]" { stream_ended = true; continue; }
-                let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
+                if data.trim() == "[DONE]" {
+                    stream_ended = true;
+                    continue;
+                }
+                let Ok(v) = serde_json::from_str::<Value>(data) else {
+                    continue;
+                };
                 // Anthropic's terminator. END ON THE PROTOCOL, NOT ON THE
                 // SOCKET: this loop used to exit only on EOF, so if the server
                 // held the connection open after the last frame — which is
@@ -951,7 +959,10 @@ fn stream_chat_inner(
                 // waiting, and 300 seconds later reported the generation as cut
                 // off. A finished stream says so; waiting for the peer to hang
                 // up is not a termination condition.
-                if v["type"] == "message_stop" { stream_ended = true; continue; }
+                if v["type"] == "message_stop" {
+                    stream_ended = true;
+                    continue;
+                }
                 if v["type"] == "content_block_delta" {
                     if let Some(t) = v["delta"]["text"].as_str() {
                         on_delta(t);
@@ -1010,9 +1021,8 @@ fn stream_chat_inner(
                 format!("[CHAT_BUSY] {why}")
             });
         }
-        let v: Value = serde_json::from_str(payload.trim()).map_err(|_| {
-            format!("cluster replied HTTP {status} with: {}", payload.trim())
-        })?;
+        let v: Value = serde_json::from_str(payload.trim())
+            .map_err(|_| format!("cluster replied HTTP {status} with: {}", payload.trim()))?;
         if let Some(t) = v["content"][0]["text"].as_str() {
             on_delta(t);
             return Ok(());
@@ -1191,9 +1201,7 @@ fn main() {
             if let Err(e) = window::install_fullscreen_exit_observer(&handle) {
                 // Fail safe: full-screen close-to-tray will stay visible
                 // instead of risking a black, stranded macOS Space.
-                eprintln!(
-                    "idletoken-client: macOS full-screen close observer unavailable: {e}"
-                );
+                eprintln!("idletoken-client: macOS full-screen close observer unavailable: {e}");
             }
             if window::load(&handle).tray_icon {
                 tray::install(&handle);
@@ -1356,7 +1364,12 @@ mod stream_tests {
         let mut prog: Vec<(u32, u32, u32)> = Vec::new();
         let msgs = serde_json::json!([{ "role": "user", "content": "hi" }]);
         let out = super::stream_chat_inner(
-            &url, &msgs, "", "m", None, &cancel,
+            &url,
+            &msgs,
+            "",
+            "m",
+            None,
+            &cancel,
             &mut |t| text.push_str(t),
             &mut |t| reasoning.push_str(t),
             &mut |d, n, r| prog.push((d, n, r)),
@@ -1440,7 +1453,10 @@ mod stream_tests {
         let (out, text, reasoning, _) = run(script);
         assert!(out.is_ok(), "{out:?}");
         assert_eq!(text, "plain");
-        assert!(reasoning.is_empty(), "got unexpected reasoning: {reasoning:?}");
+        assert!(
+            reasoning.is_empty(),
+            "got unexpected reasoning: {reasoning:?}"
+        );
     }
 
     #[test]
@@ -1458,14 +1474,19 @@ mod stream_tests {
         .as_bytes();
         let (out, text, _, _) = run(script);
         assert_eq!(out.unwrap_err(), "cluster prefill failed");
-        assert_eq!(text, "partial", "text received before the error must survive");
+        assert_eq!(
+            text, "partial",
+            "text received before the error must survive"
+        );
     }
 
     #[test]
     fn openai_shaped_error_frame_also_fails() {
         let script: &'static [u8] = Box::leak(
-            format!("{HEAD}data: {{\"error\":{{\"type\":\"api_error\",\"message\":\"boom\"}}}}\n\n")
-                .into_boxed_str(),
+            format!(
+                "{HEAD}data: {{\"error\":{{\"type\":\"api_error\",\"message\":\"boom\"}}}}\n\n"
+            )
+            .into_boxed_str(),
         )
         .as_bytes();
         assert_eq!(run(script).0.unwrap_err(), "boom");
@@ -1490,7 +1511,10 @@ cluster.\"},\"prompt_tokens\":32984,\"context_size\":32768}";
         )
         .as_bytes();
         let err = run(script).0.unwrap_err();
-        assert!(err.starts_with("This conversation needs 33000 tokens"), "{err}");
+        assert!(
+            err.starts_with("This conversation needs 33000 tokens"),
+            "{err}"
+        );
         assert!(err.contains("raise the context tier"), "{err}");
     }
 
@@ -1512,7 +1536,10 @@ cluster.\"},\"prompt_tokens\":32984,\"context_size\":32768}";
         )
         .as_bytes();
         let err = run(script).0.unwrap_err();
-        assert!(err.starts_with("[CHAT_BUSY] all sequence slots busy"), "{err}");
+        assert!(
+            err.starts_with("[CHAT_BUSY] all sequence slots busy"),
+            "{err}"
+        );
         assert!(err.contains("retrying in 7s"), "{err}");
     }
 
@@ -1557,7 +1584,12 @@ cluster.\"},\"prompt_tokens\":32984,\"context_size\":32768}";
                 let mut text = String::new();
                 let msgs = serde_json::json!([{ "role": "user", "content": "hi" }]);
                 let out = super::stream_chat_inner(
-                    &url, &msgs, "", "m", None, &cancel,
+                    &url,
+                    &msgs,
+                    "",
+                    "m",
+                    None,
+                    &cancel,
                     &mut |t| text.push_str(t),
                     &mut |_| {},
                     &mut |_, _, _| {},
@@ -1580,15 +1612,27 @@ cluster.\"},\"prompt_tokens\":32984,\"context_size\":32768}";
     fn cancelling_one_request_leaves_the_others_running() {
         let a = super::chat_register("req-a");
         let b = super::chat_register("req-b");
-        assert!(super::api_chat_cancel("req-a".into()), "a live id must be found");
+        assert!(
+            super::api_chat_cancel("req-a".into()),
+            "a live id must be found"
+        );
         assert!(a.load(std::sync::atomic::Ordering::SeqCst));
-        assert!(!b.load(std::sync::atomic::Ordering::SeqCst), "cancelling A stopped B");
+        assert!(
+            !b.load(std::sync::atomic::Ordering::SeqCst),
+            "cancelling A stopped B"
+        );
         super::chat_unregister("req-a");
         // Unregistering A must not have taken B's entry with it, and a stop for
         // an id that has already finished must answer honestly (false) so the
         // UI can fall back to recovering its own state.
-        assert!(!super::api_chat_cancel("req-a".into()), "a finished id must report not-found");
-        assert!(super::api_chat_cancel("req-b".into()), "B's registration was collateral damage");
+        assert!(
+            !super::api_chat_cancel("req-a".into()),
+            "a finished id must report not-found"
+        );
+        assert!(
+            super::api_chat_cancel("req-b".into()),
+            "B's registration was collateral damage"
+        );
         super::chat_unregister("req-b");
     }
 
@@ -1634,7 +1678,12 @@ cluster.\"},\"prompt_tokens\":32984,\"context_size\":32768}";
         let msgs = serde_json::json!([{ "role": "user", "content": "hi" }]);
         let t0 = std::time::Instant::now();
         let out = super::stream_chat_inner(
-            &url, &msgs, "", "m", None, &cancel,
+            &url,
+            &msgs,
+            "",
+            "m",
+            None,
+            &cancel,
             &mut |_| {},
             &mut |_| {},
             &mut |_, _, _| {},
@@ -1643,7 +1692,10 @@ cluster.\"},\"prompt_tokens\":32984,\"context_size\":32768}";
         done.store(true, std::sync::atomic::Ordering::SeqCst);
         // A cancelled stream is a normal end, not a failure: whatever already
         // streamed in is kept and the turn is not marked as errored.
-        assert!(out.is_ok(), "a cancelled stream must not be an error: {out:?}");
+        assert!(
+            out.is_ok(),
+            "a cancelled stream must not be an error: {out:?}"
+        );
         assert!(
             dt < std::time::Duration::from_secs(5),
             "cancel took {dt:?}; it must land within about one read slice"

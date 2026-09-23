@@ -2,7 +2,8 @@
  *
  * v0.1 scope: synchronous, one-connection-at-a-time, request/response only.
  * Supports just enough for OpenAI /v1/chat/completions and Anthropic
- * /v1/messages with JSON bodies. No keep-alive, no chunked, no TLS.
+ * /v1/messages with JSON bodies. Fixed-length and chunked requests are decoded;
+ * Expect: 100-continue is supported. No keep-alive or TLS at this layer.
  *
  * SSE ("stream":true) is supported via connection-close-delimited streaming:
  * idletoken_http_send_sse_head() sends a 200 + `Content-Type: text/event-stream`
@@ -21,8 +22,8 @@
 
 #define IDLETOKEN_HTTP_METHOD_MAX 8
 #define IDLETOKEN_HTTP_PATH_MAX   256
-#define IDLETOKEN_HTTP_BODY_CAP   (4u * 1024u * 1024u) /* 4 MiB cap on request body */
-#define IDLETOKEN_HTTP_HEADERS_CAP 4096              /* retained raw header block */
+#define IDLETOKEN_HTTP_BODY_CAP   (32u * 1024u * 1024u) /* matches platform prompt budget */
+#define IDLETOKEN_HTTP_HEADERS_CAP (16u * 1024u)       /* never truncate policy headers */
 
 typedef struct {
     char    method[IDLETOKEN_HTTP_METHOD_MAX];   /* "GET", "POST", ... */
@@ -30,15 +31,15 @@ typedef struct {
     uint8_t *body;                            /* malloc'd; caller frees */
     size_t  body_len;
     int     keepalive_unused;                 /* reserved */
-    /* Raw header block ("Name: value\r\n..."), NUL-terminated, truncated at
-     * IDLETOKEN_HTTP_HEADERS_CAP-1. Fixed-size on purpose: existing callers only
+    /* Complete raw header block ("Name: value\r\n..."), NUL-terminated.
+     * Overlong headers are refused, never silently truncated. Existing callers only
      * free `body`, and typical headers are well under 2 KB. Query it with
      * idletoken_http_header_get(). */
     char    headers[IDLETOKEN_HTTP_HEADERS_CAP];
 } idletoken_http_req;
 
 /* Read one HTTP request from `conn_fd`. Parses request line + headers +
- * fixed-length body (Content-Length). Returns 0 on success, -1 on parse
+ * fixed-length or chunked body. Returns 0 on success, -1 on parse
  * or I/O error (errno may be EPROTO / EMSGSIZE / ECONNRESET / etc.).
  *
  * On success, populates `*out` and `out->body` is malloc'd (may be NULL if
@@ -46,6 +47,18 @@ typedef struct {
  *
  * Caps body at IDLETOKEN_HTTP_BODY_CAP; oversize → -1, EMSGSIZE. */
 int idletoken_http_read_request(int conn_fd, idletoken_http_req *out);
+
+/* Classify a complete peeked header for control-plane scheduling only. Returns
+ * 1 for a framed, bodyless GET and copies its query-free path, 0 otherwise.
+ * The serving worker must still parse the request and apply every policy gate. */
+int idletoken_http_bodyless_get_path(const uint8_t *head, size_t length,
+                                    char *path, size_t path_capacity);
+
+/* After sending an early framing error, half-close and briefly drain unread
+ * upload bytes so a TCP reset does not erase the error on Windows. Caller then
+ * closes the socket. Bounded to wait_ms and 1 MiB, never an unbounded upload.
+ * A zero wait drains only immediately available bytes (for accept loops). */
+void idletoken_http_finish_rejection(int conn_fd, int wait_ms);
 
 /* Send a status line + Content-Type + Content-Length header + body in one
  * shot. status is the numeric HTTP status (200/400/404/500/501).

@@ -3,15 +3,41 @@
   "bundle": {
     "linux": {
       "deb": {
+        "depends": [
+          "libgtk-3-0",
+          "libwebkit2gtk-4.1-0",
+          "libayatana-appindicator3-1",
+          "librsvg2-2",
+          "libcurl4 (>= 7.68) | libcurl4t64 (>= 7.68)",
+          "ca-certificates",
+          "libc6 (>= 2.39)",
+          "libglib2.0-0 (>= 2.72) | libglib2.0-0t64 (>= 2.72)",
+          "libduktape207 (>= 2.7)",
+          "gsettings-desktop-schemas"
+        ],
         "files": {
           "/usr/lib/IdleToken/cuda": "runtime/linux/cuda/",
-          "/usr/bin": "runtime/linux/engine-digests/"
+          "/usr/bin": "runtime/linux/engine-digests/",
+          "/usr/lib/IdleToken/network": "runtime/linux/network/"
         }
       },
       "rpm": {
+        "depends": [
+          "gtk3",
+          "webkit2gtk4.1",
+          "libappindicator-gtk3",
+          "librsvg2",
+          "libcurl >= 7.68",
+          "ca-certificates",
+          "glibc >= 2.39",
+          "glib2 >= 2.72",
+          "duktape >= 2.7",
+          "gsettings-desktop-schemas"
+        ],
         "files": {
           "/usr/lib/IdleToken/cuda": "runtime/linux/cuda/",
-          "/usr/bin": "runtime/linux/engine-digests/"
+          "/usr/bin": "runtime/linux/engine-digests/",
+          "/usr/lib/IdleToken/network": "runtime/linux/network/"
         }
       }
     }

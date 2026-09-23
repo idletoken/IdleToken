@@ -159,7 +159,8 @@ pub fn weights_state(
     // Otherwise: the final file exists and is no smaller than the lower bound.
     // expect_bytes==0 means the manifest does not state it, and then "it exists,
     // so it is complete" is the best judgment we can offer.
-    let complete = part_len == 0 && final_len > 0 && (expect_bytes == 0 || final_len >= expect_bytes);
+    let complete =
+        part_len == 0 && final_len > 0 && (expect_bytes == 0 || final_len >= expect_bytes);
     // Cheap check only — this command must stay instant, so it consults the
     // marker written by a past verification, never the file contents. A
     // complete-but-unverified file is the caller's cue to run weights_verify.
@@ -346,8 +347,7 @@ struct StoredWeightGroup {
 fn metadata_is_link(md: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-    md.file_type().is_symlink()
-        || md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    md.file_type().is_symlink() || md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 #[cfg(not(windows))]
@@ -385,7 +385,11 @@ fn split_gguf_key(rel: &str) -> Option<(String, u32, u32)> {
     if part == 0 || total == 0 || part > total {
         return None;
     }
-    let first = format!("{prefix}-{:0width$}-of-{total_s}.gguf", 1, width = part_s.len());
+    let first = format!(
+        "{prefix}-{:0width$}-of-{total_s}.gguf",
+        1,
+        width = part_s.len()
+    );
     let key = if parent.is_empty() {
         first
     } else {
@@ -404,7 +408,9 @@ fn collect_weight_files(root: &Path, dir: &Path, depth: usize, out: &mut Vec<(St
     let Ok(rd) = fs::read_dir(dir) else { return };
     for entry in rd.flatten() {
         let path = entry.path();
-        let Ok(md) = fs::symlink_metadata(&path) else { continue };
+        let Ok(md) = fs::symlink_metadata(&path) else {
+            continue;
+        };
         // Do not follow a symlink/junction placed inside the model folder. The
         // configured folder itself may be a junction (a normal Windows disk
         // migration), but a nested reparse point could escape the delete root
@@ -419,7 +425,9 @@ fn collect_weight_files(root: &Path, dir: &Path, depth: usize, out: &mut Vec<(St
         if !md.is_file() {
             continue;
         }
-        let Ok(rel_path) = path.strip_prefix(root) else { continue };
+        let Ok(rel_path) = path.strip_prefix(root) else {
+            continue;
+        };
         let rel = relative_for_ui(rel_path);
         let (base, partial) = match rel.strip_suffix(".part") {
             Some(b) => (b.to_string(), true),
@@ -448,11 +456,16 @@ pub fn weights_list(dest_dir: String) -> Vec<StoredWeights> {
     let mut groups: BTreeMap<String, StoredWeightGroup> = BTreeMap::new();
     for (base, bytes, partial) in found {
         let split = split_gguf_key(&base);
-        let key = split.as_ref().map(|v| v.0.clone()).unwrap_or_else(|| base.clone());
-        let g = groups.entry(key.clone()).or_insert_with(|| StoredWeightGroup {
-            file: key,
-            ..StoredWeightGroup::default()
-        });
+        let key = split
+            .as_ref()
+            .map(|v| v.0.clone())
+            .unwrap_or_else(|| base.clone());
+        let g = groups
+            .entry(key.clone())
+            .or_insert_with(|| StoredWeightGroup {
+                file: key,
+                ..StoredWeightGroup::default()
+            });
         g.files.insert(base);
         g.bytes = g.bytes.saturating_add(bytes);
         g.has_partial |= partial;
@@ -483,17 +496,26 @@ fn validate_weight_relative(file: &str) -> Result<PathBuf, String> {
     // The scanner emits this portable form on every OS. Keeping one accepted
     // separator makes the traversal rules identical in Windows and Unix tests.
     if file.is_empty() || file.contains('\\') || file.starts_with('/') {
-        return Err(format!("refusing to delete {file:?}: not a relative weights path"));
+        return Err(format!(
+            "refusing to delete {file:?}: not a relative weights path"
+        ));
     }
     let pieces: Vec<&str> = file.split('/').collect();
-    if pieces.iter().any(|p| p.is_empty() || *p == "." || *p == ".." || p.contains(':'))
+    if pieces
+        .iter()
+        .any(|p| p.is_empty() || *p == "." || *p == ".." || p.contains(':'))
         || !pieces.last().is_some_and(|p| p.ends_with(".gguf"))
     {
         return Err(format!("refusing to delete {file:?}: not a weights path"));
     }
     let path = PathBuf::from(file);
-    if path.components().any(|c| !matches!(c, Component::Normal(_))) {
-        return Err(format!("refusing to delete {file:?}: path leaves the model folder"));
+    if path
+        .components()
+        .any(|c| !matches!(c, Component::Normal(_)))
+    {
+        return Err(format!(
+            "refusing to delete {file:?}: path leaves the model folder"
+        ));
     }
     Ok(path)
 }
@@ -526,8 +548,10 @@ pub fn weights_adopt(
     if from == to || expect_bytes == 0 || expect_sha256.is_empty() {
         return false;
     }
-    let (Ok(rel_from), Ok(rel_to)) = (validate_weight_relative(&from), validate_weight_relative(&to))
-    else {
+    let (Ok(rel_from), Ok(rel_to)) = (
+        validate_weight_relative(&from),
+        validate_weight_relative(&to),
+    ) else {
         return false;
     };
     let root = PathBuf::from(&dest_dir);
@@ -581,7 +605,9 @@ pub fn weights_delete(dest_dir: String, files: Vec<String>) -> Result<u64, Strin
         let rel = validate_weight_relative(file)?;
         let mut current = root.clone();
         for component in rel.components() {
-            let Component::Normal(piece) = component else { unreachable!() };
+            let Component::Normal(piece) = component else {
+                unreachable!()
+            };
             current.push(piece);
             if let Ok(md) = fs::symlink_metadata(&current) {
                 if metadata_is_link(&md) {
@@ -611,7 +637,9 @@ pub fn weights_delete(dest_dir: String, files: Vec<String>) -> Result<u64, Strin
             append_suffix(&final_path, ".idx"),
             append_suffix(&final_path, ".idx.gen"),
         ] {
-            let Ok(md) = fs::symlink_metadata(&p) else { continue };
+            let Ok(md) = fs::symlink_metadata(&p) else {
+                continue;
+            };
             if metadata_is_link(&md) || !md.is_file() {
                 errs.push(format!("{}: refusing a non-regular file", p.display()));
                 continue;
@@ -749,13 +777,14 @@ pub async fn weights_fetch(
         // the row must show "412 GB of 434 GB", not part 7 restarting at zero
         // eleven times. Each part's `have`/`total` is offset by the bytes the
         // finished parts already contributed; everything else passes through.
-        let all: Vec<(String, u64, String)> = std::iter::once((
-            file.clone(),
-            expect_bytes,
-            expect_sha256.clone(),
-        ))
-        .chain(parts.iter().map(|p| (p.file.clone(), p.bytes, p.sha256.clone())))
-        .collect();
+        let all: Vec<(String, u64, String)> =
+            std::iter::once((file.clone(), expect_bytes, expect_sha256.clone()))
+                .chain(
+                    parts
+                        .iter()
+                        .map(|p| (p.file.clone(), p.bytes, p.sha256.clone())),
+                )
+                .collect();
         // The denominator is the sum of what the manifest declares. A part with
         // an unknown size contributes its server-reported length once it starts,
         // so the total can only get more accurate, never wrong-and-stuck.
@@ -778,8 +807,8 @@ pub async fn weights_fetch(
             // names the loader derives from it.
             let local = if idx == 0 { save_local.as_str() } else { "" };
             out = fetch_inner(
-                &id2, &repo, pfile, local, &dest_dir, *pbytes, psha, &revision,
-                &endpoints, &cancel, &emit,
+                &id2, &repo, pfile, local, &dest_dir, *pbytes, psha, &revision, &endpoints,
+                &cancel, &emit,
             );
             match &out {
                 // Only the FIRST part's path is reported as the result: that is
@@ -789,7 +818,11 @@ pub async fn weights_fetch(
                     // Measured under the name it landed on -- part 1 may have
                     // been renamed, and probing the remote name there would
                     // silently fall back to the declared size.
-                    let landed_name = if idx == 0 && !local.is_empty() { local } else { pfile.as_str() };
+                    let landed_name = if idx == 0 && !local.is_empty() {
+                        local
+                    } else {
+                        pfile.as_str()
+                    };
                     let landed = fs::metadata(PathBuf::from(&dest_dir).join(landed_name))
                         .map(|m| m.len())
                         .unwrap_or(*pbytes);
@@ -804,7 +837,11 @@ pub async fn weights_fetch(
         // this string is what the caller hands the engine.
         let out = out.map(|_| {
             PathBuf::from(&dest_dir)
-                .join(if save_local.is_empty() { file.as_str() } else { save_local.as_str() })
+                .join(if save_local.is_empty() {
+                    file.as_str()
+                } else {
+                    save_local.as_str()
+                })
                 .to_string_lossy()
                 .into_owned()
         });
@@ -887,10 +924,20 @@ fn probe_one(
     file: &str,
     revision: &str,
 ) -> Result<u64, ProbeFail> {
-    let url = format!("{}/{}/resolve/{}/{}", ep.trim_end_matches('/'), repo, revision, file);
+    let url = format!(
+        "{}/{}/resolve/{}/{}",
+        ep.trim_end_matches('/'),
+        repo,
+        revision,
+        file
+    );
     let resp = match c.get(&url).header("Range", "bytes=0-0").send() {
         Ok(r) => r,
-        Err(_) => return Err(ProbeFail::Soft(format!("{ep}: unreachable (blocked or offline)"))),
+        Err(_) => {
+            return Err(ProbeFail::Soft(format!(
+                "{ep}: unreachable (blocked or offline)"
+            )))
+        }
     };
     let code = resp.status().as_u16();
     match code {
@@ -951,8 +998,12 @@ fn probe(
     for (i, ep) in endpoints.iter().enumerate() {
         let tx = tx.clone();
         let c = c.clone();
-        let (ep, repo, file, revision) =
-            (ep.clone(), repo.to_string(), file.to_string(), revision.to_string());
+        let (ep, repo, file, revision) = (
+            ep.clone(),
+            repo.to_string(),
+            file.to_string(),
+            revision.to_string(),
+        );
         std::thread::spawn(move || {
             // The receiver may be gone already (probe returned early); the
             // straggler's verdict is then simply dropped.
@@ -987,7 +1038,9 @@ fn probe(
         const SLICE: Duration = Duration::from_millis(300);
         let msg = loop {
             if cancel.load(Ordering::SeqCst) {
-                return Err("cancelled (what has been downloaded is kept; the next attempt resumes)".into());
+                return Err(
+                    "cancelled (what has been downloaded is kept; the next attempt resumes)".into(),
+                );
             }
             let wait = match first_success {
                 // Nothing usable yet: keep waiting for the next verdict,
@@ -1020,13 +1073,19 @@ fn probe(
             // Grace expired on the stragglers, or every thread has reported.
             None => {
                 if let Some((i, total)) = pick(&outcome, true) {
-                    return Ok(Probe { endpoint: endpoints[i].clone(), total });
+                    return Ok(Probe {
+                        endpoint: endpoints[i].clone(),
+                        total,
+                    });
                 }
                 break;
             }
         }
         if let Some((i, total)) = pick(&outcome, false) {
-            return Ok(Probe { endpoint: endpoints[i].clone(), total });
+            return Ok(Probe {
+                endpoint: endpoints[i].clone(),
+                total,
+            });
         }
         if outcome.iter().all(|o| o.is_some()) {
             break;
@@ -1038,7 +1097,11 @@ fn probe(
     // put a hand-downloaded GGUF in the model folder — with this endpoint list
     // as the detail. (The old text pointed at a "mirror" setting that does not
     // exist.)
-    let tried: Vec<String> = outcome.into_iter().flatten().filter_map(|r| r.err()).collect();
+    let tried: Vec<String> = outcome
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r.err())
+        .collect();
     Err(format!("[WEIGHTS_NO_SOURCE] tried: {}", tried.join("; ")))
 }
 
@@ -1071,9 +1134,14 @@ fn fetch_inner(
     // moving branch rather than refusing to download. The hash gate is the
     // authority on content either way; the revision only removes the window
     // where a force-push serves different bytes under the same name.
-    let revision = if revision.is_empty() { "main" } else { revision };
+    let revision = if revision.is_empty() {
+        "main"
+    } else {
+        revision
+    };
     let dir = PathBuf::from(dest_dir);
-    fs::create_dir_all(&dir).map_err(|e| format!("cannot create the download directory {dest_dir}: {e}"))?;
+    fs::create_dir_all(&dir)
+        .map_err(|e| format!("cannot create the download directory {dest_dir}: {e}"))?;
     // The REMOTE name (`file`) still addresses the repo; only the local path
     // changes. Keeping the two separate is the whole point of `save_as`.
     let local_name = if save_as.is_empty() { file } else { save_as };
@@ -1181,7 +1249,9 @@ fn fetch_inner(
     if have > 0 {
         req = req.header("Range", format!("bytes={have}-"));
     }
-    let mut resp = req.send().map_err(|e| format!("download request failed: {e}"))?;
+    let mut resp = req
+        .send()
+        .map_err(|e| format!("download request failed: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("download refused: HTTP {}", resp.status().as_u16()));
     }
@@ -1207,8 +1277,12 @@ fn fetch_inner(
     // file (os error 2)" while every flat-named quant downloaded fine
     // (measured 2026-08-24, BF16 on the DGX).
     if let Some(parent) = part_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("cannot create the download directory {}: {e}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "cannot create the download directory {}: {e}",
+                parent.display()
+            )
+        })?;
     }
     let mut f = if have > 0 {
         fs::OpenOptions::new()
@@ -1216,8 +1290,12 @@ fn fetch_inner(
             .open(&part_path)
             .map_err(|e| format!("cannot open the partial file {}: {e}", part_path.display()))?
     } else {
-        fs::File::create(&part_path)
-            .map_err(|e| format!("cannot create the download file {}: {e}", part_path.display()))?
+        fs::File::create(&part_path).map_err(|e| {
+            format!(
+                "cannot create the download file {}: {e}",
+                part_path.display()
+            )
+        })?
     };
 
     let mut buf = vec![0u8; 1 << 20]; // 1 MiB
@@ -1228,11 +1306,15 @@ fn fetch_inner(
     loop {
         if cancel.load(Ordering::SeqCst) {
             let _ = f.flush();
-            return Err("cancelled (what has been downloaded is kept; the next attempt resumes)".into());
+            return Err(
+                "cancelled (what has been downloaded is kept; the next attempt resumes)".into(),
+            );
         }
-        let n = resp
-            .read(&mut buf)
-            .map_err(|e| format!("read interrupted: {e}. What has been downloaded is kept; trying again resumes."))?;
+        let n = resp.read(&mut buf).map_err(|e| {
+            format!(
+                "read interrupted: {e}. What has been downloaded is kept; trying again resumes."
+            )
+        })?;
         if n == 0 {
             break;
         }
@@ -1261,7 +1343,8 @@ fn fetch_inner(
             return Err("the connection stalled: no data received for two minutes. What has been downloaded is kept; trying again resumes.".into());
         }
     }
-    f.flush().map_err(|e| format!("write to disk failed: {e}"))?;
+    f.flush()
+        .map_err(|e| format!("write to disk failed: {e}"))?;
     drop(f);
 
     // Validation: rename only when the size checks out. Renaming a short file
@@ -1410,7 +1493,10 @@ mod delete_tests {
         let freed = weights_delete(d.to_string_lossy().into(), vec!["m.gguf".into()]).unwrap();
         assert_eq!(freed, 15, "both files count towards the space freed");
         assert!(!d.join("m.gguf").exists());
-        assert!(!d.join("m.gguf.part").exists(), "a stale .part would keep the disk full");
+        assert!(
+            !d.join("m.gguf.part").exists(),
+            "a stale .part would keep the disk full"
+        );
     }
 
     #[test]
@@ -1438,7 +1524,10 @@ mod delete_tests {
             let r = weights_delete(inside.to_string_lossy().into(), vec![name.into()]);
             assert!(r.is_err(), "{name:?} must be refused");
         }
-        assert!(outside.join("precious.gguf").exists(), "nothing outside the folder may be touched");
+        assert!(
+            outside.join("precious.gguf").exists(),
+            "nothing outside the folder may be touched"
+        );
     }
 
     #[test]
@@ -1455,7 +1544,10 @@ mod delete_tests {
     fn missing_files_are_not_an_error() {
         // The row may already be gone (deleted in another window, or by hand).
         let d = tmpdir();
-        assert_eq!(weights_delete(d.to_string_lossy().into(), vec!["nope.gguf".into()]).unwrap(), 0);
+        assert_eq!(
+            weights_delete(d.to_string_lossy().into(), vec!["nope.gguf".into()]).unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -1513,10 +1605,13 @@ mod delete_tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].bytes, 22);
         assert!(got[0].partial);
-        assert_eq!(got[0].files, vec![
-            "quant/model-00001-of-00003.gguf",
-            "quant/model-00002-of-00003.gguf",
-        ]);
+        assert_eq!(
+            got[0].files,
+            vec![
+                "quant/model-00001-of-00003.gguf",
+                "quant/model-00002-of-00003.gguf",
+            ]
+        );
     }
 
     #[test]
@@ -1533,8 +1628,14 @@ mod delete_tests {
         write(&q, "model-00001-of-00003.gguf.idx.gen", 3);
         let row = weights_list(d.to_string_lossy().into()).pop().unwrap();
         let freed = weights_delete(d.to_string_lossy().into(), row.files).unwrap();
-        assert_eq!(freed, 19, "weights plus verification/index sidecars are removed");
-        assert!(!q.exists(), "an empty quantization directory should not linger");
+        assert_eq!(
+            freed, 19,
+            "weights plus verification/index sidecars are removed"
+        );
+        assert!(
+            !q.exists(),
+            "an empty quantization directory should not linger"
+        );
         assert!(d.exists(), "the configured model folder itself must remain");
     }
 
@@ -1550,7 +1651,8 @@ mod delete_tests {
         assert!(weights_delete(
             inside.to_string_lossy().into(),
             vec!["escape/precious.gguf".into()]
-        ).is_err());
+        )
+        .is_err());
         assert!(outside.join("precious.gguf").exists());
     }
 
@@ -1564,21 +1666,25 @@ mod delete_tests {
         let d = tmpdir().join("模型缓存");
         fs::create_dir_all(&d).unwrap();
         write(&d, "中文模型.gguf", 13);
-        let dir = d.to_str().expect("the CJK fixture must be Unicode").to_owned();
+        let dir = d
+            .to_str()
+            .expect("the CJK fixture must be Unicode")
+            .to_owned();
 
         let listed = weights_list(dir.clone());
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].file, "中文模型.gguf");
         assert_eq!(listed[0].bytes, 13);
 
-        let state = weights_state(
-            dir.clone(), "中文模型.gguf".into(), 13, String::new());
+        let state = weights_state(dir.clone(), "中文模型.gguf".into(), 13, String::new());
         assert!(state.complete && state.verified);
         assert!(state.path.contains("模型缓存"));
         assert!(state.path.ends_with("中文模型.gguf"));
 
-        assert_eq!(weights_delete(
-            dir, vec!["中文模型.gguf".into()]).unwrap(), 13);
+        assert_eq!(
+            weights_delete(dir, vec!["中文模型.gguf".into()]).unwrap(),
+            13
+        );
         assert!(!d.join("中文模型.gguf").exists());
     }
 }
@@ -1639,13 +1745,30 @@ mod integrity_tests {
         fs::write(d.join("mmproj-F16.gguf"), b"abc").unwrap();
         let cancel = AtomicBool::new(false);
         let got = fetch_inner(
-            "t", "repo/x", "mmproj-F16.gguf", "qwen3.5-9b-mmproj-F16.gguf",
-            d.to_str().unwrap(), 3, ABC, "", &nowhere(), &cancel, &no_emit,
+            "t",
+            "repo/x",
+            "mmproj-F16.gguf",
+            "qwen3.5-9b-mmproj-F16.gguf",
+            d.to_str().unwrap(),
+            3,
+            ABC,
+            "",
+            &nowhere(),
+            &cancel,
+            &no_emit,
         )
         .expect("a matching local file must be adopted without any transfer");
         assert_eq!(PathBuf::from(&got), d.join("qwen3.5-9b-mmproj-F16.gguf"));
-        assert!(!d.join("mmproj-F16.gguf").exists(), "adopted, so moved -- not left as a 900 MB orphan");
-        assert_eq!(fs::read_to_string(marker_of(&PathBuf::from(&got))).unwrap().trim(), ABC);
+        assert!(
+            !d.join("mmproj-F16.gguf").exists(),
+            "adopted, so moved -- not left as a 900 MB orphan"
+        );
+        assert_eq!(
+            fs::read_to_string(marker_of(&PathBuf::from(&got)))
+                .unwrap()
+                .trim(),
+            ABC
+        );
     }
 
     #[test]
@@ -1657,11 +1780,26 @@ mod integrity_tests {
         fs::write(d.join("mmproj-F16.gguf"), b"abd").unwrap();
         let cancel = AtomicBool::new(false);
         let r = fetch_inner(
-            "t", "repo/x", "mmproj-F16.gguf", "qwen3.5-9b-mmproj-F16.gguf",
-            d.to_str().unwrap(), 3, ABC, "", &nowhere(), &cancel, &no_emit,
+            "t",
+            "repo/x",
+            "mmproj-F16.gguf",
+            "qwen3.5-9b-mmproj-F16.gguf",
+            d.to_str().unwrap(),
+            3,
+            ABC,
+            "",
+            &nowhere(),
+            &cancel,
+            &no_emit,
         );
-        assert!(r.is_err(), "with no adoptable file and no network there is nothing to return");
-        assert!(d.join("mmproj-F16.gguf").exists(), "fetching one model must never destroy another's tower");
+        assert!(
+            r.is_err(),
+            "with no adoptable file and no network there is nothing to return"
+        );
+        assert!(
+            d.join("mmproj-F16.gguf").exists(),
+            "fetching one model must never destroy another's tower"
+        );
         assert!(!d.join("qwen3.5-9b-mmproj-F16.gguf").exists());
     }
 
@@ -1674,8 +1812,17 @@ mod integrity_tests {
         fs::write(d.join("other.gguf"), b"abc").unwrap();
         let cancel = AtomicBool::new(false);
         let r = fetch_inner(
-            "t", "repo/x", "wanted.gguf", "",
-            d.to_str().unwrap(), 3, ABC, "", &nowhere(), &cancel, &no_emit,
+            "t",
+            "repo/x",
+            "wanted.gguf",
+            "",
+            d.to_str().unwrap(),
+            3,
+            ABC,
+            "",
+            &nowhere(),
+            &cancel,
+            &no_emit,
         );
         assert!(r.is_err());
         assert!(d.join("other.gguf").exists());
@@ -1694,15 +1841,22 @@ mod integrity_tests {
         let d = tmpdir();
         legacy_tower(&d, b"abc", ABC);
         assert!(weights_adopt(
-            d.to_string_lossy().into(), "mmproj-F16.gguf".into(),
-            "qwen3.5-9b-mmproj-F16.gguf".into(), 3, ABC.into(),
+            d.to_string_lossy().into(),
+            "mmproj-F16.gguf".into(),
+            "qwen3.5-9b-mmproj-F16.gguf".into(),
+            3,
+            ABC.into(),
         ));
         assert!(d.join("qwen3.5-9b-mmproj-F16.gguf").exists());
         assert!(!d.join("mmproj-F16.gguf").exists());
-        assert!(!marker_of(&d.join("mmproj-F16.gguf")).exists(),
-            "a marker left behind would bless the next file under that name");
+        assert!(
+            !marker_of(&d.join("mmproj-F16.gguf")).exists(),
+            "a marker left behind would bless the next file under that name"
+        );
         assert_eq!(
-            fs::read_to_string(marker_of(&d.join("qwen3.5-9b-mmproj-F16.gguf"))).unwrap().trim(),
+            fs::read_to_string(marker_of(&d.join("qwen3.5-9b-mmproj-F16.gguf")))
+                .unwrap()
+                .trim(),
             ABC
         );
     }
@@ -1715,8 +1869,11 @@ mod integrity_tests {
         let other = "0000000000000000000000000000000000000000000000000000000000000000";
         legacy_tower(&d, b"abd", other);
         assert!(!weights_adopt(
-            d.to_string_lossy().into(), "mmproj-F16.gguf".into(),
-            "qwen3.5-9b-mmproj-F16.gguf".into(), 3, ABC.into(),
+            d.to_string_lossy().into(),
+            "mmproj-F16.gguf".into(),
+            "qwen3.5-9b-mmproj-F16.gguf".into(),
+            3,
+            ABC.into(),
         ));
         assert!(d.join("mmproj-F16.gguf").exists());
         assert!(!d.join("qwen3.5-9b-mmproj-F16.gguf").exists());
@@ -1729,8 +1886,11 @@ mod integrity_tests {
         let d = tmpdir();
         fs::write(d.join("mmproj-F16.gguf"), b"abc").unwrap();
         assert!(!weights_adopt(
-            d.to_string_lossy().into(), "mmproj-F16.gguf".into(),
-            "qwen3.5-9b-mmproj-F16.gguf".into(), 3, ABC.into(),
+            d.to_string_lossy().into(),
+            "mmproj-F16.gguf".into(),
+            "qwen3.5-9b-mmproj-F16.gguf".into(),
+            3,
+            ABC.into(),
         ));
         assert!(d.join("mmproj-F16.gguf").exists());
     }
@@ -1742,16 +1902,25 @@ mod integrity_tests {
         // Wrong declared size: the two 27B towers are 448 bytes apart, so this
         // check has to be exact.
         assert!(!weights_adopt(
-            d.to_string_lossy().into(), "mmproj-F16.gguf".into(),
-            "qwen3.5-9b-mmproj-F16.gguf".into(), 4, ABC.into(),
+            d.to_string_lossy().into(),
+            "mmproj-F16.gguf".into(),
+            "qwen3.5-9b-mmproj-F16.gguf".into(),
+            4,
+            ABC.into(),
         ));
         // And a destination that already exists is never replaced.
         fs::write(d.join("qwen3.5-9b-mmproj-F16.gguf"), b"keep").unwrap();
         assert!(!weights_adopt(
-            d.to_string_lossy().into(), "mmproj-F16.gguf".into(),
-            "qwen3.5-9b-mmproj-F16.gguf".into(), 3, ABC.into(),
+            d.to_string_lossy().into(),
+            "mmproj-F16.gguf".into(),
+            "qwen3.5-9b-mmproj-F16.gguf".into(),
+            3,
+            ABC.into(),
         ));
-        assert_eq!(fs::read(d.join("qwen3.5-9b-mmproj-F16.gguf")).unwrap(), b"keep");
+        assert_eq!(
+            fs::read(d.join("qwen3.5-9b-mmproj-F16.gguf")).unwrap(),
+            b"keep"
+        );
     }
 
     #[test]
@@ -1759,10 +1928,16 @@ mod integrity_tests {
         let d = tmpdir();
         legacy_tower(&d, b"abc", ABC);
         for bad in ["../escaped.gguf", "/etc/passwd.gguf", "sub/../../x.gguf"] {
-            assert!(!weights_adopt(
-                d.to_string_lossy().into(), "mmproj-F16.gguf".into(),
-                bad.into(), 3, ABC.into(),
-            ), "{bad} must be refused");
+            assert!(
+                !weights_adopt(
+                    d.to_string_lossy().into(),
+                    "mmproj-F16.gguf".into(),
+                    bad.into(),
+                    3,
+                    ABC.into(),
+                ),
+                "{bad} must be refused"
+            );
         }
         assert!(d.join("mmproj-F16.gguf").exists());
     }
@@ -1828,7 +2003,11 @@ mod integrity_tests {
         let d = tmpdir();
         let fin = d.join("m.gguf");
         fs::write(&fin, b"abc").unwrap();
-        fs::write(marker_of(&fin), "0000000000000000000000000000000000000000000000000000000000000000\n").unwrap();
+        fs::write(
+            marker_of(&fin),
+            "0000000000000000000000000000000000000000000000000000000000000000\n",
+        )
+        .unwrap();
         let cancel = AtomicBool::new(false);
         ensure_final_verified(&fin, ABC, "t", &cancel, &no_emit).unwrap();
         assert_eq!(
@@ -1864,6 +2043,9 @@ mod integrity_tests {
         fs::write(d.join("m.gguf"), b"abc").unwrap();
         fs::write(d.join("m.gguf.sha256"), ABC).unwrap();
         weights_delete(d.to_string_lossy().into(), vec!["m.gguf".into()]).unwrap();
-        assert!(!d.join("m.gguf.sha256").exists(), "an orphaned marker would bless a future download it never saw");
+        assert!(
+            !d.join("m.gguf.sha256").exists(),
+            "an orphaned marker would bless a future download it never saw"
+        );
     }
 }

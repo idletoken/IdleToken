@@ -242,7 +242,7 @@ static inline uint64_t idletoken_ram_expert_usable(uint64_t ram_total,
 /* Hard constraint (docs/architecture.md §2): every node needs a GPU with at least this much VRAM
  * (CUDA context + workspace + at least one layer). Unified-memory hosts are
  * exempt — their "VRAM" is host RAM. */
-#define IDLETOKEN_MIN_VRAM_BYTES (4ull * 1024ull * 1024ull * 1024ull)
+#define IDLETOKEN_MIN_VRAM_BYTES (8ull * 1024ull * 1024ull * 1024ull)
 
 /* Apple Silicon floor. The VRAM floor above is waived for unified-memory hosts
  * (their "VRAM" is host RAM), so a Mac would otherwise have no floor at all.
@@ -374,7 +374,8 @@ typedef enum {
  * along on an unsupported GPU produces garbage tokens, not an error.
  *
  * Test hooks (probe-time, see resource.c): IDLETOKEN_FORCE_NO_NVML=1,
- * IDLETOKEN_FAKE_CC=6.1, IDLETOKEN_FAKE_DRIVER=470.00. */
+ * IDLETOKEN_FAKE_CC=6.1, IDLETOKEN_FAKE_DRIVER=470.00,
+ * IDLETOKEN_FAKE_VRAM_GIB=7. */
 idletoken_hw_status idletoken_hw_check(const idletoken_resource_report *r,
                                  char *reason, size_t cap);
 

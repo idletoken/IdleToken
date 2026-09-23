@@ -19,17 +19,11 @@
 #include "idletoken_privacy.h"
 #include "idletoken_sha256.h"
 #include "idletoken_sodium_seal.h"
-/* The coordinator's existing HTTP/1.1 client. It is named after the engine it
- * was written for, but it speaks plain HTTP to a "host:port" and nothing about
- * it is llama-specific — reusing it is what keeps the plan's "no new
- * dependency" promise, and it already has the bounded-read discipline that the
- * engine link learned the hard way (results/coord-wedge-20260817.md).
- *
- * It reads no proxy environment variables, so the local-proxy hijack that bites
- * the CLIENT's loopback SSE (Clash and friends) cannot reach this connection.
- * A TUN-mode VPN still can, and that is out of any application's hands. */
+/* Public requests use verified TLS and the machine's proxy policy. The local
+ * inference path retains the sidecar transport and cancellation contract. */
 #include "idletoken_llama_sidecar.h"
 #include "idletoken_net.h"
+#include "idletoken_platform_http.h"
 
 #include "tweetnacl.h"
 
@@ -296,13 +290,11 @@ int idletoken_overflow_configure(const idletoken_overflow_cfg *cfg,
         OVF_FAIL("overflow needs an account key to spend against");
     /* Checked before the trust anchor: a URL this binary cannot dial is a
      * configuration mistake, and reporting it as a missing signing key would
-     * send whoever hit it looking in the wrong place. https:// in particular is
-     * refused rather than downgraded to plaintext on port 443 -- that would be
-     * the worst of the two, since the configuration would still LOOK encrypted. */
+     * send whoever hit it looking in the wrong place. Preserve HTTPS, explicit
+     * ports and base paths; the shared transport verifies TLS certificates. */
     char addr[160];
     if (ovf_url_to_addr(cfg->url, addr, sizeof addr) != 0)
-        OVF_FAIL("cannot use platform URL \"%s\" (https:// needs a TLS client "
-                 "this binary has not got; put a plain-HTTP hop in front)", cfg->url);
+        OVF_FAIL("invalid HTTP(S) platform URL");
 
     /* RULE 3 — no silent fallback. Without the pinned signing key there is no
      * way to tell the platform's encryption key from an attacker's, and sealing
@@ -559,23 +551,14 @@ int idletoken_overflow_should_forward(idletoken_origin origin, int want_stream,
 
 /* --- the sealed exchange --------------------------------------------------- */
 
-/* "http://host[:port]/..." or "host:port" -> "host:port". Mirrors the platform
- * agent's url_to_addr, including the refusal of https:// — there is no TLS
- * client in this binary either, and a silent downgrade to port 443 plaintext
- * would be the worst of both. */
+/* Keep the configured scheme, authority and base path unchanged. */
 static int ovf_url_to_addr(const char *url, char *out, size_t cap) {
-    const char *p = url;
-    if (!strncmp(p, "http://", 7)) p += 7;
-    else if (!strncmp(p, "https://", 8)) return -1;
-    size_t n = strcspn(p, "/");
-    if (n == 0 || n >= cap) return -1;
-    memcpy(out, p, n);
-    out[n] = '\0';
-    if (!strchr(out, ':')) {
-        if (n + 4 > cap) return -1;
-        memcpy(out + n, ":80", 4);
-    }
-    return 0;
+    return idletoken_platform_url(url, NULL, out, cap);
+}
+
+static int ovf_cancelled(void *context) {
+    int fd = *(int *)context;
+    return fd >= 0 && idletoken_peer_closed(fd);
 }
 
 /* The raw, still-escaped span of a JSON string field: same first-occurrence
@@ -685,16 +668,22 @@ static int ovf_ensure_key(const char *addr, int *out_unreachable,
     pthread_mutex_unlock(&g_ovf_mu);
     if (fresh) return 0;
 
-    idletoken_llama_conn c;
-    if (idletoken_llama_http_open(addr, "GET", IDLETOKEN_NS "/platform-key",
-                                  NULL, 0, 15000, &c) != 0) {
+    char target[1024];
+    if (idletoken_platform_url(addr, IDLETOKEN_NS "/platform-key", target, sizeof(target)))
+        OVF_FAIL("invalid platform key URL");
+    idletoken_platform_http_request request = {
+        .url = target, .method = "GET", .connect_ms = 10000,
+        .total_ms = 15000, .max_response = 64u * 1024u,
+    };
+    idletoken_platform_http_response response;
+    if (idletoken_platform_http(&request, &response) != 0) {
+        free(response.body);
         if (out_unreachable) *out_unreachable = 1;
-        OVF_FAIL("cannot reach the platform at %s to fetch its key", addr);
+        OVF_FAIL("cannot fetch the platform key: %s", response.error);
     }
-    int status = c.status;
-    size_t rlen = 0;
-    char *body = idletoken_llama_http_read_all(&c, &rlen, 64u * 1024u);
-    idletoken_llama_http_close(&c);
+    int status = response.status;
+    size_t rlen = response.len;
+    char *body = (char *)response.body;
     /* Any 2xx, for the reason spelled out at the sealed/chat status check: a
      * GET is 200 under Nest today, but "which success code does the peer use"
      * must not be the thing that decides whether this feature works. The
@@ -777,8 +766,10 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
                                 const char *tools_json, size_t tools_len,
                                 const char *tool_choice_json,
                                 size_t tool_choice_len,
+                                int parallel_tool_calls,
                                 const char *ctk_json, size_t ctk_len,
                                 const char *effort, size_t effort_len,
+                                const char *sampling_json, size_t sampling_len,
                                 const char *model, const char *quant,
                                 int max_tokens,
                                 int hops_in,
@@ -801,8 +792,7 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
 
     char addr[160];
     if (ovf_url_to_addr(url, addr, sizeof addr) != 0)
-        OVF_FAIL("cannot use platform URL \"%s\" (https:// needs a TLS client "
-                 "this binary has not got)", url);
+        OVF_FAIL("invalid HTTP(S) platform URL");
     if (ovf_ensure_key(addr, NULL, err, err_cap) != 0) return -1;
 
     idletoken_overflow_key pk;
@@ -843,20 +833,22 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
 
     /* The plaintext, and the only place it exists outside this machine's own
      * memory is nowhere: it is sealed before the socket is opened. */
-    size_t inner_cap = messages_len + tools_len + tool_choice_len + ctk_len +
+    size_t inner_cap = messages_len + tools_len + tool_choice_len + ctk_len + sampling_len +
                        effort_len +
                        strlen(api_key) + (model ? strlen(model) : 0) +
                        (quant ? strlen(quant) : 0) +
                        sizeof prov + 320;
     char *inner = malloc(inner_cap);
     if (!inner) OVF_FAIL("out of memory");
+    const char *parallel = parallel_tool_calls == 0 ? ",\"parallel_tool_calls\":false"
+                         : parallel_tool_calls == 1 ? ",\"parallel_tool_calls\":true" : "";
     int inner_len;
     if (max_tokens > 0)
         inner_len = snprintf(inner, inner_cap,
                              "{\"api_key\":\"%s\",\"model\":\"%s\"%s%s%s,"
                              "\"messages\":%.*s,\"max_tokens\":%d%s%.*s%s%.*s%s%.*s%s%.*s%s,"
                              "\"nonce\":\"%s\",\"issued_at\":%lld,"
-                             "\"dispatch_wait_ms\":5000%s}",
+                             "\"dispatch_wait_ms\":5000%s%.*s%s}",
                              api_key, model ? model : "",
                              quant && quant[0] ? ",\"quant\":\"" : "",
                              quant && quant[0] ? quant : "",
@@ -873,12 +865,12 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
                              effort && effort_len ? ",\"reasoning_effort\":\"" : "",
                              (int)effort_len, effort && effort_len ? effort : "",
                              effort && effort_len ? "\"" : "",
-                             nonce_hex, issued_at, prov);
+                             nonce_hex, issued_at, prov, (int)sampling_len, sampling_json ? sampling_json : "", parallel);
     else
         inner_len = snprintf(inner, inner_cap,
                              "{\"api_key\":\"%s\",\"model\":\"%s\"%s%s%s,\"messages\":%.*s%s%.*s%s%.*s%s%.*s%s%.*s%s,"
                              "\"nonce\":\"%s\",\"issued_at\":%lld,"
-                             "\"dispatch_wait_ms\":5000%s}",
+                             "\"dispatch_wait_ms\":5000%s%.*s%s}",
                              api_key, model ? model : "",
                              quant && quant[0] ? ",\"quant\":\"" : "",
                              quant && quant[0] ? quant : "",
@@ -895,7 +887,7 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
                              effort && effort_len ? ",\"reasoning_effort\":\"" : "",
                              (int)effort_len, effort && effort_len ? effort : "",
                              effort && effort_len ? "\"" : "",
-                             nonce_hex, issued_at, prov);
+                             nonce_hex, issued_at, prov, (int)sampling_len, sampling_json ? sampling_json : "", parallel);
     if (inner_len < 0 || (size_t)inner_len >= inner_cap) {
         free(inner);
         OVF_FAIL("request too large to seal");
@@ -953,24 +945,29 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
      * platform window, the caller rechecks the local slot and starts another
      * attempt; this is how local work can finish even while the marketplace is
      * saturated, without ever answering the user with a capacity error. */
-    idletoken_llama_conn c;
-    int opened = idletoken_llama_http_open_cancelable(
-        addr, "POST", IDLETOKEN_NS "/sealed/chat",
-        body, (size_t)bl, 0, downstream_fd, &c);
+    char target[1024];
+    if (idletoken_platform_url(addr, IDLETOKEN_NS "/sealed/chat", target, sizeof(target))) {
+        free(body); idletoken_secure_zero(&reply_kp, sizeof reply_kp);
+        OVF_FAIL("invalid platform exchange URL");
+    }
+    idletoken_platform_http_request request = {
+        .url = target, .method = "POST", .body = body, .body_len = (size_t)bl,
+        .connect_ms = 10000, .max_response = 8u * 1024u * 1024u,
+        .cancelled = ovf_cancelled, .cancel_context = &downstream_fd,
+    };
+    idletoken_platform_http_response response;
+    int opened = idletoken_platform_http(&request, &response);
     free(body);
     if (opened != 0) {
-        if (c.cancelled) {
-            idletoken_secure_zero(&reply_kp, sizeof reply_kp);
-            OVF_FAIL("downstream client cancelled while waiting for shared compute");
-        }
+        free(response.body);
         idletoken_secure_zero(&reply_kp, sizeof reply_kp);
-        OVF_FAIL("platform %s did not answer", addr);
+        if (response.cancelled) OVF_FAIL("downstream client cancelled while waiting for shared compute");
+        OVF_FAIL("platform did not answer: %s", response.error);
     }
-    int status = c.status;
-    size_t rlen = 0;
-    char *resp = idletoken_llama_http_read_all(&c, &rlen, 8u * 1024u * 1024u);
-    int cancelled = c.cancelled;
-    idletoken_llama_http_close(&c);
+    int status = response.status;
+    size_t rlen = response.len;
+    char *resp = (char *)response.body;
+    int cancelled = response.cancelled;
     if (cancelled) {
         free(resp);
         idletoken_secure_zero(&reply_kp, sizeof reply_kp);
@@ -1347,13 +1344,12 @@ int idletoken_overflow_selftest(void) {
         OST(cfg_ok || strstr(err, "pinned no platform signing key") != NULL,
             "overflow: an unpinned build says so instead of sealing to anything");
 
-        /* https:// has no client in this binary. Refused rather than quietly
-         * spoken to in the clear on port 443, which would be the worst of the
-         * two (it would LOOK encrypted in the configuration). */
-        cfg.url = "https://platform.example";
-        OST(idletoken_overflow_configure(&cfg, err, sizeof err) == -1 &&
-            strstr(err, "TLS client") != NULL,
-            "overflow: an https:// platform URL is refused, not downgraded");
+        char normalized[256];
+        OST(ovf_url_to_addr("https://platform.example:8443/base", normalized, sizeof normalized) == 0 &&
+            strcmp(normalized, "https://platform.example:8443/base") == 0,
+            "overflow: HTTPS scheme, explicit port and base path are preserved");
+        OST(ovf_url_to_addr("file:///tmp/secret", normalized, sizeof normalized) != 0,
+            "overflow: non-HTTP platform schemes are refused");
     }
 
     /* ---- the forwarding decision ----------------------------------------

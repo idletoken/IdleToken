@@ -165,9 +165,14 @@ fn refusal_reason(line: &str) -> Option<String> {
     let after = line
         .split_once(JOIN_REFUSED_MARK)
         .or_else(|| line.split_once(COORD_REFUSE_MARK))
+        .or_else(|| line.split_once("platform-agent: refuse: "))
         .map(|x| x.1)?;
     let reason = after.trim();
-    if reason.is_empty() { None } else { Some(reason.to_string()) }
+    if reason.is_empty() {
+        None
+    } else {
+        Some(reason.to_string())
+    }
 }
 
 struct Inner {
@@ -237,7 +242,11 @@ fn aggregate_status(inner: &Inner) -> EngineStatus {
     roles.sort_unstable();
     EngineStatus {
         state,
-        role: if roles.is_empty() { None } else { Some(roles.join("+")) },
+        role: if roles.is_empty() {
+            None
+        } else {
+            Some(roles.join("+"))
+        },
         pid,
         started_at,
         restarts,
@@ -251,7 +260,11 @@ fn slot_status(inner: &Inner, role: &str) -> EngineStatus {
     match inner.slots.get(role) {
         Some(s) => EngineStatus {
             state: s.state,
-            role: if s.state != EngineState::Stopped { Some(role.to_string()) } else { None },
+            role: if s.state != EngineState::Stopped {
+                Some(role.to_string())
+            } else {
+                None
+            },
             pid: s.pid,
             started_at: s.started_at,
             restarts: s.restarts,
@@ -274,7 +287,10 @@ fn emit_status(app: &AppHandle) {
     let engine = app.state::<Engine>();
     let (agg, agent) = {
         let inner = engine.0.lock().unwrap();
-        (aggregate_status(&inner), slot_status(&inner, ROLE_PLATFORM_AGENT))
+        (
+            aggregate_status(&inner),
+            slot_status(&inner, ROLE_PLATFORM_AGENT),
+        )
     };
     let _ = app.emit("engine:status", &agg);
     let _ = app.emit("platform-agent:status", &agent);
@@ -286,7 +302,11 @@ fn push_log(app: &AppHandle, role: &str, stream: &'static str, line: String) {
     // Mirror to the client's own stderr so `idletoken-client` run from a terminal
     // (or a CI harness) shows the engine lifecycle without the UI.
     eprintln!("[engine {stream}] {line}");
-    let entry = LogLine { ts: now_ms(), stream, line };
+    let entry = LogLine {
+        ts: now_ms(),
+        stream,
+        line,
+    };
     {
         let engine = app.state::<Engine>();
         let mut inner = engine.0.lock().unwrap();
@@ -410,7 +430,12 @@ fn supervise(app: AppHandle, role: String, generation: u64) {
             while let Some(ev) = rx.recv().await {
                 match ev {
                     CommandEvent::Stdout(bytes) => {
-                        push_log(&app, &role, "stdout", String::from_utf8_lossy(&bytes).trim_end().to_string());
+                        push_log(
+                            &app,
+                            &role,
+                            "stdout",
+                            String::from_utf8_lossy(&bytes).trim_end().to_string(),
+                        );
                     }
                     CommandEvent::Stderr(bytes) => {
                         let line = String::from_utf8_lossy(&bytes).trim_end().to_string();
@@ -491,7 +516,10 @@ async fn should_retry_after_exit(
         s.child = None;
         s.pid = None;
         s.last_exit_code = code;
-        let uptime = s.started_at.map(|t| now_ms().saturating_sub(t)).unwrap_or(0);
+        let uptime = s
+            .started_at
+            .map(|t| now_ms().saturating_sub(t))
+            .unwrap_or(0);
         s.started_at = None;
         // A refusal is a decision, not a crash. Restarting repeats it five
         // times, ends in "crashed", and buries the one sentence that explains
@@ -500,7 +528,12 @@ async fn should_retry_after_exit(
             s.state = EngineState::Crashed;
             drop(inner);
             emit_status(app);
-            push_log(app, role, "stderr", format!("not joining: {reason} (not retrying)"));
+            push_log(
+                app,
+                role,
+                "stderr",
+                format!("not joining: {reason} (not retrying)"),
+            );
             return false;
         }
         if uptime >= STABLE_UPTIME_MS {
@@ -524,7 +557,12 @@ async fn should_retry_after_exit(
         delay_s = (1u64 << s.restarts.min(5)).min(30);
         drop(inner);
         emit_status(app);
-        push_log(app, role, "stderr", format!("engine exited (code {code:?}); restarting in {delay_s}s"));
+        push_log(
+            app,
+            role,
+            "stderr",
+            format!("engine exited (code {code:?}); restarting in {delay_s}s"),
+        );
     }
     tokio::time::sleep(Duration::from_secs(delay_s)).await;
     let engine = app.state::<Engine>();
@@ -558,6 +596,48 @@ pub fn role_state_str(app: &AppHandle, role: &str) -> &'static str {
         .unwrap_or("stopped")
 }
 
+/// Record a permanent failure that happened *inside* a healthy sidecar.
+///
+/// The client supervises `idletoken-coord`; the coordinator in turn supervises
+/// the llama engine. When the engine gives up (five quick restarts, "a restart
+/// will not help") the coordinator process is still perfectly alive, so nothing
+/// in this module notices — the role stays "running" and every liveness check
+/// here answers honestly that it is. The failure is only visible in the
+/// coordinator's own status, which the pairing layer polls; this is how that
+/// knowledge gets onto the card the user is actually looking at.
+///
+/// Same field the join-refusal path uses, so the UI needs no new state: it
+/// suppresses the backoff loop and is cleared by the next user-initiated start.
+pub fn note_role_refusal(app: &AppHandle, role: &str, reason: &str) {
+    let engine = app.state::<Engine>();
+    let mut inner = engine.0.lock().unwrap();
+    if let Some(slot) = inner.slots.get_mut(role) {
+        if slot.refused_reason.is_none() {
+            slot.refused_reason = Some(reason.to_string());
+        }
+    }
+}
+
+/// Tear down a formation attempt after the engine *inside* a healthy sidecar
+/// has stopped permanently.
+///
+/// Merely recording the refusal is not enough: the coordinator process is
+/// still alive, so the next Start would fail with "coordinator already
+/// running". Preserve the refusal on the stopped slot (for the UI), then stop
+/// every inference sidecar from this attempt. `start_engine` replaces that
+/// slot on the next explicit Start, which clears the old reason and makes the
+/// retry real rather than another stuck state.
+pub fn stop_after_permanent_failure(app: &AppHandle, role: &str, reason: &str) {
+    note_role_refusal(app, role, reason);
+    stop_matching(app, |r| r != ROLE_PLATFORM_AGENT);
+    push_log(
+        app,
+        role,
+        "stderr",
+        format!("engine stopped after a permanent failure: {reason}"),
+    );
+}
+
 /// Start (or restart) one role's sidecar. Public (not just a command) so the
 /// pairing layer can materialize the cluster through the exact same path the UI
 /// uses. Idempotent per role: starting a role that is already active is an
@@ -569,7 +649,8 @@ pub fn start_engine(
     args: Vec<String>,
     env: Vec<(String, String)>,
 ) -> Result<(), String> {
-    if role != "worker" && role != "coordinator" && role != "weights" && role != ROLE_PLATFORM_AGENT {
+    if role != "worker" && role != "coordinator" && role != "weights" && role != ROLE_PLATFORM_AGENT
+    {
         return Err(format!("unknown role: {role}"));
     }
     let generation;
@@ -586,7 +667,9 @@ pub fn start_engine(
         }
         inner.gen_counter += 1;
         generation = inner.gen_counter;
-        inner.slots.insert(role.clone(), Slot::starting(args, env, generation));
+        inner
+            .slots
+            .insert(role.clone(), Slot::starting(args, env, generation));
         drop(inner);
         emit_status(app);
     }
@@ -674,11 +757,7 @@ pub fn stop_all(app: &AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn engine_start(
-    app: AppHandle,
-    role: String,
-    args: Option<Vec<String>>,
-) -> Result<(), String> {
+pub fn engine_start(app: AppHandle, role: String, args: Option<Vec<String>>) -> Result<(), String> {
     start_engine(&app, role, args.unwrap_or_default(), Vec::new())
 }
 
@@ -750,42 +829,19 @@ pub(crate) fn coord_api_socket() -> Result<String, String> {
         return Err("coordinator socket path has an empty HOME/USERPROFILE".into());
     }
     let dir = std::path::PathBuf::from(home).join(".idletoken");
-    std::fs::create_dir_all(&dir).map_err(|e|
-        format!("cannot create the coordinator socket directory {}: {e}", dir.display()))?;
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        format!(
+            "cannot create the coordinator socket directory {}: {e}",
+            dir.display()
+        )
+    })?;
     native_path_arg(&dir.join("coord-api.sock"), "coordinator socket path")
 }
 
-/// The platform base URL as the ENGINE-side processes can dial it.
-///
-/// The coordinator (`--overflow-url`) and the platform agent (`--platform`)
-/// are plain-HTTP/1.1 clients — neither links a TLS library, and both refuse
-/// https:// outright rather than speak in the clear to port 443
-/// (src/coord/overflow.c, src/tools/platform_agent.c). The client's
-/// `platformUrl` is the https:// gateway the web side talks to, so handing it
-/// over verbatim turned the sharing switch into a coordinator crash loop
-/// ("refuse: overflow cannot be enabled …", 2026-08-21).
-///
-/// The dialable spelling is the gateway's own plaintext port: every deployment
-/// serves :8080 in the clear (platform/docker-compose.yml), the resident
-/// headless agents already ride it in production, and nginx's :80 vhost
-/// whitelists only the rendezvous path — every other path there is a 301 the
-/// engine will not follow. What crosses it stays protected by the layer that
-/// was designed for an untrusted wire: the sealed envelope, not TLS.
-///
-/// http:// URLs pass through untouched — a LAN or self-hosted gateway is
-/// already dialable as written. Anything else (including a malformed https://
-/// with no host) is also passed through, so the engine refuses it loudly
-/// instead of this function quietly inventing an address.
+/// Preserve the platform's TLS scheme, custom port, IPv6 host and base path.
+/// Both native consumers use the shared public HTTP transport.
 pub(crate) fn engine_platform_url(url: &str) -> String {
-    let trimmed = url.trim();
-    if let Some(rest) = trimmed.strip_prefix("https://") {
-        let host: &str = rest.split(|c| c == '/' || c == ':').next().unwrap_or("");
-        if !host.is_empty() {
-            return format!("http://{host}:8080");
-        }
-        return trimmed.to_string();
-    }
-    trimmed.trim_end_matches('/').to_string()
+    url.trim().trim_end_matches('/').to_string()
 }
 
 /// Where the agent should reach the relay, given an optional entry point the
@@ -821,16 +877,21 @@ pub fn platform_agent_start(
     if platform_url.is_empty() {
         return Err("[PLATFORM_URL_EMPTY] platform URL is empty — set it in Settings first".into());
     }
-    // The agent has no TLS client; give it the gateway's plaintext spelling,
-    // unless the platform named a regional entry point for this machine.
+    // The configured public URL reaches the agent without changing its transport.
     let platform_url = engine_platform_url(&platform_url);
     if jwt.trim().is_empty() {
-        return Err("[PLATFORM_NO_SESSION] not signed in to the platform (no session token)".into());
+        return Err(
+            "[PLATFORM_NO_SESSION] not signed in to the platform (no session token)".into(),
+        );
     }
     // Must match the front end's default cluster name (settings.ts /
     // pairing.ts): account-mode pairing derives its secret from this value,
     // so a drifted fallback would split one account's machines in two.
-    let name = if name.trim().is_empty() { "IdleToken-Home".to_string() } else { name.trim().to_string() };
+    let name = if name.trim().is_empty() {
+        "IdleToken-Home".to_string()
+    } else {
+        name.trim().to_string()
+    };
     let mut args: Vec<String> = vec![
         "--relay".into(),
         "--platform".into(),
@@ -886,10 +947,14 @@ pub fn platform_agent_start(
     // agent restart minted a brand-new provider row (measured 2026-08-24:
     // cluster-2 and cluster-3 within nine seconds, both orphans on the next
     // restart). The key lives beside the coord socket in ~/.idletoken.
-    let dir = std::path::Path::new(&coord_socket).parent()
+    let dir = std::path::Path::new(&coord_socket)
+        .parent()
         .ok_or_else(|| "coordinator socket path has no parent directory".to_string())?;
     args.push("--key-file".into());
-    args.push(native_path_arg(&dir.join("agent.key"), "platform agent key path")?);
+    args.push(native_path_arg(
+        &dir.join("agent.key"),
+        "platform agent key path",
+    )?);
     let args = args;
     start_engine(&app, ROLE_PLATFORM_AGENT.into(), args, env)
 }
@@ -898,7 +963,12 @@ pub fn platform_agent_start(
 #[tauri::command]
 pub fn platform_agent_stop(app: AppHandle) -> Result<(), String> {
     stop_matching(&app, |r| r == ROLE_PLATFORM_AGENT);
-    push_log(&app, ROLE_PLATFORM_AGENT, "stdout", "platform agent stopped by user".into());
+    push_log(
+        &app,
+        ROLE_PLATFORM_AGENT,
+        "stdout",
+        "platform agent stopped by user".into(),
+    );
     Ok(())
 }
 
@@ -926,10 +996,13 @@ pub(crate) fn llama_server_bin() -> Result<std::path::PathBuf, String> {
             if pb.is_file() {
                 return Ok(pb);
             }
-            return Err(format!("IDLETOKEN_LLAMA_SERVER_BIN points at {p}, which does not exist"));
+            return Err(format!(
+                "IDLETOKEN_LLAMA_SERVER_BIN points at {p}, which does not exist"
+            ));
         }
     }
-    let exe = std::env::current_exe().map_err(|e| format!("cannot locate this app's executable: {e}"))?;
+    let exe =
+        std::env::current_exe().map_err(|e| format!("cannot locate this app's executable: {e}"))?;
     let dir = exe
         .parent()
         .ok_or_else(|| "cannot locate this app's directory".to_string())?;
@@ -972,7 +1045,12 @@ pub(crate) fn llama_engine_dir() -> Result<std::path::PathBuf, String> {
                 "idletoken-rpc-server"
             });
             let server_ok = ["idletoken-server", "llama-server"].iter().any(|n| {
-                dir.join(if cfg!(windows) { format!("{n}.exe") } else { n.to_string() }).is_file()
+                dir.join(if cfg!(windows) {
+                    format!("{n}.exe")
+                } else {
+                    n.to_string()
+                })
+                .is_file()
             });
             if rpc.is_file() && server_ok {
                 return Ok(dir);
@@ -1047,7 +1125,11 @@ pub fn llamacpp_serve(
     // passing one through would only add a warning line to explain away.
     let host = {
         let h = api_host.trim();
-        if h.is_empty() || (!h.starts_with("127.") && h != "localhost") { "127.0.0.1" } else { h }
+        if h.is_empty() || (!h.starts_with("127.") && h != "localhost") {
+            "127.0.0.1"
+        } else {
+            h
+        }
     };
     let mut args: Vec<String> = vec![
         // Same reasoning as the cluster path in pairing.rs: the engine is
@@ -1161,55 +1243,36 @@ pub async fn clear_kv_cache(app: AppHandle, kv_dir: Option<String>) -> Result<()
     Ok(())
 }
 
-/// What the engine processes can and cannot dial is a hard fact of their
-/// binaries (no TLS client), so the mapping is pinned literally: the exact
-/// production URL, the pass-throughs, and the shapes that must NOT be touched.
+// Public URLs must reach both native consumers without transport downgrades.
 #[cfg(test)]
 mod engine_platform_url_tests {
     use super::engine_platform_url;
 
     #[test]
-    fn https_becomes_the_gateways_plaintext_port() {
-        assert_eq!(engine_platform_url("https://api.idletoken.ai"),
-                   "http://api.idletoken.ai:8080");
-        // Trailing slash and an explicit https port both fold into the same
-        // dialable spelling — the engine's url_to_addr keeps host:port only.
-        assert_eq!(engine_platform_url("https://api.idletoken.ai/"),
-                   "http://api.idletoken.ai:8080");
-        assert_eq!(engine_platform_url("https://api.idletoken.ai:443"),
-                   "http://api.idletoken.ai:8080");
-    }
-
-
-
-
-    #[test]
-    fn http_and_lan_urls_pass_through() {
-        assert_eq!(engine_platform_url("http://192.168.1.164:8080"),
-                   "http://192.168.1.164:8080");
-        assert_eq!(engine_platform_url("http://localhost:8080/"),
-                   "http://localhost:8080");
-    }
-
-    #[test]
-    fn garbage_is_left_for_the_engine_to_refuse_loudly() {
-        // Inventing an address out of a malformed URL would move the failure
-        // from a clear engine refusal to a silent dial of the wrong host.
-        assert_eq!(engine_platform_url("https://"), "https://");
-        assert_eq!(engine_platform_url(""), "");
+    fn preserves_scheme_authority_and_path() {
+        for url in [
+            "https://api.idletoken.ai",
+            "https://api.idletoken.ai:443",
+            "https://[2001:db8::1]:8443/platform",
+            "http://localhost:8080",
+        ] {
+            assert_eq!(engine_platform_url(url), url);
+        }
+        assert_eq!(
+            engine_platform_url(" https://example.test/base/ "),
+            "https://example.test/base"
+        );
     }
 }
 
-/// The refusal latch is the client's whole understanding of "the engine said
-/// no, and why" — worth pinning both spellings, because a marker that stops
-/// matching does not fail loudly: it degrades into a bare "crashed" pill.
 #[cfg(test)]
 mod refusal_tests {
     use super::refusal_reason;
 
     #[test]
     fn join_refused_marker_yields_the_reason() {
-        let line = "idletoken-worker: JOIN_REFUSED: this cluster runs linux; this machine runs macos";
+        let line =
+            "idletoken-worker: JOIN_REFUSED: this cluster runs linux; this machine runs macos";
         assert_eq!(
             refusal_reason(line).as_deref(),
             Some("this cluster runs linux; this machine runs macos")
@@ -1229,7 +1292,10 @@ mod refusal_tests {
     #[test]
     fn ordinary_stderr_is_not_a_refusal() {
         assert_eq!(refusal_reason("coord: scheduler: SINGLE: fits"), None);
-        assert_eq!(refusal_reason("coord: refused 1.2.3.4 (worker): version"), None);
+        assert_eq!(
+            refusal_reason("coord: refused 1.2.3.4 (worker): version"),
+            None
+        );
         assert_eq!(refusal_reason("idletoken-coord: JOIN_REFUSED: "), None); // empty reason
     }
 }

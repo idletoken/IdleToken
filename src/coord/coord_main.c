@@ -1,3 +1,4 @@
+#include "idletoken_platform_http.h"
 /* IdleToken coordinator — node discovery, planning, OpenAI/Anthropic API.
  *
  * v0.1 scope (this version):
@@ -61,6 +62,7 @@
   #define close(fd) closesocket((SOCKET)(fd))
 #else
   #include <poll.h>   /* llama_lfd_readable: the accept loop's 1 s pulse */
+  #include <sys/socket.h>
 #endif
 #ifdef __linux__
   #include <sys/prctl.h>
@@ -200,6 +202,9 @@ static char g_adm_channel_path[400] = "";
  * entirely legitimate. `g_engine_unverified` is the reason, in a sentence the
  * platform agent relays as-is; empty means verified. */
 static char g_engine_unverified[240] = "";
+
+/* Defined beside engine_integrity_check(); used by the self-test above it. */
+static int coord_gguf_is_local_view(const char *gguf, unsigned *covered);
 
 static idletoken_llama *g_llama;
 
@@ -2695,6 +2700,29 @@ static int coord_selftest(void) {
             ST(g_engine_unverified[0] != '\0',
                "engine integrity: a missing digest file is not a pass");
 
+            /* Local layer view detection (coord_gguf_is_local_view), on the
+             * same scratch file: the marker weights.c writes beside a view
+             * must be recognised, and NOTHING ELSE may be -- a foreign
+             * `.done` or no marker at all is a model file. */
+            {
+                char vmark[700];
+                unsigned cov = 0;
+                snprintf(vmark, sizeof(vmark), "%s.done", bin);
+                remove(vmark);
+                ST(coord_gguf_is_local_view(bin, &cov) == 0,
+                   "local view: no marker beside the file means a model file");
+                FILE *vf = fopen(vmark, "w");
+                if (vf) { fprintf(vf, "IDLETOKEN_LOCAL_VIEW_V1 %016llx %u %llu\n",
+                                  0xac76b921002fa453ULL, 23u, 532517120ULL); fclose(vf); }
+                ST(coord_gguf_is_local_view(bin, &cov) == 1 && cov == 23,
+                   "local view: the weights.c marker is recognised, with its layer coverage");
+                vf = fopen(vmark, "w");
+                if (vf) { fprintf(vf, "downloaded 2026-09-22 sha256=abc\n"); fclose(vf); }
+                ST(coord_gguf_is_local_view(bin, &cov) == 0,
+                   "local view: a foreign .done file is not a view marker");
+                remove(vmark);
+            }
+
             f = fopen(base, "w");
             fprintf(f, "%s  engine\n", ABC_SHA256);
             fclose(f);
@@ -3325,6 +3353,11 @@ static int coord_overflow_relay(int conn_fd, const idletoken_http_req *req,
     long tool_choice_len = tool_choice
         ? idletoken_json_value_len(tool_choice, openai + openai_len) : 0;
     if (tool_choice_len <= 0) { tool_choice = NULL; tool_choice_len = 0; }
+    int parallel_tool_calls = -1;
+    const char *parallel = idletoken_json_obj_get(openai, openai_len, "parallel_tool_calls");
+    long parallel_len = parallel ? idletoken_json_value_len(parallel, openai + openai_len) : 0;
+    if (parallel_len == 4 && memcmp(parallel, "true", 4) == 0) parallel_tool_calls = 1;
+    if (parallel_len == 5 && memcmp(parallel, "false", 5) == 0) parallel_tool_calls = 0;
     /* The thinking switch travels with the borrowed request. Borrowing is
      * invisible to the local user by design — the answer comes back through
      * this machine's own API — so a preference that survived the local path
@@ -3347,16 +3380,28 @@ static int coord_overflow_relay(int conn_fd, const idletoken_http_req *req,
     int max_tokens = coord_json_top_int(openai, openai_len, "max_tokens", -1);
     if (max_tokens < 0) max_tokens = g_max_decode > 0 ? g_max_decode : 0;
 
+    size_t sampling_len = 0;
+    char *sampling = idletoken_sampling_fields(openai, openai_len, &sampling_len);
+    if (!sampling) {
+        if (owned_openai) { idletoken_secure_zero(owned_openai, openai_len); free(owned_openai); }
+        fprintf(stderr, "coord: overflow: invalid sampling controls or allocation failure\n");
+        return -1;
+    }
+    idletoken_mlock(sampling, sampling_len);
     idletoken_overflow_reply rep;
     char err[256];
     int rc = idletoken_overflow_exchange(messages, (size_t)messages_len,
                                          tools, (size_t)tools_len,
                                          tool_choice, (size_t)tool_choice_len,
+                                         parallel_tool_calls,
                                          ctk, (size_t)ctk_len,
                                          eff, eff_len_sz,
+                                         sampling, sampling_len,
                                          coord_model()->id, coord_quant(),
                                          max_tokens,
                                          hops_in, conn_fd, &rep, err, sizeof err);
+    idletoken_secure_zero(sampling, sampling_len);
+    idletoken_munlock(sampling, sampling_len); free(sampling);
     if (owned_openai) {
         idletoken_secure_zero(owned_openai, openai_len);
         free(owned_openai);
@@ -3987,6 +4032,23 @@ static char *llama_openai_upstream_body(const char *body, size_t len,
              * a measured way to produce a confident non-answer. */
             sb_cstr(&b, "\"reasoning_budget_message\":\""
                         IDLETOKEN_REASONING_BUDGET_MESSAGE "\",");
+        }
+        /* DashScope/Qwen spelling of the same budget. Clients aimed at a Qwen
+         * endpoint send `thinking_budget` when the user picks a thinking
+         * level; the engine reads only `reasoning_budget_tokens`, so on this
+         * face the level was silently ignored (the platform face learned the
+         * alias on 2026-09-21, when a user hit the refusal there). Injected
+         * AFTER the derived default so it wins as the later duplicate; a
+         * caller's own `reasoning_budget_tokens` sits in the body copied
+         * below, later still, and wins over both. Top-level key only: a
+         * message that merely mentions the word must not become a control. */
+        if (coord_json_top_int(body, len, "reasoning_budget_tokens", INT_MIN) == INT_MIN) {
+            const int tb = coord_json_top_int(body, len, "thinking_budget", INT_MIN);
+            if (tb != INT_MIN) {
+                char rb[64];
+                snprintf(rb, sizeof(rb), "\"reasoning_budget_tokens\":%d,", tb);
+                sb_cstr(&b, rb);
+            }
         }
     }
     if (force_nonstream) {
@@ -5837,8 +5899,13 @@ static void handle_http_request(int conn_fd,
     const int tok_ready = (coord_engine != NULL) || (coord_xtok != NULL);
     idletoken_http_req req;
     if (idletoken_http_read_request(conn_fd, &req) != 0) {
-        fprintf(stderr, "coord: http: read_request: %s\n", strerror(errno));
-        idletoken_http_send_error(conn_fd, 400, "bad request");
+        int parse_error = errno;
+        fprintf(stderr, "coord: http: read_request: %s\n", strerror(parse_error));
+        idletoken_http_send_error(conn_fd,
+            parse_error == EMSGSIZE ? 413 : parse_error == ETIMEDOUT ? 408 : 400,
+            parse_error == EMSGSIZE ? "request exceeds the HTTP size limit" :
+            parse_error == ETIMEDOUT ? "request upload stalled" : "invalid HTTP request framing");
+        idletoken_http_finish_rejection(conn_fd, 100);
         return;
     }
     idletoken_adm_rc adm_refuse = IDLETOKEN_ADM_OK;
@@ -6116,7 +6183,7 @@ static void handle_http_request(int conn_fd,
          * lets exactly `slots` relays run — E3.4's contract, which the agent
          * (platform_agent.c) depends on. */
         int rep_conc = g_concurrent_live > 0 ? g_concurrent_live : 1;
-        int rep_qdepth = intake_depth(), rep_qcap = g_intake.cap;
+        int rep_qdepth = g_llama ? 0 : intake_depth(), rep_qcap = g_llama ? 0 : g_intake.cap;
         if (g_llama) {
             int a = 0, w = 0, s = 1, qc = 1;
             infer_gate_snapshot(&a, &w, &s, &qc);
@@ -6228,7 +6295,28 @@ static void handle_http_request(int conn_fd,
     if (!strcmp(req.method, "GET") && !strcmp(req.path, IDLETOKEN_PATH_CLUSTER)) {
         if (g_llama) {
             const char *estate = coord_llama_state_name();
-            const char *phase = !strcmp(estate, "ready") ? "ready" : "starting";
+            /* "starting" is a PROMISE that waiting will help. Reporting it for
+             * an engine the supervisor has already given up on (5 quick
+             * restarts, "a restart will not help") is the same lie as a silent
+             * fallback: the client renders a timer that can never end, and the
+             * real reason sits in a log nobody opens. 2026-09-21: measured on a
+             * real machine — the card said "Loading… Elapsed 12:59" while the
+             * coordinator had declared the engine dead twelve minutes earlier.
+             * A permanent failure gets its own phase, and carries its reason. */
+            const char *phase = !strcmp(estate, "ready")  ? "ready"
+                              : !strcmp(estate, "failed") ? "failed"
+                                                          : "starting";
+            char engine_err[512] = "";
+            if (!strcmp(phase, "failed")) {
+                char raw[384];
+                idletoken_llama_fail_reason(g_llama, raw, sizeof(raw));
+                if (raw[0]) {
+                    char esc[384];
+                    idletoken_json_escape(esc, sizeof(esc), raw, strlen(raw));
+                    snprintf(engine_err, sizeof(engine_err),
+                             ",\"engine_error\":\"%s\"", esc);
+                }
+            }
             char local_host[64] = "coordinator";
             if (gethostname(local_host, sizeof(local_host) - 1) != 0)
                 snprintf(local_host, sizeof(local_host), "coordinator");
@@ -6240,10 +6328,10 @@ static void handle_http_request(int conn_fd,
             size_t off = 0;
             off += (size_t)snprintf(body + off, sizeof(body) - off,
                 "{\"phase\":\"%s\",\"engine\":\"llamacpp\","
-                "\"engine_state\":\"%s\",\"cluster_size\":%d,\"members\":["
+                "\"engine_state\":\"%s\"%s,\"cluster_size\":%d,\"members\":["
                 "{\"hostname\":\"%s\",\"role\":\"coordinator\","
                 "\"state\":\"%s\"}",
-                phase, estate, g_n_rpc_peers + 1, esc_local, phase);
+                phase, estate, engine_err, g_n_rpc_peers + 1, esc_local, phase);
             for (int i = 0; i < g_n_rpc_peers && off < sizeof(body); i++) {
                 /* Peer-chosen bytes crossing into a document someone else
                  * parses (CLUS-14). The HELLO gate already refused quotes and
@@ -7109,15 +7197,25 @@ static int llama_lfd_readable(int fd, int timeout_ms) {
 static int llama_lfd_readable2(int a, int b, int timeout_ms) {
     if (b < 0) return llama_lfd_readable(a, timeout_ms) ? a : -1;
 #ifdef _WIN32
-    fd_set rd;
-    struct timeval tv = { timeout_ms / 1000, (timeout_ms % 1000) * 1000 };
-    FD_ZERO(&rd);
-    FD_SET((SOCKET)a, &rd);
-    FD_SET((SOCKET)b, &rd);
-    if (select(0, &rd, NULL, NULL, &tv) <= 0) return -1;
-    if (FD_ISSET((SOCKET)a, &rd)) return a;
-    if (FD_ISSET((SOCKET)b, &rd)) return b;
-    return -1;
+    /* Winsock requires every socket in a select call to share a provider.
+     * AF_INET and AF_UNIX do not, even on machines where a mixed set appears
+     * to work. Poll them independently within one monotonic budget, and give
+     * both listeners turns when a local TCP burst coincides with relay work. */
+    static int prefer_unix = 0; /* only the accept thread calls this function */
+    const ULONGLONG end = GetTickCount64() + (timeout_ms > 0 ? (DWORD)timeout_ms : 0);
+    for (;;) {
+        int tcp_ready = llama_lfd_readable(a, 0);
+        int unix_ready = llama_lfd_readable(b, 0);
+        if (tcp_ready || unix_ready) {
+            int chosen = unix_ready && (!tcp_ready || prefer_unix) ? b : a;
+            prefer_unix = chosen == a;
+            return chosen;
+        }
+        ULONGLONG now = GetTickCount64();
+        if (now >= end) return -1;
+        DWORD left = (DWORD)(end - now);
+        Sleep(left < 10 ? left : 10);
+    }
 #else
     struct pollfd pfd[2] = {
         { .fd = a, .events = POLLIN, .revents = 0 },
@@ -7144,6 +7242,30 @@ static int llama_lfd_readable2(int a, int b, int timeout_ms) {
  * loop: its header warns the call is too slow for a startup path, which is
  * about 80 GiB models — the engine binary is ~17 MiB and hashes in
  * milliseconds. One implementation of a digest, always (idletoken_sha256.h). */
+/* Is `gguf` a LOCAL LAYER VIEW (src/common/weights.c) rather than a model file?
+ *
+ * A view is a worker's partial copy: the layers it owns are present, the rest
+ * of the file is holes. weights.c publishes `<file>.done` beside every view it
+ * builds, "IDLETOKEN_LOCAL_VIEW_V1 <index-hash> <layers-covered> <bytes>", and
+ * that marker is the only thing that distinguishes a view from the model: same
+ * name shape, same apparent size, loads without a complaint, then produces
+ * fluent nonsense (measured 2026-09-22 on the DGX: perplexity 19.2 against a
+ * band of 2.97 -- on CPU too, so it was the file, not the GPU). Only the exact
+ * marker counts; a missing or foreign `.done` file is "not a view". */
+static int coord_gguf_is_local_view(const char *gguf, unsigned *covered) {
+    char marker[1300];
+    if (snprintf(marker, sizeof marker, "%s.done", gguf) >= (int)sizeof marker) return 0;
+    FILE *f = fopen(marker, "r");
+    if (!f) return 0;
+    unsigned long long h = 0, sz = 0;
+    unsigned cov = 0;
+    int n = fscanf(f, "IDLETOKEN_LOCAL_VIEW_V1 %llx %u %llu", &h, &cov, &sz);
+    fclose(f);
+    if (n != 3) return 0;
+    if (covered) *covered = cov;
+    return 1;
+}
+
 static void engine_integrity_check(const char *bin) {
     g_engine_unverified[0] = '\0';
 
@@ -7191,9 +7313,12 @@ static void engine_integrity_check(const char *bin) {
  * scheduling, while health/stats must remain responsive.  The handoff queue
  * itself is dynamically allocated and has no capacity rejection. */
 #define LLAMA_POOL_MAX_THREADS  16
+#define LLAMA_CONTROL_THREADS  4
+#define LLAMA_HEADER_WAIT_MS   30000
 
 typedef struct llama_pending_conn {
     int fd;
+    long long accepted_ms;
     struct llama_pending_conn *next;
 } llama_pending_conn;
 
@@ -7238,25 +7363,11 @@ static int llama_decide_slots(int autov, const idletoken_node_mem *node,
     return 1;
 }
 
-/* --- llamacpp-mode connection pool (P2) ------------------------------------
- *
- * Before this, llamacpp mode was `accept -> serve -> close` on one thread, so
- * one chat request meant the whole coordinator was unavailable — including
- * GET /idletoken/v1/stats, which is what the client polls to draw its own
- * dashboard, and including a second chat from the same user. That serialisation
- * was never a decision; it was the shape of the first version.
- *
- * The default four threads are one local generation + up to two overflow
- * exchanges (the client's safety ceiling is three) + one spare, so health and
- * stats remain responsive. The historical `2N+1` sizing is retained for the
- * measurement-only multi-slot override.
- *
- * Every worker serves a whole connection start to finish, so nothing about a
- * request's handling changes — including the per-connection liveness watch on
- * the engine socket (idletoken_llama_http_watch). That watch is now more
- * important, not less: it is per CONNECTION, so one wedged relay fails its own
- * request and leaves the other slots serving. */
-static struct {
+/* A busy inference queue and interrupted uploads must not consume the workers
+ * that answer health/stats. Headers wait without a worker; complete bodyless
+ * control reads use a separate pool. Both paths retain the ordinary parser,
+ * Origin/token/admission checks and per-request cancellation. */
+typedef struct {
     pthread_mutex_t mu;
     pthread_cond_t  cv;
     llama_pending_conn *head, *tail;
@@ -7265,26 +7376,42 @@ static struct {
     uint32_t    ctx_size;
     const char *api_token;
     uint32_t    running_pos;
-} g_llpool;
+} llama_http_pool;
+static llama_http_pool g_llpool, g_llcontrol;
+
+static void llama_pool_init(llama_http_pool *pool, uint32_t ctx_size, const char *api_token) {
+    memset(pool, 0, sizeof(*pool));
+    pthread_mutex_init(&pool->mu, NULL);
+    pthread_cond_init(&pool->cv, NULL);
+    pool->ctx_size = ctx_size;
+    pool->api_token = api_token;
+}
 
 static void *llama_pool_worker(void *ud) {
-    (void)ud;
+    llama_http_pool *pool = ud;
     for (;;) {
-        pthread_mutex_lock(&g_llpool.mu);
-        while (g_llpool.len == 0 && !g_llpool.stop)
-            pthread_cond_wait(&g_llpool.cv, &g_llpool.mu);
-        if (g_llpool.len == 0) { pthread_mutex_unlock(&g_llpool.mu); return NULL; }
-        llama_pending_conn *pending = g_llpool.head;
+        pthread_mutex_lock(&pool->mu);
+        while (pool->len == 0 && !pool->stop)
+            pthread_cond_wait(&pool->cv, &pool->mu);
+        if (pool->len == 0) { pthread_mutex_unlock(&pool->mu); return NULL; }
+        llama_pending_conn *pending = pool->head;
         int cfd = pending->fd;
-        g_llpool.head = pending->next;
-        if (!g_llpool.head) g_llpool.tail = NULL;
-        g_llpool.len--;
-        pthread_mutex_unlock(&g_llpool.mu);
+        pool->head = pending->next;
+        if (!pool->head) pool->tail = NULL;
+        pool->len--;
+        pthread_mutex_unlock(&pool->mu);
         free(pending);
 
-        handle_http_request(cfd, NULL, 0, NULL, 0, &g_llpool.running_pos,
-                            NULL, NULL, g_llpool.ctx_size,
-                            g_llpool.api_token, NULL);
+        /* This bounds input inactivity only. Waiting for admission and engine
+         * generation retain their existing cancellation/budget semantics. */
+        if (idletoken_set_recv_timeout(cfd, LLAMA_HEADER_WAIT_MS) != 0) {
+            idletoken_http_send_error(cfd, 500, "cannot configure the HTTP upload deadline");
+            idletoken_close_fd(cfd);
+            continue;
+        }
+        handle_http_request(cfd, NULL, 0, NULL, 0, &pool->running_pos,
+                            NULL, NULL, pool->ctx_size,
+                            pool->api_token, NULL);
         /* This thread is done with whatever capability it spent. Called here,
          * once, rather than at each of handle_http_request's many returns:
          * every one of those would have to remember, and the one that forgot
@@ -7300,26 +7427,74 @@ static void *llama_pool_worker(void *ud) {
     }
 }
 
-/* 0 = queued, -1 = allocation/shutdown failure.  There is deliberately no
- * capacity ceiling: accepted local requests wait until served or cancelled. */
-static int llama_pool_push(int cfd) {
-    llama_pending_conn *pending = malloc(sizeof(*pending));
-    if (!pending) return -1;
-    pending->fd = cfd;
+/* Transfer an existing intake node; there is no inference queue capacity cut. */
+static void llama_pool_push(llama_http_pool *pool, llama_pending_conn *pending) {
     pending->next = NULL;
-    pthread_mutex_lock(&g_llpool.mu);
-    if (g_llpool.stop) {
-        pthread_mutex_unlock(&g_llpool.mu);
+    pthread_mutex_lock(&pool->mu);
+    if (pool->tail) pool->tail->next = pending;
+    else pool->head = pending;
+    pool->tail = pending;
+    pool->len++;
+    pthread_cond_signal(&pool->cv);
+    pthread_mutex_unlock(&pool->mu);
+}
+
+static int llama_control_read(const uint8_t *head, size_t length) {
+    char path[IDLETOKEN_HTTP_PATH_MAX];
+    if (!idletoken_http_bodyless_get_path(head, length, path, sizeof path)) return 0;
+    return !strcmp(path, "/health") || !strcmp(path, IDLETOKEN_PATH_STATS) ||
+           !strcmp(path, "/v1/models") || !strcmp(path, IDLETOKEN_PATH_CAPABILITY) ||
+           !strcmp(path, IDLETOKEN_PATH_CLUSTER);
+}
+
+/* Incomplete headers are network I/O, not admitted inference work. A bounded
+ * header deadline releases abandoned preconnects without expiring queued chat.
+ * Peeking leaves every policy header available to the normal serving parser. */
+static void llama_intake_drain(llama_pending_conn **waiting) {
+    uint8_t head[IDLETOKEN_HTTP_HEADERS_CAP];
+    llama_pending_conn **link = waiting;
+    const long long now = now_ms();
+    while (*link) {
+        llama_pending_conn *pending = *link;
+        int fd = pending->fd, status = 0;
+#ifdef _WIN32
+        int got = recv((SOCKET)fd, (char *)head, sizeof head, MSG_PEEK);
+        int again = got < 0 && (WSAGetLastError() == WSAEWOULDBLOCK || WSAGetLastError() == WSAEINTR);
+#else
+        ssize_t got = recv(fd, head, sizeof head, MSG_PEEK | MSG_DONTWAIT);
+        int again = got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR);
+#endif
+        size_t header_length = 0;
+        for (size_t i = 0; got > 0 && i + 3 < (size_t)got; i++) {
+            if (!memcmp(head + i, "\r\n\r\n", 4)) { header_length = i + 4; break; }
+        }
+        /* An oversized header is already enough input for the ordinary parser
+         * to reject. Let its worker perform the bounded rejection drain so
+         * Windows does not erase the 413 with an unread-data TCP reset. */
+        if (header_length || got == (int)sizeof head) {
+            *link = pending->next;
+#ifdef _WIN32
+            u_long blocking = 0;
+            if (ioctlsocket((SOCKET)fd, FIONBIO, &blocking) != 0) {
+                idletoken_close_fd(fd); free(pending); continue;
+            }
+#endif
+            llama_pool_push(llama_control_read(head, header_length) ? &g_llcontrol : &g_llpool, pending);
+            continue;
+        }
+        if ((got > 0 || again) && now - pending->accepted_ms >= LLAMA_HEADER_WAIT_MS) status = 408;
+        else if (got > 0 || again) { link = &pending->next; continue; }
+        *link = pending->next;
+        if (status) {
+            idletoken_http_send_error(fd, status, "request headers timed out");
+            /* Peeked bytes are still unread. Half-close and drain them without
+             * delaying the accept loop; otherwise Windows can erase the 408
+             * with a TCP reset, or many simultaneous expiries stall controls. */
+            idletoken_http_finish_rejection(fd, 0);
+        }
+        idletoken_close_fd(fd);
         free(pending);
-        return -1;
     }
-    if (g_llpool.tail) g_llpool.tail->next = pending;
-    else g_llpool.head = pending;
-    g_llpool.tail = pending;
-    g_llpool.len++;
-    pthread_cond_signal(&g_llpool.cv);
-    pthread_mutex_unlock(&g_llpool.mu);
-    return 0;
 }
 
 /* Name the precision this run serves, from the GGUF the engine will open.
@@ -7578,6 +7753,20 @@ static int run_llamacpp_mode(const char *llama_bin, const char *llama_gguf,
                 llama_gguf);
         return 2;
     }
+    /* A coordinator serves the verified model file, never a worker's partial
+     * view (hard constraint #14: every machine holds the whole model). The
+     * engine cannot tell the two apart; this marker check can. */
+    {
+        unsigned covered = 0;
+        if (coord_gguf_is_local_view(llama_gguf, &covered)) {
+            fprintf(stderr, "idletoken-coord: refuse: --llama-gguf is a LOCAL LAYER VIEW, "
+                            "not the model: %s.done says only layers [0,%u) are present and "
+                            "the rest of the file is holes. Serving it would produce fluent "
+                            "nonsense. Point --llama-gguf at the verified model file under "
+                            "the models directory.\n", llama_gguf, covered);
+            return 2;
+        }
+    }
 
     /* Development channel (plan A4): record WHICH bytes this machine loaded, in
      * the one form that can be reconciled with the curated manifest and with
@@ -7760,25 +7949,39 @@ static int run_llamacpp_mode(const char *llama_bin, const char *llama_gguf,
      * admission gate must be settled before any CONNECTION can reach one.
      * Between those two moments the workers are alive but idle (the accept loop
      * has not started), which is the window the gate is configured in. */
-    memset(&g_llpool, 0, sizeof(g_llpool));
-    pthread_mutex_init(&g_llpool.mu, NULL);
-    pthread_cond_init(&g_llpool.cv, NULL);
-    g_llpool.ctx_size  = ctx_size;
-    g_llpool.api_token = api_token;
+    llama_pool_init(&g_llpool, ctx_size, api_token);
+    llama_pool_init(&g_llcontrol, ctx_size, api_token);
     const int n_threads = LLAMA_POOL_MAX_THREADS;
     pthread_t pool[LLAMA_POOL_MAX_THREADS];
+    pthread_t control[LLAMA_CONTROL_THREADS];
     int n_started = 0;
     for (int i = 0; i < n_threads && i < LLAMA_POOL_MAX_THREADS; i++) {
-        if (pthread_create(&pool[n_started], NULL, llama_pool_worker, NULL) != 0)
+        if (pthread_create(&pool[n_started], NULL, llama_pool_worker, &g_llpool) != 0)
             break;
         n_started++;
     }
-    if (n_started == 0) {
+    int controls_started = 0;
+    for (int i = 0; i < LLAMA_CONTROL_THREADS; i++) {
+        if (pthread_create(&control[controls_started], NULL, llama_pool_worker, &g_llcontrol) != 0)
+            break;
+        controls_started++;
+    }
+    if (n_started == 0 || controls_started == 0) {
         /* No pool, no serving. Falling back to "handle it on the accept thread"
          * would look like it worked and then wedge the whole coordinator on the
          * first long generation — the exact failure this pool exists to end. */
         fprintf(stderr, "idletoken-coord: cannot create HTTP worker threads: %s\n",
                 strerror(errno));
+        pthread_mutex_lock(&g_llpool.mu);
+        g_llpool.stop = 1;
+        pthread_cond_broadcast(&g_llpool.cv);
+        pthread_mutex_unlock(&g_llpool.mu);
+        pthread_mutex_lock(&g_llcontrol.mu);
+        g_llcontrol.stop = 1;
+        pthread_cond_broadcast(&g_llcontrol.cv);
+        pthread_mutex_unlock(&g_llcontrol.mu);
+        for (int i = 0; i < n_started; i++) pthread_join(pool[i], NULL);
+        for (int i = 0; i < controls_started; i++) pthread_join(control[i], NULL);
         idletoken_close_fd(lfd);
         if (ufd >= 0) { idletoken_close_fd(ufd); unlink(g_api_unix); }
         idletoken_llama_shutdown(g_llama);
@@ -7799,9 +8002,10 @@ static int run_llamacpp_mode(const char *llama_bin, const char *llama_gguf,
     }
     infer_gate_init(g_llama_slots);
     fprintf(stderr, "coord: llamacpp mode — HTTP API on %s, %d sequence slot(s), "
-                    "%d worker thread(s) (model loading in the background; chat "
+                    "%d request worker(s), %d control worker(s) (model loading in the background; chat "
                     "answers 503 until the engine is ready). Ctrl-C to stop.\n",
-            api_bind, g_llama_slots, n_started);
+            api_bind, g_llama_slots, n_started, controls_started);
+    llama_pending_conn *header_waiting = NULL;
     time_t last_hb = 0;
     pthread_t postload_tid;
     int postload_started = 0;
@@ -7811,7 +8015,7 @@ static int run_llamacpp_mode(const char *llama_bin, const char *llama_gguf,
      * load must not sit there waiting for the load. */
     int fatal_exit = 0;
     for (;;) {
-        int ready_fd = llama_lfd_readable2(lfd, ufd, 1000);
+        int ready_fd = llama_lfd_readable2(lfd, ufd, header_waiting ? 25 : 1000);
         if (g_llama_stop_sig) {
             fprintf(stderr, "coord: signal received — stopping the sidecar\n");
             break;
@@ -7853,6 +8057,7 @@ static int run_llamacpp_mode(const char *llama_bin, const char *llama_gguf,
             }
         }
         llama_peers_heartbeat(&last_hb);
+        llama_intake_drain(&header_waiting);
         if (ready_fd < 0) continue;
         int cfd = idletoken_accept_tcp(ready_fd);
         if (cfd < 0) {
@@ -7860,18 +8065,24 @@ static int run_llamacpp_mode(const char *llama_bin, const char *llama_gguf,
             fprintf(stderr, "coord: http accept: %s\n", strerror(errno));
             break;
         }
-        if (llama_pool_push(cfd) != 0) {
-            /* Allocation failure must not be disguised as ordinary load.  Do
-             * the work synchronously instead of rejecting a request merely
-             * because the handoff node could not be allocated. */
-            fprintf(stderr, "coord: HTTP handoff allocation failed — serving "
-                            "the accepted connection synchronously\n");
-            handle_http_request(cfd, NULL, 0, NULL, 0, &g_llpool.running_pos,
-                                NULL, NULL, g_llpool.ctx_size,
-                                g_llpool.api_token, NULL);
-            idletoken_admission_request_end();
+#ifdef _WIN32
+        u_long nonblocking = 1;
+        if (ioctlsocket((SOCKET)cfd, FIONBIO, &nonblocking) != 0) {
             idletoken_close_fd(cfd);
+            continue;
         }
+#endif
+        llama_pending_conn *pending = malloc(sizeof(*pending));
+        if (!pending) {
+            idletoken_http_send_error(cfd, 503, "cannot allocate HTTP connection state");
+            idletoken_close_fd(cfd);
+            continue;
+        }
+        pending->fd = cfd;
+        pending->accepted_ms = now_ms();
+        pending->next = header_waiting;
+        header_waiting = pending;
+        llama_intake_drain(&header_waiting);
     }
     /* Wake every worker, then wait: a thread still inside handle_http_request
      * owns a client fd and the engine connection behind it. Tearing the sidecar
@@ -7880,7 +8091,18 @@ static int run_llamacpp_mode(const char *llama_bin, const char *llama_gguf,
     g_llpool.stop = 1;
     pthread_cond_broadcast(&g_llpool.cv);
     pthread_mutex_unlock(&g_llpool.mu);
+    pthread_mutex_lock(&g_llcontrol.mu);
+    g_llcontrol.stop = 1;
+    pthread_cond_broadcast(&g_llcontrol.cv);
+    pthread_mutex_unlock(&g_llcontrol.mu);
+    while (header_waiting) {
+        llama_pending_conn *pending = header_waiting;
+        header_waiting = pending->next;
+        idletoken_close_fd(pending->fd);
+        free(pending);
+    }
     for (int i = 0; i < n_started; i++) pthread_join(pool[i], NULL);
+    for (int i = 0; i < controls_started; i++) pthread_join(control[i], NULL);
     while (g_llpool.head) {
         llama_pending_conn *pending = g_llpool.head;
         g_llpool.head = pending->next;
@@ -7888,6 +8110,13 @@ static int run_llamacpp_mode(const char *llama_bin, const char *llama_gguf,
         free(pending);
     }
     g_llpool.tail = NULL;
+    while (g_llcontrol.head) {
+        llama_pending_conn *pending = g_llcontrol.head;
+        g_llcontrol.head = pending->next;
+        idletoken_close_fd(pending->fd);
+        free(pending);
+    }
+    g_llcontrol.tail = NULL;
     if (postload_started) pthread_join(postload_tid, NULL);
     idletoken_close_fd(lfd);
     /* Take the socket file with us. A leftover would be removed by the next
@@ -9559,6 +9788,8 @@ static int run_llamacpp_cluster_mode(
 }
 
 int main(int argc, char **argv) {
+    int proxy_helper = idletoken_platform_proxy_helper(argc, argv);
+    if (proxy_helper >= 0) return proxy_helper;
     /* A supervisor's log must be tail-able while it runs. Redirected stdio is
      * FULLY buffered (MinGW CRT buffers even stderr), so a live coordinator's
      * log file stayed at 0 bytes and the cluster matrix lane read it as dead

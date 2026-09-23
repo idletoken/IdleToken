@@ -286,7 +286,10 @@ fn token_eq(a: &str, b: &str) -> bool {
     if a.len() != b.len() || a.is_empty() {
         return false;
     }
-    a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.bytes()
+        .zip(b.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 /// Proof that the sender knows the join code, bound to one nonce and one
@@ -1314,7 +1317,11 @@ fn apply_roster(inner: &mut Inner, v: &Value) -> RosterEffect {
             };
             Peer {
                 is_self: id == inner.self_id,
-                role: if Some(id.as_str()) == coordinator_id.as_deref() { "coordinator" } else { "worker" },
+                role: if Some(id.as_str()) == coordinator_id.as_deref() {
+                    "coordinator"
+                } else {
+                    "worker"
+                },
                 stage: m["stage"].as_str().unwrap_or("joined").to_string(),
                 id,
                 hostname: m["hostname"].as_str().unwrap_or("").to_string(),
@@ -1405,14 +1412,27 @@ fn usable_cluster_ipv4(ip: Ipv4Addr) -> bool {
 /// use an unusually named physical interface; automatic mode stays fail-safe.
 fn likely_vpn_interface(name: &str) -> bool {
     let lower = name.trim().to_ascii_lowercase();
-    if lower == "meta" || lower.starts_with("utun") || lower.starts_with("tun")
-        || lower.starts_with("tap") || lower.starts_with("wg")
+    if lower == "meta"
+        || lower.starts_with("utun")
+        || lower.starts_with("tun")
+        || lower.starts_with("tap")
+        || lower.starts_with("wg")
     {
         return true;
     }
     [
-        "vpn", "tailscale", "wireguard", "wintun", "zerotier", "hamachi",
-        "nordlynx", "openvpn", "proton", "clash", "sing-box", "singbox",
+        "vpn",
+        "tailscale",
+        "wireguard",
+        "wintun",
+        "zerotier",
+        "hamachi",
+        "nordlynx",
+        "openvpn",
+        "proton",
+        "clash",
+        "sing-box",
+        "singbox",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
@@ -1473,7 +1493,9 @@ fn configured_bind_ip(tuning: &Tuning) -> Option<Ipv4Addr> {
     if nic.is_empty() || nic == "auto" {
         return None;
     }
-    nic.parse::<Ipv4Addr>().ok().filter(|ip| usable_cluster_ipv4(*ip))
+    nic.parse::<Ipv4Addr>()
+        .ok()
+        .filter(|ip| usable_cluster_ipv4(*ip))
 }
 
 /// The address this machine binds cluster traffic to and advertises to the
@@ -1522,9 +1544,15 @@ fn source_ip_for_peer(peer: &str) -> Result<Ipv4Addr, String> {
         .map_err(|e| format!("cannot open a route probe: {e}"))?;
     sock.connect((peer_ip, COORD_PORT))
         .map_err(|e| format!("no route to coordinator {peer_ip}: {e}"))?;
-    let local = match sock.local_addr().map_err(|e| format!("cannot inspect route to {peer_ip}: {e}"))?.ip() {
+    let local = match sock
+        .local_addr()
+        .map_err(|e| format!("cannot inspect route to {peer_ip}: {e}"))?
+        .ip()
+    {
         std::net::IpAddr::V4(ip) => ip,
-        std::net::IpAddr::V6(_) => return Err(format!("route to IPv4 coordinator {peer_ip} selected IPv6")),
+        std::net::IpAddr::V6(_) => {
+            return Err(format!("route to IPv4 coordinator {peer_ip} selected IPv6"))
+        }
     };
     if !usable_cluster_ipv4(local) {
         return Err(format!(
@@ -1534,7 +1562,8 @@ fn source_ip_for_peer(peer: &str) -> Result<Ipv4Addr, String> {
 
     let interfaces = local_ipv4_interfaces();
     if !interfaces.is_empty() {
-        let matching: Vec<&LocalLanInterface> = interfaces.iter().filter(|i| i.ip == local).collect();
+        let matching: Vec<&LocalLanInterface> =
+            interfaces.iter().filter(|i| i.ip == local).collect();
         if matching.is_empty() {
             return Err(format!(
                 "route to coordinator {peer_ip} selected {local}, which is not assigned to a current interface"
@@ -1562,7 +1591,10 @@ fn rpc_host_for_coordinator(tuning: &Tuning, coordinator: &str) -> Result<String
 /// setting is a restriction, and a restriction that silently passes whatever it
 /// cannot classify is not one.
 fn same_subnet(a: &str, b: &str) -> bool {
-    match (a.parse::<std::net::Ipv4Addr>(), b.parse::<std::net::Ipv4Addr>()) {
+    match (
+        a.parse::<std::net::Ipv4Addr>(),
+        b.parse::<std::net::Ipv4Addr>(),
+    ) {
         (Ok(x), Ok(y)) => x.octets()[..3] == y.octets()[..3],
         _ => false,
     }
@@ -1626,8 +1658,10 @@ fn overflow_args(tuning: &Tuning) -> Vec<String> {
     // which, on this launch path, is a crash loop the user reads as "the
     // engine keeps dying" (2026-08-21). Hand it the plaintext spelling.
     let mut v = vec![
-        "--overflow-url".into(), crate::engine::engine_platform_url(&tuning.overflow_url),
-        "--overflow-wait-s".into(), tuning.overflow_wait_s.to_string(),
+        "--overflow-url".into(),
+        crate::engine::engine_platform_url(&tuning.overflow_url),
+        "--overflow-wait-s".into(),
+        tuning.overflow_wait_s.to_string(),
     ];
     // Zero means no additional local ceiling; a positive value remains an
     // operator-only stop-loss. The desktop product always supplies zero.
@@ -1674,7 +1708,10 @@ fn secret_env(tuning: &Tuning) -> Vec<(String, String)> {
         env.push(("IDLETOKEN_KV_CACHE_TYPE".into(), tuning.kv_cache_k.clone()));
     }
     if !tuning.kv_cache_v.is_empty() {
-        env.push(("IDLETOKEN_KV_CACHE_TYPE_V".into(), tuning.kv_cache_v.clone()));
+        env.push((
+            "IDLETOKEN_KV_CACHE_TYPE_V".into(),
+            tuning.kv_cache_v.clone(),
+        ));
     }
     env
 }
@@ -1693,7 +1730,11 @@ fn materialize_engine(app: &AppHandle) {
         }
         inner.engine_started = true;
         let is_coord = inner.coordinator_id.as_deref() == Some(inner.self_id.as_str());
-        let remote_workers = inner.peers.iter().filter(|p| p.role != "coordinator").count();
+        let remote_workers = inner
+            .peers
+            .iter()
+            .filter(|p| p.role != "coordinator")
+            .count();
         (
             is_coord,
             inner.coord_ip.clone().unwrap_or_default(),
@@ -1716,15 +1757,15 @@ fn materialize_engine(app: &AppHandle) {
                 return;
             }
         };
-        let engine_bin_arg = match crate::engine::native_path_arg(
-            &engine_bin, "llama-server path") {
+        let engine_bin_arg = match crate::engine::native_path_arg(&engine_bin, "llama-server path")
+        {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("[pairing] coordinator start refused: {e}");
                 return;
             }
         };
-        let host = bind_host(&tuning);   // "Bind interface / IP", else 0.0.0.0
+        let host = bind_host(&tuning); // "Bind interface / IP", else 0.0.0.0
         let mut coord_args = vec![
             // Hardened engine, always — not only once someone presses "share
             // compute". The flags that keep a buyer's prompt unreadable on this
@@ -1739,17 +1780,24 @@ fn materialize_engine(app: &AppHandle) {
             // wants it runs the coordinator from a shell, where --shared stays
             // opt-in. See docs/shared-mode-plan-2026-08.md P0-1.
             "--shared".into(),
-            "--bind".into(), format!("{host}:{COORD_PORT}"),
-            "--llama-server-bin".into(), engine_bin_arg,
-            "--llama-gguf".into(), model_path,
-            "--llama-port".into(), LLAMA_PORT.to_string(),
+            "--bind".into(),
+            format!("{host}:{COORD_PORT}"),
+            "--llama-server-bin".into(),
+            engine_bin_arg,
+            "--llama-gguf".into(),
+            model_path,
+            "--llama-port".into(),
+            LLAMA_PORT.to_string(),
             "--http".into(),
             // Always loopback (2026-08-15): the coordinator rewrites anything
             // else to 127.0.0.1 anyway; upgraded installs may still store
             // "0.0.0.0" in settings, so it is normalized here too.
-            "--api-bind".into(), format!("127.0.0.1:{}", tuning.api_port),
-            "--ctx-size".into(), tuning.ctx_size.to_string(),
-            "--max-decode".into(), tuning.max_decode.to_string(),
+            "--api-bind".into(),
+            format!("127.0.0.1:{}", tuning.api_port),
+            "--ctx-size".into(),
+            tuning.ctx_size.to_string(),
+            "--max-decode".into(),
+            tuning.max_decode.to_string(),
         ];
         // Shared mode's second door — the SAME one llamacpp_serve opens, and
         // missing here until 2026-08-21. The comment above says this engine is
@@ -1816,7 +1864,9 @@ fn materialize_engine(app: &AppHandle) {
         }
         coord_args.extend(overflow_args(&tuning));
         // Credentials go through the environment, never argv (A-P0-4).
-        if let Err(e) = crate::engine::start_engine(app, "coordinator".into(), coord_args, secret_env(&tuning)) {
+        if let Err(e) =
+            crate::engine::start_engine(app, "coordinator".into(), coord_args, secret_env(&tuning))
+        {
             eprintln!("[pairing] coord start failed: {e}");
         }
     } else {
@@ -1840,21 +1890,26 @@ fn materialize_engine(app: &AppHandle) {
                 return;
             }
         };
-        let engine_dir_arg = match crate::engine::native_path_arg(
-            &engine_dir, "llama.cpp engine directory") {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("[pairing] rpc worker start refused: {e}");
-                return;
-            }
-        };
+        let engine_dir_arg =
+            match crate::engine::native_path_arg(&engine_dir, "llama.cpp engine directory") {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("[pairing] rpc worker start refused: {e}");
+                    return;
+                }
+            };
         let mut worker_args = vec![
             "--rpc-supervisor".into(),
-            "--engine-dir".into(), engine_dir_arg,
-            "--coordinator".into(), format!("{coord_ip}:{COORD_PORT}"),
-            "--discovery-port".into(), tuning.discovery_port.to_string(),
-            "--rpc-host".into(), rpc_host,
-            "--rpc-port".into(), tuning.inter_stage_port.to_string(),
+            "--engine-dir".into(),
+            engine_dir_arg,
+            "--coordinator".into(),
+            format!("{coord_ip}:{COORD_PORT}"),
+            "--discovery-port".into(),
+            tuning.discovery_port.to_string(),
+            "--rpc-host".into(),
+            rpc_host,
+            "--rpc-port".into(),
+            tuning.inter_stage_port.to_string(),
         ];
         // Every node keeps the complete curated GGUF on its own disk. The RPC
         // supervisor uses it only as a source for the tensor range assigned to
@@ -1897,7 +1952,11 @@ fn http_get_body(ip: &str, port: u16, path: &str) -> Option<String> {
     let addr: SocketAddr = format!("{ip}:{port}").parse().ok()?;
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).ok()?;
     s.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-    write!(s, "GET {path} HTTP/1.1\r\nHost: {ip}\r\nConnection: close\r\n\r\n").ok()?;
+    write!(
+        s,
+        "GET {path} HTTP/1.1\r\nHost: {ip}\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
 
     // Read until Content-Length is satisfied, or until EOF, and KEEP whatever
     // arrived if the read times out.
@@ -1916,7 +1975,7 @@ fn http_get_body(ip: &str, port: u16, path: &str) -> Option<String> {
     let mut chunk = [0u8; 4096];
     loop {
         match s.read(&mut chunk) {
-            Ok(0) => break,                       // clean EOF
+            Ok(0) => break, // clean EOF
             Ok(n) => {
                 buf.extend_from_slice(&chunk[..n]);
                 if let Some(end) = find_header_end(&buf) {
@@ -1944,7 +2003,10 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 fn content_length(headers: &[u8]) -> Option<usize> {
     let text = String::from_utf8_lossy(headers);
     text.lines()
-        .find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length")))
+        .find_map(|l| {
+            l.split_once(':')
+                .filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+        })
         .and_then(|(_, v)| v.trim().parse().ok())
 }
 
@@ -1953,6 +2015,38 @@ fn content_length(headers: &[u8]) -> Option<usize> {
 /// machine exclusively (coord enforces it), so a joiner cannot poll it — a
 /// joiner's phase/stage/layers all arrive through the roster protocol instead
 /// (roster_reply carries them from the creator's merge).
+///
+/// Does this coordinator status describe an engine that has given up for good?
+///
+/// Pure so it can be tested: the bug this exists to prevent was a *missing
+/// branch*, not bad arithmetic. The coordinator gives up after five quick
+/// restarts and says so ("a restart will not help"), but the client treated
+/// that byte-for-byte like "not ready yet" — so the card counted up forever.
+/// Measured 2026-09-21: "Loading… Elapsed 12:59" against an engine the
+/// coordinator had declared dead twelve minutes earlier.
+///
+/// The half that matters just as much is the negative one: `starting` and
+/// `restarting` must NOT come back as failures, or the first slow load would
+/// tear a perfectly healthy cluster down. Both directions are asserted.
+///
+/// `phase` is read as well as `engine_state` because coordinators before
+/// 2026-09-21 only ever reported `phase: "starting"` here — reading both means
+/// a new client still recognises an old coordinator's failure.
+fn permanent_engine_failure(v: &Value) -> Option<String> {
+    let failed =
+        v["phase"].as_str() == Some("failed") || v["engine_state"].as_str() == Some("failed");
+    if !failed {
+        return None;
+    }
+    Some(
+        v["engine_error"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("the engine stopped and restarting did not help")
+            .to_string(),
+    )
+}
+
 fn merge_engine_status(app: &AppHandle) -> bool {
     let api_port = {
         let pairing = app.state::<Pairing>();
@@ -1968,6 +2062,31 @@ fn merge_engine_status(app: &AppHandle) -> bool {
     let Ok(v) = serde_json::from_str::<Value>(&body) else {
         return false;
     };
+    if let Some(reason) = permanent_engine_failure(&v) {
+        let my_role = {
+            let pairing = app.state::<Pairing>();
+            let mut inner = pairing.0.lock().unwrap();
+            let my_role = if inner.coordinator_id.as_deref() == Some(inner.self_id.as_str()) {
+                "coordinator"
+            } else {
+                "worker"
+            };
+            inner.phase = "idle".into();
+            inner.engine_started = false;
+            for p in inner.peers.iter_mut() {
+                p.stage = "joined".into();
+            }
+            my_role
+        };
+        eprintln!("[pairing] engine failed permanently while forming: {reason}");
+        // The coordinator sidecar is healthy even though its llama engine is
+        // not. Stop it explicitly: otherwise the card leaves Loading but the
+        // next Start is refused as "already running". This call happens after
+        // dropping the pairing lock, avoiding an Engine↔Pairing lock inversion.
+        crate::engine::stop_after_permanent_failure(app, my_role, &reason);
+        emit_snapshot(app);
+        return true;
+    }
     if v["phase"].as_str() != Some("ready") {
         return false;
     }
@@ -1985,7 +2104,10 @@ fn merge_engine_status(app: &AppHandle) -> bool {
         // where the engine reports one (two test instances sharing a machine's
         // hostname can't be told apart — the layer plan itself is asserted at
         // the engine level; see P3).
-        if let Some(m) = members.iter().find(|m| m["hostname"].as_str() == Some(p.hostname.as_str())) {
+        if let Some(m) = members
+            .iter()
+            .find(|m| m["hostname"].as_str() == Some(p.hostname.as_str()))
+        {
             p.layer_lo = m["layer_lo"].as_u64().map(|x| x as u32);
             p.layer_hi = m["layer_hi"].as_u64().map(|x| x as u32);
         }
@@ -2068,7 +2190,11 @@ fn join_identity(inner: &Inner, id: &str, device: &str, now: Instant) -> JoinIde
             now.duration_since(seen)
                 > Duration::from_secs((p.hb_secs.clamp(1, 60) as u64 * 3).max(OFFLINE_AFTER_S))
         });
-        return if stale || !p.online { JoinIdentity::Bind } else { JoinIdentity::Conflict };
+        return if stale || !p.online {
+            JoinIdentity::Bind
+        } else {
+            JoinIdentity::Conflict
+        };
     }
     if p.device_id.is_empty() && device.is_empty() {
         // Both sides predate device ids. Nothing here can tell impersonation
@@ -2135,9 +2261,11 @@ fn roster_request(inner: &mut Inner, req: &Value, peer_ip: &str, now: Instant) -
     if matches!(req["op"].as_str(), Some("roster") | Some("leave")) {
         let id = req["id"].as_str().unwrap_or("");
         let token = req["token"].as_str().unwrap_or("");
-        if inner.closed_members.iter().any(|member| {
-            member.id == id && member.ip == peer_ip && token_eq(&member.token, token)
-        }) {
+        if inner
+            .closed_members
+            .iter()
+            .any(|member| member.id == id && member.ip == peer_ip && token_eq(&member.token, token))
+        {
             return json!({"ok": true, "closed": true});
         }
     }
@@ -2187,7 +2315,9 @@ fn roster_request(inner: &mut Inner, req: &Value, peer_ip: &str, now: Instant) -
                 return json!({"ok": false, "err": "bad hello"});
             }
             let ours = random_hex(16);
-            inner.challenges.retain(|c| now.duration_since(c.at) < CHALLENGE_TTL);
+            inner
+                .challenges
+                .retain(|c| now.duration_since(c.at) < CHALLENGE_TTL);
             // Fair share: a source spraying `hello` may only ever evict its
             // OWN oldest nonce. Before this, one sprayer emptied the shared
             // 64-entry list and every honest joiner's follow-up `join` failed
@@ -2225,7 +2355,9 @@ fn roster_request(inner: &mut Inner, req: &Value, peer_ip: &str, now: Instant) -
             // decoration.
             let proof = req["proof"].as_str().unwrap_or("");
             let code = inner.code.clone().unwrap_or_default();
-            inner.challenges.retain(|c| now.duration_since(c.at) < CHALLENGE_TTL);
+            inner
+                .challenges
+                .retain(|c| now.duration_since(c.at) < CHALLENGE_TTL);
             // Only nonces WE issued to THIS source count. A nonce is handed to
             // one address; letting another address spend it would turn the
             // challenge list into a shared pool.
@@ -2294,7 +2426,9 @@ fn roster_request(inner: &mut Inner, req: &Value, peer_ip: &str, now: Instant) -
                 || their_quant != cluster_quant
                 || !ctx_ok
             {
-                let theirs = their_ctx.map(|c| c.to_string()).unwrap_or_else(|| "unset".into());
+                let theirs = their_ctx
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "unset".into());
                 audit(
                     inner,
                     format!(
@@ -2454,7 +2588,10 @@ fn roster_request(inner: &mut Inner, req: &Value, peer_ip: &str, now: Instant) -
 /// One roster-protocol request on the creator side: bounded I/O around
 /// `roster_request`.
 fn handle_roster_conn(app: &AppHandle, stream: TcpStream, generation: u64) {
-    let peer_ip = stream.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+    let peer_ip = stream
+        .peer_addr()
+        .map(|a| a.ip().to_string())
+        .unwrap_or_default();
     let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
 
     // Admission BEFORE the read (CLUS-05). The accept loop is serial, so a
@@ -2763,7 +2900,9 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
                             return;
                         }
                     }
-                    let Ok((n, src)) = sock.recv_from(&mut buf) else { continue };
+                    let Ok((n, src)) = sock.recv_from(&mut buf) else {
+                        continue;
+                    };
                     let msg = String::from_utf8_lossy(&buf[..n]);
                     let parts: Vec<&str> = msg.trim().split('|').collect();
                     // v2 = magic|session|nonce|port, v1 = magic|hash|port. The
@@ -2831,8 +2970,10 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
         // the code, against a nonce we pick, BEFORE we prove anything to it.
         let hello = |ip: &str| -> Handshake {
             let mine = random_hex(16);
-            let Some(v) = roster_call(ip, &json!({"op": "hello", "nonce": mine, "v": PAIR_PROTO_V}))
-            else {
+            let Some(v) = roster_call(
+                ip,
+                &json!({"op": "hello", "nonce": mine, "v": PAIR_PROTO_V}),
+            ) else {
                 return Handshake::Silent;
             };
             if v["ok"].as_bool() == Some(false) {
@@ -2871,8 +3012,7 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
         //   one that measured them, and the roster is where the cluster totals
         //   them up (pre-flight "will this model fit on all of us together").
         let join_req = |nonce: &str| {
-            let (vram_free, ram_free, ram_expert_free, unified,
-                 model_id, quant, ctx, model_ready) = {
+            let (vram_free, ram_free, ram_expert_free, unified, model_id, quant, ctx, model_ready) = {
                 let pairing = app.state::<Pairing>();
                 let inner = pairing.0.lock().unwrap();
                 (
@@ -2935,7 +3075,9 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
                     continue;
                 }
                 Handshake::TooOld => {
-                    eprintln!("[pairing] {cand} does not support the join handshake — older IdleToken");
+                    eprintln!(
+                        "[pairing] {cand} does not support the join handshake — older IdleToken"
+                    );
                     last_refusal = Some("old creator".into());
                     continue;
                 }
@@ -2974,7 +3116,8 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
                     "[pairing] {cand} accepted the code but issued no member token — \
                      that machine is running an older IdleToken; update it"
                 );
-                last_refusal = Some("no member token issued (the hosting machine needs an update)".into());
+                last_refusal =
+                    Some("no member token issued (the hosting machine needs an update)".into());
                 continue;
             };
             member_token = token.to_string();
@@ -2997,7 +3140,9 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
                 inner.last_error = Some(match last_refusal.as_deref() {
                     Some("bad code") => ("badCode".into(), String::new()),
                     Some("old creator") => ("oldCreator".into(), String::new()),
-                    Some(e) if e.starts_with("different subnet") => ("subnet".into(), String::new()),
+                    Some(e) if e.starts_with("different subnet") => {
+                        ("subnet".into(), String::new())
+                    }
                     // Only claim "download this" when we actually know WHAT to
                     // download. A creator that refused without naming the model
                     // falls through to the verbatim refusal below rather than
@@ -3015,7 +3160,11 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
             emit_snapshot(&app);
             eprintln!(
                 "[pairing] no cluster accepted that code{}",
-                if listen { " on this LAN" } else { " (LAN auto-discovery is off; add the host's IP under Manual peer IPs)" }
+                if listen {
+                    " on this LAN"
+                } else {
+                    " (LAN auto-discovery is off; add the host's IP under Manual peer IPs)"
+                }
             );
             return;
         };
@@ -3044,8 +3193,7 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
         // restores the live member states from the wire.
         let mut last_ok = std::time::Instant::now();
         let mut lost = false;
-        let lost_after =
-            Duration::from_secs(poll.as_secs().saturating_mul(3).max(OFFLINE_AFTER_S));
+        let lost_after = Duration::from_secs(poll.as_secs().saturating_mul(3).max(OFFLINE_AFTER_S));
         loop {
             {
                 let pairing = app.state::<Pairing>();
@@ -3060,8 +3208,7 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
                 // report this machine's live engine state so the whole roster
                 // sees per-node progress (P4). The token is what makes this a
                 // MEMBER's poll rather than anyone's TCP connection (A-P0-2).
-                let (vram_free, ram_free, ram_expert_free, unified,
-                     model_id, quant, model_ready) = {
+                let (vram_free, ram_free, ram_expert_free, unified, model_id, quant, model_ready) = {
                     let pairing = app.state::<Pairing>();
                     let inner = pairing.0.lock().unwrap();
                     (
@@ -3166,7 +3313,12 @@ fn spawn_joiner_tasks(app: AppHandle, generation: u64, code: String, discovery_p
                     // flag (only our own error — a fresher one is not ours to
                     // erase); apply_roster below restores every member's live
                     // online state from the wire.
-                    if lost && inner.last_error.as_ref().is_some_and(|(c, _)| c == "creatorLost") {
+                    if lost
+                        && inner
+                            .last_error
+                            .as_ref()
+                            .is_some_and(|(c, _)| c == "creatorLost")
+                    {
                         inner.last_error = None;
                     }
                     apply_roster(&mut inner, &v)
@@ -3520,7 +3672,10 @@ pub fn pairing_start(
                 p.hostname, inner.tuning.model_id, inner.tuning.quant
             ));
         }
-        let coord_id = inner.coordinator_id.clone().unwrap_or_else(|| inner.self_id.clone());
+        let coord_id = inner
+            .coordinator_id
+            .clone()
+            .unwrap_or_else(|| inner.self_id.clone());
         // The creator used to transition the whole roster to "starting" and
         // return Ok before materialize_engine noticed an empty path. That
         // function could only write to stderr, so the installed UI looked as
@@ -3539,7 +3694,13 @@ pub fn pairing_start(
             .peers
             .iter()
             .find(|p| p.id == coord_id)
-            .map(|p| if p.is_self || p.ip.is_empty() { mine.clone() } else { p.ip.clone() })
+            .map(|p| {
+                if p.is_self || p.ip.is_empty() {
+                    mine.clone()
+                } else {
+                    p.ip.clone()
+                }
+            })
             .unwrap_or_else(|| mine.clone());
         inner.coord_ip = Some(coord_ip);
         inner.phase = "starting".into();
@@ -3576,7 +3737,9 @@ pub fn pairing_set_coordinator(
 /// so replaying the command is refused rather than silently reapplying it.
 fn approve_coordinator_request(inner: &mut Inner, peer_id: &str) -> Result<(), String> {
     if inner.mode != Mode::Creator {
-        return Err("[PAIR_NOT_CREATOR] only the cluster creator can approve a coordinator request".into());
+        return Err(
+            "[PAIR_NOT_CREATOR] only the cluster creator can approve a coordinator request".into(),
+        );
     }
     if inner.phase != "idle" {
         return Err("[PAIR_ALREADY_STARTED] cluster already started".into());
@@ -3588,7 +3751,9 @@ fn approve_coordinator_request(inner: &mut Inner, peer_id: &str) -> Result<(), S
         return Err("[PAIR_ROLE_REQUEST_STALE] that machine is no longer online".into());
     }
     if !peer.wants_coordinator {
-        return Err("[PAIR_ROLE_NOT_REQUESTED] that machine is not requesting the coordinator role".into());
+        return Err(
+            "[PAIR_ROLE_NOT_REQUESTED] that machine is not requesting the coordinator role".into(),
+        );
     }
     if peer.device_id.is_empty() {
         return Err(
@@ -3601,7 +3766,11 @@ fn approve_coordinator_request(inner: &mut Inner, peer_id: &str) -> Result<(), S
     let device = device_identity_label(&peer.device_id).unwrap_or_else(|| "unknown".into());
     inner.coordinator_id = Some(peer_id.to_string());
     for p in inner.peers.iter_mut() {
-        p.role = if p.id == peer_id { "coordinator" } else { "worker" };
+        p.role = if p.id == peer_id {
+            "coordinator"
+        } else {
+            "worker"
+        };
         if p.id == peer_id {
             // One approval consumes exactly the request that authorized it.
             p.wants_coordinator = false;
@@ -3645,10 +3814,12 @@ pub fn pairing_report_memory(
         inner.self_unified = unified_memory;
         let self_id = inner.self_id.clone();
         match inner.peers.iter_mut().find(|p| p.id == self_id) {
-            Some(p) if p.vram_free != vram_free
-                || p.ram_free != ram_free
-                || p.ram_expert_free != ram_expert_free
-                || p.unified_memory != unified_memory => {
+            Some(p)
+                if p.vram_free != vram_free
+                    || p.ram_free != ram_free
+                    || p.ram_expert_free != ram_expert_free
+                    || p.unified_memory != unified_memory =>
+            {
                 p.vram_free = vram_free;
                 p.ram_free = ram_free;
                 p.ram_expert_free = ram_expert_free;
@@ -3694,7 +3865,9 @@ pub fn pairing_leave(app: AppHandle, state: State<'_, Pairing>) -> Result<(), St
                     until,
                 })
                 .collect();
-            inner.closed_members.retain(|member| member.until > Instant::now());
+            inner
+                .closed_members
+                .retain(|member| member.until > Instant::now());
             inner.closed_members.extend(closing_members);
             inner.mode = Mode::Closing;
             inner.code = None;
@@ -3722,7 +3895,9 @@ pub fn pairing_leave(app: AppHandle, state: State<'_, Pairing>) -> Result<(), St
             std::thread::sleep(grace);
             let pairing = app.state::<Pairing>();
             let mut inner = pairing.0.lock().unwrap();
-            inner.closed_members.retain(|member| member.until > Instant::now());
+            inner
+                .closed_members
+                .retain(|member| member.until > Instant::now());
             if inner.generation != generation || inner.mode != Mode::Closing {
                 return;
             }
@@ -3809,7 +3984,17 @@ pub fn headless_pair(app: &AppHandle, spec: &str) {
     eprintln!("[pairing] headless {op} code={code} as={name}");
     match op {
         "create" => {
-            let _ = pairing_create(app.clone(), app.state(), code, name, "headless".into(), model_opt, None, tuning_opt, None);
+            let _ = pairing_create(
+                app.clone(),
+                app.state(),
+                code,
+                name,
+                "headless".into(),
+                model_opt,
+                None,
+                tuning_opt,
+                None,
+            );
             // Auto-start once a second machine joins (mirrors pairing-auto-start).
             let app2 = app.clone();
             std::thread::spawn(move || loop {
@@ -3826,7 +4011,17 @@ pub fn headless_pair(app: &AppHandle, spec: &str) {
             });
         }
         "join" => {
-            let _ = pairing_join(app.clone(), app.state(), code, name, "headless".into(), model_opt, None, tuning_opt, None);
+            let _ = pairing_join(
+                app.clone(),
+                app.state(),
+                code,
+                name,
+                "headless".into(),
+                model_opt,
+                None,
+                tuning_opt,
+                None,
+            );
         }
         _ => eprintln!("[pairing] headless: unknown op '{op}'"),
     }
@@ -3870,6 +4065,48 @@ mod pairing_settings_tests {
     }
 
     #[test]
+    fn a_given_up_engine_is_not_reported_as_still_starting() {
+        // The shape measured on 2026-09-21: coordinator process healthy, its
+        // llama engine dead for good. Before the fix this returned None and the
+        // client's card counted up forever.
+        let v: Value = serde_json::from_str(
+            r#"{"phase":"failed","engine":"llamacpp","engine_state":"failed",
+                "engine_error":"idletoken-server kept crashing (5 quick restarts, last: exit code 3221226505); a restart will not help — check the engine log"}"#,
+        )
+        .unwrap();
+        let reason = permanent_engine_failure(&v).expect("a failed engine must be recognised");
+        assert!(reason.contains("kept crashing"), "reason was {reason:?}");
+
+        // An older coordinator says `phase: "starting"` and only admits the
+        // failure in engine_state. A new client must still catch it.
+        let old: Value =
+            serde_json::from_str(r#"{"phase":"starting","engine_state":"failed"}"#).unwrap();
+        assert!(permanent_engine_failure(&old).is_some());
+
+        // No sentence on the wire: still a failure, never silence.
+        let bare: Value = serde_json::from_str(r#"{"phase":"failed"}"#).unwrap();
+        assert!(!permanent_engine_failure(&bare).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_slow_start_is_not_mistaken_for_a_failure() {
+        // The other half, and the more expensive one to get wrong: tearing a
+        // healthy cluster down because a big model takes minutes to load.
+        for body in [
+            r#"{"phase":"starting","engine_state":"starting"}"#,
+            r#"{"phase":"starting","engine_state":"restarting"}"#,
+            r#"{"phase":"ready","engine_state":"ready"}"#,
+            r#"{}"#,
+        ] {
+            let v: Value = serde_json::from_str(body).unwrap();
+            assert!(
+                permanent_engine_failure(&v).is_none(),
+                "{body} must not read as a permanent failure"
+            );
+        }
+    }
+
+    #[test]
     fn same_subnet_compares_the_first_three_octets() {
         assert!(same_subnet("192.168.1.10", "192.168.1.250"));
         assert!(!same_subnet("192.168.1.10", "192.168.2.10"));
@@ -3900,9 +4137,18 @@ mod pairing_settings_tests {
     #[test]
     fn heartbeat_is_clamped_to_a_sane_range() {
         // 0 would spin the roster loop; an hour would look like a frozen UI.
-        assert_eq!(heartbeat(&tuning(|t| t.heartbeat_sec = 0)), Duration::from_secs(1));
-        assert_eq!(heartbeat(&tuning(|t| t.heartbeat_sec = 5)), Duration::from_secs(5));
-        assert_eq!(heartbeat(&tuning(|t| t.heartbeat_sec = 9999)), Duration::from_secs(60));
+        assert_eq!(
+            heartbeat(&tuning(|t| t.heartbeat_sec = 0)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            heartbeat(&tuning(|t| t.heartbeat_sec = 5)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            heartbeat(&tuning(|t| t.heartbeat_sec = 9999)),
+            Duration::from_secs(60)
+        );
         // The default must equal what the loop slept before the setting existed.
         assert_eq!(heartbeat(&Tuning::default()), Duration::from_secs(1));
     }
@@ -3911,41 +4157,81 @@ mod pairing_settings_tests {
     fn bind_nic_governs_both_the_bind_and_the_advertised_address() {
         let t = tuning(|t| t.bind_nic = "10.0.0.7".into());
         assert_eq!(bind_host(&t), "10.0.0.7");
-        assert_eq!(self_ip(&t), "10.0.0.7", "peers must be told the address we listen on");
+        assert_eq!(
+            self_ip(&t),
+            "10.0.0.7",
+            "peers must be told the address we listen on"
+        );
     }
 
     #[test]
     fn bind_nic_falls_back_when_it_is_not_a_usable_address() {
         for v in [
-            "", "auto", " AUTO-ish ", "eth0", "999.1.1.1", "127.0.0.1",
-            "100.100.1.2", "198.18.0.1",
+            "",
+            "auto",
+            " AUTO-ish ",
+            "eth0",
+            "999.1.1.1",
+            "127.0.0.1",
+            "100.100.1.2",
+            "198.18.0.1",
         ] {
             let t = tuning(|t| t.bind_nic = v.into());
-            assert_eq!(bind_host(&t), "0.0.0.0", "{v:?} must not become a bind host");
-            assert_ne!(self_ip(&t), v.trim(), "{v:?} must not be advertised verbatim");
+            assert_eq!(
+                bind_host(&t),
+                "0.0.0.0",
+                "{v:?} must not become a bind host"
+            );
+            assert_ne!(
+                self_ip(&t),
+                v.trim(),
+                "{v:?} must not be advertised verbatim"
+            );
         }
     }
 
     #[test]
     fn automatic_cluster_addresses_exclude_vpn_and_non_lan_ranges() {
         for ip in [
-            "127.0.0.1", "169.254.2.3", "100.64.0.1", "100.127.255.254",
-            "198.18.0.1", "198.19.255.254", "224.0.0.1", "255.255.255.255",
+            "127.0.0.1",
+            "169.254.2.3",
+            "100.64.0.1",
+            "100.127.255.254",
+            "198.18.0.1",
+            "198.19.255.254",
+            "224.0.0.1",
+            "255.255.255.255",
         ] {
-            assert!(!usable_cluster_ipv4(ip.parse().unwrap()), "{ip} must be refused");
+            assert!(
+                !usable_cluster_ipv4(ip.parse().unwrap()),
+                "{ip} must be refused"
+            );
         }
         for ip in ["192.168.10.248", "10.23.4.5", "172.20.1.9", "203.0.113.9"] {
-            assert!(usable_cluster_ipv4(ip.parse().unwrap()), "{ip} remains a usable routed LAN address");
+            assert!(
+                usable_cluster_ipv4(ip.parse().unwrap()),
+                "{ip} remains a usable routed LAN address"
+            );
         }
     }
 
     #[test]
     fn common_vpn_interfaces_are_not_auto_selected() {
         for name in [
-            "Meta", "Tailscale", "utun4", "tun0", "tap-windows6", "wg0",
-            "WireGuard Home", "OpenVPN Data Channel Offload", "Clash TUN",
+            "Meta",
+            "Tailscale",
+            "utun4",
+            "tun0",
+            "tap-windows6",
+            "wg0",
+            "WireGuard Home",
+            "OpenVPN Data Channel Offload",
+            "Clash TUN",
         ] {
-            assert!(likely_vpn_interface(name), "{name:?} must be treated as a VPN interface");
+            assert!(
+                likely_vpn_interface(name),
+                "{name:?} must be treated as a VPN interface"
+            );
         }
         for name in ["Ethernet 2", "Wi-Fi", "en0", "eth0"] {
             assert!(!likely_vpn_interface(name), "{name:?} must remain eligible");
@@ -3955,30 +4241,48 @@ mod pairing_settings_tests {
     #[test]
     fn directed_broadcast_uses_each_interfaces_real_netmask() {
         assert_eq!(
-            directed_broadcast("192.168.10.248".parse().unwrap(), "255.255.255.0".parse().unwrap()),
+            directed_broadcast(
+                "192.168.10.248".parse().unwrap(),
+                "255.255.255.0".parse().unwrap()
+            ),
             Some("192.168.10.255".parse().unwrap())
         );
         assert_eq!(
-            directed_broadcast("10.30.44.5".parse().unwrap(), "255.255.252.0".parse().unwrap()),
+            directed_broadcast(
+                "10.30.44.5".parse().unwrap(),
+                "255.255.252.0".parse().unwrap()
+            ),
             Some("10.30.47.255".parse().unwrap())
         );
         assert_eq!(
-            directed_broadcast("10.0.0.1".parse().unwrap(), "255.255.255.252".parse().unwrap()),
+            directed_broadcast(
+                "10.0.0.1".parse().unwrap(),
+                "255.255.255.252".parse().unwrap()
+            ),
             Some("10.0.0.3".parse().unwrap())
         );
         assert!(directed_broadcast(
-            "10.0.0.1".parse().unwrap(), "255.255.255.255".parse().unwrap()
-        ).is_none());
-        assert!(directed_broadcast(
-            "10.0.0.1".parse().unwrap(), "255.0.255.0".parse().unwrap()
-        ).is_none());
+            "10.0.0.1".parse().unwrap(),
+            "255.255.255.255".parse().unwrap()
+        )
+        .is_none());
+        assert!(
+            directed_broadcast("10.0.0.1".parse().unwrap(), "255.0.255.0".parse().unwrap())
+                .is_none()
+        );
     }
 
     #[test]
     fn peer_specific_route_never_falls_back_to_loopback() {
-        assert_eq!(source_ip_for_peer("127.0.0.1").unwrap(), Ipv4Addr::LOCALHOST);
+        assert_eq!(
+            source_ip_for_peer("127.0.0.1").unwrap(),
+            Ipv4Addr::LOCALHOST
+        );
         for remote in ["100.100.1.2", "198.18.0.1", "not-an-ip"] {
-            assert!(source_ip_for_peer(remote).is_err(), "{remote} must be refused");
+            assert!(
+                source_ip_for_peer(remote).is_err(),
+                "{remote} must be refused"
+            );
         }
     }
 
@@ -4008,7 +4312,7 @@ mod pairing_settings_tests {
         assert!(overflow_args(&tuning(|t| t.overflow_url = "http://p".into())).is_empty());
         assert!(overflow_args(&tuning(|t| t.overflow_key = "sk".into())).is_empty());
         let t = tuning(|t| {
-            t.overflow_enabled = true;   // the switch; the pair below is the capability
+            t.overflow_enabled = true; // the switch; the pair below is the capability
             t.overflow_url = "http://p".into();
             t.overflow_key = "sk".into();
             t.overflow_wait_s = 5;
@@ -4016,8 +4320,14 @@ mod pairing_settings_tests {
         });
         assert_eq!(
             overflow_args(&t),
-            vec!["--overflow-url", "http://p",
-                 "--overflow-wait-s", "5", "--overflow-daily-cap", "2500"]
+            vec![
+                "--overflow-url",
+                "http://p",
+                "--overflow-wait-s",
+                "5",
+                "--overflow-daily-cap",
+                "2500"
+            ]
         );
         // Half a pair stays half a pair whatever the switch says: an enabled
         // flag with no key must still send nothing, because the coordinator
@@ -4025,7 +4335,8 @@ mod pairing_settings_tests {
         assert!(overflow_args(&tuning(|t| {
             t.overflow_enabled = true;
             t.overflow_url = "http://p".into();
-        })).is_empty());
+        }))
+        .is_empty());
         // A cap of 0 means no additional local ceiling and needs no flag.
         let no_cap = tuning(|t| {
             t.overflow_url = "http://p".into();
@@ -4057,12 +4368,27 @@ mod pairing_settings_tests {
         assert_eq!(t.overflow_key, "new-key");
         assert_eq!(t.overflow_wait_s, 7);
         assert_eq!(t.overflow_daily_cap_milli, 4200);
-        assert_eq!(t.model_id, "qwen3-8b", "launch routing must not change the roster model");
-        assert_eq!(t.api_port, 8123, "launch routing must not move the local API");
-        assert_eq!(t.max_vram_mb, 8192, "launch routing must not alter resource caps");
-        assert_eq!(t.max_ram_mb, 16384, "launch routing must not alter resource caps");
+        assert_eq!(
+            t.model_id, "qwen3-8b",
+            "launch routing must not change the roster model"
+        );
+        assert_eq!(
+            t.api_port, 8123,
+            "launch routing must not move the local API"
+        );
+        assert_eq!(
+            t.max_vram_mb, 8192,
+            "launch routing must not alter resource caps"
+        );
+        assert_eq!(
+            t.max_ram_mb, 16384,
+            "launch routing must not alter resource caps"
+        );
 
-        assert!(t.overflow_enabled, "an enabled payload must arrive switched on");
+        assert!(
+            t.overflow_enabled,
+            "an enabled payload must arrive switched on"
+        );
 
         // Off keeps the credentials and says so in the flag (2026-09-16).
         //
@@ -4091,32 +4417,38 @@ mod pairing_settings_tests {
         // forwarding off. Without `--overflow-off` the engine would start
         // borrowing the moment it came up.
         let args = overflow_args(&t);
-        assert!(args.iter().any(|a| a == "--overflow-url"),
-            "the capability must be handed over even while switched off");
-        assert!(args.iter().any(|a| a == "--overflow-off"),
-            "off must be spelled to the coordinator, not implied by a missing URL");
+        assert!(
+            args.iter().any(|a| a == "--overflow-url"),
+            "the capability must be handed over even while switched off"
+        );
+        assert!(
+            args.iter().any(|a| a == "--overflow-off"),
+            "off must be spelled to the coordinator, not implied by a missing URL"
+        );
 
         t.overflow_enabled = true;
         let on_args = overflow_args(&t);
-        assert!(!on_args.iter().any(|a| a == "--overflow-off"),
-            "switched on, nothing tells the coordinator to stay off");
+        assert!(
+            !on_args.iter().any(|a| a == "--overflow-off"),
+            "switched on, nothing tells the coordinator to stay off"
+        );
     }
 
     /// The bug that shipped as 0.1.4 (2026-08-21): the client handed the
-    /// coordinator its own https:// platform URL, and the coordinator — which
-    /// has no TLS client and rightly refuses to downgrade — exited with
-    /// "refuse: overflow cannot be enabled" on every start. To the user that
-    /// was a crash-looping engine and a machine that never joined the cluster.
-    /// The argv the coordinator receives must never spell https.
+    /// coordinator its configured platform URL without stripping TLS, custom
+    /// ports or a reverse-proxy base path.
     #[test]
-    fn overflow_url_reaches_the_coordinator_as_plaintext() {
+    fn overflow_url_reaches_the_coordinator_with_tls() {
         let t = tuning(|t| {
             t.overflow_url = "https://api.idletoken.ai".into();
             t.overflow_key = "sk".into();
         });
         let argv = overflow_args(&t).join(" ");
-        assert!(argv.contains("--overflow-url http://api.idletoken.ai:8080"), "{argv}");
-        assert!(!argv.contains("https://"), "{argv}");
+        assert!(
+            argv.contains("--overflow-url https://api.idletoken.ai"),
+            "{argv}"
+        );
+        assert!(!argv.contains("http://api.idletoken.ai:8080"), "{argv}");
     }
 
     /// The client sends camelCase; a rename on either side must fail loudly
@@ -4171,8 +4503,14 @@ mod pairing_settings_tests {
         // reads. The names are checked literally: a typo here would not fail
         // to compile, it would silently start an engine with no API token.
         let env = secret_env(&t);
-        assert!(env.contains(&("IDLETOKEN_API_TOKEN".into(), "tok-should-not-be-in-argv".into())));
-        assert!(env.contains(&("IDLETOKEN_OVERFLOW_KEY".into(), "sk-should-not-be-in-argv".into())));
+        assert!(env.contains(&(
+            "IDLETOKEN_API_TOKEN".into(),
+            "tok-should-not-be-in-argv".into()
+        )));
+        assert!(env.contains(&(
+            "IDLETOKEN_OVERFLOW_KEY".into(),
+            "sk-should-not-be-in-argv".into()
+        )));
 
         // No token configured = no variable at all, so an empty string can
         // never be mistaken for "auth is on with a blank token".
@@ -4281,10 +4619,16 @@ mod pairing_settings_tests {
 
         // What an impostor can produce with no code: nothing that verifies.
         let expected = pair_proof("creator", code, joiner_nonce);
-        assert!(!token_eq(&pair_proof("creator", "AAAAAA", joiner_nonce), &expected));
+        assert!(!token_eq(
+            &pair_proof("creator", "AAAAAA", joiner_nonce),
+            &expected
+        ));
         assert!(!token_eq("", &expected));
         assert!(!token_eq(&"0".repeat(64), &expected));
-        assert!(token_eq(&pair_proof("creator", code, joiner_nonce), &expected));
+        assert!(token_eq(
+            &pair_proof("creator", code, joiner_nonce),
+            &expected
+        ));
 
         // Direction matters: a creator's proof must not be replayable as the
         // joiner's answer, or an eavesdropper could join with what it heard.
@@ -4293,7 +4637,10 @@ mod pairing_settings_tests {
             pair_proof("joiner", code, joiner_nonce)
         );
         // And so does the nonce: one exchange proves nothing about the next.
-        assert_ne!(pair_proof("joiner", code, "aaaa"), pair_proof("joiner", code, "bbbb"));
+        assert_ne!(
+            pair_proof("joiner", code, "aaaa"),
+            pair_proof("joiner", code, "bbbb")
+        );
 
         // The proof is not the code, and does not contain it — this is the
         // whole reason the code stops travelling on the wire.
@@ -4334,7 +4681,11 @@ mod pairing_settings_tests {
 
     fn inner_with(peers: Vec<Peer>) -> Inner {
         let Pairing(m) = Pairing::default();
-        Inner { mode: Mode::Creator, peers, ..m.into_inner().unwrap() }
+        Inner {
+            mode: Mode::Creator,
+            peers,
+            ..m.into_inner().unwrap()
+        }
     }
 
     #[test]
@@ -4344,8 +4695,14 @@ mod pairing_settings_tests {
 
         // What anybody on the LAN could send before A-P0-2 — and what used to
         // be answered with the whole roster.
-        assert_eq!(member_authorized(&inner, &json!({"op": "roster", "id": "machine-a"}), ip), None);
-        assert_eq!(member_authorized(&inner, &json!({"op": "roster"}), ip), None);
+        assert_eq!(
+            member_authorized(&inner, &json!({"op": "roster", "id": "machine-a"}), ip),
+            None
+        );
+        assert_eq!(
+            member_authorized(&inner, &json!({"op": "roster"}), ip),
+            None
+        );
         // An empty token is not a token; a missing field must not read as one
         // either (no silent downgrade — the request is refused, not trimmed).
         assert_eq!(
@@ -4358,7 +4715,11 @@ mod pairing_settings_tests {
         );
         // Right token, wrong source: a stolen token does not travel.
         assert_eq!(
-            member_authorized(&inner, &json!({"id": "machine-a", "token": "a1b2c3"}), "192.168.1.99"),
+            member_authorized(
+                &inner,
+                &json!({"id": "machine-a", "token": "a1b2c3"}),
+                "192.168.1.99"
+            ),
             None
         );
         // Unknown member.
@@ -4443,12 +4804,20 @@ mod pairing_settings_tests {
             joined_member("machine-b", "192.168.1.51", "bbbb"),
         ]);
         assert_eq!(
-            member_authorized(&inner, &json!({"id": "machine-b", "token": "aaaa"}), "192.168.1.50"),
+            member_authorized(
+                &inner,
+                &json!({"id": "machine-b", "token": "aaaa"}),
+                "192.168.1.50"
+            ),
             None,
             "machine-a's token must not authenticate as machine-b"
         );
         assert_eq!(
-            member_authorized(&inner, &json!({"id": "machine-a", "token": "aaaa"}), "192.168.1.50"),
+            member_authorized(
+                &inner,
+                &json!({"id": "machine-a", "token": "aaaa"}),
+                "192.168.1.50"
+            ),
             Some("machine-a".to_string())
         );
     }
@@ -4637,7 +5006,9 @@ mod pairing_settings_tests {
         quant: &str,
         ready: bool,
     ) -> Value {
-        do_join_claiming_ctx(inner, host, device, ip, prefer, now, model, quant, ready, None)
+        do_join_claiming_ctx(
+            inner, host, device, ip, prefer, now, model, quant, ready, None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4654,7 +5025,12 @@ mod pairing_settings_tests {
         ctx: Option<u32>,
     ) -> Value {
         let mine = random_hex(16);
-        let hello = ask(inner, json!({"op": "hello", "nonce": mine, "v": PAIR_PROTO_V}), ip, now);
+        let hello = ask(
+            inner,
+            json!({"op": "hello", "nonce": mine, "v": PAIR_PROTO_V}),
+            ip,
+            now,
+        );
         let nonce = hello["nonce"].as_str().unwrap_or("").to_string();
         let mut req = json!({"op": "join", "proof": pair_proof("joiner", "ABC234", &nonce),
                              "hostname": host, "gpu": "GPU", "prefer": prefer,
@@ -4665,12 +5041,7 @@ mod pairing_settings_tests {
         if let Some(c) = ctx {
             req["ctx"] = json!(c);
         }
-        ask(
-            inner,
-            req,
-            ip,
-            now,
-        )
+        ask(inner, req, ip, now)
     }
 
     fn do_join(inner: &mut Inner, host: &str, device: &str, ip: &str, now: Instant) -> Value {
@@ -4685,7 +5056,10 @@ mod pairing_settings_tests {
         let now = Instant::now();
         let r = do_join(&mut inner, "box-a", "dev-a", "192.168.1.50", now);
         assert_eq!(r["ok"], true, "{r}");
-        assert!(!r["token"].as_str().unwrap_or("").is_empty(), "a member token is issued");
+        assert!(
+            !r["token"].as_str().unwrap_or("").is_empty(),
+            "a member token is issued"
+        );
         assert_eq!(inner.peers.len(), 1);
     }
 
@@ -4704,14 +5078,30 @@ mod pairing_settings_tests {
         let now = Instant::now();
 
         let r = do_join_claiming(
-            &mut inner, "box-a", "dev-a", "192.168.1.50", false, now,
-            "deepseek-v4-flash", "IQ2_XXS", false,
+            &mut inner,
+            "box-a",
+            "dev-a",
+            "192.168.1.50",
+            false,
+            now,
+            "deepseek-v4-flash",
+            "IQ2_XXS",
+            false,
         );
         assert_eq!(r["ok"], false, "{r}");
         assert_eq!(r["err"], "model not ready");
-        assert_eq!(r["modelId"], "deepseek-v4-flash", "the refusal must name the model");
-        assert_eq!(r["quant"], "IQ2_XXS", "and the precision — the UI fetches one exact file");
-        assert!(inner.peers.is_empty(), "a refused machine must not appear in the roster");
+        assert_eq!(
+            r["modelId"], "deepseek-v4-flash",
+            "the refusal must name the model"
+        );
+        assert_eq!(
+            r["quant"], "IQ2_XXS",
+            "and the precision — the UI fetches one exact file"
+        );
+        assert!(
+            inner.peers.is_empty(),
+            "a refused machine must not appear in the roster"
+        );
     }
 
     /// A cluster is a model AND a precision. Q2 weights cannot serve an
@@ -4724,23 +5114,46 @@ mod pairing_settings_tests {
         let now = Instant::now();
 
         let r = do_join_claiming(
-            &mut inner, "box-a", "dev-a", "192.168.1.50", false, now,
-            "deepseek-v4-flash", "Q2_K_XL", true,
+            &mut inner,
+            "box-a",
+            "dev-a",
+            "192.168.1.50",
+            false,
+            now,
+            "deepseek-v4-flash",
+            "Q2_K_XL",
+            true,
         );
-        assert_eq!(r["ok"], false, "having SOME copy is not having THIS one: {r}");
-        assert_eq!(r["quant"], "IQ2_XXS", "the refusal names what the cluster wants, not what we hold");
+        assert_eq!(
+            r["ok"], false,
+            "having SOME copy is not having THIS one: {r}"
+        );
+        assert_eq!(
+            r["quant"], "IQ2_XXS",
+            "the refusal names what the cluster wants, not what we hold"
+        );
         assert!(inner.peers.is_empty());
 
         // The same machine once it holds the right precision. Being refused for
         // weights must not have burned its admission: the code was correct, so
         // this is a member coming back prepared, not an intruder retrying.
         let r = do_join_claiming(
-            &mut inner, "box-a", "dev-a", "192.168.1.50", false, now,
-            "deepseek-v4-flash", "IQ2_XXS", true,
+            &mut inner,
+            "box-a",
+            "dev-a",
+            "192.168.1.50",
+            false,
+            now,
+            "deepseek-v4-flash",
+            "IQ2_XXS",
+            true,
         );
         assert_eq!(r["ok"], true, "{r}");
         assert_eq!(inner.peers.len(), 1);
-        assert!(inner.peers[0].model_ready, "and it lands in the roster already ready");
+        assert!(
+            inner.peers[0].model_ready,
+            "and it lands in the roster already ready"
+        );
     }
 
     /// A cluster is a model, a precision AND a context window (2026-09-02,
@@ -4759,24 +5172,48 @@ mod pairing_settings_tests {
         let now = Instant::now();
 
         let r = do_join_claiming_ctx(
-            &mut inner, "box-a", "dev-a", "192.168.1.50", false, now,
-            "qwen3.8-27b", "Q6_K", true, Some(131072),
+            &mut inner,
+            "box-a",
+            "dev-a",
+            "192.168.1.50",
+            false,
+            now,
+            "qwen3.8-27b",
+            "Q6_K",
+            true,
+            Some(131072),
         );
-        assert_eq!(r["ok"], false, "the default tier is not close enough to 256K: {r}");
-        assert_eq!(r["ctx"], 262144,
-                   "the refusal must name the cluster's window — a refused machine never \
-                    reaches the roster, so this is its only way to learn it");
+        assert_eq!(
+            r["ok"], false,
+            "the default tier is not close enough to 256K: {r}"
+        );
+        assert_eq!(
+            r["ctx"], 262144,
+            "the refusal must name the cluster's window — a refused machine never \
+                    reaches the roster, so this is its only way to learn it"
+        );
         assert_eq!(r["modelId"], "qwen3.8-27b", "and it still names the model");
         assert_eq!(r["quant"], "Q6_K");
-        assert!(inner.peers.is_empty(), "a refused machine must not appear in the roster");
+        assert!(
+            inner.peers.is_empty(),
+            "a refused machine must not appear in the roster"
+        );
 
         // The longer window is refused too. This is not "at least as much as we
         // need": a 1M member would advertise capacity for a window nobody is
         // allocating, and the creator's plan would be wrong in the other
         // direction.
         let r = do_join_claiming_ctx(
-            &mut inner, "box-a", "dev-a", "192.168.1.50", false, now,
-            "qwen3.8-27b", "Q6_K", true, Some(1048576),
+            &mut inner,
+            "box-a",
+            "dev-a",
+            "192.168.1.50",
+            false,
+            now,
+            "qwen3.8-27b",
+            "Q6_K",
+            true,
+            Some(1048576),
         );
         assert_eq!(r["ok"], false, "more is also different: {r}");
         assert!(inner.peers.is_empty());
@@ -4784,8 +5221,16 @@ mod pairing_settings_tests {
         // And the same machine on the matching tier gets in — otherwise the two
         // refusals above would be satisfied by a gate that refuses everyone.
         let r = do_join_claiming_ctx(
-            &mut inner, "box-a", "dev-a", "192.168.1.50", false, now,
-            "qwen3.8-27b", "Q6_K", true, Some(262144),
+            &mut inner,
+            "box-a",
+            "dev-a",
+            "192.168.1.50",
+            false,
+            now,
+            "qwen3.8-27b",
+            "Q6_K",
+            true,
+            Some(262144),
         );
         assert_eq!(r["ok"], true, "{r}");
         assert_eq!(inner.peers.len(), 1);
@@ -4803,10 +5248,21 @@ mod pairing_settings_tests {
         let now = Instant::now();
 
         let r = do_join_claiming_ctx(
-            &mut inner, "box-old", "dev-old", "192.168.1.51", false, now,
-            "qwen3.8-27b", "Q6_K", true, None,
+            &mut inner,
+            "box-old",
+            "dev-old",
+            "192.168.1.51",
+            false,
+            now,
+            "qwen3.8-27b",
+            "Q6_K",
+            true,
+            None,
         );
-        assert_eq!(r["ok"], true, "an absent window is agreement, not a mismatch: {r}");
+        assert_eq!(
+            r["ok"], true,
+            "an absent window is agreement, not a mismatch: {r}"
+        );
         assert_eq!(inner.peers.len(), 1);
     }
 
@@ -4823,16 +5279,28 @@ mod pairing_settings_tests {
         let r = do_join(&mut inner, "box-a", "dev-EVIL", "192.168.1.99", now);
         assert_eq!(r["ok"], false, "the impostor must be refused: {r}");
         assert_eq!(inner.peers.len(), 1, "no second row, and no replaced row");
-        assert_eq!(inner.peers[0].ip, "192.168.1.50", "the real machine keeps its address");
-        assert_eq!(inner.peers[0].token, victim_token, "and its token is not rotated out from under it");
+        assert_eq!(
+            inner.peers[0].ip, "192.168.1.50",
+            "the real machine keeps its address"
+        );
+        assert_eq!(
+            inner.peers[0].token, victim_token,
+            "and its token is not rotated out from under it"
+        );
         assert_eq!(inner.peers[0].device_id, "dev-a");
 
         // The real machine coming back on a new DHCP lease is NOT a conflict.
         let r = do_join(&mut inner, "box-a", "dev-a", "192.168.1.77", now);
-        assert_eq!(r["ok"], true, "the same device rejoining must still work: {r}");
+        assert_eq!(
+            r["ok"], true,
+            "the same device rejoining must still work: {r}"
+        );
         assert_eq!(inner.peers.len(), 1);
         assert_eq!(inner.peers[0].ip, "192.168.1.77");
-        assert_ne!(inner.peers[0].token, victim_token, "a rejoin still rotates the token");
+        assert_ne!(
+            inner.peers[0].token, victim_token,
+            "a rejoin still rotates the token"
+        );
     }
 
     /// CLUS-08 / CHAIN-04: the coordinator is the plaintext window. A joiner may
@@ -4843,7 +5311,12 @@ mod pairing_settings_tests {
         inner.coordinator_id = Some("creator".into());
         let now = Instant::now();
         let mine = random_hex(16);
-        let hello = ask(&mut inner, json!({"op": "hello", "nonce": mine, "v": PAIR_PROTO_V}), "192.168.1.50", now);
+        let hello = ask(
+            &mut inner,
+            json!({"op": "hello", "nonce": mine, "v": PAIR_PROTO_V}),
+            "192.168.1.50",
+            now,
+        );
         let nonce = hello["nonce"].as_str().unwrap().to_string();
         let r = ask(
             &mut inner,
@@ -4861,11 +5334,25 @@ mod pairing_settings_tests {
             Some("creator"),
             "asking must not move the plaintext window"
         );
-        assert_eq!(inner.peers.iter().find(|p| p.id == "box-a").unwrap().role, "worker");
-        let asked = inner.peers.iter().find(|p| p.id == "box-a").unwrap().wants_coordinator;
-        assert!(asked, "the request is recorded so the creator can approve it");
+        assert_eq!(
+            inner.peers.iter().find(|p| p.id == "box-a").unwrap().role,
+            "worker"
+        );
+        let asked = inner
+            .peers
+            .iter()
+            .find(|p| p.id == "box-a")
+            .unwrap()
+            .wants_coordinator;
         assert!(
-            inner.audit.iter().any(|l| l.contains("asked to become the coordinator")),
+            asked,
+            "the request is recorded so the creator can approve it"
+        );
+        assert!(
+            inner
+                .audit
+                .iter()
+                .any(|l| l.contains("asked to become the coordinator")),
             "and it leaves a trace: {:?}",
             inner.audit
         );
@@ -4895,12 +5382,13 @@ mod pairing_settings_tests {
             "the review label is a short stable fingerprint: {label:?}"
         );
         assert_ne!(
-            label,
-            "0123456789abcdef0123456789abcdef",
+            label, "0123456789abcdef0123456789abcdef",
             "the raw stable id must not enter the webview"
         );
         assert!(
-            !snap.to_string().contains("0123456789abcdef0123456789abcdef"),
+            !snap
+                .to_string()
+                .contains("0123456789abcdef0123456789abcdef"),
             "the creator snapshot carries only the digest label: {snap}"
         );
 
@@ -4927,47 +5415,37 @@ mod pairing_settings_tests {
 
         let mut non_creator = creator_with_code();
         non_creator.mode = Mode::Joiner;
-        assert!(
-            approve_coordinator_request(&mut non_creator, "box-a")
-                .unwrap_err()
-                .contains("PAIR_NOT_CREATOR")
-        );
+        assert!(approve_coordinator_request(&mut non_creator, "box-a")
+            .unwrap_err()
+            .contains("PAIR_NOT_CREATOR"));
 
         let mut absent = creator_with_code();
         absent.mode = Mode::Creator;
-        assert!(
-            approve_coordinator_request(&mut absent, "box-a")
-                .unwrap_err()
-                .contains("PAIR_NO_MEMBER")
-        );
+        assert!(approve_coordinator_request(&mut absent, "box-a")
+            .unwrap_err()
+            .contains("PAIR_NO_MEMBER"));
 
         let mut not_requested = creator_with_code();
         not_requested.mode = Mode::Creator;
         do_join(&mut not_requested, "box-a", "dev-a", "192.168.1.50", now);
-        assert!(
-            approve_coordinator_request(&mut not_requested, "box-a")
-                .unwrap_err()
-                .contains("PAIR_ROLE_NOT_REQUESTED")
-        );
+        assert!(approve_coordinator_request(&mut not_requested, "box-a")
+            .unwrap_err()
+            .contains("PAIR_ROLE_NOT_REQUESTED"));
 
         let mut offline = creator_with_code();
         offline.mode = Mode::Creator;
         do_join_request(&mut offline, "box-a", "dev-a", "192.168.1.50", true, now);
         offline.peers[0].online = false;
-        assert!(
-            approve_coordinator_request(&mut offline, "box-a")
-                .unwrap_err()
-                .contains("PAIR_ROLE_REQUEST_STALE")
-        );
+        assert!(approve_coordinator_request(&mut offline, "box-a")
+            .unwrap_err()
+            .contains("PAIR_ROLE_REQUEST_STALE"));
 
         let mut legacy = creator_with_code();
         legacy.mode = Mode::Creator;
         do_join_request(&mut legacy, "box-a", "", "192.168.1.50", true, now);
-        assert!(
-            approve_coordinator_request(&mut legacy, "box-a")
-                .unwrap_err()
-                .contains("PAIR_DEVICE_ID_REQUIRED")
-        );
+        assert!(approve_coordinator_request(&mut legacy, "box-a")
+            .unwrap_err()
+            .contains("PAIR_DEVICE_ID_REQUIRED"));
     }
 
     #[test]
@@ -4988,11 +5466,9 @@ mod pairing_settings_tests {
             now + Duration::from_millis(1),
         );
         assert_eq!(withdrawn.peers[0].wants_coordinator, false);
-        assert!(
-            approve_coordinator_request(&mut withdrawn, "box-a")
-                .unwrap_err()
-                .contains("PAIR_ROLE_NOT_REQUESTED")
-        );
+        assert!(approve_coordinator_request(&mut withdrawn, "box-a")
+            .unwrap_err()
+            .contains("PAIR_ROLE_NOT_REQUESTED"));
 
         let mut left = creator_with_code();
         left.mode = Mode::Creator;
@@ -5005,11 +5481,9 @@ mod pairing_settings_tests {
             now + Duration::from_millis(1),
         );
         assert_eq!(reply["ok"], true, "{reply}");
-        assert!(
-            approve_coordinator_request(&mut left, "box-a")
-                .unwrap_err()
-                .contains("PAIR_NO_MEMBER")
-        );
+        assert!(approve_coordinator_request(&mut left, "box-a")
+            .unwrap_err()
+            .contains("PAIR_NO_MEMBER"));
 
         let mut approved = creator_with_code();
         approved.mode = Mode::Creator;
@@ -5018,7 +5492,10 @@ mod pairing_settings_tests {
         approve_coordinator_request(&mut approved, "box-a").unwrap();
         assert_eq!(approved.coordinator_id.as_deref(), Some("box-a"));
         assert_eq!(approved.peers[0].role, "coordinator");
-        assert!(!approved.peers[0].wants_coordinator, "approval consumes the request");
+        assert!(
+            !approved.peers[0].wants_coordinator,
+            "approval consumes the request"
+        );
         assert!(
             approved
                 .audit
@@ -5045,7 +5522,12 @@ mod pairing_settings_tests {
 
         // An honest joiner takes a nonce and is briefly interrupted.
         let honest = random_hex(16);
-        let hello = ask(&mut inner, json!({"op": "hello", "nonce": honest, "v": PAIR_PROTO_V}), "192.168.1.50", now);
+        let hello = ask(
+            &mut inner,
+            json!({"op": "hello", "nonce": honest, "v": PAIR_PROTO_V}),
+            "192.168.1.50",
+            now,
+        );
         let honest_nonce = hello["nonce"].as_str().unwrap().to_string();
 
         // The attacker sprays several times its own quota. Three times is
@@ -5057,10 +5539,19 @@ mod pairing_settings_tests {
         // build.
         for i in 0..(MAX_CHALLENGES_PER_SOURCE * 3) {
             let n = format!("{i:032x}");
-            ask(&mut inner, json!({"op": "hello", "nonce": n, "v": PAIR_PROTO_V}), "192.168.1.99", now);
+            ask(
+                &mut inner,
+                json!({"op": "hello", "nonce": n, "v": PAIR_PROTO_V}),
+                "192.168.1.99",
+                now,
+            );
         }
         assert!(
-            inner.challenges.iter().filter(|c| c.src == "192.168.1.99").count()
+            inner
+                .challenges
+                .iter()
+                .filter(|c| c.src == "192.168.1.99")
+                .count()
                 <= MAX_CHALLENGES_PER_SOURCE,
             "a source may only ever hold its own small quota"
         );
@@ -5076,7 +5567,10 @@ mod pairing_settings_tests {
             "192.168.1.50",
             now,
         );
-        assert_eq!(r["ok"], true, "the flood must not have cost the honest joiner its nonce: {r}");
+        assert_eq!(
+            r["ok"], true,
+            "the flood must not have cost the honest joiner its nonce: {r}"
+        );
     }
 
     /// A nonce is handed to one address; another address must not spend it.
@@ -5085,7 +5579,12 @@ mod pairing_settings_tests {
         let mut inner = creator_with_code();
         let now = Instant::now();
         let mine = random_hex(16);
-        let hello = ask(&mut inner, json!({"op": "hello", "nonce": mine, "v": PAIR_PROTO_V}), "192.168.1.50", now);
+        let hello = ask(
+            &mut inner,
+            json!({"op": "hello", "nonce": mine, "v": PAIR_PROTO_V}),
+            "192.168.1.50",
+            now,
+        );
         let nonce = hello["nonce"].as_str().unwrap().to_string();
         let r = ask(
             &mut inner,
@@ -5102,23 +5601,47 @@ mod pairing_settings_tests {
     #[test]
     fn wrong_codes_get_slower_but_typos_stay_free() {
         assert_eq!(gate_backoff(1), None, "a typo costs nothing");
-        assert_eq!(gate_backoff(GATE_FREE_TRIES), None, "the whole allowance is free");
-        assert_eq!(gate_backoff(GATE_FREE_TRIES + 1), Some(Duration::from_secs(1)));
-        assert_eq!(gate_backoff(GATE_FREE_TRIES + 2), Some(Duration::from_secs(2)));
-        assert_eq!(gate_backoff(99), Some(GATE_MAX), "capped: never a permanent lockout");
+        assert_eq!(
+            gate_backoff(GATE_FREE_TRIES),
+            None,
+            "the whole allowance is free"
+        );
+        assert_eq!(
+            gate_backoff(GATE_FREE_TRIES + 1),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            gate_backoff(GATE_FREE_TRIES + 2),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            gate_backoff(99),
+            Some(GATE_MAX),
+            "capped: never a permanent lockout"
+        );
 
         let mut gate = LanGate::default();
         let now = Instant::now();
-        assert!(gate.admit("10.0.0.5", now).is_ok(), "a fresh source is served");
+        assert!(
+            gate.admit("10.0.0.5", now).is_ok(),
+            "a fresh source is served"
+        );
         for _ in 0..(GATE_FREE_TRIES + 1) {
             gate.note_failure("10.0.0.5", now);
         }
-        assert!(gate.admit("10.0.0.5", now).is_err(), "past the allowance it must wait");
+        assert!(
+            gate.admit("10.0.0.5", now).is_err(),
+            "past the allowance it must wait"
+        );
         // A different machine is not punished for its neighbour's mistakes.
-        assert!(gate.admit("10.0.0.6", now).is_ok(), "the penalty is per source");
+        assert!(
+            gate.admit("10.0.0.6", now).is_ok(),
+            "the penalty is per source"
+        );
         // And it expires rather than latching.
         assert!(
-            gate.admit("10.0.0.5", now + GATE_MAX + Duration::from_secs(1)).is_ok(),
+            gate.admit("10.0.0.5", now + GATE_MAX + Duration::from_secs(1))
+                .is_ok(),
             "the block lifts on its own"
         );
     }
@@ -5129,14 +5652,18 @@ mod pairing_settings_tests {
         let mut gate = LanGate::default();
         let now = Instant::now();
         for _ in 0..GATE_REQ_MAX {
-            assert!(gate.admit("10.0.0.7", now).is_ok(), "normal traffic is served");
+            assert!(
+                gate.admit("10.0.0.7", now).is_ok(),
+                "normal traffic is served"
+            );
         }
         assert!(
             gate.admit("10.0.0.7", now).is_err(),
             "past the ceiling the source is refused without parsing anything"
         );
         assert!(
-            gate.admit("10.0.0.7", now + GATE_REQ_BLOCK + Duration::from_secs(1)).is_ok(),
+            gate.admit("10.0.0.7", now + GATE_REQ_BLOCK + Duration::from_secs(1))
+                .is_ok(),
             "and it is a rate cap, not a ban"
         );
     }
@@ -5156,7 +5683,8 @@ mod pairing_settings_tests {
             "a hundred fresh addresses do not buy a hundred free allowances"
         );
         assert!(
-            gate.admit("10.0.9.9", now + GATE_GLOBAL_BLOCK + Duration::from_secs(1)).is_ok(),
+            gate.admit("10.0.9.9", now + GATE_GLOBAL_BLOCK + Duration::from_secs(1))
+                .is_ok(),
             "the cluster-wide block is a short rate cap, not a lockout"
         );
     }
@@ -5166,18 +5694,36 @@ mod pairing_settings_tests {
     /// every member's UI parses.
     #[test]
     fn hostile_field_values_are_refused_before_they_reach_the_roster() {
-        assert!(!peer_field_ok("a\",\"role\":\"coordinator\",\"x\":\""), "JSON injection");
-        assert!(!peer_field_ok("box-a\nJan 01 coord: all clear"), "log forging");
+        assert!(
+            !peer_field_ok("a\",\"role\":\"coordinator\",\"x\":\""),
+            "JSON injection"
+        );
+        assert!(
+            !peer_field_ok("box-a\nJan 01 coord: all clear"),
+            "log forging"
+        );
         assert!(!peer_field_ok("back\\slash"));
         assert!(!peer_field_ok(""), "empty is not a name");
-        assert!(!peer_field_ok(&"a".repeat(MAX_PEER_FIELD + 1)), "over-long is refused, not clamped");
+        assert!(
+            !peer_field_ok(&"a".repeat(MAX_PEER_FIELD + 1)),
+            "over-long is refused, not clamped"
+        );
         assert!(!peer_field_ok("caf\u{e9}"), "non-ASCII is refused");
         assert!(peer_field_ok("box-a"), "and real names still pass");
-        assert!(peer_field_ok(&"a".repeat(MAX_PEER_FIELD)), "exactly the limit passes");
+        assert!(
+            peer_field_ok(&"a".repeat(MAX_PEER_FIELD)),
+            "exactly the limit passes"
+        );
 
         let mut inner = creator_with_code();
         let now = Instant::now();
-        let r = do_join(&mut inner, "a\",\"role\":\"coordinator\",\"x\":\"", "dev-x", "192.168.1.50", now);
+        let r = do_join(
+            &mut inner,
+            "a\",\"role\":\"coordinator\",\"x\":\"",
+            "dev-x",
+            "192.168.1.50",
+            now,
+        );
         assert_eq!(r["ok"], false, "{r}");
         assert!(inner.peers.is_empty(), "nothing hostile reached the roster");
     }
@@ -5217,8 +5763,15 @@ mod pairing_settings_tests {
                 panic!("malformed request was accepted: {req} -> {r}");
             }
         }
-        assert_eq!(inner.peers.len(), before, "and none of it changed the roster");
-        assert_eq!(inner.peers[0].ip, "192.168.1.50", "the real member is untouched");
+        assert_eq!(
+            inner.peers.len(),
+            before,
+            "and none of it changed the roster"
+        );
+        assert_eq!(
+            inner.peers[0].ip, "192.168.1.50",
+            "the real member is untouched"
+        );
     }
 
     /// CLUS-09: a member's self-reported memory decides whether the cluster
@@ -5229,7 +5782,11 @@ mod pairing_settings_tests {
         merge_peer_memory(&mut peer, &json!({"vramFree": 24_u64 << 30}));
         assert_eq!(peer.vram_free, 24 << 30, "a real figure is taken");
         merge_peer_memory(&mut peer, &json!({"vramFree": u64::MAX}));
-        assert_eq!(peer.vram_free, 24 << 30, "an impossible one is dropped, not clamped in");
+        assert_eq!(
+            peer.vram_free,
+            24 << 30,
+            "an impossible one is dropped, not clamped in"
+        );
     }
 
     /// CLUS-19 / HOST-15: the roster broadcast carries what collaboration needs
@@ -5243,16 +5800,35 @@ mod pairing_settings_tests {
         let member = &reply["members"][0];
 
         let allowed = [
-            "id", "hostname", "gpu", "stage", "online", "layerLo", "layerHi",
-            "vramFree", "ramFree", "ramExpertFree", "unifiedMemory", "modelReady",
+            "id",
+            "hostname",
+            "gpu",
+            "stage",
+            "online",
+            "layerLo",
+            "layerHi",
+            "vramFree",
+            "ramFree",
+            "ramExpertFree",
+            "unifiedMemory",
+            "modelReady",
         ];
         for (k, _) in member.as_object().unwrap() {
-            assert!(allowed.contains(&k.as_str()), "new roster field {k:?} needs a disclosure decision");
+            assert!(
+                allowed.contains(&k.as_str()),
+                "new roster field {k:?} needs a disclosure decision"
+            );
         }
         let body = reply.to_string();
-        assert!(!body.contains("192.168.1.50"), "a member's LAN address is not broadcast: {body}");
+        assert!(
+            !body.contains("192.168.1.50"),
+            "a member's LAN address is not broadcast: {body}"
+        );
         assert!(!body.contains("dev-a"), "nor its stable device id: {body}");
-        assert!(!body.contains(&inner.peers[0].token), "nor anyone's member token");
+        assert!(
+            !body.contains(&inner.peers[0].token),
+            "nor anyone's member token"
+        );
     }
 
     /// The stretched proof is the only thing standing between one unauthenticated
@@ -5264,7 +5840,11 @@ mod pairing_settings_tests {
         let c = pair_proof("joiner", "ABC234", "nonce-1");
         assert_ne!(a, b, "the nonce binds the proof");
         assert_ne!(a, c, "so does the direction");
-        assert_eq!(a, pair_proof("creator", "ABC234", "nonce-1"), "and it is deterministic");
+        assert_eq!(
+            a,
+            pair_proof("creator", "ABC234", "nonce-1"),
+            "and it is deterministic"
+        );
 
         // v1 was a single SHA-256 of a fixed format. If this ever matches, the
         // oracle is back.

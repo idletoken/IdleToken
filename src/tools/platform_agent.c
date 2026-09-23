@@ -46,6 +46,9 @@
                                     * platform work (threat register PROV-28) */
 #include "idletoken_deflate_wire.h"  /* the platform may deflate a job before
                                       * sealing it; we are the only inflater */
+#ifndef _WIN32
+#include <poll.h>
+#endif
 
 /* Release builds inject this from client/package.json.  There is deliberately
  * no fallback: a hand-maintained default would let one of the three platform
@@ -64,6 +67,7 @@
 #define IDLETOKEN_MAX_INFLATED_REQUEST (16u * 1024u * 1024u)
 
 #include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #ifdef __linux__
   #include <sys/prctl.h>
@@ -86,6 +90,8 @@
   #include <sys/socket.h>
   #include <unistd.h>
 #endif
+
+#include "idletoken_platform_http.h"
 
 /* Thread-local storage across our three toolchains: MSVC spells it
  * __declspec(thread); MinGW and the Unix compilers take C11 _Thread_local. */
@@ -643,10 +649,16 @@ static int http_body_idle_secs(void) {
  * job back is a gesture nobody receives: a body budget equal to that timeout
  * fires at the exact instant the platform gives up on its own — the buyer gets
  * the generic "relay job timed out" and the seller never learns that the thing
- * wrong with their machine is the uplink. Raise it only together with the
- * platform's job timeout; the two are a pair.
+ * wrong with their machine is the uplink. The platform's job timeout is no
+ * longer a fixed 600 s: it scales with the request size (provider-timeout.ts,
+ * min five minutes), and the per-job `remaining_ms`/`expires_at_ms` the gateway
+ * sends is the authoritative bound — that is what clamps every control request
+ * (relay_post_result, ack) through `g_inference_deadline_ms`. This body budget
+ * is the fallback for an old gateway that sends no deadline; keep it below the
+ * platform's five-minute floor for the reason above.
  *
- * **480 s, paired with `PROVIDER_TIMEOUT_MS=600000` (2026-09-16).** The earlier
+ * **480 s (2026-09-16; the old "paired with PROVIDER_TIMEOUT_MS=600000" pairing
+ * retired 2026-09-20 when the platform budget went size-scaled).** The earlier
  * 180 s was sized against text-only relay jobs of a few hundred KB. An image
  * request is megabytes, and on the link measured that day (40–80 KB/s to the
  * platform) 180 s admits only ~7–14 MB — so an ordinary phone photo landed
@@ -672,438 +684,72 @@ static int http_body_total_secs(void) {
     return v > 0 ? v : HTTP_BODY_TOTAL_SECS;
 }
 
-/* Arm (or re-arm) the receive timeout on an open socket. */
-static void http_set_rcv_timeout(int fd, int secs) {
-    /* Winsock's SO_RCVTIMEO takes a DWORD of milliseconds, not a struct
-     * timeval — passing the timeval silently sets a nonsense timeout (its
-     * first 4 bytes read as milliseconds). */
-#ifdef _WIN32
-    DWORD to = (DWORD)secs * 1000u;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof(to));
-#else
-    struct timeval to = { secs, 0 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
-#endif
-}
+/* Per-request control is thread-local; heartbeat/watch traffic cannot replace
+ * an inference's deadline or cancellation callback. */
+static IDLETOKEN_TLS int64_t g_delivery_deadline_ms;
+static IDLETOKEN_TLS int64_t g_inference_deadline_ms;
+static IDLETOKEN_TLS int (*g_request_cancelled)(void *);
+static IDLETOKEN_TLS void *g_cancel_context;
 
-/* `Content-Length: N` out of a response header block; -1 when absent or
- * unparsable (then EOF is the only framing we have, as before). Matched
- * case-insensitively and only at the start of a line: the field name is ours to
- * read, not ours to dictate, and `X-Foo-Content-Length:` is not it. */
-/* long long, not long: `long` is 32 bits on Windows (LLP64), which made the
- * overflow guard below a shift past the width of its own type — undefined, and
- * folded by GCC into a bound that rejected every real length. The whole check
- * then reported "no Content-Length" on the one platform this bug was found on
- * (2026-09-13; caught by running the oracle on Windows, not by reading it). */
-static long long http_content_length(const uint8_t *hdr, size_t len) {
-    static const char key[] = "content-length:";
-    const size_t klen = sizeof(key) - 1;
-    for (size_t i = 0; i + klen < len; i++) {
-        if (i && hdr[i - 1] != '\n') continue;
-        size_t j = 0;
-        while (j < klen && (uint8_t)(hdr[i + j] | 0x20) == (uint8_t)key[j]) j++;
-        if (j != klen) continue;
-        size_t p = i + klen;
-        while (p < len && (hdr[p] == ' ' || hdr[p] == '\t')) p++;
-        long long v = 0; int digits = 0;
-        while (p < len && hdr[p] >= '0' && hdr[p] <= '9') {
-            if (v > (1LL << 40)) return -1;     /* absurd; treat as unparsable */
-            v = v * 10 + (hdr[p] - '0'); p++; digits++;
-        }
-        return digits ? v : -1;
-    }
-    return -1;
-}
-
-/* ======================================================================
- * Outbound HTTP proxy
- *
- * Why this exists at all: on a machine whose owner has configured a proxy,
- * every OTHER part of the product already uses it — the desktop client is
- * reqwest, which reads these variables — while this process opens a raw
- * socket and does not. The result is one machine leaving by two different
- * routes, and the one carrying the megabytes takes the worse of them. That
- * was observed on 2026-09-17: the same host, in the same second, was
- * classified as two different regions depending on which of its own
- * components was asking, and the owner had every reason to believe their
- * proxy covered both.
- *
- * A proxy in the operating-system sense is opt-in per program. A tunnel that
- * captures the routing table is not. Reading these variables is how a program
- * opts in, so this is not a new policy — it is this process finally obeying
- * the policy the machine was already configured with.
- *
- * Deliberately NOT supported: SOCKS. Saying so out loud once beats treating a
- * socks5:// URL as though it named an HTTP proxy, which would produce a
- * connection that fails in a way nobody could read.
- * ====================================================================== */
-
-typedef struct {
-    char host_port[256];   /* the proxy's own "host:port" */
-    char auth_b64[512];    /* base64("user:pass"), "" when the URL carried none */
-} agent_proxy;
-
-/* Loopback is never proxied, whatever the environment says.
- *
- * Two independent reasons, either one sufficient. The address on the other end
- * is this machine's own coordinator, so there is no route for a proxy to
- * improve. And a local HTTP proxy that intercepts loopback has been measured
- * (see the known-traps list) swallowing the end-of-stream signal on server-sent
- * events, which hangs the caller forever — a proxy cannot help here and can
- * certainly hurt. */
-static int addr_is_loopback(const char *addr) {
-    return strncmp(addr, "127.", 4) == 0
-        || strncmp(addr, "localhost:", 10) == 0
-        || strcmp(addr, "localhost") == 0
-        || strncmp(addr, "[::1]", 5) == 0
-        || strncmp(addr, "::1", 3) == 0;
-}
-
-static const char *env_any(const char *const *names) {
-    for (; *names; names++) {
-        const char *v = getenv(*names);
-        if (v && *v) return v;
-    }
-    return NULL;
-}
-
-/* Does NO_PROXY exempt this address? Suffix match on the host part, plus the
- * "*" catch-all, which is how curl and every runtime spell "never proxy". */
-static int no_proxy_covers(const char *addr) {
-    static const char *const names[] = { "NO_PROXY", "no_proxy", NULL };
-    const char *np = env_any(names);
-    if (!np) return 0;
-
-    char host[256];
-    size_t n = 0;
-    for (const char *p = addr; *p && *p != ':' && n + 1 < sizeof(host); p++) host[n++] = *p;
-    host[n] = '\0';
-
-    for (const char *p = np; *p; ) {
-        while (*p == ',' || *p == ' ' || *p == '\t') p++;
-        const char *start = p;
-        while (*p && *p != ',') p++;
-        size_t len = (size_t)(p - start);
-        while (len && (start[len - 1] == ' ' || start[len - 1] == '\t')) len--;
-        if (len == 1 && start[0] == '*') return 1;
-        if (len && len <= n) {
-            /* Suffix match, and only on a label boundary: "example.com" must
-             * not exempt "notexample.com". */
-            const char *tail = host + (n - len);
-            size_t i = 0;
-            while (i < len && (tail[i] | 0x20) == (start[i] | 0x20)) i++;
-            if (i == len && (n == len || tail[-1] == '.' || start[0] == '.')) return 1;
-        }
-    }
-    return 0;
-}
-
-/* Resolve the configured proxy once. Returns 0 when there is none to use.
- *
- * Order follows curl's, because that is the order the people who set these
- * variables already expect. Only plaintext HTTP proxies are understood, which
- * is exactly enough: this process speaks plaintext HTTP by design. */
-static int agent_proxy_resolve(agent_proxy *out) {
-    static const char *const names[] = {
-        "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", NULL
-    };
-    const char *url = env_any(names);
-    if (!url) return 0;
-
-    if (strncmp(url, "socks", 5) == 0) {
-        static int said = 0;
-        if (!said) {
-            said = 1;
-            fprintf(stderr, "platform agent: %s names a SOCKS proxy, which this "
-                            "process does not speak; connecting directly. Set "
-                            "HTTP_PROXY to an http:// proxy to route through it.\n", url);
-        }
-        return 0;
-    }
-    if (strncmp(url, "http://", 7) == 0) url += 7;
-    else if (strstr(url, "://")) {
-        static int said = 0;
-        if (!said) {
-            said = 1;
-            fprintf(stderr, "platform agent: proxy %s has a scheme this process "
-                            "does not speak; connecting directly.\n", url);
-        }
-        return 0;
-    }
-
-    /* [user:pass@]host[:port] */
-    const char *at = strrchr(url, '@');
-    memset(out, 0, sizeof(*out));
-    if (at) {
-        size_t clen = (size_t)(at - url);
-        char creds[256];
-        if (clen >= sizeof(creds)) return 0;
-        memcpy(creds, url, clen); creds[clen] = '\0';
-        char *b64 = idletoken_b64_encode((const uint8_t *)creds, clen);
-        if (b64) {
-            snprintf(out->auth_b64, sizeof(out->auth_b64), "%s", b64);
-            free(b64);
-        }
-        url = at + 1;
-    }
-
-    size_t n = 0;
-    while (url[n] && url[n] != '/' && n + 1 < sizeof(out->host_port)) n++;
-    if (!n) return 0;
-    memcpy(out->host_port, url, n); out->host_port[n] = '\0';
-    if (!strchr(out->host_port, ':')) {
-        /* A proxy URL without a port is legal and means 80. Spelling it here
-         * keeps the connect helper from having to guess. */
-        size_t l = strlen(out->host_port);
-        if (l + 3 < sizeof(out->host_port)) memcpy(out->host_port + l, ":80", 4);
-    }
-    return 1;
-}
-
-/* The proxy to use for one destination, or NULL to connect directly.
- * Resolved once per process; the environment does not change under us. */
-static const agent_proxy *http_proxy_for(const char *addr) {
-    static agent_proxy px;
-    static int resolved = 0;   /* 0 = not yet, 1 = have one, -1 = none */
-    if (!resolved) {
-        resolved = agent_proxy_resolve(&px) ? 1 : -1;
-        if (resolved == 1)
-            fprintf(stderr, "platform agent: routing platform traffic through "
-                            "proxy %s (loopback excluded)\n", px.host_port);
-    }
-    if (resolved != 1) return NULL;
-    if (addr_is_loopback(addr) || no_proxy_covers(addr)) return NULL;
-    return &px;
-}
-
-/* POST `body` as JSON to addr("host:port")+path. Returns malloc'd response
- * body (caller frees), sets *out_len and *out_status; NULL on I/O error.
- * timeout_secs > 0 arms SO_RCVTIMEO/SO_SNDTIMEO so a dead platform link can't
- * hang a relay long-poll forever (0 = block indefinitely, e.g. slow coord
- * inference where the caller owns pacing).
- *
- * `out_truncated` (optional) is how a caller says it wants to see a body that
- * arrived incomplete. Pass NULL — as everything but the relay poll does — and
- * an incomplete body is a failed request (NULL return), because a fragment of
- * JSON is indistinguishable from the whole thing once it reaches a parser. */
+/* The public transport owns HTTPS, dual-stack DNS, proxies and framing.
+ * Unix sockets retain the local inference privacy boundary. */
 static uint8_t *http_request_json(const char *method,
                                   const char *addr, const char *path,
                                   const char *bearer, const char *extra_hdr,
                                   const uint8_t *body, size_t body_len,
                                   int *out_status, size_t *out_len,
                                   int timeout_secs, int *out_truncated) {
+    if (out_status) *out_status = 0;
+    if (out_len) *out_len = 0;
     if (out_truncated) *out_truncated = 0;
-    /* "unix:<path>" is the shared-mode transport to the coordinator. The agent
-     * opens the platform's envelope, so everything it sends onward is the
-     * buyer's plaintext; on loopback TCP that is readable with one tcpdump by
-     * the owner of this machine. Same dispatch shape as the sidecar's engine
-     * link, so there is one idiom to learn, not two. */
-    int is_unix = strncmp(addr, "unix:", 5) == 0;
-    const agent_proxy *px = is_unix ? NULL : http_proxy_for(addr);
-    int fd = is_unix ? idletoken_connect_unix(addr + 5)
-                     : idletoken_connect_tcp(px ? px->host_port : addr);
-    if (fd < 0 && px) {
-        /* The proxy was named but could not be reached. Go direct rather than
-         * take the machine offline: these variables outlive the program that
-         * set them — a proxy left configured in the user's environment while
-         * its process is not running has already been seen here, and it broke
-         * every request this agent made. Direct still works; it is only slower.
-         *
-         * Loud, once. "No silent fallback" forbids the silence, not the
-         * fallback, and the owner needs to know their proxy is not in the path
-         * because that is a fact about their machine, not about ours. */
-        static int said = 0;
-        if (!said) {
-            said = 1;
-            fprintf(stderr, "platform agent: proxy %s is not reachable; "
-                            "connecting directly to %s. Traffic is NOT going "
-                            "through the proxy.\n", px->host_port, addr);
+    const char *unix_socket = !strncmp(addr, "unix:", 5) ? addr + 5 : NULL;
+    char url[4096];
+    if (idletoken_platform_url(unix_socket ? "http://localhost" : addr, path, url, sizeof(url))) return NULL;
+    int receipt = out_truncated && strstr(path, "/relay/poll");
+    idletoken_platform_http_request request = {
+        .url = url, .method = method, .bearer = bearer, .headers = extra_hdr,
+        .unix_socket = unix_socket, .cancelled = g_request_cancelled, .cancel_context = g_cancel_context,
+        .body = body, .body_len = body_len, .connect_ms = 10000,
+        .headers_ms = timeout_secs * 1000,
+        /* No whole-transfer wall clock from `timeout_secs`. It bounds how long
+         * the server may take to START answering once the upload has left this
+         * process (the socket-timeout semantics it always had). Deriving a
+         * total from it gave the sealed-result POST a 10-30 s cap on the whole
+         * upload: on a 40-80 KB/s uplink that is under 800 KB, so an image
+         * reply the buyer had already paid for was cut, retried from byte 0
+         * and cut again until the job expired -- while every LAN test passed.
+         * The upload is bounded by the body budgets below; the job's own
+         * expiry still caps everything through the clamp that follows. */
+        .total_ms = 0,
+        .body_idle_ms = timeout_secs ? http_body_idle_secs() * 1000 : 0,
+        .body_total_ms = timeout_secs ? http_body_total_secs() * 1000 : 0,
+        .max_response = 64u * 1024u * 1024u, .receipt = receipt,
+    };
+    if (g_inference_deadline_ms) {
+        int64_t left = g_inference_deadline_ms - idletoken_platform_now_ms();
+        if (left <= 0) return NULL;
+        /* The delivery may shorten a control request, never extend its own
+         * short budget after response headers have already arrived. */
+        if (!request.total_ms || left < request.total_ms) request.total_ms = (int)left;
+    }
+    idletoken_platform_http_response response;
+    int rc = idletoken_platform_http(&request, &response);
+    if (receipt) g_delivery_deadline_ms = response.delivery_deadline_ms;
+    if (rc) {
+        fprintf(stderr, "platform-agent: %s %s failed: %s (%zu body bytes)\n",
+                method, path, response.error, response.len);
+        if (!out_truncated || !response.body || response.status < 200) {
+            free(response.body); return NULL;
         }
-        px = NULL;
-        fd = idletoken_connect_tcp(addr);
     }
-    if (fd < 0) return NULL;
-    if (timeout_secs > 0) {
-        http_set_rcv_timeout(fd, timeout_secs);
-#ifdef _WIN32
-        DWORD to = (DWORD)timeout_secs * 1000u;
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&to, sizeof(to));
-#else
-        struct timeval to = { timeout_secs, 0 };
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &to, sizeof(to));
-#endif
-    }
-
-    char auth[1024] = "";
-    if (bearer) {
-        int an = snprintf(auth, sizeof(auth), "Authorization: Bearer %s\r\n", bearer);
-        if (an < 0 || (size_t)an >= sizeof(auth)) { idletoken_close_fd(fd); return NULL; }
-    }
-    char pauth[640] = "";
-    if (px && px->auth_b64[0]) {
-        int pn = snprintf(pauth, sizeof(pauth), "Proxy-Authorization: Basic %s\r\n", px->auth_b64);
-        if (pn < 0 || (size_t)pn >= sizeof(pauth)) { idletoken_close_fd(fd); return NULL; }
-    }
-    /* Through a proxy the request line carries the absolute URL; direct, it
-     * carries the path alone. No CONNECT tunnel is needed or wanted: this
-     * process speaks plaintext HTTP, so the proxy can forward it as an ordinary
-     * request. (The privacy that would otherwise argue for a tunnel is already
-     * in the body — every payload is a sealed envelope.) */
-    char target[1024];
-    if (px) {
-        int tn = snprintf(target, sizeof(target), "http://%s%s", addr, path);
-        if (tn < 0 || (size_t)tn >= sizeof(target)) { idletoken_close_fd(fd); return NULL; }
-    } else {
-        int tn = snprintf(target, sizeof(target), "%s", path);
-        if (tn < 0 || (size_t)tn >= sizeof(target)) { idletoken_close_fd(fd); return NULL; }
-    }
-    char head[2560];
-    int hn = snprintf(head, sizeof(head),
-                      "%s %s HTTP/1.1\r\n"
-                      "Host: %s\r\n"
-                      "Content-Type: application/json\r\n"
-                      "Content-Length: %zu\r\n"
-                      "%s%s%s"
-                      "Connection: close\r\n\r\n",
-                      /* A socket path is not a host name; send a name the
-                       * server will accept (cpp-httplib and our own parser
-                       * both ignore which). */
-                      method, target, is_unix ? "localhost" : addr, body_len, pauth, auth,
-                      extra_hdr ? extra_hdr : "");
-    if (hn < 0 || (size_t)hn >= sizeof(head)) { idletoken_close_fd(fd); return NULL; }
-    if (idletoken_sendall(fd, head, (size_t)hn) < 0 ||
-        (body_len && idletoken_sendall(fd, body, body_len) < 0)) {
-        idletoken_close_fd(fd); return NULL;
-    }
-
-    /* Read the headers, then exactly as many body bytes as the server said it
-     * was sending. "Read until EOF" is only correct when the transfer really
-     * ended, and from inside this loop a stalled socket looks exactly like a
-     * finished one — so the old version returned short bodies as successes.
-     * On 2026-09-13 that turned a slow link into a false accusation: the relay
-     * job's `sealed_request` lost its closing quote mid-flight and this agent
-     * reported the PLATFORM as having omitted the field. */
-    size_t cap = 8192, len = 0;
-    size_t hdr_end = 0;              /* offset of the first body byte; 0 = unseen */
-    long long content_len = -1;
-    int truncated = 0;               /* 1 = stopped/cut, 2 = moving but too slow */
-    time_t body_start = 0;           /* when the headers ended; 0 = not yet */
-    uint8_t *buf = malloc(cap);
-    if (!buf) { idletoken_close_fd(fd); return NULL; }
-    for (;;) {
-        if (len + 4096 > cap) {
-            size_t ncap = cap * 2;
-            uint8_t *nb = realloc(buf, ncap);
-            if (!nb) { free(buf); idletoken_close_fd(fd); return NULL; }
-            buf = nb; cap = ncap;
-        }
-        /* recv, not read: on Windows the CRT's read() only understands CRT
-         * file descriptors, and a SOCKET is not one -- read() returns EBADF
-         * without touching the wire. The request had already been sent, so
-         * every reply (register, relay poll, coord answer) was thrown away
-         * and the agent called a working platform "unreachable". recv() is
-         * identical to read() for sockets on POSIX, so one spelling serves
-         * both platforms. */
-        ssize_t r = recv(fd, (char *)buf + len, 4096, 0);
-        if (r > 0) {
-            /* The blank line can straddle two reads, so rescan the last three
-             * bytes we already had. */
-            size_t scan_from = (!hdr_end && len > 3) ? len - 3 : len;
-            len += (size_t)r;
-            if (!hdr_end) {
-                for (size_t i = scan_from; i + 3 < len; i++) {
-                    if (buf[i]=='\r' && buf[i+1]=='\n' && buf[i+2]=='\r' && buf[i+3]=='\n') {
-                        hdr_end = i + 4;
-                        content_len = http_content_length(buf, hdr_end);
-                        /* The waiting is over; what is left is transfer. */
-                        body_start = time(NULL);
-                        if (timeout_secs > 0) http_set_rcv_timeout(fd, http_body_idle_secs());
-                        break;
-                    }
-                }
-            }
-            /* Framed by Content-Length: stop at the last declared byte instead
-             * of waiting for a FIN that a keep-alive server will not send. */
-            if (hdr_end && content_len >= 0 && len - hdr_end >= (size_t)content_len) break;
-            /* "Still moving" is not "going to arrive". Without this, a link
-             * dribbling a few bytes per minute re-arms the idle budget forever
-             * and the job is never delivered AND never handed back. */
-            if (timeout_secs > 0 && body_start &&
-                (long)(time(NULL) - body_start) >= (long)http_body_total_secs()) {
-                truncated = 2;
-                break;
-            }
-            continue;
-        }
-        if (r == 0) break;               /* the peer closed: a real end of body */
-#ifndef _WIN32
-        if (errno == EINTR) continue;    /* a signal, not a failure */
-#endif
-        truncated = 1;                   /* idle timeout, reset, or socket error */
-        break;
-    }
-    idletoken_close_fd(fd);
-
-    /* Status line: "HTTP/1.x NNN ..." */
-    int status = 0;
-    if (len > 12 && memcmp(buf, "HTTP/1.", 7) == 0)
-        status = (buf[9]-'0')*100 + (buf[10]-'0')*10 + (buf[11]-'0');
-    if (status < 100 || !hdr_end) { free(buf); return NULL; }
-
-    size_t blen = len - hdr_end;
-    /* Fewer bytes than the server announced is a body cut short, whether or not
-     * the socket bothered to tell us why. Do NOT clobber a 2 already set above:
-     * a body that ran out of time is also short, and "too slow" is the more
-     * specific and more actionable of the two readings. */
-    if (!truncated && content_len >= 0 && blen < (size_t)content_len) truncated = 1;
-    if (truncated) {
-        /* The rate is the whole diagnosis for a seller whose link is the
-         * problem — "it failed" sends them looking at the software. */
-        long secs = body_start ? (long)(time(NULL) - body_start) : 0;
-        fprintf(stderr, "platform-agent: %s %s: read %zu of %lld announced "
-                        "body bytes in %lds (%.2f KB/s) — %s\n",
-                method, path, blen, content_len, secs,
-                secs > 0 ? (double)blen / 1024.0 / (double)secs : 0.0,
-                truncated == 2 ? "still arriving, but too slow to finish in time"
-                               : "the transfer stopped");
-    }
-    if (truncated && !out_truncated) {
-        fprintf(stderr, "platform-agent: the reply to %s %s was cut short in "
-                        "transit (%zu of %lld body bytes); failing the request "
-                        "instead of parsing the fragment\n",
-                method, path, blen, content_len);
-        free(buf); return NULL;
-    }
-
-    uint8_t *body_out = malloc(blen ? blen : 1);
-    if (!body_out) { free(buf); return NULL; }
-    memcpy(body_out, buf + hdr_end, blen);
-    free(buf);
-    if (out_status) *out_status = status;
-    if (out_len) *out_len = blen;
-    if (out_truncated) *out_truncated = truncated;
-    return body_out;
+    if (out_status) *out_status = response.status;
+    if (out_len) *out_len = response.len;
+    if (out_truncated) *out_truncated = response.truncated;
+    return response.body;
 }
 
-/* "http://host:port[/...]" or "host:port" → "host:port" into `out`.
- * Any path suffix is dropped (both coord and platform APIs hang off /). */
 static int url_to_addr(const char *url, char *out, size_t cap) {
-    const char *p = url;
-    if (!strncmp(p, "http://", 7)) p += 7;
-    else if (!strncmp(p, "https://", 8)) {
-        fprintf(stderr, "platform-agent: https:// upstreams are not supported (no TLS client); "
-                        "terminate TLS in front or use http\n");
-        return -1;
-    }
-    size_t n = strcspn(p, "/");
-    if (n == 0 || n >= cap) return -1;
-    memcpy(out, p, n);
-    out[n] = '\0';
-    if (!strchr(out, ':')) {
-        if (n + 3 >= cap) return -1;
-        memcpy(out + n, ":80", 4);   /* default http port */
-    }
-    return 0;
+    return idletoken_platform_url(url, NULL, out, cap);
 }
 
 /* ======================================================================
@@ -1150,10 +796,12 @@ static void json_escape_into(char *dst, size_t cap, const char *src) {
 /* POST /providers → provider id (malloc'd) or NULL. relay != 0 registers the
  * outbound-only transport: no endpoint at all (the platform never dials us —
  * zero home-side configuration, integration-plan §4). */
+static IDLETOKEN_TLS int g_registration_status;
 static char *platform_register(const char *platform_addr, const char *jwt,
                                const char *name, const char *pubkey_b64,
                                const char *endpoint, int relay,
                                const agent_identity *want) {
+    g_registration_status = 400;
     /* A marketplace service is a concrete model + precision + context triple.
      * Refuse defensively here as well as at the coordinator-reading call sites:
      * an omitted precision must never turn into a wildcard listing. */
@@ -1206,6 +854,7 @@ static char *platform_register(const char *platform_addr, const char *jwt,
     int status = 0; size_t rlen = 0;
     uint8_t *resp = http_post_json(platform_addr, "/providers", jwt,
                                    (const uint8_t *)body, (size_t)bl, &status, &rlen, 30);
+    g_registration_status = status;
     if (!resp) {
         fprintf(stderr, "platform-agent: register: platform %s unreachable\n", platform_addr);
         return NULL;
@@ -1747,7 +1396,7 @@ typedef struct {
     int         relay;
     char       *provider_id;    /* owned here; re-registration may return a new one */
     agent_identity declared;    /* what the platform currently has from this machine */
-    time_t      retry_after;    /* backoff after a refused re-registration */
+    int64_t     retry_after;    /* monotonic milliseconds, including sleep */
     int         backoff_s;
 } agent_registration;
 
@@ -1802,7 +1451,7 @@ static void reconcile_identity(agent_registration *reg, const agent_identity *li
         exit(4);
     }
 
-    const time_t t = time(NULL);
+    const int64_t t = idletoken_platform_now_ms();
     if (reg->retry_after && t < reg->retry_after) return;
 
     fprintf(stderr, "platform-agent: the coordinator now serves '%s' (was '%s'); "
@@ -1814,7 +1463,7 @@ static void reconcile_identity(agent_registration *reg, const agent_identity *li
         reg->backoff_s = reg->backoff_s ? reg->backoff_s * 2 : AGENT_REDECLARE_BACKOFF_MIN_S;
         if (reg->backoff_s > AGENT_REDECLARE_BACKOFF_MAX_S)
             reg->backoff_s = AGENT_REDECLARE_BACKOFF_MAX_S;
-        reg->retry_after = t + reg->backoff_s;
+        reg->retry_after = t + (int64_t)reg->backoff_s * 1000;
         /* Loud, and it keeps saying it: until this succeeds the machine is
          * selling something it is not running, and the operator is the only
          * one who can act on the reason (a churn limit, an expired JWT). */
@@ -2017,24 +1666,32 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
                           const char *json, size_t json_len, const char *job_id,
                           char **out_b64, int *err_status, const char **err_msg);
 
-/* POST the job result (success or error). Best effort: on failure the job
- * simply expires platform-side and routing fails over. Returns 0 on 2xx. */
+/* Retry the same sealed answer until the original delivery deadline. The
+ * gateway atomically consumes a receipt once; a lost response must not trigger
+ * another inference or charge. Legacy jobs retain their one-shot behavior. */
 static int relay_post_result(const char *platform_addr, const char *jwt,
                              const char *provider_id, const char *job_id,
                              const char *sealed_b64 /* NULL on error */,
                              const char *err_msg,   /* used when sealed_b64 == NULL */
-                             int err_status         /* HTTP-ish code for that error */) {
+                             int err_status,        /* HTTP-ish code for that error */
+                             const char *delivery_token, int64_t expires) {
     char path[256];
     int pn = snprintf(path, sizeof(path), "/providers/%s/relay/result", provider_id);
     if (pn < 0 || (size_t)pn >= sizeof(path)) return -1;
 
-    size_t cap = (sealed_b64 ? strlen(sealed_b64) : strlen(err_msg)) + strlen(job_id) + 96;
+    char delivery_frag[160] = "";
+    if (delivery_token) {
+        char escaped[96];
+        json_escape_into(escaped, sizeof(escaped), delivery_token);
+        snprintf(delivery_frag, sizeof(delivery_frag), ",\"delivery_token\":\"%s\"", escaped);
+    }
+    size_t cap = (sealed_b64 ? strlen(sealed_b64) : strlen(err_msg)) + strlen(job_id) + 320;
     char *body = malloc(cap);
     if (!body) return -1;
     int bl;
     if (sealed_b64) {
-        bl = snprintf(body, cap, "{\"job_id\":\"%s\",\"sealed_response\":\"%s\"}",
-                      job_id, sealed_b64);
+        bl = snprintf(body, cap, "{\"job_id\":\"%s\",\"sealed_response\":\"%s\"%s}",
+                      job_id, sealed_b64, delivery_frag);
     } else {
         char msg_esc[256];
         json_escape_into(msg_esc, sizeof(msg_esc), err_msg);
@@ -2046,18 +1703,182 @@ static int relay_post_result(const char *platform_addr, const char *jwt,
          * cooldown. Relay is the DEFAULT for home providers, so the transport
          * most people run was the one that punished them for being busy.
          * An older gateway simply ignores the extra field. */
-        bl = snprintf(body, cap, "{\"job_id\":\"%s\",\"error\":\"%s\",\"status\":%d}",
-                      job_id, msg_esc, err_status > 0 ? err_status : 502);
+        bl = snprintf(body, cap, "{\"job_id\":\"%s\",\"error\":\"%s\",\"status\":%d%s}",
+                      job_id, msg_esc, err_status > 0 ? err_status : 502, delivery_frag);
     }
     if (bl < 0 || (size_t)bl >= cap) { free(body); return -1; }
 
-    int status = 0; size_t rlen = 0;
-    uint8_t *resp = http_post_json(platform_addr, path, jwt,
-                                   (const uint8_t *)body, (size_t)bl, &status, &rlen, 30);
+    int retry = delivery_token && expires > 0;
+    for (;;) {
+        int64_t remaining = expires - idletoken_platform_now_ms();
+        if (g_request_cancelled && g_request_cancelled(g_cancel_context)) {
+            fprintf(stderr, "platform-agent: result job=%s already answered, cancelled or expired\n", job_id);
+            free(body); return 0;
+        }
+        if (retry && remaining <= 0) break;
+        int timeout = retry ? (remaining < 10000 ? (int)((remaining + 999) / 1000) : 10) : 30;
+        int status = 0; size_t rlen = 0;
+        int64_t prior_deadline = g_inference_deadline_ms;
+        g_inference_deadline_ms = expires;
+        uint8_t *resp = http_post_json(platform_addr, path, jwt,
+                                       (const uint8_t *)body, (size_t)bl, &status, &rlen, timeout);
+        g_inference_deadline_ms = prior_deadline;
+        int accepted = resp && status >= 200 && status < 300;
+        free(resp);
+        if (accepted || (retry && status == 404)) {
+            if (!accepted) fprintf(stderr, "platform-agent: result job=%s already answered, cancelled or expired\n", job_id);
+            free(body); return 0;
+        }
+        if (!retry || status == 400 || status == 401 || status == 403 || status == 413) break;
+        fprintf(stderr, "platform-agent: retrying sealed result for job=%s (http %d)\n", job_id, status);
+        sleep(1);
+    }
     free(body);
-    if (!resp) return -1;
-    free(resp);
-    return (status >= 200 && status < 300) ? 0 : -1;
+    return -1;
+}
+
+/* A lost acknowledgement response is retried with the SAME token. Do not
+ * repoll after an uncertain ACK: the platform may already have accepted it.
+ * Cancellation, expiry or a superseding delivery returns 404 and forbids work. */
+static int relay_ack_lease_ms(const char *json, size_t len) {
+    const char *value = idletoken_json_obj_get(json, len, "provider_lease_ms");
+    if (!value) return 0; /* Older gateways do not advertise a provider lease. */
+    long size = idletoken_json_value_len(value, json + len);
+    if (size <= 0 || size > 10) return -1;
+    int ms = 0;
+    for (long i = 0; i < size; i++) {
+        int digit = value[i] - '0';
+        if (digit < 0 || digit > 9 || ms > (INT_MAX - digit) / 10) return -1;
+        ms = ms * 10 + digit;
+    }
+    return ms > 0 ? ms : -1;
+}
+
+static int relay_acknowledge(const char *addr, const char *jwt, const char *provider,
+                             const char *job, const char *token, int64_t expires,
+                             int64_t *lease_deadline) {
+    *lease_deadline = 0;
+    char path[256], body[512];
+    snprintf(path, sizeof(path), "/providers/%s/relay/ack", provider);
+    char job_esc[192], token_esc[128];
+    json_escape_into(job_esc, sizeof(job_esc), job);
+    json_escape_into(token_esc, sizeof(token_esc), token);
+    int n = snprintf(body, sizeof(body), "{\"job_id\":\"%s\",\"delivery_token\":\"%s\"}", job_esc, token_esc);
+    if (n < 0 || (size_t)n >= sizeof(body)) return -1;
+    while (idletoken_platform_now_ms() < expires) {
+        int status = 0; size_t len = 0;
+        int64_t started = idletoken_platform_now_ms();
+        int64_t remaining = expires - started;
+        if (remaining <= 0) break;
+        int timeout = remaining < 10000 ? (int)((remaining + 999) / 1000) : 10;
+        int64_t prior_deadline = g_inference_deadline_ms;
+        g_inference_deadline_ms = expires;
+        uint8_t *response = http_post_json(addr, path, jwt, (uint8_t *)body, (size_t)n, &status, &len, timeout);
+        g_inference_deadline_ms = prior_deadline;
+        const char *ok = response ? idletoken_json_obj_get((const char *)response, len, "ok") : NULL;
+        int accepted = response && status >= 200 && status < 300 && ok && strncmp(ok, "true", 4) == 0;
+        int lease_ms = accepted ? relay_ack_lease_ms((const char *)response, len) : 0;
+        free(response);
+        if (accepted) {
+            if (lease_ms < 0) break;
+            if (lease_ms > 0) {
+                /* Charge the whole ACK round trip to the advertised lease.
+                 * A delayed response must not create fresh execution time. */
+                *lease_deadline = started + lease_ms;
+                if (*lease_deadline > expires) *lease_deadline = expires;
+                if (*lease_deadline <= idletoken_platform_now_ms()) break;
+            }
+            return 0;
+        }
+        if (status == 404 || status == 400 || status == 401 || status == 403) break;
+        fprintf(stderr, "platform-agent: retrying receipt confirmation for job=%s (http %d)\n", job, status);
+        sleep(1);
+    }
+    fprintf(stderr, "platform-agent: delivery for job=%s expired, cancelled or superseded; skipping inference\n", job);
+    return -1;
+}
+
+/* ACK is an idempotent liveness check, not a lease renewal. Rechecking it
+ * reaches cancellation even while the main thread waits for prefill headers.
+ * Definitive receipt loss or authentication refusal cancels. A disconnected
+ * provider stops local inference at its last confirmed execution lease even
+ * when the original job deadline is hours away. Only successful, well-formed
+ * ACKs extend this bound; transient outages within it can recover. No plaintext
+ * travels. Older gateways without an advertised lease retain their deadline. */
+typedef struct {
+    pthread_mutex_t mutex;
+    int stopped, cancelled;
+    const char *addr, *jwt, *provider, *job, *token;
+    int64_t expires, lease_deadline;
+} relay_watch;
+
+static int watch_stopped(void *arg) {
+    relay_watch *watch = arg;
+    pthread_mutex_lock(&watch->mutex);
+    int stopped = watch->stopped;
+    pthread_mutex_unlock(&watch->mutex);
+    return stopped;
+}
+static int watch_cancelled(void *arg) {
+    relay_watch *watch = arg;
+    pthread_mutex_lock(&watch->mutex);
+    int cancelled = watch->cancelled;
+    int64_t lease_deadline = watch->lease_deadline;
+    pthread_mutex_unlock(&watch->mutex);
+    int64_t now = idletoken_platform_now_ms();
+    return cancelled || now >= watch->expires || (lease_deadline > 0 && now >= lease_deadline);
+}
+static void *relay_watch_loop(void *arg) {
+    relay_watch *watch = arg;
+    char path[256], url[4096], body[512], job[192], token[128];
+    json_escape_into(job, sizeof(job), watch->job);
+    json_escape_into(token, sizeof(token), watch->token);
+    snprintf(path, sizeof(path), "/providers/%s/relay/ack", watch->provider);
+    if (idletoken_platform_url(watch->addr, path, url, sizeof(url))) return NULL;
+    int n = snprintf(body, sizeof(body), "{\"job_id\":\"%s\",\"delivery_token\":\"%s\"}", job, token);
+    while (!watch_stopped(watch) && !watch_cancelled(watch)) {
+        int64_t started = idletoken_platform_now_ms();
+        int64_t left = watch->expires - started;
+        idletoken_platform_http_request request = {
+            .url = url, .method = "POST", .bearer = watch->jwt,
+            .headers = IDLETOKEN_VERSION_HTTP_HEADER, .body = body, .body_len = (size_t)n,
+            .connect_ms = 2000, .total_ms = left < 3000 ? (int)left : 3000,
+            .max_response = 8192, .cancelled = watch_stopped, .cancel_context = watch,
+        };
+        idletoken_platform_http_response response;
+        int rc = idletoken_platform_http(&request, &response);
+        if (!rc && (response.status == 404 || response.status == 401 || response.status == 403)) {
+            pthread_mutex_lock(&watch->mutex);
+            watch->cancelled = 1;
+            pthread_mutex_unlock(&watch->mutex);
+        }
+        if (!rc && response.status >= 200 && response.status < 300 && response.body) {
+            const char *ok = idletoken_json_obj_get((const char *)response.body, response.len, "ok");
+            int lease_ms = ok && strncmp(ok, "true", 4) == 0
+                ? relay_ack_lease_ms((const char *)response.body, response.len) : -1;
+            int64_t now = idletoken_platform_now_ms();
+            pthread_mutex_lock(&watch->mutex);
+            /* A late ACK cannot revive work after the locally confirmed lease
+             * expired. Missing metadata cannot remove an established bound. */
+            if (lease_ms < 0 || (watch->lease_deadline > 0 && now >= watch->lease_deadline)) {
+                watch->cancelled = 1;
+            } else if (lease_ms > 0) {
+                watch->lease_deadline = started + lease_ms;
+                if (watch->lease_deadline <= now) watch->cancelled = 1;
+            }
+            pthread_mutex_unlock(&watch->mutex);
+        }
+        free(response.body);
+        /* Interruptible wait also bounds join when inference finished first. */
+        for (int i = 0; i < 10 && !watch_stopped(watch) && !watch_cancelled(watch); i++) {
+#ifdef _WIN32
+            Sleep(100);
+#else
+            struct timespec pause = {0, 100000000}; nanosleep(&pause, NULL);
+#endif
+        }
+    }
+    return NULL;
 }
 
 /* The relay main loop: long-poll → process job → post result → repeat.
@@ -2146,11 +1967,11 @@ static void relay_loop(const idletoken_keypair *node, agent_registration *reg) {
         int pbl;
         if (coord_stats_json(coord_addr, stats, sizeof(stats)) == 0)
             pbl = snprintf(poll_body, sizeof(poll_body),
-                           "{\"wait_ms\":%d,\"capacity\":%s}", RELAY_WAIT_MS, stats);
+                           "{\"wait_ms\":%d,\"delivery_ack\":true,\"delivery_watch\":true,\"capacity\":%s}", RELAY_WAIT_MS, stats);
         else
-            pbl = snprintf(poll_body, sizeof(poll_body), "{\"wait_ms\":%d}", RELAY_WAIT_MS);
+            pbl = snprintf(poll_body, sizeof(poll_body), "{\"wait_ms\":%d,\"delivery_ack\":true,\"delivery_watch\":true}", RELAY_WAIT_MS);
         if (pbl < 0 || (size_t)pbl >= sizeof(poll_body))
-            pbl = snprintf(poll_body, sizeof(poll_body), "{\"wait_ms\":%d}", RELAY_WAIT_MS);
+            pbl = snprintf(poll_body, sizeof(poll_body), "{\"wait_ms\":%d,\"delivery_ack\":true,\"delivery_watch\":true}", RELAY_WAIT_MS);
 
         int status = 0; size_t rlen = 0; int truncated = 0;
         /* Socket timeout comfortably above the server's hold time. Once the job
@@ -2160,6 +1981,11 @@ static void relay_loop(const idletoken_keypair *node, agent_registration *reg) {
                                               (const uint8_t *)poll_body, (size_t)pbl,
                                               &status, &rlen, RELAY_WAIT_MS / 1000 + 15,
                                               &truncated);
+        if (status == 401 || status == 403) {
+            fprintf(stderr, "platform-agent: refuse: platform credentials rejected (HTTP %d); sign in again or check the account status before restarting sharing\n", status);
+            free(resp);
+            exit(3);
+        }
         if (!resp || status < 200 || status >= 300) {
             fprintf(stderr, "platform-agent: relay poll %s (http %d); retry in %ds\n",
                     resp ? "rejected" : "unreachable", status, backoff);
@@ -2174,6 +2000,8 @@ static void relay_loop(const idletoken_keypair *node, agent_registration *reg) {
         /* {"job_id":null} (idle timeout) → just poll again. */
         char *job_id = json_str_dup((const char *)resp, rlen, "job_id");
         if (!job_id) { free(resp); continue; }
+        char *delivery_token = json_str_dup((const char *)resp, rlen, "delivery_token");
+        int64_t expires = g_delivery_deadline_ms;
 
         /* A job that only half arrived is not a job we can run, but it IS one
          * the platform is still holding open for us, and the id at the front of
@@ -2182,10 +2010,28 @@ static void relay_loop(const idletoken_keypair *node, agent_registration *reg) {
          * buyer wait out the platform's job timeout, and parsing the fragment is
          * what used to make us report the platform's envelope as malformed. */
         if (truncated) {
-            /* Two different things to tell the seller, and only one of them is
-             * "your link dropped": a link that is merely too slow keeps working
-             * for small jobs, so naming it precisely is the difference between
-             * "my machine is broken" and "my uplink cannot carry big requests". */
+            /* Three different things to tell the seller, and only one of them
+             * is "your link dropped". A link that is merely too slow keeps
+             * working for small jobs, so naming it precisely is the difference
+             * between "my machine is broken" and "my uplink cannot carry big
+             * requests". And a job whose platform budget was already spent by
+             * the time its bytes landed (remaining_ms smaller than its own
+             * transfer time, or zero) is no fault of this link at all: the
+             * platform expires it on its own, and a hand-back would only hit
+             * that same spent deadline. Blaming the uplink there sends a seller
+             * hunting for a network problem that does not exist (found by the
+             * 2026-09-21 receipt simulation, remaining_ms=0). */
+            const int deadline_spent = expires > 0 && expires <= idletoken_platform_now_ms();
+            if (deadline_spent) {
+                fprintf(stderr, "platform-agent: relay job=%s arrived after its platform "
+                                "deadline was already spent (%zu bytes landed with no time "
+                                "budget left); the platform expires it, nothing to hand back. "
+                                "This is not a link fault.\n", job_id, rlen);
+                free(delivery_token);
+                free(job_id);
+                free(resp);
+                continue;
+            }
             const int too_slow = (truncated == 2);
             fprintf(stderr, "platform-agent: relay job=%s arrived cut short "
                             "(%zu bytes) — this machine's link to the platform "
@@ -2197,17 +2043,40 @@ static void relay_loop(const idletoken_keypair *node, agent_registration *reg) {
                                 ? "job body was cut short in transit (this "
                                   "provider's link is too slow to carry a job this size)"
                                 : "job body was cut short in transit "
-                                  "(this provider's link to the platform stalled)", 502);
+                                  "(this provider's link to the platform stalled)", 502, delivery_token, expires);
+            free(delivery_token);
             free(job_id);
             free(resp);
             continue;
         }
+
+        int64_t lease_deadline = 0;
+        if (delivery_token) {
+            if (relay_acknowledge(platform_addr, jwt, reg->provider_id, job_id, delivery_token, expires, &lease_deadline) != 0) {
+                free(delivery_token); free(job_id); free(resp); continue;
+            }
+        }
+
+        relay_watch watch = { .mutex = PTHREAD_MUTEX_INITIALIZER,
+            .addr = platform_addr, .jwt = jwt, .provider = reg->provider_id,
+            .job = job_id, .token = delivery_token, .expires = expires, .lease_deadline = lease_deadline };
+        pthread_t watch_thread;
+        int watching = delivery_token && expires > 0;
+        if (watching && pthread_create(&watch_thread, NULL, relay_watch_loop, &watch)) {
+            relay_post_result(platform_addr, jwt, reg->provider_id, job_id, NULL,
+                              "could not monitor consumer cancellation", 503, delivery_token, expires);
+            pthread_mutex_destroy(&watch.mutex);
+            free(delivery_token); free(job_id); free(resp); continue;
+        }
+        g_request_cancelled = watching ? watch_cancelled : NULL;
+        g_cancel_context = watching ? &watch : NULL;
 
         /* The poll response body IS the sealed envelope (same keys as the
          * direct /infer body) — feed it straight to the shared path. */
         char *sealed_b64 = NULL;
         int err_status = 500;
         const char *err_msg = "internal error";
+        g_inference_deadline_ms = expires;
         int rc = process_sealed(node, coord_addr, (const char *)resp, rlen, job_id,
                                 &sealed_b64, &err_status, &err_msg);
         free(resp);
@@ -2215,10 +2084,20 @@ static void relay_loop(const idletoken_keypair *node, agent_registration *reg) {
                 job_id, rc == 0 ? "sealed ok" : err_msg);
 
         if (relay_post_result(platform_addr, jwt, reg->provider_id, job_id,
-                              rc == 0 ? sealed_b64 : NULL, err_msg, err_status) != 0)
+                              rc == 0 ? sealed_b64 : NULL, err_msg, err_status, delivery_token, expires) != 0)
             fprintf(stderr, "platform-agent: relay result post failed for job=%s "
                             "(job will expire platform-side)\n", job_id);
+        /* Result uploads can also be slow. Keep confirming liveness and
+         * observing cancellation until the sealed result has been accepted. */
+        g_inference_deadline_ms = 0;
+        g_request_cancelled = NULL; g_cancel_context = NULL;
+        if (watching) {
+            pthread_mutex_lock(&watch.mutex); watch.stopped = 1; pthread_mutex_unlock(&watch.mutex);
+            pthread_join(watch_thread, NULL);
+        }
+        pthread_mutex_destroy(&watch.mutex);
         free(sealed_b64);
+        free(delivery_token);
         free(job_id);
 
         /* KV cache state: report it in the gap between finishing a job and the
@@ -2347,6 +2226,13 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
         ? idletoken_json_value_len(choice_tok, (const char *)plain + plain_len)
         : -1;
     size_t choice_len = choice_len_raw > 0 ? (size_t)choice_len_raw : 0;
+    const char *parallel_tok = idletoken_json_obj_get((const char *)plain, plain_len,
+                                                     "parallel_tool_calls");
+    const char *parallel_frag = "";
+    if (parallel_tok && strncmp(parallel_tok, "false", 5) == 0)
+        parallel_frag = ",\"parallel_tool_calls\":false";
+    else if (parallel_tok && strncmp(parallel_tok, "true", 4) == 0)
+        parallel_frag = ",\"parallel_tool_calls\":true";
     /* The consumer's thinking switch, forwarded VERBATIM.
      *
      * The platform seals it under the key the engine itself reads
@@ -2376,10 +2262,20 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
     static char staged[PFX_MAX_BLOCKS][65];
     int staged_n = prefix_hash_messages(msgs_tok, msgs_len, staged, PFX_MAX_BLOCKS);
 
-    size_t creq_cap = msgs_len + model_len + tools_len + choice_len + ctk_len
-                      + eff_len + 224;
+    size_t sampling_len = 0;
+    char *sampling = idletoken_sampling_fields((const char *)plain, plain_len, &sampling_len);
+    if (!sampling) {
+        idletoken_secure_zero(plain, plain_cap);
+        idletoken_munlock(plain, plain_cap); free(plain); free(reply_to);
+        FAIL(400, "invalid sampling controls or allocation failure");
+    }
+    idletoken_mlock(sampling, sampling_len);
+    size_t creq_cap = msgs_len + model_len + tools_len + choice_len + ctk_len + sampling_len
+                      + eff_len + 256;
     char *creq = malloc(creq_cap);
     if (!creq) {
+        idletoken_secure_zero(sampling, sampling_len);
+        idletoken_munlock(sampling, sampling_len); free(sampling);
         idletoken_secure_zero(plain, plain_cap);
         idletoken_munlock(plain, plain_cap); free(plain);
         free(reply_to);
@@ -2391,7 +2287,7 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
     if (max_tokens > 0)
         snprintf(mt_frag, sizeof mt_frag, ",\"max_tokens\":%d", max_tokens);
     int cl = snprintf(creq, creq_cap,
-                      "{\"model\":\"%.*s\",\"messages\":%.*s%s%s%.*s%s%.*s%s%.*s%s%.*s%s}",
+                      "{\"model\":\"%.*s\",\"messages\":%.*s%s%s%.*s%s%.*s%s%.*s%s%.*s%s%s%.*s}",
                       (int)model_len, model_tok, (int)msgs_len, msgs_tok, mt_frag,
                       have_req_tools ? ",\"tools\":" : "",
                       (int)tools_len, have_req_tools ? tools_tok : "",
@@ -2401,7 +2297,9 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
                       (int)ctk_len, ctk_len ? ctk_tok : "",
                       have_effort ? ",\"reasoning_effort\":\"" : "",
                       (int)eff_len, have_effort ? eff_tok : "",
-                      have_effort ? "\"" : "");
+                      have_effort ? "\"" : "", parallel_frag, (int)sampling_len, sampling);
+    idletoken_secure_zero(sampling, sampling_len);
+    idletoken_munlock(sampling, sampling_len); free(sampling);
 
     /* -- forward plaintext to coord over loopback ------------------------- *
      * Deliberately NO "stream":true here: the sealed envelope is a one-shot
@@ -2476,6 +2374,8 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
          * coord's actual status must survive this hop. The buffer is
          * thread-local because process_sealed also runs on per-connection
          * threads, and *err_msg is read after this function returns. */
+        if (!coord_answered && g_request_cancelled && g_request_cancelled(g_cancel_context))
+            FAIL(499, "consumer cancelled or delivery expired");
         if (!coord_answered)
             FAIL(502, "upstream coord unreachable (no response on loopback)");
         if (cstatus >= 400 && cstatus < 500) {
@@ -2662,14 +2562,36 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
 }
 
 /* Handle POST /infer (direct transport): process_sealed + HTTP framing. */
+static int infer_consumer_closed(void *arg) {
+    int fd = *(int *)arg;
+#ifdef _WIN32
+    /* Winsock's fd_set is an array of handles; FD_SETSIZE bounds the count,
+     * not the value, so select() is safe for any socket here. */
+    fd_set readable; FD_ZERO(&readable); FD_SET((SOCKET)fd, &readable);
+    struct timeval timeout = {0, 0};
+    if (select(0, &readable, NULL, NULL, &timeout) <= 0) return 0;
+#else
+    /* POSIX FD_SET on a descriptor >= FD_SETSIZE (1024) writes past the set:
+     * one thread per connection makes such descriptors ordinary. poll() has
+     * no such bound. */
+    struct pollfd probe = { fd, POLLIN, 0 };
+    if (poll(&probe, 1, 0) <= 0) return 0;
+    if (probe.revents & (POLLERR | POLLNVAL)) return 1;
+#endif
+    char byte;
+    return recv(fd, &byte, 1, MSG_PEEK) <= 0;
+}
 static void handle_infer(int conn_fd, const idletoken_keypair *node,
                          const char *coord_addr,
                          const uint8_t *body, size_t body_len) {
     char *resp_b64 = NULL;
     int err_status = 500;
     const char *err_msg = "internal error";
-    if (process_sealed(node, coord_addr, (const char *)body, body_len, NULL,
-                       &resp_b64, &err_status, &err_msg) != 0) {
+    g_request_cancelled = infer_consumer_closed; g_cancel_context = &conn_fd;
+    int rc = process_sealed(node, coord_addr, (const char *)body, body_len, NULL,
+                           &resp_b64, &err_status, &err_msg);
+    g_request_cancelled = NULL; g_cancel_context = NULL;
+    if (rc != 0) {
         idletoken_http_send_error(conn_fd, err_status, err_msg);
         return;
     }
@@ -2715,7 +2637,10 @@ static void handle_conn(int conn_fd, const idletoken_keypair *node,
                         const char *coord_addr, const char *pubkey_b64) {
     idletoken_http_req req;
     if (idletoken_http_read_request(conn_fd, &req) != 0) {
-        idletoken_http_send_error(conn_fd, 400, "bad request");
+        int parse_error = errno;
+        idletoken_http_send_error(conn_fd, parse_error == EMSGSIZE ? 413 : 400,
+            parse_error == EMSGSIZE ? "request exceeds the HTTP size limit" : "invalid HTTP request framing");
+        idletoken_http_finish_rejection(conn_fd, 100);
         return;
     }
     /* Log method/path/sizes only — NEVER bodies (they hold the envelope; and
@@ -2934,7 +2859,84 @@ static void usage(FILE *o) {
 "  -h, --help          this help\n");
 }
 
+
+/* Desktop control requests use the exact agent/overflow transport. Secrets
+ * cross an anonymous stdin pipe, never argv or a temporary file. The length
+ * prefix avoids relying on EOF (Tauri keeps the child's stdin open). */
+static char *stdio_string(const char *json, size_t len, const char *key, size_t *out_len) {
+    const char *value = idletoken_json_obj_get(json, len, key);
+    if (!value || *value != '"') return NULL;
+    long n = idletoken_json_value_len(value, json + len);
+    if (n < 2) return NULL;
+    return idletoken_json_unescape(value + 1, (size_t)n - 2, out_len);
+}
+static int platform_http_stdio(void) {
+    unsigned char prefix[4];
+    if (fread(prefix, 1, 4, stdin) != 4) return 2;
+    size_t len = ((size_t)prefix[0] << 24) | ((size_t)prefix[1] << 16) |
+                 ((size_t)prefix[2] << 8) | prefix[3];
+    if (!len || len > 64u * 1024u * 1024u) return 2;
+    char *input = calloc(len + 1, 1);
+    if (!input || fread(input, 1, len, stdin) != len) { free(input); return 2; }
+    size_t body_len = 0;
+    char *url = stdio_string(input, len, "url", NULL);
+    char *method = stdio_string(input, len, "method", NULL);
+    char *body = stdio_string(input, len, "body", &body_len);
+    char *bearer = stdio_string(input, len, "bearer", NULL);
+    int timeout = json_int_field(input, len, "timeout_ms", 20000);
+    wipe_free(input, len);
+    if (timeout < 1) timeout = 1;
+    if (timeout > 120000) timeout = 120000;
+    int result = 2;
+    if (url && method && !strpbrk(method, "\r\n\t ") && strlen(method) <= 16) {
+        idletoken_platform_http_request request = {
+            .url = url, .method = method, .bearer = bearer,
+            .headers = IDLETOKEN_VERSION_HTTP_HEADER,
+            .body = body, .body_len = body_len,
+            .connect_ms = 10000, .total_ms = timeout, .max_response = 64u * 1024u * 1024u,
+        };
+        idletoken_platform_http_response response;
+        int64_t started = idletoken_platform_now_ms();
+        int rc = idletoken_platform_http(&request, &response);
+        /* A completed HTTP error is authoritative. Only bodyless, idempotent
+         * desktop reads with no response can retry a transient connection
+         * failure; writes and inference keep their receipt protocol. Both
+         * attempts spend the caller's original budget, never a fresh one. */
+        int64_t remaining = timeout - (idletoken_platform_now_ms() - started);
+        if (rc && response.retryable && !response.status && !body_len &&
+            !strcmp(method, "GET") && remaining > 0) {
+            fprintf(stderr, "platform-http: retrying GET once: %s\n", response.error);
+            if (response.body) wipe_free(response.body, response.len);
+            request.total_ms = (int)remaining;
+            rc = idletoken_platform_http(&request, &response);
+        }
+        if (!rc) {
+            printf("{\"status\":%d}\n", response.status);
+            fwrite(response.body, 1, response.len, stdout);
+            result = 0;
+        } else {
+            char error[1600];
+            json_escape_into(error, sizeof(error), response.error);
+            printf("{\"error\":\"%s\"}\n", error);
+            result = 1;
+        }
+        if (response.body) wipe_free(response.body, response.len);
+    }
+    free(url); free(method);
+    if (body) wipe_free(body, body_len);
+    if (bearer) wipe_free(bearer, strlen(bearer));
+    return result;
+}
+
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    if (argc == 2 && !strcmp(argv[1], "--platform-http-stdio")) {
+        _setmode(_fileno(stdin), _O_BINARY); _setmode(_fileno(stdout), _O_BINARY);
+    }
+#endif
+    if (argc == 2 && !strcmp(argv[1], "--platform-http-stdio")) return platform_http_stdio();
+    int proxy_helper = idletoken_platform_proxy_helper(argc, argv);
+    if (proxy_helper >= 0) return proxy_helper;
 #ifdef __linux__
     /* Opt-in (set by the client supervisor): die with the launching client.
      * Same block as coord_main.c/worker_main.c — the agent was the ONE
@@ -3151,11 +3153,24 @@ int main(int argc, char **argv) {
                             "the '%s' this agent was started with; declaring the "
                             "coordinator's\n", live.quant, quant);
         }
-        reg.provider_id = platform_register(platform_addr, jwt, name, pubkey_b64,
-                                            endpoint, relay, &live);
-        if (!reg.provider_id) {
-            fprintf(stderr, "platform-agent: registration failed; refusing to start\n");
-            return 1;
+        unsigned retry_s = 1;
+        for (;;) {
+            reg.provider_id = platform_register(platform_addr, jwt, name, pubkey_b64,
+                                                endpoint, relay, &live);
+            if (reg.provider_id) break;
+            if (g_registration_status && g_registration_status != 408 &&
+                g_registration_status != 429 && g_registration_status < 500) {
+                fprintf(stderr, "platform-agent: refuse: registration rejected (HTTP %d); check account credentials or client configuration\n", g_registration_status);
+                free(pubkey_b64); return 3;
+            }
+            unsigned pause_s = g_registration_status == 429 ? 300 : retry_s;
+            fprintf(stderr, "platform-agent: platform unavailable (HTTP %d); registration retries in %us\n", g_registration_status, pause_s);
+            sleep(pause_s);
+            if (retry_s < 60) retry_s = retry_s < 30 ? retry_s * 2 : 60;
+            int ready = await_sellable_engine(coord_addr, &live);
+            if (ready != 0) { free(pubkey_b64); return ready; }
+            int floor = assert_listable_ctx(&live);
+            if (floor != 0) { free(pubkey_b64); return floor; }
         }
         reg.declared = live;
         char what[224];

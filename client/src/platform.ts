@@ -13,7 +13,7 @@
 import { apiBase, loadSettings } from "./settings";
 import { getAuthProvider, type Session } from "./auth";
 import { platformRequest, replyJson } from "./platformHttp";
-import { AGENT_TOKEN_KEY, getSecret, setSecret } from "./secrets";
+import { AGENT_TOKEN_KEY, clearSecret, getSecret, setSecret } from "./secrets";
 
 const FETCH_TIMEOUT_MS = 10_000;
 
@@ -98,7 +98,17 @@ async function req<T>(path: string, init?: { method?: string; body?: string }): 
     // the reader to different places, and the old message named neither.
     throw new Error(`network: can't reach the platform server (${e instanceof Error ? e.message : e})`);
   }
+  const current = platformGate();
+  if (!current.ok || current.url !== gate.url || current.session.token !== gate.session.token) {
+    throw new Error("session changed while contacting the platform — try again");
+  }
   return handleReply<T>(res, path);
+}
+
+class PlatformHttpError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+  }
 }
 
 /** Turn a reply into a value or an error. */
@@ -117,7 +127,7 @@ function handleReply<T>(res: any, path: string): T {
     const body = replyJson<{ message?: string | string[] }>(res);
     const m = body?.message;
     const detail = Array.isArray(m) ? m.join("; ") : m || "";
-    throw new Error(`HTTP ${res.status}${detail ? `: ${detail}` : ""}`);
+    throw new PlatformHttpError(res.status, `HTTP ${res.status}${detail ? `: ${detail}` : ""}`);
   }
   const parsed = replyJson<T>(res);
   if (parsed === null) throw new Error(`the platform sent a non-JSON reply to ${path}`);
@@ -267,12 +277,13 @@ const AGENT_LOG_TAG = "[platform-agent]";
  */
 const AGENT_TOKEN_RENEW_BEFORE_MS = 24 * 3600 * 1000;
 
-function storedAgentToken(): string | null {
+function storedAgentToken(userId?: string): string | null {
   const raw = getSecret(AGENT_TOKEN_KEY);
   if (!raw) return null;
   try {
     const payload = JSON.parse(atob(raw.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
-    if (typeof payload.exp !== "number") return null;
+    if (typeof payload.exp !== "number" || payload.scope !== "agent"
+      || (userId && payload.sub !== userId)) return null;
     // Renew a day early: a token that expires while the agent is mid-shift takes
     // the machine off the market until someone notices.
     if (payload.exp * 1000 - Date.now() < AGENT_TOKEN_RENEW_BEFORE_MS) return null;
@@ -283,21 +294,48 @@ function storedAgentToken(): string | null {
 }
 
 export async function agentCredential(fallbackJwt: string): Promise<string> {
-  const cached = storedAgentToken();
-  if (cached) return cached;
+  const gate = platformGate();
+  if (!gate.ok) throw new Error(`platform not connected (${gate.reason})`);
+  const stillCurrent = () => {
+    const current = platformGate();
+    if (!current.ok || current.url !== gate.url || current.session.token !== fallbackJwt) {
+      throw new Error("session changed while starting sharing — try again");
+    }
+  };
+  stillCurrent();
+  const cached = storedAgentToken(gate.session.userId);
+  if (cached) {
+    // Expiry alone cannot detect a revoked session. Validate on an explicit
+    // start, before handing the cached credential to a long-running process.
+    // An agent 401 must not sign out the independently valid console session.
+    const res = await platformRequest(gate.url + "/providers", {
+      bearer: cached, timeoutMs: FETCH_TIMEOUT_MS,
+    });
+    stillCurrent();
+    if (res.status !== 401) {
+      handleReply<ProviderInfo[]>(res, "/providers");
+      return cached;
+    }
+  }
+  clearSecret(AGENT_TOKEN_KEY);
   try {
     const issued = await req<{ token?: string; scope?: string }>("/auth/agent-token", {
       method: "POST",
       body: JSON.stringify({ label: "sharing agent" }),
     });
+    stillCurrent();
     if (issued?.token && issued.scope === "agent") {
       setSecret(AGENT_TOKEN_KEY, issued.token);
       return issued.token;
     }
-    console.warn("platform: /auth/agent-token returned an unexpected body; falling back to the console session token");
+    throw new Error("the platform did not return a scoped agent token");
   } catch (e) {
+    // Only the documented old-gateway case permits this compatibility path.
+    // Outages, throttling and rejected credentials must retain their cause.
+    if (!(e instanceof PlatformHttpError) || e.status !== 404) throw e;
+    stillCurrent();
     console.warn(
-      `platform: could not obtain a scope-restricted agent token (${e instanceof Error ? e.message : e}). ` +
+      "platform: this gateway does not support scope-restricted agent tokens (HTTP 404). " +
         "Falling back to the console session token — the agent will run with more authority than it needs. " +
         "Upgrade the platform gateway to close this."
     );

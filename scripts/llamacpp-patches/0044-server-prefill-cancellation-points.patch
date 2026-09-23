@@ -1,0 +1,28 @@
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3455,8 +3455,12 @@
+                     const auto & spans = slot.task->params.message_spans;
+                     const auto last_user_pos = spans.last_user_message_pos();
+ 
+-                    // add prompt tokens for processing in the current batch
+-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
++                    // Return to the task queue after one physical text-prefill batch.
++                    // Slot cancellation must run between decode calls, never concurrently
++                    // with GPU work. Embedding and multimodal batching stay unchanged.
++                    const int32_t n_prompt_batch = !slot.task->need_embd() && !mctx
++                        ? std::min(n_batch, n_ubatch) : n_batch;
++                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_prompt_batch) {
+                         // get next token to process
+                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
+                         if (cur_tok == LLAMA_TOKEN_NULL) {
+@@ -3616,7 +3620,9 @@
+         int ret = 0;
+         queue_tasks.yield_to_queue([&]() {
+             ret = llama_decode(ctx_tgt, batch_view);
+-            if (ret == 0 && has_output) {
++            // Drain this text batch before accepting another: otherwise asynchronous
++            // submission can accumulate several batches ahead of a pending cancel.
++            if (ret == 0 && (has_output || !mctx)) {
+                 llama_synchronize(ctx_tgt);
+             }
+         });

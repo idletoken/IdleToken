@@ -1,0 +1,132 @@
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -1069,7 +1069,7 @@
+     }
+ 
+     auto has_tools            = inputs.tools.is_array() && !inputs.tools.empty();
+-    auto has_response_format  = inputs.json_schema.is_object() && !inputs.json_schema.empty();
++    auto has_response_format  = inputs.json_schema.is_object();
+     auto extract_reasoning    = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+     auto include_grammar      = true;
+ 
+@@ -1194,7 +1194,7 @@
+     };
+ 
+     auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+-    auto has_response_format = inputs.json_schema.is_object() && !inputs.json_schema.empty();
++    auto has_response_format = inputs.json_schema.is_object();
+     auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+     auto include_grammar     = has_response_format || (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE);
+ 
+@@ -2605,7 +2605,7 @@
+     };
+ 
+     auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+-    auto has_response_format = inputs.json_schema.is_object() && !inputs.json_schema.empty();
++    auto has_response_format = inputs.json_schema.is_object();
+     auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+     auto include_grammar     = has_response_format || (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE);
+ 
+@@ -3203,7 +3203,7 @@
+     };
+ 
+     auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+-    auto has_response_format = inputs.json_schema.is_object() && !inputs.json_schema.empty();
++    auto has_response_format = inputs.json_schema.is_object();
+     auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+     auto include_grammar     = has_response_format || (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE);
+ 
+--- a/common/chat-auto-parser-generator.cpp
++++ b/common/chat-auto-parser-generator.cpp
+@@ -80,7 +80,7 @@
+     std::string trigger_marker = !autoparser.tools.format.section_start.empty() ? autoparser.tools.format.section_start :
+                                                                                   autoparser.tools.format.per_call_start;
+ 
+-    bool has_response_format = !inputs.json_schema.empty() && inputs.json_schema.is_object();
++    bool has_response_format = inputs.json_schema.is_object();
+     bool include_grammar = has_response_format || (has_tools &&
+             ((inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO && !trigger_marker.empty()) ||
+               inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED));
+@@ -133,7 +133,7 @@
+         auto parser = p.eps();
+ 
+         bool has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+-        bool has_response_format = inputs.json_schema.is_object() && !inputs.json_schema.empty();
++        bool has_response_format = inputs.json_schema.is_object();
+         bool pure_content        = reasoning.mode == reasoning_mode::NONE;
+ 
+         if (has_response_format) {
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -1165,7 +1165,8 @@
+         std::string response_type = json_value(response_format, "type", std::string());
+         if (response_type == "json_object") {
+             if (response_format.contains("schema") || json_schema.empty()) {
+-                json_schema = json_value(response_format, "schema", json::object());
++                // The default must constrain an object even without a caller schema.
++                json_schema = json_value(response_format, "schema", json{{"type", "object"}});
+             }
+         } else if (response_type == "json_schema") {
+             auto schema_wrapper = json_value(response_format, "json_schema", json::object());
+--- a/tests/test-chat.cpp
++++ b/tests/test-chat.cpp
+@@ -7154,6 +7154,39 @@
+     }
+ }
+ 
++static void test_empty_response_format_schema() {
++    // An explicit {} schema allows arbitrary JSON, not arbitrary text. Keep
++    // the specialized template paths and the differential autoparser aligned.
++    const char * paths[] = {
++        "models/templates/Qwen3.5-4B.jinja",
++        "models/templates/Qwen3-Coder.jinja",
++        "models/templates/Qwen-Qwen3-0.6B.jinja",
++        "models/templates/openbmb-MiniCPM5-1B.jinja",
++        "models/templates/mistralai-Ministral-3-14B-Reasoning-2512.jinja",
++        "models/templates/Cohere2MoE.jinja",
++    };
++    for (const auto * path : paths) {
++        auto templates = read_templates(path);
++        for (bool thinking : { false, true }) {
++            common_chat_templates_inputs inputs;
++            common_chat_msg message;
++            message.role = "user";
++            message.content = "Reply with the plain word PLAIN. Do not write JSON.";
++            inputs.messages = { message };
++            inputs.enable_thinking = thinking;
++            const auto plain = common_chat_templates_apply(templates.get(), inputs);
++            for (const auto * schema : { "{}", R"({"type":"object"})" }) {
++                inputs.json_schema = schema;
++                const auto constrained = common_chat_templates_apply(templates.get(), inputs);
++                if (constrained.grammar.empty() || constrained.grammar_lazy ||
++                    constrained.grammar == plain.grammar) {
++                    throw std::runtime_error(std::string("Response format was ignored: ") + path + " schema=" + schema);
++                }
++            }
++        }
++    }
++}
++
+ int main(int argc, char ** argv) {
+     bool detailed_debug    = false;
+     bool only_run_filtered = false;
+@@ -7161,6 +7194,11 @@
+     // Check for --template and --detailed flags
+     for (int i = 1; i < argc; i++) {
+         std::string arg = argv[i];
++        if (arg == "--empty-json-schema") {
++            test_empty_response_format_schema();
++            std::cout << "[chat] Empty JSON schema tests passed!" << '\n';
++            return 0;
++        }
+         if (arg == "--template" && i + 1 < argc) {
+             g_template_filter = argv[++i];
+             // Only run PEG parser tests with the filter
+@@ -7226,6 +7264,7 @@
+     } else
+ #endif
+     {
++        test_empty_response_format_schema();
+         test_msg_diffs_compute();
+         test_msgs_oaicompat_json_conversion();
+         test_msg_token_delimiters_split();

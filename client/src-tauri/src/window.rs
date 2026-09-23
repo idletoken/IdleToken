@@ -319,7 +319,9 @@ pub fn apply_startup(app: &AppHandle) {
     let prefs = load(app);
     app.state::<SysPrefs>().set(prefs.clone());
 
-    let Some(window) = main_window(app) else { return };
+    let Some(window) = main_window(app) else {
+        return;
+    };
 
     if prefs.remember_window {
         if let Some(g) = prefs.geometry {
@@ -353,7 +355,9 @@ pub fn remember_geometry(app: &AppHandle) {
     if !prefs.remember_window {
         return;
     }
-    let Some(window) = main_window(app) else { return };
+    let Some(window) = main_window(app) else {
+        return;
+    };
     // A minimized window reports a garbage position (-32000 on Windows); the
     // last good geometry is more useful than that.
     if window.is_minimized().unwrap_or(false) {
@@ -364,9 +368,24 @@ pub fn remember_geometry(app: &AppHandle) {
         // While maximized, keep the restore-size the user last chose rather
         // than the screen-filling one, so un-maximizing lands somewhere sane.
         let geometry = if maximized {
-            Geometry { maximized: true, ..prefs.geometry.unwrap_or(Geometry { x: pos.x, y: pos.y, width: size.width, height: size.height, maximized: true }) }
+            Geometry {
+                maximized: true,
+                ..prefs.geometry.unwrap_or(Geometry {
+                    x: pos.x,
+                    y: pos.y,
+                    width: size.width,
+                    height: size.height,
+                    maximized: true,
+                })
+            }
         } else {
-            Geometry { x: pos.x, y: pos.y, width: size.width, height: size.height, maximized: false }
+            Geometry {
+                x: pos.x,
+                y: pos.y,
+                width: size.width,
+                height: size.height,
+                maximized: false,
+            }
         };
         prefs.geometry = Some(geometry);
         state.set(prefs.clone());

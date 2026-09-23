@@ -138,6 +138,7 @@ pub fn tray_sync(app: AppHandle, labels: TrayLabels) -> Result<(), String> {
     };
     let menu = build_menu(&app, &labels).map_err(|e| e.to_string())?;
     tray.set_menu(Some(menu)).map_err(|e| e.to_string())?;
-    tray.set_tooltip(Some(&labels.status)).map_err(|e| e.to_string())?;
+    tray.set_tooltip(Some(&labels.status))
+        .map_err(|e| e.to_string())?;
     Ok(())
 }

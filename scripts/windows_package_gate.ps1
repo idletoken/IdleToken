@@ -70,7 +70,7 @@ try {
         $expected = Get-FileHash -LiteralPath "$RepoRoot\client\src-tauri\runtime\windows\$name" -Algorithm SHA256
         if ($actual.Hash -ne $expected.Hash) { throw "Packaged runtime differs from staging: $name" }
     }
-    foreach ($name in @('LICENSE.txt','NOTICE.txt','ds4-MIT.txt','rax-BSD-3-Clause.txt','llamacpp-MIT.txt','NVIDIA-CUDA-EULA.txt',
+    foreach ($name in @('LICENSE.txt','NOTICE.txt','ds4-MIT.txt','rax-BSD-3-Clause.txt','llamacpp-MIT.txt','curl.txt','NVIDIA-CUDA-EULA.txt',
         'gcc-14.2.0-GPL-3.0.txt','gcc-runtime-exception-3.1.txt','mingw-w64-runtime.txt','mingw-w64-headers.txt','winpthreads.txt')) {
         if ((Get-Item -LiteralPath "$app\licenses\$name").Length -eq 0) { throw "Missing license: $name" }
     }

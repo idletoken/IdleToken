@@ -10,8 +10,11 @@
 #include <string.h>
 #ifdef _WIN32
   #include <winsock2.h>
+  #include <windows.h>
 #else
   #include <unistd.h>
+  #include <sys/socket.h>
+  #include <time.h>
 #endif
 
 /* Winsock sockets are NOT CRT file descriptors, so read() on one fails with
@@ -22,11 +25,53 @@
 static ssize_t sock_read(int fd, void *buf, size_t n) {
 #ifdef _WIN32
     int r = recv((SOCKET)fd, (char *)buf, (int)n, 0);
-    if (r < 0) errno = ECONNRESET;   /* WSAGetLastError() is not in errno */
+    if (r < 0) errno = WSAGetLastError() == WSAETIMEDOUT ? ETIMEDOUT : ECONNRESET;
     return r;
 #else
-    return read(fd, buf, n);
+    ssize_t r = read(fd, buf, n);
+    if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) errno = ETIMEDOUT;
+    return r;
 #endif
+}
+
+static uint64_t http_monotonic_ms(void) {
+#ifdef _WIN32
+    return (uint64_t)GetTickCount64();
+#else
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
+#endif
+}
+
+void idletoken_http_finish_rejection(int fd, int wait_ms) {
+#ifdef _WIN32
+    shutdown((SOCKET)fd, SD_SEND);
+    if (wait_ms <= 0) {
+        u_long nonblocking = 1;
+        if (ioctlsocket((SOCKET)fd, FIONBIO, &nonblocking)) return;
+    }
+#else
+    shutdown(fd, SHUT_WR);
+#endif
+    uint64_t end = http_monotonic_ms() + (wait_ms > 0 ? (unsigned)wait_ms : 0);
+    size_t total = 0;
+    uint8_t discarded[8192];
+    while (total < (1u << 20)) {
+        if (wait_ms > 0) {
+            uint64_t now = http_monotonic_ms();
+            if (now >= end) break;
+            if (idletoken_set_recv_timeout(fd, (int)(end - now))) break;
+        }
+#ifdef _WIN32
+        ssize_t n = sock_read(fd, discarded, sizeof discarded);
+#else
+        ssize_t n = wait_ms > 0 ? sock_read(fd, discarded, sizeof discarded) :
+                    recv(fd, discarded, sizeof discarded, MSG_DONTWAIT);
+#endif
+        if (n <= 0) break;
+        total += (size_t)n;
+    }
 }
 
 void idletoken_http_path_strip_query(char *path) {
@@ -89,33 +134,181 @@ static ssize_t read_until_headers_end(int fd, uint8_t *buf, size_t cap,
     return -1;
 }
 
-/* Parse a Content-Length header value. Returns the length, or -1 if absent
- * or invalid. Case-insensitive header name match. */
-static long find_content_length(const char *head, size_t head_len) {
-    static const char want[] = "content-length:";
-    const size_t wlen = sizeof(want) - 1;
-    for (size_t i = 0; i + wlen <= head_len; i++) {
-        size_t j;
-        for (j = 0; j < wlen; j++) {
-            char c = head[i + j];
-            if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
-            if (c != want[j]) break;
-        }
-        if (j == wlen) {
-            /* Skip whitespace, parse digits. */
-            i += wlen;
-            while (i < head_len && (head[i] == ' ' || head[i] == '\t')) i++;
-            long v = 0;
-            int saw = 0;
-            while (i < head_len && head[i] >= '0' && head[i] <= '9') {
-                v = v * 10 + (head[i] - '0');
-                if (v > (long)IDLETOKEN_HTTP_BODY_CAP) return (long)IDLETOKEN_HTTP_BODY_CAP + 1;
-                i++; saw = 1;
-            }
-            return saw ? v : -1;
-        }
+static int http_equal(const char *text, size_t len, const char *expected) {
+    if (len != strlen(expected)) return 0;
+    for (size_t i = 0; i < len; i++)
+        if (tolower((unsigned char)text[i]) != (unsigned char)expected[i]) return 0;
+    return 1;
+}
+
+static int http_field_name(const char *text, size_t len) {
+    if (!len) return 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)text[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || strchr("!#$%&'*+-.^_`|~", c))) return 0;
+        if (!c) return 0;
     }
+    return 1;
+}
+
+/* RFC 9112 framing is a header-line property, never a substring search.
+ * Ambiguous lengths/encodings fail closed instead of parsing a partial prompt. */
+static int request_framing(const char *head, size_t len, long *length,
+                           int *chunked, int *expect_continue) {
+    *length = -1; *chunked = 0; *expect_continue = 0;
+    size_t pos = 0;
+    while (pos < len) {
+        size_t end = pos;
+        while (end + 1 < len && !(head[end] == '\r' && head[end+1] == '\n')) end++;
+        if (end + 1 >= len) goto invalid;
+        size_t colon = pos;
+        while (colon < end && head[colon] != ':') colon++;
+        if (colon == end || !http_field_name(head + pos, colon - pos)) goto invalid;
+        size_t start = colon + 1, finish = end;
+        while (start < finish && (head[start] == ' ' || head[start] == '\t')) start++;
+        while (finish > start && (head[finish-1] == ' ' || head[finish-1] == '\t')) finish--;
+        for (size_t i = start; i < finish; i++)
+            if (((unsigned char)head[i] < 32 && head[i] != '\t') || head[i] == 127) goto invalid;
+        if (http_equal(head + pos, colon - pos, "content-length")) {
+            if (*length >= 0 || start == finish) goto invalid;
+            long value = 0;
+            for (size_t i = start; i < finish; i++) {
+                if (head[i] < '0' || head[i] > '9') goto invalid;
+                value = value * 10 + (head[i] - '0');
+                if (value > (long)IDLETOKEN_HTTP_BODY_CAP) { errno = EMSGSIZE; return -1; }
+            }
+            *length = value;
+        } else if (http_equal(head + pos, colon - pos, "transfer-encoding")) {
+            if (*chunked || !http_equal(head + start, finish - start, "chunked")) goto invalid;
+            *chunked = 1;
+        } else if (http_equal(head + pos, colon - pos, "expect")) {
+            if (!http_equal(head + start, finish - start, "100-continue")) goto invalid;
+            *expect_continue = 1;
+        }
+        pos = end + 2;
+    }
+    if (*chunked && *length >= 0) goto invalid;
+    return 0;
+invalid:
+    errno = EPROTO;
     return -1;
+}
+
+int idletoken_http_bodyless_get_path(const uint8_t *head, size_t length,
+                                    char *path, size_t path_capacity) {
+    if (!head || length < 4 || memcmp(head, "GET ", 4) || !path || !path_capacity)
+        return 0;
+    size_t end = 4;
+    while (end < length && head[end] != ' ') end++;
+    if (end == length || end == 4 || end - 4 >= path_capacity) return 0;
+    size_t line = end;
+    while (line + 1 < length && !(head[line] == '\r' && head[line + 1] == '\n')) line++;
+    if (line + 3 >= length || head[length - 2] != '\r' || head[length - 1] != '\n')
+        return 0;
+    long content_length;
+    int chunked, expect_continue;
+    if (request_framing((const char *)head + line + 2, length - line - 4,
+                        &content_length, &chunked, &expect_continue) || chunked || content_length > 0)
+        return 0;
+    memcpy(path, head + 4, end - 4);
+    path[end - 4] = 0;
+    idletoken_http_path_strip_query(path);
+    return 1;
+}
+
+typedef struct {
+    int fd;
+    uint8_t *buffer;
+    size_t pos, end, capacity;
+} http_reader;
+
+static int http_read_exact(http_reader *reader, void *target, size_t count) {
+    uint8_t *out = target;
+    while (count) {
+        if (reader->pos == reader->end) {
+            ssize_t n = sock_read(reader->fd, reader->buffer, reader->capacity);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) { if (!n) errno = ECONNRESET; return -1; }
+            reader->pos = 0; reader->end = (size_t)n;
+        }
+        size_t take = reader->end - reader->pos;
+        if (take > count) take = count;
+        memcpy(out, reader->buffer + reader->pos, take);
+        reader->pos += take; out += take; count -= take;
+    }
+    return 0;
+}
+
+static int http_read_line(http_reader *reader, char *line, size_t capacity, size_t *length) {
+    size_t pos = 0;
+    while (pos + 1 < capacity) {
+        char c;
+        if (http_read_exact(reader, &c, 1)) return -1;
+        if (c == '\r') {
+            if (http_read_exact(reader, &c, 1)) return -1;
+            if (c != '\n') { errno = EPROTO; return -1; }
+            line[pos] = 0; *length = pos; return 0;
+        }
+        if (((unsigned char)c < 32 && c != '\t') || c == 127) { errno = EPROTO; return -1; }
+        line[pos++] = c;
+    }
+    errno = EMSGSIZE;
+    return -1;
+}
+
+static int http_read_chunked(http_reader *reader, idletoken_http_req *request) {
+    size_t allocated = 0, framing = 0;
+    for (;;) {
+        char line[4096]; size_t length;
+        if (http_read_line(reader, line, sizeof line, &length)) return -1;
+        framing += length + 4;
+        if (framing > IDLETOKEN_HTTP_BODY_CAP) { errno = EMSGSIZE; return -1; }
+        size_t size = 0, digits = 0;
+        while (digits < length && isxdigit((unsigned char)line[digits])) {
+            unsigned char c = (unsigned char)tolower((unsigned char)line[digits]);
+            unsigned value = c <= '9' ? c - '0' : c - 'a' + 10;
+            if (size > (IDLETOKEN_HTTP_BODY_CAP - value) / 16) { errno = EMSGSIZE; return -1; }
+            size = size * 16 + value; digits++;
+        }
+        if (!digits) { errno = EPROTO; return -1; }
+        while (digits < length && (line[digits] == ' ' || line[digits] == '\t')) digits++;
+        if (digits < length && line[digits] != ';') { errno = EPROTO; return -1; }
+        if (!size) {
+            size_t trailers = 0;
+            do {
+                if (http_read_line(reader, line, sizeof line, &length)) return -1;
+                trailers += length + 2;
+                if (trailers > IDLETOKEN_HTTP_HEADERS_CAP) { errno = EMSGSIZE; return -1; }
+                if (length) {
+                    char *colon = strchr(line, ':');
+                    if (!colon || !http_field_name(line, (size_t)(colon-line))) { errno = EPROTO; return -1; }
+                    /* Trailers cannot smuggle policy/framing headers past the
+                     * coordinator's admission and Origin checks. */
+                    const char *forbidden[] = { "origin", "authorization", "proxy-authorization", "host",
+                        "cookie", "content-length", "transfer-encoding", "expect" };
+                    for (size_t i = 0; i < sizeof forbidden / sizeof forbidden[0]; i++)
+                        if (http_equal(line, (size_t)(colon-line), forbidden[i])) { errno = EPROTO; return -1; }
+                    if ((size_t)(colon-line) >= 12 && http_equal(line, 12, "x-idletoken-")) { errno = EPROTO; return -1; }
+                }
+            } while (length);
+            return 0;
+        }
+        if (size > IDLETOKEN_HTTP_BODY_CAP - request->body_len) { errno = EMSGSIZE; return -1; }
+        size_t needed = request->body_len + size;
+        if (needed > allocated) {
+            size_t next = allocated ? allocated : 4096;
+            while (next < needed) next *= 2;
+            uint8_t *body = realloc(request->body, next);
+            if (!body) { errno = ENOMEM; return -1; }
+            request->body = body; allocated = next;
+        }
+        if (http_read_exact(reader, request->body + request->body_len, size)) return -1;
+        request->body_len += size;
+        char ending[2];
+        if (http_read_exact(reader, ending, 2)) return -1;
+        if (ending[0] != '\r' || ending[1] != '\n') { errno = EPROTO; return -1; }
+    }
 }
 
 int idletoken_http_read_request(int conn_fd, idletoken_http_req *out) {
@@ -160,53 +353,33 @@ int idletoken_http_read_request(int conn_fd, idletoken_http_req *out) {
     size_t hdr_end   = head_len - 2;  /* exclude the final CRLF before body */
     if (hdr_end < hdr_start) hdr_end = hdr_start;
 
-    /* Retain the raw header block so callers can query individual headers
-     * (e.g. Authorization for the coord's --api-token check). Truncation past
-     * the cap only loses headers nobody sends in practice. */
+    /* Policy headers must survive the same header budget as framing headers. */
     {
         size_t hlen = hdr_end - hdr_start;
-        if (hlen >= sizeof(out->headers)) hlen = sizeof(out->headers) - 1;
+        if (hlen >= sizeof(out->headers)) { free(buf); errno = EMSGSIZE; return -1; }
         memcpy(out->headers, buf + hdr_start, hlen);
         out->headers[hlen] = 0;
     }
 
-    long cl = find_content_length((const char *)(buf + hdr_start),
-                                  hdr_end - hdr_start);
-    if (cl > (long)IDLETOKEN_HTTP_BODY_CAP) {
-        free(buf); errno = EMSGSIZE; return -1;
+    long cl; int chunked, expect_continue;
+    if (request_framing((const char *)buf + hdr_start, hdr_end - hdr_start,
+                        &cl, &chunked, &expect_continue)) { free(buf); return -1; }
+    if (expect_continue && (chunked || cl > 0)) {
+        static const char interim[] = "HTTP/1.1 100 Continue\r\n\r\n";
+        if (idletoken_sendall(conn_fd, interim, sizeof interim - 1) < 0) { free(buf); return -1; }
     }
-
-    /* Body: some of it may already be in buf after head_len. */
-    size_t body_avail = (size_t)got - head_len;
-    size_t body_total = (cl < 0) ? body_avail : (size_t)cl;
-
-    if (body_total > 0) {
-        out->body = malloc(body_total);
+    http_reader reader = { conn_fd, buf, head_len, (size_t)got, head_cap };
+    int result = 0;
+    if (chunked) result = http_read_chunked(&reader, out);
+    else if (cl > 0) {
+        out->body = malloc((size_t)cl);
         if (!out->body) { free(buf); errno = ENOMEM; return -1; }
-        size_t copy = body_avail < body_total ? body_avail : body_total;
-        if (copy > 0) memcpy(out->body, buf + head_len, copy);
-        size_t pos = copy;
-        while (pos < body_total) {
-            ssize_t r = sock_read(conn_fd, out->body + pos, body_total - pos);
-            if (r < 0) {
-                if (errno == EINTR) continue;
-                free(buf); free(out->body); out->body = NULL;
-                return -1;
-            }
-            if (r == 0) {
-                free(buf); free(out->body); out->body = NULL;
-                errno = ECONNRESET; return -1;
-            }
-            pos += (size_t)r;
-        }
-        out->body_len = body_total;
+        result = http_read_exact(&reader, out->body, (size_t)cl);
+        if (!result) out->body_len = (size_t)cl;
     }
-    /* If Content-Length absent, body_total = body_avail (whatever arrived
-     * with the header burst). Every real client of these routes sends
-     * Content-Length; this branch only serves hand-typed probes. */
-
     free(buf);
-    return 0;
+    if (result) { free(out->body); out->body = NULL; out->body_len = 0; }
+    return result;
 }
 
 static const char *http_reason(int status) {
@@ -220,6 +393,7 @@ static const char *http_reason(int status) {
     case 403: return "Forbidden";
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
+    case 408: return "Request Timeout";
     case 413: return "Payload Too Large";
     case 429: return "Too Many Requests";
     case 500: return "Internal Server Error";

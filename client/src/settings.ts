@@ -924,12 +924,8 @@ export function engineTuning(
     // Overflow reaches the coordinator only when Request help is on AND a key
     // has been minted for it. Providing work is deliberately unrelated.
     //
-    // This stays the URL as the user configured it (usually https://). The
-    // coordinator has no TLS client, so the spawn layer translates it to the
-    // gateway's plaintext spelling (engine_platform_url in engine.rs) — the
-    // translation lives in Rust because both launch paths (coord overflow and
-    // the platform agent) pass through there, and a second copy here would be
-    // the kind that drifts.
+    // Keep the configured scheme, port and base path. Both the coordinator and
+    // the platform agent use the shared transport with verified HTTPS.
     overflowUrl: overflow.overflowUrl,
     overflowKey: overflow.overflowKey,
     overflowWaitS: overflow.overflowWaitS,

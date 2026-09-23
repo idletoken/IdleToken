@@ -52,6 +52,10 @@ IdleToken 想做的，就是把这些错开的峰谷连接起来：让闲置的�
 
 ## 🚀 两种开始方式
 
+> 📖 **第一次用？[手把手使用教程](docs/user-guide.zh-CN.md)配了截图，从头走一遍**——
+> 安装、注册、跑通第一个模型、多机组网、分享算力、接 Claude Code。
+> ([English](docs/user-guide.md))
+
 ### 🖥️ 部署并分享自己的模型
 
 1. [下载并安装客户端](https://github.com/idletoken/IdleToken/releases)。
@@ -157,9 +161,11 @@ opencode
 
 - Git、CMake、Node.js 18+、pnpm、Rust 1.77+
 - [Tauri v2 系统依赖](https://tauri.app/start/prerequisites/)
-- Linux：C 编译器与对应架构的 CUDA Toolkit
+- Linux：C 编译器、对应架构的 CUDA Toolkit、pkg-config、libcurl 开发包（7.68+，带 TLS 与异步 DNS）、GLib 2.72+、Duktape 2.7 和 CA 证书
 - macOS：Apple Silicon Mac 与 Xcode Command Line Tools
 - Windows：Visual Studio 2022 Build Tools（Desktop development with C++）、Windows SDK、CUDA Toolkit 12.8（含 Visual Studio Integration）以及提供 `gcc`、`windres` 的 WinLibs/MinGW
+
+桌面客户端的账户操作、平台 agent 与 coordinator overflow 共用同一套传输。公网 API 连接保留 HTTPS，并遵循机器的 HTTP/SOCKS 代理及 PAC 配置。Windows 构建会下载固定版本的静态 curl，使用 Windows 证书库；macOS 使用系统 libcurl。代理失败会明确报错，不会静默改为直连；本机推理绕过代理。Linux 安装包自带固定版本的私有 libproxy，不要求升级发行版的同名库。源码构建可用 `scripts/build_platform_proxy_linux.sh` 准备同一解析器；Debian/Ubuntu 构建依赖包括 `libcurl4-openssl-dev`、`libglib2.0-dev`、`duktape-dev`、`gsettings-desktop-schemas-dev`、`pkg-config`、`meson`、`ninja-build`、`patchelf`、`curl` 与 `ca-certificates`。原生代理解析放在有时间上限的子进程中，PAC 卡死不会永久占满调用端资源。设置环境变量 `CURL_CA_BUNDLE` 会覆盖所有平台连接使用的证书库；留空则使用系统证书库。
 
 ### 获取源码
 

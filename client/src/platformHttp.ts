@@ -58,6 +58,7 @@ export async function platformRequest(
       const { invoke } = await import("@tauri-apps/api/core");
       const r = await invoke<{ status: number; body: string }>("platform_http", {
         method,
+        timeoutMs: init?.timeoutMs ?? PLATFORM_TIMEOUT_MS,
         url,
         body: init?.body ?? null,
         bearer: init?.bearer ?? null,
@@ -65,7 +66,7 @@ export async function platformRequest(
       return { status: r.status, ok: r.status >= 200 && r.status < 300, text: r.body };
     } catch (e) {
       // The command's own Err — the request did not complete. Its message is
-      // reqwest's, which names the actual cause (dns error, connection refused,
+      // the transport's, which names the actual cause (dns error, connection refused,
       // certificate, timed out) instead of the browser's opaque TypeError.
       throw new PlatformNetworkError(e instanceof Error ? e.message : String(e));
     }

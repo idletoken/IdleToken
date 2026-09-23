@@ -373,6 +373,8 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
                                 const char *tools_json, size_t tools_len,
                                 const char *tool_choice_json,
                                 size_t tool_choice_len,
+                                /* -1 preserves the engine default; 0/1 is explicit. */
+                                int parallel_tool_calls,
                                 /* Optional `chat_template_kwargs` object from
                                  * the same request, verbatim. It carries the
                                  * consumer's thinking switch under the key the
@@ -387,6 +389,8 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
                                  * requests, and collapsing them would lose the
                                  * level. */
                                 const char *effort, size_t effort_len,
+                                /* Comma-prefixed fields from idletoken_sampling_fields. */
+                                const char *sampling_json, size_t sampling_len,
                                 const char *model, const char *quant,
                                 int max_tokens,
                                 int hops_in,

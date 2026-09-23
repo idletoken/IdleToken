@@ -137,6 +137,10 @@ cp -f "$ROOT/vendor/llama.cpp/LICENSE" "$LIC/llamacpp-MIT.txt" \
     || fail "could not stage the llama.cpp licence"
 echo "  staged licences -> $LIC"
 
+# The distro libproxy version is not the network contract; stage the pinned
+# resolver alongside the app and verify it from the final extracted package.
+scripts/build_platform_proxy_linux.sh || fail "private proxy resolver build failed"
+
 # --- stage the redistributable Linux CUDA runtime ---------------------------
 # A release package must run on a machine that has an NVIDIA driver but no
 # CUDA Toolkit. The build nodes both have complete toolkits, so merely running

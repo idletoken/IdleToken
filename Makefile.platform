@@ -1,9 +1,9 @@
 # IdleToken platform Agent — standalone build.
 #
 # Same philosophy as Makefile.privacy (which it deliberately does not touch):
-# the agent is pure portable C (vendored TweetNaCl + BLAKE2b, no external
-# deps), so it builds on macOS / Linux / Windows with just a C compiler —
-# no GPU, no CUDA, no cluster needed. It reuses the privacy/net/http common
+# the agent is portable C (vendored TweetNaCl + BLAKE2b, system libcurl on
+# Unix and pinned static Schannel curl on Windows). No GPU, CUDA or cluster
+# is needed. It reuses the privacy/net/http common
 # objects by compiling them from their unmodified sources.
 #
 #   make -f Makefile.platform          # build build/idletoken-platform-agent
@@ -16,6 +16,9 @@ CC       ?= cc
 CFLAGS   ?= -O2 -std=c99 -Wall -Wextra
 INCLUDES := -Iinclude -Ivendor/tweetnacl -Ivendor/blake2 -Ivendor/puff
 LDLIBS   :=
+include scripts/platform-http.mk
+CFLAGS += $(PLATFORM_HTTP_CFLAGS)
+LDLIBS += $(PLATFORM_HTTP_LIBS)
 
 # The agent spawns one thread per connection (see the concurrency section in
 # platform_agent.c). On macOS pthread lives in libc, and so it does on recent
@@ -28,7 +31,7 @@ endif
 
 # Windows needs bcrypt for BCryptGenRandom (randombytes in privacy.c).
 ifeq ($(OS),Windows_NT)
-  LDLIBS += -lbcrypt
+  LDLIBS += -lbcrypt -lwinhttp
 endif
 
 BUILD := build/platform
@@ -48,9 +51,11 @@ OBJS := $(BUILD)/tweetnacl.o \
         $(BUILD)/admission.o \
         $(BUILD)/deflate_wire.o \
         $(BUILD)/puff.o \
+        $(BUILD)/platform_http.o \
+        $(BUILD)/platform_proxy.o \
         $(BUILD)/platform_agent.o
 
-.PHONY: all clean
+.PHONY: all clean httpcheck
 all: $(BIN)
 
 $(BUILD):
@@ -105,11 +110,34 @@ $(BUILD)/puff.o: vendor/puff/puff.c vendor/puff/puff.h | $(BUILD)
 $(BUILD)/deflate_wire.o: src/common/deflate_wire.c include/idletoken_deflate_wire.h include/idletoken_privacy.h vendor/puff/puff.h | $(BUILD)
 	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
 
-$(BUILD)/platform_agent.o: src/tools/platform_agent.c include/idletoken_sodium_seal.h include/idletoken_privacy.h include/idletoken_net.h include/idletoken_http.h include/idletoken_b64.h include/idletoken_apiconv.h include/idletoken_admission.h include/idletoken_deflate_wire.h $(VERSION_HEADER) | $(BUILD)
+$(BUILD)/platform_http.o: src/common/platform_http.c include/idletoken_platform_http.h src/common/platform_proxy.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
+
+$(BUILD)/platform_proxy.o: src/common/platform_proxy.c include/idletoken_platform_http.h src/common/platform_proxy.h | $(BUILD)
+	$(CC) $(CFLAGS) -D_GNU_SOURCE $(INCLUDES) -c -o $@ $<
+
+$(BUILD)/platform_agent.o: src/tools/platform_agent.c include/idletoken_platform_http.h include/idletoken_sodium_seal.h include/idletoken_privacy.h include/idletoken_net.h include/idletoken_http.h include/idletoken_b64.h include/idletoken_apiconv.h include/idletoken_admission.h include/idletoken_deflate_wire.h $(VERSION_HEADER) | $(BUILD)
 	$(CC) $(CFLAGS) -D_GNU_SOURCE $(INCLUDES) -include $(VERSION_HEADER) -c -o $@ $<
 
 $(BIN): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+build/platform_http_probe: src/tools/platform_http_probe.c $(BUILD)/platform_http.o $(BUILD)/platform_proxy.o $(BUILD)/apiconv.o
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ $(LDLIBS)
+
+build/platform_proxy_probe: src/tools/platform_proxy_probe.c src/common/platform_proxy.c $(BUILD)/platform_http.o $(BUILD)/apiconv.o
+	$(CC) $(CFLAGS) -D_GNU_SOURCE $(INCLUDES) -o $@ src/tools/platform_proxy_probe.c $(BUILD)/platform_http.o $(BUILD)/apiconv.o $(LDLIBS)
+
+build/platform_proxy_stress: src/tools/platform_proxy_stress.c src/common/platform_proxy.c $(BUILD)/platform_http.o $(BUILD)/apiconv.o
+	$(CC) $(CFLAGS) -D_GNU_SOURCE $(INCLUDES) -o $@ src/tools/platform_proxy_stress.c $(BUILD)/platform_http.o $(BUILD)/apiconv.o $(LDLIBS)
+
+httpcheck: $(BIN) build/platform_http_probe build/platform_proxy_probe build/platform_proxy_stress
+	python3 scripts/platform_http_gate.py build/platform_http_probe
+	python3 scripts/platform_proxy_gate.py build/platform_proxy_probe
+	build/platform_proxy_stress
+	python3 scripts/platform_stdio_gate.py $(BIN)
+	python3 scripts/platform_http_behavior_gate.py $(BIN)
+	python3 scripts/agent_receipt_gate.py $(BIN)
 
 clean:
 	rm -rf $(BUILD) $(BIN)

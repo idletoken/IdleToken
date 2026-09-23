@@ -1,0 +1,129 @@
+diff --git a/common/common.cpp b/common/common.cpp
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1485,44 +1485,51 @@
+     }
+ 
+     if (params.warmup) {
+-        COM_TRC("%s", "warming up the model with an empty run - please wait ... (--no-warmup to disable)\n");
+-
+-        std::vector<llama_token> tmp;
+-        llama_token bos = llama_vocab_bos(vocab);
+-        llama_token eos = llama_vocab_eos(vocab);
+-
+-        // some models (e.g. T5) don't have a BOS token
+-        if (bos != LLAMA_TOKEN_NULL) {
+-            tmp.push_back(bos);
+-        }
+-        if (eos != LLAMA_TOKEN_NULL) {
+-            tmp.push_back(eos);
+-        }
+-        if (tmp.empty()) {
+-            tmp.push_back(0);
+-        }
+-
+-        if (llama_model_has_encoder(model)) {
+-            llama_encode(lctx, llama_batch_get_one(tmp.data(), tmp.size()));
+-            llama_token decoder_start_token_id = llama_model_decoder_start_token(model);
+-            if (decoder_start_token_id == LLAMA_TOKEN_NULL) {
+-                decoder_start_token_id = bos;
+-            }
+-            tmp.clear();
+-            tmp.push_back(decoder_start_token_id);
+-        }
+-        if (llama_model_has_decoder(model)) {
+-            llama_decode(lctx, llama_batch_get_one(tmp.data(), std::min(tmp.size(), (size_t) params.n_batch)));
+-        }
+-        llama_memory_clear(llama_get_memory(lctx), true);
+-        llama_synchronize(lctx);
+-        llama_perf_context_reset(lctx);
+-
+-        // reset samplers to reset RNG state after warmup to the seeded state
+-        res->reset_samplers();
++        res->warmup(params);
+     }
+ 
+     return res;
++}
++
++void common_init_result::warmup(const common_params & params) {
++    llama_model * model = this->model();
++    llama_context * lctx = context();
++    const llama_vocab * vocab = llama_model_get_vocab(model);
++    COM_TRC("%s", "warming up the model with an empty run - please wait ... (--no-warmup to disable)\n");
++
++    std::vector<llama_token> tmp;
++    llama_token bos = llama_vocab_bos(vocab);
++    llama_token eos = llama_vocab_eos(vocab);
++
++    // some models (e.g. T5) don't have a BOS token
++    if (bos != LLAMA_TOKEN_NULL) {
++        tmp.push_back(bos);
++    }
++    if (eos != LLAMA_TOKEN_NULL) {
++        tmp.push_back(eos);
++    }
++    if (tmp.empty()) {
++        tmp.push_back(0);
++    }
++
++    if (llama_model_has_encoder(model)) {
++        llama_encode(lctx, llama_batch_get_one(tmp.data(), tmp.size()));
++        llama_token decoder_start_token_id = llama_model_decoder_start_token(model);
++        if (decoder_start_token_id == LLAMA_TOKEN_NULL) {
++            decoder_start_token_id = bos;
++        }
++        tmp.clear();
++        tmp.push_back(decoder_start_token_id);
++    }
++    if (llama_model_has_decoder(model)) {
++        llama_decode(lctx, llama_batch_get_one(tmp.data(), std::min(tmp.size(), (size_t) params.n_batch)));
++    }
++    llama_memory_clear(llama_get_memory(lctx), true);
++    llama_synchronize(lctx);
++    llama_perf_context_reset(lctx);
++
++    // reset samplers to reset RNG state after warmup to the seeded state
++    reset_samplers();
+ }
+ 
+ common_init_result::~common_init_result() = default;
+diff --git a/common/common.h b/common/common.h
+--- a/common/common.h
++++ b/common/common.h
+@@ -917,6 +917,7 @@
+ 
+     common_sampler * sampler(llama_seq_id seq_id);
+     void reset_samplers();
++    void warmup(const common_params & params);
+ 
+     std::vector<llama_adapter_lora_ptr> & lora();
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1091,7 +1091,13 @@
+             params_base.load_progress_callback_user_data = &load_progress_text;
+         }
+ 
++        // Warmup enables the adaptive expert cache from currently free VRAM.
++        // Load and warm the vision tower first so its weights and workspace
++        // cannot consume memory already promised to that cache.
++        const bool text_warmup = params_base.warmup;
++        if (has_mmproj) params_base.warmup = false;
+         llama_init = common_init_from_params(params_base);
++        params_base.warmup = text_warmup;
+ 
+         model_tgt = llama_init->model();
+         ctx_tgt   = llama_init->context();
+@@ -1160,6 +1166,10 @@
+                 return false;
+             }
+             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
++            if (text_warmup) {
++                SRV_INF("%s", "warming text engine after vision allocations\n");
++                llama_init->warmup(params_base);
++            }
+ 
+             if (params_base.ctx_shift) {
+                 params_base.ctx_shift = false;

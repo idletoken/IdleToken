@@ -26,6 +26,13 @@ const char *idletoken_json_obj_get(const char *json, size_t len, const char *key
  * number, or literal), or -1 when unterminated. */
 long idletoken_json_value_len(const char *v, const char *end);
 
+/* Copy supported sampling, output-format and logit-bias controls as
+ * comma-prefixed JSON fields. Absent/null controls stay absent. Strings and
+ * schema objects retain their exact escaping and structure.
+ * Caller owns and wipes the result; NULL means invalid fields or allocation
+ * failure. Shared by sealed provider requests and local overflow requests. */
+char *idletoken_sampling_fields(const char *body, size_t len, size_t *out_len);
+
 /* Raw span (still escaped, quotes excluded) of `key` at the top level of
  * `json` when its value is a string. Returns 0, or -1 when absent or not a
  * string. */

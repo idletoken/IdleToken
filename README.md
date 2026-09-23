@@ -52,6 +52,10 @@ Join the IdleToken Discord to discuss using and developing the project.
 
 ## 🚀 Two ways to start
 
+> 📖 **New here? The [step-by-step guide](docs/user-guide.md) walks through the
+> whole path with screenshots** — install, account, your first model, clusters,
+> sharing, and connecting Claude Code. ([中文版](docs/user-guide.zh-CN.md))
+
 ### 🖥️ Deploy and share your own model
 
 1. [Download and install the client](https://github.com/idletoken/IdleToken/releases).
@@ -157,9 +161,11 @@ Our client lets you connect multiple devices into a cluster to deploy large lang
 
 - Git, CMake, Node.js 18+, pnpm, and Rust 1.77+
 - [Tauri v2 system prerequisites](https://tauri.app/start/prerequisites/)
-- Linux: a C compiler and the CUDA Toolkit for the target architecture
+- Linux: a C compiler, the CUDA Toolkit for the target architecture, pkg-config, libcurl development headers (7.68+ with TLS and asynchronous DNS), GLib 2.72+, Duktape 2.7, and CA certificates
 - macOS: an Apple Silicon Mac and Xcode Command Line Tools
 - Windows: Visual Studio 2022 Build Tools with Desktop development with C++, Windows SDK, CUDA Toolkit 12.8 with Visual Studio Integration, and WinLibs/MinGW providing `gcc` and `windres`
+
+Desktop account/control requests, the provider agent and coordinator overflow share one transport. Public API connections preserve HTTPS and use the machine's proxy policy, including HTTP/SOCKS proxies and PAC. Windows builds fetch a pinned static curl with the Windows certificate store; macOS uses system libcurl. Proxy failures are reported without silently switching to direct access. Loopback inference bypasses proxies. Linux installers bundle a pinned private libproxy instead of requiring the distribution to upgrade its copy. Source builds can stage the same resolver with `scripts/build_platform_proxy_linux.sh`; its Debian/Ubuntu build dependencies are `libcurl4-openssl-dev`, `libglib2.0-dev`, `duktape-dev`, `gsettings-desktop-schemas-dev`, `pkg-config`, `meson`, `ninja-build`, `patchelf`, `curl`, and `ca-certificates`. Native proxy discovery runs in bounded subprocesses so a stuck PAC resolver cannot permanently exhaust the caller. Setting `CURL_CA_BUNDLE` in the environment overrides the certificate store used for every platform connection; leave it unset to use the system store.
 
 ### Get the source
 

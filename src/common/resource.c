@@ -632,6 +632,20 @@ int idletoken_resource_probe(idletoken_resource_report *out, const char *gguf_di
                     "test harness.\n", fake_drv);
             snprintf(out->driver_version, sizeof(out->driver_version), "%s", fake_drv);
         }
+        const char *fake_vram = getenv("IDLETOKEN_FAKE_VRAM_GIB");
+        if (fake_vram && *fake_vram) {
+            char *end = NULL;
+            unsigned long gib = strtoul(fake_vram, &end, 10);
+            if (end != fake_vram && *end == '\0' && gib > 0 && gib <= 1024) {
+                fprintf(stderr,
+                        "*** TEST OVERRIDE *** IDLETOKEN_FAKE_VRAM_GIB=%s "
+                        "replaces the real total VRAM of this GPU. Never set "
+                        "this outside a test harness.\n", fake_vram);
+                out->vram_total = (uint64_t)gib * 1024ull * 1024ull * 1024ull;
+                if (out->vram_usable > out->vram_total)
+                    out->vram_usable = out->vram_total;
+            }
+        }
         /* G_MACSEAL needs an Apple-vendor report, and the only machines that
          * produce one are the ones the seal keeps out of the ladder. Forcing
          * the vendor byte lets the refusal be exercised on the CUDA nodes that

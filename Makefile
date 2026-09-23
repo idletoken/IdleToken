@@ -135,6 +135,8 @@ METAL_LDLIBS := -lm -pthread -framework Foundation -framework Metal
 
 WORKER_BUILD := build/worker
 COORD_BUILD  := build/coord
+include scripts/platform-http.mk
+CFLAGS_COORD += $(PLATFORM_HTTP_CFLAGS)
 
 # The platform verify-key pin (CFLAGS_COORD, above) is a compile-time input
 # that make cannot see. Set it on a tree whose build/coord is already warm and
@@ -236,7 +238,7 @@ COMMON_SRC_COORD    := $(COMMON_SRC_SHARED) src/common/http.c src/common/plan.c 
                        src/common/weights.c \
                        src/common/advise.c src/common/resource.c src/common/model_auto.c \
                        src/common/apiconv.c src/common/b64.c src/common/sodium_seal.c \
-                       src/common/admission.c
+                       src/common/admission.c src/common/platform_http.c src/common/platform_proxy.c
 WORKER_COMMON_OBJ   := $(patsubst src/common/%.c,$(WORKER_BUILD)/common/%.o,$(COMMON_SRC_WORKER))
 
 # ds4x generic CPU backend (small models: Qwen3 GQA, GLM/Kimi MLA). Pure C, no
@@ -299,7 +301,25 @@ else
 endif
 
 idletoken-coord: $(COORD_MAIN_OBJ) $(COORD_COMMON_OBJ) $(DS4X_COORD_OBJ) $(DS4_COORD_OBJ) $(PLATFORM_COORD_OBJ)
-	$(CC) $(CFLAGS_COORD) -o $@ $^ -lm -pthread $(COORD_PROBE_LDLIBS)
+	$(CC) $(CFLAGS_COORD) -o $@ $^ -lm -pthread $(COORD_PROBE_LDLIBS) $(PLATFORM_HTTP_LIBS)
+
+# The platform's billing tokenizer (`idletoken-coord --tokenizer-only`,
+# IDLETOKEN_TOKENIZER_URL points at it) counts metered text through the ds4
+# vocab BPE — `ds4_engine_open`, one of the symbols the default build stubs.
+# So a DEFAULT coord cannot serve --tokenizer-only, and for a while the only
+# working tokenizer binaries were pre-stub artifacts nobody could rebuild.
+# This target rebuilds a working one on demand: same `idletoken-coord` file,
+# linked against the real ds4 vocab tokenizer (CPU only; coord never uses the
+# ds4 GPU path). Verified on macOS 2026-09-21 — the ds4 tokenizer initialises
+# and reads vocab; it only opens a DeepSeek-family vocab shard (the production
+# shard is one). Migrating the vocab to llama.cpp is the long-term fix and a
+# separate decision (it would change billed token counts); until then this is
+# the reproducible build. See hard constraint #1 in CLAUDE.md.
+.PHONY: tokenizer-coord
+tokenizer-coord:
+	$(MAKE) IDLETOKEN_WITH_DS4=1 idletoken-coord
+	@echo "Built idletoken-coord with the real ds4 vocab tokenizer."
+	@echo "Serve it with: ./idletoken-coord --tokenizer-only --model-path <vocab-shard.gguf> --api-bind 0.0.0.0:8200"
 
 $(COORD_BUILD)/platform/mac_gpu.o: src/platform/mac/mac_gpu.m include/idletoken_mac_gpu.h | $(COORD_BUILD)/platform
 	$(CC) $(OBJCFLAGS) -c -o $@ $<

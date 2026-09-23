@@ -1,0 +1,16 @@
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1295,6 +1295,13 @@
+     }
+ #endif
+ 
++    // Version probes must work even when no GPU context can be created.
++    // Keep all other argument parsing and backend checks unchanged.
++    if (argc == 2 && strcmp(argv[1], "--version") == 0 && ex != LLAMA_EXAMPLE_DOWNLOAD) {
++        llama_print_build_info(llama_version());
++        exit(0);
++    }
++
+     auto ctx_arg = common_params_parser_init(params, ex, print_usage);
+     const common_params params_org = ctx_arg.params; // the example can modify the default params
+ 
