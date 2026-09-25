@@ -1,5 +1,5 @@
-/* IdleToken Cluster — resource probe (Linux NVML + Windows runtime nvml.dll
- * + macOS Metal/mach).
+/* IdleToken Cluster — resource probe (Linux/Windows runtime NVML + macOS
+ * Metal/mach).
  *
  * Numbers report what's *actually free for our worker*, after deducting what
  * the system and other processes already use. VRAM carries no margin on top of
@@ -25,6 +25,9 @@
   #include <sys/statvfs.h>
   #include <sys/utsname.h>
   #include <unistd.h>
+#if !defined(__APPLE__)
+  #include <dlfcn.h>
+#endif
 #endif
 
 #ifdef __APPLE__
@@ -35,14 +38,16 @@
 #endif
 
 /* GPU probe backends:
- *   - Linux: link NVML from the CUDA install (nvml.h + -lnvidia-ml, always
- *     present at /usr/local/cuda/include/nvml.h on the DGX Spark).
+ *   - Linux: compile against nvml.h, then load libnvidia-ml.so.1 from the
+ *     NVIDIA driver at runtime. This lets the same coordinator binary run its
+ *     explicit tokenizer-only mode on a CPU-only platform host.
  *   - Windows: load nvml.dll from the NVIDIA driver at *runtime* (see the
  *     _WIN32 probe_gpu below), so a driver-only machine with no CUDA toolkit
  *     can still report its GPU (driver-only one-click start, architecture.md §2). No nvml.h needed.
  *   - macOS: Metal via src/platform/mac/mac_gpu.m. No NVML equivalent exists
  *     and none is needed — see the Darwin probe_gpu below.
- * NVML ships with every NVIDIA driver, so neither path adds a toolkit dep. */
+ * NVML ships with every NVIDIA driver, so neither runtime path adds a toolkit
+ * dependency. Linux builds still need nvml.h at compile time. */
 #if !defined(_WIN32) && !defined(__APPLE__)
   #define IDLETOKEN_HAVE_NVML 1
   #include <nvml.h>
@@ -291,26 +296,97 @@ static int probe_gpu(idletoken_resource_report *r) {
     return 0;
 }
 #elif defined(IDLETOKEN_HAVE_NVML)
-static int probe_gpu(idletoken_resource_report *r) {
-    /* Test hook: pretend the driver is absent (G-HW gate) — same contract as
-     * the Windows path, where it short-circuits the nvml.dll load. */
+typedef nvmlReturn_t (*fn_linux_nvml_init)(void);
+typedef nvmlReturn_t (*fn_linux_nvml_shutdown)(void);
+typedef const char *(*fn_linux_nvml_error_string)(nvmlReturn_t);
+typedef nvmlReturn_t (*fn_linux_nvml_get_count)(unsigned int *);
+typedef nvmlReturn_t (*fn_linux_nvml_get_handle)(unsigned int, nvmlDevice_t *);
+typedef nvmlReturn_t (*fn_linux_nvml_get_name)(nvmlDevice_t, char *, unsigned int);
+typedef nvmlReturn_t (*fn_linux_nvml_get_cc)(nvmlDevice_t, int *, int *);
+typedef nvmlReturn_t (*fn_linux_nvml_get_driver)(char *, unsigned int);
+typedef nvmlReturn_t (*fn_linux_nvml_get_mem)(nvmlDevice_t, nvmlMemory_v2_t *);
+typedef nvmlReturn_t (*fn_linux_nvml_get_procs)(nvmlDevice_t, unsigned int *,
+                                                nvmlProcessInfo_t *);
+
+typedef struct {
+    void *library;
+    fn_linux_nvml_init init;
+    fn_linux_nvml_shutdown shutdown;
+    fn_linux_nvml_error_string error_string;
+    fn_linux_nvml_get_count get_count;
+    fn_linux_nvml_get_handle get_handle;
+    fn_linux_nvml_get_name get_name;
+    fn_linux_nvml_get_cc get_cc;
+    fn_linux_nvml_get_driver get_driver;
+    fn_linux_nvml_get_mem get_mem;
+    fn_linux_nvml_get_procs get_procs;
+} idletoken_nvml_api;
+
+static void linux_nvml_close(idletoken_nvml_api *api) {
+    if (api->library) dlclose(api->library);
+    memset(api, 0, sizeof(*api));
+}
+
+static int linux_nvml_load(idletoken_nvml_api *api) {
+    memset(api, 0, sizeof(*api));
     if (getenv("IDLETOKEN_FORCE_NO_NVML")) {
-        fprintf(stderr, "idletoken-probe: NVML unavailable — is the NVIDIA "
-                        "driver installed?\n");
+        fprintf(stderr, "idletoken-probe: *** TEST OVERRIDE ACTIVE *** "
+                        "NVML unavailable (forced by IDLETOKEN_FORCE_NO_NVML)\n");
         return -1;
     }
-    nvmlReturn_t st = nvmlInit_v2();
+
+    api->library = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!api->library) {
+        fprintf(stderr, "idletoken-probe: libnvidia-ml.so.1 not found — is the "
+                        "NVIDIA driver installed?\n");
+        return -1;
+    }
+
+    api->init = (fn_linux_nvml_init)(void *)dlsym(api->library, "nvmlInit_v2");
+    api->shutdown = (fn_linux_nvml_shutdown)(void *)dlsym(api->library, "nvmlShutdown");
+    api->error_string = (fn_linux_nvml_error_string)(void *)dlsym(api->library, "nvmlErrorString");
+    api->get_count = (fn_linux_nvml_get_count)(void *)dlsym(api->library, "nvmlDeviceGetCount_v2");
+    api->get_handle = (fn_linux_nvml_get_handle)(void *)dlsym(api->library, "nvmlDeviceGetHandleByIndex_v2");
+    api->get_name = (fn_linux_nvml_get_name)(void *)dlsym(api->library, "nvmlDeviceGetName");
+    api->get_cc = (fn_linux_nvml_get_cc)(void *)dlsym(api->library, "nvmlDeviceGetCudaComputeCapability");
+    api->get_driver = (fn_linux_nvml_get_driver)(void *)dlsym(api->library, "nvmlSystemGetDriverVersion");
+    api->get_mem = (fn_linux_nvml_get_mem)(void *)dlsym(api->library, "nvmlDeviceGetMemoryInfo_v2");
+    /* Process accounting improves used-by-others reporting, but old drivers
+     * may not export the v3 entry point. The total/free measurement remains
+     * authoritative, so this one symbol is deliberately optional. */
+    api->get_procs = (fn_linux_nvml_get_procs)(void *)dlsym(
+        api->library, "nvmlDeviceGetComputeRunningProcesses_v3");
+
+    if (!api->init || !api->shutdown || !api->error_string || !api->get_count ||
+        !api->get_handle || !api->get_name || !api->get_cc || !api->get_driver ||
+        !api->get_mem) {
+        fprintf(stderr, "idletoken-probe: libnvidia-ml.so.1 is missing expected "
+                        "symbols (driver too old?)\n");
+        linux_nvml_close(api);
+        return -1;
+    }
+    return 0;
+}
+
+static int probe_gpu(idletoken_resource_report *r) {
+    idletoken_nvml_api api;
+    if (linux_nvml_load(&api) != 0) return -1;
+
+    #define ESTR(s) api.error_string(s)
+    nvmlReturn_t st = api.init();
     if (st != NVML_SUCCESS) {
-        fprintf(stderr, "idletoken-probe: nvmlInit_v2 failed: %s\n", nvmlErrorString(st));
+        fprintf(stderr, "idletoken-probe: nvmlInit_v2 failed: %s\n", ESTR(st));
+        linux_nvml_close(&api);
         return -1;
     }
 
     unsigned int count = 0;
-    st = nvmlDeviceGetCount_v2(&count);
+    st = api.get_count(&count);
     if (st != NVML_SUCCESS || count == 0) {
         fprintf(stderr, "idletoken-probe: no NVIDIA GPU found (%s)\n",
-                st == NVML_SUCCESS ? "count=0" : nvmlErrorString(st));
-        nvmlShutdown();
+                st == NVML_SUCCESS ? "count=0" : ESTR(st));
+        api.shutdown();
+        linux_nvml_close(&api);
         return -1;
     }
     if (count > 1) {
@@ -319,11 +395,12 @@ static int probe_gpu(idletoken_resource_report *r) {
     }
 
     nvmlDevice_t dev;
-    st = nvmlDeviceGetHandleByIndex_v2(0, &dev);
+    st = api.get_handle(0, &dev);
     if (st != NVML_SUCCESS) {
         fprintf(stderr, "idletoken-probe: nvmlDeviceGetHandleByIndex_v2: %s\n",
-                nvmlErrorString(st));
-        nvmlShutdown();
+                ESTR(st));
+        api.shutdown();
+        linux_nvml_close(&api);
         return -1;
     }
 
@@ -331,12 +408,12 @@ static int probe_gpu(idletoken_resource_report *r) {
     r->gpu_vendor = IDLETOKEN_GPU_VENDOR_NVIDIA;
 
     char name[NVML_DEVICE_NAME_BUFFER_SIZE] = {0};
-    if (nvmlDeviceGetName(dev, name, sizeof(name)) == NVML_SUCCESS) {
+    if (api.get_name(dev, name, sizeof(name)) == NVML_SUCCESS) {
         snprintf(r->gpu_name, sizeof(r->gpu_name), "%s", name);
     }
 
     int major = 0, minor = 0;
-    if (nvmlDeviceGetCudaComputeCapability(dev, &major, &minor) == NVML_SUCCESS) {
+    if (api.get_cc(dev, &major, &minor) == NVML_SUCCESS) {
         r->cc_major = (uint8_t)major;
         r->cc_minor = (uint8_t)minor;
     }
@@ -345,7 +422,7 @@ static int probe_gpu(idletoken_resource_report *r) {
      * (see IDLETOKEN_MIN_DRIVER_*). */
     {
         char drv[80] = {0};
-        if (nvmlSystemGetDriverVersion(drv, (unsigned)sizeof(drv)) == NVML_SUCCESS)
+        if (api.get_driver(drv, (unsigned)sizeof(drv)) == NVML_SUCCESS)
             snprintf(r->driver_version, sizeof(r->driver_version), "%s", drv);
     }
 
@@ -360,7 +437,7 @@ static int probe_gpu(idletoken_resource_report *r) {
 
     nvmlMemory_v2_t mem;
     mem.version = nvmlMemory_v2;
-    st = nvmlDeviceGetMemoryInfo_v2(dev, &mem);
+    st = api.get_mem(dev, &mem);
     if (st == NVML_SUCCESS) {
         r->vram_total = mem.total;
         /* "used" reported by NVML is total - free, which includes our own
@@ -372,7 +449,7 @@ static int probe_gpu(idletoken_resource_report *r) {
         /* try to remove our own usage from "used_others" */
         unsigned int n_procs = 64;
         nvmlProcessInfo_t procs[64];
-        if (nvmlDeviceGetComputeRunningProcesses_v3(dev, &n_procs, procs) == NVML_SUCCESS) {
+        if (api.get_procs && api.get_procs(dev, &n_procs, procs) == NVML_SUCCESS) {
             for (unsigned int i = 0; i < n_procs; i++) {
                 if ((pid_t)procs[i].pid == self) {
                     if (used_others >= procs[i].usedGpuMemory) used_others -= procs[i].usedGpuMemory;
@@ -385,10 +462,12 @@ static int probe_gpu(idletoken_resource_report *r) {
          * `free`, and charge every inference cost once, on the need side. */
         r->vram_usable = mem.free;
     } else {
-        fprintf(stderr, "idletoken-probe: nvmlDeviceGetMemoryInfo_v2: %s\n", nvmlErrorString(st));
+        fprintf(stderr, "idletoken-probe: nvmlDeviceGetMemoryInfo_v2: %s\n", ESTR(st));
     }
 
-    nvmlShutdown();
+    api.shutdown();
+    linux_nvml_close(&api);
+    #undef ESTR
     return 0;
 }
 #else  /* neither Windows nor Linux/NVML — no known GPU probe backend */

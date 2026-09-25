@@ -125,11 +125,13 @@ OBJCFLAGS := -O3 -ffast-math $(NATIVE_CPU_FLAG) -Wall -Wextra -fobjc-arc \
 NVCCFLAGS := -O3 --use_fast_math \
              -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 
-# libnvidia-ml.so.1 ships with the NVIDIA driver and is usually in the linker
-# default path; CUDA_HOME/lib64 is a fallback for non-standard installs.
+# The CUDA worker links the redistributable runtime/BLAS libraries. NVML is a
+# driver library and resource.c loads libnvidia-ml.so.1 at runtime, just as the
+# Windows build loads nvml.dll. That keeps --tokenizer-only usable on a CPU-only
+# platform host without weakening the compute-node hardware check.
 CUDA_LDLIBS := -lm -Xcompiler -pthread \
                -L$(CUDA_HOME)/targets/sbsa-linux/lib \
-               -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lnvidia-ml
+               -L$(CUDA_HOME)/lib64 -lcudart -lcublas -ldl
 
 METAL_LDLIBS := -lm -pthread -framework Foundation -framework Metal
 
@@ -209,7 +211,7 @@ endif
 # above -- like tweetnacl it is crypto we need either way.
 DS4_COORD_OBJ  += $(COORD_BUILD)/vendor/blake2b.o
 
-# common (resource.c is worker-only — pulls in NVML; http.c is coord-only)
+# common (resource.c probes NVML at runtime on Linux; http.c is coord-only)
 # nodecrypt.c + privacy.c: token-id encryption on the coord<->worker link
 # (docs/inter-node-encryption.md). privacy.c owns the XSalsa20-Poly1305
 # primitive and was already used by the privacy proxy; nodecrypt.c adds the
@@ -230,7 +232,8 @@ COMMON_SRC_WORKER   := $(COMMON_SRC_SHARED) src/common/resource.c src/common/wei
 # resource.c + model_auto.c joined the coordinator for the llamacpp mode
 # (v2 WS-B2/B4): the coord now probes ITS OWN machine (single-machine fit
 # check + ctx sizing) and builds a runtime model spec from any GGUF header.
-# On Linux that pulls NVML into the coord link — see the idletoken-coord rule.
+# On Linux the probe loads the driver's NVML library only when it is called;
+# tokenizer-only mode therefore has no NVIDIA runtime dependency.
 # b64.c: the base64 the sealed envelope is spelled in. Shared with the platform
 # agent (Makefile.platform) so the side that seals and the side that opens
 # cannot drift.
@@ -290,36 +293,17 @@ else
 endif
 
 # The coord links the hardware probe since v2 WS-B2 (llamacpp-mode fit check):
-# NVML on Linux (ships with the driver), the Metal facts object on macOS.
+# runtime-loaded NVML on Linux, the Metal facts object on macOS.
 ifeq ($(IDLETOKEN_GPU),metal)
   PLATFORM_COORD_OBJ := $(COORD_BUILD)/platform/mac_gpu.o
   COORD_PROBE_LDLIBS := -framework Foundation -framework Metal
 else
   PLATFORM_COORD_OBJ :=
-  COORD_PROBE_LDLIBS := -L$(CUDA_HOME)/targets/sbsa-linux/lib \
-                        -L$(CUDA_HOME)/lib64 -lnvidia-ml
+  COORD_PROBE_LDLIBS := -ldl
 endif
 
 idletoken-coord: $(COORD_MAIN_OBJ) $(COORD_COMMON_OBJ) $(DS4X_COORD_OBJ) $(DS4_COORD_OBJ) $(PLATFORM_COORD_OBJ)
 	$(CC) $(CFLAGS_COORD) -o $@ $^ -lm -pthread $(COORD_PROBE_LDLIBS) $(PLATFORM_HTTP_LIBS)
-
-# The platform's billing tokenizer (`idletoken-coord --tokenizer-only`,
-# IDLETOKEN_TOKENIZER_URL points at it) counts metered text through the ds4
-# vocab BPE — `ds4_engine_open`, one of the symbols the default build stubs.
-# So a DEFAULT coord cannot serve --tokenizer-only, and for a while the only
-# working tokenizer binaries were pre-stub artifacts nobody could rebuild.
-# This target rebuilds a working one on demand: same `idletoken-coord` file,
-# linked against the real ds4 vocab tokenizer (CPU only; coord never uses the
-# ds4 GPU path). Verified on macOS 2026-09-21 — the ds4 tokenizer initialises
-# and reads vocab; it only opens a DeepSeek-family vocab shard (the production
-# shard is one). Migrating the vocab to llama.cpp is the long-term fix and a
-# separate decision (it would change billed token counts); until then this is
-# the reproducible build. See hard constraint #1 in CLAUDE.md.
-.PHONY: tokenizer-coord
-tokenizer-coord:
-	$(MAKE) IDLETOKEN_WITH_DS4=1 idletoken-coord
-	@echo "Built idletoken-coord with the real ds4 vocab tokenizer."
-	@echo "Serve it with: ./idletoken-coord --tokenizer-only --model-path <vocab-shard.gguf> --api-bind 0.0.0.0:8200"
 
 $(COORD_BUILD)/platform/mac_gpu.o: src/platform/mac/mac_gpu.m include/idletoken_mac_gpu.h | $(COORD_BUILD)/platform
 	$(CC) $(OBJCFLAGS) -c -o $@ $<

@@ -18,6 +18,9 @@
 #   scripts/build_llamacpp.sh              fetch + patch + build + verify
 #   scripts/build_llamacpp.sh --fetch-only clean checkout at the pinned SHA
 #                                          (for regenerating patches)
+# Env:
+#   IDLETOKEN_BUILD_JOBS                   optional positive parallel-job count;
+#                                          defaults to the machine CPU count
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -192,7 +195,7 @@ fi
 case "$(uname -s)" in
     Darwin)
         PLATFORM_FLAGS=(-DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON)
-        NPROC=$(sysctl -n hw.ncpu)
+        DEFAULT_NPROC=$(sysctl -n hw.ncpu)
         ;;
     Linux)
         # Non-interactive ssh sessions miss the login-shell PATH; find nvcc in
@@ -222,13 +225,22 @@ case "$(uname -s)" in
                 ;;
         esac
         PLATFORM_FLAGS+=(-DCMAKE_CUDA_ARCHITECTURES="${IDLETOKEN_CUDA_ARCHS:-$DEFAULT_CUDA_ARCHS}")
-        NPROC=$(nproc)
+        DEFAULT_NPROC=$(nproc)
         ;;
     *)
         echo "FATAL: unsupported platform $(uname -s) (Windows uses its own batch script)" >&2
         exit 1
         ;;
 esac
+
+NPROC=${IDLETOKEN_BUILD_JOBS:-$DEFAULT_NPROC}
+case "$NPROC" in
+    ''|*[!0-9]*|0)
+        echo "FATAL: IDLETOKEN_BUILD_JOBS must be a positive integer (got '$NPROC')" >&2
+        exit 1
+        ;;
+esac
+echo "== building with $NPROC parallel job(s)"
 
 cmake -S "$SRC_DIR" -B "$BUILD_DIR" "${COMMON_FLAGS[@]}" "${PLATFORM_FLAGS[@]}"
 cmake --build "$BUILD_DIR" -j "$NPROC" \

@@ -33,14 +33,15 @@ Anthropic 兼容 API。
 | 网络 | 多机运行时接入同一个局域网，建议使用千兆有线网络 |
 | 版本 | 同一集群里的每台机器安装相同版本的 IdleToken |
 
-AMD/Intel 显卡、纯 CPU 电脑和 Intel Mac 不能参与模型计算，但可以作为控制端。
-不符合计算要求的设备不会自动改用 CPU 推理。
+AMD/Intel 显卡、纯 CPU 电脑和 Intel Mac 不能作为计算节点加入集群。客户端仍可启动，
+但创建或加入集群需要受支持的计算硬件；不符合要求的设备不会自动改用 CPU 推理。
 
 ### 模型与上下文
 
 - 客户端提供经过适配的模型列表，不接受任意本地模型路径或 Hugging Face 地址。
-- 当前精选列表只包含文本生成模型，不支持图片输入。
-- 默认上下文严格为 256K；模型支持时可显式选择 1M。启动时不会静默缩短所选窗口。
+- 带有图片能力标识的模型可以接收图片；其他模型只接收文本。
+- 默认上下文严格为 128K；模型支持时还可显式选择 256K 或 1M。启动时不会静默改成
+  另一个档位。
 - “仅用本机”和“多台机器一起”两个入口都会显示。“多台机器一起”始终是默认主操作，
   界面不标注“推荐”。容量警告不会禁用任一入口；明确选择多机后也不会静默退回本机。
 - 资源卡是启动前的估算。最终能否运行以启动时的检查结果为准。
@@ -58,10 +59,9 @@ AMD/Intel 显卡、纯 CPU 电脑和 Intel Mac 不能参与模型计算，但可
 | Debian / Ubuntu arm64 | `IdleToken_<版本>_arm64.deb` |
 | RPM 系 Linux x86_64 | `IdleToken-<版本>-1.x86_64.rpm` |
 | RPM 系 Linux arm64 | `IdleToken-<版本>-1.aarch64.rpm` |
-| Arch Linux x86_64 | `idletoken-bin-<版本>-1-x86_64.pkg.tar.zst` |
 
-源码支持与 Release 安装包分开发送。如果当前 Release 页面尚未列出 Arch 文件，说明该版本
-还没有项目发布的 Arch 安装包；此时请按 README 的源码构建步骤操作。
+只有上表中的安装包属于官方发布目标。其他 Linux 发行版的用户可以基于开源代码自行适配，
+但项目不负责构建或支持这些安装包。
 
 ### Windows
 
@@ -81,7 +81,7 @@ AMD/Intel 显卡、纯 CPU 电脑和 Intel Mac 不能参与模型计算，但可
 1. 打开 `.dmg`，把 IdleToken 拖入“应用程序”。
 2. 首次启动时，右键 IdleToken 并选择 **打开**。若仍被拦截，前往
    **系统设置 → 隐私与安全性 → 仍要打开**。
-3. Apple Silicon Mac 可以参与计算；Intel Mac 只能作为控制端。
+3. Apple Silicon Mac 可以参与计算；Intel Mac 不能作为计算节点。
 
 ### Linux
 
@@ -95,26 +95,21 @@ sudo apt install ./IdleToken_<版本>_amd64.deb
 sudo apt install ./IdleToken_<版本>_arm64.deb
 ```
 
-Fedora / RHEL / openSUSE：
+Fedora 及兼容的 `dnf` 系发行版（glibc 下限见本节后文）：
 
 ```sh
 # x86_64
-sudo rpm -Uvh IdleToken-<版本>-1.x86_64.rpm
+sudo dnf install ./IdleToken-<版本>-1.x86_64.rpm
 
 # arm64
-sudo rpm -Uvh IdleToken-<版本>-1.aarch64.rpm
+sudo dnf install ./IdleToken-<版本>-1.aarch64.rpm
 ```
 
-Arch Linux（x86_64）：
-
-```sh
-sudo pacman -U ./idletoken-bin-<版本>-1-x86_64.pkg.tar.zst
-```
-
-Linux 安装包已经包含所需的 CUDA 用户态运行库，只需要兼容的 NVIDIA 驱动。安装包要求
-glibc 2.39 或更新版本；不满足时，包管理器会拒绝安装。Linux 发布流程支持 `.deb`、
-`.rpm`，以及仅支持 x86_64 的 Arch Linux `.pkg.tar.zst`；只有实际出现在对应 Release
-页面上的文件才已经发布。Arch Linux ARM 不属于正式发布目标；其他发行版需要从公开仓库构建。
+Linux 安装包已经包含所需的 CUDA 用户态运行库，只需要兼容的 NVIDIA 驱动。Release 页面
+已经发布的 v0.1.90 Linux 安装包要求 glibc 2.39；当前源码的下一次 Linux 构建以 glibc 2.35
+为目标，并会在包元数据中声明该下限。这个较低下限要等新安装包实际发布后才生效。官方 Linux
+发布流程只支持 `.deb` 和 `.rpm`；其他 RPM 发行版的依赖包名可能不同，不能假定 Fedora 包
+可以原样安装到 RHEL 或 openSUSE。
 
 IdleToken 没有应用内更新器。升级时下载新的原生安装包并覆盖安装。
 
@@ -131,7 +126,7 @@ IdleToken 没有应用内更新器。升级时下载新的原生安装包并覆�
 1. 打开 [idletoken.ai](https://idletoken.ai)，选择 **注册**。
 2. 输入邮箱和至少 8 位密码。
 
-   ![IdleToken 注册表单](images/guide/03-portal-register.png)
+   <img src="images/guide/03-portal-register.zh-CN.png" alt="IdleToken 注册表单" width="420">
 
 3. 打开 `no-reply@idletoken.ai` 发来的验证邮件，并在 24 小时内点击链接。
 4. 回到门户登录。
@@ -143,7 +138,7 @@ IdleToken 没有应用内更新器。升级时下载新的原生安装包并覆�
 
 在客户端点击账号入口，使用同一邮箱和密码登录。
 
-![IdleToken 客户端登录面板](images/guide/03-client-signin.png)
+<img src="images/guide/03-client-signin.zh-CN.png" alt="IdleToken 客户端登录面板" width="460">
 
 登录用于账号身份、自动组网和平台功能。私有集群的推理仍在你的机器与局域网中进行。
 
@@ -153,10 +148,11 @@ IdleToken 没有应用内更新器。升级时下载新的原生安装包并覆�
 
 1. 打开 **集群** 页面。
 2. 在“已选模型”一栏选择模型与精度。
-3. 保持默认的 256K 上下文；模型支持时也可选择 1M。1M 通常需要更多显存或统一内存。
+3. 保持默认的 128K 上下文；模型支持时也可选择 256K 或 1M。更大的窗口通常需要更多
+   显存或统一内存。
 4. 查看资源卡。
 
-![选中模型后的资源预估卡](images/guide/04-capacity.png)
+<img src="images/guide/04-capacity.zh-CN.png" alt="选中模型后的资源预估卡" width="620">
 
 - **可用**：客户端从当前机器或集群成员测得的可用资源。
 - **需要（预估）**：模型权重、所选上下文和运行时开销的合计。
@@ -164,8 +160,8 @@ IdleToken 没有应用内更新器。升级时下载新的原生安装包并覆�
 
 ### 下载模型文件
 
-若所选模型尚未准备好，点击 **下载权重**，等待下载和哈希校验完成。多机运行时，每台
-计算节点都需要模型文件的完整副本。
+若所选模型尚未准备好，点击 **下载权重**，等待下载和哈希校验完成。支持图片的模型还会
+下载视觉文件。多机运行时，每台计算节点都需要模型文件的完整副本。
 
 ### 选择本机或多机运行
 
@@ -180,9 +176,10 @@ IdleToken 没有应用内更新器。升级时下载新的原生安装包并覆�
 
 状态变为 **就绪** 后，打开 **聊天** 并发送消息。
 
-![文本聊天，思考栏默认折叠](images/guide/04-chat.png)
+<img src="images/guide/04-chat.zh-CN.png" alt="文本聊天，思考栏默认折叠" width="780">
 
-模型的思考内容显示在默认折叠的 **思考** 区域。当前精选列表与聊天输入框仅支持文本。
+模型的思考内容显示在默认折叠的 **思考** 区域。使用带图片能力标识的模型时，输入框旁会
+出现图片按钮，可添加 PNG、JPEG、WebP 或 GIF；若没有该按钮，当前模型只支持文本。
 
 ## 5. 组建局域网集群
 
@@ -220,7 +217,8 @@ flowchart LR
 4. 从创建方启动集群。
 
 启动时会检查成员版本、模型文件和资源。如果某台机器没有准备好，客户端会指出对应成员和
-原因。全部通过后，状态变为 **集群就绪**，页面显示本机 API 地址。
+原因。全部通过后，状态变为 **集群就绪**；协调者页面会显示本机 API 地址，该 API 仍只允许
+从协调者本机访问。
 
 局域网发现只用于找到机器；配对凭据不会通过广播公开。计算节点之间的 RPC 连接使用
 PSK-TLS 加密。
@@ -233,11 +231,11 @@ PSK-TLS 加密。
 2. 点击客户端右上角的 **打开分享**。
 3. 等按钮变为 **分享中**。
 
-   ![客户端里的分享算力开关](images/guide/06-share-toggle.png)
+   <img src="images/guide/06-share-toggle.zh-CN.png" alt="客户端里的分享算力开关" width="400">
 
 4. 登录门户，打开 **我的集群**，确认服务显示为在线，并按需要管理定价。
 
-   ![我的集群页面里已上架的服务](images/guide/06-my-clusters.png)
+   <img src="images/guide/06-my-clusters.zh-CN.png" alt="我的集群页面里已上架的服务" width="720">
 
 关闭分享后，平台不会再把新任务发给这项服务；已经开始执行的任务会继续完成。若分享按钮
 显示失败，打开错误详情或最近代理日志，按提示检查登录状态、客户端版本和网络。
@@ -285,7 +283,7 @@ curl http://127.0.0.1:8000/v1/messages \
 2. 点击右上角头像，打开 **火花 → API 密钥**。
 3. 点击 **新建密钥**，立即复制只显示一次的密钥。
 
-![门户里的 API 密钥管理](images/guide/07-api-keys.png)
+<img src="images/guide/07-api-keys.zh-CN.png" alt="门户里的 API 密钥管理" width="760">
 
 ```sh
 curl https://api.idletoken.ai/v1/chat/completions \
@@ -325,7 +323,7 @@ curl https://api.idletoken.ai/v1/chat/completions \
 
 ### 模型无法启动
 
-- 确认权重已经下载完成并通过校验。
+- 确认权重和视觉文件（如需要）都已下载并通过校验。
 - 根据资源卡和错误详情释放显存/内存，或选择更低精度；适用时可从 1M 改为 256K。
 - 多机运行时，检查错误中点名的成员是否在线且配置一致。
 
@@ -344,7 +342,7 @@ curl https://api.idletoken.ai/v1/chat/completions \
 先从终端启动一次：
 
 ```sh
-WEBKIT_DISABLE_DMABUF_RENDERER=1 idletoken
+WEBKIT_DISABLE_DMABUF_RENDERER=1 idletoken-client
 ```
 
 若界面恢复正常，把这个环境变量加入桌面启动器。

@@ -664,8 +664,9 @@ export function loadSettings(): AppSettings {
       merged.overflowEnabled =
         typeof legacyMarket.overflowEnabled === "boolean" ? legacyMarket.overflowEnabled : legacyOn;
     }
-    // v10 → v11: context became an explicit two-state product choice. Existing
-    // installs stay on the safe/default 256K service until the user checks 1M.
+    // v10 → v11: context was briefly an explicit two-state product choice.
+    // Existing installs stayed on that version's 256K default unless the user
+    // selected 1M.
     // v11 → v12: two windows became three and the default dropped to 128K
     // (docs/ctx-tiers-2026-09.md). The boolean is translated, not discarded: a
     // user who explicitly asked for 1M keeps 1M. Everyone else lands on the new

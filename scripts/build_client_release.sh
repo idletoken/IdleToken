@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Build the installable desktop client on a Linux compute node (.deb, .rpm,
-# and an x86_64 Arch Linux .pkg.tar.zst).
+# Build the installable desktop client on a Linux compute node (.deb and .rpm).
 #
 # The engine and the client are two processes (design philosophy 17), but the
 # *installer* has to carry both: Tauri ships the engine binaries as sidecars.
@@ -25,6 +24,29 @@ BUNDLE=1
 
 fail() { echo "CLIENT_RELEASE_FAIL: $1"; exit 1; }
 
+# Linux releases are native package-manager installers only. Validate this
+# before any compilation so a stale environment cannot spend an hour building
+# and then quietly resurrect AppImage, Arch, or updater artifacts.
+if [ "$BUNDLE" = 1 ]; then
+    DEFAULT_BUNDLES=deb,rpm
+    # Unset means the supported default. Explicitly empty is a configuration
+    # error and must not silently expand back to every package format.
+    BUNDLES="${IDLETOKEN_BUNDLES-$DEFAULT_BUNDLES}"
+    WANT_DEB=0
+    WANT_RPM=0
+    IFS=',' read -r -a REQUESTED_BUNDLES <<< "$BUNDLES"
+    [ "${#REQUESTED_BUNDLES[@]}" -gt 0 ] || fail "IDLETOKEN_BUNDLES is empty"
+    for bundle in "${REQUESTED_BUNDLES[@]}"; do
+        case "$bundle" in
+            deb) [ "$WANT_DEB" -eq 0 ] || fail "IDLETOKEN_BUNDLES contains duplicate deb"; WANT_DEB=1 ;;
+            rpm) [ "$WANT_RPM" -eq 0 ] || fail "IDLETOKEN_BUNDLES contains duplicate rpm"; WANT_RPM=1 ;;
+            *) fail "IDLETOKEN_BUNDLES accepts only deb and rpm (got '$bundle' in '$BUNDLES')" ;;
+        esac
+    done
+    [ "$WANT_DEB" -eq 1 ] || [ "$WANT_RPM" -eq 1 ] \
+        || fail "IDLETOKEN_BUNDLES selects no package"
+fi
+
 command -v cargo >/dev/null 2>&1 || fail "no cargo on PATH (need the Rust toolchain)"
 command -v pnpm  >/dev/null 2>&1 || fail "no pnpm on PATH (need node + pnpm for the frontend)"
 
@@ -48,10 +70,9 @@ echo "target triple: $TRIPLE"
 # -B on purpose: make cannot see that the flags changed, so without it a warm
 # tree keeps yesterday's native objects. Same reasoning as the verify-key pin
 # in the mac script, which shipped unpinned once for exactly this reason.
-# A caller that already chose a baseline wins: package_client_linux.sh sets one
-# per architecture before it ever gets here, and silently widening its choice
-# would be worse than doing nothing. The values below match that script's, so
-# the direct path and the driven path ship the same bytes.
+# A caller that deliberately chose a baseline still wins; silently widening its
+# choice would be worse than doing nothing. The normal direct and remote-driven
+# paths both use the architecture-specific portable defaults below.
 if [ -n "${NATIVE_CPU_FLAG:-}" ]; then
     PORTABLE_CPU=$NATIVE_CPU_FLAG
 else
@@ -62,6 +83,11 @@ else
     esac
 fi
 echo "  CPU baseline for our binaries: $PORTABLE_CPU"
+BUILD_JOBS=${IDLETOKEN_BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}
+case "$BUILD_JOBS" in
+    ''|*[!0-9]*|0) fail "IDLETOKEN_BUILD_JOBS must be a positive integer" ;;
+esac
+echo "  parallel build jobs: $BUILD_JOBS"
 # Pin the platform verify key here too. -B discards whatever the tree had, so a
 # rebuild that does not re-pin produces a coordinator that refuses to enable
 # sharing on every machine that installs it (overflow.c RULE 3). The gate below
@@ -72,9 +98,10 @@ if [ -z "${IDLETOKEN_PLATFORM_VERIFY_KEY_B64:-}" ] && [ -f scripts/platform-veri
     IDLETOKEN_PLATFORM_VERIFY_KEY_B64=$(cat scripts/platform-verify-key.b64)
 fi
 IDLETOKEN_PLATFORM_VERIFY_KEY_B64="${IDLETOKEN_PLATFORM_VERIFY_KEY_B64:-}" \
-make -B NATIVE_CPU_FLAG="$PORTABLE_CPU" coord worker >/dev/null \
+make -j "$BUILD_JOBS" -B NATIVE_CPU_FLAG="$PORTABLE_CPU" coord worker >/dev/null \
     || fail "make coord worker failed at $PORTABLE_CPU"
-make -f Makefile.platform >/dev/null || fail "make -f Makefile.platform failed"
+make -j "$BUILD_JOBS" -f Makefile.platform >/dev/null \
+    || fail "make -f Makefile.platform failed"
 # Ask the binaries, not the flags. A baseline that was passed but did not reach
 # the object file looks identical from here otherwise.
 if command -v objdump >/dev/null 2>&1; then
@@ -250,13 +277,25 @@ for pair in \
 done
 
 # NVIDIA lists the CUDA runtime and BLAS dynamic libraries as redistributable,
-# but the Toolkit terms must travel with them. Locate the EULA belonging to the
-# exact Toolkit tree that supplied libcudart; never copy a similarly named file
-# from whichever /usr/local/cuda symlink happens to be current.
+# but the Toolkit terms must travel with them. A runfile install keeps EULA.txt
+# in the Toolkit root; NVIDIA's Debian packages instead install the same full
+# terms as the owning package's /usr/share/doc/.../copyright file. In both cases
+# locate the terms from the exact libcudart selected above, never from whichever
+# /usr/local/cuda symlink happens to be current.
 CUDA_LIB_DIR=$(dirname "$(readlink -f "$CUDART_SRC")")
 CUDA_ROOT=$(cd "$CUDA_LIB_DIR/../../.." 2>/dev/null && pwd)
 CUDA_EULA="$CUDA_ROOT/EULA.txt"
-[ -f "$CUDA_EULA" ] || fail "CUDA EULA missing beside the selected runtime ($CUDA_EULA)"
+if [ ! -f "$CUDA_EULA" ] && command -v dpkg-query >/dev/null 2>&1; then
+    CUDART_REAL=$(readlink -f "$CUDART_SRC")
+    CUDART_OWNER=$(dpkg-query -S "$CUDART_REAL" 2>/dev/null | sed -n '1s/: \/.*$//p')
+    if [ -n "$CUDART_OWNER" ]; then
+        PACKAGE_EULA=$(dpkg-query -L "$CUDART_OWNER" 2>/dev/null \
+            | awk '/\/copyright$/ { print; exit }')
+        [ -n "$PACKAGE_EULA" ] && CUDA_EULA=$PACKAGE_EULA
+    fi
+fi
+[ -f "$CUDA_EULA" ] \
+    || fail "CUDA EULA missing for the selected runtime (checked Toolkit root and owning Debian package)"
 grep -q 'libcudart\.so' "$CUDA_EULA" \
     || fail "CUDA EULA does not identify libcudart.so as redistributable"
 grep -q 'libcublasLt\.so' "$CUDA_EULA" \
@@ -307,41 +346,11 @@ fi
 # `tauri build` runs beforeBuildCommand (pnpm build:release) itself — that is
 # what injects the production platform URL into the shipped frontend.
 #
-# Linux releases are native package-manager installers only. Keep this list
-# fail closed so a stale environment cannot quietly resurrect AppImage or an
-# updater artifact in a public release. Arch Linux itself supports x86_64; the
-# aarch64 release lane therefore remains deb/rpm only.
-case "$TRIPLE" in
-    x86_64-unknown-linux-gnu)  DEFAULT_BUNDLES=deb,rpm,arch ;;
-    aarch64-unknown-linux-gnu) DEFAULT_BUNDLES=deb,rpm ;;
-esac
-BUNDLES="${IDLETOKEN_BUNDLES:-$DEFAULT_BUNDLES}"
-WANT_DEB=0
-WANT_RPM=0
-WANT_ARCH=0
-IFS=',' read -r -a REQUESTED_BUNDLES <<< "$BUNDLES"
-[ "${#REQUESTED_BUNDLES[@]}" -gt 0 ] || fail "IDLETOKEN_BUNDLES is empty"
-for bundle in "${REQUESTED_BUNDLES[@]}"; do
-    case "$bundle" in
-        deb)  [ "$WANT_DEB" -eq 0 ] || fail "IDLETOKEN_BUNDLES contains duplicate deb";  WANT_DEB=1 ;;
-        rpm)  [ "$WANT_RPM" -eq 0 ] || fail "IDLETOKEN_BUNDLES contains duplicate rpm";  WANT_RPM=1 ;;
-        arch) [ "$WANT_ARCH" -eq 0 ] || fail "IDLETOKEN_BUNDLES contains duplicate arch"; WANT_ARCH=1 ;;
-        *) fail "IDLETOKEN_BUNDLES accepts only deb, rpm, and arch (got '$bundle' in '$BUNDLES')" ;;
-    esac
-done
-[ "$WANT_DEB" -eq 1 ] || [ "$WANT_RPM" -eq 1 ] || [ "$WANT_ARCH" -eq 1 ] \
-    || fail "IDLETOKEN_BUNDLES selects no package"
-if [ "$WANT_ARCH" -eq 1 ] && [ "$TRIPLE" != x86_64-unknown-linux-gnu ]; then
-    fail "Arch Linux release packages are x86_64 only (host target is $TRIPLE)"
-fi
-
-# Tauri does not have an ALPM bundler. The Arch package is produced from the
-# exact Debian payload, so request an internal deb even for an arch-only build.
 TAURI_BUNDLES=""
 append_tauri_bundle() {
     if [ -n "$TAURI_BUNDLES" ]; then TAURI_BUNDLES="$TAURI_BUNDLES,$1"; else TAURI_BUNDLES=$1; fi
 }
-if [ "$WANT_DEB" -eq 1 ] || [ "$WANT_ARCH" -eq 1 ]; then append_tauri_bundle deb; fi
+[ "$WANT_DEB" -eq 1 ] && append_tauri_bundle deb
 [ "$WANT_RPM" -eq 1 ] && append_tauri_bundle rpm
 # ⚠ not `| tail`: the pipe exit code is tail's, and a bundler that failed
 # AFTER producing the .deb sailed through as CLIENT_RELEASE_OK (hit 2026-08-15;
@@ -370,20 +379,11 @@ case "$TRIPLE" in
 esac
 CURRENT_DEB="$BDIR/deb/IdleToken_${CLIENT_VERSION}_${DEB_ARCH}.deb"
 CURRENT_RPM="$BDIR/rpm/IdleToken-${CLIENT_VERSION}-1.${RPM_ARCH}.rpm"
-CURRENT_ARCH="$BDIR/arch/idletoken-bin-${CLIENT_VERSION}-1-x86_64.pkg.tar.zst"
-
-if [ "$WANT_ARCH" -eq 1 ]; then
-    [ -f "$CURRENT_DEB" ] || fail "the Arch build has no current Debian payload at $CURRENT_DEB"
-    "$ROOT/scripts/build_arch_package.sh" "$ROOT/client/$CURRENT_DEB" "$ROOT/client/$BDIR/arch" \
-        || fail "Arch package build failed"
-    [ -f "$CURRENT_ARCH" ] || fail "Arch package builder reported success but $CURRENT_ARCH is missing"
-fi
 
 echo "--- artifacts ---"
 ARTIFACTS=()
 [ "$WANT_DEB" -eq 1 ] && ARTIFACTS+=("$CURRENT_DEB")
 [ "$WANT_RPM" -eq 1 ] && ARTIFACTS+=("$CURRENT_RPM")
-[ "$WANT_ARCH" -eq 1 ] && ARTIFACTS+=("$CURRENT_ARCH")
 for f in "${ARTIFACTS[@]}"; do
     [ -f "$f" ] || fail "requested package is missing: $f"
     printf '%s  %s  %s\n' "$(sha256sum "$f" | cut -c1-16)" "$(du -h "$f" | cut -f1)" "$ROOT/client/$f"

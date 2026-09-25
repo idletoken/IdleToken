@@ -1,0 +1,19 @@
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -441,7 +441,8 @@
+ 
+     json res = json {
+         {"choices",            json::array({choice})},
+         {"created",            t},
++        {"idletoken_stop_sequence", stopping_word.empty() ? nullptr : json(stopping_word)},
+         {"model",              oaicompat_model},
+         {"system_fingerprint", std::string(llama_build_info())},
+         {"object",             "chat.completion"},
+@@ -496,6 +497,7 @@
+         })},
+         {"created",            t},
+         {"id",                 oaicompat_cmpl_id},
++        {"idletoken_stop_sequence", stopping_word.empty() ? nullptr : json(stopping_word)},
+         {"model",              oaicompat_model},
+         {"system_fingerprint", std::string(llama_build_info())},
+         {"object",             "chat.completion.chunk"},

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Install an IdleToken .pkg.tar.zst in a clean official Arch Linux userspace,
-# validate ALPM ownership and runtime linkage, smoke the desktop shell under
-# Xvfb, then uninstall it and prove the product files are gone.
+# Validate an unsupported experimental IdleToken .pkg.tar.zst in a clean
+# official Arch Linux userspace. This helper is retained for community
+# adaptation; passing it does not make Arch an official support or release
+# target. It checks ALPM ownership and runtime linkage, smokes the desktop shell
+# under Xvfb, then uninstalls it and proves the product files are gone.
 #
 # Usage: scripts/arch_package_gate.sh <idletoken-bin-VERSION-1-x86_64.pkg.tar.zst>
 # Set IDLETOKEN_ARCH_GATE_MIRROR to an HTTPS Arch mirror base when the

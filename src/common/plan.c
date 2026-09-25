@@ -645,7 +645,7 @@ const char *idletoken_llama_kv_type_for_weight(int weight_bits) {
 }
 
 /* Display rounding is retained for diagnostics. Product starts use the exact
- * selected 256K or 1M context and never call this as an automatic ladder. */
+ * selected 128K, 256K, or 1M context and never call this as an automatic ladder. */
 uint32_t idletoken_llama_ctx_display_tier(uint32_t max_ctx) {
     static const uint32_t tiers[] = {
         16384, 32768, 65536, 131072, 262144, 524288, 1048576,

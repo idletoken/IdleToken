@@ -97,7 +97,8 @@ npx @deepseek-ai/dsh web
 ```
 
 The Web UI opens at `http://127.0.0.1:3080`; pick the model under the
-`idletoken` provider. IdleToken's current catalog is text-only.
+`idletoken` provider. A model added by hand is treated as text-only, so give a
+vision model `input: [text, image]` next to its `id`.
 
 ### Connect OpenCode
 
@@ -142,7 +143,7 @@ Minimum requirements for deploying a model on your own machine:
 
 | Platform | Minimum requirements |
 | --- | --- |
-| **Windows 10/11 · Linux x86_64/arm64** | An NVIDIA GPU from the RTX 20 series or newer (Turing, compute capability 7.5) with 8 GB of VRAM, and a current NVIDIA driver. |
+| **Windows 10/11 · Linux x86_64/arm64** | An NVIDIA GPU from the RTX 20 series or newer (Turing, compute capability 7.5) with 8 GB of VRAM, and a current NVIDIA driver. The published v0.1.90 Linux binaries require glibc 2.39; builds from the current source target and declare glibc 2.35. |
 | **macOS** | An Apple Silicon Mac with 16 GB of unified memory. |
 
 ## 🖧 Cluster deployment
@@ -185,8 +186,8 @@ make -f Makefile.platform
 ```
 
 Installers are written below `client/src-tauri/target/release/bundle/deb/` and
-`client/src-tauri/target/release/bundle/rpm/`. On x86_64, the same command also
-writes an Arch Linux package below `client/src-tauri/target/release/bundle/arch/`.
+`client/src-tauri/target/release/bundle/rpm/`. Other Linux distributions can
+adapt the open-source build, but their packages are not official release assets.
 
 ### macOS
 

@@ -20,9 +20,11 @@
  * READY therefore requires GET /health to return 200 with the exact body
  * {"status":"ok"}.
  *
- * The child never listens anywhere the LAN can reach: the coordinator's own
- * api_token gate must remain the only gate. Local use binds `--host 127.0.0.1`;
- * shared mode binds a Unix socket instead (see `engine_sock` below).
+ * The child never listens anywhere the LAN can reach. The coordinator is the
+ * only HTTP policy boundary: it binds loopback, rejects browser Origin requests
+ * and additionally enforces api_token when the user configured one. Local use
+ * binds the engine at `--host 127.0.0.1`; shared mode binds a Unix socket
+ * instead (see `engine_sock` below).
  *
  * Windows uses CreateProcess plus a kill-on-close Job object; POSIX uses
  * fork/exec and parent-death handling where the platform provides it.

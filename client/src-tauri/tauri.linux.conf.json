@@ -10,7 +10,7 @@
           "librsvg2-2",
           "libcurl4 (>= 7.68) | libcurl4t64 (>= 7.68)",
           "ca-certificates",
-          "libc6 (>= 2.39)",
+          "libc6 (>= 2.35)",
           "libglib2.0-0 (>= 2.72) | libglib2.0-0t64 (>= 2.72)",
           "libduktape207 (>= 2.7)",
           "gsettings-desktop-schemas"
@@ -29,7 +29,7 @@
           "librsvg2",
           "libcurl >= 7.68",
           "ca-certificates",
-          "glibc >= 2.39",
+          "glibc >= 2.35",
           "glib2 >= 2.72",
           "duktape >= 2.7",
           "gsettings-desktop-schemas"

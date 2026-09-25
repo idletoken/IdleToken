@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Build a native Arch Linux package from the already verified x86_64 Debian
-# payload. The conversion deliberately preserves every payload byte: Arch and
-# Debian users receive the same client, sidecars, CUDA runtime, digests, desktop
-# entry, icons, and licence set.
+# Unsupported packaging experiment: build an Arch Linux package from an
+# already verified x86_64 Debian payload. This helper is retained for community
+# adaptation, but is not called by the official release build, does not produce
+# a supported release asset, and carries no project support commitment. The
+# conversion deliberately preserves every payload byte.
 #
 # Usage: scripts/build_arch_package.sh <IdleToken_VERSION_amd64.deb> [output-dir]
 #
@@ -60,7 +61,7 @@ DEB_ARCH=$(control_value Architecture)
 [ "$DEB_PACKAGE" = "idle-token" ] \
     || fail "expected Debian package idle-token, got '${DEB_PACKAGE:-missing}'"
 [ "$DEB_ARCH" = "amd64" ] \
-    || fail "Arch Linux release packages are x86_64 only; Debian payload is '${DEB_ARCH:-missing}'"
+    || fail "experimental Arch packaging accepts x86_64 only; Debian payload is '${DEB_ARCH:-missing}'"
 case "$VERSION" in
     ''|*[!0-9A-Za-z.+_]*) fail "Debian version '$VERSION' is not a safe Arch pkgver" ;;
 esac
@@ -91,7 +92,7 @@ sed \
     || fail "could not render PKGBUILD"
 
 BUILDER=${IDLETOKEN_ARCH_BUILDER:-auto}
-ARCH_PACKAGER=${IDLETOKEN_ARCH_PACKAGER:-IdleToken Release Engineering <support@idletoken.ai>}
+ARCH_PACKAGER=${IDLETOKEN_ARCH_PACKAGER:-IdleToken Packaging Experiment <support@idletoken.ai>}
 if [ "$BUILDER" = auto ]; then
     if command -v makepkg >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ]; then
         BUILDER=native
@@ -116,8 +117,8 @@ case "$BUILDER" in
     docker|podman)
         command -v "$BUILDER" >/dev/null 2>&1 \
             || fail "IDLETOKEN_ARCH_BUILDER=$BUILDER but $BUILDER is unavailable"
-        # Pinned consciously: changing the Arch build image is a release-toolchain
-        # update and must not ride along with an unrelated client release.
+        # Pinned consciously: changing the Arch build image changes the
+        # experiment's toolchain and must be reviewed independently.
         ARCH_IMAGE=${IDLETOKEN_ARCH_IMAGE:-docker.io/library/archlinux@sha256:8745817f349ed24373341ddb92776209eeec3f0364ea48f7f645ac5800d30a50}
         container_args=(run --rm --platform linux/amd64
             -e "HOST_UID=$(id -u)"
@@ -129,7 +130,7 @@ case "$BUILDER" in
             -w /work)
         if [ "$(uname -m)" != x86_64 ]; then
             # QEMU user-mode emulation needs these syscalls. Native x86_64
-            # release builders keep the container's default seccomp profile.
+            # Keep the container's default seccomp profile.
             container_args+=(--security-opt seccomp=unconfined)
         fi
         "$BUILDER" "${container_args[@]}" "$ARCH_IMAGE" bash -lc \
@@ -160,7 +161,7 @@ for required in \
     "arch = x86_64" \
     "xdata = pkgtype=pkg" \
     "depend = dbus" \
-    "depend = glibc>=2.39" \
+    "depend = glibc>=2.35" \
     "depend = hicolor-icon-theme" \
     "depend = webkit2gtk-4.1"; do
     printf '%s\n' "$PKGINFO" | grep -Fxq "$required" \

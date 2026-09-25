@@ -14,7 +14,7 @@
 //              not render the entry at all rather than show a dead control.
 import { loadSettings } from "./settings";
 
-/** The public repository. Same host the updater's release feed comes from. */
+/** The public repository and the canonical origin for installer releases. */
 export const REPO_URL = "https://github.com/idletoken/IdleToken";
 /** Where a missing model, a bad download source or any other defect goes. */
 export const ISSUES_URL = `${REPO_URL}/issues`;

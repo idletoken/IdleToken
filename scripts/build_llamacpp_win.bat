@@ -43,6 +43,8 @@ REM                                     dependencies off the system drive.
 REM         IDLETOKEN_CUDA_ARCHS        CUDA archs    (default covers every CUDA
 REM                                     12.8 architecture at or above the product
 REM                                     floor, with forward PTX on compute_120)
+REM         IDLETOKEN_BUILD_JOBS        outer CMake/MSBuild parallelism (default 5)
+REM         IDLETOKEN_NVCC_THREADS       per-NVCC architecture parallelism (default 4)
 REM         IDLETOKEN_LLAMACPP_GIT_URL  mirror URL tried when the UPSTREAM url fails
 REM         IDLETOKEN_MBEDTLS_SRC       local mbedTLS v3.6.7 source tree for the TLS
 REM                                     transport patch (default <repo>\tools\mbedtls
@@ -57,6 +59,18 @@ if defined IDLETOKEN_LLAMACPP_SRC (set "SRC_DIR=%IDLETOKEN_LLAMACPP_SRC%") else 
 set "BUILD_DIR=%SRC_DIR%\build"
 if not defined IDLETOKEN_CUDA_VER set "IDLETOKEN_CUDA_VER=12.8"
 if not defined IDLETOKEN_CUDA_ARCHS set "IDLETOKEN_CUDA_ARCHS=75-real;80-real;86-real;87-real;89-real;90-real;100-real;101-real;120"
+if not defined IDLETOKEN_BUILD_JOBS set "IDLETOKEN_BUILD_JOBS=5"
+if not defined IDLETOKEN_NVCC_THREADS set "IDLETOKEN_NVCC_THREADS=4"
+echo(%IDLETOKEN_BUILD_JOBS%| findstr /r "^[1-9][0-9]*$" >nul
+if errorlevel 1 (
+    echo FATAL: IDLETOKEN_BUILD_JOBS must be a positive integer ^(got "%IDLETOKEN_BUILD_JOBS%"^)
+    exit /b 1
+)
+echo(%IDLETOKEN_NVCC_THREADS%| findstr /r "^[1-9][0-9]*$" >nul
+if errorlevel 1 (
+    echo FATAL: IDLETOKEN_NVCC_THREADS must be a positive integer ^(got "%IDLETOKEN_NVCC_THREADS%"^)
+    exit /b 1
+)
 
 REM --- pin ---------------------------------------------------------------------
 set "REPO_URL="
@@ -278,10 +292,11 @@ REM                                         offset from the Windows event log ca
 REM                                         named without a debugger on the machine
 REM   CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded   /MT -- no VC redist needed on
 REM                                         a machine with only the NVIDIA driver
-echo == configuring ^(MSVC + CUDA %IDLETOKEN_CUDA_VER%, archs %IDLETOKEN_CUDA_ARCHS%^)
+echo == configuring ^(MSVC + CUDA %IDLETOKEN_CUDA_VER%, archs %IDLETOKEN_CUDA_ARCHS%, outer jobs %IDLETOKEN_BUILD_JOBS%, NVCC threads %IDLETOKEN_NVCC_THREADS%^)
 "%CMAKE%" -S "%SRC_DIR%" -B "%BUILD_DIR%" -G "Visual Studio 17 2022" -A x64 -T "%CUDA_TOOLSET%" ^
     -DGGML_CUDA=ON ^
     "-DCMAKE_CUDA_ARCHITECTURES=%IDLETOKEN_CUDA_ARCHS%" ^
+    "-DCMAKE_CUDA_FLAGS=--threads=%IDLETOKEN_NVCC_THREADS%" ^
     -DLLAMA_BUILD_NUMBER=%PIN_BUILD% ^
     -DLLAMA_BUILD_COMMIT=%PIN7% ^
     -DGGML_RPC=ON ^
@@ -309,7 +324,7 @@ if errorlevel 1 (
 )
 
 echo == building ^(this takes 30-60+ min for the CUDA kernels^)
-"%CMAKE%" --build "%BUILD_DIR%" --config Release -j %NUMBER_OF_PROCESSORS% ^
+"%CMAKE%" --build "%BUILD_DIR%" --config Release -j %IDLETOKEN_BUILD_JOBS% ^
     --target llama-server ggml-rpc-server
 if errorlevel 1 (
     echo FATAL: build failed
@@ -375,6 +390,7 @@ echo cmake-arg -DLLAMA_BUILD_EXAMPLES=OFF>> "%BUILD_DIR%\IDLETOKEN_ENGINE_STAMP"
 echo cmake-arg -DLLAMA_BUILD_TOOLS=ON>> "%BUILD_DIR%\IDLETOKEN_ENGINE_STAMP"
 echo cmake-arg -DGGML_CUDA=ON>> "%BUILD_DIR%\IDLETOKEN_ENGINE_STAMP"
 echo cmake-arg -DCMAKE_CUDA_ARCHITECTURES=%IDLETOKEN_CUDA_ARCHS%>> "%BUILD_DIR%\IDLETOKEN_ENGINE_STAMP"
+echo cmake-arg -DCMAKE_CUDA_FLAGS=--threads=%IDLETOKEN_NVCC_THREADS%>> "%BUILD_DIR%\IDLETOKEN_ENGINE_STAMP"
 echo cmake-arg -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded>> "%BUILD_DIR%\IDLETOKEN_ENGINE_STAMP"
 echo cmake-arg -DCMAKE_EXE_LINKER_FLAGS=/MAP>> "%BUILD_DIR%\IDLETOKEN_ENGINE_STAMP"
 for /f "delims=" %%P in ('dir /b /a-d /on "%PATCH_DIR%\*.patch" 2^>nul') do (

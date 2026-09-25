@@ -4,7 +4,7 @@
  * should I pick", it is "can my computer run any of this at all". This module
  * answers it: given the memory of one machine (or of a whole cluster), it walks
  * every registered model × every shipped precision and reports whether exact
- * 256K and 1M services fit. Discrete CUDA machines may report MoE Hybrid,
+ * 128K, 256K, and 1M services fit. Discrete CUDA machines may report MoE Hybrid,
  * including a cluster candidate whose exact per-owner-node placement is
  * verified later from the selected GGUF; dense models remain GPU-only-or-refuse.
  *

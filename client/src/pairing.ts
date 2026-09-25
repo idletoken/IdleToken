@@ -461,7 +461,9 @@ class DevSimPairing implements PairingProvider {
         // Loopback, like the real thing: the inference API is coordinator-local
         // (2026-08-15), so a LAN address here was both a stale claim and a real
         // internal address in a shipped bundle.
-        this.state.api = { baseUrl: "http://127.0.0.1:8000", status: "online" };
+        this.state.api = this.state.isCreator
+          ? { baseUrl: "http://127.0.0.1:8000", status: "online" }
+          : null;
         this.emit();
       }, 2600)
     );

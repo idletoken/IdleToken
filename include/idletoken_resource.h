@@ -8,9 +8,9 @@
  * overhead is charged once, by the scheduler, on the need side. RAM still keeps
  * a safety floor — it backs the OS itself, which VRAM does not.
  *
- * GPU via NVML (Linux: linked nvml.h; Windows: nvml.dll loaded from the
- * driver at runtime). RAM via /proc/meminfo (Linux) or GlobalMemoryStatusEx
- * (Windows). */
+ * GPU via NVML (Linux: libnvidia-ml.so.1 loaded from the driver at runtime;
+ * Windows: nvml.dll loaded the same way). RAM via /proc/meminfo (Linux) or
+ * GlobalMemoryStatusEx (Windows). */
 
 #ifndef IDLETOKEN_RESOURCE_H
 #define IDLETOKEN_RESOURCE_H

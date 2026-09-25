@@ -96,8 +96,8 @@ export IDLETOKEN_API_KEY='sk-idletoken-********************************'
 npx @deepseek-ai/dsh web
 ```
 
-Web 界面默认打开 `http://127.0.0.1:3080`，在 `idletoken` 服务商下选择模型即可。
-IdleToken 当前的精选列表只支持文本。
+Web 界面默认打开 `http://127.0.0.1:3080`，在 `idletoken` 服务商下选择模型即可。手动添加的
+模型默认按纯文本处理，视觉模型需要在其 `id` 旁补一行 `input: [text, image]`。
 
 ### 接入 OpenCode
 
@@ -142,7 +142,7 @@ opencode
 
 | 平台 | 最低配置 |
 | --- | --- |
-| **Windows 10/11 · Linux x86_64/arm64** | NVIDIA 显卡，RTX 20 系（Turing，计算能力 7.5）及以后，显存 8 GB，并安装当前 NVIDIA 驱动。 |
+| **Windows 10/11 · Linux x86_64/arm64** | NVIDIA 显卡，RTX 20 系（Turing，计算能力 7.5）及以后，显存 8 GB，并安装当前 NVIDIA 驱动。已发布的 v0.1.90 Linux 二进制要求 glibc 2.39；当前源码构建以 glibc 2.35 为目标并在包元数据中声明。 |
 | **macOS** | Apple Silicon Mac，统一内存 16 GB。 |
 
 ## 🖧 联机
@@ -185,8 +185,8 @@ make -f Makefile.platform
 ```
 
 安装包位于 `client/src-tauri/target/release/bundle/deb/` 和
-`client/src-tauri/target/release/bundle/rpm/`。在 x86_64 上，同一命令还会把 Arch Linux
-安装包写入 `client/src-tauri/target/release/bundle/arch/`。
+`client/src-tauri/target/release/bundle/rpm/`。其他 Linux 发行版可以基于开源代码自行适配，
+但这些包不属于官方发布资产。
 
 ### macOS
 

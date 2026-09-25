@@ -1,0 +1,36 @@
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3456,7 +3456,8 @@
+                     // Return to the task queue after one physical text-prefill batch.
+                     // Slot cancellation must run between decode calls, never concurrently
+-                    // with GPU work. Embedding and multimodal batching stay unchanged.
+-                    const int32_t n_prompt_batch = !slot.task->need_embd() && !mctx
++                    // with GPU work. Media chunks are decoded separately above, so merely
++                    // loading an mmproj must not disable cancellation for text chunks.
++                    const int32_t n_prompt_batch = !slot.task->need_embd()
+                         ? std::min(n_batch, n_ubatch) : n_batch;
+                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_prompt_batch) {
+                         // get next token to process
+@@ -3609,8 +3610,10 @@
+         }
+ 
+         bool has_output = false;
++        bool has_text_prefill = false;
+         for (int i = off; i < off + batch_view.n_tokens; ++i) {
+             has_output |= batch.tokens[i].output;
++            has_text_prefill |= batch.tokens[i].is_prompt && batch.tokens[i].token != LLAMA_TOKEN_NULL;
+         }
+ 
+         // yield to the queue, so we can still handle metrics tasks while decoding
+@@ -3620,8 +3623,8 @@
+         queue_tasks.yield_to_queue([&]() {
+             ret = llama_decode(ctx_tgt, batch_view);
+-            // Drain this text batch before accepting another: otherwise asynchronous
+-            // submission can accumulate several batches ahead of a pending cancel.
+-            if (ret == 0 && (has_output || !mctx)) {
++            // Drain text prefill before accepting another task. This is deliberately
++            // based on the current batch, not on whether the server loaded an mmproj.
++            if (ret == 0 && (has_output || has_text_prefill)) {
+                 llama_synchronize(ctx_tgt);
+             }
+         });

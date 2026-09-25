@@ -2506,15 +2506,24 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
     const char *fr_tok = NULL; size_t fr_len = 0;
     int have_fr = json_str_token((const char *)cresp, cresp_len, "finish_reason",
                                  &fr_tok, &fr_len) == 0 && fr_len < 32;
+    /* Coordinator-internal bridge for Anthropic stop_sequence fidelity. The
+     * agent keeps the still-escaped bytes and gives the sealed platform reply
+     * the protocol-neutral name. The gateway independently verifies the value
+     * against the consumer's declared stop list before exposing it. */
+    const char *stop_tok = NULL; size_t stop_len = 0;
+    int have_stop = json_str_token((const char *)cresp, cresp_len,
+                                   "idletoken_stop_sequence",
+                                   &stop_tok, &stop_len) == 0 && stop_len > 0;
 
-    size_t reply_cap = content_len + reason_len + tc_len + 224 + sizeof usage_frag;
+    size_t reply_cap = content_len + reason_len + tc_len + stop_len +
+                       256 + sizeof usage_frag;
     char *reply = malloc(reply_cap);
     if (!reply) { wipe_free(cresp, cresp_len); free(reply_to); FAIL(500, "oom"); }
     idletoken_mlock(reply, reply_cap);
     char tc_frag_head[24];
     snprintf(tc_frag_head, sizeof tc_frag_head, "%s", have_tools ? ",\"tool_calls\":" : "");
     int rl = snprintf(reply, reply_cap,
-                      "{\"text\":\"%.*s\"%s%.*s%s,\"cache_hit\":%s,\"cached_tokens\":%d%s%s%.*s%s%.*s%s}",
+                      "{\"text\":\"%.*s\"%s%.*s%s,\"cache_hit\":%s,\"cached_tokens\":%d%s%s%.*s%s%.*s%s%s%.*s%s}",
                       (int)content_len, have_content ? content_tok : "",
                       have_reason ? ",\"reasoning\":\"" : "",
                       (int)reason_len, have_reason ? reason_tok : "",
@@ -2523,7 +2532,10 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
                       tc_frag_head, (int)tc_len, have_tools ? tc_tok : "",
                       have_fr ? ",\"finish_reason\":\"" : "",
                       (int)fr_len, have_fr ? fr_tok : "",
-                      have_fr ? "\"" : "");
+                      have_fr ? "\"" : "",
+                      have_stop ? ",\"stop_sequence\":\"" : "",
+                      (int)stop_len, have_stop ? stop_tok : "",
+                      have_stop ? "\"" : "");
     wipe_free(cresp, cresp_len);
     if (rl < 0 || (size_t)rl >= reply_cap) {
         idletoken_secure_zero(reply, reply_cap);

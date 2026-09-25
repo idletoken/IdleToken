@@ -199,7 +199,7 @@ typedef struct {
     uint64_t dsv4_fixed_bytes_per_seq;
     uint64_t overhead_base_bytes;      /* MLA/GQA: non-KV per-node overhead
                                         * (activations/workspace/comms) */
-    /* MEASURED graph workspace at the two product context tiers, in bytes,
+    /* MEASURED graph workspace at the three product context tiers, in bytes,
      * from llama.cpp's own no_alloc dry-run — `scripts/measure_model_memory.sh`
      * against the pinned engine. NOT estimated, and not derivable from any
      * other field here: the growth rate is set by the model's architecture

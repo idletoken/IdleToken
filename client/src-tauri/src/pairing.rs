@@ -82,7 +82,7 @@ pub struct Tuning {
     /// model's default variant / single-precision models. Broadcast with the
     /// model_id so joiners host the same precision.
     quant: String,
-    /// Exact product context window (256K or explicit 1M) passed to coord
+    /// Exact product context window (128K by default, or explicit 256K / 1M) passed to coord
     /// `--ctx-size` for the runtime VRAM admission check.
     ctx_size: u32,
     /// KV cache dtypes (settings "KV cache precision") → the coordinator's
@@ -2446,7 +2446,6 @@ fn roster_request(inner: &mut Inner, req: &Value, peer_ip: &str, now: Instant) -
                     "ctx": cluster_ctx,
                 });
             }
-
             let hb = (req["hb"].as_u64().unwrap_or(0) as u32).clamp(0, 60);
             // A fresh token on every accepted join, including a re-join.
             // Rotating it is what keeps a token that leaked from outliving
@@ -5803,6 +5802,7 @@ mod pairing_settings_tests {
             "id",
             "hostname",
             "gpu",
+            "role",
             "stage",
             "online",
             "layerLo",

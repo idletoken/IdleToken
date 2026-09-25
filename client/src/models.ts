@@ -87,7 +87,7 @@ export interface ModelManifest {
   /** Curated/validated YaRN-extended window (Qwen publishes 4x configs);
    *  absent/0 = the trained window is the hard ceiling. */
   context_yarn_max?: number;
-  /** MEASURED graph workspace at the two product context tiers, in bytes,
+  /** MEASURED graph workspace at the three product context tiers, in bytes,
    *  from llama.cpp's own no_alloc dry-run (scripts/measure_model_memory.sh).
    *  Mirrors idletoken_model_spec.compute_bytes_* one for one; absent/0 means
    *  "not measured", which the estimate must surface rather than treat as 0 —
@@ -523,7 +523,7 @@ const LLAMA_CUDA_CONTEXT_BYTES = 878 * 1024 ** 2;
 const LLAMA_NODE_MARGIN_BYTES = 100 * 1024 ** 2;
 
 /** The measured workspace for a context size on a backend, or 0 when
- *  unmeasured. Two product tiers, two measurements — nothing in between to
+ *  unmeasured. Three product tiers, three measurements — nothing in between to
  *  interpolate, and interpolating is what this replaced.
  *
  *  An unknown backend takes the LARGER of the two, matching plan.c: picking one
@@ -578,7 +578,7 @@ function kvGrowthScale(quant: string): number {
 }
 
 /** The measured workspace for a context size on a backend, or 0 when
- *  unmeasured. Two product tiers, two measurements — nothing in between to
+ *  unmeasured. Three product tiers, three measurements — nothing in between to
  *  interpolate, and interpolating is what this replaced.
  *
  *  `quant` selects the KV tier, because the workspace differs between cache

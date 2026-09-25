@@ -314,6 +314,11 @@ typedef struct {
     /* Optional OpenAI tool_calls array, brackets included, copied verbatim
      * from the sealed reply. NULL means this was a text-only turn. */
     char     *tool_calls_json;
+    /* Exact caller-declared stop string matched by the remote engine, still
+     * JSON-escaped. NULL means EOS, length, tool call, or an older platform.
+     * The platform response guard verifies it against the original request
+     * before this trusted sealed reply is created. */
+    char     *stop_sequence_escaped;
     /* OpenAI finish_reason. Empty only for an old platform response; callers
      * then derive the historical default from tool_calls/text. */
     char      finish_reason[24];

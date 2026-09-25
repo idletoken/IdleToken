@@ -998,11 +998,12 @@ static int llama_spawn(idletoken_llama *lc) {
         argv[argc++] = "--mmproj";
         argv[argc++] = lc->mmproj;
     }
-    /* Never reachable from the LAN: the coordinator's api_token gate must
-     * remain the only gate. Shared mode goes one further and leaves the IP
-     * stack entirely — the engine picks AF_UNIX off a `--host` ending in .sock
-     * (llama.cpp server-http.cpp), which is why --port is omitted there: with
-     * a socket it is meaningless, and printing one would misdescribe the link. */
+    /* Never reachable from the LAN: only the coordinator may apply the public
+     * loopback API policy (Origin-CSRF plus an optional user token). Shared mode
+     * goes one further and leaves the IP stack entirely — the engine picks
+     * AF_UNIX off a `--host` ending in .sock (llama.cpp server-http.cpp), which
+     * is why --port is omitted there: with a socket it is meaningless, and
+     * printing one would misdescribe the link. */
     if (lc->sock_path[0]) {
         argv[argc++] = "--host";    argv[argc++] = lc->sock_path;
     } else {

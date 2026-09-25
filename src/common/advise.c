@@ -7,9 +7,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* The advisor reports the two product service choices. Runtime never searches
+/* The advisor reports the three exact product service choices. Runtime never searches
  * or silently selects smaller tiers. */
-static const uint32_t TIERS[] = { 1048576u, 262144u };
+static const uint32_t TIERS[] = { 1048576u, 262144u, 131072u };
 #define N_TIERS ((int)(sizeof(TIERS) / sizeof(TIERS[0])))
 
 static const double GiB = 1024.0 * 1024.0 * 1024.0;
@@ -26,8 +26,10 @@ static int tiers_for(const idletoken_model_spec *m, uint32_t *out) {
     return n;
 }
 
-/* Best product verdict for one (model, quant). On one discrete machine an MoE
- * row may be HYBRID; cluster and dense rows remain GPU-only-or-no. */
+/* Best product verdict for one (model, quant). A discrete-machine MoE row may
+ * be HYBRID; with a roster this is a candidate whose exact owner-local expert
+ * placement is verified from the selected GGUF at startup. Dense rows remain
+ * GPU-only-or-no. */
 static void judge(const idletoken_model_spec *m, const char *quant,
                   const idletoken_node_mem *nodes, int n_nodes,
                   idletoken_advice_row *row) {
@@ -174,8 +176,9 @@ void idletoken_advise_print(const idletoken_advice_row *rows, int n,
                mode_word(r), ctx, note);
     }
     printf("\n  \"yes (GPU only)\" means the full service fits in GPU memory.\n"
-           "  \"yes (MoE Hybrid)\" is single-machine only: routed experts may\n"
-           "  use system RAM after the GGUF tensor layout is checked at startup.\n"
+           "  \"yes (MoE Hybrid)\" means routed experts may use owner-local\n"
+           "  system RAM after the GGUF tensor layout is checked at startup;\n"
+           "  cluster nodes are admitted independently and never pool RAM.\n"
            "  \"no\" tells you how much GPU memory is missing — for a cluster\n"
            "  model, adding another machine adds its memory to the pool.\n"
            "  Models marked \"runs on one machine\" are served by a single node:\n"

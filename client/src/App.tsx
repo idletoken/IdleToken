@@ -850,17 +850,6 @@ function ActivityRow(props: { stats: ClusterStats | null }) {
 // with the pairing panel as the management surface.
 function ClusterCard(props: {
   pair: PairingSnapshot | null;
-  /** Does the selected model+precision fit THIS machine alone, by the MEASURED
-   *  budget? Drives which deployment gets the primary button — nothing else.
-   *  Both entries stay on screen and both stay clickable either way; only the
-   *  visual weight follows the fact.
-   *
-   *  This was pinned to "cluster" from 2026-09-01 to 2026-09-02, because the
-   *  local-fit verdict was then a closed-form ESTIMATE that measured 8.2x low
-   *  on GLM-5.2 — not something to steer a user with. The need side is measured
-   *  now (results/memory-need-measured-20260901.md), so the verdict is worth
-   *  following. Undefined = unknown = leave cluster primary. */
-  fitsStandalone?: boolean;
   // A hardware/backend fact, not a capacity estimate. Unsupported compute
   // hardware remains a hard gate; an estimated memory shortfall does not.
   canServeStandalone?: boolean;
@@ -937,12 +926,6 @@ function ClusterCard(props: {
   // that do not exercise the download surface.
   const weightsReady = !props.weights
     || (!!props.weights.path && !props.weights.needs && !props.weights.dl);
-  // Single machine leads when it can actually hold the model: it is faster (no
-  // RPC hop), simpler, and strictly better for privacy since nothing leaves the
-  // machine. Hard constraint #1 says single-machine users are the majority and
-  // should not pay the clustering tax; making them press the secondary button
-  // to get the simpler path was exactly that tax.
-  const localLeads = props.fitsStandalone === true && canServe;
   if (!active) {
     return (
       // No pitch here (2026-08-10): whoever is looking at this screen already
@@ -1022,16 +1005,16 @@ function ClusterCard(props: {
         </div>
 
         {/* Two ways to deploy, always both on screen. They used to be one
-            either/or row driven by fitsStandalone, which meant a machine big
-            enough to go solo was never offered "join someone else's cluster",
-            and a machine too small never saw the local option at all — the
-            path you can't take should say why, not disappear. */}
+            either/or row driven by the capacity verdict, which meant a machine
+            big enough to go solo was never offered "join someone else's
+            cluster", and a machine too small never saw the local option at all
+            — the path you can't take should say why, not disappear. */}
         <div className="deploy-opt">
           <div className="deploy-opt__text">
             <h3 className="deploy-opt__title">{t("deploy.local")}</h3>
           </div>
           <button
-            className={localLeads ? "btn-primary" : "btn-secondary"}
+            className="btn-secondary"
             // Serving needs the weights already here. The selected-model row
             // above owns downloading, so this button waits rather than
             // duplicating that action or its progress. Capacity is deliberately
@@ -1057,19 +1040,23 @@ function ClusterCard(props: {
                 already offers joining with a code — a second button for the
                 same dialog's other tab was noise (removed 2026-08-15). */}
             <button
-              className={localLeads ? "btn-secondary" : "btn-primary"}
-              disabled={!weightsReady}
-              title={!weightsReady ? t("pairing.needsModel") : undefined}
+              className="btn-primary"
+              disabled={!canServe || !weightsReady}
+              title={!canServe
+                ? t("pairing.createNeedsCompute")
+                : !weightsReady
+                  ? t("pairing.needsModel")
+                  : undefined}
               onClick={props.onCreate}
             >
               {t("cluster.create")}
             </button>
           </div>
-          {/* Still no "recommended" badge and no explanatory copy: the emphasis
-              swap is the whole signal. Both paths remain one click away, and
-              the coordinator's runtime admission is still the authority — this
-              only stops the UI from pointing at the slower path when the
-              measured budget says the simpler one works. */}
+          {/* Still no "recommended" badge and no explanatory copy. Clustering
+              remains the stable primary action; the capacity card is a warning,
+              not a control that silently changes which choice the UI promotes.
+              Both paths remain one click away and runtime admission remains the
+              authority. */}
         </div>
 
         {/* The capability table (A-P1-3) was here until 2026-08-21 (Settings →
@@ -1503,7 +1490,6 @@ function Dashboard(props: {
   onServeStandalone: () => void;
   onCreateCluster: () => void;
   onNeedLogin: () => void;
-  onJoinCluster: () => void;
   onManageCluster: () => void;
   onLeaveCluster: () => Promise<void>;
   /** Jump to the full model section in Settings (the cluster card's picker
@@ -1518,40 +1504,6 @@ function Dashboard(props: {
   // old fallback of three added two imaginary engine-overhead allocations and
   // made a 256K estimate look larger without any machines to justify it.
   const nNodes = props.pair && props.pair.peers.length > 0 ? props.pair.peers.length : 1;
-  // Does the model fit THIS machine alone (N=1)? Only the primary-button
-  // emphasis reads it; both deployment entries stay clickable regardless, and
-  // the coordinator still performs the authoritative admission.
-  //
-  // Ask the PLANNER, the same one the capacity card asks, or the card can say
-  // "not enough" while the buttons lead with single-machine (hard constraint
-  // #8). The estimate below cannot answer this for a MoE model: it counts
-  // expert RAM as plain capacity, so a machine whose shortfall is KV — which
-  // may never leave video memory — reads as "fits" to it and as a refusal to
-  // the planner. Unpaired, this is the card's own question and the answer is
-  // already in the cache; paired, the card asks about the roster and this asks
-  // about this machine, which is two sidecar runs on a model change.
-  const soloSpec = useMemo(
-    () => plannerNodesSpec([{
-      vramFree: props.budget.vram_usable,
-      ramFree: props.budget.ram_usable,
-      ramExpertFree: props.budget.ram_expert_usable,
-      unifiedMemory: s.unified_memory,
-    }], backendOfOs(s.os), [s.hostname]),
-    [props.budget, s.unified_memory, s.os, s.hostname]);
-  const [soloPlan] = usePlan(props.model.id, props.quant,
-                             props.weights?.needs ? "" : (props.weights?.path ?? ""),
-                             props.tier.ctx, soloSpec);
-  // Browser mode has no sidecar, and the moment before the planner answers has
-  // no verdict at all: fall back to the estimate rather than leading with a
-  // path we have not checked.
-  const standalone = estimateClusterCapacity(props.model, props.budget, props.tier.ctx, 1,
-                                             props.quant, backendOfOs(s.os),
-                                             moeRamExpertBudget(props.model.id,
-                                                                props.budget.ram_expert_usable,
-                                                                s.unified_memory));
-  const fitsStandalone = soloPlan
-    ? soloPlan.kind !== 2        /* REFUSE */
-    : standalone.gapBytes === 0;
   // The generic refusal surface (D2): whatever sentence the engine sent
   // through the JOIN_REFUSED / exit-3 channel, verbatim, where the user is
   // looking. WS-C's "upgrade machine X" (version mismatch) arrives through
@@ -1584,7 +1536,6 @@ function Dashboard(props: {
           ) : (
           <ClusterCard
             pair={props.pair}
-            fitsStandalone={fitsStandalone}
             canServeStandalone={(s.hw_status ?? HW_OK) === HW_OK}
             onServeStandalone={props.onServeStandalone}
             weights={props.weights}
@@ -2624,10 +2575,6 @@ export default function App() {
                   setShowPairing(true);
                 }}
                 onNeedLogin={() => setShowAuth(true)}
-                onJoinCluster={() => {
-                  setPairingView("join");
-                  setShowPairing(true);
-                }}
                 onManageCluster={() => {
                   setPairingView("choose");
                   setShowPairing(true);

@@ -289,7 +289,7 @@ typedef struct {
      * these buckets sum to total_bytes when expert_bytes_complete is true. */
     uint64_t weight_bytes_per_layer[IDLETOKEN_LLPLAN_MAX_LAYERS];
     uint64_t weight_bytes_shared;
-    /* MEASURED graph workspace at the two context tiers — llama.cpp's own
+    /* MEASURED graph workspace at the three product context tiers — llama.cpp's own
      * no_alloc dry-run (`scripts/measure_model_memory.sh`), NOT an estimate.
      * 0 = not measured for this model; the planner then refuses to guess.
      *
@@ -425,11 +425,13 @@ typedef struct {
     double tensor_split[IDLETOKEN_LLPLAN_MAX_NODES]; /* proportional, Σ = 1.0 */
     int    layer0_node;   /* == order[0] == coordinator (CLUSTER); == single_node (SINGLE) */
 
-    /* SINGLE + HYBRID only. The sidecar passes `--n-cpu-moe N`, which keeps
-     * expert tensors for blocks [0,N) in host memory while every complete
-     * transformer layer and the KV cache remain GPU-offloaded. N is the
-     * smallest prefix whose exact GGUF bytes close the VRAM shortfall,
-     * including mandatory GPU cache/staging space for the RAM experts. */
+    /* Aggregate HYBRID summary. For SINGLE, the sidecar passes
+     * `--n-cpu-moe N`, which keeps expert tensors for blocks [0,N) in host
+     * memory while every complete transformer layer and the KV cache remain
+     * GPU-offloaded. For CLUSTER, the per-owner ranges below are authoritative.
+     * In both modes N/ranges are the smallest exact GGUF expert prefix that
+     * closes the owner GPU's VRAM shortfall, including mandatory GPU
+     * cache/staging space for RAM-resident experts. */
     uint32_t n_cpu_moe;
     uint64_t cpu_moe_bytes;
     /* What this plan needs from each physical pool, kept apart because Hybrid
@@ -507,10 +509,12 @@ int idletoken_llama_device_layer_range(
 /* Decide how to run `model` on `nodes` (n of them, coordinator = index of the
  * node this coordinator process runs on).
  *
- *   - Fits the coordinator → SINGLE by default. The coordinator is the only
- *     machine that can legally run single: layer 0 + embedding may not move to
- *     a worker, so a strong worker never substitutes. `force_cluster` records
- *     an explicit user choice and keeps CLUSTER even when SINGLE would fit.
+ *   - With no explicit cluster choice, a model that fits the coordinator takes
+ *     the shorter SINGLE path. This is a planner fallback, not the product UI
+ *     default: the client's primary cluster action passes `force_cluster`.
+ *     The coordinator is the only machine that can legally run single: layer 0
+ *     + embedding may not move to a worker, so a strong worker never substitutes.
+ *     `force_cluster` keeps CLUSTER even when SINGLE would fit.
  *   - Needs several nodes → CLUSTER with tensor_split; coordinator first and
  *     holding at least one layer's worth. A coordinator with no usable local
  *     compute memory → REFUSE (layer 0 + embedding may not leave it).

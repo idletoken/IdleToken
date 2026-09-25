@@ -34,18 +34,20 @@ sharing, API access, and common troubleshooting.
 | Network | The same LAN for multi-machine use; gigabit Ethernet is recommended |
 | Version | The same IdleToken version on every machine in a cluster |
 
-AMD and Intel GPUs, CPU-only computers, and Intel Macs cannot compute model
-layers, but they can act as controllers. Unsupported compute hardware does not
-silently fall back to CPU inference.
+AMD and Intel GPUs, CPU-only computers, and Intel Macs cannot join a cluster as
+compute nodes. The client may still open, but cluster creation and joining
+require supported compute hardware. IdleToken never silently falls back to CPU
+inference.
 
 ### Models and context windows
 
 - The client offers an adapted model catalog. It does not accept arbitrary
   local model paths or Hugging Face URLs.
-- The current catalog contains text-generation models only. Image input is not
-  supported.
-- The default context is exactly 256K. Models that support it also offer an
-  explicit 1M option. Startup never silently shortens the selected window.
+- Models marked with image support can accept pictures; other models accept
+  text only.
+- The default context is exactly 128K. The selector also offers exact 256K and
+  1M windows when the model supports them. Startup never silently changes the
+  selected window to another tier.
 - Both **On this machine only** and **Across several machines** remain visible.
   Multi-machine execution is the default primary action, without a
   "recommended" label. A capacity warning does not disable either choice, and
@@ -65,11 +67,10 @@ Download the package matching your operating system and CPU architecture from
 | Debian / Ubuntu arm64 | `IdleToken_<version>_arm64.deb` |
 | RPM-based Linux x86_64 | `IdleToken-<version>-1.x86_64.rpm` |
 | RPM-based Linux arm64 | `IdleToken-<version>-1.aarch64.rpm` |
-| Arch Linux x86_64 | `idletoken-bin-<version>-1-x86_64.pkg.tar.zst` |
 
-Source support and Release assets are published separately. If the current
-Release page does not list the Arch artifact, that release does not yet have a
-project-built Arch installer; use the source-build instructions in the README.
+Only the packages listed above are official release targets. Users of other
+Linux distributions may adapt the open-source build, but those packages are
+not produced or supported by the project.
 
 ### Windows
 
@@ -91,7 +92,7 @@ project-built Arch installer; use the source-build instructions in the README.
 1. Open the `.dmg` and drag IdleToken into Applications.
 2. On first launch, right-click IdleToken and choose **Open**. If macOS still
    blocks it, use **System Settings -> Privacy & Security -> Open Anyway**.
-3. Apple Silicon Macs can compute. Intel Macs can only act as controllers.
+3. Apple Silicon Macs can compute. Intel Macs are not supported as compute nodes.
 
 ### Linux
 
@@ -105,29 +106,24 @@ sudo apt install ./IdleToken_<version>_amd64.deb
 sudo apt install ./IdleToken_<version>_arm64.deb
 ```
 
-Fedora / RHEL / openSUSE:
+Fedora and compatible `dnf`-based distributions (see the glibc floor below):
 
 ```sh
 # x86_64
-sudo rpm -Uvh IdleToken-<version>-1.x86_64.rpm
+sudo dnf install ./IdleToken-<version>-1.x86_64.rpm
 
 # arm64
-sudo rpm -Uvh IdleToken-<version>-1.aarch64.rpm
-```
-
-Arch Linux (x86_64):
-
-```sh
-sudo pacman -U ./idletoken-bin-<version>-1-x86_64.pkg.tar.zst
+sudo dnf install ./IdleToken-<version>-1.aarch64.rpm
 ```
 
 Linux packages include the required user-space CUDA runtime libraries. You only
-need a compatible NVIDIA driver. The packages require glibc 2.39 or newer; the
-package manager refuses installation when that requirement is not met. The
-Linux release lane supports `.deb`, `.rpm`, and an x86_64 Arch Linux
-`.pkg.tar.zst`; an installer is published only when that asset appears on its
-Release page. Arch Linux ARM is not an official release target; other
-distributions require a build from the public repository.
+need a compatible NVIDIA driver. The published v0.1.90 Linux packages require
+glibc 2.39. The next packages built from the current source target glibc 2.35
+and will declare that floor in package metadata; the lower floor does not take
+effect until those packages are actually released. The official Linux release
+lane supports `.deb` and `.rpm`; dependency names vary on other RPM
+distributions, so do not assume that the Fedora package installs unchanged on
+RHEL or openSUSE.
 
 IdleToken has no in-app updater. To upgrade, download and install the newer
 native package over the existing installation.
@@ -146,7 +142,7 @@ An account is required to:
 1. Open [idletoken.ai](https://idletoken.ai) and select **Sign up**.
 2. Enter an email address and a password of at least eight characters.
 
-   ![IdleToken registration form](images/guide/03-portal-register.png)
+   <img src="images/guide/03-portal-register.png" alt="IdleToken registration form" width="420">
 
 3. Open the message from `no-reply@idletoken.ai` and follow its link within 24
    hours.
@@ -161,7 +157,7 @@ the account. Verification and password-reset messages use the same language.
 Open the account control in the client and sign in with the same email address
 and password.
 
-![IdleToken client sign-in panel](images/guide/03-client-signin.png)
+<img src="images/guide/03-client-signin.png" alt="IdleToken client sign-in panel" width="460">
 
 Sign-in provides account identity, automatic pairing, and platform features.
 Private-cluster inference still runs on your machines and LAN.
@@ -172,11 +168,11 @@ Private-cluster inference still runs on your machines and LAN.
 
 1. Open **Cluster**.
 2. Choose a model and precision under **Selected**.
-3. Keep the default 256K context, or enable 1M when the model supports it. A 1M
-   window generally requires more VRAM or unified memory.
+3. Keep the default 128K context, or select 256K / 1M when the model supports
+   them. Larger windows generally require more VRAM or unified memory.
 4. Review the capacity card.
 
-![Resource estimate for a selected model](images/guide/04-capacity.png)
+<img src="images/guide/04-capacity.png" alt="Resource estimate for a selected model" width="620">
 
 - **Available** is measured from the current machine or cluster roster.
 - **Needed (estimated)** includes model weights, the selected context, and
@@ -187,8 +183,9 @@ Private-cluster inference still runs on your machines and LAN.
 ### Download the model files
 
 If the selected model is not ready, choose **Download weights** and wait for the
-download and hash verification to finish. Every compute node in a multi-machine
-deployment needs a complete copy of the model file.
+download and hash verification to finish. Models with image support also
+download a vision file. Every compute node in a multi-machine deployment needs
+a complete copy of the model files.
 
 ### Choose local or multi-machine execution
 
@@ -205,10 +202,12 @@ applicable, free memory, or add compute nodes and try again.
 
 When the status becomes **Ready**, open **Chat** and send a message.
 
-![A text conversation with the Reasoning section collapsed](images/guide/04-chat.png)
+<img src="images/guide/04-chat.png" alt="A text conversation with the Reasoning section collapsed" width="780">
 
-Model reasoning appears in a collapsed **Reasoning** section. The current
-catalog and chat composer are text-only.
+Model reasoning appears in a collapsed **Reasoning** section. When the current
+model supports images, an image button appears beside the composer. It accepts
+PNG, JPEG, WebP, and GIF files. If the button is absent, the current model is
+text-only.
 
 ## 5. Build a LAN cluster
 
@@ -250,8 +249,8 @@ under that account, so no pairing code is required.
 
 Startup checks member versions, model files, and resources. If a member is not
 ready, the client identifies that machine and the reason. After every check
-passes, the status changes to **Cluster ready** and the page shows the local API
-address.
+passes, the status changes to **Cluster ready**; the coordinator's page shows
+the local API address. That API remains loopback-only on the coordinator.
 
 LAN discovery only finds machines; it does not broadcast the pairing
 credential. RPC connections between compute nodes use PSK-TLS encryption.
@@ -264,12 +263,12 @@ Sharing is a separate opt-in. Creating a private cluster does not enable it.
 2. Select **Share compute** in the top-right corner of the client.
 3. Wait for the button to change to **Sharing**.
 
-   ![Share-compute control in the client](images/guide/06-share-toggle.png)
+   <img src="images/guide/06-share-toggle.png" alt="Share-compute control in the client" width="400">
 
 4. Sign in to the portal and open **My Clusters**. Confirm that the service is
    online, then manage pricing if needed.
 
-   ![A listed service in My Clusters](images/guide/06-my-clusters.png)
+   <img src="images/guide/06-my-clusters.png" alt="A listed service in My Clusters" width="720">
 
 Turning sharing off prevents new platform work from being assigned to the
 service. Work already in progress is allowed to finish. If sharing reports a
@@ -323,7 +322,7 @@ served by this coordinator.
    **Sparks -> API keys**.
 3. Select **New key** and immediately copy the secret, which is shown once.
 
-![API-key management in the portal](images/guide/07-api-keys.png)
+<img src="images/guide/07-api-keys.png" alt="API-key management in the portal" width="760">
 
 ```sh
 curl https://api.idletoken.ai/v1/chat/completions \
@@ -369,7 +368,8 @@ or `GET /catalog` to see models and precisions with an online service.
 
 ### The model cannot start
 
-- Confirm that the weights finished downloading and passed verification.
+- Confirm that weights and the vision file, when required, finished downloading
+  and passed verification.
 - Use the capacity card and error details to free VRAM or RAM, select a lower
   precision, or switch from 1M to 256K when applicable.
 - For a cluster, check whether the error identifies an offline or mismatched
@@ -392,7 +392,7 @@ intercept loopback SSE and swallow the end-of-stream signal.
 Launch the client once from a terminal:
 
 ```sh
-WEBKIT_DISABLE_DMABUF_RENDERER=1 idletoken
+WEBKIT_DISABLE_DMABUF_RENDERER=1 idletoken-client
 ```
 
 If the interface appears, add that environment variable to the desktop

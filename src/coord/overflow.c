@@ -727,9 +727,11 @@ void idletoken_overflow_reply_free(idletoken_overflow_reply *r) {
     free(r->text_escaped);
     free(r->reasoning_escaped);
     free(r->tool_calls_json);
+    free(r->stop_sequence_escaped);
     r->text_escaped = NULL;
     r->reasoning_escaped = NULL;
     r->tool_calls_json = NULL;
+    r->stop_sequence_escaped = NULL;
     r->finish_reason[0] = '\0';
 }
 
@@ -1038,6 +1040,11 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
     const int have_reason =
         ovf_str_span((const char *)plain, plain_len, "reasoning", &rsn, &rsn_len) == 0
         && rsn_len > 0;
+    const char *stop_seq = NULL;
+    size_t stop_seq_len = 0;
+    const int have_stop_seq =
+        ovf_str_span((const char *)plain, plain_len, "stop_sequence",
+                     &stop_seq, &stop_seq_len) == 0 && stop_seq_len > 0;
     const char *tool_calls = idletoken_json_obj_get((const char *)plain, plain_len,
                                                     "tool_calls");
     long tool_calls_len = tool_calls
@@ -1092,6 +1099,17 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
         memcpy(out->tool_calls_json, tool_calls, (size_t)tool_calls_len);
         out->tool_calls_json[tool_calls_len] = '\0';
     }
+    if (have_stop_seq) {
+        out->stop_sequence_escaped = malloc(stop_seq_len + 1);
+        if (!out->stop_sequence_escaped) {
+            idletoken_secure_zero(plain, plain_len);
+            free(plain);
+            idletoken_overflow_reply_free(out);
+            OVF_FAIL("out of memory");
+        }
+        memcpy(out->stop_sequence_escaped, stop_seq, stop_seq_len);
+        out->stop_sequence_escaped[stop_seq_len] = '\0';
+    }
     {
         const char *fr = NULL;
         size_t fr_len = 0;
@@ -1103,6 +1121,14 @@ int idletoken_overflow_exchange(const char *messages_json, size_t messages_len,
             snprintf(out->finish_reason, sizeof out->finish_reason, "%s",
                      have_tool_calls ? "tool_calls" : "stop");
         }
+    }
+    /* A stop string is meaningful only with finish_reason=stop. Drop any
+     * inconsistent value even though current gateways already enforce this;
+     * it keeps an older or compromised platform from manufacturing a local
+     * Anthropic stop_sequence. */
+    if (strcmp(out->finish_reason, "stop") != 0) {
+        free(out->stop_sequence_escaped);
+        out->stop_sequence_escaped = NULL;
     }
     out->in_tokens     = (int)ovf_int_field((const char *)plain, plain_len, "input_tokens", 0);
     out->out_tokens    = (int)ovf_int_field((const char *)plain, plain_len, "output_tokens", 0);

@@ -207,6 +207,11 @@ static char g_engine_unverified[240] = "";
 static int coord_gguf_is_local_view(const char *gguf, unsigned *covered);
 
 static idletoken_llama *g_llama;
+/* The platform metering process uses the same supervised llama.cpp sidecar,
+ * but exposes only liveness and raw-text tokenization. Keeping this explicit
+ * prevents a vocabulary-only engine from being mistaken for an inference
+ * service merely because it has a healthy HTTP listener. */
+static int g_tokenizer_only_mode;
 
 /* A cluster is not effectively READY merely because llama-server has finished
  * constructing its CUDA/RPC tensors. The post-load worker keeps public state
@@ -426,9 +431,11 @@ static void usage(FILE *out) {
 "                      its own machine only. Exceptions: --tokenizer-only, or\n"
 "                      IDLETOKEN_API_ALLOW_LAN=1 (tests/operators).\n"
 "  --http              serve HTTP API on --api-bind after warmup\n"
-"  --tokenizer-only    no cluster: open the vocab and serve ONLY /health +\n"
-"                      /idletoken/v1/tokenize on --api-bind (platform metering instance;\n"
-"                      works with a layer-free sparse vocab shard)\n"
+"  --tokenizer-only    platform metering instance: spawn --engine-bin with\n"
+"                      llama.cpp --vocab-only against --model (legacy\n"
+"                      --model-path also accepted), then serve ONLY /health +\n"
+"                      /idletoken/v1/tokenize on --api-bind. A vocabulary-only\n"
+"                      GGUF is sufficient; no model weights or ds4 binary are used.\n"
 "  --api-token TOK     require `Authorization: Bearer TOK` or `x-api-key: TOK`\n"
 "                      on /v1/messages and /v1/chat/completions (401 otherwise).\n"
 "                      /health and /idletoken/v1/cluster/status stay open — clients and\n"
@@ -3439,7 +3446,10 @@ static int coord_overflow_relay(int conn_fd, const idletoken_http_req *req,
      * platform sent none (older platform, or a provider that did not think). */
     const char *rsn = rep.reasoning_escaped ? rep.reasoning_escaped : "";
     const size_t rsn_len = strlen(rsn);
-    size_t cap = strlen(rep.text_escaped) + rsn_len + tc_len + 768;
+    const char *stop_seq = rep.stop_sequence_escaped;
+    const size_t stop_len = stop_seq ? strlen(stop_seq) : 0;
+    const size_t stop_json_len = stop_seq ? stop_len : 4;
+    size_t cap = strlen(rep.text_escaped) + rsn_len + tc_len + stop_len + 896;
     char *body = (char *)malloc(cap);
     int bl = -1;
     if (body) {
@@ -3477,10 +3487,13 @@ static int coord_overflow_relay(int conn_fd, const idletoken_http_req *req,
                           "{\"id\":\"msg_idletoken_%llu\",\"type\":\"message\","
                           "\"role\":\"assistant\",\"model\":\"%s\","
                           "\"content\":%.*s,\"stop_reason\":\"%s\","
+                          "\"stop_sequence\":%s%.*s%s,"
                           "\"usage\":{\"input_tokens\":%d,\"output_tokens\":%d},"
                           "\"cache_hit\":false,\"cached_tokens\":0}",
                           (unsigned long long)req_id, coord_model()->id,
                           (int)content_len, content, stop_reason,
+                          stop_seq ? "\"" : "", (int)stop_json_len,
+                          stop_seq ? stop_seq : "null", stop_seq ? "\"" : "",
                           rep.in_tokens, rep.out_tokens);
             free(content);
         } else {
@@ -3490,6 +3503,7 @@ static int coord_overflow_relay(int conn_fd, const idletoken_http_req *req,
                           "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
                           "%s%s%s"
                           "\"content\":%s%s%s%s%s},\"finish_reason\":\"%s\"}],"
+                          "\"idletoken_stop_sequence\":%s%.*s%s,"
                           "\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,"
                           "\"total_tokens\":%d},\"cache_hit\":false,\"cached_tokens\":0}",
                           (unsigned long long)req_id, (long long)time(NULL),
@@ -3502,6 +3516,8 @@ static int coord_overflow_relay(int conn_fd, const idletoken_http_req *req,
                           rep.tool_calls_json ? rep.tool_calls_json : "",
                           rep.finish_reason[0] ? rep.finish_reason
                                                : (rep.tool_calls_json ? "tool_calls" : "stop"),
+                          stop_seq ? "\"" : "", (int)stop_json_len,
+                          stop_seq ? stop_seq : "null", stop_seq ? "\"" : "",
                           rep.in_tokens, rep.out_tokens,
                           rep.in_tokens + rep.out_tokens);
         }
@@ -3736,8 +3752,68 @@ static void sse_prefill_tick(idletoken_sse *s, int done, int total, int reused) 
  * client reads one contract, not two. Platform metering does NOT depend on
  * this: the agent forces stream:false on sealed work (platform_agent.c), so
  * billing only ever sees the non-stream response. */
-static void sse_finish(idletoken_sse *s, int n_input, int n_output, int eos_stop,
-                       int cached) {
+static void sse_anthropic_finish_event(idletoken_sse *s, const char *stop_reason,
+                                       const char *stop_sequence, size_t stop_len,
+                                       int n_output, int cached) {
+    const char *prefix = stop_sequence ? "\"" : "";
+    const char *value = stop_sequence ? stop_sequence : "null";
+    const size_t value_len = stop_sequence ? stop_len : 4;
+    const char *suffix = stop_sequence ? "\"" : "";
+    size_t cap = value_len + 512;
+    char *body = (char *)malloc(cap);
+    if (!body || value_len > INT_MAX) {
+        free(body);
+        s->failed = 1;
+        return;
+    }
+    int n = snprintf(body, cap,
+        "{\"type\":\"message_delta\","
+         "\"delta\":{\"stop_reason\":\"%s\",\"stop_sequence\":%s%.*s%s},"
+         "\"usage\":{\"output_tokens\":%d},"
+         "\"cache_hit\":%s,\"cached_tokens\":%d}",
+        stop_reason, prefix, (int)value_len, value, suffix, n_output,
+        cached > 0 ? "true" : "false", cached > 0 ? cached : 0);
+    if (n < 0 || (size_t)n >= cap ||
+        idletoken_http_sse_event(s->fd, "message_delta", body, (size_t)n) != 0)
+        s->failed = 1;
+    free(body);
+}
+
+static void sse_openai_finish_event(idletoken_sse *s, const char *finish_reason,
+                                    const char *stop_sequence, size_t stop_len,
+                                    int n_input, int n_output, int cached) {
+    const char *prefix = stop_sequence ? "\"" : "";
+    const char *value = stop_sequence ? stop_sequence : "null";
+    const size_t value_len = stop_sequence ? stop_len : 4;
+    const char *suffix = stop_sequence ? "\"" : "";
+    size_t cap = value_len + 768;
+    char *body = (char *)malloc(cap);
+    if (!body || value_len > INT_MAX) {
+        free(body);
+        s->failed = 1;
+        return;
+    }
+    int n = snprintf(body, cap,
+        "{\"id\":\"chatcmpl_idletoken_%s\",\"object\":\"chat.completion.chunk\","
+         "\"created\":%lld,\"model\":\"%s\","
+         "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"%s\"}],"
+         "\"idletoken_stop_sequence\":%s%.*s%s,"
+         "\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,"
+                     "\"total_tokens\":%d},"
+         "\"cache_hit\":%s,\"cached_tokens\":%d}",
+        s->id, s->created, coord_model()->id, finish_reason,
+        prefix, (int)value_len, value, suffix,
+        n_input, n_output, n_input + n_output,
+        cached > 0 ? "true" : "false", cached > 0 ? cached : 0);
+    if (n < 0 || (size_t)n >= cap ||
+        idletoken_http_sse_event(s->fd, NULL, body, (size_t)n) != 0)
+        s->failed = 1;
+    free(body);
+}
+
+static void sse_finish_matched(idletoken_sse *s, int n_input, int n_output,
+                               int eos_stop, int cached,
+                               const char *stop_sequence, size_t stop_len) {
     if (cached < 0) cached = 0;
     if (s->anthropic) {
         /* A generation that produced nothing at all still owes the client the
@@ -3745,27 +3821,20 @@ static void sse_finish(idletoken_sse *s, int n_input, int n_output, int eos_stop
          * a message with no content blocks. */
         if (!s->blk_any) sse_block_open(s, 0);
         sse_block_close(s);
-        sse_emitf(s, "message_delta",
-            "{\"type\":\"message_delta\","
-             "\"delta\":{\"stop_reason\":\"%s\",\"stop_sequence\":null},"
-             "\"usage\":{\"output_tokens\":%d},"
-             "\"cache_hit\":%s,\"cached_tokens\":%d}",
-            eos_stop ? "end_turn" : "max_tokens", n_output,
-            cached > 0 ? "true" : "false", cached);
+        sse_anthropic_finish_event(s, eos_stop ? "end_turn" : "max_tokens",
+                                   stop_sequence, stop_len, n_output, cached);
         sse_emitf(s, "message_stop", "{\"type\":\"message_stop\"}");
     } else {
-        sse_emitf(s, NULL,
-            "{\"id\":\"chatcmpl_idletoken_%s\",\"object\":\"chat.completion.chunk\","
-             "\"created\":%lld,\"model\":\"%s\","
-             "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"%s\"}],"
-             "\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,"
-                         "\"total_tokens\":%d},"
-             "\"cache_hit\":%s,\"cached_tokens\":%d}",
-            s->id, s->created, coord_model()->id, eos_stop ? "stop" : "length",
-            n_input, n_output, n_input + n_output,
-            cached > 0 ? "true" : "false", cached);
+        sse_openai_finish_event(s, eos_stop ? "stop" : "length",
+                                stop_sequence, stop_len,
+                                n_input, n_output, cached);
         sse_emitf(s, NULL, "[DONE]");
     }
+}
+
+static void sse_finish(idletoken_sse *s, int n_input, int n_output, int eos_stop,
+                       int cached) {
+    sse_finish_matched(s, n_input, n_output, eos_stop, cached, NULL, 0);
 }
 
 /* Stream a whole text as word-sized SSE deltas (mock path: real streaming has
@@ -4219,8 +4288,10 @@ static int llama_prompt_token_count(int conn_fd,
 }
 
 /* POST /idletoken/v1/tokenize — RAW text count for platform metering: no chat
- * template, add_special=false (the platform meters user-visible text, not our
- * prompt framing — same contract as the cluster path's ds4x count). */
+ * template, add_special=false, parse_special=false. The platform meters the
+ * user's literal text, not prompt framing, and strings that merely resemble a
+ * control token remain ordinary billable text. This preserves the established
+ * production ds4 tokenizer contract during the llama.cpp migration. */
 static void llama_tokenize_route(int conn_fd, const idletoken_http_req *req) {
     if (llama_gate_ready(conn_fd) != 0) return;
     const char *tspan = NULL;
@@ -4235,7 +4306,7 @@ static void llama_tokenize_route(int conn_fd, const idletoken_http_req *req) {
     llama_sb tb = {0};
     sb_cstr(&tb, "{\"content\":\"");
     sb_put(&tb, tspan, tlen);
-    sb_cstr(&tb, "\",\"add_special\":false,\"parse_special\":true}");
+    sb_cstr(&tb, "\",\"add_special\":false,\"parse_special\":false}");
     if (tb.oom) {
         free(tb.p);
         idletoken_http_send_error(conn_fd, 500, "oom");
@@ -4451,6 +4522,17 @@ static void llama_chat_nonstream(int conn_fd, int is_anthropic,
     int have_fr = json_raw_str_span(resp, rlen, "finish_reason", &fr, &frlen) == 0;
     int eos_stop = have_fr && frlen == 4 && !memcmp(fr, "stop", 4);
     int fr_tools = have_fr && frlen == 10 && !memcmp(fr, "tool_calls", 10);
+    /* llama.cpp knows whether `finish_reason:stop` came from EOS or from one
+     * of the caller's literal stop strings. Patch 0048 carries that matched
+     * string on the OpenAI-compatible response so the Anthropic face can keep
+     * its standard `stop_sequence` contract. The span remains JSON-escaped. */
+    const char *stop_seq = NULL;
+    size_t stop_len = 0;
+    if (!eos_stop ||
+        json_raw_str_span(resp, rlen, "idletoken_stop_sequence",
+                          &stop_seq, &stop_len) != 0)
+        stop_seq = NULL;
+    const size_t stop_json_len = stop_seq ? stop_len : 4;
     /* OpenAI face: the rebuilt message must carry the engine's tool_calls
      * through verbatim, not drop them (they are valid JSON from the engine). */
     const char *tcalls = NULL;
@@ -4487,7 +4569,7 @@ static void llama_chat_nonstream(int conn_fd, int is_anthropic,
         ablocks = idletoken_oai_resp_to_anthropic_content(resp, rlen, sreason,
                                                           sizeof(sreason), &ablen);
 
-    size_t body_cap = clen + rclen + ablen + (size_t)tcalls_len + 1024;
+    size_t body_cap = clen + rclen + ablen + (size_t)tcalls_len + stop_len + 1152;
     char *body = malloc(body_cap);
     if (!body) {
         llama_error_json(conn_fd, 500, "api_error", "out of memory building the response");
@@ -4504,10 +4586,14 @@ static void llama_chat_nonstream(int conn_fd, int is_anthropic,
                        "\"model\":\"%s\","
                        "\"content\":%s,"
                        "\"stop_reason\":\"%s\","
+                       "\"stop_sequence\":%s%.*s%s,"
                        "\"usage\":{\"input_tokens\":%d,\"output_tokens\":%d},"
                        "\"cache_hit\":%s,\"cached_tokens\":%d}",
                       (unsigned long long)req_id, coord_model()->id,
-                      ablocks, sreason, up_in, n_out,
+                      ablocks, sreason,
+                      stop_seq ? "\"" : "", (int)stop_json_len,
+                      stop_seq ? stop_seq : "null", stop_seq ? "\"" : "",
+                      up_in, n_out,
                       cache_hit ? "true" : "false", cached_n);
     } else if (is_anthropic) {
         bl = snprintf(body, body_cap,
@@ -4517,11 +4603,14 @@ static void llama_chat_nonstream(int conn_fd, int is_anthropic,
                        "\"model\":\"%s\","
                        "\"content\":[{\"type\":\"text\",\"text\":\"%.*s\"}],"
                        "\"stop_reason\":\"%s\","
+                       "\"stop_sequence\":%s%.*s%s,"
                        "\"usage\":{\"input_tokens\":%d,\"output_tokens\":%d},"
                        "\"cache_hit\":%s,\"cached_tokens\":%d}",
                       (unsigned long long)req_id, coord_model()->id,
                       (int)clen, content,
                       eos_stop ? "end_turn" : "max_tokens",
+                      stop_seq ? "\"" : "", (int)stop_json_len,
+                      stop_seq ? stop_seq : "null", stop_seq ? "\"" : "",
                       up_in, n_out,
                       cache_hit ? "true" : "false", cached_n);
     } else {
@@ -4537,6 +4626,7 @@ static void llama_chat_nonstream(int conn_fd, int is_anthropic,
                                                     "%s%.*s%s"
                                                     "\"content\":\"%.*s\"%s%.*s},"
                                       "\"finish_reason\":\"%s\"}],"
+                       "\"idletoken_stop_sequence\":%s%.*s%s,"
                        "\"usage\":{\"prompt_tokens\":%d,"
                                    "\"completion_tokens\":%d,"
                                    "\"total_tokens\":%d},"
@@ -4548,6 +4638,8 @@ static void llama_chat_nonstream(int conn_fd, int is_anthropic,
                       (int)clen, content,
                       tc_field, (int)tcalls_len, tcalls ? tcalls : "",
                       fr_tools ? "tool_calls" : (eos_stop ? "stop" : "length"),
+                      stop_seq ? "\"" : "", (int)stop_json_len,
+                      stop_seq ? stop_seq : "null", stop_seq ? "\"" : "",
                       up_in, n_out, up_in + n_out,
                       cache_hit ? "true" : "false", cached_n);
     }
@@ -4560,7 +4652,8 @@ static void llama_chat_nonstream(int conn_fd, int is_anthropic,
     free(resp);
     fprintf(stderr, "coord: chat: generated %d tok (llama.cpp relay), stop=%s, "
                     "prefix reuse %d/%d tok\n",
-            n_out, eos_stop ? "EOS" : "max_tokens", cached_n, up_in);
+            n_out, stop_seq ? "stop_sequence" : (eos_stop ? "EOS" : "max_tokens"),
+            cached_n, up_in);
     llama_account(up_in, n_out, tps, t0, cached);
     llama_account_ttft_ms(prefill_ms);
 }
@@ -4622,6 +4715,8 @@ static void llama_chat_stream(int conn_fd, int is_anthropic,
      * takes, so it goes out without an unescape/re-escape round trip. */
     char chunk[4096];
     char *line = NULL;
+    char *stop_escaped = NULL;
+    size_t stop_escaped_len = 0;
     size_t llen = 0, lcap = 0;
     int done = 0, eos_stop = 0, broke = 0;
     int n_deltas = 0, up_in = -1, up_out = -1, cached = -1;
@@ -4681,6 +4776,19 @@ static void llama_chat_stream(int conn_fd, int is_anthropic,
                     size_t frlen;
                     if (json_raw_str_span(d, dlen, "finish_reason", &fr, &frlen) == 0)
                         eos_stop = (frlen == 4 && !memcmp(fr, "stop", 4));
+                    const char *matched;
+                    size_t matched_len;
+                    if (json_raw_str_span(d, dlen, "idletoken_stop_sequence",
+                                          &matched, &matched_len) == 0 &&
+                        matched_len > 0) {
+                        char *copy = (char *)malloc(matched_len + 1);
+                        if (!copy) { broke = 1; goto stream_end; }
+                        memcpy(copy, matched, matched_len);
+                        copy[matched_len] = '\0';
+                        free(stop_escaped);
+                        stop_escaped = copy;
+                        stop_escaped_len = matched_len;
+                    }
                     if (json_value_pos(d, dlen, "usage")) {
                         up_in  = extract_int_field(d, dlen, "prompt_tokens", up_in);
                         up_out = extract_int_field(d, dlen, "completion_tokens", up_out);
@@ -4705,7 +4813,10 @@ stream_end:
     /* Closing the upstream connection is also how a hung-up client cancels
      * generation: idletoken-server aborts the slot when its client disconnects. */
     idletoken_llama_http_close(&c);
-    if (cancelled) return;
+    if (cancelled) {
+        free(stop_escaped);
+        return;
+    }
     int n_out = up_out >= 0 ? up_out : n_deltas;
     int n_in  = up_in  >= 0 ? up_in  : n_input;
     /* A stream the client cut short never reached the usage frame, so "no
@@ -4713,11 +4824,16 @@ stream_end:
      * evidence worth warning about. */
     if (cached < 0 && done && !broke) llama_warn_no_cache_field();
     if (broke) sse_error(&s, "engine connection lost mid-generation");
-    sse_finish(&s, n_in, n_out, eos_stop && !broke, cached);
+    const int matched_stop = eos_stop && !broke && stop_escaped != NULL;
+    sse_finish_matched(&s, n_in, n_out, eos_stop && !broke, cached,
+                       matched_stop ? stop_escaped : NULL,
+                       matched_stop ? stop_escaped_len : 0);
     fprintf(stderr, "coord: chat: generated %d tok (llama.cpp relay), stop=%s "
                     "(streamed), prefix reuse %d/%d tok\n",
-            n_out, broke ? "decode_failed" : (eos_stop ? "EOS" : "max_tokens"),
+            n_out, broke ? "decode_failed" :
+                   (matched_stop ? "stop_sequence" : (eos_stop ? "EOS" : "max_tokens")),
             cached > 0 ? cached : 0, n_in);
+    free(stop_escaped);
     llama_account(n_in, n_out, tps, t0, cached);
 }
 
@@ -4778,8 +4894,10 @@ static void coord_overflow_stream_reply(int conn_fd, int is_anthropic,
             sse_delta(&s, frame);
             i += n;
         }
-        sse_finish(&s, rep->in_tokens, rep->out_tokens,
-                   strcmp(rep->finish_reason, "length") != 0, 0);
+        const char *stop_seq = rep->stop_sequence_escaped;
+        sse_finish_matched(&s, rep->in_tokens, rep->out_tokens,
+                           strcmp(rep->finish_reason, "length") != 0, 0,
+                           stop_seq, stop_seq ? strlen(stop_seq) : 0);
         return;
     }
 
@@ -4982,6 +5100,11 @@ static void llama_chat_stream_tools(int conn_fd, int is_anthropic,
     int cached = llama_cached_prompt_tokens(resp, rlen);
     if (cached < 0) llama_warn_no_cache_field();
     const int cached_n = cached > 0 ? cached : 0;
+    const char *stop_seq = NULL;
+    size_t stop_len = 0;
+    if (json_raw_str_span(resp, rlen, "idletoken_stop_sequence",
+                          &stop_seq, &stop_len) != 0)
+        stop_seq = NULL;
     char sreason[16] = "max_tokens";
     {
         char *probe = idletoken_oai_resp_to_anthropic_content(resp, rlen, sreason,
@@ -5058,12 +5181,12 @@ static void llama_chat_stream_tools(int conn_fd, int is_anthropic,
                 "{\"type\":\"content_block_stop\",\"index\":%d}", idx);
             idx++;
         }
-        sse_emitf(&s, "message_delta",
-            "{\"type\":\"message_delta\","
-             "\"delta\":{\"stop_reason\":\"%s\",\"stop_sequence\":null},"
-             "\"usage\":{\"output_tokens\":%d},"
-             "\"cache_hit\":%s,\"cached_tokens\":%d}",
-            sreason, n_out, cached_n > 0 ? "true" : "false", cached_n);
+        const int matched_stop = !have_calls && !strcmp(sreason, "end_turn") &&
+                                 stop_seq != NULL;
+        sse_anthropic_finish_event(&s, sreason,
+                                   matched_stop ? stop_seq : NULL,
+                                   matched_stop ? stop_len : 0,
+                                   n_out, cached_n);
         sse_emitf(&s, "message_stop", "{\"type\":\"message_stop\"}");
     } else {
         sse_begin(&s, up_in);      /* role preamble frame */
@@ -5113,16 +5236,12 @@ static void llama_chat_stream_tools(int conn_fd, int is_anthropic,
         }
         const char *fr = have_calls ? "tool_calls"
                        : (!strcmp(sreason, "end_turn") ? "stop" : "length");
-        sse_emitf(&s, NULL,
-            "{\"id\":\"chatcmpl_idletoken_%s\",\"object\":\"chat.completion.chunk\","
-             "\"created\":%lld,\"model\":\"%s\","
-             "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"%s\"}],"
-             "\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,"
-                         "\"total_tokens\":%d},"
-             "\"cache_hit\":%s,\"cached_tokens\":%d}",
-            s.id, s.created, coord_model()->id, fr,
-            up_in, n_out, up_in + n_out,
-            cached_n > 0 ? "true" : "false", cached_n);
+        const int matched_stop = !have_calls && !strcmp(fr, "stop") &&
+                                 stop_seq != NULL;
+        sse_openai_finish_event(&s, fr,
+                                matched_stop ? stop_seq : NULL,
+                                matched_stop ? stop_len : 0,
+                                up_in, n_out, cached_n);
         sse_emitf(&s, NULL, "[DONE]");
     }
     free(resp);
@@ -5965,6 +6084,20 @@ static void handle_http_request(int conn_fd,
                           g_llama ? g_n_rpc_peers : n, *running_pos,
                           engine_extra);
         idletoken_http_send_json(conn_fd, 200, body, (size_t)bl);
+        free(req.body);
+        return;
+    }
+
+    /* A vocabulary-only sidecar cannot generate. Refuse every other surface
+     * before the ordinary coordinator routes can advertise models, cluster
+     * capacity, sharing controls, or forward a chat request into a context
+     * that deliberately has no logits. The one public job of this process is
+     * the platform's raw-text billing count. */
+    if (g_tokenizer_only_mode &&
+        (strcmp(req.method, "POST") != 0 ||
+         strcmp(req.path, IDLETOKEN_PATH_TOKENIZE) != 0)) {
+        idletoken_http_send_error(conn_fd, 404,
+                                  "tokenizer-only service exposes only /health and /idletoken/v1/tokenize");
         free(req.body);
         return;
     }
@@ -8254,6 +8387,163 @@ static void coord_sleep_ms(unsigned ms) {
 #endif
 }
 
+/* Platform billing tokenizer: supervise the pinned llama-server in
+ * --vocab-only mode, then expose the coordinator's stable count shape
+ * ({"tokens":N}) on the existing route. The GGUF may contain no weight
+ * tensors at all; llama.cpp loads only metadata and vocabulary, so this does
+ * not pull the retired ds4 implementation back into a special binary. */
+static int run_llamacpp_tokenizer_mode(const char *llama_bin,
+                                       const char *vocab_gguf,
+                                       int llama_port,
+                                       const char *api_bind,
+                                       const char *api_token) {
+    struct stat st;
+    if (!llama_bin || !llama_bin[0] || stat(llama_bin, &st) != 0 ||
+        !S_ISREG(st.st_mode)) {
+        fprintf(stderr,
+                "idletoken-coord: --tokenizer-only needs a readable "
+                "--engine-bin/--llama-server-bin: %s\n",
+                llama_bin && llama_bin[0] ? llama_bin : "(missing)");
+        return 2;
+    }
+    if (!vocab_gguf || !vocab_gguf[0] || stat(vocab_gguf, &st) != 0 ||
+        !S_ISREG(st.st_mode)) {
+        fprintf(stderr,
+                "idletoken-coord: --tokenizer-only needs a readable "
+                "--model/--model-path vocab GGUF: %s\n",
+                vocab_gguf && vocab_gguf[0] ? vocab_gguf : "(missing)");
+        return 2;
+    }
+    if (llama_port < 1 || llama_port > 65535) {
+        fprintf(stderr, "idletoken-coord: --engine-port must be 1..65535\n");
+        return 2;
+    }
+
+    char state_dir[400] = "";
+    char log_path[512] = "";
+    const char *home = getenv("HOME");
+#ifdef _WIN32
+    if (!home || !home[0]) home = getenv("USERPROFILE");
+#endif
+    if (home && home[0]) {
+        snprintf(state_dir, sizeof(state_dir), "%s/.idletoken", home);
+#ifdef _WIN32
+        _mkdir(state_dir);
+#else
+        mkdir(state_dir, 0700);
+        chmod(state_dir, 0700);
+#endif
+    }
+    const char *log_env = getenv("IDLETOKEN_LLAMA_LOG");
+    if (log_env && log_env[0])
+        snprintf(log_path, sizeof(log_path), "%s", log_env);
+    else if (state_dir[0])
+        snprintf(log_path, sizeof(log_path), "%s/idletoken-tokenizer-%d.log",
+                 state_dir, llama_port);
+    else
+        snprintf(log_path, sizeof(log_path), "idletoken-tokenizer-%d.log",
+                 llama_port);
+
+    char engine_sock[300] = "";
+#ifndef _WIN32
+    /* Metered text is user content too. Keep the coord-to-engine hop off the
+     * packet stack when a private state directory is available, exactly as a
+     * shared inference coordinator does. */
+    if (state_dir[0])
+        snprintf(engine_sock, sizeof(engine_sock),
+                 "%s/tokenizer-%d.sock", state_dir, llama_port);
+#endif
+
+    char err[320] = "";
+    g_tokenizer_only_mode = 1;
+    g_llama = idletoken_llama_start(
+        llama_bin, vocab_gguf, llama_port, engine_sock,
+        1, 0, 1, 0, 0, "0",
+        "--vocab-only --no-warmup --cache-ram 0",
+        log_path,
+        1, /* lock engine arguments and disable the prompt-revealing /slots */
+        NULL, NULL, err, sizeof(err));
+    if (!g_llama) {
+        g_tokenizer_only_mode = 0;
+        fprintf(stderr,
+                "idletoken-coord: could not start the llama.cpp tokenizer: %s\n",
+                err[0] ? err : "unknown error");
+        return 1;
+    }
+
+    /* Unlike the normal desktop path, do not open the metering listener while
+     * its only dependency is still loading: the gateway treats a failed count
+     * as permission to use the billing heuristic. Vocab-only startup is small,
+     * but the wait stays bounded and names the engine log on failure. */
+    const long long ready_deadline = now_ms() + 60000;
+    while (idletoken_llama_get_state(g_llama) != IDLETOKEN_LLAMA_READY &&
+           now_ms() < ready_deadline) {
+        if (idletoken_llama_get_state(g_llama) == IDLETOKEN_LLAMA_FAILED)
+            break;
+        coord_sleep_ms(50);
+    }
+    if (idletoken_llama_get_state(g_llama) != IDLETOKEN_LLAMA_READY) {
+        char why[700] = "";
+        idletoken_llama_fail_reason(g_llama, why, sizeof(why));
+        fprintf(stderr,
+                "idletoken-coord: llama.cpp tokenizer did not become ready: "
+                "%s (engine log: %s)\n",
+                why[0] ? why : "60 second startup deadline expired", log_path);
+        idletoken_llama_shutdown(g_llama);
+        g_llama = NULL;
+        g_tokenizer_only_mode = 0;
+        return 1;
+    }
+
+    ignore_sigpipe();
+#ifndef _WIN32
+    {
+        struct sigaction sa = {0};
+        sa.sa_handler = llama_stop_handler;
+        sigaction(SIGINT, &sa, NULL);
+        sigaction(SIGTERM, &sa, NULL);
+    }
+#endif
+    int lfd = idletoken_listen_tcp(api_bind);
+    if (lfd < 0) {
+        fprintf(stderr, "coord: tokenizer http listen(%s): %s\n",
+                api_bind, strerror(errno));
+        idletoken_llama_shutdown(g_llama);
+        g_llama = NULL;
+        g_tokenizer_only_mode = 0;
+        return 1;
+    }
+
+    g_stats.started_at = (long long)time(NULL);
+    g_llama_stop_sig = 0;
+    fprintf(stderr,
+            "coord: tokenizer-only — llama.cpp vocab ready; HTTP on %s "
+            "(engine link %s, log %s). Ctrl-C to stop.\n",
+            api_bind, engine_sock[0] ? "private unix socket" : "loopback TCP",
+            log_path);
+    uint32_t pos = 0;
+    while (!g_llama_stop_sig) {
+        int cfd = idletoken_accept_tcp(lfd);
+        if (cfd < 0) {
+            if (errno == EINTR) continue;
+            fprintf(stderr, "coord: tokenizer http accept: %s\n",
+                    strerror(errno));
+            break;
+        }
+        handle_http_request(cfd, NULL, 0, NULL, 0, &pos,
+                            NULL, NULL, 1, api_token, NULL);
+        idletoken_admission_request_end();
+        idletoken_close_fd(cfd);
+    }
+
+    idletoken_close_fd(lfd);
+    idletoken_llama_shutdown(g_llama);
+    g_llama = NULL;
+    g_tokenizer_only_mode = 0;
+    fprintf(stderr, "coord: tokenizer-only stopped\n");
+    return 0;
+}
+
 /* Start a byte-range repository for this exact GGUF. A deployment may instead
  * set IDLETOKEN_SHARD_REPO to a DGX/LAN repository; the automatic local server
  * is the zero-configuration desktop path. */
@@ -9811,8 +10101,9 @@ int main(int argc, char **argv) {
 #endif
     const char *bind       = "0.0.0.0:14100";
     const char *api_bind   = "127.0.0.1:8000";
-    /* API access token (client setting apiToken). Empty/NULL = no auth (LAN
-     * default). Env fallback so the Tauri sidecar can avoid arg quoting. */
+    /* Optional API access token (client setting apiToken). Empty/NULL keeps the
+     * loopback API tokenless; api_origin_ok() still rejects browser requests.
+     * Env fallback lets the Tauri sidecar avoid putting a secret in argv. */
     const char *api_token  = getenv("IDLETOKEN_API_TOKEN");
     const char *model_id   = NULL;   /* --model-id; default = registry default */
     const char *model_path = NULL;   /* --model-path; default = model's own gguf */
@@ -10114,6 +10405,34 @@ int main(int argc, char **argv) {
     if (!g_model) {
         fprintf(stderr, "idletoken-coord: unknown model id '%s'\n", model_id);
         return 2;
+    }
+
+    /* The platform metering service is llama.cpp too. Resolve its vocabulary
+     * GGUF before the normal inference-mode decision so --tokenizer-only never
+     * enters hardware planning and never reaches the frozen ds4 path below.
+     * Accept --model-path for existing service units; --model is the current
+     * spelling and wins when both are present. */
+    if (tokenizer_only) {
+        const char *vocab_gguf =
+            (llama_gguf && llama_gguf[0]) ? llama_gguf : model_path;
+        if (!vocab_gguf || !vocab_gguf[0]) {
+            const idletoken_model_variant *tv =
+                idletoken_model_variant_get(g_model, quant);
+            vocab_gguf = tv && tv->gguf[0] ? tv->gguf : g_model->default_gguf;
+        }
+        static char resolved_vocab[1024];
+        if (gguf_dir && vocab_gguf && vocab_gguf[0] != '/' &&
+            !(vocab_gguf[0] && vocab_gguf[1] == ':')) {
+            const size_t dl = strlen(gguf_dir);
+            snprintf(resolved_vocab, sizeof(resolved_vocab), "%s%s%s",
+                     gguf_dir,
+                     (dl && (gguf_dir[dl - 1] == '/' ||
+                             gguf_dir[dl - 1] == '\\')) ? "" : "/",
+                     vocab_gguf);
+            vocab_gguf = resolved_vocab;
+        }
+        return run_llamacpp_tokenizer_mode(llama_bin, vocab_gguf,
+                                           llama_port, api_bind, api_token);
     }
 
     /* --- llamacpp single-machine mode decision (v2 rebuild WS-B1+B3) ------
@@ -10766,64 +11085,6 @@ int main(int argc, char **argv) {
     g_max_decode = max_decode;
     printf("  max_decode  : %d%s\n", max_decode, max_decode ? "" : " (context-bound)");
     printf("  n_predict   : %d\n\n", n_predict);
-
-    /* --- tokenizer-only mode (integration-plan: platform metering) --------
-     * No cluster, no warmup: open the vocab (a layer-free SPARSE shard is
-     * enough — ds4 only touches the metadata/vocab pages) and serve /health
-     * + /idletoken/v1/tokenize. Chat routes 503 via the no-cluster guard. This is the
-     * platform's own metering instance, so billing counts with the exact
-     * engine vocab without shipping the 80GB weights to the cloud. */
-    if (tokenizer_only) {
-        char tk_lock[64];
-        snprintf(tk_lock, sizeof(tk_lock), "/tmp/ds4-%ld.lock", (long)getpid());
-        setenv("DS4_LOCK_FILE", tk_lock, 1);
-        ds4_engine_options teo = {
-            .model_path = model_path,
-            .backend = DS4_BACKEND_CPU,
-            .n_threads = 0,
-            .warm_weights = false,
-            .quality = false,
-            .load_layer_lo = 0,
-            .load_layer_hi = 0,
-        };
-        struct stat tst;
-        if (stat(model_path, &tst) != 0 || !S_ISREG(tst.st_mode)) {
-            fprintf(stderr, "idletoken-coord: --tokenizer-only needs a readable "
-                            "model/vocab shard: %s\n", model_path);
-            return 1;   /* nothing else to serve — fail loudly */
-        }
-        ds4_engine *tok_engine = NULL;
-        if (ds4_engine_open(&tok_engine, &teo) != 0 || !tok_engine) {
-            fprintf(stderr, "idletoken-coord: tokenizer engine open failed\n");
-            return 1;
-        }
-        fprintf(stderr, "coord: tokenizer-only — vocab ready (eos_token=%d)\n",
-                ds4_token_eos(tok_engine));
-        ignore_sigpipe();
-        int tk_lfd = idletoken_listen_tcp(api_bind);
-        if (tk_lfd < 0) {
-            fprintf(stderr, "coord: http listen(%s): %s\n", api_bind, strerror(errno));
-            ds4_engine_close(tok_engine);
-            return 1;
-        }
-        fprintf(stderr, "coord: tokenizer-only HTTP on %s. Ctrl-C to stop.\n", api_bind);
-        uint32_t tk_pos = 0;
-        for (;;) {
-            int cfd = idletoken_accept_tcp(tk_lfd);
-            if (cfd < 0) {
-                if (errno == EINTR) continue;
-                fprintf(stderr, "coord: http accept: %s\n", strerror(errno));
-                break;
-            }
-            handle_http_request(cfd, NULL, 0, NULL, 0, &tk_pos,   /* parking mode does not apply */
-                                tok_engine, NULL, ctx_size, api_token, NULL);
-            idletoken_admission_request_end();
-            close(cfd);
-        }
-        ds4_engine_close(tok_engine);
-        close(tk_lfd);
-        return 0;
-    }
 
 #ifdef _WIN32
     /* Self-provision inbound firewall rules, exactly as the worker does.

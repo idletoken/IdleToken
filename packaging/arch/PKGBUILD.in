@@ -1,4 +1,5 @@
-# Maintainer: IdleToken <support@idletoken.ai>
+# Unsupported packaging experiment retained for community adaptation.
+# This template is not an official IdleToken release or support target.
 
 pkgname=idletoken-bin
 pkgver=@VERSION@
@@ -38,7 +39,7 @@ package() {
     return 1
   fi
 
-  # The Debian package has already passed the release payload gates. Preserve
+  # The Debian package has already passed its payload gates. Preserve
   # it byte-for-byte so the Arch package cannot acquire a different engine,
   # CUDA runtime, digest, licence set, or desktop integration.
   ar p "${srcdir}/@DEB_NAME@" "${data_member}" | bsdtar -xf - -C "${pkgdir}"
