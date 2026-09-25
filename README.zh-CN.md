@@ -54,7 +54,6 @@ IdleToken 想做的，就是把这些错开的峰谷连接起来：让闲置的�
 
 > 📖 **第一次用？[手把手使用教程](docs/user-guide.zh-CN.md)配了截图，从头走一遍**——
 > 安装、注册、跑通第一个模型、多机组网、分享算力、接 Claude Code。
-> ([English](docs/user-guide.md))
 
 ### 🖥️ 部署并分享自己的模型
 

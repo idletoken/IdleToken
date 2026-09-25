@@ -54,7 +54,7 @@ Join the IdleToken Discord to discuss using and developing the project.
 
 > 📖 **New here? The [step-by-step guide](docs/user-guide.md) walks through the
 > whole path with screenshots** — install, account, your first model, clusters,
-> sharing, and connecting Claude Code. ([中文版](docs/user-guide.zh-CN.md))
+> sharing, and connecting Claude Code.
 
 ### 🖥️ Deploy and share your own model
 
