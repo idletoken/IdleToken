@@ -208,8 +208,8 @@ const char *idletoken_llama_state_name(idletoken_llama_state st);
 
 /* Non-empty once the engine's own log reported a startup condition that no
  * restart and no waiting can fix, and that the coordinator must refuse over
- * instead of serving around. Today there is exactly one: the engine could not
- * fit the model into device memory (see idletoken_llama_log_fit_failed).
+ * instead of serving around. This includes a failed device-memory fit and the
+ * engine's tagged resource/cache-plan assertions (see the detectors below).
  *
  * Distinct from fail_reason on purpose. FAILED means "it kept crashing" — the
  * coordinator stays up and answers 503, because the user may fix the model
@@ -237,6 +237,16 @@ void idletoken_llama_fatal_reason(idletoken_llama *lc, char *out, size_t cap);
  * idletoken_llama_seq_slots is what actually keeps us out of this state, and
  * this catches the cases the budget's estimates get wrong. */
 int idletoken_llama_log_fit_failed(const char *text);
+
+/* Does this line contain a fail-closed engine diagnostic that must be surfaced
+ * on the first crash rather than retried as an ordinary transient exit?
+ *
+ * These tags are part of IdleToken's pinned llama.cpp patch contract. The
+ * engine deliberately aborts after printing them because continuing would
+ * violate the admitted resource or owner-local cache plan. The supervisor
+ * still has to recognize the line: otherwise that deliberate refusal is
+ * hidden behind five generic quick-crash retries. */
+int idletoken_llama_log_terminal_failure(const char *text);
 
 /* The `-ngl` value the engine is spawned with. Always returns "99": all
  * repeating layers must be GPU-resident. Spawn also supplies `--fit off`. */

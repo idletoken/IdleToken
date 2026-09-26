@@ -1232,6 +1232,12 @@ int idletoken_llama_log_fit_failed(const char *text) {
     return strstr(text, "failed to fit params to free device memory") != NULL;
 }
 
+int idletoken_llama_log_terminal_failure(const char *text) {
+    if (!text) return 0;
+    return strstr(text, "[RESOURCE_INSUFFICIENT]") != NULL ||
+           strstr(text, "[ENGINE_CACHE_PLAN_MISMATCH]") != NULL;
+}
+
 /* Disk opens can pause for seconds under filesystem/antivirus pressure. Never
  * hold the state mutex during log I/O: the HTTP accept loop reads fatal/state
  * snapshots under that same mutex. Snapshot the child identity and cursor,
@@ -1265,20 +1271,33 @@ static void llama_scan_log(idletoken_llama *lc) {
         if (line[n - 1] != '\n' && n < sizeof(line) - 1)
             break;   /* the child is mid-line; re-read it whole next time */
         offset += (long long)n;
-        if (!idletoken_llama_log_fit_failed(line)) continue;
+        const int fit_failed = idletoken_llama_log_fit_failed(line);
+        const int terminal_failure = idletoken_llama_log_terminal_failure(line);
+        if (!fit_failed && !terminal_failure) continue;
 
-        /* Placement is locked for both single and cluster execution. Reaching
-         * this line is a runtime confirmation that the exact GPU-only service
-         * does not fit; no environment escape hatch may turn it into paging. */
-        snprintf(fatal, sizeof fatal,
-                 "[RESOURCE_INSUFFICIENT] the inference engine could not fit this model into free "
-                 "device memory and started anyway (its log: \"%s\"). Serving "
-                 "in that state makes the GPU driver page video memory out to "
-                 "system memory — on Windows that can freeze the whole machine "
-                 "rather than fail. What to do: ask for a smaller --ctx-size, "
-                 "pick a smaller quantization of this model, close other GPU "
-                 "users, or add a machine to the cluster.",
-                 line);
+        if (terminal_failure) {
+            /* Strip the internal source path/assertion prefix. The tagged text
+             * is the stable public diagnostic and already explains why the
+             * engine refused; exposing it also keeps the original category for
+             * the client instead of replacing it with "kept crashing". */
+            const char *tag = strstr(line, "[RESOURCE_INSUFFICIENT]");
+            if (!tag) tag = strstr(line, "[ENGINE_CACHE_PLAN_MISMATCH]");
+            snprintf(fatal, sizeof fatal, "%s", tag ? tag : line);
+        } else {
+            /* Placement is locked for both single and cluster execution.
+             * Reaching this line is a runtime confirmation that the exact
+             * GPU-only service does not fit; no environment escape hatch may
+             * turn it into paging. */
+            snprintf(fatal, sizeof fatal,
+                     "[RESOURCE_INSUFFICIENT] the inference engine could not fit this model into free "
+                     "device memory and started anyway (its log: \"%s\"). Serving "
+                     "in that state makes the GPU driver page video memory out to "
+                     "system memory — on Windows that can freeze the whole machine "
+                     "rather than fail. What to do: ask for a smaller --ctx-size, "
+                     "pick a smaller quantization of this model, close other GPU "
+                     "users, or add a machine to the cluster.",
+                     line);
+        }
         /* Trim the copied engine line to one line's worth of noise. */
         for (char *p = fatal; *p; p++) if (*p == '\n' || *p == '\r') *p = ' ';
         break;

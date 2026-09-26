@@ -795,8 +795,14 @@ export interface PlannerPlan {
   mode: number;
   hybrid: boolean;
   nCpuMoe: number;
+  /** Exact occupancy of the selected runtime placement. Admission/logging use
+   * these; Hybrid may trade GPU against RAM as context changes. */
   gpuNeedBytes: number;
   ramNeedBytes: number;
+  /** Monotone, conservative UI reservation envelope across every
+   * smaller/equal product context at this precision. */
+  budgetGpuNeedBytes: number;
+  budgetRamNeedBytes: number;
   /** false = the GGUF's exact expert layout was unavailable, so a MoE model
    *  could only be planned GPU-only. The card must not present that as the
    *  Hybrid answer. */

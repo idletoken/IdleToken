@@ -355,11 +355,21 @@ typedef struct {
     uint64_t mmproj_bytes;
 } idletoken_llm_model_size;
 
+/* Minimum persistent-cache width preferred by Hybrid admission. One active
+ * route (top-k) is only the execution floor: it can end every token holding
+ * exactly that token's route and has no room for reuse. The product
+ * performance floor is the larger of two complete routes and one third of
+ * the model's expert population, capped by the total expert count. This is
+ * derived only from GGUF metadata; invalid/non-MoE metadata returns zero. */
+uint32_t idletoken_llama_moe_cache_target_experts(
+                                    const idletoken_llm_model_size *model);
+
 /* Owner-local cache geometry for RAM expert layers [lo,hi). On success,
  * fixed_bytes includes the runtime's 512-MiB reserve, largest full-tensor
  * staging buffer and allocation tails; slot_bytes covers one expert in
  * every cached weight. Empty ranges return zero. Invalid/missing geometry
- * or overflow returns -1. Admission additionally charges top-k slots. */
+ * or overflow returns -1. Strict admission additionally charges the cache
+ * target above; the relaxed last-resort pass may admit less. */
 int idletoken_llama_moe_cache_budget(const idletoken_llm_model_size *model,
                                     uint32_t lo, uint32_t hi,
                                     uint64_t *slot_bytes, uint64_t *fixed_bytes);
@@ -528,6 +538,28 @@ int idletoken_plan_llamacpp(const idletoken_llm_model_size *model,
                             int force_cluster,
                             idletoken_llama_plan *out);
 
+/* Stable resource-card budget for one resolved model precision.
+ *
+ * Runtime admission MUST use idletoken_plan_llamacpp() for the exact selected
+ * context.  A Hybrid plan is a placement, not an intrinsic requirement: when
+ * the context grows, the planner may move more routed experts to RAM and the
+ * resulting GPU occupancy can legitimately fall.  Presenting that occupancy
+ * as "minimum GPU needed" made 128K appear to require more VRAM than 256K.
+ *
+ * This helper takes the component-wise maximum of the real planner results at
+ * every product context tier up to and including `ctx_size`.  The returned GPU
+ * and RAM figures are therefore a conservative, monotone reservation envelope
+ * for display only.  They never participate in admission or engine arguments.
+ * Refused placements are included so a refusal card remains monotone too.
+ * Returns 0 on success or -1 for invalid inputs / a nested planner error. */
+int idletoken_plan_llamacpp_requirement_envelope(
+                            const idletoken_llm_model_size *model,
+                            const idletoken_node_mem *nodes, int n,
+                            int coordinator, uint32_t ctx_size,
+                            int force_cluster,
+                            uint64_t *gpu_need_out,
+                            uint64_t *ram_need_out);
+
 /* Largest context that fits `usable` bytes next to the weights + fixed
  * overhead, capped at ctx_want. Returns the granted context (a multiple of
  * 1024, ≥ ctx_floor), or 0 when even ctx_floor does not fit — the caller must
@@ -584,6 +616,12 @@ int idletoken_llama_kv_tier_of_name(const char *name);
  * flash-attention pairs were measured falling back to CPU on the pinned engine.
  * This rule is identical in private and shared mode. */
 const char *idletoken_llama_kv_type_for_weight(int weight_bits);
+
+/* Growth-cache byte scale selected by the same weight-tier rule as the dtype
+ * above: q4_0 = 18/64, q8_0 = 34/64, f16 = 1.  Keeping this derived from the
+ * single tier function prevents capability/card callers from silently leaving
+ * Q5/Q6/Q8 at f16 while the coordinator launches them with q8_0. */
+double idletoken_llama_kv_growth_scale_for_weight(int weight_bits);
 
 /* Legacy diagnostic rounding helper. Product startup uses the exact selected
  * 131072, 262144, or 1048576 tokens; it never walks this list automatically. */

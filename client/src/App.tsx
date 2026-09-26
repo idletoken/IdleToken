@@ -196,6 +196,8 @@ interface PlanJson {
   n_cpu_moe: number;
   gpu_need: number;
   ram_need: number;
+  budget_gpu_need?: number;
+  budget_ram_need?: number;
   expert_layout_exact: boolean;
   nodes: { index: number; label: string; gpu: number; ram: number; vram_usable: number }[];
   why: string;
@@ -221,6 +223,8 @@ function loadPlan(modelId: string, quant: string, ggufPath: string, ctx: number,
       nCpuMoe: r.n_cpu_moe,
       gpuNeedBytes: r.gpu_need,
       ramNeedBytes: r.ram_need,
+      budgetGpuNeedBytes: r.budget_gpu_need ?? r.gpu_need,
+      budgetRamNeedBytes: r.budget_ram_need ?? r.ram_need,
       expertLayoutExact: r.expert_layout_exact,
       nodes: (r.nodes ?? []).map((n) => ({
         index: n.index, label: n.label, gpu: n.gpu, ram: n.ram,
@@ -421,14 +425,15 @@ function NodeCapacityCard(props: {
       });
     return () => { live = false; };
   }, [hybridMode, props.model.id, props.quant, props.weights?.needs, props.weights?.path]);
-  /* Totals to display: the planner's own per-machine figures, added up. The
-   * per-machine feasibility has already been decided by the planner, so the
-   * verdict below comes from its decision and never from comparing these two
-   * sums — an aggregate that fits can still have no workable split. */
-  const planGpuNeed = plan
-    ? (plan.nodes.length ? plan.nodes.reduce((a, n) => a + n.gpu, 0) : plan.gpuNeedBytes)
-    : undefined;
-  const planRamNeed = plan ? plan.ramNeedBytes : undefined;
+  /* Display the planner's reservation ENVELOPE, not the exact placement's
+   * instantaneous occupancy. Hybrid may move more experts to RAM at a larger
+   * context, so exact GPU occupancy can legitimately fall (the reported Qwen
+   * 35B case was 9.39 GiB at 128K and 8.77 GiB at 256K). Calling those values
+   * "minimum required" made the product ladder look backwards. The envelope
+   * is the component-wise maximum across every smaller/equal product context
+   * at the selected precision; runtime admission still uses the exact plan. */
+  const planGpuNeed = plan?.budgetGpuNeedBytes;
+  const planRamNeed = plan?.budgetRamNeedBytes;
   const hybridNeed = hybridMode ? hybridRequirements(gpuCap.needBytes, moeLayout) : null;
   const estimateVerdict: ClusterCapacityVerdict = !hybridMode
     ? clustered
@@ -606,7 +611,7 @@ function NodeCapacityCard(props: {
                 <strong>{GiBHave(gpuAvailable)} GiB</strong>
               </span>
               <span className="capacity__resource-stat">
-                <span>{t(hybridMode ? "capacity.minimum" : "capacity.required")}</span>
+                <span>{t(hybridMode ? "capacity.reserveBudget" : "capacity.required")}</span>
                 <strong className={gpuShort ? "capacity__gap" : ""}>
                   {planGpuNeed !== undefined
                     ? `${GiBNeed(planGpuNeed)} GiB`
@@ -616,7 +621,7 @@ function NodeCapacityCard(props: {
                 </strong>
               </span>
             </div>
-            <div className="spine capacity__spine" role="img" aria-label={`${capacityMemoryLabel} · ${t("capacity.available")} ${GiBHave(gpuAvailable)} GiB · ${t(hybridMode ? "capacity.minimum" : "capacity.required")} ${gpuNeedBytes ? `${GiBNeed(gpuNeedBytes)} GiB` : "—"}`}>
+            <div className="spine capacity__spine" role="img" aria-label={`${capacityMemoryLabel} · ${t("capacity.available")} ${GiBHave(gpuAvailable)} GiB · ${t(hybridMode ? "capacity.reserveBudget" : "capacity.required")} ${gpuNeedBytes ? `${GiBNeed(gpuNeedBytes)} GiB` : "—"}`}>
               {ticks.map((_, i) => (
                 <span key={i} className={`tick${i < gpuVisibleLayers ? " tick--on" : ""}`} />
               ))}
@@ -844,15 +849,18 @@ function ActivityRow(props: { stats: ClusterStats | null }) {
 // (a box that looks like chat must be chat — the one-shot answer lived here
 // before and violated that expectation).
 
-// ---- cluster: the product's home on the dashboard --------------------------
-// The cluster (not this machine) is what the user is here for. Empty state =
-// the onboarding hero; active state = members, API address and the try-it box,
-// with the pairing panel as the management surface.
+// ---- local / cluster deployment card ---------------------------------------
+// Empty state presents both deployment choices with planner-driven emphasis;
+// active state shows members, API address and the pairing management surface.
 function ClusterCard(props: {
   pair: PairingSnapshot | null;
   // A hardware/backend fact, not a capacity estimate. Unsupported compute
   // hardware remains a hard gate; an estimated memory shortfall does not.
   canServeStandalone?: boolean;
+  /** The shipped planner says this exact model/quant/context fits the local
+   *  machine. This changes visual priority only; neither deployment path is
+   *  hidden or capacity-disabled. */
+  preferLocal?: boolean;
   onServeStandalone?: () => void;
   // Weight presence and download state belong to the selected model, above the
   // two deployment choices. Rendering this inside each choice made one transfer
@@ -1014,7 +1022,7 @@ function ClusterCard(props: {
             <h3 className="deploy-opt__title">{t("deploy.local")}</h3>
           </div>
           <button
-            className="btn-secondary"
+            className={props.preferLocal ? "btn-primary" : "btn-secondary"}
             // Serving needs the weights already here. The selected-model row
             // above owns downloading, so this button waits rather than
             // duplicating that action or its progress. Capacity is deliberately
@@ -1040,7 +1048,7 @@ function ClusterCard(props: {
                 already offers joining with a code — a second button for the
                 same dialog's other tab was noise (removed 2026-08-15). */}
             <button
-              className="btn-primary"
+              className={props.preferLocal ? "btn-secondary" : "btn-primary"}
               disabled={!canServe || !weightsReady}
               title={!canServe
                 ? t("pairing.createNeedsCompute")
@@ -1052,11 +1060,11 @@ function ClusterCard(props: {
               {t("cluster.create")}
             </button>
           </div>
-          {/* Still no "recommended" badge and no explanatory copy. Clustering
-              remains the stable primary action; the capacity card is a warning,
-              not a control that silently changes which choice the UI promotes.
-              Both paths remain one click away and runtime admission remains the
-              authority. */}
+          {/* Still no "recommended" badge and no explanatory copy. The same
+              native planner that drives the capacity card promotes local when
+              this exact selection fits; otherwise cluster stays primary. This
+              is visual priority only: both paths remain one click away and
+              runtime admission remains the authority. */}
         </div>
 
         {/* The capability table (A-P1-3) was here until 2026-08-21 (Settings →
@@ -1504,6 +1512,22 @@ function Dashboard(props: {
   // old fallback of three added two imaginary engine-overhead allocations and
   // made a 256K estimate look larger without any machines to justify it.
   const nNodes = props.pair && props.pair.peers.length > 0 ? props.pair.peers.length : 1;
+  /* Deployment priority asks the native planner about THIS machine only. The
+   * buttons are rendered only before a roster exists, but keeping this query
+   * explicitly local prevents a stale/closing roster from making a cluster
+   * aggregate promote the local action. The identical cache key is shared with
+   * NodeCapacityCard, so the card and buttons cannot drift. */
+  const localNodesSpec = useMemo(() => plannerNodesSpec([{
+    vramFree: props.budget.vram_usable,
+    ramFree: props.budget.ram_usable,
+    ramExpertFree: props.budget.ram_expert_usable,
+    unifiedMemory: s.unified_memory,
+  }], backendOfOs(s.os), [s.hostname]),
+  [props.budget, s.unified_memory, s.os, s.hostname]);
+  const localPlanGguf = props.weights?.needs ? "" : (props.weights?.path ?? "");
+  const [localPlan] = usePlan(props.model.id, props.quant, localPlanGguf,
+                              props.tier.ctx, localNodesSpec);
+  const preferLocal = localPlan?.kind === 0;
   // The generic refusal surface (D2): whatever sentence the engine sent
   // through the JOIN_REFUSED / exit-3 channel, verbatim, where the user is
   // looking. WS-C's "upgrade machine X" (version mismatch) arrives through
@@ -1537,6 +1561,7 @@ function Dashboard(props: {
           <ClusterCard
             pair={props.pair}
             canServeStandalone={(s.hw_status ?? HW_OK) === HW_OK}
+            preferLocal={preferLocal}
             onServeStandalone={props.onServeStandalone}
             weights={props.weights}
             onCreate={props.onCreateCluster}

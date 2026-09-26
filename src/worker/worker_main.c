@@ -1968,6 +1968,12 @@ int main(int argc, char **argv) {
                             "tier (131072, 262144 or 1048576), not %s\n", pj_ctx);
             return 2;
         }
+        if (ctx > idletoken_llama_product_ctx_ceiling(spec)) {
+            fprintf(stderr, "idletoken-worker: --plan-json context %u exceeds "
+                            "%s's supported ceiling %u\n", ctx, spec->id,
+                            idletoken_llama_product_ctx_ceiling(spec));
+            return 2;
+        }
         idletoken_llm_model_size size;
         char source[512] = "";
         if (idletoken_model_size_resolve(spec, pj_quant, gguf, &size,
@@ -1982,9 +1988,10 @@ int main(int argc, char **argv) {
             int wbits = pj_quant && pj_quant[0]
                 ? idletoken_quant_weight_bits(pj_quant) : 0;
             if (!wbits && gguf) wbits = idletoken_quant_bits_from_path(gguf);
-            const char *kv = idletoken_llama_kv_type_for_weight(wbits);
-            if (kv && !strcmp(kv, "q4_0")) idletoken_llama_model_kv_scale(&size, 18.0 / 64.0);
-            else if (kv && !strcmp(kv, "q8_0")) idletoken_llama_model_kv_scale(&size, 34.0 / 64.0);
+            const double scale =
+                idletoken_llama_kv_growth_scale_for_weight(wbits);
+            if (scale != 1.0)
+                idletoken_llama_model_kv_scale(&size, scale);
             idletoken_model_size_set_kv_tier(spec, &size,
                 idletoken_llama_kv_tier_for_weight(wbits));
         }
@@ -2027,17 +2034,30 @@ int main(int argc, char **argv) {
             fprintf(stderr, "idletoken-worker: planner rejected the inputs\n");
             return 1;
         }
+        uint64_t budget_gpu = 0, budget_ram = 0;
+        if (idletoken_plan_llamacpp_requirement_envelope(
+                &size, nodes, n, 0, ctx, n > 1,
+                &budget_gpu, &budget_ram) != 0) {
+            fprintf(stderr, "idletoken-worker: could not build the monotone "
+                            "resource budget envelope\n");
+            return 1;
+        }
         printf("{\"kind\":%d,\"mode\":%d,\"hybrid\":%s,\"n_cpu_moe\":%u,"
-               "\"gpu_need\":%llu,\"ram_need\":%llu,\"n_nodes\":%d,"
+               "\"gpu_need\":%llu,\"ram_need\":%llu,"
+               "\"budget_gpu_need\":%llu,\"budget_ram_need\":%llu,"
+               "\"n_nodes\":%d,"
                "\"expert_layout_exact\":%s,\"estimated\":%s,\"nodes\":[",
                /* `expert_layout_exact` already tells the caller whether the
                 * expert split was read from the file or spread from the
                 * manifest; plan.estimated is the same fact carried on the plan
                 * itself, and the two must never disagree. */
                (int)plan.kind, (int)plan.mode,
-               plan.cluster_moe_hybrid ? "true" : "false", plan.n_cpu_moe,
+               plan.mode == IDLETOKEN_MODE_HYBRID ? "true" : "false",
+               plan.n_cpu_moe,
                (unsigned long long)plan.gpu_need_bytes,
                (unsigned long long)plan.ram_need_bytes,
+               (unsigned long long)budget_gpu,
+               (unsigned long long)budget_ram,
                plan.kind == IDLETOKEN_LLPLAN_CLUSTER ? plan.n_nodes : 1,
                size.expert_bytes_complete ? "true" : "false",
                plan.estimated ? "true" : "false");

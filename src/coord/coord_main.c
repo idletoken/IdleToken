@@ -2799,6 +2799,21 @@ static int coord_selftest(void) {
            "fit detector: an unrelated engine line does not trip it");
         ST(idletoken_llama_log_fit_failed(NULL) == 0,
            "fit detector: no text is not a failure");
+
+        ST(idletoken_llama_log_terminal_failure(
+               "ggml-backend.cpp:1283: [RESOURCE_INSUFFICIENT] planned GPU "
+               "expert cache cannot hold this model's active experts; refusing "
+               "CPU fallback") == 1,
+           "engine fatal detector: tagged resource refusal is terminal");
+        ST(idletoken_llama_log_terminal_failure(
+               "ggml-backend.cpp:4658: [ENGINE_CACHE_PLAN_MISMATCH] owner-local "
+               "expert graph does not match the admitted GGUF cache plan") == 1,
+           "engine fatal detector: tagged cache-plan mismatch is terminal");
+        ST(idletoken_llama_log_terminal_failure(
+               "moe-pool: adaptive cache enabled: 8 slots/tensor") == 0,
+           "engine fatal detector: successful cache setup stays quiet");
+        ST(idletoken_llama_log_terminal_failure(NULL) == 0,
+           "engine fatal detector: no text is not terminal");
     }
 
     /* --- -ngl: all product paths are GPU-only ---------------------------- */
@@ -8668,12 +8683,12 @@ static int coord_weight_repo_start(const char *gguf,
  * interval [dev_lo,dev_hi) belongs to one remote machine. Output tensors are
  * shared/global in the GGUF index and are fetched for every worker, so only
  * repeating layers are returned here. */
-/* Expert-pool slot count actually handed out, after the measurement knob
- * IDLETOKEN_MOE_POOL_EXPERTS (2026-09-07): unset = the planner's number; a
- * value forces every node's per-tensor pool to it, and 0 means NO pool — the
- * routed experts then stay on the CPU device and the engine computes them
- * there instead of copying them to the GPU per token. Not a product setting;
- * it exists to measure that path against the pool path on the same plan. */
+/* Expert-pool slot count from the planner, plus the measurement knob
+ * IDLETOKEN_MOE_POOL_EXPERTS (2026-09-07): unset uses the planner; a value
+ * forces every node's per-tensor pool to it, and 0 means NO pool — the routed
+ * experts then stay on the CPU device and the engine computes them there
+ * instead of copying them to the GPU per token. Not a product setting; it
+ * exists to measure that path against the pool path on the same plan. */
 static int coord_moe_pool_override_value(uint32_t *value) {
     const char *e = getenv("IDLETOKEN_MOE_POOL_EXPERTS");
     if (!e || !e[0] || !value) return 0;
@@ -8708,9 +8723,44 @@ static int coord_moe_pool_covers_active(uint32_t capacity,
     return n_expert_used > 0 && capacity >= n_expert_used;
 }
 
-/* Metadata identity of the exact routed-expert weight set the runtime cache
- * must observe for an owner range. Hash addition is deliberately commutative:
- * GGUF directory order and graph traversal order are not required to match. */
+/* Convert a single-machine planner cache budget into its deterministic runtime
+ * reservation. The strict Hybrid pass budgets the planner's metadata-derived
+ * reuse floor; reserve its whole planned capacity before graph allocation.
+ * Asking AUTO to allocate it after the first graph is too late on the affected
+ * WDDM path: the same plan that successfully preallocates slots reported zero
+ * free bytes post-load and hit the engine's fail-closed abort (Windows,
+ * 2026-09-25). Reserving only the active-set floor avoids that crash but throws
+ * away the warm expert working set: Qwen3.5-35B fell from 49--53 to 14--24
+ * tok/s on the measured 16-GiB node (2026-09-26).
+ *
+ * The relaxed pass deliberately admits the model without this optional cache,
+ * so a capacity below the active set becomes zero. The existing measurement
+ * override remains literal, including an explicit zero. */
+static uint32_t coord_moe_single_pool_runtime_capacity(
+                                                int requested, int overridden,
+                                                uint32_t capacity,
+                                                uint32_t n_expert_used) {
+    if (!requested) return 0;
+    if (overridden) return capacity;
+    return coord_moe_pool_covers_active(capacity, n_expert_used)
+        ? capacity : 0;
+}
+
+/* Cluster mode keeps the post-load adaptive path that has real two-node
+ * Windows evidence. AUTO is still a hard execution promise, so only request it
+ * when the plan can pay for a complete active set. The planner's separate
+ * reuse target is a performance preference: a relaxed plan may legally
+ * expose a smaller-but-active cache. */
+static int coord_moe_pool_should_adapt(int requested, int overridden,
+                                       uint32_t capacity,
+                                       uint32_t n_expert_used) {
+    return requested && !overridden &&
+           coord_moe_pool_covers_active(capacity, n_expert_used);
+}
+
+/* Metadata identity of the exact routed-expert weight set the adaptive
+ * cluster cache must observe for an owner range. Hash addition is deliberately
+ * commutative: GGUF directory order and graph traversal order need not match. */
 static int coord_moe_weight_signature(const idletoken_llm_model_size *msize,
                                       uint32_t lo, uint32_t hi,
                                       uint32_t *count, uint64_t *hash) {
@@ -8960,21 +9010,56 @@ static int cluster_moe_args_selftest(void) {
         }
     }
 
-    /* The minimum useful pool follows the model metadata. Keep all curated
-     * routing widths represented so a convenient top-8 model cannot turn back
-     * into a global threshold. */
+    /* Both cache widths follow model metadata: one route is the runtime
+     * execution floor, while the planner's reuse target is max(two routes,
+     * one third of all experts). Keep all curated routing widths represented
+     * so a convenient top-8 model cannot turn back into a global threshold. */
     {
         static const uint32_t active[] = { 4, 6, 8, 10 };
         int bad = 0;
         for (size_t i = 0; i < sizeof active / sizeof active[0]; i++) {
+            idletoken_llm_model_size model = {0};
+            model.n_expert = 256;
+            model.n_expert_used = active[i];
             bad += !coord_moe_pool_covers_active(active[i], active[i]);
             bad += coord_moe_pool_covers_active(active[i] - 1, active[i]);
+            bad += idletoken_llama_moe_cache_target_experts(&model) != 86;
         }
+        idletoken_llm_model_size route_dominates = {0};
+        route_dominates.n_expert = 12;
+        route_dominates.n_expert_used = 6;
+        bad += idletoken_llama_moe_cache_target_experts(&route_dominates) != 12;
         if (!bad && !coord_moe_pool_covers_active(8, 10) &&
             coord_moe_pool_covers_active(6, 6)) {
-            fprintf(stderr, "selftest PASS MoE pool floor follows top-4/6/8/10 model metadata\n");
+            fprintf(stderr, "selftest PASS MoE execution floor and metadata-derived reuse target follow expert counts\n");
         } else {
-            fprintf(stderr, "selftest FAIL MoE pool floor used a model-independent threshold\n");
+            fprintf(stderr, "selftest FAIL MoE cache widths used a model-independent threshold\n");
+            fails++;
+        }
+    }
+
+    /* Regression: single-machine Hybrid reserves every useful byte-exact
+     * planned capacity before graph allocation. A capacity below the active
+     * route requests no pool; a relaxed capacity between the active floor and
+     * the reuse target remains valid. The separate cluster AUTO path keeps
+     * the same execution-floor rule. */
+    {
+        const int ok =
+            coord_moe_single_pool_runtime_capacity(1, 0, 0, 8) == 0 &&
+            coord_moe_single_pool_runtime_capacity(1, 0, 7, 8) == 0 &&
+            coord_moe_single_pool_runtime_capacity(1, 0, 8, 8) == 8 &&
+            coord_moe_single_pool_runtime_capacity(1, 0, 13, 8) == 13 &&
+            coord_moe_single_pool_runtime_capacity(1, 1, 13, 8) == 13 &&
+            coord_moe_single_pool_runtime_capacity(1, 1, 0, 8) == 0 &&
+            coord_moe_single_pool_runtime_capacity(0, 0, 13, 8) == 0 &&
+            !coord_moe_pool_should_adapt(1, 0, 7, 8) &&
+             coord_moe_pool_should_adapt(1, 0, 8, 8) &&
+            !coord_moe_pool_should_adapt(1, 1, 8, 8) &&
+            !coord_moe_pool_should_adapt(0, 0, 8, 8);
+        if (ok) {
+            fprintf(stderr, "selftest PASS single MoE preallocates its planned cache and cluster AUTO keeps the active-route floor\n");
+        } else {
+            fprintf(stderr, "selftest FAIL MoE runtime pool drifted from the strict/relaxed plan\n");
             fails++;
         }
     }
@@ -9709,10 +9794,8 @@ static int run_llamacpp_cluster_mode(
         const char *server_sched = getenv("IDLETOKEN_MOE_SERVER_SCHED");
         worker_moe_mode = server_sched && server_sched[0] == '0' ? 1 : 2;
         setenv("GGML_RPC_NODE_LOCAL_MOE", worker_moe_mode == 2 ? "2" : "1", 1);
-        /* Prefer the plan-time pool when its conservative remainder fits a
-         * useful batch. Otherwise give the engine the exact bytes for one slot
-         * across this node's real RAM-resident expert tensors. It may then use
-         * only memory genuinely left after model/graph allocation. */
+        /* Keep the measured post-load adaptive path for a strict cluster plan;
+         * a relaxed plan sends zero and uses the explicit no-cache path. */
         unsetenv("GGML_MOE_POOL_BYTES");
         coord_moe_layer_issue_env();
         for (int s = 0; s < lplan.n_nodes; s++) {
@@ -9744,8 +9827,11 @@ static int run_llamacpp_cluster_mode(
             const uint32_t n_cap = coord_moe_pool_override(planned_cap);
             const int pool_ready = coord_moe_pool_covers_active(
                 n_cap, msize->n_expert_used);
-            const int use_adaptive = worker_moe_mode == 2 && spilled > 0 &&
-                                     !pool_overridden;
+            const int use_adaptive = coord_moe_pool_should_adapt(
+                worker_moe_mode == 2 && spilled > 0, pool_overridden,
+                n_cap, msize->n_expert_used);
+            const uint32_t fixed_cap = pool_overridden ? n_cap
+                : (pool_ready ? n_cap : 0);
             fprintf(stderr, "coord: expert pool on node %u: planner estimates %u of %u "
                             "experts per tensor (%u RAM-expert layers, %.2f GiB total cache budget, "
                             "%.2f GiB GPU need, %.2f GiB of experts in RAM)%s%s\n",
@@ -9755,8 +9841,7 @@ static int run_llamacpp_cluster_mode(
                     (double)lplan.cpu_moe_bytes_per_node[s] / 1073741824.0,
                     pool_ready ? "" : " -- below this model's active-expert count",
                     use_adaptive ? "; runtime will size it from post-load free VRAM" : "");
-            pool_experts_slot[s] = use_adaptive ? 0
-                : (pool_overridden ? n_cap : (pool_ready ? n_cap : 0));
+            pool_experts_slot[s] = use_adaptive ? 0 : fixed_cap;
             if (use_adaptive) {
                 if (coord_moe_weight_signature(
                         msize, lplan.layer_lo[s], lplan.cpu_moe_layer_hi[s],
@@ -9778,9 +9863,9 @@ static int run_llamacpp_cluster_mode(
                     unsetenv("GGML_MOE_POOL_EXPERTS");
                     setenv("GGML_MOE_AUTO_WEIGHT_COUNT", count, 1);
                     setenv("GGML_MOE_AUTO_WEIGHT_HASH", hash, 1);
-                } else if (pool_overridden || pool_ready) {
+                } else if (pool_overridden || fixed_cap > 0) {
                     char pool[16];
-                    snprintf(pool, sizeof(pool), "%u", n_cap);
+                    snprintf(pool, sizeof(pool), "%u", fixed_cap);
                     setenv("GGML_MOE_POOL_EXPERTS", pool, 1);
                     unsetenv("GGML_MOE_AUTO_WEIGHT_COUNT");
                     unsetenv("GGML_MOE_AUTO_WEIGHT_HASH");
@@ -10821,37 +10906,32 @@ int main(int argc, char **argv) {
                 const uint32_t n_cap = coord_moe_pool_override(planned_cap);
                 const int pool_ready = coord_moe_pool_covers_active(
                     n_cap, msize.n_expert_used);
-                if (!pool_overridden) {
-                    uint32_t weight_count = 0;
-                    uint64_t weight_hash = 0;
-                    if (coord_moe_weight_signature(&msize, 0, lplan.n_cpu_moe,
-                                                   &weight_count, &weight_hash) != 0) {
-                        fprintf(stderr, "idletoken-coord: exact expert-weight identity failed "
-                                        "for local layers [0,%u)\n", lplan.n_cpu_moe);
-                        return 1;
-                    }
-                    char count[16], hash[32];
-                    snprintf(count, sizeof(count), "%u", weight_count);
-                    snprintf(hash, sizeof(hash), "%llu", (unsigned long long)weight_hash);
-                    unsetenv("GGML_MOE_POOL_EXPERTS");
-                    setenv("GGML_MOE_AUTO_WEIGHT_COUNT", count, 1);
-                    setenv("GGML_MOE_AUTO_WEIGHT_HASH", hash, 1);
-                } else {
+                const uint32_t runtime_cap = coord_moe_single_pool_runtime_capacity(
+                    1, pool_overridden, n_cap, msize.n_expert_used);
+                if (pool_overridden || runtime_cap > 0) {
                     char pool[16];
-                    snprintf(pool, sizeof(pool), "%u", n_cap);
+                    snprintf(pool, sizeof(pool), "%u", runtime_cap);
                     setenv("GGML_MOE_POOL_EXPERTS", pool, 1);
+                    unsetenv("GGML_MOE_AUTO_WEIGHT_COUNT");
+                    unsetenv("GGML_MOE_AUTO_WEIGHT_HASH");
+                } else {
+                    /* The relaxed planner pass admitted this model without a
+                     * persistent expert cache. */
+                    unsetenv("GGML_MOE_POOL_EXPERTS");
                     unsetenv("GGML_MOE_AUTO_WEIGHT_COUNT");
                     unsetenv("GGML_MOE_AUTO_WEIGHT_HASH");
                 }
                 fprintf(stderr, "coord: expert pool: planner estimates %u of %u experts per "
                                 "tensor (%.2f GiB total cache budget, %u block(s) of experts "
-                                "in RAM)%s%s\n",
+                                "in RAM)%s; runtime reserves %u slot(s)/tensor%s\n",
                         planned_cap, msize.n_expert,
                         (double)lplan.moe_pool_bytes / 1073741824.0,
                         lplan.n_cpu_moe,
                         pool_ready ? "" : " -- below this model's active-expert count",
-                        pool_overridden ? "" :
-                            "; runtime will size it from post-load free VRAM");
+                        runtime_cap,
+                        pool_overridden ? " (measurement override)" :
+                        (runtime_cap > 0 ? " (planned capacity, preallocated)" :
+                                           " (persistent cache disabled)"));
             } else {
                 unsetenv("GGML_MOE_POOL_EXPERTS");
                 unsetenv("GGML_MOE_AUTO_WEIGHT_COUNT");
