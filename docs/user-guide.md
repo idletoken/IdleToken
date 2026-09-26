@@ -18,8 +18,7 @@ sharing, API access, and common troubleshooting.
 5. [Build a LAN cluster](#5-build-a-lan-cluster)
 6. [Share spare compute](#6-share-spare-compute)
 7. [Connect Claude Code and API clients](#7-connect-claude-code-and-api-clients)
-8. [Understand the privacy boundary](#8-understand-the-privacy-boundary)
-9. [Troubleshoot](#9-troubleshoot)
+8. [Troubleshoot](#8-troubleshoot)
 
 ## 1. Check the device requirements
 
@@ -288,7 +287,6 @@ for example through `IDLETOKEN_API_TOKEN`, send that token with each request.
 ```sh
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8000
 export ANTHROPIC_API_KEY=idletoken
-export NO_PROXY=127.0.0.1,localhost
 claude
 ```
 
@@ -334,21 +332,19 @@ curl https://api.idletoken.ai/v1/chat/completions \
 Platform requests spend Sparks from the account. Use the portal's Discover page
 or `GET /catalog` to see models and precisions with an online service.
 
-## 8. Understand the privacy boundary
+### Models and precisions
 
-- Cross-machine compute in a private LAN cluster uses PSK-TLS. The embedding
-  lookup and layer 0 stay on the machine that created the cluster.
-- The local API binds only to `127.0.0.1`, not the LAN. Requests carrying a
-  browser `Origin` header are rejected to prevent a web page from calling the
-  loopback API directly.
-- Remote platform requests use encrypted transport envelopes in transit, but
-  the platform may process plaintext for routing, moderation, abuse handling,
-  and accounting. Transport encryption does not mean the platform cannot read
-  prompts.
-- Add only machines you trust to a private cluster. Link encryption cannot
-  protect against an attacker who already controls a participating node.
+When a request specifies only a model name, the platform uses the account's
+scheduling preference to choose among all currently available precisions and
+services for that model. When a request uses `model:quant`, the platform first
+tries the requested precision. If it is unavailable and **Allow higher-precision
+substitution** is enabled, the platform applies the same scheduling preference
+only to higher precisions of the same model. It never substitutes a lower
+precision. If no higher precision is available, or if substitution is disabled,
+the request returns a no-service error. Charges always use the precision that
+actually serves the request.
 
-## 9. Troubleshoot
+## 8. Troubleshoot
 
 ### Verification or reset mail does not arrive
 
@@ -381,11 +377,6 @@ A large model can take several minutes to load. Open the engine log to see its
 current stage. If the card shows an error, address the logged cause before
 trying again. Include the client version, error details, and relevant log when
 reporting a problem.
-
-### A streaming response never finishes
-
-Set `NO_PROXY=127.0.0.1,localhost`. Local HTTP proxies such as Clash can
-intercept loopback SSE and swallow the end-of-stream signal.
 
 ### The Linux window is blank
 
