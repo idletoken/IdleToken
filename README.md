@@ -143,7 +143,7 @@ Minimum requirements for deploying a model on your own machine:
 
 | Platform | Minimum requirements |
 | --- | --- |
-| **Windows 10/11 · Linux x86_64/arm64** | An NVIDIA GPU from the RTX 20 series or newer (Turing, compute capability 7.5) with 8 GB of VRAM, and a current NVIDIA driver. The published v0.1.90 Linux binaries require glibc 2.39; builds from the current source target and declare glibc 2.35. |
+| **Windows 10/11 · Linux x86_64/arm64** | An NVIDIA GPU from the RTX 20 series or newer (Turing, compute capability 7.5) with 8 GB of VRAM, and a current NVIDIA driver. Current Linux packages require glibc 2.35. |
 | **macOS** | An Apple Silicon Mac with 16 GB of unified memory. |
 
 ## 🖧 Cluster deployment

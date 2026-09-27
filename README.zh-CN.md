@@ -141,7 +141,7 @@ opencode
 
 | 平台 | 最低配置 |
 | --- | --- |
-| **Windows 10/11 · Linux x86_64/arm64** | NVIDIA 显卡，RTX 20 系（Turing，计算能力 7.5）及以后，显存 8 GB，并安装当前 NVIDIA 驱动。已发布的 v0.1.90 Linux 二进制要求 glibc 2.39；当前源码构建以 glibc 2.35 为目标并在包元数据中声明。 |
+| **Windows 10/11 · Linux x86_64/arm64** | NVIDIA 显卡，RTX 20 系（Turing，计算能力 7.5）及以后，显存 8 GB，并安装当前 NVIDIA 驱动。当前 Linux 安装包要求 glibc 2.35。 |
 | **macOS** | Apple Silicon Mac，统一内存 16 GB。 |
 
 ## 🖧 联机

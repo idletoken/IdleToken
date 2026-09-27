@@ -116,13 +116,11 @@ sudo dnf install ./IdleToken-<version>-1.aarch64.rpm
 ```
 
 Linux packages include the required user-space CUDA runtime libraries. You only
-need a compatible NVIDIA driver. The published v0.1.90 Linux packages require
-glibc 2.39. The next packages built from the current source target glibc 2.35
-and will declare that floor in package metadata; the lower floor does not take
-effect until those packages are actually released. The official Linux release
-lane supports `.deb` and `.rpm`; dependency names vary on other RPM
-distributions, so do not assume that the Fedora package installs unchanged on
-RHEL or openSUSE.
+need a compatible NVIDIA driver. Current Linux packages require glibc 2.35 and
+declare that floor in package metadata. The official Linux release lane
+supports `.deb` and `.rpm`; dependency names vary on other RPM distributions,
+so do not assume that the Fedora package installs unchanged on RHEL or
+openSUSE.
 
 IdleToken has no in-app updater. To upgrade, download and install the newer
 native package over the existing installation.

@@ -104,11 +104,10 @@ sudo dnf install ./IdleToken-<版本>-1.x86_64.rpm
 sudo dnf install ./IdleToken-<版本>-1.aarch64.rpm
 ```
 
-Linux 安装包已经包含所需的 CUDA 用户态运行库，只需要兼容的 NVIDIA 驱动。Release 页面
-已经发布的 v0.1.90 Linux 安装包要求 glibc 2.39；当前源码的下一次 Linux 构建以 glibc 2.35
-为目标，并会在包元数据中声明该下限。这个较低下限要等新安装包实际发布后才生效。官方 Linux
-发布流程只支持 `.deb` 和 `.rpm`；其他 RPM 发行版的依赖包名可能不同，不能假定 Fedora 包
-可以原样安装到 RHEL 或 openSUSE。
+Linux 安装包已经包含所需的 CUDA 用户态运行库，只需要兼容的 NVIDIA 驱动。当前 Linux
+安装包要求 glibc 2.35，并在包元数据中声明该下限。官方 Linux 发布流程只支持 `.deb` 和
+`.rpm`；其他 RPM 发行版的依赖包名可能不同，不能假定 Fedora 包可以原样安装到 RHEL 或
+openSUSE。
 
 IdleToken 没有应用内更新器。升级时下载新的原生安装包并覆盖安装。
 
