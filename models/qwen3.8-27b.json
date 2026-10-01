@@ -202,7 +202,10 @@
       "repo": "unsloth/Qwen3.8-27B-GGUF",
       "gguf": "Qwen3.8-27B-UD-IQ1_S.gguf",
       "sha256": "3895b6eaa91e705c06ad1938d16c22e86f073c6a67df86260a1da79be3d1f887",
-      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "IQ1_M",
@@ -211,7 +214,10 @@
       "repo": "unsloth/Qwen3.8-27B-GGUF",
       "gguf": "Qwen3.8-27B-UD-IQ1_M.gguf",
       "sha256": "1b5165a7149ea51e683c8eaf23372188ad9fc9d1a795386f7a1b558acf847dc6",
-      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "IQ2_XXS",
@@ -220,7 +226,10 @@
       "repo": "unsloth/Qwen3.8-27B-GGUF",
       "gguf": "Qwen3.8-27B-UD-IQ2_XXS.gguf",
       "sha256": "e792d8fb3142fe6d9171876d6da0f71f05a71028718debc72dbec93ff645e67d",
-      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "IQ2_S",
@@ -229,7 +238,10 @@
       "repo": "unsloth/Qwen3.8-27B-GGUF",
       "gguf": "Qwen3.8-27B-UD-IQ2_S.gguf",
       "sha256": "7897d2c5a5cee46aef50895141b2c8a0803c1185f3d03c4fda4cd137a7ad77fe",
-      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q2_K_XL",
@@ -238,7 +250,10 @@
       "repo": "unsloth/Qwen3.8-27B-GGUF",
       "gguf": "Qwen3.8-27B-UD-Q2_K_XL.gguf",
       "sha256": "fd4730dd8aad070517978752b63d530aeb1740d2283cab9fa24f1e404032ddb0",
-      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7",
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 351008768,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "IQ3_XXS",
@@ -247,7 +262,10 @@
       "repo": "unsloth/Qwen3.8-27B-GGUF",
       "gguf": "Qwen3.8-27B-UD-IQ3_XXS.gguf",
       "sha256": "c0b7c3038681ed2e3040456c1dd45f9858b6c2290bed172c70388a94874f3eee",
-      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7",
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 351008768,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "IQ3_S",
@@ -256,7 +274,10 @@
       "repo": "unsloth/Qwen3.8-27B-GGUF",
       "gguf": "Qwen3.8-27B-UD-IQ3_S.gguf",
       "sha256": "d847e2c1e4aa276e4b7b8e9ad7628050e61e165d49ab995407bc36677a6f3864",
-      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7",
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 351008768,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q3_K_XL",
@@ -265,7 +286,10 @@
       "repo": "unsloth/Qwen3.8-27B-GGUF",
       "gguf": "Qwen3.8-27B-UD-Q3_K_XL.gguf",
       "sha256": "8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e",
-      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7",
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 351008768,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "IQ4_XS",
@@ -274,7 +298,10 @@
       "repo": "unsloth/Qwen3.8-27B-GGUF",
       "gguf": "Qwen3.8-27B-UD-IQ4_XS.gguf",
       "sha256": "40fac4050e940397dbf13087afd50f4734a11805bf9d65ef8ddd7483470e6199",
-      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7",
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 351008768,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q4_K_S",
@@ -283,7 +310,10 @@
       "repo": "unsloth/Qwen3.8-27B-GGUF",
       "gguf": "Qwen3.8-27B-UD-Q4_K_S.gguf",
       "sha256": "75bc9c8adba2842e72f0ab5201aaa07133c5010b566305c09187fcbdcd364017",
-      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7",
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 351008768,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q4_0",
@@ -292,7 +322,10 @@
       "repo": "unsloth/Qwen3.8-27B-GGUF",
       "gguf": "Qwen3.8-27B-Q4_0.gguf",
       "sha256": "ede16c7b36e578ca87a8c70e011e4b4633a32c831c0ce76d0f474582384e671d",
-      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7",
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 265197568,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q4_K_M",
@@ -301,7 +334,10 @@
       "repo": "unsloth/Qwen3.8-27B-GGUF",
       "gguf": "Qwen3.8-27B-UD-Q4_K_M.gguf",
       "sha256": "322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482",
-      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7",
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 351008768,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q4_1",
@@ -310,7 +346,10 @@
       "repo": "unsloth/Qwen3.8-27B-GGUF",
       "gguf": "Qwen3.8-27B-Q4_1.gguf",
       "sha256": "3e020514545c310dfc511dc8d3ddc23482b645189cb9287816d84bed6eddd4ac",
-      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7",
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 288462848,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q4_K_XL",
@@ -319,7 +358,10 @@
       "repo": "unsloth/Qwen3.8-27B-GGUF",
       "gguf": "Qwen3.8-27B-UD-Q4_K_XL.gguf",
       "sha256": "3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e",
-      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7",
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 351008768,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q5_K_S",
@@ -328,7 +370,10 @@
       "repo": "unsloth/Qwen3.8-27B-GGUF",
       "gguf": "Qwen3.8-27B-UD-Q5_K_S.gguf",
       "sha256": "d8d62ffcf84d42658dd6ccf9782b4d0404700af78b26d750507510c7597b5bfe",
-      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7",
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 351008768,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q5_K_M",
@@ -337,7 +382,10 @@
       "repo": "unsloth/Qwen3.8-27B-GGUF",
       "gguf": "Qwen3.8-27B-UD-Q5_K_M.gguf",
       "sha256": "2de73110cb254cbf09b54b717578dadff12ef1194e7271527e68202f39ba4bfd",
-      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7",
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 351008768,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q5_K_XL",
@@ -346,7 +394,10 @@
       "repo": "unsloth/Qwen3.8-27B-GGUF",
       "gguf": "Qwen3.8-27B-UD-Q5_K_XL.gguf",
       "sha256": "8601193d3d5760c37fb8ce1b43afebc69df5fb24e1fbc5a547c32e2200305276",
-      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7",
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 351008768,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q6_K",
@@ -355,7 +406,10 @@
       "repo": "unsloth/Qwen3.8-27B-GGUF",
       "gguf": "Qwen3.8-27B-UD-Q6_K.gguf",
       "sha256": "c9c206812fbe4ac7b76a729e25928b63f2ae89d37f69da7a71c20aec763cd436",
-      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7",
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 351008768,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q6_K_M",
@@ -364,7 +418,10 @@
       "repo": "unsloth/Qwen3.8-27B-GGUF",
       "gguf": "Qwen3.8-27B-UD-Q6_K_M.gguf",
       "sha256": "493301830a596b8ad56dc1329f80bbcb578c8e910da395feafdc9cd8263430bb",
-      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7",
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 351008768,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q6_K_L",
@@ -373,7 +430,10 @@
       "repo": "unsloth/Qwen3.8-27B-GGUF",
       "gguf": "Qwen3.8-27B-UD-Q6_K_L.gguf",
       "sha256": "121355b4c7422771da25adc74090e3c90138f77ce5c92d348687d47824ec80f4",
-      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7",
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 351008768,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q6_K_XL",
@@ -382,7 +442,10 @@
       "repo": "unsloth/Qwen3.8-27B-GGUF",
       "gguf": "Qwen3.8-27B-UD-Q6_K_XL.gguf",
       "sha256": "701d8fa9ed214ab21bfc130cd2a7df19ca89bbef7713e2dfb19f3c63696aa917",
-      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7",
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 351008768,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q8_K_L",
@@ -391,7 +454,10 @@
       "repo": "unsloth/Qwen3.8-27B-GGUF",
       "gguf": "Qwen3.8-27B-UD-Q8_K_L.gguf",
       "sha256": "2a13bba36d2efa213f9275abc430c40e4d914b145bfde976f30f1bb5b7e23ac2",
-      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7",
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 351008768,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q8_0",
@@ -400,7 +466,10 @@
       "repo": "unsloth/Qwen3.8-27B-GGUF",
       "gguf": "Qwen3.8-27B-Q8_0.gguf",
       "sha256": "a680f44a06920e5d689774823782006aa3acc8db95750323373b24139b67e348",
-      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7",
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 451319808,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q8_K_XL",
@@ -409,7 +478,10 @@
       "repo": "unsloth/Qwen3.8-27B-GGUF",
       "gguf": "Qwen3.8-27B-UD-Q8_K_XL.gguf",
       "sha256": "af36ecb6b5db1407953345b746c14ac93f0657dda413910b4348683a2d990377",
-      "revision": "990216cf312573f2ac4060279848e0f4237600c7"
+      "revision": "990216cf312573f2ac4060279848e0f4237600c7",
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 569284608,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "BF16",
@@ -425,7 +497,10 @@
           "bytes": 4671576000,
           "sha256": "92e3943c4f9bd6292a7bef82369f65fed9bfed088b9df0fb2fa2ce17c9edfa02"
         }
-      ]
+      ],
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 849451008,
+      "mtp_draft_compatible": true
     }
   ],
   "notes": [
@@ -440,5 +515,76 @@
     "deployment=cluster since 2026-08-28. This field now records technical capability, not a model-wide recommendation: IQ1_S is only 6.2 GB and commonly runs on one machine, while higher precisions such as BF16 may need several. The client defaults the deployment from the selected precision and current hardware, then honors the user's explicit choice.",
     "Every byte count, sha256 and the revision come from the HF API and from HTTP Range reads of the file headers. No weights were downloaded to the control machine.",
     "Gate coverage, stated plainly so nobody assumes more than was measured: the ppl band covers Q4_K_M, which is the precision the gate ran on. default_quant is IQ1_S -- the smallest rung, chosen the same way qwen3.5-27b defaults to IQ2_XXS, so the model reaches the most machines. That default is NOT ppl-gated, and IQ1_S is exactly the precision where quantisation damage would show first. Gating it needs its own download and its own band; until then the honest statement is that Q4_K_M is verified and the low rungs are inherited convention."
-  ]
+  ],
+  "mtp_kv_bytes_per_token": 4096,
+  "mtp_compute_bytes_128k_cuda": [
+    205539456,
+    205539456,
+    205539456
+  ],
+  "mtp_host_compute_bytes_128k_cuda": [
+    155207712,
+    155207712,
+    155207712
+  ],
+  "mtp_compute_bytes_256k_cuda": [
+    339757184,
+    339757184,
+    339757184
+  ],
+  "mtp_host_compute_bytes_256k_cuda": [
+    289425440,
+    289425440,
+    289425440
+  ],
+  "mtp_compute_bytes_1m_cuda": [
+    1145063552,
+    1145063552,
+    1145063552
+  ],
+  "mtp_host_compute_bytes_1m_cuda": [
+    1094731808,
+    1094731808,
+    1094731808
+  ],
+  "mtp_compute_bytes_128k_metal": [
+    236341280,
+    236341280,
+    236341280
+  ],
+  "mtp_host_compute_bytes_128k_metal": [
+    310415424,
+    310415424,
+    310415424
+  ],
+  "mtp_compute_bytes_256k_metal": [
+    370690080,
+    370690080,
+    370690080
+  ],
+  "mtp_host_compute_bytes_256k_metal": [
+    578850880,
+    578850880,
+    578850880
+  ],
+  "mtp_compute_bytes_1m_metal": [
+    1176782880,
+    1176782880,
+    1176782880
+  ],
+  "mtp_host_compute_bytes_1m_metal": [
+    2189463616,
+    2189463616,
+    2189463616
+  ],
+  "mtp_draft": {
+    "repo": "a4lg/Qwen3.8-27B-MTP-ONLY-GGUF",
+    "revision": "2476d11971c63a9185686ab4ab0d311506d192b0",
+    "gguf": "Qwen3.8-27B-MTP-ONLY-Q4_K_M.gguf",
+    "bytes": 2120079648,
+    "sha256": "a4588aa60fe3ddd2f91007a95c5cb3d9da6d1c02ef2cf4d60775572ac97379bf",
+    "layers": 1,
+    "weight_bytes": 2109134848,
+    "kv_bytes_per_token": 4096
+  }
 }

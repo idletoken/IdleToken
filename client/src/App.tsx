@@ -5,7 +5,7 @@ import { getEngineProvider, type EngineLogLine, type EngineStatus } from "./prov
 import type { NodeSnapshot, ClusterState } from "./types";
 import { HW_OK, HW_NO_GPU, HW_CC_TOO_LOW, HW_DRIVER_TOO_OLD, HW_VRAM_TOO_SMALL, HW_GPU_UNSUPPORTED, HW_MACOS_SEALED } from "./types";
 import { getModel, getManifest, estimateClusterCapacity, poolVram, poolRam, clusterCapacityVerdict, hybridRequirements, isMoeModel, moeRamExpertBudget, pickBestFittingModel, backendOfOs, plannerNodesSpec, type ModelSpec, type MoeLayoutBudget, type PlannerPlan, type ClusterCapacityVerdict } from "./models";
-import { resolveLocalWeights, fetchWeights, onFetchProgress, defaultModelDir, cancelFetch, resolveDownload, resolveMmprojDownload, mmprojLocalPath, targetLocalName, weightsState, verifyWeights, isWeightsCancelled, type DownloadTarget } from "./weights";
+import { fetchWeights, onFetchProgress, defaultModelDir, cancelFetch, resolveDownload, mmprojLocalPath, targetLocalName, weightsState, verifyWeights, isWeightsCancelled, type DownloadTarget, resolveLocalModelAssets, prepareModelAssets, mtpDraftLocalPath, type LocalModelAsset } from "./weights";
 import { loadSettings, saveSettings, settingsWerePersisted, effectiveCaps, runtimeResourceBudget, effectiveCtx, engineTuning, overflowTuning, autoUiScale, contextTiersFor, type AppSettings, type ContextTier, type RuntimeResourceBudget, type Tier } from "./settings";
 import { getAuthProvider, type Session } from "./auth";
 import SettingsPanel from "./SettingsPanel";
@@ -368,8 +368,8 @@ function NodeCapacityCard(props: {
                                     props.tier.ctx, nodesSpec);
 
   // Mode follows the selected resource path, not the architecture label. An
-  // MoE that fits wholly in VRAM is GPU_ONLY and therefore has no RAM row.
-  // Unified-memory machines also have no second pool to display.
+  // MTP can also need coordinator Host workspace with GPU_ONLY weights.
+  // Unified-memory machines have no second pool to display.
   /* Estimate-derived mode, used only until the planner answers (and in browser
    * mode, where there is no sidecar). Once it has, the planner's own mode wins:
    * whether routed experts go to RAM is its decision, not a UI guess. */
@@ -389,6 +389,11 @@ function NodeCapacityCard(props: {
   const refusedHybrid = plan !== null && plan.kind === 2 && isMoe &&
     ramExpert > 0 && (clustered || !s.unified_memory);
   const hybridMode = plan ? plan.mode === 2 || refusedHybrid : estimateHybridMode;
+  const showRam = hybridMode || (plan?.budgetRamNeedBytes ?? 0) > 0;
+  // A dense MTP draft's Host buffers exist only on the coordinator. Remote
+  // members' spare RAM cannot satisfy that allocation.
+  const ramAvailable = hybridMode ? ramExpert : props.budget.ram_usable;
+  const localRamAvailable = hybridMode ? localRamExpert : props.budget.ram_usable;
   const [cpuName, setCpuName] = useState("");
   useEffect(() => {
     let live = true;
@@ -465,7 +470,7 @@ function NodeCapacityCard(props: {
   // expert-RAM headroom: one decimal would print 77.3 beside 77.3 and hide the
   // very boundary this card is meant to explain. GPU-only keeps the quieter
   // one-decimal readout used elsewhere.
-  const budgetDigits = hybridMode ? 2 : 1;
+  const budgetDigits = showRam ? 2 : 1;
   const budgetScale = 10 ** budgetDigits;
   /* GiB, like every other memory readout in this client (see format.ts) and
    * like the engine's own log. These two divide by 1024^3 and used to print
@@ -485,7 +490,7 @@ function NodeCapacityCard(props: {
   // now reports remaining memory directly (NVML's own `free`), so read that.
   const vFree = fmtGiB(s.vram_usable);
   const vTotal = fmtGiB(s.vram_total);
-  const rFree = fmtGiB(localRamExpert);
+  const rFree = fmtGiB(localRamAvailable);
   const rTotal = fmtGiB(s.ram_total);
   // `vram_*` is the cross-platform scheduler ABI, not necessarily physical
   // VRAM. Apple Silicon stores its Metal-addressable unified-memory budget in
@@ -513,7 +518,7 @@ function NodeCapacityCard(props: {
     ? Math.floor(total * Math.min(1, have / need))
     : 0;
   const gpuVisibleLayers = coverageLayers(gpuAvailable, gpuNeedBytes);
-  const ramVisibleLayers = coverageLayers(ramExpert, ramNeedBytes);
+  const ramVisibleLayers = coverageLayers(ramAvailable, ramNeedBytes);
   /* Each figure is marked short by ITS OWN pool, not by the plan's verdict.
    * Painting both amber whenever anything was short undid what the two rows
    * are for: on the machine that prompted this, video memory covered its
@@ -522,7 +527,7 @@ function NodeCapacityCard(props: {
    * says which gate closed. */
   const gpuOver = gpuNeedBytes !== undefined && gpuAvailable < gpuNeedBytes;
   const ramOver = ramNeedBytes !== undefined && ramNeedBytes > 0 &&
-    ramExpert < ramNeedBytes;
+    ramAvailable < ramNeedBytes;
   /* A refusal neither bar explains is the SPLIT: machines can hold the bytes
    * between them and still have no boundary that works (layer 0 is pinned, a
    * layer's experts may only use its owner's RAM). Marking both then is
@@ -572,10 +577,8 @@ function NodeCapacityCard(props: {
             <span className="track__used" style={{ width: `${pct(topReservedBytes, s.vram_total)}%` }} />
           </div>
         </div>
-        {/* RAM appears only when this selection actually needs Hybrid. A MoE
-            that fits in VRAM is GPU_ONLY and reads exactly like a dense model.
-            The value is the page-lock-aware expert budget, but the label stays
-            ordinary "memory" for people who should not need WDDM vocabulary. */}
+        {/* Hybrid experts and discrete-coordinator MTP Host workspace each
+            use system RAM. Unified memory is already in the first pool. */}
         {hybridMode ? (
           <div className="nstat nstat--cpu">
             <span className="nstat__k">{t("node.cpu")}</span>
@@ -583,7 +586,7 @@ function NodeCapacityCard(props: {
             <span className="nstat__sub">{s.cpu_count > 0 ? t("node.threads", { n: s.cpu_count }) : ""}</span>
           </div>
         ) : null}
-        {hybridMode ? (
+        {showRam ? (
           <div className="nstat nstat--bar">
             <span className="nstat__k">{t("capacity.availableRam")}</span>
             <span className="nstat__v">
@@ -591,8 +594,8 @@ function NodeCapacityCard(props: {
               <span className="unit">/ {rTotal.value} {rTotal.unit}</span>
             </span>
             <div className="track track--mini">
-              <span className="track__usable" style={{ width: `${pct(localRamExpert, s.ram_total)}%` }} />
-              <span className="track__used" style={{ width: `${pct(s.ram_total - localRamExpert, s.ram_total)}%` }} />
+              <span className="track__usable" style={{ width: `${pct(localRamAvailable, s.ram_total)}%` }} />
+              <span className="track__used" style={{ width: `${pct(s.ram_total - localRamAvailable, s.ram_total)}%` }} />
             </div>
           </div>
         ) : null}
@@ -627,16 +630,16 @@ function NodeCapacityCard(props: {
               ))}
             </div>
           </div>
-          {hybridMode ? (
+          {showRam ? (
             <div className="capacity__resource">
               <span className="capacity__resource-kind">{t("node.ram")}</span>
               <div className="capacity__resource-stats">
                 <span className="capacity__resource-stat">
                   <span>{t("capacity.available")}</span>
-                  <strong>{GiBHave(ramExpert)} GiB</strong>
+                  <strong>{GiBHave(ramAvailable)} GiB</strong>
                 </span>
                 <span className="capacity__resource-stat">
-                  <span>{t("capacity.expertStorage")}</span>
+                  <span>{t("capacity.reserveBudget")}</span>
                   <strong className={ramShort ? "capacity__gap" : ""}>
                     {planRamNeed !== undefined
                       ? `${GiBNeed(planRamNeed)} GiB`
@@ -644,7 +647,7 @@ function NodeCapacityCard(props: {
                   </strong>
                 </span>
               </div>
-              <div className="spine capacity__spine" role="img" aria-label={`${t("node.ram")} · ${t("capacity.available")} ${GiBHave(ramExpert)} GiB · ${t("capacity.expertStorage")} ${ramNeedBytes ? `${GiBNeed(ramNeedBytes)} GiB` : "—"}`}>
+              <div className="spine capacity__spine" role="img" aria-label={`${t("node.ram")} · ${t("capacity.available")} ${GiBHave(ramAvailable)} GiB · ${t("capacity.reserveBudget")} ${ramNeedBytes ? `${GiBNeed(ramNeedBytes)} GiB` : "—"}`}>
                 {ticks.map((_, i) => (
                   <span key={i} className={`tick${i < ramVisibleLayers ? " tick--on" : ""}`} />
                 ))}
@@ -933,7 +936,7 @@ function ClusterCard(props: {
   // fresh install. A missing `weights` prop is kept compatible with fixtures
   // that do not exercise the download surface.
   const weightsReady = !props.weights
-    || (!!props.weights.path && !props.weights.needs && !props.weights.dl);
+    || (!!props.weights.path && !props.weights.needs && !props.weights.visionNeeds && !props.weights.assetsNeed && !props.weights.needsVerify && !props.weights.dl);
   if (!active) {
     return (
       // No pitch here (2026-08-10): whoever is looking at this screen already
@@ -977,7 +980,7 @@ function ClusterCard(props: {
           {/* Downloading is a property of the selected model+precision, not of
               either deployment path. Keep one control and one progress bar
               here so local and cluster never narrate the same transfer twice. */}
-          {props.weights && (props.weights.needs || props.weights.visionNeeds || props.weights.dl) ? (
+          {props.weights && (props.weights.needs || props.weights.visionNeeds || props.weights.assetsNeed || props.weights.needsVerify || props.weights.dl) ? (
             <WeightsRow w={props.weights} idle="show" />
           ) : null}
         </div>
@@ -1696,6 +1699,12 @@ export default function App() {
   const [weightsPath, setWeightsPath] = useState("");
   /** Verified vision tower for the selected model; "" = none to offer. */
   const [mmprojPath, setMmprojPath] = useState("");
+  const [mtpDraftPath, setMtpDraftPath] = useState("");
+  const [localAssets, setLocalAssets] = useState<LocalModelAsset[]>([]);
+  const [bundleBusy, setBundleBusy] = useState<Record<string, boolean>>({});
+  const bundleTasks = useRef(new Map<string, Promise<string>>());
+  const bundleCancels = useRef(new Map<string, { cancelled: boolean }>());
+  const weightsProbeSeq = useRef(0);
   const [needsWeights, setNeedsWeights] = useState(false);
   // Bytes of an unfinished copy on disk. The download resumes from it, so this
   // is the difference between "4.7 GB to fetch" and "600 MB to go".
@@ -1720,24 +1729,27 @@ export default function App() {
    */
   const [dlErrors, setDlErrors] = useState<Record<string, string>>({});
   const refreshWeights = useCallback(async () => {
+    const seq = ++weightsProbeSeq.current;
     try {
-      const r = await resolveLocalWeights({
-        modelDir: settings.modelDir,
-        manifest: getManifest(settings.modelId),
-        quant: settings.quant,
-      });
-      setWeightsPath(r.path);
-      setNeedsWeights(r.needsDownload);
-      setPartialBytes(r.haveBytes);
-      setSelFile(resolveDownload(getManifest(settings.modelId), settings.quant)?.file ?? "");
-      setMmprojPath(await mmprojLocalPath(settings.modelDir, getManifest(settings.modelId)));
+      const assets = await resolveLocalModelAssets({ modelDir: settings.modelDir,
+        manifest: getManifest(settings.modelId), quant: settings.quant });
+      if (seq !== weightsProbeSeq.current) return;
+      const main = assets[0];
+      setLocalAssets(assets);
+      setWeightsPath(main?.path ?? "");
+      setNeedsWeights(!main?.complete);
+      setPartialBytes(main?.complete ? 0 : main?.haveBytes ?? 0);
+      setSelFile(main?.target.file ?? "");
+      setMmprojPath(assets.find(a => a.kind === "vision" && a.verified)?.path ?? "");
+      setMtpDraftPath(assets.find(a => a.kind === "mtp" && a.verified)?.path ?? "");
     } catch {
-      // A failed probe must not block the UI: treat it as "needs downloading", and
-      // the user gets the real error when they press download.
+      if (seq !== weightsProbeSeq.current) return;
+      setLocalAssets([]);
       setWeightsPath("");
       setNeedsWeights(true);
       setPartialBytes(0);
       setMmprojPath("");
+      setMtpDraftPath("");
     }
   }, [settings.modelDir, settings.modelId, settings.quant]);
 
@@ -1778,6 +1790,7 @@ export default function App() {
       if (!file) return Promise.resolve(false);
       const existing = fetchTasks.current.get(file);
       if (existing) return existing;
+      cancelled.current.delete(file);
       const task = (async () => {
         activeFetches.current.add(file);
         const dir = settings.modelDir || (await defaultModelDir());
@@ -1953,97 +1966,47 @@ export default function App() {
   /** Resolve and integrity-check one exact curated model. Joining a cluster
    * may additionally fetch it: the creator chose the identity, so the joiner
    * prepares that same full GGUF automatically before it can report ready. */
-  const prepareWeights = useCallback(async (
+  const prepareWeights = useCallback((
     over?: { modelId: string; quant: string },
     fetchMissing = false,
   ): Promise<string> => {
     const modelId = over?.modelId ?? settings.modelId;
     const quant = over?.quant ?? settings.quant;
     const manifest = getManifest(modelId);
-    let r = await resolveLocalWeights({
-      modelDir: settings.modelDir,
-      manifest,
-      quant,
-    });
-    if ((r.needsDownload || !r.path) && fetchMissing) {
-      const target = r.target ?? resolveDownload(manifest, quant);
-      if (!target || !(await startDownload(target.file, target))) {
-        throw new Error(`[WEIGHTS_NOT_DOWNLOADED] ${modelId}${quant ? ` ${quant}` : ""}`);
-      }
-      // The download command verifies every part before returning. Resolve
-      // again instead of manufacturing a path so split GGUF completeness and
-      // the marker files remain one source of truth.
-      r = await resolveLocalWeights({ modelDir: settings.modelDir, manifest, quant });
-    }
-    if (r.needsDownload || !r.path) {
-      // "[CODE] detail" — localized by tErr (ERROR_KEYS in i18n.ts).
-      throw new Error(`[WEIGHTS_NOT_DOWNLOADED] ${modelId}${quant ? ` ${quant}` : ""}`);
-    }
-    // Complete on disk but never hash-checked (script download, or a client
-    // from before the integrity gate): verify NOW, before any engine sees the
-    // file. On mismatch the engine deletes it and rejects — re-probe so the
-    // UI flips back to "needs downloading" instead of offering a file that no
-    // longer exists.
-    if (r.needsVerify && r.target) {
+    if (!inTauri()) return Promise.resolve("(dev-sim)");
+    const key = JSON.stringify([settings.modelDir, modelId, quant]);
+    const existing = bundleTasks.current.get(key);
+    if (existing) return existing;
+    const cancellation = { cancelled: false };
+    bundleCancels.current.set(key, cancellation);
+    setBundleBusy(m => ({ ...m, [key]: true }));
+    const task = (async () => {
       try {
-        const dir = settings.modelDir || (await defaultModelDir());
-        // A split model verifies file by file: each part carries its own hash
-        // and marker, and a part already verified is a fast marker hit.
-        const files = [
-          { file: r.target.file, sha256: r.target.sha256 },
-          ...r.target.parts.map((p) => ({ file: p.file, sha256: p.sha256 ?? "" })),
-        ];
-        for (const f of files) {
-          await verifyWeights({ id: f.file, destDir: dir, file: f.file, sha256: f.sha256 });
-        }
-      } catch (e) {
+        const assets = await prepareModelAssets({ modelDir: settings.modelDir,
+          manifest, quant, fetchMissing: fetchMissing ? "all" : "dependencies",
+          cancelled: () => cancellation.cancelled,
+          fetch: asset => startDownload(targetLocalName(asset.target), asset.target),
+          verify: async args => {
+            cancelled.current.delete(args.id);
+            setDls(m => ({ ...m, [args.id]: { have: 0, total: 0, phase: "verifying" } }));
+            try { await verifyWeights(args); }
+            finally { setDls(m => { const next = { ...m }; delete next[args.id]; return next; }); }
+          },
+        });
+        return assets[0].path;
+      } finally {
+        bundleTasks.current.delete(key);
+        bundleCancels.current.delete(key);
+        setBundleBusy(m => { const next = { ...m }; delete next[key]; return next; });
         bumpWeights();
-        throw e;
       }
-    }
-    // The vision tower, held to the same bar as the weights (hard constraint
-    // #14): present, complete, and hash-verified before anything is allowed to
-    // start. It is a second file rather than another part — one tower serves
-    // every precision — so it gets its own state/verify pass.
-    //
-    // A model with a tower is NOT downgraded silently when the file is missing
-    // and `fetchMissing` is false: the caller (creation preflight) already
-    // treats a missing weight file as "not ready", and the tower is part of
-    // what this model is. Serving it text-only is a decision for a human, made
-    // by declining the download, not something to slide past them.
-    const mmTarget = resolveMmprojDownload(manifest);
-    if (mmTarget) {
-      const dir = settings.modelDir || (await defaultModelDir());
-      // Everything below asks about the LOCAL file, so it asks under the local
-      // name — nine models publish their tower as `mmproj-F16.gguf` and one
-      // folder holds one of those.
-      const mmFile = targetLocalName(mmTarget);
-      let st = await weightsState(dir, mmFile, mmTarget.expectBytes, mmTarget.sha256);
-      if ((!st.complete || !st.verified) && fetchMissing) {
-        if (!(await startDownload(mmFile, mmTarget))) {
-          throw new Error(`[WEIGHTS_NOT_DOWNLOADED] ${modelId} ${mmFile}`);
-        }
-        st = await weightsState(dir, mmFile, mmTarget.expectBytes, mmTarget.sha256);
-      }
-      if (!st.complete) {
-        throw new Error(`[WEIGHTS_NOT_DOWNLOADED] ${modelId} ${mmFile}`);
-      }
-      if (!st.verified) {
-        try {
-          await verifyWeights({
-            id: mmFile, destDir: dir, file: mmFile, sha256: mmTarget.sha256,
-          });
-        } catch (e) {
-          bumpWeights();
-          throw e;
-        }
-      }
-    }
-    return r.path;
+    })();
+    bundleTasks.current.set(key, task);
+    return task;
   }, [settings.modelDir, settings.modelId, settings.quant, bumpWeights, startDownload]);
 
-  /** Creator/standalone preflight: creation never starts a surprise transfer.
-   * The cluster card owns the explicit download control and progress. */
+  /** Creator/standalone preflight: reuse the main model and complete its required
+   * dependencies. The download control can fetch the entire bundle. */
   const ensureWeights = useCallback(
     (over?: { modelId: string; quant: string }) => prepareWeights(over, false),
     [prepareWeights]
@@ -2082,7 +2045,9 @@ export default function App() {
       setSettings(next);
       saveSettings(next);
       const modelPath = await ensureClusterWeights({ modelId, quant });
-      return { modelPath, tuning: engineTuning(next, caps) };
+      return { modelPath, tuning: engineTuning(next, caps),
+        mmprojPath: await mmprojLocalPath(next.modelDir, getManifest(modelId)),
+        mtpDraftPath: await mtpDraftLocalPath(next.modelDir, getManifest(modelId), quant) };
     },
     [ensureClusterWeights, caps]
   );
@@ -2121,52 +2086,34 @@ export default function App() {
   // directly under the model choice; deployment buttons consume readiness but
   // do not each grow their own copy of the download control.
   const weightsInfo = useMemo<WeightsInfo>(() => {
-    const mmTarget = resolveMmprojDownload(getManifest(settings.modelId));
-    // Progress, errors and cancellation are keyed by the file on disk — see
-    // targetLocalName.
-    const mmFile = mmTarget ? targetLocalName(mmTarget) : "";
-    // A vision model is not "ready" until its tower is here too. Without this
-    // the row would say ready, the coordinator would start TEXT ONLY, and the
-    // user would find out by attaching a picture and being refused — the
-    // download control is the place to say it, not the failure.
-    // NOT folded into `needs`: that flag owns the sentence "not in the model
-    // folder yet", and a machine that has the weights but not the tower would
-    // then be told it has no model. Reported separately so the row can say the
-    // true thing.
-    const towerMissing = !!mmTarget && !mmprojPath;
+    const key = JSON.stringify([settings.modelDir, settings.modelId, settings.quant]);
+    const files = localAssets.map(a => targetLocalName(a.target));
+    const active = files.map(file => dls[file]).find(Boolean);
+    const busy = bundleBusy[key];
+    const visionMissing = localAssets.some(a => a.kind === "vision" && !a.complete);
+    const dependenciesMissing = localAssets.some(a => a.kind !== "model" && !a.complete);
+    const needsVerify = localAssets.some(a => a.complete && !a.verified);
     return {
       needs: needsWeights,
-      visionNeeds: towerMissing && !needsWeights,
+      visionNeeds: visionMissing && !needsWeights,
+      assetsNeed: dependenciesMissing && !needsWeights,
+      needsVerify,
       path: weightsPath,
-      // Whichever of the two files is moving. They are downloaded one after
-      // the other, so at most one has progress at a time and the row still
-      // represents "one job" the way it was designed to.
-      dl: dls[selFile] ?? (mmTarget ? dls[mmFile] ?? null : null),
+      dl: active ?? (busy ? { have: 0, total: 0, phase: "verifying" } : null),
       partialBytes,
-      lastError: dlErrors[selFile] ?? (mmTarget ? dlErrors[mmFile] ?? null : null),
-      onDownload: () => {
-        void (async () => {
-          // Only touch the weights when they are actually missing. Re-running
-          // the fetch path over a complete model is not a no-op: it re-hashes
-          // the file, which is minutes on a large one — and the user pressed
-          // this to fetch the part that is missing.
-          if (needsWeights) {
-            const target = resolveDownload(getManifest(settings.modelId), settings.quant);
-            if (target) await startDownload(target.file, target);
-          }
-          // Weights first, tower second: the tower is useless on its own, and
-          // a cancelled weight download should not leave a stray 900 MB file.
-          if (mmTarget && !mmprojPath) await startDownload(mmFile, mmTarget);
-        })();
-      },
+      lastError: files.map(file => dlErrors[file]).find(Boolean) ?? null,
+      onDownload: () => { void prepareWeights(undefined, true).catch(e => reportWeightsError(e)); },
       onCancel: () => {
-        cancelDownloadFor(selFile);
-        if (mmTarget) cancelDownloadFor(mmFile);
+        const cancel = bundleCancels.current.get(key);
+        if (cancel) cancel.cancelled = true;
+        for (const file of files) {
+          if (dls[file] || activeFetches.current.has(file)) cancelDownloadFor(file);
+        }
       },
     };
-  },
-    [needsWeights, weightsPath, mmprojPath, dls, dlErrors, selFile, partialBytes, cancelDownloadFor, startDownload, settings.modelId, settings.quant]
-  );
+  }, [settings.modelDir, settings.modelId, settings.quant, localAssets, dls, dlErrors,
+    bundleBusy, needsWeights, weightsPath, partialBytes, prepareWeights, reportWeightsError,
+    cancelDownloadFor]);
 
   /**
    * "Run it here": download the weights if needed, then serve from this one
@@ -2211,6 +2158,8 @@ export default function App() {
         gpu: snap.gpu_name,
         modelPath: path,
         mmprojPath: mm,
+        mtpDraftPath: await mtpDraftLocalPath(loadSettings().modelDir,
+          getManifest(over?.modelId ?? settings.modelId), over?.quant ?? settings.quant),
         tuning: engineTuning(over ? { ...loadSettings(), ...over } : loadSettings(), caps),
       });
       // allowSolo: this IS the one-machine flow. Without it the engine's
@@ -2630,12 +2579,16 @@ export default function App() {
             gpu: snap.gpu_name,
             modelPath: weightsPath,
             mmprojPath,
+            mtpDraftPath,
             // From storage, not state — same staleness as serveStandalone.
             tuning: engineTuning(loadSettings(), caps),
           }}
           session={session}
           initialView={pairingView}
-          prepareSelectedModel={() => ensureWeights()}
+          prepareSelectedModel={async () => ({ modelPath: await ensureWeights(),
+            mmprojPath: await mmprojLocalPath(loadSettings().modelDir, getManifest(settings.modelId)),
+            mtpDraftPath: await mtpDraftLocalPath(loadSettings().modelDir, getManifest(settings.modelId), settings.quant),
+          })}
           prepareClusterModel={prepareClusterModel}
           onSignIn={() => {
             setShowPairing(false);

@@ -1,0 +1,141 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1980,6 +1980,11 @@
+         }
+     ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_MTMD, LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_RETRIEVAL, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_DEBUG}));
+     add_opt(common_arg(
++        {"--idletoken-mtp-external-safe"},
++        "require verified standalone MTP dependency support and memory accounting",
++        [](common_params &) {}
++    ).set_examples({LLAMA_EXAMPLE_SERVER}));
++    add_opt(common_arg(
+         {"--idletoken-mtp-safe"},
+         "require the bundled MTP privacy, probability and image-request guards",
+         [](common_params &) {
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -90,9 +90,9 @@
+ // Same graph shapes and placement as the server, with no tensor-data or KV allocation.
+ static int idletoken_memory_json(common_params params) {
+     try {
+-        if (params.model.path.empty() || params.vocab_only || params.speculative.has_dft() ||
++        if (params.model.path.empty() || params.vocab_only ||
+                 params.embedding || !params.lora_adapters.empty()) {
+-            throw std::invalid_argument("memory JSON requires a local generation model without a separate draft or adapter");
++            throw std::invalid_argument("memory JSON requires a local generation model without an adapter");
+         }
+         if (params.n_parallel < 0) {
+             params.n_parallel = 4;
+@@ -114,14 +114,27 @@
+         if (!target) {
+             throw std::runtime_error("cannot estimate target context for memory JSON");
+         }
++        llama_model_ptr draft_model;
+         llama_context_ptr draft;
++        if (params.speculative.has_dft() && !mparams.load_mtp) {
++            throw std::invalid_argument("memory JSON only supports an MTP draft model");
++        }
+         if (mparams.load_mtp) {
+             auto dparams = common_base_params_to_speculative(params);
+             auto dcparams = common_context_params_to_llama(dparams);
+             dcparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+             dcparams.ctx_other = target.get();
+             dcparams.n_rs_seq = 0;
+-            draft.reset(llama_init_from_model(model.get(), dcparams));
++            llama_model *draft_source = model.get();
++            if (params.speculative.has_dft()) {
++                auto dmparams = common_model_params_to_llama(dparams);
++                dmparams.no_alloc = true;
++                dmparams.load_mode = LLAMA_LOAD_MODE_NONE;
++                draft_model.reset(llama_model_load_from_file(dparams.model.path.c_str(), dmparams));
++                if (!draft_model) throw std::runtime_error("cannot inspect standalone MTP model");
++                draft_source = draft_model.get();
++            }
++            draft.reset(llama_init_from_model(draft_source, dcparams));
+             if (!draft) {
+                 throw std::runtime_error("cannot estimate MTP context for memory JSON");
+             }
+@@ -137,6 +150,12 @@
+         std::vector<ggml_backend_dev_t> devices;
+         for (int i = 0; i < llama_model_n_devices(model.get()); ++i) {
+             devices.push_back(llama_model_get_device(model.get(), i));
++        }
++        if (draft_model) {
++            for (int i = 0; i < llama_model_n_devices(draft_model.get()); ++i) {
++                auto dev = llama_model_get_device(draft_model.get(), i);
++                if (std::find(devices.begin(), devices.end(), dev) == devices.end()) devices.push_back(dev);
++            }
+         }
+         std::vector<memory_row> rows(devices.size() + 1);
+         auto accumulate = [&](const llama_context * ctx, bool is_draft) {
+@@ -152,7 +171,8 @@
+                 }
+                 auto & row = rows[idx];
+                 if (is_draft) {
+-                    // Both contexts share one model. Count its tensors only once.
++                    // An external draft owns its tensors; embedded MTP shares the target.
++                    if (draft_model) row.model += mb.model;
+                     row.draft_context += mb.context;
+                     row.draft_compute += mb.compute;
+                 } else {
+@@ -170,7 +190,8 @@
+             {"version", 1}, {"no_alloc", true},
+             {"ctx_size", llama_n_ctx(target.get())}, {"seq_slots", params.n_parallel},
+             {"model_layers", llama_model_n_layer(model.get())},
+-            {"mtp_layers", llama_model_n_layer_nextn(model.get())},
++            {"mtp_layers", llama_model_n_layer_nextn(draft_model ? draft_model.get() : model.get())},
++            {"mtp_external", (bool) draft_model},
+             {"mtp", mparams.load_mtp}, {"draft_max", params.speculative.draft.n_max},
+             {"mmproj_included", false}, {"expert_cache_included", false},
+             {"devices", json::array()}
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1325,6 +1325,10 @@
+         n_embd = llama_model_n_embd_out(llama_get_model(ctx_dft));
+         GGML_ASSERT(n_embd == llama_model_n_embd_out(llama_get_model(ctx_tgt)) &&
+                 "MTP input row width must match the target h_nextn width");
++        if (llama_get_model(ctx_tgt) != llama_get_model(ctx_dft) &&
++                !common_speculative_are_compatible(llama_get_model(ctx_tgt), llama_get_model(ctx_dft))) {
++            throw std::runtime_error("target and standalone MTP vocabularies are incompatible");
++        }
+         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
+ 
+         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1270,6 +1270,11 @@
+             } catch (const std::exception & e) {
+                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
+             }
++        }
++
++        if (spec_mtp && !spec) {
++            SRV_ERR("%s", "required MTP decoding could not be initialized\n");
++            return false;
+         }
+ 
+         if (ctx_dft) {
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1391,7 +1391,15 @@
+                 local_gpu = dev.dev;
+             }
+         }
+-        if (has_rpc) {
++        const bool standalone_mtp = ml.get_weight("blk.0.attn_norm.weight") == nullptr;
++        if (standalone_mtp) {
++            if (!local_gpu || has_rpc || devices.size() != 1) {
++                throw std::runtime_error("standalone MTP requires exactly one local GPU");
++            }
++            // Its embedding is a separate allocation, fully charged on the local GPU.
++            pimpl->dev_input = {local_gpu, &pimpl->gpu_buft_list.at(local_gpu)};
++        }
++        if (has_rpc || standalone_mtp) {
+             if (!local_gpu) {
+                 throw std::runtime_error("MTP over RPC requires a local GPU to keep prompt token embeddings private");
+             }

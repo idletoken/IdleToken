@@ -102,6 +102,12 @@ typedef struct {
     uint64_t expert_weight_bytes;
     uint64_t expert_max_tensor_bytes;
     const char *gguf;              /* default filename for this quant */
+    /* Verified at this precision's immutable GGUF revision, including all
+     * shards. Metadata alone is insufficient: all NextN heads must exist.
+     * Weight bytes are a subset of layer/shared bytes, never an extra copy. */
+    uint16_t mtp_layers;
+    uint64_t mtp_weight_bytes;
+    uint8_t mtp_draft_compatible; /* audited immutable target/standalone pair */
 } idletoken_model_variant;
 
 /* The vision tower (mmproj) of a model whose upstream is image-text-to-text.
@@ -149,6 +155,27 @@ typedef struct {
 } idletoken_model_mmproj;
 
 typedef struct {
+    const char *gguf;
+    uint64_t bytes;
+    const char *sha256;
+} idletoken_model_mtp_part;
+
+/* A verified standalone MTP dependency. Its shared tensors are additional
+ * allocations, unlike an embedded NextN block already counted in the target. */
+typedef struct {
+    const char *repo;
+    const char *gguf;
+    const char *sha256;
+    const char *revision;
+    uint64_t bytes;
+    uint64_t weight_bytes;
+    uint64_t kv_bytes_per_token;
+    uint16_t layers;
+    const idletoken_model_mtp_part *parts; /* additional shards only */
+    uint16_t n_parts;
+} idletoken_model_mtp_draft;
+
+typedef struct {
     const char *id;            /* stable id, e.g. "deepseek-v4-flash" */
     const char *label;         /* human name for logs/UI */
     uint8_t  backend;          /* idletoken_backend */
@@ -172,7 +199,7 @@ typedef struct {
                                 * for every quant of one model (architecture). */
 
     uint64_t layer_weight_bytes;   /* Σ all blk.* tensors at the shipped quant */
-    uint64_t shared_weight_bytes;  /* embd + output head + mtp — every stage loads */
+    uint64_t shared_weight_bytes;  /* non-decoder tensors, per manifest convention */
     uint32_t ctx_max;              /* trained context window */
     uint32_t ctx_yarn_max;         /* curated/validated YaRN-extended window
                                     * (Qwen: 4x the trained one); 0 = no
@@ -234,6 +261,26 @@ typedef struct {
     uint64_t compute_bytes_256k_metal[IDLETOKEN_KV_TIER_COUNT];
     uint64_t compute_bytes_1m_metal[IDLETOKEN_KV_TIER_COUNT];
 
+    /* Default-on MTP uses a separate f16 draft cache and --draft-max 3.
+     * Capability belongs to each variant; this geometry/workspace belongs to
+     * the model graph. A zero measurement on a capable variant is a refusal,
+     * never permission to silently disable MTP. */
+    uint64_t mtp_kv_bytes_per_token;
+    uint64_t mtp_compute_bytes_128k_cuda[IDLETOKEN_KV_TIER_COUNT];
+    uint64_t mtp_compute_bytes_256k_cuda[IDLETOKEN_KV_TIER_COUNT];
+    uint64_t mtp_compute_bytes_1m_cuda[IDLETOKEN_KV_TIER_COUNT];
+    uint64_t mtp_compute_bytes_128k_metal[IDLETOKEN_KV_TIER_COUNT];
+    uint64_t mtp_compute_bytes_256k_metal[IDLETOKEN_KV_TIER_COUNT];
+    uint64_t mtp_compute_bytes_1m_metal[IDLETOKEN_KV_TIER_COUNT];
+
+    /* Draft graph staging lives in coordinator host RAM, including RPC. */
+    uint64_t mtp_host_compute_bytes_128k_cuda[IDLETOKEN_KV_TIER_COUNT];
+    uint64_t mtp_host_compute_bytes_256k_cuda[IDLETOKEN_KV_TIER_COUNT];
+    uint64_t mtp_host_compute_bytes_1m_cuda[IDLETOKEN_KV_TIER_COUNT];
+    uint64_t mtp_host_compute_bytes_128k_metal[IDLETOKEN_KV_TIER_COUNT];
+    uint64_t mtp_host_compute_bytes_256k_metal[IDLETOKEN_KV_TIER_COUNT];
+    uint64_t mtp_host_compute_bytes_1m_metal[IDLETOKEN_KV_TIER_COUNT];
+
     const char *default_gguf;  /* default filename when --model-path is absent;
                                 * mirrors variants[default_variant].gguf */
 
@@ -241,6 +288,7 @@ typedef struct {
      * One per model, NOT per variant: the tower does not follow the weight
      * precision the user picked. */
     const idletoken_model_mmproj *mmproj;
+    const idletoken_model_mtp_draft *mtp_draft;
 
     /* Selectable precisions. When n_variants==0 the scalar *_weight_bytes /
      * default_gguf above ARE the single implicit variant (unchanged behaviour

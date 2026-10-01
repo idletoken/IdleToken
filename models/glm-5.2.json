@@ -192,7 +192,9 @@
         }
       ],
       "expert_weight_bytes": 197627215872,
-      "expert_max_tensor_bytes": 1711276032
+      "expert_max_tensor_bytes": 1711276032,
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 3755716608
     },
     {
       "quant": "IQ1_M",
@@ -230,7 +232,9 @@
         }
       ],
       "expert_weight_bytes": 209404821504,
-      "expert_max_tensor_bytes": 1711276032
+      "expert_max_tensor_bytes": 1711276032,
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 3755716608
     },
     {
       "quant": "IQ2_XXS",
@@ -268,7 +272,9 @@
         }
       ],
       "expert_weight_bytes": 219370487808,
-      "expert_max_tensor_bytes": 1711276032
+      "expert_max_tensor_bytes": 1711276032,
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 3755716608
     },
     {
       "quant": "IQ2_M",
@@ -306,7 +312,9 @@
         }
       ],
       "expert_weight_bytes": 219370487808,
-      "expert_max_tensor_bytes": 1711276032
+      "expert_max_tensor_bytes": 1711276032,
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 3755716608
     },
     {
       "quant": "Q2_K_XL",
@@ -349,7 +357,9 @@
         }
       ],
       "expert_weight_bytes": 234671308800,
-      "expert_max_tensor_bytes": 1711276032
+      "expert_max_tensor_bytes": 1711276032,
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 3755716608
     },
     {
       "quant": "IQ3_XXS",
@@ -392,7 +402,9 @@
         }
       ],
       "expert_weight_bytes": 260592107520,
-      "expert_max_tensor_bytes": 1711276032
+      "expert_max_tensor_bytes": 1711276032,
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 3774099456
     },
     {
       "quant": "IQ3_S",
@@ -440,7 +452,9 @@
         }
       ],
       "expert_weight_bytes": 287116886016,
-      "expert_max_tensor_bytes": 2642411520
+      "expert_max_tensor_bytes": 2642411520,
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 4201918464
     },
     {
       "quant": "Q3_K_M",
@@ -493,7 +507,9 @@
         }
       ],
       "expert_weight_bytes": 317567533056,
-      "expert_max_tensor_bytes": 2642411520
+      "expert_max_tensor_bytes": 2642411520,
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 4892798976
     },
     {
       "quant": "Q3_K_XL",
@@ -546,7 +562,9 @@
         }
       ],
       "expert_weight_bytes": 317567533056,
-      "expert_max_tensor_bytes": 2642411520
+      "expert_max_tensor_bytes": 2642411520,
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 4892798976
     },
     {
       "quant": "IQ4_XS",
@@ -599,7 +617,9 @@
         }
       ],
       "expert_weight_bytes": 339914784768,
-      "expert_max_tensor_bytes": 2642411520
+      "expert_max_tensor_bytes": 2642411520,
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 4892798976
     },
     {
       "quant": "IQ4_NL",
@@ -652,7 +672,9 @@
         }
       ],
       "expert_weight_bytes": 347263205376,
-      "expert_max_tensor_bytes": 2642411520
+      "expert_max_tensor_bytes": 2642411520,
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 4892798976
     },
     {
       "quant": "Q4_K_S",
@@ -710,7 +732,9 @@
         }
       ],
       "expert_weight_bytes": 410177765376,
-      "expert_max_tensor_bytes": 2642411520
+      "expert_max_tensor_bytes": 2642411520,
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 5748436992
     },
     {
       "quant": "Q4_K_M",
@@ -773,7 +797,9 @@
         }
       ],
       "expert_weight_bytes": 439168794624,
-      "expert_max_tensor_bytes": 2642411520
+      "expert_max_tensor_bytes": 2642411520,
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 6151090176
     },
     {
       "quant": "Q4_K_XL",
@@ -836,7 +862,9 @@
         }
       ],
       "expert_weight_bytes": 440401920000,
-      "expert_max_tensor_bytes": 2642411520
+      "expert_max_tensor_bytes": 2642411520,
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 6151090176
     },
     {
       "quant": "Q5_K_S",
@@ -904,7 +932,9 @@
         }
       ],
       "expert_weight_bytes": 499566772224,
-      "expert_max_tensor_bytes": 2642411520
+      "expert_max_tensor_bytes": 2642411520,
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 6956396544
     },
     {
       "quant": "Q5_K_M",
@@ -977,7 +1007,9 @@
         }
       ],
       "expert_weight_bytes": 532710162432,
-      "expert_max_tensor_bytes": 3422552064
+      "expert_max_tensor_bytes": 3422552064,
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 7384215552
     },
     {
       "quant": "Q5_K_XL",
@@ -1050,7 +1082,9 @@
         }
       ],
       "expert_weight_bytes": 534345940992,
-      "expert_max_tensor_bytes": 3422552064
+      "expert_max_tensor_bytes": 3422552064,
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 7384215552
     },
     {
       "quant": "Q6_K",
@@ -1128,7 +1162,9 @@
         }
       ],
       "expert_weight_bytes": 596883013632,
-      "expert_max_tensor_bytes": 3422552064
+      "expert_max_tensor_bytes": 3422552064,
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 8239853568
     },
     {
       "quant": "Q6_K_XL",
@@ -1216,7 +1252,9 @@
         }
       ],
       "expert_weight_bytes": 654613413888,
-      "expert_max_tensor_bytes": 3422552064
+      "expert_max_tensor_bytes": 3422552064,
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 9019994112
     },
     {
       "quant": "Q8_0",
@@ -1309,7 +1347,9 @@
         }
       ],
       "expert_weight_bytes": 770074214400,
-      "expert_max_tensor_bytes": 3422552064
+      "expert_max_tensor_bytes": 3422552064,
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 10580275200
     },
     {
       "quant": "Q8_K_XL",
@@ -1407,7 +1447,9 @@
         }
       ],
       "expert_weight_bytes": 788193607680,
-      "expert_max_tensor_bytes": 6442450944
+      "expert_max_tensor_bytes": 6442450944,
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 10580275200
     },
     {
       "quant": "BF16",
@@ -1580,7 +1622,70 @@
         }
       ],
       "expert_weight_bytes": 1449551462400,
-      "expert_max_tensor_bytes": 6442450944
+      "expert_max_tensor_bytes": 6442450944,
+      "mtp_layers": 1,
+      "mtp_weight_bytes": 19909447680
     }
+  ],
+  "mtp_kv_bytes_per_token": 1152,
+  "mtp_compute_bytes_128k_cuda": [
+    348133504,
+    348133504,
+    348133504
+  ],
+  "mtp_host_compute_bytes_128k_cuda": [
+    159391776,
+    159391776,
+    159391776
+  ],
+  "mtp_compute_bytes_256k_cuda": [
+    482351232,
+    482351232,
+    482351232
+  ],
+  "mtp_host_compute_bytes_256k_cuda": [
+    293609504,
+    293609504,
+    293609504
+  ],
+  "mtp_compute_bytes_1m_cuda": [
+    1287657600,
+    1287657600,
+    1287657600
+  ],
+  "mtp_host_compute_bytes_1m_cuda": [
+    1098915872,
+    1098915872,
+    1098915872
+  ],
+  "mtp_compute_bytes_128k_metal": [
+    550328352,
+    550328352,
+    550328352
+  ],
+  "mtp_host_compute_bytes_128k_metal": [
+    318783552,
+    318783552,
+    318783552
+  ],
+  "mtp_compute_bytes_256k_metal": [
+    684677152,
+    684677152,
+    684677152
+  ],
+  "mtp_host_compute_bytes_256k_metal": [
+    587219008,
+    587219008,
+    587219008
+  ],
+  "mtp_compute_bytes_1m_metal": [
+    1490769952,
+    1490769952,
+    1490769952
+  ],
+  "mtp_host_compute_bytes_1m_metal": [
+    2197831744,
+    2197831744,
+    2197831744
   ]
 }

@@ -164,11 +164,8 @@ pub fn weights_state(
     // Cheap check only — this command must stay instant, so it consults the
     // marker written by a past verification, never the file contents. A
     // complete-but-unverified file is the caller's cue to run weights_verify.
-    let verified = complete
-        && (expect_sha256.is_empty()
-            || fs::read_to_string(marker_of(&final_path))
-                .map(|m| m.trim().eq_ignore_ascii_case(&expect_sha256))
-                .unwrap_or(false));
+    let verified =
+        complete && (expect_sha256.is_empty() || marker_matches(&final_path, &expect_sha256));
     WeightsState {
         path: final_path.to_string_lossy().into_owned(),
         complete,
@@ -205,6 +202,104 @@ fn marker_of(final_path: &Path) -> PathBuf {
     let mut s = final_path.as_os_str().to_os_string();
     s.push(".sha256");
     PathBuf::from(s)
+}
+
+/// A cached digest belongs to a particular file, not just its path. Old digest-
+/// only markers trigger one real verification when upgrading. This avoids
+/// trusting a replaced or edited weight file with a stale neighboring marker.
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct WeightFingerprint {
+    bytes: u64,
+    modified_secs: u64,
+    modified_nanos: u32,
+    identity: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WeightVerification {
+    version: u32,
+    sha256: String,
+    file: WeightFingerprint,
+}
+
+fn weight_fingerprint(path: &Path) -> Result<WeightFingerprint, String> {
+    let md = fs::metadata(path).map_err(|e| format!("cannot inspect {}: {e}", path.display()))?;
+    if !md.is_file() {
+        return Err(format!(
+            "weights are not a regular file: {}",
+            path.display()
+        ));
+    }
+    let modified = md
+        .modified()
+        .map_err(|e| format!("cannot read file timestamp: {e}"))?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("invalid file timestamp: {e}"))?;
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt;
+        format!(
+            "{}:{}:{}:{}",
+            md.dev(),
+            md.ino(),
+            md.ctime(),
+            md.ctime_nsec()
+        )
+    };
+    #[cfg(windows)]
+    let identity = {
+        use std::os::windows::fs::MetadataExt;
+        format!("{}:{}", md.creation_time(), md.file_attributes())
+    };
+    #[cfg(not(any(unix, windows)))]
+    let identity = format!("{:?}", md.created().ok());
+    Ok(WeightFingerprint {
+        bytes: md.len(),
+        modified_secs: modified.as_secs(),
+        modified_nanos: modified.subsec_nanos(),
+        identity,
+    })
+}
+
+fn marker_matches(path: &Path, digest: &str) -> bool {
+    let Ok(raw) = fs::read(marker_of(path)) else {
+        return false;
+    };
+    let Ok(marker) = serde_json::from_slice::<WeightVerification>(&raw) else {
+        return false;
+    };
+    marker.version == 1
+        && marker.sha256.eq_ignore_ascii_case(digest)
+        && weight_fingerprint(path)
+            .map(|file| file == marker.file)
+            .unwrap_or(false)
+}
+
+fn write_verified_marker(path: &Path, digest: &str) -> Result<(), String> {
+    let marker = WeightVerification {
+        version: 1,
+        sha256: digest.to_ascii_lowercase(),
+        file: weight_fingerprint(path)?,
+    };
+    let encoded = serde_json::to_vec(&marker).map_err(|e| e.to_string())?;
+    fs::write(marker_of(path), encoded).map_err(|e| e.to_string())
+}
+
+fn stable_file_sha256(
+    path: &Path,
+    id: &str,
+    cancel: &AtomicBool,
+    emit: &dyn Fn(serde_json::Value),
+) -> Result<String, String> {
+    let before = weight_fingerprint(path)?;
+    let digest = file_sha256(path, id, cancel, emit)?;
+    if before != weight_fingerprint(path)? {
+        return Err(
+            "[WEIGHTS_CHANGED_DURING_VERIFY] weights changed during verification; check them again"
+                .into(),
+        );
+    }
+    Ok(digest)
 }
 
 /// Stream a file through SHA-256 with progress events and cancellation.
@@ -269,7 +364,7 @@ fn promote_verified(
     emit: &dyn Fn(serde_json::Value),
 ) -> Result<(), String> {
     if !expect_sha256.is_empty() {
-        let got = file_sha256(part_path, id, cancel, emit)?;
+        let got = stable_file_sha256(part_path, id, cancel, emit)?;
         if !got.eq_ignore_ascii_case(expect_sha256) {
             let _ = fs::remove_file(part_path);
             return Err(format!(
@@ -281,7 +376,7 @@ fn promote_verified(
         .map_err(|e| format!("rename failed for {}: {e}", final_path.display()))?;
     if !expect_sha256.is_empty() {
         // Best effort: a missing marker only costs a one-time re-verification.
-        let _ = fs::write(marker_of(final_path), format!("{expect_sha256}\n"));
+        let _ = write_verified_marker(final_path, expect_sha256);
     }
     Ok(())
 }
@@ -300,13 +395,10 @@ fn ensure_final_verified(
         return Ok(());
     }
     let marker = marker_of(final_path);
-    if let Ok(m) = fs::read_to_string(&marker) {
-        if m.trim().eq_ignore_ascii_case(expect_sha256) {
-            return Ok(());
-        }
-        // Marker from another manifest revision: stale, re-verify in full.
+    if marker_matches(final_path, expect_sha256) {
+        return Ok(());
     }
-    let got = file_sha256(final_path, id, cancel, emit)?;
+    let got = stable_file_sha256(final_path, id, cancel, emit)?;
     if !got.eq_ignore_ascii_case(expect_sha256) {
         let _ = fs::remove_file(final_path);
         let _ = fs::remove_file(&marker);
@@ -314,7 +406,7 @@ fn ensure_final_verified(
             "[WEIGHTS_SHA256_MISMATCH] the file on disk does not match the curated model (got {got}, manifest says {expect_sha256}). The file was deleted; download it again."
         ));
     }
-    let _ = fs::write(&marker, format!("{expect_sha256}\n"));
+    let _ = write_verified_marker(final_path, expect_sha256);
     Ok(())
 }
 
@@ -566,16 +658,16 @@ pub fn weights_adopt(
     if fs::metadata(&src).map(|m| m.len()).unwrap_or(0) != expect_bytes {
         return false;
     }
-    match fs::read_to_string(marker_of(&src)) {
-        Ok(mk) if mk.trim().eq_ignore_ascii_case(&expect_sha256) => {}
-        _ => return false,
+    if !marker_matches(&src, &expect_sha256) {
+        return false;
     }
     if fs::rename(&src, &dst).is_err() {
         return false;
     }
     // The marker travels with the file it certifies; leaving it behind would
     // bless whatever lands under the old name next.
-    let _ = fs::rename(marker_of(&src), marker_of(&dst));
+    let _ = fs::remove_file(marker_of(&src));
+    let _ = write_verified_marker(&dst, &expect_sha256);
     true
 }
 
@@ -732,8 +824,8 @@ pub async fn weights_fetch(
     endpoints: Vec<String>,
     parts: Vec<SplitPart>,
     // Local name for the FIRST file when it must differ from the remote one
-    // (see fetch_inner). Absent/empty keeps the remote name. Split parts are
-    // never renamed: llama.cpp finds them by their own names next to part 1.
+    // (see fetch_inner). Split dependencies may give every part a matching
+    // local prefix, preserving the loader's numbered-shard naming convention.
     save_as: Option<String>,
 ) -> Result<(), String> {
     // One download per id, enforced here. `register` used to just drop the old
@@ -777,22 +869,29 @@ pub async fn weights_fetch(
         // the row must show "412 GB of 434 GB", not part 7 restarting at zero
         // eleven times. Each part's `have`/`total` is offset by the bytes the
         // finished parts already contributed; everything else passes through.
-        let all: Vec<(String, u64, String)> =
-            std::iter::once((file.clone(), expect_bytes, expect_sha256.clone()))
-                .chain(
-                    parts
-                        .iter()
-                        .map(|p| (p.file.clone(), p.bytes, p.sha256.clone())),
-                )
-                .collect();
+        let all: Vec<(String, u64, String, String)> = std::iter::once((
+            file.clone(),
+            expect_bytes,
+            expect_sha256.clone(),
+            local_first,
+        ))
+        .chain(parts.iter().map(|p| {
+            (
+                p.file.clone(),
+                p.bytes,
+                p.sha256.clone(),
+                p.save_as.clone().unwrap_or_default(),
+            )
+        }))
+        .collect();
         // The denominator is the sum of what the manifest declares. A part with
         // an unknown size contributes its server-reported length once it starts,
         // so the total can only get more accurate, never wrong-and-stuck.
         let save_local = save_as.clone().unwrap_or_default();
-        let declared_total: u64 = all.iter().map(|(_, b, _)| *b).sum();
+        let declared_total: u64 = all.iter().map(|(_, b, _, _)| *b).sum();
         let done_before = std::sync::Arc::new(Mutex::new(0u64));
         let mut out: Result<String, String> = Err("no parts to download".into());
-        for (idx, (pfile, pbytes, psha)) in all.iter().enumerate() {
+        for (idx, (pfile, pbytes, psha, local)) in all.iter().enumerate() {
             let base = *done_before.lock().unwrap();
             let emit = |v: serde_json::Value| {
                 raw_emit(whole_model_progress(
@@ -803,9 +902,6 @@ pub async fn weights_fetch(
                     all.len() as u64,
                 ));
             };
-            // Only part 1 may be renamed; the continuation files must keep the
-            // names the loader derives from it.
-            let local = if idx == 0 { save_local.as_str() } else { "" };
             out = fetch_inner(
                 &id2, &repo, pfile, local, &dest_dir, *pbytes, psha, &revision, &endpoints,
                 &cancel, &emit,
@@ -818,8 +914,8 @@ pub async fn weights_fetch(
                     // Measured under the name it landed on -- part 1 may have
                     // been renamed, and probing the remote name there would
                     // silently fall back to the declared size.
-                    let landed_name = if idx == 0 && !local.is_empty() {
-                        local
+                    let landed_name = if !local.is_empty() {
+                        local.as_str()
                     } else {
                         pfile.as_str()
                     };
@@ -884,6 +980,9 @@ pub struct SplitPart {
     /// SHA-256 for this part. "" = unpinned; the gate then has nothing to check.
     #[serde(default)]
     pub sha256: String,
+    /// Model-specific local prefix for a split dependency (same for all parts).
+    #[serde(default, rename = "saveAs")]
+    pub save_as: Option<String>,
 }
 
 /// The result of probing one endpoint.
@@ -1154,6 +1253,12 @@ fn fetch_inner(
     if let Ok(m) = fs::metadata(&final_path) {
         if m.len() > 0 && (expect_bytes == 0 || m.len() >= expect_bytes) {
             ensure_final_verified(&final_path, expect_sha256, id, cancel, emit)?;
+            // A verified final file supersedes an abandoned resume fragment.
+            // Keeping it would make weights_state report incomplete forever.
+            if part_path.exists() {
+                fs::remove_file(&part_path)
+                    .map_err(|e| format!("cannot remove obsolete partial weights: {e}"))?;
+            }
             return Ok(final_path.to_string_lossy().into_owned());
         }
     }
@@ -1173,11 +1278,12 @@ fn fetch_inner(
         // nothing on every switch.
         let legacy_len = fs::metadata(&legacy).map(|m| m.len()).unwrap_or(0);
         if legacy != final_path && expect_bytes > 0 && legacy_len == expect_bytes {
-            let adopt = match fs::read_to_string(marker_of(&legacy)) {
+            let adopt = if marker_matches(&legacy, expect_sha256) {
                 // Its own marker already answers the question; no second pass
                 // over 900 MB.
-                Ok(mk) if mk.trim().eq_ignore_ascii_case(expect_sha256) => true,
-                _ => match file_sha256(&legacy, id, cancel, emit) {
+                true
+            } else {
+                match stable_file_sha256(&legacy, id, cancel, emit) {
                     Ok(got) => got.eq_ignore_ascii_case(expect_sha256),
                     // A cancel during the hash is still a cancel: falling
                     // through here would start the very transfer the user just
@@ -1185,11 +1291,11 @@ fn fetch_inner(
                     // adopt", and the normal download takes over.
                     Err(e) if cancel.load(Ordering::SeqCst) => return Err(e),
                     Err(_) => false,
-                },
+                }
             };
             if adopt && fs::rename(&legacy, &final_path).is_ok() {
                 let _ = fs::remove_file(marker_of(&legacy));
-                let _ = fs::write(marker_of(&final_path), format!("{expect_sha256}\n"));
+                let _ = write_verified_marker(&final_path, expect_sha256);
                 return Ok(final_path.to_string_lossy().into_owned());
             }
         }
@@ -1728,7 +1834,35 @@ mod integrity_tests {
         let cancel = AtomicBool::new(false);
         promote_verified(&part, &fin, ABC, "t", &cancel, &no_emit).unwrap();
         assert!(fin.exists() && !part.exists());
-        assert_eq!(fs::read_to_string(marker_of(&fin)).unwrap().trim(), ABC);
+        assert!(marker_matches(&fin, ABC));
+    }
+
+    #[test]
+    fn verified_final_file_repairs_an_abandoned_partial_without_network() {
+        let d = tmpdir();
+        fs::write(d.join("m.gguf"), b"abc").unwrap();
+        fs::write(d.join("m.gguf.part"), b"ab").unwrap();
+        let cancel = AtomicBool::new(false);
+        assert!(
+            !weights_state(d.to_string_lossy().into(), "m.gguf".into(), 3, ABC.into()).complete
+        );
+        fetch_inner(
+            "t",
+            "repo/x",
+            "m.gguf",
+            "",
+            d.to_str().unwrap(),
+            3,
+            ABC,
+            "",
+            &nowhere(),
+            &cancel,
+            &no_emit,
+        )
+        .unwrap();
+        let state = weights_state(d.to_string_lossy().into(), "m.gguf".into(), 3, ABC.into());
+        assert!(state.complete && state.verified);
+        assert!(!d.join("m.gguf.part").exists());
     }
 
     /// An unreachable endpoint, so "it reached the network" is a visible
@@ -1763,12 +1897,7 @@ mod integrity_tests {
             !d.join("mmproj-F16.gguf").exists(),
             "adopted, so moved -- not left as a 900 MB orphan"
         );
-        assert_eq!(
-            fs::read_to_string(marker_of(&PathBuf::from(&got)))
-                .unwrap()
-                .trim(),
-            ABC
-        );
+        assert!(marker_matches(&PathBuf::from(&got), ABC));
     }
 
     #[test]
@@ -1833,7 +1962,7 @@ mod integrity_tests {
     /// with the marker this client wrote when it downloaded it.
     fn legacy_tower(d: &Path, bytes: &[u8], marker: &str) {
         fs::write(d.join("mmproj-F16.gguf"), bytes).unwrap();
-        fs::write(marker_of(&d.join("mmproj-F16.gguf")), format!("{marker}\n")).unwrap();
+        write_verified_marker(&d.join("mmproj-F16.gguf"), marker).unwrap();
     }
 
     #[test]
@@ -1853,12 +1982,7 @@ mod integrity_tests {
             !marker_of(&d.join("mmproj-F16.gguf")).exists(),
             "a marker left behind would bless the next file under that name"
         );
-        assert_eq!(
-            fs::read_to_string(marker_of(&d.join("qwen3.5-9b-mmproj-F16.gguf")))
-                .unwrap()
-                .trim(),
-            ABC
-        );
+        assert!(marker_matches(&d.join("qwen3.5-9b-mmproj-F16.gguf"), ABC));
     }
 
     #[test]
@@ -1979,10 +2103,50 @@ mod integrity_tests {
         // No marker (script download): full hash, then a marker appears.
         ensure_final_verified(&fin, ABC, "t", &cancel, &no_emit).unwrap();
         assert!(marker_of(&fin).exists());
-        // Second call is the fast path; corrupt the CONTENT but keep the
-        // marker to prove the marker is what answers now.
-        fs::write(&fin, b"abd").unwrap();
+        // Hashing refuses cancellation before its first read. A cached result
+        // needs no I/O pass, so it remains usable with this diagnostic flag.
+        let cancel_hash = AtomicBool::new(true);
+        ensure_final_verified(&fin, ABC, "t", &cancel_hash, &no_emit).unwrap();
+    }
+
+    #[test]
+    fn changed_file_invalidates_verification_even_at_the_same_size() {
+        let d = tmpdir();
+        let fin = d.join("m.gguf");
+        fs::write(&fin, b"abc").unwrap();
+        let cancel = AtomicBool::new(false);
         ensure_final_verified(&fin, ABC, "t", &cancel, &no_emit).unwrap();
+        // Force a later timestamp even on filesystems with coarse resolution.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&fin, b"abd").unwrap();
+        assert!(!marker_matches(&fin, ABC));
+        let state = weights_state(d.to_string_lossy().into(), "m.gguf".into(), 3, ABC.into());
+        assert!(state.complete && !state.verified);
+        let err = ensure_final_verified(&fin, ABC, "t", &cancel, &no_emit).unwrap_err();
+        assert!(err.contains("WEIGHTS_SHA256_MISMATCH"));
+    }
+
+    #[test]
+    fn legacy_digest_only_marker_requires_verification() {
+        let d = tmpdir();
+        let fin = d.join("m.gguf");
+        fs::write(&fin, b"abc").unwrap();
+        fs::write(marker_of(&fin), format!("{ABC}\n")).unwrap();
+        assert!(!marker_matches(&fin, ABC));
+        let cancel = AtomicBool::new(false);
+        ensure_final_verified(&fin, ABC, "t", &cancel, &no_emit).unwrap();
+        assert!(marker_matches(&fin, ABC));
+    }
+
+    #[test]
+    fn replaced_file_does_not_inherit_the_previous_markers_identity() {
+        let d = tmpdir();
+        let fin = d.join("m.gguf");
+        fs::write(&fin, b"abc").unwrap();
+        write_verified_marker(&fin, ABC).unwrap();
+        fs::remove_file(&fin).unwrap();
+        fs::write(&fin, b"abcdef").unwrap();
+        assert!(!marker_matches(&fin, ABC));
     }
 
     #[test]
@@ -2010,10 +2174,9 @@ mod integrity_tests {
         .unwrap();
         let cancel = AtomicBool::new(false);
         ensure_final_verified(&fin, ABC, "t", &cancel, &no_emit).unwrap();
-        assert_eq!(
-            fs::read_to_string(marker_of(&fin)).unwrap().trim(),
-            ABC,
-            "the marker must be rewritten to the hash that was actually verified"
+        assert!(
+            marker_matches(&fin, ABC),
+            "the marker must describe the verified file"
         );
     }
 
@@ -2029,7 +2192,7 @@ mod integrity_tests {
         let s = weights_state(dir.clone(), "m.gguf".into(), 0, String::new());
         assert!(s.complete && s.verified);
         // Marker present and matching.
-        fs::write(marker_of(&d.join("m.gguf")), format!("{ABC}\n")).unwrap();
+        write_verified_marker(&d.join("m.gguf"), ABC).unwrap();
         let s = weights_state(dir.clone(), "m.gguf".into(), 0, ABC.into());
         assert!(s.complete && s.verified);
         // Marker for a different hash (uppercase compare also covered).

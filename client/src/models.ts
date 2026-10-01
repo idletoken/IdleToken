@@ -31,6 +31,11 @@ export interface ModelVariant {
   shared_weight_bytes: number;
   repo: string;
   gguf: string;
+  /** Verified appended NextN blocks in this exact pinned GGUF variant. */
+  mtp_layers?: number;
+  mtp_weight_bytes?: number;
+  /** This exact pinned variant was checked against the model's external draft. */
+  mtp_draft_compatible?: boolean;
   // Content hash of the GGUF (integrity gate; scripts/manifest_sha256.py fills
   // it from the HF API). Absent only during curation — a shipped variant
   // without a hash downloads unverified, which the gate treats as "nothing to
@@ -52,6 +57,8 @@ export interface ModelVariant {
  *  unknown, the server's length decides); `sha256` gates that part alone. */
 export interface SplitPart {
   file: string;
+  /** Local name for independent draft shards; ordinary model parts retain file. */
+  saveAs?: string;
   bytes?: number;
   sha256?: string;
 }
@@ -112,6 +119,36 @@ export interface ModelManifest {
   compute_bytes_128k_metal?: number[];
   compute_bytes_256k_metal?: number[];
   compute_bytes_1m_metal?: number[];
+  /** Default MTP draft context: f16 cache plus measured workspace. The
+   * weights are already included above; these arrays use target KV-tier
+   * indexing because the target and draft graphs are measured together. */
+  mtp_layers?: number;
+  mtp_weight_bytes?: number;
+  mtp_kv_bytes_per_token?: number;
+  mtp_compute_bytes_128k_cuda?: number[];
+  mtp_compute_bytes_256k_cuda?: number[];
+  mtp_compute_bytes_1m_cuda?: number[];
+  mtp_compute_bytes_128k_metal?: number[];
+  mtp_compute_bytes_256k_metal?: number[];
+  mtp_compute_bytes_1m_metal?: number[];
+  mtp_host_compute_bytes_128k_cuda?: number[];
+  mtp_host_compute_bytes_256k_cuda?: number[];
+  mtp_host_compute_bytes_1m_cuda?: number[];
+  mtp_host_compute_bytes_128k_metal?: number[];
+  mtp_host_compute_bytes_256k_metal?: number[];
+  mtp_host_compute_bytes_1m_metal?: number[];
+  /** Independently pinned NextN weights, required only for audited variants. */
+  mtp_draft?: {
+    repo: string;
+    gguf: string;
+    bytes: number;
+    sha256: string;
+    revision: string;
+    layers: number;
+    weight_bytes: number;
+    kv_bytes_per_token: number;
+    parts?: SplitPart[];
+  };
   split: { boundary_multiple: number };
   kv: {
     kind: string;
@@ -416,6 +453,11 @@ export function mmprojLocalName(man: ModelManifest): string {
   return mm && mm.gguf ? `${man.id}-${mm.gguf}` : "";
 }
 
+export function mtpDraftLocalName(man: ModelManifest): string {
+  const file = man.mtp_draft?.gguf.split(/[\\/]/).pop();
+  return file ? `${man.id}-mtp-${file}` : "";
+}
+
 /**
  * Put a human name on a GGUF file found on disk.
  *
@@ -452,6 +494,11 @@ export function describeGguf(file: string): { label: string; quant?: string } | 
     // a plain file name — honest, and it is the one the user may want to delete.
     const tower = mmprojLocalName(m);
     if (tower && leaf(tower) === want) return { label: `${m.label} · vision tower` };
+    const draft = mtpDraftLocalName(m);
+    if (draft && leaf(draft) === want) return { label: `${m.label} · MTP weights` };
+    for (const part of m.mtp_draft?.parts ?? []) {
+      if (`${m.id}-mtp-${leaf(part.file)}` === want) return { label: `${m.label} · MTP weights` };
+    }
   }
   // Engine-produced layer shards ("L26-38.gguf": layers 26 through 38 of a
   // model, written by the weight-sharding tooling). They are not models and
@@ -619,6 +666,71 @@ function roundCells256(cells: number): number {
   return Math.ceil(cells / 256) * 256;
 }
 
+function mtpVariant(m: ModelManifest, quant: string): Pick<ModelVariant, "mtp_layers" | "mtp_weight_bytes" | "mtp_draft_compatible"> | undefined {
+  const variants = m.variants ?? [];
+  if (quant && variants.length) return variants.find(v => v.quant === quant);
+  return variants.find(v => v.quant === m.default_quant) ?? variants[0] ?? m;
+}
+
+export function requiresMtpDraft(m: ModelManifest, quant: string): boolean {
+  const v = mtpVariant(m, quant);
+  if ((v?.mtp_layers ?? 0) > 0 && (v?.mtp_weight_bytes ?? 0) > 0) return false;
+  return v?.mtp_draft_compatible === true;
+}
+
+/** A model family alone does not prove the downloaded GGUF has its MTP head. */
+export function hasMtp(m: ModelManifest, quant: string): boolean {
+  const v = mtpVariant(m, quant);
+  return ((v?.mtp_layers ?? 0) > 0 && (v?.mtp_weight_bytes ?? 0) > 0)
+    || requiresMtpDraft(m, quant);
+}
+
+/** Total physical draft allocation across a cluster.
+ * Draft blocks/KV and Host buffers stay on the coordinator because MTP embeds
+ * prompt tokens during prefill. A shared output head can run on a worker, so
+ * each active GPU reserves a conservative complete draft compute buffer.
+ * Native runtime admission separates its unified/discrete pools exactly.
+ * Target recurrent rollback is in kvBytesForContext. Embedded draft weights
+ * are already counted; external draft tensor bytes are added here once.
+ * An unmeasured enabled draft is unknown, never a zero-byte draft. */
+export function mtpBytesForContext(
+  m: ModelManifest, ctx: number, backend: NodeBackend, quant: string,
+  nNodes = 1,
+): number {
+  if (!hasMtp(m, quant)) return 0;
+  if (requiresMtpDraft(m, quant) && !m.mtp_draft) return Infinity;
+  const external = requiresMtpDraft(m, quant) ? m.mtp_draft : undefined;
+  const kv = external?.kv_bytes_per_token ?? m.mtp_kv_bytes_per_token ?? 0;
+  const tier = kvTierForQuant(quant);
+  let cuda = 0, metal = 0, cudaHost = 0, metalHost = 0;
+  if (ctx > 0 && ctx <= 131072) {
+    cuda = m.mtp_compute_bytes_128k_cuda?.[tier] ?? 0;
+    metal = m.mtp_compute_bytes_128k_metal?.[tier] ?? 0;
+    cudaHost = m.mtp_host_compute_bytes_128k_cuda?.[tier] ?? 0;
+    metalHost = m.mtp_host_compute_bytes_128k_metal?.[tier] ?? 0;
+  } else if (ctx > 0 && ctx <= 262144) {
+    cuda = m.mtp_compute_bytes_256k_cuda?.[tier] ?? 0;
+    metal = m.mtp_compute_bytes_256k_metal?.[tier] ?? 0;
+    cudaHost = m.mtp_host_compute_bytes_256k_cuda?.[tier] ?? 0;
+    metalHost = m.mtp_host_compute_bytes_256k_metal?.[tier] ?? 0;
+  } else if (ctx === 1048576) {
+    cuda = m.mtp_compute_bytes_1m_cuda?.[tier] ?? 0;
+    metal = m.mtp_compute_bytes_1m_metal?.[tier] ?? 0;
+    cudaHost = m.mtp_host_compute_bytes_1m_cuda?.[tier] ?? 0;
+    metalHost = m.mtp_host_compute_bytes_1m_metal?.[tier] ?? 0;
+  }
+  const compute = backend === "cuda" ? cuda : backend === "metal" ? metal
+    : cuda && metal ? Math.max(cuda, metal) : 0;
+  const host = backend === "cuda" ? cudaHost : backend === "metal" ? metalHost
+    : Math.max(cudaHost, metalHost);
+  // A reused output head can run on a worker even with local MTP blocks.
+  // Reserve the measured draft graph peak per GPU until split-specific
+  // profiles exist, matching the native planner's conservative rule.
+  return kv > 0 && compute > 0
+    ? (external?.weight_bytes ?? 0) + kv * ctx + compute * Math.max(1, nNodes) + host
+    : Infinity;
+}
+
 /** One sequence's actual cache/state allocation for the selected context and
  * automatic KV tier. Fixed recurrent/compressor state stays f32 and is not
  * scaled with K/V dtype. */
@@ -635,7 +747,7 @@ export function kvBytesForContext(m: ModelManifest, ctx: number, quant: string):
     const full = Math.ceil(m.n_layers / interval);
     const linear = m.n_layers - full;
     return m.kv.bytes_per_token_per_layer * full * ctx * scale
-      + (m.kv.state_bytes_per_layer ?? 0) * linear;
+      + (m.kv.state_bytes_per_layer ?? 0) * linear * (hasMtp(m, quant) ? 4 : 1);
   }
   return m.kv.bytes_per_token_per_layer * m.n_layers * ctx * scale;
 }
@@ -783,7 +895,7 @@ export interface PlannerNode {
   label: string;
   /** Bytes this machine must hold in GPU memory under the plan. */
   gpu: number;
-  /** Routed-expert bytes this machine keeps in its own RAM (0 = GPU-only). */
+  /** System RAM for owner-local experts plus coordinator MTP Host workspace. */
   ram: number;
   vramUsable: number;
 }
@@ -795,8 +907,8 @@ export interface PlannerPlan {
   mode: number;
   hybrid: boolean;
   nCpuMoe: number;
-  /** Exact occupancy of the selected runtime placement. Admission/logging use
-   * these; Hybrid may trade GPU against RAM as context changes. */
+  /** Admitted requirement for the selected runtime placement. Graph reserves
+   * are conservative per GPU; Hybrid may trade GPU against RAM as ctx changes. */
   gpuNeedBytes: number;
   ramNeedBytes: number;
   /** Monotone, conservative UI reservation envelope across every
@@ -820,9 +932,9 @@ export function backendCode(backend: NodeBackend): number {
  *  FIRST — the planner pins layer 0 to the first entry, and so does the
  *  coordinator at launch.
  *
- *  `ram` carries the probe's already-capped expert budget (Windows applies its
- *  WDDM page-lock ceiling before publishing it), so `pinnable` is passed as 0,
- *  which the planner reads as "no further ceiling to apply". */
+ *  `ram` carries physical usable RAM, including MTP Host workspace. `pinnable`
+ *  separately carries the published expert ceiling so neither resource is
+ *  substituted for the other. */
 export function plannerNodesSpec(
   nodes: NodeMemory[],
   backend: NodeBackend,
@@ -831,8 +943,11 @@ export function plannerNodesSpec(
   return nodes
     .map((n, i) => [
       Math.max(0, Math.floor(n.vramFree ?? 0)),
-      Math.max(0, Math.floor(n.ramExpertFree ?? 0)),
-      0,
+      Math.max(0, Math.floor(n.ramFree ?? n.ramExpertFree ?? 0)),
+      // Physical Host workspace and page-locked experts spend independent
+      // limits. One byte is an explicit unusable expert ceiling when the
+      // peer omitted its measurement; native zero means unconstrained.
+      Math.max(1, Math.floor(n.ramExpertFree ?? 0)),
       n.unifiedMemory ? 1 : 0,
       backendCode(backend),
       (labels?.[i] ?? `node${i}`).replace(/[,:]/g, "_"),
@@ -927,7 +1042,8 @@ export function estimateClusterCapacity(
   // are 733 MiB.
   const mmprojBytes = man.mmproj?.bytes ?? 0;
   const needBytes =
-    weightBytes + kvBytes + n * (computeBytes + nodeOverhead) + mmprojBytes;
+    weightBytes + kvBytes + n * (computeBytes + nodeOverhead) + mmprojBytes
+    + mtpBytesForContext(man, ctx, backend, kvQuant, n);
   // Product capacity is GPU-addressable memory only. On unified-memory
   // machines the native probe already reports the GPU working-set budget in
   // vram_usable, so there is still exactly one number to count.

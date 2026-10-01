@@ -334,6 +334,36 @@ typedef struct {
      * is already reduced. Kept so a log line can state the configuration it
      * priced instead of leaving the reader to re-derive it from the quant. */
     uint8_t kv_tier;
+    /* Default MTP is a property of this verified GGUF variant, not a user
+     * toggle. Tail weights are ALREADY included in total_bytes/shared bytes.
+     * The draft context's f16 KV and measured workspace are additional and
+     * indivisible: the engine pins the entire MTP head and its KV to the
+     * coordinator GPU so prompt embeddings never reach a worker. Draft graph
+     * workspace is conservatively charged per active GPU: a reused output
+     * head can still execute remotely and reserve a separate draft buffer.
+     * Target recurrent state includes the 3 rollback copies needed by the
+     * product's fixed --draft-max 3; modelsize resolves that before planning.
+     * Zero draft workspace while enabled means unmeasured, never free. */
+    uint8_t mtp_enabled;
+    uint32_t mtp_layers;
+    uint64_t mtp_weight_bytes; /* embedded in target total_bytes */
+    uint64_t mtp_external_weight_bytes; /* separate model, coordinator-local */
+    uint64_t mtp_kv_bytes_per_token;
+    uint64_t mtp_compute_bytes_128k_cuda;
+    uint64_t mtp_compute_bytes_256k_cuda;
+    uint64_t mtp_compute_bytes_1m_cuda;
+    uint64_t mtp_compute_bytes_128k_metal;
+    uint64_t mtp_compute_bytes_256k_metal;
+    uint64_t mtp_compute_bytes_1m_metal;
+    /* True Host buffers belong to the coordinator process, even when the
+     * target layers are remote. On a unified coordinator they share its GPU pool;
+     * on a discrete coordinator they consume its independent RAM budget. */
+    uint64_t mtp_host_compute_bytes_128k_cuda;
+    uint64_t mtp_host_compute_bytes_256k_cuda;
+    uint64_t mtp_host_compute_bytes_1m_cuda;
+    uint64_t mtp_host_compute_bytes_128k_metal;
+    uint64_t mtp_host_compute_bytes_256k_metal;
+    uint64_t mtp_host_compute_bytes_1m_metal;
     /* The vision tower, in bytes, or 0 for a text-only model (and for a vision
      * model launched without its tower, which serves text and says so).
      *
@@ -369,7 +399,9 @@ uint32_t idletoken_llama_moe_cache_target_experts(
  * staging buffer and allocation tails; slot_bytes covers one expert in
  * every cached weight. Empty ranges return zero. Invalid/missing geometry
  * or overflow returns -1. Strict admission additionally charges the cache
- * target above; the relaxed last-resort pass may admit less. */
+ * target above. Relaxed admission first retains the largest feasible cache
+ * target covering an active route, then minimizes the expert prefix. Only
+ * when no active-route cache fits may correctness-only admission use less. */
 int idletoken_llama_moe_cache_budget(const idletoken_llm_model_size *model,
                                     uint32_t lo, uint32_t hi,
                                     uint64_t *slot_bytes, uint64_t *fixed_bytes);
@@ -380,6 +412,16 @@ int idletoken_llama_moe_cache_budget(const idletoken_llm_model_size *model,
  * capability table ask the same question the planner does. */
 uint64_t idletoken_llama_compute_bytes(const idletoken_llm_model_size *model,
                                        uint32_t ctx_size, uint8_t backend);
+
+/* Extra draft context allocations only; weights are already in total_bytes.
+ * UINT64_MAX means enabled MTP lacks a measured workspace/valid geometry.
+ * Disabled MTP returns zero. The amount is charged once to the coordinator. */
+uint64_t idletoken_llama_mtp_bytes(const idletoken_llm_model_size *model,
+                                  uint32_t ctx_size, uint8_t backend);
+uint64_t idletoken_llama_mtp_compute_bytes(const idletoken_llm_model_size *model,
+                                          uint32_t ctx_size, uint8_t backend);
+uint64_t idletoken_llama_mtp_host_bytes(const idletoken_llm_model_size *model,
+                                      uint32_t ctx_size, uint8_t backend);
 
 /* The backend a homogeneous roster runs on, or UNKNOWN if the rows disagree or
  * any row never reported one. Heterogeneous clusters are out of scope for the
@@ -439,13 +481,15 @@ typedef struct {
      * `--n-cpu-moe N`, which keeps expert tensors for blocks [0,N) in host
      * memory while every complete transformer layer and the KV cache remain
      * GPU-offloaded. For CLUSTER, the per-owner ranges below are authoritative.
-     * In both modes N/ranges are the smallest exact GGUF expert prefix that
-     * closes the owner GPU's VRAM shortfall, including mandatory GPU
-     * cache/staging space for RAM-resident experts. */
+     * In both modes N/ranges are the smallest exact GGUF expert prefixes
+     * satisfying the selected cache target and the owner's VRAM/RAM gates.
+     * When the strict target cannot fit, planning maximizes the feasible
+     * relaxed target before minimizing RAM spill. */
     uint32_t n_cpu_moe;
     uint64_t cpu_moe_bytes;
     /* What this plan needs from each physical pool, kept apart because Hybrid
-     * admits them through two independent gates.
+     * admits them through two independent gates. Coordinator MTP Host scratch
+     * also consumes RAM on discrete machines, including GPU_ONLY plans.
      *
      * ON A REFUSAL these still carry the REFUSED placement's two halves
      * (2026-09-13): a MoE refusal describes a Hybrid split, so the GPU figure
@@ -457,6 +501,9 @@ typedef struct {
      * refusal keeps ram_need = 0, which is the honest "there is no RAM side". */
     uint64_t gpu_need_bytes;
     uint64_t ram_need_bytes;
+    /* Coordinator-local MTP Host workspace using discrete system RAM. It is
+     * included in ram_need_bytes but never in expert spill/cache controls. */
+    uint64_t mtp_host_ram_bytes;
 
     /* CLUSTER + HYBRID. Node i owns [layer_lo[i], layer_hi[i]); its routed
      * expert tensors for [layer_lo[i], cpu_moe_layer_hi[i]) live in that same
@@ -479,12 +526,13 @@ typedef struct {
     /* VRAM left over after admission, i.e. what an expert pool may use.
      *
      * Since 2026-09-13 the post-load pool is NOT an admission cost (the engine
-     * creates it after the first complete graph from the VRAM free then, and
-     * runs without it otherwise), so `gpu_need_bytes` excludes its floor and
+     * creates it after the first complete graph from the VRAM free then),
+     * so `gpu_need_bytes` excludes its floor and
      * this is the plain remainder. A value below the floor means "no pool on
-     * this node" — coord_moe_pool_room() turns it into zero slots. Cache policy
-     * must not enlarge the minimum owner-local RAM prefix chosen for
-     * admission. In mode 2 the coordinator sends no slot count at all and the
+     * this node" — coord_moe_pool_room() turns it into zero slots. The resource
+     * solver selects prefixes with room for its strict or relaxed cache
+     * target; this remainder must not add that target's bytes again.
+     * In mode 2 the coordinator sends no slot count at all and the
      * engine sizes the pool from its own measured free VRAM; this figure is
      * then a planner estimate for the log, not a control. */
     uint64_t moe_pool_bytes;                                    /* single machine */

@@ -180,9 +180,16 @@ Private-cluster inference still runs on your machines and LAN.
 ### Download the model files
 
 If the selected model is not ready, choose **Download weights** and wait for the
-download and hash verification to finish. Models with image support also
-download a vision file. Every compute node in a multi-machine deployment needs
-a complete copy of the model files.
+download and hash verification to finish. The client checks the complete set:
+all model shards, the vision file when required, and a compatible MTP draft
+when it is supplied separately. **Complete download** reuses verified files
+and downloads only missing or damaged files. Cancelling or a failed check
+stops preparation; the model is ready only after every required file passes.
+Starting an existing model also completes missing dependencies automatically.
+Compatible MTP runs by default without a separate switch. Its memory usage is
+included in the capacity check, keeping your selected context unchanged.
+Every compute node in a multi-machine deployment needs a complete copy of the
+model files.
 
 ### Choose local or multi-machine execution
 
@@ -362,8 +369,8 @@ actually serves the request.
 
 ### The model cannot start
 
-- Confirm that weights and the vision file, when required, finished downloading
-  and passed verification.
+- Use **Complete download** to check all model files and complete any required
+  vision or MTP files.
 - Use the capacity card and error details to free VRAM or RAM, select a lower
   precision, or switch from 1M to 256K when applicable.
 - For a cluster, check whether the error identifies an offline or mismatched

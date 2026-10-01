@@ -138,6 +138,15 @@ static size_t receive_body(char *data, size_t size, size_t count, void *context)
     size_t n = size * count;
     size_t max = t->request->max_response ? t->request->max_response : 64u * 1024u * 1024u;
     if (n > max || r->len > max - n) { snprintf(r->error, sizeof(r->error), "response exceeds byte limit"); return 0; }
+    if (t->request->on_body && r->status >= 200 && r->status < 300) {
+        if (t->request->on_body((const unsigned char *)data, n, t->request->body_context)) {
+            snprintf(r->error, sizeof(r->error), "stream consumer rejected response");
+            return 0;
+        }
+        r->len += n;
+        t->last_byte = idletoken_platform_now_ms();
+        return n;
+    }
     if (r->len + n + 1 > t->capacity) {
         size_t cap = t->capacity ? t->capacity : 8192;
         while (cap < r->len + n + 1 && cap <= max / 2) cap *= 2;

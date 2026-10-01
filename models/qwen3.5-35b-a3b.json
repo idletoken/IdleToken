@@ -200,7 +200,10 @@
       "sha256": "2a809de317cfd49ac9130b95619ee6ac039a855e467015b3e996eb61af84718b",
       "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
       "expert_weight_bytes": 8975810560,
-      "expert_max_tensor_bytes": 85983232
+      "expert_max_tensor_bytes": 85983232,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "IQ2_M",
@@ -211,7 +214,10 @@
       "sha256": "187b5bbb81d7ec1dc228cb04120302cc0d486cb3c988501af87e5f02e15ace0e",
       "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
       "expert_weight_bytes": 9646899200,
-      "expert_max_tensor_bytes": 102760448
+      "expert_max_tensor_bytes": 102760448,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q2_K_XL",
@@ -222,7 +228,10 @@
       "sha256": "855b8d11f4b52e7ea4b9eeea2fbe3555c4d96d5b7b74702b6144810db3e77270",
       "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
       "expert_weight_bytes": 10408165376,
-      "expert_max_tensor_bytes": 142606336
+      "expert_max_tensor_bytes": 142606336,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "IQ3_XXS",
@@ -233,7 +242,10 @@
       "sha256": "9f7f59280fcac9373f9122de0ed7a19e014fc14120a68b343ea46ac5f5dd96cd",
       "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
       "expert_weight_bytes": 10989076480,
-      "expert_max_tensor_bytes": 102760448
+      "expert_max_tensor_bytes": 102760448,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "IQ3_S",
@@ -244,7 +256,10 @@
       "sha256": "ca6e9542e9f9e34f28d59e1e335b3629825daf30a4c0b5c1ec9d2f898c061fb6",
       "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
       "expert_weight_bytes": 11492392960,
-      "expert_max_tensor_bytes": 115343360
+      "expert_max_tensor_bytes": 115343360,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q3_K_S",
@@ -255,7 +270,10 @@
       "sha256": "315cce210c0406ae05c4e482ceba154c9225fa0bb4c9e779465209dec08e625d",
       "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
       "expert_weight_bytes": 12834570240,
-      "expert_max_tensor_bytes": 115343360
+      "expert_max_tensor_bytes": 115343360,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q3_K_M",
@@ -266,7 +284,10 @@
       "sha256": "5607c8fcc8b04ada7d1a1152b9a5b6c1e67e6768232c16f6b03d9719d5ab1b2d",
       "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
       "expert_weight_bytes": 13925089280,
-      "expert_max_tensor_bytes": 142606336
+      "expert_max_tensor_bytes": 142606336,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q3_K_XL",
@@ -277,7 +298,10 @@
       "sha256": "fef37f41877128b0c82195c5cd173ca0e02394f48c7667dbf96172fa300fc945",
       "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
       "expert_weight_bytes": 14046724096,
-      "expert_max_tensor_bytes": 184549376
+      "expert_max_tensor_bytes": 184549376,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "IQ4_XS",
@@ -288,7 +312,10 @@
       "sha256": "745def087c9ec34d12a94eb9b31eb52dba958b36def510b7e8f6f2e6bf1be123",
       "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
       "expert_weight_bytes": 14931722240,
-      "expert_max_tensor_bytes": 142606336
+      "expert_max_tensor_bytes": 142606336,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "IQ4_NL",
@@ -299,7 +326,10 @@
       "sha256": "6aec31ed654fbf12f9950c98bab0a09faea433ffdc4b3acfeb55a1f050e3e444",
       "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
       "expert_weight_bytes": 15267266560,
-      "expert_max_tensor_bytes": 150994944
+      "expert_max_tensor_bytes": 150994944,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q4_K_L",
@@ -310,7 +340,10 @@
       "sha256": "b65bba850b65e989ac8c37978970b2fe2ed3aa404fcb8408c9b3f2df13e6ab0b",
       "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
       "expert_weight_bytes": 18119393280,
-      "expert_max_tensor_bytes": 150994944
+      "expert_max_tensor_bytes": 150994944,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q4_K_S",
@@ -321,7 +354,10 @@
       "sha256": "ee93ceffed5ce4df8b09bcbaf59a286d531025a1ebde9cf204c74e800c47d57e",
       "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
       "expert_weight_bytes": 18119393280,
-      "expert_max_tensor_bytes": 150994944
+      "expert_max_tensor_bytes": 150994944,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Qwen3.5-35B-A3B-MXFP4_MOE",
@@ -332,7 +368,10 @@
       "sha256": "0f135a59159030f4710477abc6f9922d2f13552c85bff736deaaef71023cd770",
       "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
       "expert_weight_bytes": 18910019584,
-      "expert_max_tensor_bytes": 220200960
+      "expert_max_tensor_bytes": 220200960,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q4_K_M",
@@ -343,7 +382,10 @@
       "sha256": "3b46d1066bc91cc2d613e3bc22ce691dd77e6f0d33c9060690d24ce6de494375",
       "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
       "expert_weight_bytes": 19461570560,
-      "expert_max_tensor_bytes": 184549376
+      "expert_max_tensor_bytes": 184549376,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q4_K_XL",
@@ -354,7 +396,10 @@
       "sha256": "1b0ac637dfa092bbba2793977db9485a40c4f8b42df5fe342f0076d61b66ae83",
       "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
       "expert_weight_bytes": 19564331008,
-      "expert_max_tensor_bytes": 220200960
+      "expert_max_tensor_bytes": 220200960,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q5_K_S",
@@ -365,7 +410,10 @@
       "sha256": "ac6ea71c0a694e6e90554f8cb0daacecb7873b93a08ad009d1d524c322a2d25c",
       "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
       "expert_weight_bytes": 22145925120,
-      "expert_max_tensor_bytes": 184549376
+      "expert_max_tensor_bytes": 184549376,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q5_K_M",
@@ -376,7 +424,10 @@
       "sha256": "93198787ca7744a813f437317ff086b9abeb3f6fabbd5fa5702aa893fa315d89",
       "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
       "expert_weight_bytes": 23571988480,
-      "expert_max_tensor_bytes": 220200960
+      "expert_max_tensor_bytes": 220200960,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q5_K_XL",
@@ -387,7 +438,10 @@
       "sha256": "fa35af22dd694b8146bfb990c1227d834ee8ab83a4b91772105a14a9e09fde3d",
       "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
       "expert_weight_bytes": 23708303360,
-      "expert_max_tensor_bytes": 285212672
+      "expert_max_tensor_bytes": 285212672,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q6_K_S",
@@ -398,7 +452,10 @@
       "sha256": "9812147c6c561c5229d72f14717618f9e1fc62f26a98e720569981891830b5d8",
       "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
       "expert_weight_bytes": 26424115200,
-      "expert_max_tensor_bytes": 220200960
+      "expert_max_tensor_bytes": 220200960,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q6_K",
@@ -409,7 +466,10 @@
       "sha256": "56ddab06cc049b66fee8cff294c0b0e5e848f3381ed0da1a3a16a7bd80e8280a",
       "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
       "expert_weight_bytes": 26424115200,
-      "expert_max_tensor_bytes": 220200960
+      "expert_max_tensor_bytes": 220200960,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q6_K_XL",
@@ -420,7 +480,10 @@
       "sha256": "c5cd54592ac3a1fc20340841e57769ce8d0b685bb39d7879ab657f301c17155d",
       "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
       "expert_weight_bytes": 29154607104,
-      "expert_max_tensor_bytes": 285212672
+      "expert_max_tensor_bytes": 285212672,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q8_0",
@@ -431,7 +494,10 @@
       "sha256": "3808866c016ab02b4adb26b873f7008a2cdd2c0704a39704050119ab0631db46",
       "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
       "expert_weight_bytes": 34225520640,
-      "expert_max_tensor_bytes": 285212672
+      "expert_max_tensor_bytes": 285212672,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q8_K_XL",
@@ -442,7 +508,10 @@
       "sha256": "86aaf646491f623ce0a7d6983ea8788e36b09d59e5543a4799ccc57ee3af15a9",
       "revision": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
       "expert_weight_bytes": 44291850240,
-      "expert_max_tensor_bytes": 536870912
+      "expert_max_tensor_bytes": 536870912,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "BF16",
@@ -460,7 +529,10 @@
         }
       ],
       "expert_weight_bytes": 64424509440,
-      "expert_max_tensor_bytes": 536870912
+      "expert_max_tensor_bytes": 536870912,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     }
   ],
   "notes": [
@@ -482,5 +554,76 @@
     "weights_norm": true,
     "shared_expert_gate": "sigmoid",
     "first_layer": 0
-  }
+  },
+  "mtp_compute_bytes_128k_cuda": [
+    176179328,
+    176179328,
+    176179328
+  ],
+  "mtp_host_compute_bytes_128k_cuda": [
+    138430496,
+    138430496,
+    138430496
+  ],
+  "mtp_compute_bytes_256k_cuda": [
+    310397056,
+    310397056,
+    310397056
+  ],
+  "mtp_host_compute_bytes_256k_cuda": [
+    272648224,
+    272648224,
+    272648224
+  ],
+  "mtp_compute_bytes_1m_cuda": [
+    1115703424,
+    1115703424,
+    1115703424
+  ],
+  "mtp_host_compute_bytes_1m_cuda": [
+    1077954592,
+    1077954592,
+    1077954592
+  ],
+  "mtp_compute_bytes_128k_metal": [
+    200537120,
+    200537120,
+    200537120
+  ],
+  "mtp_host_compute_bytes_128k_metal": [
+    276860992,
+    276860992,
+    276860992
+  ],
+  "mtp_compute_bytes_256k_metal": [
+    334885920,
+    334885920,
+    334885920
+  ],
+  "mtp_host_compute_bytes_256k_metal": [
+    545296448,
+    545296448,
+    545296448
+  ],
+  "mtp_compute_bytes_1m_metal": [
+    1140978720,
+    1140978720,
+    1140978720
+  ],
+  "mtp_host_compute_bytes_1m_metal": [
+    2155909184,
+    2155909184,
+    2155909184
+  ],
+  "mtp_draft": {
+    "repo": "tomngdev/MTP-Qwen3.5-35B-A3B-GGUF",
+    "revision": "46d16904cba3b7caadabeee401325134f4c7707c",
+    "gguf": "mtp-Q4_K_M.gguf",
+    "sha256": "81e8b07d9c18ea644cdb18aeeb1c725e0726e5d5327b8002da0558ac47682a3c",
+    "bytes": 1621551168,
+    "layers": 1,
+    "weight_bytes": 1610606592,
+    "kv_bytes_per_token": 2048
+  },
+  "mtp_kv_bytes_per_token": 2048
 }

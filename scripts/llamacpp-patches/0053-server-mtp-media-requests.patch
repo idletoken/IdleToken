@@ -1,0 +1,85 @@
+diff --git a/tools/server/server-common.h b/tools/server/server-common.h
+--- a/tools/server/server-common.h
++++ b/tools/server/server-common.h
+@@ -219,6 +219,8 @@
+     size_t size() const { return tokens.size(); }
+ 
+     bool empty() const { return tokens.empty(); }
++
++    bool has_media() const { return !map_idx_to_media.empty(); }
+ 
+     void clear() {
+         map_idx_to_media.clear();
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -373,6 +373,9 @@
+         if (spec && task->params.sampling.n_probs > 0) {
+             SLT_INF(*this, "%s", "speculative drafting disabled for this request: token probabilities require target sampling\n");
+         }
++        if (skip_media_draft()) {
++            SLT_INF(*this, "%s", "model-based drafting disabled for this request: image embeddings require target-only decoding\n");
++        }
+ 
+         const int64_t t_start = ggml_time_us();
+ 
+@@ -412,6 +415,7 @@
+ 
+         return task->type == other_slot.task->type
+             && inp_embd.size() == other_slot.inp_embd.size()
++            && skip_media_draft() == other_slot.skip_media_draft()
+             && are_lora_equal(lora, other_slot.lora);
+     }
+ 
+@@ -428,9 +432,13 @@
+         return state != SLOT_STATE_IDLE;
+     }
+ 
++    bool skip_media_draft() const {
++        return ctx_dft && task && task->tokens.has_media();
++    }
++
+     bool can_speculate() const {
+         // The speculative acceptance path does not populate token probabilities.
+-        return !!spec && task && task->params.sampling.n_probs == 0;
++        return !!spec && task && task->params.sampling.n_probs == 0 && !skip_media_draft();
+     }
+ 
+     void add_token(const completion_token_output & token) {
+@@ -514,7 +522,8 @@
+             state = SLOT_STATE_IDLE;
+ 
+             // do not keep context of the child slots - the parent's context is enough
+-            if (task->is_child()) {
++            // A media request has no matching draft KV. Do not reuse its target prefix later.
++            if (task->is_child() || skip_media_draft()) {
+                 prompt_clear();
+             }
+ 
+@@ -712,7 +721,7 @@
+         if (mbatch) {
+             float * embd = mtmd_batch_get_output_embd(mbatch.get(), chunk.get());
+             if (embd) {
+-                void * cb_data = slot.spec;
++                void * cb_data = slot.skip_media_draft() ? nullptr : slot.spec;
+                 static auto cb = [](llama_batch batch, void * user_data) {
+                     common_speculative * spec = static_cast<common_speculative *>(user_data);
+                     if (!common_speculative_process(spec, batch)) {
+@@ -3691,7 +3700,16 @@
+         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
+         //       for now, always re-evaluate for simplicity
+         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
+-        if (spec) {
++        bool process_spec_batch = !!spec;
++        for (int i = 0; i < batch_view.n_tokens && process_spec_batch; ++i) {
++            for (int j = 0; j < batch_view.n_seq_id[i]; ++j) {
++                if (slots.at(batch_view.seq_id[i][j]).skip_media_draft()) {
++                    process_spec_batch = false;
++                    break;
++                }
++            }
++        }
++        if (process_spec_batch) {
+             bool ok = true;
+             queue_tasks.yield_to_queue([&]() {
+                 ok = common_speculative_process(spec.get(), batch_view);

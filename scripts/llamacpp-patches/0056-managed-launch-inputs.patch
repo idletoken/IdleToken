@@ -1,0 +1,62 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -763,11 +763,27 @@
+ static bool common_params_parse_ex(int argc, char ** argv, common_params_context & ctx_arg) {
+     common_params & params = ctx_arg.params;
+ 
++    // A managed launch has already admitted its exact CLI configuration. Read
++    // this sentinel before any implicit preset or environment handler: those
++    // handlers can append speculators and tensor overrides that later CLI
++    // options do not remove. Match the parser's long-option normalization.
++    bool idletoken_managed = false;
++    for (int i = 1; i < argc; ++i) {
++        std::string arg = argv[i];
++        std::replace(arg.begin(), arg.end(), '_', '-');
++        if (arg == "--idletoken-managed") {
++            idletoken_managed = true;
++            break;
++        }
++    }
++
+     // setup log directly from params.verbosity: see tools/cli/cli.cpp
+     common_log_set_verbosity_thold(params.verbosity);
+ 
+     // config file applies first, so env variables and CLI arguments override it
+-    common_params_apply_system_config(params, ctx_arg.ex);
++    if (!idletoken_managed) {
++        common_params_apply_system_config(params, ctx_arg.ex);
++    }
+ 
+     std::unordered_map<std::string, std::pair<common_arg *, bool>> arg_to_options;
+     for (auto & opt : ctx_arg.options) {
+@@ -782,7 +798,7 @@
+     // handle environment variables
+     for (auto & opt : ctx_arg.options) {
+         std::string value;
+-        if (opt.get_value_from_env(value)) {
++        if (!idletoken_managed && opt.get_value_from_env(value)) {
+             try {
+                 if (opt.handler_void && is_truthy(value)) {
+                     opt.handler_void(params);
+@@ -834,7 +850,7 @@
+             auto & tmp = arg_to_options[arg];
+             auto opt = *tmp.first;
+             bool is_positive = tmp.second;
+-            if (opt.has_value_from_env()) {
++            if (!idletoken_managed && opt.has_value_from_env()) {
+                 fprintf(stderr, "warn: %s environment variable is set, but will be overwritten by command line argument %s\n", opt.env, arg.c_str());
+             }
+             try {
+@@ -1980,6 +1996,11 @@
+         }
+     ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_MTMD, LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_RETRIEVAL, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_DEBUG}));
+     add_opt(common_arg(
++        {"--idletoken-managed"},
++        "require an explicit managed launch without implicit config files or argument environment variables",
++        [](common_params &) {}
++    ).set_examples({LLAMA_EXAMPLE_SERVER}));
++    add_opt(common_arg(
+         {"--idletoken-mtp-external-safe"},
+         "require verified standalone MTP dependency support and memory accounting",
+         [](common_params &) {}

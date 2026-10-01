@@ -1,0 +1,157 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1980,6 +1980,15 @@
+         }
+     ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_MTMD, LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_RETRIEVAL, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_DEBUG}));
+     add_opt(common_arg(
++        {"--idletoken-memory-json"},
++        "print server model, target and MTP buffer estimates as JSON, then exit without loading tensor data",
++        [](common_params & params) {
++            params.no_alloc = true;
++            params.fit_params = false;
++            params.warmup = false;
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}));
++    add_opt(common_arg(
+         {"--vocab-only"},
+         "load only model metadata and vocabulary; generation endpoints are unavailable",
+         [](common_params & params) {
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -11,6 +11,8 @@
+ #include "fit.h"
+ #include "llama.h"
+ #include "log.h"
++#include "speculative.h"
++#include "../../src/llama-ext.h"
+ 
+ #include <atomic>
+ #include <clocale>
+@@ -85,6 +87,115 @@
+     };
+ }
+ 
++// Same graph shapes and placement as the server, with no tensor-data or KV allocation.
++static int idletoken_memory_json(common_params params) {
++    try {
++        if (params.model.path.empty() || params.vocab_only || params.speculative.has_dft() ||
++                params.embedding || !params.lora_adapters.empty()) {
++            throw std::invalid_argument("memory JSON requires a local generation model without a separate draft or adapter");
++        }
++        if (params.n_parallel < 0) {
++            params.n_parallel = 4;
++            params.kv_unified = true;
++        }
++        const auto limits = common_speculative_get_output_limits(
++                params.n_batch, params.n_parallel, common_speculative_n_max(&params.speculative));
++        params.n_outputs_max = std::max<int32_t>(1, limits.total);
++        params.n_outputs_max_per_seq = std::max<int32_t>(1, limits.per_seq);
++        auto mparams = common_model_params_to_llama(params);
++        mparams.no_alloc = true;
++        mparams.load_mode = LLAMA_LOAD_MODE_NONE;
++        llama_model_ptr model(llama_model_load_from_file(params.model.path.c_str(), mparams));
++        if (!model) {
++            throw std::runtime_error("cannot read model metadata for memory JSON");
++        }
++        auto cparams = common_context_params_to_llama(params);
++        llama_context_ptr target(llama_init_from_model(model.get(), cparams));
++        if (!target) {
++            throw std::runtime_error("cannot estimate target context for memory JSON");
++        }
++        llama_context_ptr draft;
++        if (mparams.load_mtp) {
++            auto dparams = common_base_params_to_speculative(params);
++            auto dcparams = common_context_params_to_llama(dparams);
++            dcparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
++            dcparams.ctx_other = target.get();
++            dcparams.n_rs_seq = 0;
++            draft.reset(llama_init_from_model(model.get(), dcparams));
++            if (!draft) {
++                throw std::runtime_error("cannot estimate MTP context for memory JSON");
++            }
++        }
++
++        struct memory_row {
++            size_t model = 0;
++            size_t target_context = 0;
++            size_t target_compute = 0;
++            size_t draft_context = 0;
++            size_t draft_compute = 0;
++        };
++        std::vector<ggml_backend_dev_t> devices;
++        for (int i = 0; i < llama_model_n_devices(model.get()); ++i) {
++            devices.push_back(llama_model_get_device(model.get(), i));
++        }
++        std::vector<memory_row> rows(devices.size() + 1);
++        auto accumulate = [&](const llama_context * ctx, bool is_draft) {
++            for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx)) {
++                size_t idx = devices.size();
++                if (!ggml_backend_buft_is_host(buft)) {
++                    const auto dev = ggml_backend_buft_get_device(buft);
++                    auto found = std::find(devices.begin(), devices.end(), dev);
++                    if (found == devices.end()) {
++                        throw std::runtime_error("memory JSON found an unaccounted device buffer");
++                    }
++                    idx = (size_t) (found - devices.begin());
++                }
++                auto & row = rows[idx];
++                if (is_draft) {
++                    // Both contexts share one model. Count its tensors only once.
++                    row.draft_context += mb.context;
++                    row.draft_compute += mb.compute;
++                } else {
++                    row.model += mb.model;
++                    row.target_context += mb.context;
++                    row.target_compute += mb.compute;
++                }
++            }
++        };
++        accumulate(target.get(), false);
++        if (draft) {
++            accumulate(draft.get(), true);
++        }
++        json output = {
++            {"version", 1}, {"no_alloc", true},
++            {"ctx_size", llama_n_ctx(target.get())}, {"seq_slots", params.n_parallel},
++            {"model_layers", llama_model_n_layer(model.get())},
++            {"mtp_layers", llama_model_n_layer_nextn(model.get())},
++            {"mtp", mparams.load_mtp}, {"draft_max", params.speculative.draft.n_max},
++            {"mmproj_included", false}, {"expert_cache_included", false},
++            {"devices", json::array()}
++        };
++        for (size_t i = 0; i < rows.size(); ++i) {
++            const auto & row = rows[i];
++            output["devices"].push_back({
++                {"name", i < devices.size() ? ggml_backend_dev_name(devices[i]) : "Host"},
++                {"host", i == devices.size()},
++                {"model_bytes", row.model},
++                {"target_context_bytes", row.target_context},
++                {"target_compute_bytes", row.target_compute},
++                {"draft_context_bytes", row.draft_context},
++                {"draft_compute_bytes", row.draft_compute},
++                {"total_bytes", row.model + row.target_context + row.target_compute + row.draft_context + row.draft_compute}
++            });
++        }
++        printf("%s\n", output.dump().c_str());
++        return 0;
++    } catch (const std::exception & e) {
++        fprintf(stderr, "[MEMORY_ESTIMATE_FAILED] %s\n", e.what());
++        return 1;
++    }
++}
++
+ int llama_server(int argc, char ** argv) {
+     std::setlocale(LC_NUMERIC, "C");
+ 
+@@ -113,6 +224,9 @@
+ }
+ 
+ int llama_server(common_params & params, int argc, char ** argv) {
++    if (params.no_alloc) {
++        return idletoken_memory_json(params);
++    }
+     bool is_run_by_cli = (argv == nullptr);
+ 
+     common_models_handler models_handler;

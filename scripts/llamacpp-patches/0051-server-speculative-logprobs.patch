@@ -1,0 +1,24 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -370,6 +370,10 @@
+             return;
+         }
+ 
++        if (spec && task->params.sampling.n_probs > 0) {
++            SLT_INF(*this, "%s", "speculative drafting disabled for this request: token probabilities require target sampling\n");
++        }
++
+         const int64_t t_start = ggml_time_us();
+ 
+         int n_text = 0;
+@@ -425,7 +429,8 @@
+     }
+ 
+     bool can_speculate() const {
+-        return !!spec;
++        // The speculative acceptance path does not populate token probabilities.
++        return !!spec && task && task->params.sampling.n_probs == 0;
+     }
+ 
+     void add_token(const completion_token_output & token) {

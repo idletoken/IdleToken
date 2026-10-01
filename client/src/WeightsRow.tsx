@@ -30,6 +30,10 @@ export interface WeightsInfo {
    *  machine that HAD the model report that it did not — the user's own words:
    *  "明明有,但却说没有". The model is there; one extra file is not. */
   visionNeeds?: boolean;
+  /** A required model dependency is absent (vision or an audited MTP draft). */
+  assetsNeed?: boolean;
+  /** All relevant files exist, but at least one needs integrity verification. */
+  needsVerify?: boolean;
   onDownload: () => void;
   onCancel: () => void;
 }
@@ -113,7 +117,7 @@ export default function WeightsRow(props: { w: WeightsInfo; idle?: "hide" | "sho
   // Weights present, tower absent. Deliberately AFTER the `needs` branch: when
   // both are missing the weights are the bigger, more important download and
   // one row cannot lead with both.
-  if (props.w.visionNeeds) {
+  if (props.w.assetsNeed || props.w.visionNeeds || props.w.needsVerify) {
     // Deliberately NOT hidden by `idle="hide"`. That flag suppresses the
     // RESTING states — "ready", "not downloaded yet" — on hosts that only want
     // live progress. A missing tower is not a resting state: it is the only
@@ -122,9 +126,13 @@ export default function WeightsRow(props: { w: WeightsInfo; idle?: "hide" | "sho
     // unreachable (caught on the real client, 2026-09-14).
     return (
       <span className="wrow" onClick={stop}>
-        <span className="wrow__msg">{t("weights.visionNeeded")}</span>
+        <span className="wrow__msg" title={props.w.lastError ? tErr(props.w.lastError) : undefined}>
+          {t(props.w.assetsNeed ? "weights.assetsNeeded" : props.w.visionNeeds
+            ? "weights.visionNeeded" : "weights.verifyNeeded")}
+          {props.w.lastError ? <span className="wrow__note"> · {t("weights.lastStop", { why: tErr(props.w.lastError) })}</span> : null}
+        </span>
         <button className="linkbtn" onClick={props.w.onDownload}>
-          {t("weights.download")}
+          {t(props.w.needsVerify && !props.w.assetsNeed && !props.w.visionNeeds ? "weights.verify" : "weights.complete")}
         </button>
       </span>
     );

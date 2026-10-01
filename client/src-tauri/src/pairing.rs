@@ -899,6 +899,8 @@ struct Inner {
     /// it from the directory would be worse than either — a model whose tower
     /// was downloaded twice (F16 and BF16) has two candidates and no rule.
     mmproj_path: String,
+    /// Verified standalone MTP dependency; never inferred from a filename.
+    mtp_draft_path: String,
     engine_started: bool,
     /// Account-mode pairing (integration plan 3.3): the "code" is a secret
     /// derived on the JS side from stable account material (platform user id +
@@ -976,6 +978,7 @@ impl Default for Pairing {
             coord_ip: None,
             model_path: String::new(),
             mmproj_path: String::new(),
+            mtp_draft_path: String::new(),
             engine_started: false,
             account_mode: false,
             last_error: None,
@@ -1300,6 +1303,7 @@ fn apply_roster(inner: &mut Inner, v: &Value) -> RosterEffect {
     if inner.tuning.model_id != old_model || inner.tuning.quant != old_quant {
         inner.model_path.clear();
         inner.mmproj_path.clear();
+        inner.mtp_draft_path.clear();
     }
     let cluster_model = inner.tuning.model_id.clone();
     let cluster_quant = inner.tuning.quant.clone();
@@ -1722,7 +1726,16 @@ fn secret_env(tuning: &Tuning) -> Vec<(String, String)> {
 /// tensor index (and an old-client compatibility source), while current workers
 /// seed only their assigned tensors from their own complete local GGUF.
 fn materialize_engine(app: &AppHandle) {
-    let (is_coord, coord_ip, remote_workers, model_path, mmproj_path, engine_code, tuning) = {
+    let (
+        is_coord,
+        coord_ip,
+        remote_workers,
+        model_path,
+        mmproj_path,
+        mtp_draft_path,
+        engine_code,
+        tuning,
+    ) = {
         let pairing = app.state::<Pairing>();
         let mut inner = pairing.0.lock().unwrap();
         if inner.engine_started {
@@ -1741,6 +1754,7 @@ fn materialize_engine(app: &AppHandle) {
             remote_workers,
             inner.model_path.clone(),
             inner.mmproj_path.clone(),
+            inner.mtp_draft_path.clone(),
             inner.engine_code.clone(),
             inner.tuning.clone(),
         )
@@ -1834,6 +1848,10 @@ fn materialize_engine(app: &AppHandle) {
         if !mmproj_path.trim().is_empty() {
             coord_args.push("--mmproj-path".into());
             coord_args.push(mmproj_path.trim().to_string());
+        }
+        if !mtp_draft_path.trim().is_empty() {
+            coord_args.push("--mtp-draft-path".into());
+            coord_args.push(mtp_draft_path.trim().to_string());
         }
         // The user's "Resource usage" caps, which reached the WORKER (line
         // ~925) and not the coordinator until 2026-08-21. On a single machine
@@ -3439,6 +3457,7 @@ pub fn pairing_create(
     gpu: String,
     model_path: Option<String>,
     mmproj_path: Option<String>,
+    mtp_draft_path: Option<String>,
     tuning: Option<Tuning>,
     account: Option<bool>,
 ) -> Result<(), String> {
@@ -3468,6 +3487,7 @@ pub fn pairing_create(
         inner.coord_ip = None;
         inner.model_path = model_path.clone();
         inner.mmproj_path = mmproj_path.clone().unwrap_or_default();
+        inner.mtp_draft_path = mtp_draft_path.unwrap_or_default();
         inner.engine_started = false;
         inner.last_error = None;
         inner.required_model = None;
@@ -3537,6 +3557,7 @@ pub fn pairing_join(
     gpu: String,
     model_path: Option<String>,
     mmproj_path: Option<String>,
+    mtp_draft_path: Option<String>,
     tuning: Option<Tuning>,
     account: Option<bool>,
 ) -> Result<(), String> {
@@ -3558,6 +3579,7 @@ pub fn pairing_join(
         inner.coord_ip = None;
         inner.model_path = model_path.unwrap_or_default();
         inner.mmproj_path = mmproj_path.unwrap_or_default();
+        inner.mtp_draft_path = mtp_draft_path.unwrap_or_default();
         inner.engine_started = false;
         inner.last_error = None;
         inner.required_model = None;
@@ -3587,6 +3609,8 @@ pub fn pairing_update_model(
     model_id: String,
     quant: String,
     model_path: String,
+    mmproj_path: Option<String>,
+    mtp_draft_path: Option<String>,
 ) -> Result<(), String> {
     {
         let mut inner = state.0.lock().unwrap();
@@ -3603,6 +3627,8 @@ pub fn pairing_update_model(
             return Err("[WEIGHTS_NOT_DOWNLOADED] selected GGUF is not ready".into());
         }
         inner.model_path = model_path;
+        inner.mmproj_path = mmproj_path.unwrap_or_default();
+        inner.mtp_draft_path = mtp_draft_path.unwrap_or_default();
         let self_id = inner.self_id.clone();
         if let Some(p) = inner.peers.iter_mut().find(|p| p.id == self_id) {
             p.model_ready = true;
@@ -3991,6 +4017,7 @@ pub fn headless_pair(app: &AppHandle, spec: &str) {
                 "headless".into(),
                 model_opt,
                 None,
+                None,
                 tuning_opt,
                 None,
             );
@@ -4017,6 +4044,7 @@ pub fn headless_pair(app: &AppHandle, spec: &str) {
                 name,
                 "headless".into(),
                 model_opt,
+                None,
                 None,
                 tuning_opt,
                 None,

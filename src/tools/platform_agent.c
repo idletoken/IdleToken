@@ -690,6 +690,8 @@ static IDLETOKEN_TLS int64_t g_delivery_deadline_ms;
 static IDLETOKEN_TLS int64_t g_inference_deadline_ms;
 static IDLETOKEN_TLS int (*g_request_cancelled)(void *);
 static IDLETOKEN_TLS void *g_cancel_context;
+static IDLETOKEN_TLS int (*g_stream_body)(const unsigned char *, size_t, void *);
+static IDLETOKEN_TLS void *g_stream_context;
 
 /* The public transport owns HTTPS, dual-stack DNS, proxies and framing.
  * Unix sockets retain the local inference privacy boundary. */
@@ -715,6 +717,8 @@ static uint8_t *http_request_json(const char *method,
     int bulk_transfer = strstr(path, "/relay/poll") || strstr(path, "/relay/result");
     idletoken_platform_http_request request = {
         .url = url, .method = method, .bearer = bearer, .headers = extra_hdr,
+        .on_body = !strcmp(path, "/v1/chat/completions") ? g_stream_body : NULL,
+        .body_context = g_stream_context,
         .unix_socket = unix_socket, .cancelled = g_request_cancelled, .cancel_context = g_cancel_context,
         .body = body, .body_len = body_len, .connect_ms = 10000,
         .headers_ms = timeout_secs * 1000,
@@ -750,7 +754,7 @@ static uint8_t *http_request_json(const char *method,
         }
     }
     if (out_status) *out_status = response.status;
-    if (out_len) *out_len = response.len;
+    if (out_len) *out_len = request.on_body && response.status == 200 ? 0 : response.len;
     if (out_truncated) *out_truncated = response.truncated;
     return response.body;
 }
@@ -1580,7 +1584,7 @@ static int coord_stats_json(const char *coord_addr, char *out, size_t out_cap) {
      * way to say it is to be able to do it. An older agent simply omits it and
      * keeps receiving plain JSON. */
     int n = snprintf(out, out_cap,
-        "{\"accepts_deflate\":true,"
+        "{\"accepts_deflate\":true,\"accepts_stream\":true,"
         "\"seq_slots_by_ctx\":{\"%d\":%d},\"avg_service_ms\":{\"%d\":%d},%s%s"
         "%s\"queue_depth\":%d,\"max_ctx_tokens\":%d}",
         ctx, slots > 0 ? slots : 1, ctx, svc_ms > 0 ? svc_ms : 0, ttft_field,
@@ -1742,6 +1746,140 @@ static int relay_post_result(const char *platform_addr, const char *jwt,
     }
     free(body);
     return -1;
+}
+
+/* Incremental relay replies. Frames are sealed immediately and ciphertext is
+ * uploaded in bounded batches; plaintext lives only in the current SSE line.
+ * Retries reuse byte-identical ciphertext and the same offset. */
+typedef struct {
+    const char *addr, *jwt, *provider, *job, *token;
+    int64_t expires, last_flush;
+    const uint8_t *reply_to;
+    char *line, *summary, *terminal, *batch;
+    size_t llen, lcap, batch_len;
+    int seq, offset, count, done, failed;
+    int direct, fd, head_sent;
+} agent_stream;
+static IDLETOKEN_TLS agent_stream *g_relay_stream;
+
+static int agent_stream_flush(agent_stream *s) {
+    if (!s->count) return 0;
+    char path[256];
+    snprintf(path, sizeof(path), "/providers/%s/relay/frames", s->provider);
+    size_t cap = s->batch_len + 512;
+    char *body = malloc(cap);
+    if (!body) return -1;
+    int n = snprintf(body, cap, "{\"job_id\":\"%s\",\"delivery_token\":\"%s\",\"offset\":%d,\"frames\":[%s]}",
+        s->job, s->token, s->offset, s->batch);
+    if (n < 0 || (size_t)n >= cap) { free(body); return -1; }
+    int accepted = 0;
+    while (idletoken_platform_now_ms() < s->expires &&
+           !(g_request_cancelled && g_request_cancelled(g_cancel_context))) {
+        int status = 0; size_t len = 0;
+        uint8_t *response = http_post_json(s->addr, path, s->jwt, (uint8_t *)body, (size_t)n, &status, &len, 10);
+        accepted = response && status >= 200 && status < 300;
+        free(response);
+        if (accepted || status == 400 || status == 401 || status == 403 || status == 404 || status == 413) break;
+        sleep(1);
+    }
+    free(body);
+    if (!accepted) return -1;
+    s->offset += s->count; s->count = 0; s->batch_len = 0;
+    if (s->batch) s->batch[0] = 0;
+    s->last_flush = idletoken_platform_now_ms();
+    return 0;
+}
+
+static char *agent_stream_seal(agent_stream *s, const char *chunk, size_t len, int terminal) {
+    size_t cap = len + 96;
+    char *plain = malloc(cap);
+    uint8_t *sealed = malloc(cap + IDLETOKEN_SEAL_OVERHEAD);
+    if (!plain || !sealed) { free(plain); free(sealed); return NULL; }
+    int n = snprintf(plain, cap, "{\"seq\":%d,\"type\":\"%s\",\"chunk\":%.*s}", s->seq,
+        terminal ? "end" : "delta", (int)len, chunk);
+    size_t sealed_len = 0;
+    int rc = n > 0 && (size_t)n < cap
+        ? idletoken_sodium_seal(s->reply_to, (uint8_t *)plain, (size_t)n, sealed, cap + IDLETOKEN_SEAL_OVERHEAD, &sealed_len) : -1;
+    idletoken_secure_zero(plain, cap); free(plain);
+    char *b64 = rc == IDLETOKEN_PRIV_OK ? b64_encode(sealed, sealed_len) : NULL;
+    free(sealed);
+    if (b64) s->seq++;
+    return b64;
+}
+
+static int agent_stream_direct(agent_stream *s, const char *frame) {
+    if (!s->head_sent) {
+        const char *head = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+        if (idletoken_sendall(s->fd, head, strlen(head)) < 0) return -1;
+        s->head_sent = 1;
+    }
+    return idletoken_sendall(s->fd, frame, strlen(frame)) < 0 || idletoken_sendall(s->fd, "\n", 1) < 0 ? -1 : 0;
+}
+
+static int agent_stream_line(agent_stream *s) {
+    while (s->llen && s->line[s->llen - 1] == '\r') s->llen--;
+    s->line[s->llen] = 0;
+    if (s->llen < 5 || memcmp(s->line, "data:", 5)) return 0;
+    const char *d = s->line + 5; while (*d == ' ') d++;
+    size_t len = s->llen - (size_t)(d - s->line);
+    if (s->done) return -1;
+    if (len == 6 && !memcmp(d, "[DONE]", 6)) {
+        if (!s->summary || agent_stream_flush(s)) return -1;
+        s->terminal = agent_stream_seal(s, s->summary, strlen(s->summary), 1);
+        s->done = s->terminal != NULL;
+        return s->done ? 0 : -1;
+    }
+    if (!len || *d != '{' || idletoken_json_obj_get(d, len, "error")) return -1;
+    const char *usage = idletoken_json_obj_get(d, len, "usage");
+    if (usage && *usage == '{') {
+        if (s->summary) { idletoken_secure_zero(s->summary, strlen(s->summary)); free(s->summary); }
+        s->summary = malloc(len + 1);
+        if (!s->summary) return -1;
+        memcpy(s->summary, d, len); s->summary[len] = 0;
+        return 0;
+    }
+    char *frame = agent_stream_seal(s, d, len, 0);
+    if (!frame) return -1;
+    if (s->direct) { int rc = agent_stream_direct(s, frame); free(frame); return rc; }
+    size_t flen = strlen(frame);
+    if (flen > 240 * 1024) { free(frame); return -1; }
+    if (s->batch_len + flen + 4 > 240 * 1024 || s->count >= 128) {
+        if (agent_stream_flush(s)) { free(frame); return -1; }
+    }
+    char *next = realloc(s->batch, s->batch_len + flen + 4);
+    if (!next) { free(frame); return -1; }
+    s->batch = next;
+    s->batch_len += (size_t)sprintf(s->batch + s->batch_len, "%s\"%s\"", s->count ? "," : "", frame);
+    s->count++; free(frame);
+    if (idletoken_platform_now_ms() - s->last_flush >= 100) return agent_stream_flush(s);
+    return 0;
+}
+
+static int agent_stream_body(const unsigned char *data, size_t len, void *arg) {
+    agent_stream *s = arg;
+    for (size_t i = 0; i < len; i++) {
+        if (data[i] == '\n') {
+            if (s->line && agent_stream_line(s)) { s->failed = 1; return -1; }
+            if (s->line) idletoken_secure_zero(s->line, s->llen);
+            s->llen = 0;
+        } else {
+            if (s->llen + 2 > s->lcap) {
+                size_t cap = s->lcap ? s->lcap * 2 : 4096;
+                if (cap > 128 * 1024) { s->failed = 1; return -1; }
+                char *next = realloc(s->line, cap);
+                if (!next) { s->failed = 1; return -1; }
+                s->line = next; s->lcap = cap;
+            }
+            s->line[s->llen++] = (char)data[i];
+        }
+    }
+    return 0;
+}
+
+static void agent_stream_free(agent_stream *s) {
+    if (s->line) { idletoken_secure_zero(s->line, s->lcap); free(s->line); }
+    if (s->summary) { idletoken_secure_zero(s->summary, strlen(s->summary)); free(s->summary); }
+    free(s->batch); free(s->terminal);
 }
 
 /* A lost acknowledgement response is retried with the SAME token. Do not
@@ -2084,8 +2222,14 @@ static void relay_loop(const idletoken_keypair *node, agent_registration *reg) {
         int err_status = 500;
         const char *err_msg = "internal error";
         g_inference_deadline_ms = expires;
+        const char *stream_flag = idletoken_json_obj_get((const char *)resp, rlen, "stream");
+        agent_stream stream = { .addr = platform_addr, .jwt = jwt, .provider = reg->provider_id,
+            .job = job_id, .token = delivery_token, .expires = expires };
+        g_relay_stream = stream_flag && !strncmp(stream_flag, "true", 4) && delivery_token ? &stream : NULL;
         int rc = process_sealed(node, coord_addr, (const char *)resp, rlen, job_id,
                                 &sealed_b64, &err_status, &err_msg);
+        g_relay_stream = NULL;
+        agent_stream_free(&stream);
         free(resp);
         fprintf(stderr, "platform-agent: relay infer job=%s -> %s\n",
                 job_id, rc == 0 ? "sealed ok" : err_msg);
@@ -2266,7 +2410,7 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
      * buffer while `plain` still exists (it is wiped moments from now), and are
      * committed as the "live session" state only after the whole round trip
      * succeeds (see the end of this function). */
-    static char staged[PFX_MAX_BLOCKS][65];
+    char staged[PFX_MAX_BLOCKS][65];
     int staged_n = prefix_hash_messages(msgs_tok, msgs_len, staged, PFX_MAX_BLOCKS);
 
     size_t sampling_len = 0;
@@ -2278,7 +2422,7 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
     }
     idletoken_mlock(sampling, sampling_len);
     size_t creq_cap = msgs_len + model_len + tools_len + choice_len + ctk_len + sampling_len
-                      + eff_len + 256;
+                      + eff_len + 512;
     char *creq = malloc(creq_cap);
     if (!creq) {
         idletoken_secure_zero(sampling, sampling_len);
@@ -2308,14 +2452,13 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
     idletoken_secure_zero(sampling, sampling_len);
     idletoken_munlock(sampling, sampling_len); free(sampling);
 
-    /* -- forward plaintext to coord over loopback ------------------------- *
-     * Deliberately NO "stream":true here: the sealed envelope is a one-shot
-     * roundtrip (seal → open → reply → seal), so the agent takes the coord's
-     * complete response and seals it whole. The coord's own SSE streaming
-     * (integration-plan 3.4) serves DIRECT LAN clients; cross-envelope
-     * streaming needs a framed sealing protocol (per-frame seq + MAC) and is
-     * deferred — the seam for it is the platform's SealedChannel interface
-     * (gateway/src/crypto/sealed-transport.ts) + this single data path. */
+    if (g_relay_stream && cl > 0 && (size_t)cl + 40 < creq_cap) {
+        cl--; /* Replace the closing brace. */
+        cl += snprintf(creq + cl, creq_cap - (size_t)cl, ",\"stream\":true}");
+        g_relay_stream->reply_to = reply_to;
+        g_stream_body = agent_stream_body;
+        g_stream_context = g_relay_stream;
+    }
     int cstatus = 0; size_t cresp_len = 0;
     uint8_t *cresp = NULL;
     if (cl > 0 && (size_t)cl < creq_cap)
@@ -2323,12 +2466,26 @@ static int process_sealed(const idletoken_keypair *node, const char *coord_addr,
                                job_id, hops_in,
                                (const uint8_t *)creq, (size_t)cl, &cstatus, &cresp_len,
                                0 /* no timeout: real-model inference is slow by design */);
+    g_stream_body = NULL; g_stream_context = NULL;
     /* plaintext request buffers are done — wipe immediately */
     idletoken_secure_zero(creq, creq_cap);
     idletoken_munlock(creq, creq_cap); free(creq);
     idletoken_secure_zero(plain, plain_cap);
     idletoken_munlock(plain, plain_cap); free(plain);
 
+    if (g_relay_stream && cresp && cstatus == 200) {
+        free(cresp); free(reply_to);
+        if (!g_relay_stream->done || g_relay_stream->failed) FAIL(502, "coordinator stream ended without complete usage");
+        *out_b64 = g_relay_stream->terminal;
+        g_relay_stream->terminal = NULL;
+        if (staged_n > 0) {
+            pthread_mutex_lock(&g_prefix_mu);
+            memcpy(g_prefix.hashes, staged, (size_t)staged_n * sizeof(staged[0]));
+            g_prefix.n = staged_n; g_prefix.dirty = 1;
+            pthread_mutex_unlock(&g_prefix_mu);
+        }
+        return 0;
+    }
     if (!cresp || cstatus != 200) {
         int coord_answered = cresp != NULL;
         /* Salvage the coord's own words before the body is wiped: an engine
@@ -2607,9 +2764,20 @@ static void handle_infer(int conn_fd, const idletoken_keypair *node,
     int err_status = 500;
     const char *err_msg = "internal error";
     g_request_cancelled = infer_consumer_closed; g_cancel_context = &conn_fd;
+    const char *flag = idletoken_json_obj_get((const char *)body, body_len, "stream");
+    agent_stream stream = { .direct = 1, .fd = conn_fd };
+    g_relay_stream = flag && !strncmp(flag, "true", 4) ? &stream : NULL;
+    int streaming = g_relay_stream != NULL;
     int rc = process_sealed(node, coord_addr, (const char *)body, body_len, NULL,
                            &resp_b64, &err_status, &err_msg);
+    g_relay_stream = NULL;
     g_request_cancelled = NULL; g_cancel_context = NULL;
+    if (streaming) {
+        if (rc == 0) agent_stream_direct(&stream, resp_b64);
+        else if (!stream.head_sent) idletoken_http_send_error(conn_fd, err_status, err_msg);
+        free(resp_b64); agent_stream_free(&stream);
+        return;
+    }
     if (rc != 0) {
         idletoken_http_send_error(conn_fd, err_status, err_msg);
         return;

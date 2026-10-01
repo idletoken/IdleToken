@@ -14,7 +14,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { mmprojLocalName } from "./models";
+import { mmprojLocalName, mtpDraftLocalName, requiresMtpDraft } from "./models";
 import type { ModelManifest, SplitPart } from "./models";
 import { inTauri } from "./platform";
 
@@ -63,6 +63,7 @@ export function resolveDownload(man: ModelManifest, quant?: string): DownloadTar
   let v = null as (typeof variants)[number] | null;
   if (variants.length > 0) {
     v = (quant ? variants.find((x) => x.quant === quant) : null) ?? null;
+    if (quant && !v) throw new Error(`[WEIGHTS_VARIANT_UNKNOWN] ${man.id} ${quant}`);
     if (!v) {
       const dq = man.default_quant;
       v = (dq ? variants.find((x) => x.quant === dq) : null) ?? variants[0] ?? null;
@@ -132,6 +133,156 @@ export function resolveMmprojDownload(man: ModelManifest): DownloadTarget | null
     revision: mm.revision ?? "",
     parts: [],
   };
+}
+
+/** External drafts are selected by audited variant identity, never model name. */
+export function resolveMtpDraftDownload(man: ModelManifest, quant?: string): DownloadTarget | null {
+  // Reject an unknown explicit precision even if it has no draft declaration.
+  resolveDownload(man, quant);
+  if (!requiresMtpDraft(man, quant ?? "")) return null;
+  const mtp = man.mtp_draft;
+  if (!mtp || !mtp.repo || !mtp.gguf || !mtp.revision || !/^[a-f0-9]{64}$/i.test(mtp.sha256)
+      || !(mtp.bytes > 0) || !(mtp.layers > 0) || !(mtp.weight_bytes > 0)
+      || !(mtp.kv_bytes_per_token > 0)) {
+    throw new Error(`[WEIGHTS_ASSET_INVALID] ${man.id} MTP`);
+  }
+  const parts = (mtp.parts ?? []).map(p => ({ ...p,
+    saveAs: `${man.id}-mtp-${p.file.split(/[\\/]/).pop()}` }));
+  const expectBytes = mtp.bytes - parts.reduce((n, p) => n + (p.bytes ?? 0), 0);
+  if (expectBytes <= 0 || parts.some(p => !(p.bytes! > 0) || !/^[a-f0-9]{64}$/i.test(p.sha256 ?? ""))) {
+    throw new Error(`[WEIGHTS_ASSET_INVALID] ${man.id} MTP parts`);
+  }
+  return { repo: mtp.repo, file: mtp.gguf, expectBytes,
+    sha256: mtp.sha256, revision: mtp.revision, parts, saveAs: mtpDraftLocalName(man) };
+}
+
+export type ModelAssetKind = "model" | "vision" | "mtp";
+export interface ModelAsset { kind: ModelAssetKind; target: DownloadTarget }
+
+/** One selected model is one bundle: the main split set and every dependency. */
+export function resolveModelAssets(man: ModelManifest, quant?: string): ModelAsset[] {
+  const main = resolveDownload(man, quant);
+  if (!main) throw new Error(`[WEIGHTS_ASSET_INVALID] ${man.id}`);
+  const assets: ModelAsset[] = [{ kind: "model", target: main }];
+  const vision = resolveMmprojDownload(man);
+  const mtp = resolveMtpDraftDownload(man, quant);
+  if (vision) assets.push({ kind: "vision", target: vision });
+  if (mtp) assets.push({ kind: "mtp", target: mtp });
+  return assets;
+}
+
+export interface LocalModelAsset extends ModelAsset {
+  path: string;
+  complete: boolean;
+  verified: boolean;
+  haveBytes: number;
+}
+
+type StateReader = typeof weightsState;
+async function inspectAsset(asset: ModelAsset, dir: string, read: StateReader): Promise<LocalModelAsset> {
+  const t = asset.target;
+  const states = [await read(dir, targetLocalName(t), t.expectBytes, t.sha256)];
+  for (const p of t.parts) states.push(await read(dir, p.saveAs ?? p.file, p.bytes ?? 0, p.sha256 ?? ""));
+  const complete = states.every(s => s.complete);
+  return { ...asset, path: complete ? states[0].path : "", complete,
+    verified: complete && states.every(s => s.verified),
+    haveBytes: states.reduce((n, s) => n + s.have_bytes, 0) };
+}
+
+export async function resolveLocalModelAssets(args: {
+  modelDir: string; manifest: ModelManifest; quant?: string;
+}): Promise<LocalModelAsset[]> {
+  const assets = resolveModelAssets(args.manifest, args.quant);
+  if (!inTauri()) return assets.map(asset => ({ ...asset, path: "(dev-sim)",
+    complete: true, verified: true, haveBytes: 0 }));
+  const dir = args.modelDir || await defaultModelDir();
+  // Preserve the inexpensive legacy tower adoption before the bundle probe.
+  await mmprojLocalPath(dir, args.manifest);
+  const states: LocalModelAsset[] = [];
+  for (const asset of assets) states.push(await inspectAsset(asset, dir, weightsState));
+  return states;
+}
+
+export async function mtpDraftLocalPath(modelDir: string, man: ModelManifest, quant?: string): Promise<string> {
+  const target = resolveMtpDraftDownload(man, quant);
+  if (!target) return "";
+  const dir = modelDir || await defaultModelDir();
+  const state = await inspectAsset({ kind: "mtp", target }, dir, weightsState);
+  return state.verified ? state.path : "";
+}
+
+/** Shared transaction for download controls and startup. Injectable I/O keeps
+ * cancellation, partial files and repair behaviour testable without a webview. */
+export async function prepareModelAssets(args: {
+  modelDir: string; manifest: ModelManifest; quant?: string;
+  fetchMissing: "all" | "dependencies" | false;
+  cancelled?: () => boolean;
+  fetch: (asset: ModelAsset) => Promise<boolean>;
+  read?: StateReader;
+  verify?: typeof verifyWeights;
+}): Promise<LocalModelAsset[]> {
+  const read = args.read ?? weightsState;
+  const verify = args.verify ?? verifyWeights;
+  const assets = resolveModelAssets(args.manifest, args.quant);
+  const dir = args.modelDir || await defaultModelDir();
+  const checkCancelled = () => {
+    if (args.cancelled?.()) throw new WeightsCancelled("cancelled (model preparation stopped)");
+  };
+  const result: LocalModelAsset[] = [];
+  for (const asset of assets) {
+    checkCancelled();
+    let state = await inspectAsset(asset, dir, read);
+    checkCancelled();
+    const canFetch = args.fetchMissing === "all"
+      || (args.fetchMissing === "dependencies" && asset.kind !== "model");
+    if (!state.verified) {
+      const t = asset.target;
+      const files = [{ file: targetLocalName(t), sha256: t.sha256, bytes: t.expectBytes },
+        ...t.parts.map(p => ({ file: p.saveAs ?? p.file, sha256: p.sha256 ?? "", bytes: p.bytes ?? 0 }))];
+      // An incomplete split set can still contain corrupt completed members.
+      // Check every existing member first so the single fetch below repairs
+      // all missing/corrupt shards, not just the first failure on each click.
+      for (const f of files) {
+        checkCancelled();
+        const member = await read(dir, f.file, f.bytes, f.sha256);
+        if (!member.complete || member.verified) continue;
+        try {
+          // One operation id covers every shard so Cancel reaches the active
+          // verification even when it is no longer reading the first file.
+          await verify({ id: targetLocalName(t), destDir: dir, file: f.file, sha256: f.sha256 });
+        } catch (e) {
+          checkCancelled();
+          // The hash gate removed this corrupt member. Continue checking its
+          // siblings before the authorized repair; other errors stop the job.
+          if (!canFetch || !String(e).includes("WEIGHTS_SHA256_MISMATCH")) throw e;
+        }
+      }
+      state = await inspectAsset(asset, dir, read);
+    }
+    checkCancelled();
+    if (!state.complete || !state.verified) {
+      if (!canFetch) throw new Error(`[WEIGHTS_NOT_DOWNLOADED] ${args.manifest.id} ${targetLocalName(asset.target)}`);
+      if (!(await args.fetch(asset))) {
+        checkCancelled();
+        throw new Error(`[WEIGHTS_NOT_DOWNLOADED] ${args.manifest.id} ${targetLocalName(asset.target)}`);
+      }
+      checkCancelled();
+      state = await inspectAsset(asset, dir, read);
+    }
+    if (!state.complete || !state.verified) {
+      throw new Error(`[WEIGHTS_NOT_DOWNLOADED] ${args.manifest.id} ${targetLocalName(asset.target)}`);
+    }
+    result.push(state);
+  }
+  // A dependency transfer may take minutes. Recheck earlier files before
+  // advertising readiness instead of trusting a snapshot from its beginning.
+  for (let i = 0; i < result.length; i++) {
+    checkCancelled();
+    result[i] = await inspectAsset(result[i], dir, read);
+    if (!result[i].verified) throw new Error(`[WEIGHTS_NOT_DOWNLOADED] ${args.manifest.id} ${targetLocalName(result[i].target)}`);
+  }
+  checkCancelled();
+  return result;
 }
 
 /**

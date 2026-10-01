@@ -1,0 +1,127 @@
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -333,6 +333,9 @@
+ 
+     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
+     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
++    // Auxiliary contexts must not inherit the target's fixed/AUTO expert cache or weight identity.
++    // This is instance-local and applies to every scheduler recreation; no process environment is changed.
++    GGML_API ggml_backend_sched_t ggml_backend_sched_new_with_moe_cache(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload, bool enable_moe_cache);
+     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
+ 
+     // Initialize backend buffers from a measure graph
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -4410,6 +4410,18 @@
+         size_t graph_size,
+         bool parallel,
+         bool op_offload) {
++    return ggml_backend_sched_new_with_moe_cache(backends, bufts, n_backends,
++            graph_size, parallel, op_offload, true);
++}
++
++ggml_backend_sched_t ggml_backend_sched_new_with_moe_cache(
++        ggml_backend_t * backends,
++        ggml_backend_buffer_type_t * bufts,
++        int n_backends,
++        size_t graph_size,
++        bool parallel,
++        bool op_offload,
++        bool enable_moe_cache) {
+     GGML_ASSERT(n_backends > 0);
+     GGML_ASSERT(n_backends <= GGML_SCHED_MAX_BACKENDS);
+     GGML_ASSERT(ggml_backend_dev_type(ggml_backend_get_device(backends[n_backends - 1])) == GGML_BACKEND_DEVICE_TYPE_CPU);
+@@ -4418,7 +4430,7 @@
+ 
+     const char * GGML_SCHED_DEBUG = getenv("GGML_SCHED_DEBUG");
+     sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
+-    sched->moe = sched_moe_state_new();
++    sched->moe = enable_moe_cache ? sched_moe_state_new() : nullptr;
+ 
+     sched->debug_realloc = 0;
+ #ifdef GGML_SCHED_NO_REALLOC
+@@ -4435,7 +4447,7 @@
+     char * hash_end = nullptr;
+     const uint64_t expected_auto_count = auto_count ? strtoull(auto_count, &count_end, 10) : 0;
+     const uint64_t expected_auto_hash = auto_hash ? strtoull(auto_hash, &hash_end, 10) : 0;
+-    if (sched->moe == nullptr && getenv("GGML_MOE_POOL_EXPERTS") == nullptr &&
++    if (enable_moe_cache && sched->moe == nullptr && getenv("GGML_MOE_POOL_EXPERTS") == nullptr &&
+         getenv("GGML_MOE_POOL_BYTES") == nullptr && sched->n_copies == 1 &&
+         expected_auto_count > 0 && count_end != auto_count && *count_end == '\0' &&
+         hash_end != auto_hash && *hash_end == '\0') {
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -601,7 +601,10 @@
+     gf_res_prev.reset(new llm_graph_result(max_nodes));
+     gf_res_reserve.reset(new llm_graph_result(max_nodes));
+ 
+-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
++    // The process-wide expert cache plan belongs to the target model only.
++    // MTP experts are GPU-resident and cannot satisfy the target's AUTO identity.
++    const bool enable_moe_cache = cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP;
++    sched.reset(ggml_backend_sched_new_with_moe_cache(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload, enable_moe_cache));
+ 
+     llama_memory_context_ptr mctx;
+     if (memory) {
+@@ -636,7 +639,7 @@
+             if (cparams.pipeline_parallel) {
+                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
+                 cparams.pipeline_parallel = false;
+-                sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
++                sched.reset(ggml_backend_sched_new_with_moe_cache(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload, enable_moe_cache));
+                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+             }
+             if (!gf) {
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1106,10 +1106,11 @@
+         }
+ 
+         // Warmup enables the adaptive expert cache from currently free VRAM.
+-        // Load and warm the vision tower first so its weights and workspace
+-        // cannot consume memory already promised to that cache.
++        // Allocate the complete draft context and vision tower first so their
++        // weights, KV and workspace cannot spend memory promised to that cache.
+         const bool text_warmup = params_base.warmup;
+-        if (has_mmproj) params_base.warmup = false;
++        const bool defer_text_warmup = has_mmproj || has_spec;
++        if (defer_text_warmup) params_base.warmup = false;
+         llama_init = common_init_from_params(params_base);
+         params_base.warmup = text_warmup;
+ 
+@@ -1180,10 +1181,6 @@
+                 return false;
+             }
+             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+-            if (text_warmup) {
+-                SRV_INF("%s", "warming text engine after vision allocations\n");
+-                llama_init->warmup(params_base);
+-            }
+ 
+             if (params_base.ctx_shift) {
+                 params_base.ctx_shift = false;
+@@ -1196,6 +1193,11 @@
+             }
+         }
+ 
++        if (defer_text_warmup && text_warmup) {
++            SRV_INF("%s", "warming text engine after draft and vision allocations\n");
++            llama_init->warmup(params_base);
++        }
++
+         if (!llama_memory_can_shift(llama_get_memory(ctx_tgt))) {
+             if (params_base.ctx_shift) {
+                 params_base.ctx_shift = false;
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -218,8 +218,9 @@
+         backend_ptrs.push_back(backend_cpu);
+         backend_buft.push_back(ggml_backend_get_default_buffer_type(backend_cpu));
+ 
++        // Vision owns no target-model routed experts or target AUTO signature.
+         sched.reset(
+-            ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), 8192, false, true)
++            ggml_backend_sched_new_with_moe_cache(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), 8192, false, true, false)
+         );
+ 
+         if (ctx_params.cb_eval != nullptr) {

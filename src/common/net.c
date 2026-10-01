@@ -409,11 +409,16 @@ int idletoken_connect_tcp(const char *peer_addr) {
 
     if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
 #ifdef _WIN32
+        int wsa_error = WSAGetLastError();
         int e = socket_errno();
 #else
         int e = errno;
 #endif
-        closesock(fd); freeaddrinfo(res); errno = e; return -1;
+        closesock(fd); freeaddrinfo(res); errno = e;
+#ifdef _WIN32
+        WSASetLastError(wsa_error);
+#endif
+        return -1;
     }
     freeaddrinfo(res);
 
@@ -451,7 +456,15 @@ int idletoken_connect_unix(const char *path) {
     int fd = (int)socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     if (connect(fd, (struct sockaddr *)&sa, (socklen_t)sizeof(sa)) != 0) {
-        int e = errno; closesock(fd); errno = e; return -1;
+        int e = errno;
+#ifdef _WIN32
+        int wsa_error = WSAGetLastError();
+#endif
+        closesock(fd); errno = e;
+#ifdef _WIN32
+        WSASetLastError(wsa_error);
+#endif
+        return -1;
     }
     return fd;
 #endif

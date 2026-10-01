@@ -1,0 +1,17 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1980,6 +1980,13 @@
+         }
+     ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_MTMD, LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_RETRIEVAL, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_DEBUG}));
+     add_opt(common_arg(
++        {"--idletoken-mtp-safe"},
++        "require the bundled MTP privacy, probability and image-request guards",
++        [](common_params &) {
++            // Compatibility sentinel: older engines must reject MTP launches.
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}));
++    add_opt(common_arg(
+         {"--idletoken-memory-json"},
+         "print server model, target and MTP buffer estimates as JSON, then exit without loading tensor data",
+         [](common_params & params) {

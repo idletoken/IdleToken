@@ -8,6 +8,7 @@ import {
   hybridRequirements,
   kvBytesForContext,
   poolRam,
+  plannerNodesSpec,
 } from "../src/models";
 import { PRODUCT_CONTEXT_CAP, modelCtxMax, runtimeResourceBudget } from "../src/settings";
 
@@ -38,6 +39,17 @@ const oracle = JSON.parse(readFileSync(oraclePath, "utf8")) as {
 };
 const models = new Map(MODELS.map((m) => [m.id, m]));
 let failures = 0;
+
+// Host workspace needs physical RAM while expert spill also obeys the
+// separately measured page-lock ceiling. Missing expert telemetry must not
+// turn the native zero (= unconstrained) convention into optimistic admission.
+if (plannerNodesSpec([{ vramFree: 16, ramFree: 64, ramExpertFree: 40 }], "cuda")
+      !== "16:64:40:0:1:node0" ||
+    plannerNodesSpec([{ vramFree: 16, ramFree: 64 }], "cuda")
+      !== "16:64:1:0:1:node0") {
+  console.error("RESOURCE_ESTIMATE_MISMATCH physical RAM and expert ceiling were conflated");
+  failures++;
+}
 
 // Three product windows since 2026-09-02 (docs/ctx-tiers-2026-09.md), 128K the
 // default. qwen3-8b is the between-tiers case: its ceiling is 163840, so asking

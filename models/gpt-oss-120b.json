@@ -107,7 +107,9 @@
         }
       ],
       "expert_weight_bytes": 61073326080,
-      "expert_max_tensor_bytes": 564019200
+      "expert_max_tensor_bytes": 564019200,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0
     },
     {
       "quant": "Q4_K_XL",
@@ -125,7 +127,9 @@
         }
       ],
       "expert_weight_bytes": 61073326080,
-      "expert_max_tensor_bytes": 564019200
+      "expert_max_tensor_bytes": 564019200,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0
     },
     {
       "quant": "Q8_0",
@@ -143,7 +147,9 @@
         }
       ],
       "expert_weight_bytes": 61073326080,
-      "expert_max_tensor_bytes": 564019200
+      "expert_max_tensor_bytes": 564019200,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0
     },
     {
       "quant": "F16",
@@ -154,7 +160,9 @@
       "sha256": "2d1f0298ae4b6c874d5a468598c5ce17c1763b3fea99de10b1a07df93cef014f",
       "revision": "ff1a82da6ad466e32284fa3d2b86694db3204789",
       "expert_weight_bytes": 61073326080,
-      "expert_max_tensor_bytes": 564019200
+      "expert_max_tensor_bytes": 564019200,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0
     }
   ],
   "note": "Curated Unsloth quantizations; MoE expert tensors remain MXFP4-derived. Alternating 128-token sliding attention and full attention."

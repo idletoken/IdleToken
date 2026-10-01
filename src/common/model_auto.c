@@ -219,9 +219,9 @@ int idletoken_model_from_gguf(const char *path, idletoken_auto_model *out,
     if (arch_u32(m, out->arch, "block_count", &n_layers) != 0 || n_layers == 0)
         FAILF("%s (arch %s) declares no %s.block_count — cannot plan a model "
               "with an unknown layer count", base, out->arch, out->arch);
-    /* Several current GGUFs append one NextN/MTP draft block to block_count.
-     * The ordinary llama-server does not load it without a draft context, so
-     * treating it as a decode layer overstates KV and corrupts PP boundaries. */
+    /* Several GGUFs append NextN/MTP draft blocks to block_count. Target
+     * decoding excludes them; the MTP budget prices them separately. Counting
+     * them as target layers overstates KV and corrupts PP boundaries. */
     uint32_t n_nextn = 0;
     if (arch_u32(m, out->arch, "nextn_predict_layers", &n_nextn) == 0 &&
         n_nextn > 0 && n_nextn < n_layers)
@@ -417,8 +417,8 @@ int idletoken_model_from_gguf(const char *path, idletoken_auto_model *out,
      * NOT in the registry (open intake) still finds nothing here, keeps its
      * zeros, and is still refused — which is the case the gate was written for.
      *
-     * Copied per field rather than by struct: only these four are the registry's
-     * to supply. Everything else in `spec` describes THIS file and must keep
+     * Copied per field rather than by struct: measured workspaces and draft
+     * cache geometry come from the registry. Everything else describes THIS file and must keep
      * coming from its header — a registry row for the same id can name a
      * different quantization with different layer sizes.
      *
@@ -440,6 +440,31 @@ int idletoken_model_from_gguf(const char *path, idletoken_auto_model *out,
                    sizeof s->compute_bytes_256k_metal);
             memcpy(s->compute_bytes_1m_metal,   reg->compute_bytes_1m_metal,
                    sizeof s->compute_bytes_1m_metal);
+            s->mtp_kv_bytes_per_token = reg->mtp_kv_bytes_per_token;
+            memcpy(s->mtp_compute_bytes_128k_cuda, reg->mtp_compute_bytes_128k_cuda,
+                   sizeof s->mtp_compute_bytes_128k_cuda);
+            memcpy(s->mtp_compute_bytes_256k_cuda, reg->mtp_compute_bytes_256k_cuda,
+                   sizeof s->mtp_compute_bytes_256k_cuda);
+            memcpy(s->mtp_compute_bytes_1m_cuda, reg->mtp_compute_bytes_1m_cuda,
+                   sizeof s->mtp_compute_bytes_1m_cuda);
+            memcpy(s->mtp_compute_bytes_128k_metal, reg->mtp_compute_bytes_128k_metal,
+                   sizeof s->mtp_compute_bytes_128k_metal);
+            memcpy(s->mtp_compute_bytes_256k_metal, reg->mtp_compute_bytes_256k_metal,
+                   sizeof s->mtp_compute_bytes_256k_metal);
+            memcpy(s->mtp_compute_bytes_1m_metal, reg->mtp_compute_bytes_1m_metal,
+                   sizeof s->mtp_compute_bytes_1m_metal);
+            memcpy(s->mtp_host_compute_bytes_128k_cuda, reg->mtp_host_compute_bytes_128k_cuda,
+                   sizeof s->mtp_host_compute_bytes_128k_cuda);
+            memcpy(s->mtp_host_compute_bytes_256k_cuda, reg->mtp_host_compute_bytes_256k_cuda,
+                   sizeof s->mtp_host_compute_bytes_256k_cuda);
+            memcpy(s->mtp_host_compute_bytes_1m_cuda, reg->mtp_host_compute_bytes_1m_cuda,
+                   sizeof s->mtp_host_compute_bytes_1m_cuda);
+            memcpy(s->mtp_host_compute_bytes_128k_metal, reg->mtp_host_compute_bytes_128k_metal,
+                   sizeof s->mtp_host_compute_bytes_128k_metal);
+            memcpy(s->mtp_host_compute_bytes_256k_metal, reg->mtp_host_compute_bytes_256k_metal,
+                   sizeof s->mtp_host_compute_bytes_256k_metal);
+            memcpy(s->mtp_host_compute_bytes_1m_metal, reg->mtp_host_compute_bytes_1m_metal,
+                   sizeof s->mtp_host_compute_bytes_1m_metal);
         }
     }
     return 0;

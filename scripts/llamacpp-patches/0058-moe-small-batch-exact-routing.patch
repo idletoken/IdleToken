@@ -1,0 +1,100 @@
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1817,7 +1817,9 @@
+ // that serialized the copy pipeline it was meant to create.
+ static void * sched_moe_readback_ptr(ggml_backend_sched_t sched, ggml_backend_t backend,
+                                     bool scores, size_t bytes, void * ordinary) {
+-    if (!sched->moe || !sched->moe->pinned_readback) return ordinary;
++    // Keep this optimization within the existing small CUDA host buffer. Long
++    // prefill routes use ordinary readback and never grow pinned allocations.
++    if (!sched->moe || !sched->moe->pinned_readback || bytes > 4096) return ordinary;
+     const auto dev = ggml_backend_get_device(backend);
+     const auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+     // This path targets discrete CUDA. It must not allocate a host
+@@ -2438,8 +2440,8 @@
+ // before that tensor's own MUL_MAT_ID, so nothing overlaps. Here, as soon as
+ // the layer's ids are known (its first serve), the misses of the layer's OTHER
+ // pools are issued on the prefetch stream and pinned for their coming serve,
+-// which then finds them resident and only waits on the event. Decode only
+-// (one token), and only for pools that can hold the batch's experts.
++// which then finds them resident and only waits on the event. Bounded route
++// batches are eligible only when their actual expert union fits the pools.
+ static void sched_moe_issue_layer_siblings(ggml_backend_sched_t sched, const struct ggml_tensor * input,
+                                            const std::vector<ggml_bitset_t> & used_ids, int64_t n_expert_total) {
+     ggml_timeline::scope trace("moe.exact_siblings", input->name);
+@@ -2457,10 +2459,17 @@
+             n_used++;
+         }
+     }
++    // pool_serve also returns true for the staging/bypass path. Never issue
++    // siblings from such a batch, even when its per-token top-k would fit.
++    const auto current = st.pools.find(input->name);
++    if (current == st.pools.end() || !current->second || current->second->cap < n_used) {
++        return;
++    }
+     for (auto & kv : st.pools) {
+         sched_moe_pool * q = kv.second.get();
+         if (q == nullptr || q->layer != layer || q->weight == nullptr || q->weight == input ||
+-            q->backend_id < 0 || q->cap < n_used || !st.current_weights.count(kv.first) || q->weight->ne[2] != n_expert_total) {
++            q->backend_id < 0 || q->backend_id != current->second->backend_id ||
++            q->cap < n_used || !st.current_weights.count(kv.first) || q->weight->ne[2] != n_expert_total) {
+             continue;
+         }
+         // Only pools this graph has NOT served yet. A pool served earlier in
+@@ -2483,6 +2492,11 @@
+         if (q->ev == nullptr) {
+             q->ev = ggml_backend_event_new(ggml_backend_get_device(pf));
+         }
++        // A distinct copy stream needs a completion event before it may mutate
++        // residency or pin slots. Without it, keep the ordinary serve path.
++        if (q->ev == nullptr) {
++            continue;
++        }
+         const uint64_t next_tick = q->tick + 1;
+         ggml_moe_cache::pin_selected(q->slot_expert, q->slot_pin, next_tick,
+             [&](int32_t e) { return e < n_expert_total && ggml_bitset_get(used_ids.data(), e); });
+@@ -4164,6 +4178,7 @@
+                     }
+ 
+                     bool ids_just_read = false;
++                    const bool bounded_route = ggml_nbytes(ids_tensor) <= 4096;
+                     if (ids_tensor != prev_ids_tensor) {
+                         ggml_timeline::scope trace_ids("moe.route_readback", input->name);
+                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
+@@ -4171,10 +4186,10 @@
+                         auto * moe_timing = ids_tensor->ne[1] == 1
+                             ? sched_moe_timing_route(sched, moe_layer, ids_backend) : nullptr;
+                         SCHED_PROF_T(t_ids);
+-                        void * ids_read_ptr = ids_tensor->ne[1] == 1
++                        void * ids_read_ptr = bounded_route
+                             ? sched_moe_readback_ptr(sched, ids_backend, false, ggml_nbytes(ids_tensor), ids.data())
+                             : ids.data();
+-                        if (ids_tensor->ne[1] == 1) {
++                        if (bounded_route) {
+                             sched_moe_readback_async(sched, ids_backend, ids_tensor, ids_read_ptr, ggml_nbytes(ids_tensor));
+                         } else {
+                             ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids_read_ptr, 0, ggml_nbytes(ids_tensor));
+@@ -4229,11 +4244,19 @@
+                             // Only the first split of a layer has just read ids. The former
+                             // `prev_ids_tensor == ids_tensor` test stayed true for gate/up/down
+                             // and ran the prediction path three times per layer.
+-                            if (ids_just_read && ids_tensor->ne[1] == 1 && input_id == 0) {
++                            if (ids_just_read && input_id == 0 &&
++                                (ids_tensor->ne[1] == 1 || (bounded_route && ids_backend == split_backend))) {
++                                // For multi-token routes the readback synchronization
++                                // must also finish this owner's previous graph before
++                                // its independent copy stream can reuse pool slots.
+                                 sched_moe_issue_layer_siblings(sched, input, used_ids, n_expert);
+-                                const int layer = sched_moe_layer_of(input->name);
+-                                if (sched->moe->schedule && !sched->callback_eval) deferred_prediction = layer;
+-                                else sched_moe_prefetch_issue(sched, layer);
++                                // Future-layer prediction still uses one token's
++                                // scores. Exact multi-token routes do not enable it.
++                                if (ids_tensor->ne[1] == 1) {
++                                    const int layer = sched_moe_layer_of(input->name);
++                                    if (sched->moe->schedule && !sched->callback_eval) deferred_prediction = layer;
++                                    else sched_moe_prefetch_issue(sched, layer);
++                                }
+                             }
+                             continue; // served from the expert pool: no staging copy for this input
+                         }

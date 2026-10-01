@@ -60,7 +60,7 @@
  * than LLAMA_PROBE_EVERY_MS. */
 #define LLAMA_SILENCE_GRACE_MS 15000
 #define LLAMA_PROBE_EVERY_MS   10000
-#define LLAMA_ARGV_MAX 64
+#define LLAMA_ARGV_MAX 80
 #define LLAMA_CLUSTER_ARGS_MAX 8192
 
 struct idletoken_llama {
@@ -74,28 +74,12 @@ struct idletoken_llama {
     char extra_args[1024];    /* IDLETOKEN_LLAMA_ARGS copy, split at spawn */
     char kv_type[12];         /* IDLETOKEN_KV_CACHE_TYPE (validated); "" = f16 default */
     char kv_type_v[12];       /* IDLETOKEN_KV_CACHE_TYPE_V; "" = follow kv_type */
-    /* Speculative decoding, passed as --spec-type. DEFAULT "ngram-mod"
-     * (2026-09-16, user decision; results/mtp-speculative-ab-20260916.md).
-     *
-     * Why this one and nothing else. It drafts by matching patterns already in
-     * the context, so it costs NO weights, NO second context and no device
-     * memory at all — which is why it needs no term in plan.c, no manifest
-     * field, no per-precision gate, and nothing new lands on a remote node in a
-     * cluster. Measured on Qwen3.8-27B UD-Q2_K_XL at 128K: 6.8x on a
-     * from-scratch answer, 14x when the answer echoes a supplied file, 1.7x on
-     * prose, with output BYTE-IDENTICAL to the unaccelerated run.
-     *
-     * The alternatives were measured in the same session and are not enabled:
-     * `draft-mtp` buys less and costs 1.46 GiB plus a per-node accounting shape
-     * the planner does not have; `ngram-cache` is a small NEGATIVE on the task
-     * it should suit; `ngram-map-k4v` is noise. Do not treat "n-gram" as one
-     * thing — the five variants differ by an order of magnitude.
-     *
-     * ⚠ Do NOT try to turn this off through IDLETOKEN_LLAMA_ARGS: llama.cpp's
-     * --spec-type handler APPENDS to a list (common/arg.cpp), so a second
-     * --spec-type adds a type instead of replacing ours. IDLETOKEN_SPEC_TYPE is
-     * the off switch ("none"/"off"/"" = pass no flag at all). */
+    /* Default MTP for every supported, resource-admitted GGUF (2026-09-30).
+     * ngram-mod remains complementary. The planner owns capability and memory;
+     * this launcher must never independently guess from a model filename. */
     char spec_type[32];
+    char mtp_draft_path[1024];
+    char mtp_draft_device[64];
     int  shared;              /* serving OTHER people's requests — see below */
     int  gpu_only;            /* every layer and KV allocation fits the GPU
                                * working-set budget (Hybrid sets this false);
@@ -225,12 +209,47 @@ static const char *hdr_find(const char *hay, size_t hay_len, const char *needle)
 
 static ssize_t conn_recv_watched(idletoken_llama_conn *c, void *dst, size_t cap);
 
+/* Private diagnostics: never retain an endpoint or response body. */
+typedef struct {
+    const char *stage;
+    const char *error_domain;
+    int system_error;
+    int status;
+    long long elapsed_ms;
+} llama_health_diag;
+
+static int conn_last_error(void) {
+#ifdef _WIN32
+    return WSAGetLastError();
+#else
+    return errno;
+#endif
+}
+
+static void conn_clear_error(void) {
+#ifdef _WIN32
+    WSASetLastError(0);
+#else
+    errno = 0;
+#endif
+}
+
+static void health_socket_error(llama_health_diag *diag, int error) {
+    if (!diag) return;
+#ifdef _WIN32
+    diag->error_domain = "winsock";
+#else
+    diag->error_domain = "errno";
+#endif
+    diag->system_error = error;
+}
+
 static int llama_http_open_impl(const char *endpoint, const char *method,
                                 const char *path,
                                 const char *body, size_t body_len,
                                 int timeout_ms, int downstream_fd,
                                 const char *watch_endpoint,
-                                idletoken_llama_conn *c) {
+                                idletoken_llama_conn *c, llama_health_diag *diag) {
     memset(c, 0, sizeof(*c));
     c->fd = -1;
     c->cancel_fd = downstream_fd;
@@ -246,9 +265,13 @@ static int llama_http_open_impl(const char *endpoint, const char *method,
      * "localhost" rather than a filesystem path. */
     int is_unix = strncmp(endpoint, "unix:", 5) == 0;
     const char *host_hdr = is_unix ? "localhost" : endpoint;
+    if (diag) { diag->stage = "connect"; conn_clear_error(); }
     int fd = is_unix ? idletoken_connect_unix(endpoint + 5)
                      : idletoken_connect_tcp(endpoint);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        health_socket_error(diag, conn_last_error());
+        return -1;
+    }
     /* Keep the caller's ordinary timeout while sending. The short cancellation
      * slice is installed only after the complete request is on loopback; using
      * it for send would reject a legitimate large prompt after 250 ms. */
@@ -263,8 +286,10 @@ static int llama_http_open_impl(const char *endpoint, const char *method,
                       "Connection: close\r\n\r\n",
                       method, path, host_hdr, body_len);
     if (hn < 0 || (size_t)hn >= sizeof(head)) { idletoken_close_fd(fd); return -1; }
+    if (diag) { diag->stage = "send"; conn_clear_error(); }
     if (idletoken_sendall(fd, head, (size_t)hn) < 0 ||
         (body_len && idletoken_sendall(fd, body, body_len) < 0)) {
+        health_socket_error(diag, conn_last_error());
         idletoken_close_fd(fd);
         return -1;
     }
@@ -272,6 +297,7 @@ static int llama_http_open_impl(const char *endpoint, const char *method,
     if (c->slice_ms > 0) conn_set_timeout(fd, c->slice_ms);
 
     /* Read until the header terminator; whatever follows it stays buffered. */
+    if (diag) diag->stage = "header";
     size_t hdr_end = 0;
     for (;;) {
         if (c->blen + 1 >= sizeof(c->buf)) {
@@ -279,12 +305,14 @@ static int llama_http_open_impl(const char *endpoint, const char *method,
             c->fd = -1;
             return -1;
         }
+        if (diag) conn_clear_error();
         ssize_t r = c->slice_ms > 0
             ? conn_recv_watched(c, c->buf + c->blen,
                                 sizeof(c->buf) - 1 - c->blen)
             : conn_recv(fd, c->buf + c->blen,
                         sizeof(c->buf) - 1 - c->blen);
         if (r <= 0) {
+            health_socket_error(diag, r < 0 ? conn_last_error() : 0);
             idletoken_close_fd(fd);
             c->fd = -1;
             return -1;
@@ -302,6 +330,7 @@ static int llama_http_open_impl(const char *endpoint, const char *method,
         return -1;
     }
     c->status = atoi(c->buf + 9);
+    if (diag) diag->status = c->status;
 
     const char *te = hdr_find(c->buf, hdr_end, "transfer-encoding:");
     if (te && hdr_find(te, hdr_end - (size_t)(te - c->buf), "chunked"))
@@ -322,7 +351,7 @@ int idletoken_llama_http_open(const char *endpoint, const char *method,
                               const char *body, size_t body_len,
                               int timeout_ms, idletoken_llama_conn *c) {
     return llama_http_open_impl(endpoint, method, path, body, body_len,
-                                timeout_ms, -1, NULL, c);
+                                timeout_ms, -1, NULL, c, NULL);
 }
 
 int idletoken_llama_http_open_relay(const char *endpoint, const char *method,
@@ -331,7 +360,7 @@ int idletoken_llama_http_open_relay(const char *endpoint, const char *method,
                                     int timeout_ms, int downstream_fd,
                                     idletoken_llama_conn *c) {
     return llama_http_open_impl(endpoint, method, path, body, body_len,
-                                timeout_ms, downstream_fd, endpoint, c);
+                                timeout_ms, downstream_fd, endpoint, c, NULL);
 }
 
 int idletoken_llama_http_open_cancelable(const char *endpoint,
@@ -341,7 +370,7 @@ int idletoken_llama_http_open_cancelable(const char *endpoint,
                                          int timeout_ms, int downstream_fd,
                                          idletoken_llama_conn *c) {
     return llama_http_open_impl(endpoint, method, path, body, body_len,
-                                timeout_ms, downstream_fd, NULL, c);
+                                timeout_ms, downstream_fd, NULL, c, NULL);
 }
 
 /* Did that recv fail only because the slice expired, or for a real reason? */
@@ -355,6 +384,28 @@ static int conn_recv_timed_out(void) {
 }
 
 static int llama_health_ok(const char *endpoint);   /* defined below */
+static int llama_health_probe(const char *endpoint, llama_health_diag *diag);
+
+/* A health probe uses another connection. Data can arrive on this stream
+ * while that probe fails. Only an actual positive read proves recovery;
+ * readability alone also includes EOF/reset. This connection has one reader. */
+static ssize_t conn_recv_available(int fd, void *dst, size_t cap) {
+    fd_set rd;
+    struct timeval tv = {0, 0};
+    FD_ZERO(&rd);
+#ifdef _WIN32
+    FD_SET((SOCKET)fd, &rd);
+#else
+    if (fd < 0 || fd >= FD_SETSIZE) return -1;
+    FD_SET(fd, &rd);
+#endif
+    if (select(fd + 1, &rd, NULL, NULL, &tv) <= 0) return -1;
+#ifdef _WIN32
+    return conn_recv(fd, dst, cap);
+#else
+    return recv(fd, dst, cap, MSG_DONTWAIT);
+#endif
+}
 
 /* recv() with the bounded-wait policy applied (see idletoken_llama_http_watch).
  *
@@ -400,19 +451,38 @@ static ssize_t conn_recv_watched(idletoken_llama_conn *c, void *dst, size_t cap)
             c->silent_ms - c->probed_at_ms < LLAMA_PROBE_EVERY_MS)
             continue;                      /* still plausibly just a long prefill */
         c->probed_at_ms = c->silent_ms;
-        if (llama_health_ok(c->watch)) continue;   /* alive and working: keep waiting */
-        /* It is not answering any more, and waiting longer cannot help. The
-         * check is PER CONNECTION, which is what keeps this to one lost
+        llama_health_diag health;
+        if (llama_health_probe(c->watch, &health)) continue;
+        if (c->cancel_fd >= 0 && idletoken_peer_closed(c->cancel_fd)) {
+            c->cancelled = 1;
+            c->eof = 1;
+            return -1;
+        }
+        r = conn_recv_available(c->fd, dst, cap);
+        fprintf(stderr,
+                "coord: llama-sidecar: health probe failed: stage=%s status=%d "
+                "error_domain=%s system_error=%d elapsed_ms=%lld "
+                "silence_nominal_ms=%lld stream_recovered=%d\n",
+                health.stage, health.status, health.error_domain,
+                health.system_error, health.elapsed_ms, c->silent_ms, r > 0);
+        if (r > 0) {
+            c->silent_ms = 0;
+            c->probed_at_ms = 0;
+            return r;
+        }
+        /* Health failed and this stream has no actual data to recover. Keep
+         * the original failure policy. The check is PER CONNECTION, keeping
+         * this to one lost
          * request: the other pool threads go on serving their own slots.
          * (Until the pool landed on 2026-08-18 this thread was the
          * coordinator's only executor, so parking here stopped everything —
          * that is the failure the check was written for, and the reason it
          * still matters is that a dead relay must not become a dead machine.) */
         fprintf(stderr,
-                "coord: llama-sidecar: the engine stopped answering (%llds of silence, "
+                "coord: llama-sidecar: the engine stopped answering (%lldms of accumulated receive timeouts, "
                 "and GET /health no longer succeeds) — failing this request rather than "
                 "waiting forever; other in-flight requests are unaffected\n",
-                (long long)(c->silent_ms / 1000));
+                c->silent_ms);
         c->eof = 1;
         return -1;
     }
@@ -548,24 +618,53 @@ void idletoken_llama_http_close(idletoken_llama_conn *c) {
  * 503 {"error":{"message":"Loading model",...}} there — a status-only or
  * connect-only check reports ready long before the model exists (this exact
  * mistake invalidated three measurement runs; see the header comment). */
-static int llama_health_ok(const char *endpoint) {
+static int llama_health_probe(const char *endpoint, llama_health_diag *diag) {
+    const long long started_ms = llama_now_ms();
+    *diag = (llama_health_diag){"connect", "none", 0, 0, 0};
     idletoken_llama_conn c;
-    if (idletoken_llama_http_open(endpoint, "GET", "/health", NULL, 0,
-                                  LLAMA_HEALTH_TIMEOUT_MS, &c) != 0)
+    if (llama_http_open_impl(endpoint, "GET", "/health", NULL, 0,
+            LLAMA_HEALTH_TIMEOUT_MS, -1, NULL, &c, diag) != 0) {
+        diag->elapsed_ms = llama_now_ms() - started_ms;
         return 0;
+    }
+    /* Keep the old status/body acceptance rule and socket timeout. A bounded
+     * stack buffer lets us capture body-read errors before close/free/logging. */
+    char body[4096];
     size_t blen = 0;
-    char *body = idletoken_llama_http_read_all(&c, &blen, 4096);
-    int st = c.status;
+    int complete = 0;
+    diag->stage = "body";
+    while (blen + 1 < sizeof(body)) {
+        conn_clear_error();
+        ssize_t n = idletoken_llama_http_read(&c, body + blen, sizeof(body) - blen - 1);
+        if (n < 0) { health_socket_error(diag, conn_last_error()); break; }
+        if (n == 0) { complete = 1; break; }
+        blen += (size_t)n;
+    }
+    if (blen + 1 == sizeof(body)) {
+        char extra;
+        conn_clear_error();
+        ssize_t n = idletoken_llama_http_read(&c, &extra, 1);
+        if (n == 0) complete = 1;
+        else if (n < 0) health_socket_error(diag, conn_last_error());
+        else diag->stage = "body_limit";
+    }
     idletoken_llama_http_close(&c);
-    if (!body) return 0;
+    diag->elapsed_ms = llama_now_ms() - started_ms;
+    if (!complete) return 0;
+    body[blen] = '\0';
     /* trim surrounding whitespace before the exact compare */
     char *b = body;
     while (*b == ' ' || *b == '\t' || *b == '\r' || *b == '\n') b++;
     char *e = b + strlen(b);
     while (e > b && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n')) *--e = '\0';
-    int ok = (st == 200) && (strcmp(b, "{\"status\":\"ok\"}") == 0);
-    free(body);
+    int ok = (c.status == 200) && (strcmp(b, "{\"status\":\"ok\"}") == 0);
+    diag->stage = c.status != 200 ? "status" : (ok ? "ok" : "body_match");
     return ok;
+}
+
+static int llama_health_ok(const char *endpoint) {
+    llama_health_diag diag;
+    return llama_health_probe(endpoint, &diag);
 }
 
 /* --- spawn ---------------------------------------------------------------- */
@@ -580,7 +679,7 @@ static int llama_health_ok(const char *endpoint) {
  * the prompt recoverable only where the embedding table is), and the next
  * upstream release may add one that matters more.
  *
- * So shared mode does to the environment what it already does to argv: an
+ * Every managed launch does to the environment what shared mode does to argv: an
  * allow-list whose allowed set is (almost) empty. Everything in the engine's
  * own namespaces goes, and the coordinator-owned RPC variables come back:
  * GGML_RPC_PSK, which the cluster TLS link cannot work without, and
@@ -591,56 +690,52 @@ static int llama_health_ok(const char *endpoint) {
  * Note this still drops GGML_RPC_ALLOW_PLAINTEXT, which is right:
  * "testing only" is not a thing to honour while holding someone else's prompt.
  *
- * Deliberately NOT applied in local mode — LLAMA_ARG_* is how you experiment
- * with your own engine. */
-static int llama_env_is_engine_namespace(const char *name) {
+ * Private diagnostic tuning uses guarded IDLETOKEN_LLAMA_ARGS instead of
+ * inherited engine configuration. The managed engine flag also prevents
+ * config.ini and LLAMA_ARG_* handlers from changing the admitted plan. */
+int idletoken_llama_env_keep(const char *entry) {
+    if (!entry || entry[0] == '=') return 1;
+    char name[64];
+    size_t n = 0;
+    while (entry[n] && entry[n] != '=' && n + 1 < sizeof name) {
+        const unsigned char c = (unsigned char)entry[n];
+        name[n] = c >= 'a' && c <= 'z' ? (char)(c - 'a' + 'A') : (char)c;
+        ++n;
+    }
+    name[n] = '\0';
+    /* Windows environment names are case-insensitive. Match prefixes even
+     * for oversized names, and exact coordinator-owned exceptions only. */
+    if (!strcmp(name, "GGML_RPC_PSK") ||
+        !strcmp(name, "GGML_RPC_REQUIRE_MODEL_CACHE") ||
+        !strcmp(name, "GGML_RPC_NODE_LOCAL_MOE")) return 1;
     /* GGML_MOE_* is ours: the expert pool and pre-gate prefetch of patch 0006
      * (GGML_MOE_POOL_EXPERTS, GGML_MOE_PREGATE, GGML_MOE_PREGATE_EXTRA,
      * GGML_MOE_POOL_DEBUG). They change where expert bytes live, never what
      * is computed, and the coordinator is the one that sets them. */
-    if (strncmp(name, "GGML_MOE_", 9) == 0) return 0;
-    return strncmp(name, "LLAMA_", 6) == 0 ||
-           strncmp(name, "GGML_", 5) == 0 ||
-           strncmp(name, "HF_", 3) == 0;
+    if (strncmp(name, "GGML_MOE_", 9) == 0) return 1;
+    return strncmp(name, "LLAMA_", 6) != 0 &&
+           strncmp(name, "GGML_", 5) != 0 &&
+           strncmp(name, "HF_", 3) != 0;
 }
 
 #ifndef _WIN32
 extern char **environ;
 
-/* Called in the CHILD between fork and exec. The names are collected first:
- * unsetenv rewrites `environ` underneath a walk of it. */
-static void llama_scrub_env(void) {
-    char keep_psk[160] = "";
-    const char *psk = getenv("GGML_RPC_PSK");
-    if (psk) snprintf(keep_psk, sizeof(keep_psk), "%s", psk);
-    char keep_require_cache[16] = "";
-    const char *require_cache = getenv("GGML_RPC_REQUIRE_MODEL_CACHE");
-    if (require_cache)
-        snprintf(keep_require_cache, sizeof(keep_require_cache), "%s",
-                 require_cache);
-    char keep_node_local_moe[16] = "";
-    const char *node_local_moe = getenv("GGML_RPC_NODE_LOCAL_MOE");
-    if (node_local_moe)
-        snprintf(keep_node_local_moe, sizeof(keep_node_local_moe), "%s",
-                 node_local_moe);
-
-    char names[128][64];
-    int n = 0;
-    for (char **e = environ; *e && n < 128; e++) {
-        const char *eq = strchr(*e, '=');
-        size_t len = eq ? (size_t)(eq - *e) : strlen(*e);
-        if (len >= sizeof(names[0])) continue;
-        char nm[64];
-        memcpy(nm, *e, len);
-        nm[len] = '\0';
-        if (llama_env_is_engine_namespace(nm)) snprintf(names[n++], 64, "%s", nm);
+/* Called in the CHILD between fork and exec. Restart after unsetenv because it
+ * rewrites environ. No fixed entry count may leave a later protected variable. */
+static int llama_scrub_env(void) {
+    for (char **e = environ; *e;) {
+        if (idletoken_llama_env_keep(*e)) { ++e; continue; }
+        char *name = strdup(*e);
+        if (!name) return -1;
+        char *eq = strchr(name, '=');
+        if (eq) *eq = '\0';
+        const int rc = unsetenv(name);
+        free(name);
+        if (rc != 0) return -1;
+        e = environ;
     }
-    for (int i = 0; i < n; i++) unsetenv(names[i]);
-    if (keep_psk[0]) setenv("GGML_RPC_PSK", keep_psk, 1);
-    if (keep_require_cache[0])
-        setenv("GGML_RPC_REQUIRE_MODEL_CACHE", keep_require_cache, 1);
-    if (keep_node_local_moe[0])
-        setenv("GGML_RPC_NODE_LOCAL_MOE", keep_node_local_moe, 1);
+    return 0;
 }
 #endif
 
@@ -853,14 +948,22 @@ static int llama_spawn(idletoken_llama *lc) {
      * why it is not "off" any more, and what guards the empty-answer failure
      * instead, is on the POSIX path below. The two spawn paths must not
      * diverge. */
-    /* Speculative decoding (default ngram-mod — see the struct field). Same
+    /* Speculative decoding (admitted MTP plus ngram-mod). Same
      * fragment on the POSIX path below; the two spawn paths must not diverge. */
-    char spec_frag[48];
+    char spec_frag[1400];
     spec_frag[0] = '\0';
     if (lc->spec_type[0])
-        snprintf(spec_frag, sizeof(spec_frag), " --spec-type %s", lc->spec_type);
+        snprintf(spec_frag, sizeof(spec_frag), " --spec-type %s%s", lc->spec_type,
+                 strstr(lc->spec_type, "draft-mtp")
+                     ? " --idletoken-mtp-safe --spec-draft-n-max 3 -ctkd f16 -ctvd f16" : "");
+    if (lc->mtp_draft_path[0] && strstr(lc->spec_type, "draft-mtp")) {
+        size_t used = strlen(spec_frag);
+        snprintf(spec_frag + used, sizeof(spec_frag) - used,
+                 " --idletoken-mtp-external-safe --spec-draft-model \"%s\" --spec-draft-device %s --spec-draft-ngl all",
+                 lc->mtp_draft_path, lc->mtp_draft_device);
+    }
     int n = snprintf(cmd, sizeof(cmd),
-                     "\"%s\" -m \"%s\"%s %s%s%s%s "
+                     "\"%s\" --idletoken-managed -m \"%s\"%s %s%s%s%s "
                      "-ngl %s --fit off%s --reasoning auto%s%s%s%s -np %s%s%s%s",
                      lc->bin, lc->gguf, mmproj_frag, listen_args,
                      lc->shared ? " --no-slots" : "",
@@ -890,12 +993,11 @@ static int llama_spawn(idletoken_llama *lc) {
         snprintf(cmd + used, sizeof(cmd) - used, "%s", lc->extra_args);
     }
 
-    /* The environment the child gets. NULL = inherit ours; in shared mode we
-     * hand over a filtered block instead (see llama_env_is_engine_namespace).
+    /* Every launch receives a filtered environment block.
      * The block is "NAME=VAL\0NAME=VAL\0\0" and must stay alive across
      * CreateProcess, hence the malloc rather than a scratch local. */
     char *child_env = NULL;
-    if (lc->shared) {
+    {
         LPCH all = GetEnvironmentStringsA();
         if (!all) {
             snprintf(lc->fail, sizeof(lc->fail),
@@ -923,11 +1025,7 @@ static int llama_spawn(idletoken_llama *lc) {
              * tower silently moves to whichever device registers first, an RPC
              * one in a cluster, and ONLY in shared mode, i.e. only while
              * holding somebody else's image. llama_sidecar_test covers it. */
-            if (p[0] != '=' && llama_env_is_engine_namespace(p) &&
-                strncmp(p, "GGML_RPC_PSK=", 13) != 0 &&
-                strncmp(p, "GGML_RPC_REQUIRE_MODEL_CACHE=", 29) != 0 &&
-                strncmp(p, "GGML_RPC_NODE_LOCAL_MOE=", 24) != 0)
-                continue;
+            if (!idletoken_llama_env_keep(p)) continue;
             size_t n2 = strlen(p) + 1;
             memcpy(child_env + off, p, n2);
             off += n2;
@@ -989,6 +1087,7 @@ static int llama_spawn(idletoken_llama *lc) {
     char *argv[LLAMA_ARGV_MAX];
     int argc = 0;
     argv[argc++] = lc->bin;
+    argv[argc++] = "--idletoken-managed";
     argv[argc++] = "-m";        argv[argc++] = lc->gguf;
     /* Vision tower. Loading it is what flips the engine's allow_image on, so a
      * model with a tower on disk serves images and one without says so in
@@ -1063,11 +1162,25 @@ static int llama_spawn(idletoken_llama *lc) {
      * Overridable via IDLETOKEN_LLAMA_ARGS (appended last, so a user-supplied
      * --reasoning wins). */
     argv[argc++] = "--reasoning"; argv[argc++] = "auto";
-    /* Speculative decoding (default ngram-mod — see the struct field). Mirrors
+    /* Speculative decoding (admitted MTP plus ngram-mod). Mirrors
      * spec_frag on the Windows path above; the two must not diverge. */
     if (lc->spec_type[0]) {
         argv[argc++] = "--spec-type";
         argv[argc++] = lc->spec_type;
+        if (strstr(lc->spec_type, "draft-mtp")) {
+            /* Older binaries share our upstream version but lack the local
+             * input and request guards. They must reject this capability flag. */
+            argv[argc++] = "--idletoken-mtp-safe";
+            argv[argc++] = "--spec-draft-n-max"; argv[argc++] = "3";
+            argv[argc++] = "-ctkd"; argv[argc++] = "f16";
+            argv[argc++] = "-ctvd"; argv[argc++] = "f16";
+            if (lc->mtp_draft_path[0]) {
+                argv[argc++] = "--idletoken-mtp-external-safe";
+                argv[argc++] = "--spec-draft-model"; argv[argc++] = lc->mtp_draft_path;
+                argv[argc++] = "--spec-draft-device"; argv[argc++] = lc->mtp_draft_device;
+                argv[argc++] = "--spec-draft-ngl"; argv[argc++] = "all";
+            }
+        }
     }
     if (lc->ctx_size > 0) { argv[argc++] = "-c"; argv[argc++] = ctxstr; }
     /* Mirrors the Windows yarn_frag above — the two spawn paths must not
@@ -1132,7 +1245,10 @@ static int llama_spawn(idletoken_llama *lc) {
          * there the coordinator's own signal path does the cleanup) */
         prctl(PR_SET_PDEATHSIG, SIGKILL);
 #endif
-        if (lc->shared) llama_scrub_env();
+        if (llama_scrub_env() != 0) {
+            fprintf(stderr, "coord: cannot isolate the engine environment\n");
+            _exit(126);
+        }
         /* AFTER the scrub, and set here rather than inherited, so neither the
          * scrub nor the coordinator's own environment can decide where a user's
          * image gets encoded. Empty device name is not a silent default: the
@@ -1161,16 +1277,33 @@ static int llama_spawn(idletoken_llama *lc) {
  *
  * Contract and the reasoning: the header. Pure function of the string so
  * coord --selftest can drive both directions. */
-const char *idletoken_llama_placement_flag(const char *args) {
+const char *idletoken_llama_budget_flag(const char *args, int mtp_enabled) {
     /* The closed set of flags that decide where tensors live. `-dev`/`-ts` are
      * upstream's short aliases for `--device`/`--tensor-split`; refusing the
      * long form alone would be a doorway, not a guard. */
     static const char *placement[] = { "--device", "-dev", "--rpc",
+                                       "-m", "--model", "-mu", "--model-url",
+                                       "-hf", "--hf-repo", "-hff", "--hf-file",
+                                       "-mm", "--mmproj", "-mmu", "--mmproj-url",
+                                       "--mmproj-auto", "--no-mmproj", "--mmproj-offload",
+                                       "--no-mmproj-offload", "-mg", "--main-gpu",
+                                       "--override-kv", "--lora", "--lora-scaled",
+                                       "--lora-init-without-apply", "--control-vector",
+                                       "--control-vector-scaled", "--control-vector-layer-range",
+                                       "--models-dir", "--models-preset", "--models-max",
+                                       "--models-autoload", "--no-models-autoload",
                                        "--tensor-split", "-ts", "-ngl",
                                        "--n-gpu-layers", "--fit",
                                        "--cpu-moe", "-cmoe",
                                        "--n-cpu-moe", "-ncmoe",
-                                       "--override-tensor", "-ot" };
+                                       "--override-tensor", "-ot",
+                                       "--spec-type", "-md", "--model-draft",
+                                       "-hfd", "-hfrd", "--hf-repo-draft",
+                                       "-ctkd", "-ctvd", "--cache-type-k-draft",
+                                       "--cache-type-v-draft", "-devd", "--device-draft",
+                                       "-ngld", "--gpu-layers-draft", "--n-gpu-layers-draft",
+                                       "-otd", "--override-tensor-draft", "-cmoed",
+                                       "--cpu-moe-draft", "-ncmoed", "--n-cpu-moe-draft" };
     if (!args || !args[0]) return NULL;
 
     /* Walk token by token rather than substring-searching the whole string:
@@ -1181,18 +1314,21 @@ const char *idletoken_llama_placement_flag(const char *args) {
     while (*p) {
         while (*p == ' ' || *p == '\t') p++;
         if (!*p) break;
-        const char *start = p;
-        while (*p && *p != ' ' && *p != '\t') p++;
-
-        /* The token, cut at '=' so `--device=RPC0` compares as `--device`. */
-        size_t len = (size_t)(p - start);
-        const char *eq = memchr(start, '=', len);
-        if (eq) len = (size_t)(eq - start);
-
         char tok[64];
-        if (len < sizeof(tok)) {
-            memcpy(tok, start, len);
-            tok[len] = '\0';
+        size_t len = 0;
+        int value = 0;
+        while (*p && *p != ' ' && *p != '\t') {
+            const char c = *p++;
+            /* CreateProcess removes enclosing/interior quotes before the
+             * engine sees argv. Conservatively remove quoting/escapes here
+             * too, including split spelling and arbitrarily many quotes.
+             * This is only the guard; it never rewrites a diagnostic value. */
+            if (c == '"' || c == '\'' || c == '\\') continue;
+            if (c == '=') value = 1;
+            if (!value && len + 1 < sizeof tok) tok[len++] = c;
+        }
+        tok[len] = '\0';
+        if (len) {
             /* Upstream normalises '_' to '-' for every '--' argument
              * (common/arg.cpp), so `--tensor_split` IS `--tensor-split` to the
              * engine. Do the same before comparing, or the guard has a bypass
@@ -1200,11 +1336,45 @@ const char *idletoken_llama_placement_flag(const char *args) {
              * matching upstream exactly: a short flag keeps its spelling. */
             if (tok[0] == '-' && tok[1] == '-')
                 for (char *c = tok; *c; c++) if (*c == '_') *c = '-';
+            if (!strncmp(tok, "--spec-draft-", 13)) return "--spec-draft-*";
             for (size_t i = 0; i < sizeof(placement) / sizeof(*placement); i++)
                 if (!strcmp(tok, placement[i])) return placement[i];
+            if (mtp_enabled) {
+                if (!strncmp(tok, "--spec-ngram-", 13)) return "--spec-ngram-*";
+                static const char *profile[] = {
+                    "-c", "--ctx-size", "-np", "--parallel", "-b", "--batch-size",
+                    "-ub", "--ubatch-size", "-ctk", "--cache-type-k", "-ctv",
+                    "--cache-type-v", "-fa", "--flash-attn", "-nkvo",
+                    "--no-kv-offload", "--no-op-offload", "--swa-full"
+                };
+                for (size_t i = 0; i < sizeof profile / sizeof *profile; i++)
+                    if (!strcmp(tok, profile[i])) return profile[i];
+                /* New upstream options must not become unbudgeted model or
+                 * graph inputs by default. Private MTP diagnostics retain
+                 * explicit thread/log/metrics options only. */
+                if (tok[0] == '-' && (tok[1] == '-' ||
+                        (tok[1] >= 'a' && tok[1] <= 'z') ||
+                        (tok[1] >= 'A' && tok[1] <= 'Z'))) {
+                    static const char *diagnostics[] = {
+                        "-t", "--threads", "-tb", "--threads-batch",
+                        "--threads-http", "--poll", "--poll-batch",
+                        "--metrics", "--log-disable", "--log-file",
+                        "--log-colors", "--log-prefix", "--log-timestamps",
+                        "--log-verbosity", "-v", "--verbose"
+                    };
+                    int safe = 0;
+                    for (size_t i = 0; i < sizeof diagnostics / sizeof *diagnostics; ++i)
+                        if (!strcmp(tok, diagnostics[i])) safe = 1;
+                    if (!safe) return "an option outside the measured MTP diagnostic allow-list";
+                }
+            }
         }
     }
     return NULL;
+}
+
+const char *idletoken_llama_placement_flag(const char *args) {
+    return idletoken_llama_budget_flag(args, 0);
 }
 
 /* --- monitor thread ------------------------------------------------------- */
@@ -1667,6 +1837,27 @@ int idletoken_llama_grow(idletoken_llama *lc, uint32_t new_ctx,
     return restored;
 }
 
+int idletoken_llama_spec_type(int mtp_enabled, const char *override,
+                              char out[32], char *err, size_t err_cap) {
+    const char *value = override;
+    out[0] = '\0';
+    if (!value || !strcmp(value, "auto"))
+        value = mtp_enabled ? "ngram-mod,draft-mtp" : "ngram-mod";
+    if (!value[0] || !strcmp(value, "off") || !strcmp(value, "none")) return 0;
+    if (!strcmp(value, "ngram-mod") ||
+        (mtp_enabled && (!strcmp(value, "draft-mtp") ||
+                         !strcmp(value, "ngram-mod,draft-mtp") ||
+                         !strcmp(value, "draft-mtp,ngram-mod")))) {
+        snprintf(out, 32, "%s", value);
+        return 0;
+    }
+    if (err && err_cap)
+        snprintf(err, err_cap,
+                 "IDLETOKEN_SPEC_TYPE requests unsupported or unbudgeted drafting; "
+                 "use auto, none, ngram-mod, or admitted draft-mtp");
+    return -1;
+}
+
 /* --- public lifecycle ----------------------------------------------------- */
 
 idletoken_llama *idletoken_llama_start(const char *bin, const char *gguf,
@@ -1679,6 +1870,8 @@ idletoken_llama *idletoken_llama_start(const char *bin, const char *gguf,
                                        const char *log_path, int shared,
                                        const char *grow_dir,
                                        const idletoken_llama_vision *vision,
+                                       int mtp_enabled,
+                                       const idletoken_llama_mtp_draft *draft,
                                        char *err, size_t err_cap) {
     /* A tower without a device is refused, never defaulted. The default would
      * be the engine's own first-registered GPU, which in a cluster is a remote
@@ -1694,10 +1887,24 @@ idletoken_llama *idletoken_llama_start(const char *bin, const char *gguf,
                      "registered GPU, which is a remote RPC device in a cluster)");
         return NULL;
     }
+    if (draft && (!mtp_enabled || !draft->path || !draft->path[0] ||
+        !draft->device || !draft->device[0] || strstr(draft->device, "RPC") ||
+        strpbrk(draft->device, ", \t\r\n"))) {
+        if (err_cap) snprintf(err, err_cap, "standalone MTP requires an admitted asset and one local GPU");
+        return NULL;
+    }
     idletoken_llama *lc = calloc(1, sizeof(*lc));
     if (!lc) {
         if (err_cap) snprintf(err, err_cap, "out of memory");
         return NULL;
+    }
+    if (draft) {
+        if (strlen(draft->path) >= sizeof lc->mtp_draft_path || strlen(draft->device) >= sizeof lc->mtp_draft_device) {
+            if (err_cap) snprintf(err, err_cap, "standalone MTP path or device is too long");
+            free(lc); return NULL;
+        }
+        snprintf(lc->mtp_draft_path, sizeof lc->mtp_draft_path, "%s", draft->path);
+        snprintf(lc->mtp_draft_device, sizeof lc->mtp_draft_device, "%s", draft->device);
     }
     snprintf(lc->bin, sizeof(lc->bin), "%s", bin);
     snprintf(lc->gguf, sizeof(lc->gguf), "%s", gguf);
@@ -1772,26 +1979,23 @@ idletoken_llama *idletoken_llama_start(const char *bin, const char *gguf,
      * deny-list would leak the next time upstream adds a logging flag).
      * The refusal is PRINTED: "no output" cannot be told apart from "never
      * read the variable" — see G-SHARED-2 in docs/shared-mode-plan-2026-08.md. */
-    /* Speculative decoding: on by default, for every model and every precision
-     * (see the struct field for what was measured and why this variant).
-     * Shared mode keeps it — it changes speed, not output, and the engine
-     * re-samples every drafted position from the target model, so a draft can
-     * only ever be slower, never wrong. The escape hatch stays available in
-     * shared mode for the same reason; unlike IDLETOKEN_LLAMA_ARGS it cannot
-     * name a logging flag, it only picks among the engine's own draft types. */
-    {
-        const char *st = getenv("IDLETOKEN_SPEC_TYPE");
-        if (!st) st = "ngram-mod";
-        if (strcmp(st, "none") != 0 && strcmp(st, "off") != 0 && st[0]) {
-            if (strlen(st) >= sizeof(lc->spec_type)) {
-                if (err_cap)
-                    snprintf(err, err_cap, "IDLETOKEN_SPEC_TYPE is too long: %s", st);
-                free(lc);
-                return NULL;
-            }
-            snprintf(lc->spec_type, sizeof(lc->spec_type), "%s", st);
-        }
+    /* Only resource-admitted MTP may reach either platform's spawn path.
+     * Disabling it for a diagnostic retains the conservative planned budget. */
+    if (idletoken_llama_spec_type(mtp_enabled, getenv("IDLETOKEN_SPEC_TYPE"),
+                                  lc->spec_type, err, err_cap) != 0) {
+        free(lc);
+        return NULL;
     }
+    if (strstr(lc->spec_type, "draft-mtp") && lc->n_parallel != 1) {
+        if (err && err_cap)
+            snprintf(err, err_cap, "MTP memory admission requires one sequence slot; "
+                     "remove IDLETOKEN_LLAMA_SLOTS");
+        free(lc);
+        return NULL;
+    }
+    fprintf(stderr, "coord: speculative decoding: %s (MTP capability: %s)\n",
+            lc->spec_type[0] ? lc->spec_type : "disabled by diagnostic override",
+            mtp_enabled ? "supported and resource-admitted" : "not available");
     const char *extra = getenv("IDLETOKEN_LLAMA_ARGS");
     if (extra && extra[0] && lc->shared) {
         fprintf(stderr, "coord: shared mode: IDLETOKEN_LLAMA_ARGS ignored "
@@ -1820,7 +2024,8 @@ idletoken_llama *idletoken_llama_start(const char *bin, const char *gguf,
          * Refuse rather than silently drop: a user who set the variable is
          * trying to do something, and a dropped flag would look like the engine
          * ignoring them for no reason. */
-        const char *hit = idletoken_llama_placement_flag(extra);
+        const char *hit = idletoken_llama_budget_flag(extra,
+                                                     strstr(lc->spec_type, "draft-mtp") != NULL);
         if (hit) {
             /* The caller's buffer is small (256 B at the only call site) and
              * snprintf truncates silently, so the WHY goes to stderr, which has
@@ -1829,19 +2034,15 @@ idletoken_llama *idletoken_llama_start(const char *bin, const char *gguf,
              * cut off mid-word. */
             fprintf(stderr,
                     "coord: refusing IDLETOKEN_LLAMA_ARGS: it sets %s, which "
-                    "decides where tensors live.\n"
-                    "coord: layer 0 and the token embedding must stay on this "
-                    "machine — with layer 0 remote, prompts were recovered from "
-                    "the public GGUF 17 times out of 17 (privacy invariant "
-                    "#10).\n"
-                    "coord: --rpc/--device/--tensor-split are computed from the "
-                    "scheduler plan; IDLETOKEN_LLAMA_ARGS is appended after "
-                    "them, so setting %s here would silently win.\n", hit, hit);
+                    "changes scheduler-owned placement or draft memory.\n"
+                    "coord: layer 0 must stay local and every node must fit its "
+                    "admitted weights, context and workspace. Setting %s after "
+                    "the planned arguments would invalidate that admission.\n", hit, hit);
             if (err && err_cap)
                 snprintf(err, err_cap,
-                         "IDLETOKEN_LLAMA_ARGS sets %s, which would move layer 0 "
-                         "off this machine (privacy invariant #10). Remove it: "
-                         "placement is computed from the scheduler plan.", hit);
+                         "IDLETOKEN_LLAMA_ARGS sets %s, which overrides planned "
+                         "placement or draft memory. Remove it; use "
+                         "IDLETOKEN_SPEC_TYPE for admitted drafting diagnostics.", hit);
             free(lc);
             return NULL;
         }

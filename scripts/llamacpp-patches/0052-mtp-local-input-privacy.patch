@@ -1,0 +1,53 @@
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1380,6 +1380,30 @@
+         pimpl->dev_layer[il] = get_layer_buft_list(il);
+     }
+ 
++    if (params.load_mtp && hparams.n_layer_nextn > 0) {
++        ggml_backend_dev_t local_gpu = nullptr;
++        bool has_rpc = false;
++        for (const auto & dev : devices) {
++            const bool rpc = std::string(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev.dev))).compare(0, 3, "RPC") == 0;
++            const auto type = ggml_backend_dev_type(dev.dev);
++            has_rpc |= rpc;
++            if (!local_gpu && !rpc && (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU)) {
++                local_gpu = dev.dev;
++            }
++        }
++        if (has_rpc) {
++            if (!local_gpu) {
++                throw std::runtime_error("MTP over RPC requires a local GPU to keep prompt token embeddings private");
++            }
++            // MTP consumes prompt tokens again. Its complete input block must stay local.
++            for (int il = hparams.n_layer(); il < n_layer_all; ++il) {
++                pimpl->dev_layer[il] = {local_gpu, &pimpl->gpu_buft_list.at(local_gpu)};
++                LLAMA_LOG_INFO("load_tensors: MTP layer %d pinned to local device %s for prompt privacy\n",
++                        il, ggml_backend_dev_name(local_gpu));
++            }
++        }
++    }
++
+     // assign the output layer
+     pimpl->dev_output = get_layer_buft_list(n_layer_all);
+ 
+@@ -1590,6 +1614,18 @@
+ 
+     for (auto & [buft, ctx_ptr] : ml.ctx_map) {
+         ggml_context * ctx = ctx_ptr.get();
++
++        const auto buffer_dev = ggml_backend_buft_get_device(buft);
++        if (params.load_mtp && buffer_dev &&
++                std::string(ggml_backend_reg_name(ggml_backend_dev_backend_reg(buffer_dev))).compare(0, 3, "RPC") == 0) {
++            for (auto * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
++                int layer = -1;
++                if (sscanf(ggml_get_name(tensor), "blk.%d.", &layer) == 1 &&
++                        layer >= (int) hparams.n_layer() && layer < n_layer_all) {
++                    throw std::runtime_error("MTP tensor override would expose prompt token embeddings over RPC");
++                }
++            }
++        }
+ 
+         // skip contexts without tensors
+         if (ggml_get_first_tensor(ctx) == nullptr) {

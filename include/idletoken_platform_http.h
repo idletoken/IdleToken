@@ -20,6 +20,10 @@ typedef struct {
     int body_total_ms;                   /* whole upload, and separately the whole response body */
     size_t max_response;
     int receipt;                         /* read the relay deadline prefix */
+    /* Optional incremental 2xx body consumer; nonzero aborts the transfer.
+     * In this mode response.len counts bytes but response.body stays empty. */
+    int (*on_body)(const unsigned char *, size_t, void *);
+    void *body_context;
     int (*cancelled)(void *);
     void *cancel_context;
 } idletoken_platform_http_request;

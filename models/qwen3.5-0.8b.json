@@ -190,7 +190,10 @@
       "repo": "unsloth/Qwen3.5-0.8B-GGUF",
       "gguf": "Qwen3.5-0.8B-UD-IQ2_XXS.gguf",
       "sha256": "a369165c8ec45a92d55cbad98b5377e2c32ca8dfc824c899d9d05b33b6b53e54",
-      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "IQ2_M",
@@ -199,7 +202,10 @@
       "repo": "unsloth/Qwen3.5-0.8B-GGUF",
       "gguf": "Qwen3.5-0.8B-UD-IQ2_M.gguf",
       "sha256": "e31519c0ffb8e5bec09f34d7783731c39f9eaee13c0ec5a0f14b191761bb5134",
-      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "IQ3_XXS",
@@ -208,7 +214,10 @@
       "repo": "unsloth/Qwen3.5-0.8B-GGUF",
       "gguf": "Qwen3.5-0.8B-UD-IQ3_XXS.gguf",
       "sha256": "3dc1f2217751ca270d41f6fc3084160c386465fe09bf4596576dccd7a4565b8a",
-      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q2_K_XL",
@@ -217,7 +226,10 @@
       "repo": "unsloth/Qwen3.5-0.8B-GGUF",
       "gguf": "Qwen3.5-0.8B-UD-Q2_K_XL.gguf",
       "sha256": "8d992fef3b0bd269eb4ef2ed492b2b02f9027a055d6a764b700f4092593c9909",
-      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q3_K_S",
@@ -226,7 +238,10 @@
       "repo": "unsloth/Qwen3.5-0.8B-GGUF",
       "gguf": "Qwen3.5-0.8B-Q3_K_S.gguf",
       "sha256": "4649ee78ff7cbad4e9fe4c0bab3b73a7c70096b51e36ef299469b08989a93c39",
-      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q3_K_M",
@@ -235,7 +250,10 @@
       "repo": "unsloth/Qwen3.5-0.8B-GGUF",
       "gguf": "Qwen3.5-0.8B-Q3_K_M.gguf",
       "sha256": "c49ad509cd0a3f8584c4eff50d84202336bf9475b8a724c89f4061687c1fb510",
-      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q3_K_XL",
@@ -244,7 +262,10 @@
       "repo": "unsloth/Qwen3.5-0.8B-GGUF",
       "gguf": "Qwen3.5-0.8B-UD-Q3_K_XL.gguf",
       "sha256": "30a1353e67c9795e375dac8a19d25429ace0ec2b6ca55436406ee02d2603a218",
-      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "IQ4_XS",
@@ -253,7 +274,10 @@
       "repo": "unsloth/Qwen3.5-0.8B-GGUF",
       "gguf": "Qwen3.5-0.8B-IQ4_XS.gguf",
       "sha256": "619917ae92f61eb6515a7070e944a0a7c2b198a2cf6536386f475485188a36ff",
-      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "IQ4_NL",
@@ -262,7 +286,10 @@
       "repo": "unsloth/Qwen3.5-0.8B-GGUF",
       "gguf": "Qwen3.5-0.8B-IQ4_NL.gguf",
       "sha256": "de9f7f28a4155c1678cbdae54c61ae63aa6326f7fffd2cdacfb765cfeab21670",
-      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q4_0",
@@ -271,7 +298,10 @@
       "repo": "unsloth/Qwen3.5-0.8B-GGUF",
       "gguf": "Qwen3.5-0.8B-Q4_0.gguf",
       "sha256": "444406ddd926550c724ec18d5120a9d40ded44908a063b0e66e9a7e5464c652c",
-      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q4_K_S",
@@ -280,7 +310,10 @@
       "repo": "unsloth/Qwen3.5-0.8B-GGUF",
       "gguf": "Qwen3.5-0.8B-Q4_K_S.gguf",
       "sha256": "5f7ccfa6e9df0d9ebbaff9ee095b18202bec1e0ac313ca688d2c57c9c80a6bc9",
-      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q4_K_M",
@@ -289,7 +322,10 @@
       "repo": "unsloth/Qwen3.5-0.8B-GGUF",
       "gguf": "Qwen3.5-0.8B-Q4_K_M.gguf",
       "sha256": "bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517",
-      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q4_1",
@@ -298,7 +334,10 @@
       "repo": "unsloth/Qwen3.5-0.8B-GGUF",
       "gguf": "Qwen3.5-0.8B-Q4_1.gguf",
       "sha256": "e5926ccfef0c54aebf5d8bda01b2fb6c12ceff4f02a490bc108c5fabf60b334e",
-      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q4_K_XL",
@@ -307,7 +346,10 @@
       "repo": "unsloth/Qwen3.5-0.8B-GGUF",
       "gguf": "Qwen3.5-0.8B-UD-Q4_K_XL.gguf",
       "sha256": "3177ebd67afe4438374da19e690bc1b98756f7e0fea9240e1be404336156a7b5",
-      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q5_K_S",
@@ -316,7 +358,10 @@
       "repo": "unsloth/Qwen3.5-0.8B-GGUF",
       "gguf": "Qwen3.5-0.8B-Q5_K_S.gguf",
       "sha256": "a201a5899049a7f7845f910ad803574787b4474c3daffc0d33e8688f9114880f",
-      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q5_K_M",
@@ -325,7 +370,10 @@
       "repo": "unsloth/Qwen3.5-0.8B-GGUF",
       "gguf": "Qwen3.5-0.8B-Q5_K_M.gguf",
       "sha256": "c3ef5827b322c4be08a3a26ce424460d8b37daf593356c2cc1f4e40a7ab0581b",
-      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q5_K_XL",
@@ -334,7 +382,10 @@
       "repo": "unsloth/Qwen3.5-0.8B-GGUF",
       "gguf": "Qwen3.5-0.8B-UD-Q5_K_XL.gguf",
       "sha256": "299824f81e5a1d84bf49db6b603b1c002a4e910c6e9f242a504ddc51e758ee0e",
-      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q6_K",
@@ -343,7 +394,10 @@
       "repo": "unsloth/Qwen3.5-0.8B-GGUF",
       "gguf": "Qwen3.5-0.8B-Q6_K.gguf",
       "sha256": "8408c5c222111cec253682b49eece2a02ed641ded68490001ec4ee160e71098e",
-      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q6_K_XL",
@@ -352,7 +406,10 @@
       "repo": "unsloth/Qwen3.5-0.8B-GGUF",
       "gguf": "Qwen3.5-0.8B-UD-Q6_K_XL.gguf",
       "sha256": "8f0cb1e8e058e45c7d9676fcd4da2f08eb62ff537da747a6ffc7157c1f6a5684",
-      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q8_0",
@@ -361,7 +418,10 @@
       "repo": "unsloth/Qwen3.5-0.8B-GGUF",
       "gguf": "Qwen3.5-0.8B-Q8_0.gguf",
       "sha256": "0ad885ffd4bb022fc4f0d33a3308fa108ef8613159d3b3a67e23abca056b7a6c",
-      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q8_K_XL",
@@ -370,7 +430,10 @@
       "repo": "unsloth/Qwen3.5-0.8B-GGUF",
       "gguf": "Qwen3.5-0.8B-UD-Q8_K_XL.gguf",
       "sha256": "167183aecc0735359970e977c21a88c7d69112be06aa5d2df27c0d2a23662805",
-      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "BF16",
@@ -379,7 +442,10 @@
       "repo": "unsloth/Qwen3.5-0.8B-GGUF",
       "gguf": "Qwen3.5-0.8B-BF16.gguf",
       "sha256": "cedf89af31c9041b601fa58303285bc46d99c51baee1b13f5e919626ca526ee5",
-      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0"
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     }
   ],
   "notes": [
@@ -390,5 +456,163 @@
     "Aligned against llama.cpp layer by layer and token by token on real Q4_K_M weights on a unified-memory Linux node, 2026-07-28 (docs/linear-attention-design.md §4d).",
     "All five precisions load and infer on real GGUF files (unified-memory Linux node, 2026-07-28); Q5_K_M/Q6_K/Q8_0/BF16 answer \"Paris\" correctly, Q4_K_M does not -- quantization loss is perceptible at 0.8B.",
     "layer_weight_bytes / shared_weight_bytes are **measured**, not estimated from bits per weight: summed tensor by tensor from the GGUF tensor directory, with blk.N.* counted as layer weights and everything else as shared."
-  ]
+  ],
+  "mtp_compute_bytes_128k_cuda": [
+    155207808,
+    155207808,
+    155207808
+  ],
+  "mtp_host_compute_bytes_128k_cuda": [
+    136333344,
+    136333344,
+    136333344
+  ],
+  "mtp_compute_bytes_256k_cuda": [
+    289425536,
+    289425536,
+    289425536
+  ],
+  "mtp_host_compute_bytes_256k_cuda": [
+    270551072,
+    270551072,
+    270551072
+  ],
+  "mtp_compute_bytes_1m_cuda": [
+    1094731904,
+    1094731904,
+    1094731904
+  ],
+  "mtp_host_compute_bytes_1m_cuda": [
+    1075857440,
+    1075857440,
+    1075857440
+  ],
+  "mtp_compute_bytes_128k_metal": [
+    166217760,
+    166217760,
+    166217760
+  ],
+  "mtp_host_compute_bytes_128k_metal": [
+    272666688,
+    272666688,
+    272666688
+  ],
+  "mtp_compute_bytes_256k_metal": [
+    300566560,
+    300566560,
+    300566560
+  ],
+  "mtp_host_compute_bytes_256k_metal": [
+    541102144,
+    541102144,
+    541102144
+  ],
+  "mtp_compute_bytes_1m_metal": [
+    1106659360,
+    1106659360,
+    1106659360
+  ],
+  "mtp_host_compute_bytes_1m_metal": [
+    2151714880,
+    2151714880,
+    2151714880
+  ],
+  "mtp_draft": {
+    "repo": "Thireus/mtp-Qwen3.5-0.8B-THIREUS-Q8_0-SPECIAL_SPLIT",
+    "revision": "0f2bb87ce1fb3a9f1abb880ff2f2438b4c9ab18b",
+    "gguf": "mtp-Qwen3.5-0.8B-THIREUS-Q8_0-SPECIAL_TENSOR-00001-of-00018.gguf",
+    "sha256": "ff23787946bfa0a95fe1b527e42e3fbce816fe151a418b8a90bcc2424b84a318",
+    "bytes": 302870080,
+    "parts": [
+      {
+        "file": "mtp-Qwen3.5-0.8B-THIREUS-Q8_0-SPECIAL_TENSOR-00002-of-00018.gguf",
+        "bytes": 270172352,
+        "sha256": "9019a9015ed5a9ce4414d898ecff0d871ad684b07745c58183278b49a74dc1fa"
+      },
+      {
+        "file": "mtp-Qwen3.5-0.8B-THIREUS-Q8_0-SPECIAL_TENSOR-00003-of-00018.gguf",
+        "bytes": 4256,
+        "sha256": "9b64e634634350dfd25134a38369befc9bfc471299f808215898802db2c8fce7"
+      },
+      {
+        "file": "mtp-Qwen3.5-0.8B-THIREUS-Q8_0-SPECIAL_TENSOR-00004-of-00018.gguf",
+        "bytes": 2228416,
+        "sha256": "dc5bee74042bc967bba9359351cec8a90be5475840159adc3d879022d408dca1"
+      },
+      {
+        "file": "mtp-Qwen3.5-0.8B-THIREUS-Q8_0-SPECIAL_TENSOR-00005-of-00018.gguf",
+        "bytes": 4288,
+        "sha256": "4950b226e820ceb63826b4690cfe3016c5b3795a0e0bbffbededb4a95a6458a8"
+      },
+      {
+        "file": "mtp-Qwen3.5-0.8B-THIREUS-Q8_0-SPECIAL_TENSOR-00006-of-00018.gguf",
+        "bytes": 3899584,
+        "sha256": "7f001a53c27b1cae854ccdcfcdf5b5d8a23b3b8fc2e29a1456b51073b69d3adc"
+      },
+      {
+        "file": "mtp-Qwen3.5-0.8B-THIREUS-Q8_0-SPECIAL_TENSOR-00007-of-00018.gguf",
+        "bytes": 3899584,
+        "sha256": "3171deadb394923e3a2c48443994ee9b92beebbbb0919dc3784ffeed0445f660"
+      },
+      {
+        "file": "mtp-Qwen3.5-0.8B-THIREUS-Q8_0-SPECIAL_TENSOR-00008-of-00018.gguf",
+        "bytes": 3899584,
+        "sha256": "fecc13d266909ec21fb9af59c09d8c83b665846571def805e78e9bdf4074333f"
+      },
+      {
+        "file": "mtp-Qwen3.5-0.8B-THIREUS-Q8_0-SPECIAL_TENSOR-00009-of-00018.gguf",
+        "bytes": 4288,
+        "sha256": "eefa795fe164cb7d5968fc5c7f2df508c65a316085b55c3ecabdcac1870eff64"
+      },
+      {
+        "file": "mtp-Qwen3.5-0.8B-THIREUS-Q8_0-SPECIAL_TENSOR-00010-of-00018.gguf",
+        "bytes": 1216,
+        "sha256": "5ac5a69e5a84a8988842c1e41af923364dfcc2f68ff3750b8480f9de48290633"
+      },
+      {
+        "file": "mtp-Qwen3.5-0.8B-THIREUS-Q8_0-SPECIAL_TENSOR-00011-of-00018.gguf",
+        "bytes": 557248,
+        "sha256": "a2bcda47d3029d5e6c6c55bce1148a754ef538e222d3225e294364a929d44a1e"
+      },
+      {
+        "file": "mtp-Qwen3.5-0.8B-THIREUS-Q8_0-SPECIAL_TENSOR-00012-of-00018.gguf",
+        "bytes": 2228416,
+        "sha256": "0ec78212c8935a5ab7344e21c6372531b81c57eb776c7399eb7acba09ef29abe"
+      },
+      {
+        "file": "mtp-Qwen3.5-0.8B-THIREUS-Q8_0-SPECIAL_TENSOR-00013-of-00018.gguf",
+        "bytes": 1216,
+        "sha256": "515f032bd4b22c2b1dd6f11b5b11595b4e1b18513dbcd73e288c799bce54a3bf"
+      },
+      {
+        "file": "mtp-Qwen3.5-0.8B-THIREUS-Q8_0-SPECIAL_TENSOR-00014-of-00018.gguf",
+        "bytes": 4456640,
+        "sha256": "51fa5578022de4411b1ed5ba8d3d58cdcf3995f72429a1463778cac19b3d0aab"
+      },
+      {
+        "file": "mtp-Qwen3.5-0.8B-THIREUS-Q8_0-SPECIAL_TENSOR-00015-of-00018.gguf",
+        "bytes": 557248,
+        "sha256": "cf3822419e1612227bdb757fc72f8e7cdab951a985fc96a830a9de042762c5c4"
+      },
+      {
+        "file": "mtp-Qwen3.5-0.8B-THIREUS-Q8_0-SPECIAL_TENSOR-00016-of-00018.gguf",
+        "bytes": 4288,
+        "sha256": "aa9d706f3a2c6bac1919836e3984b86e3a891558ba14fcbaae0db105d82048a7"
+      },
+      {
+        "file": "mtp-Qwen3.5-0.8B-THIREUS-Q8_0-SPECIAL_TENSOR-00017-of-00018.gguf",
+        "bytes": 4288,
+        "sha256": "242ddc673551d365aa87d658eab3a00edd87b4625f9dd05dd57dcb6275491d60"
+      },
+      {
+        "file": "mtp-Qwen3.5-0.8B-THIREUS-Q8_0-SPECIAL_TENSOR-00018-of-00018.gguf",
+        "bytes": 4288,
+        "sha256": "4be36458c8730327b177e3448c8f38ab96e8c5e87c8db619ea63aeff62834049"
+      }
+    ],
+    "layers": 1,
+    "weight_bytes": 291923968,
+    "kv_bytes_per_token": 2048
+  },
+  "mtp_kv_bytes_per_token": 2048
 }

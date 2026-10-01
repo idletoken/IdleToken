@@ -112,16 +112,18 @@ export default function PairingPanel(props: {
   session: Session | null;
   initialView?: "choose" | "join";
   // Preflight for BOTH roles: resolve and integrity-check the locally selected
-  // GGUF, downloading nothing. Returns the exact local primary GGUF path, or
-  // throws `[WEIGHTS_NOT_DOWNLOADED]` when the parts are not all here. A
+  // GGUF and its dependencies. Reuses the main model and automatically fills
+  // missing dependencies; returns freshly verified paths together. A
   // creator may not advertise a cluster without it; since 2026-09-01 a joiner
   // may not be admitted without it either.
-  prepareSelectedModel: () => Promise<string>;
+  prepareSelectedModel: () => Promise<Pick<SelfInfo, "modelPath" | "mmprojPath" | "mtpDraftPath">>;
   /** Fetch and verify the exact model a cluster demanded, then hand back the
    *  path and the tuning that names it. Both are returned rather than read back
    *  from props because the join follows in the same turn (see `join`). */
   prepareClusterModel: (modelId: string, quant: string) => Promise<{
     modelPath: string;
+    mmprojPath?: string;
+    mtpDraftPath?: string;
     tuning: EngineTuning;
   }>;
   onSignIn?: () => void;
@@ -255,8 +257,8 @@ export default function PairingPanel(props: {
 
   const create = async () => {
     await guard(
-      props.prepareSelectedModel().then((modelPath) =>
-        getPairingProvider().create({ ...props.self, modelPath })
+      props.prepareSelectedModel().then((paths) =>
+        getPairingProvider().create({ ...props.self, ...paths })
       )
     );
   };
@@ -274,13 +276,13 @@ export default function PairingPanel(props: {
     const secret = await deriveSecret();
     if (secret) {
       await guard(
-        props.prepareSelectedModel().then((modelPath) =>
-          getPairingProvider().createAccount({ ...props.self, modelPath }, secret)
+        props.prepareSelectedModel().then((paths) =>
+          getPairingProvider().createAccount({ ...props.self, ...paths }, secret)
         )
       );
     }
   };
-  const accountJoin = async (over?: { modelPath: string; tuning: EngineTuning }) => {
+  const accountJoin = async (over?: { modelPath: string; mmprojPath?: string; mtpDraftPath?: string; tuning: EngineTuning }) => {
     const secret = await deriveSecret();
     if (!secret) return;
     setJoinKind("account");
@@ -288,9 +290,9 @@ export default function PairingPanel(props: {
     autoClose.current = "joined";
     await guard(
       (async () => {
-        const modelPath = over?.modelPath ?? (await props.prepareSelectedModel());
+        const paths = over ?? (await props.prepareSelectedModel());
         await getPairingProvider().joinAccount(
-          { ...props.self, modelPath, tuning: over?.tuning ?? props.self.tuning },
+          { ...props.self, ...paths, tuning: over?.tuning ?? props.self.tuning },
           secret
         );
       })(),
@@ -307,7 +309,7 @@ export default function PairingPanel(props: {
   // turn, before React has committed them, so `props.self` still describes the
   // model we were refused for. Sending that would earn a second refusal for the
   // model we just spent an hour downloading.
-  const join = async (over?: { modelPath: string; tuning: EngineTuning }) => {
+  const join = async (over?: { modelPath: string; mmprojPath?: string; mtpDraftPath?: string; tuning: EngineTuning }) => {
     if (!isValidCode(code)) {
       setCodeErr(true);
       return;
@@ -321,10 +323,10 @@ export default function PairingPanel(props: {
         // Admission requires verified local weights. Never send an empty path:
         // the four entry choices are disabled while the selected model is
         // missing, and this preflight closes the file-removal/race window.
-        const modelPath = over?.modelPath ?? (await props.prepareSelectedModel());
+        const paths = over ?? (await props.prepareSelectedModel());
         await getPairingProvider().join(code, {
           ...props.self,
-          modelPath,
+          ...paths,
           tuning: over?.tuning ?? props.self.tuning,
         });
       })(),

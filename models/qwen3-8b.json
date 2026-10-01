@@ -95,7 +95,9 @@
       "repo": "Qwen/Qwen3-8B-GGUF",
       "gguf": "Qwen3-8B-Q4_K_M.gguf",
       "sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785",
-      "revision": "7c41481f57cb95916b40956ab2f0b139b296d974"
+      "revision": "7c41481f57cb95916b40956ab2f0b139b296d974",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0
     },
     {
       "quant": "Q5_0",
@@ -104,7 +106,9 @@
       "repo": "Qwen/Qwen3-8B-GGUF",
       "gguf": "Qwen3-8B-Q5_0.gguf",
       "sha256": "c034cdfb0ad5b3edc5cf4ac07bff3b1b214aa541e633b37191c19c3a7b119727",
-      "revision": "7c41481f57cb95916b40956ab2f0b139b296d974"
+      "revision": "7c41481f57cb95916b40956ab2f0b139b296d974",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0
     },
     {
       "quant": "Q5_K_M",
@@ -113,7 +117,9 @@
       "repo": "Qwen/Qwen3-8B-GGUF",
       "gguf": "Qwen3-8B-Q5_K_M.gguf",
       "sha256": "068bae163faa96ad48032daf4e071a6a28fe67d8dcc95367609c2ff165e52738",
-      "revision": "7c41481f57cb95916b40956ab2f0b139b296d974"
+      "revision": "7c41481f57cb95916b40956ab2f0b139b296d974",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0
     },
     {
       "quant": "Q6_K",
@@ -122,7 +128,9 @@
       "repo": "Qwen/Qwen3-8B-GGUF",
       "gguf": "Qwen3-8B-Q6_K.gguf",
       "sha256": "cb042ccd76795a8830d6be6bd4165245847cc68e41797b13bd61aed4c2cfbce6",
-      "revision": "7c41481f57cb95916b40956ab2f0b139b296d974"
+      "revision": "7c41481f57cb95916b40956ab2f0b139b296d974",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0
     },
     {
       "quant": "Q8_0",
@@ -131,7 +139,9 @@
       "repo": "Qwen/Qwen3-8B-GGUF",
       "gguf": "Qwen3-8B-Q8_0.gguf",
       "sha256": "408b955510e196121c1c375201744783b5c9a43c7956d73fc78df54c66e883d6",
-      "revision": "7c41481f57cb95916b40956ab2f0b139b296d974"
+      "revision": "7c41481f57cb95916b40956ab2f0b139b296d974",
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0
     }
   ],
   "note": "Runs on a single machine; verified on real hardware 2026-07-27 (Qwen3-8B Q4_K_M, CPU and CUDA agree token for token)"

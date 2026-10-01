@@ -54,8 +54,9 @@ typedef struct idletoken_llama idletoken_llama;   /* opaque; one per sidecar */
  * order is preserved, which matters — llama.cpp arg handlers run in argv
  * order and `--device RPC0` only resolves AFTER `--rpc` registered the
  * server. Extra user arguments come from the environment variable
- * IDLETOKEN_LLAMA_ARGS (whitespace-split, appended last so they win over ours
- * on duplicate flags). ctx_size > 0 adds `-c ctx_size` so the engine's
+ * IDLETOKEN_LLAMA_ARGS (guarded diagnostics, appended last). Every launch
+ * requires --idletoken-managed so inherited engine configuration cannot add
+ * unbudgeted models or placement. ctx_size > 0 adds `-c ctx_size` so the engine's
  * context matches what the coordinator reports. The child's stdout+stderr are
  * redirected to `log_path` (its own file, NOT the coordinator's stderr:
  * engine logs are not ours, and keeping them separate is part of the
@@ -70,7 +71,7 @@ typedef struct idletoken_llama idletoken_llama;   /* opaque; one per sidecar */
  * --log-prompts-dir), and nothing that could carry prompt text is enabled.
  * See docs/threat-model-shared-compute-2026-08.md — the bar is "not readable
  * by ordinary means", not "safe against a debugger".
- * Local use passes 0 and is unaffected: reading your OWN prompts is normal.
+ * Local use passes 0 and permits guarded private diagnostic arguments.
  *
  * `engine_sock` (non-empty only with `shared`) is the AF_UNIX path the engine
  * binds INSTEAD of the TCP port, so the prompts crossing this link never
@@ -137,6 +138,13 @@ typedef struct {
     const char *device;
 } idletoken_llama_vision;
 
+typedef struct {
+    const char *path; /* verified standalone MTP GGUF */
+    const char *device; /* one coordinator-local GPU, never RPC */
+} idletoken_llama_mtp_draft;
+
+/* mtp_enabled is the exact GGUF capability after resource admission; it is
+ * not a user toggle. MTP launches require the patched engine capability flag. */
 idletoken_llama *idletoken_llama_start(const char *bin, const char *gguf,
                                        int port, const char *engine_sock,
                                        uint32_t ctx_size, uint32_t yarn_orig_ctx,
@@ -147,7 +155,15 @@ idletoken_llama *idletoken_llama_start(const char *bin, const char *gguf,
                                        const char *log_path, int shared,
                                        const char *grow_dir,
                                        const idletoken_llama_vision *vision,
+                                       int mtp_enabled,
+                                       const idletoken_llama_mtp_draft *draft,
                                        char *err, size_t err_cap);
+
+/* The admitted GGUF capability selects the default. A diagnostic override may
+ * disable drafting, but cannot enable an unbudgeted draft model. Returns -1
+ * for an unsupported override; out must hold at least 32 bytes. */
+int idletoken_llama_spec_type(int mtp_enabled, const char *override,
+                              char out[32], char *err, size_t err_cap);
 
 /* Restart the engine with a LARGER per-slot context. Not a crash: the child is
  * stopped and respawned with `-c new_ctx * n_parallel`, preserving the
@@ -252,8 +268,9 @@ int idletoken_llama_log_terminal_failure(const char *text);
  * repeating layers must be GPU-resident. Spawn also supplies `--fit off`. */
 const char *idletoken_llama_ngl_arg(const char *cluster_args);
 
-/* Does this IDLETOKEN_LLAMA_ARGS string set a flag that decides WHERE tensors
- * live? Returns the offending flag (a static string) or NULL.
+/* Does this IDLETOKEN_LLAMA_ARGS string replace admitted assets or placement?
+ * Returns the offending flag (a static string) or NULL. The budget variant
+ * additionally limits active MTP launches to measured diagnostic options.
  *
  * The coordinator refuses to start when this hits: those flags are computed
  * from the scheduler plan and pin layer 0 + the token embedding to the local
@@ -265,12 +282,17 @@ const char *idletoken_llama_ngl_arg(const char *cluster_args);
  * AND strings that must not. A deny-list nobody has watched over-match is how
  * you find out later that it broke a legitimate flag.
  *
- * Matching is whole-token, accepts the `=` form, and NORMALISES UNDERSCORES for
+ * Matching conservatively removes quotes/escapes for Windows argv, accepts
+ * the `=` form, and NORMALISES UNDERSCORES for
  * `--` flags — upstream does `std::replace(arg.begin(), arg.end(), '_', '-')`
  * on every `--` argument (common/arg.cpp), so `--tensor_split` reaches the
  * engine as `--tensor-split`. A literal matcher misses it, which is exactly the
  * bypass measured on 2026-08-20. */
 const char *idletoken_llama_placement_flag(const char *args);
+const char *idletoken_llama_budget_flag(const char *args, int mtp_enabled);
+/* Child environment policy, shared by Windows and POSIX managed launches.
+ * Accepts NAME or NAME=VALUE and compares names without Windows case bypasses. */
+int idletoken_llama_env_keep(const char *entry);
 
 /* --- Minimal blocking HTTP/1.1 client for the sidecar (loopback only) ------
  *

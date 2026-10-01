@@ -26,6 +26,12 @@ export const STRINGS = {
     "weights.download": "Download weights",
     "weights.ready": "Ready in the model folder",
     "weights.visionNeeded": "Model ready — image support needs one more file",
+    "weights.assetsNeeded": "Model present — required files are missing",
+    "weights.verifyNeeded": "Model files need verification",
+    "weights.verify": "Verify files",
+    "weights.complete": "Complete download",
+    "weights.err.invalidAsset": "The selected model files are not declared correctly ({detail}). Update the client and try again.",
+    "weights.err.changed": "A model file changed during verification. Verify the files again.",
     "weights.cancel": "Cancel",
     // No "Download failed" string any more (2026-08-13): an unfinished download
     // leaves the machine without the weights, which is what `weights.needed` /
@@ -610,6 +616,12 @@ export const STRINGS = {
     "weights.download": "下载权重",
     "weights.ready": "当前模型目录下已就绪",
     "weights.visionNeeded": "模型已就绪 — 图片支持还需要一个文件",
+    "weights.assetsNeeded": "模型已存在 — 还需补齐配套文件",
+    "weights.verifyNeeded": "模型文件尚需校验",
+    "weights.verify": "校验文件",
+    "weights.complete": "补齐下载",
+    "weights.err.invalidAsset": "所选模型的文件清单不完整或不匹配（{detail}），请更新客户端后重试。",
+    "weights.err.changed": "模型文件在校验过程中发生了变化，请重新校验。",
     "weights.cancel": "取消",
     "weights.partial": "已下载 {have}，可从此处继续",
     "weights.err.noSource":
@@ -1071,6 +1083,9 @@ const ERROR_KEYS: Record<string, StringKey> = {
   WEIGHTS_PART_OVERRUN: "weights.note.partOverrun",
   WEIGHTS_NO_RESUME: "weights.note.noResume",
   WEIGHTS_NOT_DOWNLOADED: "weights.err.notDownloaded",
+  WEIGHTS_VARIANT_UNKNOWN: "weights.err.invalidAsset",
+  WEIGHTS_ASSET_INVALID: "weights.err.invalidAsset",
+  WEIGHTS_CHANGED_DURING_VERIFY: "weights.err.changed",
   WEIGHTS_VERIFYING: "weights.note.verifying",
   WEIGHTS_SHA256_MISMATCH: "weights.err.sha256Mismatch",
   // A-P1-4: an installed user cannot run scripts/build_llamacpp.sh — telling

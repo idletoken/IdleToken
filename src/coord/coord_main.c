@@ -120,6 +120,7 @@ static const idletoken_model_spec *g_model;
  * answers image requests with its own refusal, and nothing pretends the picture
  * was read (hard constraint #11). */
 static char g_mmproj_path[1024];
+static char g_mtp_draft_path[1024];
 
 /* THIS machine's first compute device, by the engine's own naming.
  *
@@ -2152,6 +2153,24 @@ static int windows_utf8_path_selftest(void) {
 }
 #endif
 
+/* A valid metadata-only GGUF keeps size-source tests independent from the MTP
+ * detector's required malformed-file refusal. No real weights are allocated. */
+static size_t coord_selftest_gguf_header(FILE *f) {
+    unsigned char bytes[128];
+    idletoken_buf b;
+    idletoken_buf_init(&b, bytes, sizeof bytes);
+    idletoken_buf_put_bytes(&b, "GGUF", 4);
+    idletoken_buf_put_u32(&b, 3);
+    idletoken_buf_put_u64(&b, 0);
+    idletoken_buf_put_u64(&b, 1);
+    idletoken_buf_put_u64(&b, strlen("general.architecture"));
+    idletoken_buf_put_bytes(&b, "general.architecture", strlen("general.architecture"));
+    idletoken_buf_put_u32(&b, 8);
+    idletoken_buf_put_u64(&b, strlen("qwen35"));
+    idletoken_buf_put_bytes(&b, "qwen35", strlen("qwen35"));
+    return b.err ? 0 : fwrite(bytes, 1, b.pos, f);
+}
+
 static int coord_selftest(void) {
     int fails = 0;
 #define ST(cond, name) do { \
@@ -2159,12 +2178,67 @@ static int coord_selftest(void) {
         else      { fprintf(stderr, "selftest FAIL %s\n", name); fails++; } \
     } while (0)
 
+    {
+        char spec[32], error[256];
+        ST(idletoken_llama_spec_type(1, NULL, spec, error, sizeof error) == 0 &&
+           !strcmp(spec, "ngram-mod,draft-mtp"), "MTP-capable default includes MTP");
+        ST(idletoken_llama_spec_type(0, NULL, spec, error, sizeof error) == 0 &&
+           !strcmp(spec, "ngram-mod"), "GGUF without MTP keeps ngram default");
+        ST(idletoken_llama_spec_type(1, "none", spec, error, sizeof error) == 0 &&
+           !spec[0], "explicit diagnostic speculation disable");
+        ST(idletoken_llama_spec_type(1, "auto", spec, error, sizeof error) == 0 &&
+           strstr(spec, "draft-mtp"), "auto reuses admitted capability");
+        ST(idletoken_llama_spec_type(0, "draft-mtp", spec, error, sizeof error) < 0,
+           "unbudgeted MTP override refuses");
+        ST(idletoken_llama_spec_type(1, "draft-eagle3", spec, error, sizeof error) < 0,
+           "unbudgeted external draft model refuses");
+        ST(idletoken_llama_spec_type(1, "ngram-mod --device RPC0", spec, error,
+                                     sizeof error) < 0,
+           "speculation override rejects argument injection");
+        ST(idletoken_llama_budget_flag("-np 2", 1) != NULL &&
+           idletoken_llama_budget_flag("--ctx_size=4096", 1) != NULL &&
+           idletoken_llama_budget_flag("--ubatch-size 4096", 1) != NULL &&
+           idletoken_llama_budget_flag("--spec-ngram-mod-n-max 512", 1) != NULL,
+           "MTP launch cannot override measured context, slots or workspace");
+        ST(idletoken_llama_budget_flag("--threads 4", 1) == NULL,
+           "MTP budget guard still permits CPU thread tuning");
+        ST(idletoken_llama_budget_flag("\"--spec-draft-n-max\" 32", 1) != NULL &&
+           idletoken_llama_budget_flag("--spec-\"draft\"-model evil.gguf", 1) != NULL &&
+           idletoken_llama_budget_flag("\"--spec_draft_n_max\"=32", 1) != NULL &&
+           idletoken_llama_budget_flag("\\\"--spec-draft-model\\\" evil.gguf", 1) != NULL &&
+           idletoken_llama_budget_flag("\"-np\" 32", 1) != NULL,
+           "Windows quoted and escaped flags cannot replace admitted MTP inputs");
+        char padded_flag[256];
+        memset(padded_flag, '"', 100);
+        snprintf(padded_flag + 100, sizeof padded_flag - 100, "--spec-draft-n-max 32");
+        ST(idletoken_llama_budget_flag(padded_flag, 1) != NULL,
+           "quote padding cannot exceed the protected flag scan buffer");
+        ST(idletoken_llama_budget_flag("--threads \"4\" --log-file \"C:\\safe path\\log.txt\" --metrics", 1) == NULL &&
+           idletoken_llama_budget_flag("-t 4 --new-unmeasured-allocation 1", 1) != NULL,
+           "MTP diagnostics allow-list keeps benign quoted values and rejects unknown options");
+        ST(!idletoken_llama_env_keep("LLAMA_ARG_SPEC_DRAFT_CPU_MOE=1") &&
+           !idletoken_llama_env_keep("llama_arg_spec_draft_model=evil.gguf") &&
+           !idletoken_llama_env_keep("LLAMA_ARG_SPEC_TYPE=draft-simple") &&
+           !idletoken_llama_env_keep("LLAMA_ARG_MODEL=evil.gguf") &&
+           !idletoken_llama_env_keep("LLAMA_ARG_MMPROJ=evil.gguf") &&
+           !idletoken_llama_env_keep("LLAMA_ARG_ALIAS=unadmitted") &&
+           !idletoken_llama_env_keep("GGML_RPC_ALLOW_PLAINTEXT=1"),
+           "managed child environment drops inherited model, draft and placement inputs");
+        ST(idletoken_llama_env_keep("GGML_RPC_PSK=owned") &&
+           idletoken_llama_env_keep("GGML_RPC_REQUIRE_MODEL_CACHE=1") &&
+           idletoken_llama_env_keep("GGML_RPC_NODE_LOCAL_MOE=1") &&
+           idletoken_llama_env_keep("GGML_MOE_POOL_EXPERTS=8") &&
+           idletoken_llama_env_keep("MTMD_BACKEND_DEVICE=CUDA0") &&
+           idletoken_llama_env_keep("PATH=/bin") &&
+           idletoken_llama_env_keep("=C:=C:\\temp"),
+           "managed environment preserves coordinator controls and OS variables");
+    }
+
     /* IDLETOKEN_LLAMA_ARGS placement-flag guard (privacy invariant #10). Both
      * directions on purpose. The REFUSE half alone would also pass for a guard
      * that rejects everything, and that failure mode is not hypothetical here:
-     * this variable is the documented escape hatch for engine tuning, and T14
-     * used it to inject --spec-type. A guard that ate that would be discovered
-     * by a person, not by a test.
+     * this variable is the documented escape hatch for ordinary engine tuning.
+     * Draft parameters now belong to the admitted resource plan as well.
      *
      * The underscore case is the one that matters most. Upstream rewrites '_'
      * to '-' in every '--' argument, so `--tensor_split` reaches the engine as
@@ -2187,7 +2261,17 @@ static int coord_selftest(void) {
             { "-cmoe",                      1, "all-expert placement alias" },
             { "-ot blk\\.0=CPU",           1, "tensor placement override" },
             { "-c 4096 --device RPC0 -np 2", 1, "mid-string" },
-            { "--spec-type f16",            0, "T14's real use must keep working" },
+            { "--spec-type draft-mtp",      1, "MTP requires resource admission" },
+            { "--spec_draft_n_max=64",      1, "draft rollback memory is planned" },
+            { "-ctkd q4_0",                1, "draft workspace depends on KV type" },
+            { "--spec-draft-model model.gguf", 1, "draft weights cannot bypass planner" },
+            { "\"--device\" RPC0",         1, "Windows quoted placement" },
+            { "\"--model\" evil.gguf",      1, "target asset is planner-owned" },
+            { "-m evil.gguf",               1, "target short alias" },
+            { "--mmproj evil.gguf",         1, "vision asset is planner-owned" },
+            { "-mm evil.gguf",              1, "vision short alias" },
+            { "--override-kv x=int:1",       1, "model geometry is measured" },
+            { "--lora extra.gguf",          1, "extra model tensors are unbudgeted" },
             { "--devices-note x",           0, "contains --device but is not it" },
             { "--no-rpc-fallback x",        0, "contains --rpc but is not it" },
             { "-c 4096 -np 2",              0, "ordinary tuning" },
@@ -3057,7 +3141,8 @@ static int coord_selftest(void) {
         FILE *bf = fopen(p, "wb");
         int sized = 0;
         if (bf) {
-            if (fseeko(bf, (off_t)(Q4_K_M_BYTES - 1), SEEK_SET) == 0 &&
+            if (coord_selftest_gguf_header(bf) > 0 &&
+                fseeko(bf, (off_t)(Q4_K_M_BYTES - 1), SEEK_SET) == 0 &&
                 fputc(0, bf) != EOF) sized = 1;
             fclose(bf);
         }
@@ -3089,10 +3174,10 @@ static int coord_selftest(void) {
             fprintf(stderr, "selftest SKIP budget source: unrecognised size "
                             "(cannot write under %s)\n", tmpdir);
         } else {
-            fputs("not a real gguf, only a size", bf);
+            const size_t fixture_bytes = coord_selftest_gguf_header(bf);
             fclose(bf);
             ST(q27 && idletoken_model_size_resolve(q27, NULL, p, &ms, w, sizeof w) == 0 &&
-                   ms.total_bytes == 28 && strstr(w, "WARNING") != NULL,
+                   fixture_bytes > 0 && ms.total_bytes == fixture_bytes && strstr(w, "WARNING") != NULL,
                "budget source: an unrecognised quant size is used AND flagged");
             remove(p);
         }
@@ -4072,7 +4157,7 @@ static void sb_cstr(llama_sb *b, const char *s) { sb_put(b, s, strlen(s)); }
  * (--max-decode, the same default the cluster path applies), and the thinking
  * budget above.
  * `force_nonstream` appends "stream":false at the END of the object (the
- * later duplicate wins), for the tools one-shot path where the client asked
+ * later duplicate wins), for a request override where the client asked
  * to stream but the upstream request must not. */
 static char *llama_openai_upstream_body(const char *body, size_t len,
                                         int want_stream, int force_nonstream,
@@ -4687,6 +4772,72 @@ static void llama_stream_span(idletoken_sse *s, const char *span, size_t slen,
     free(esc);
 }
 
+typedef struct {
+    int opened, block;
+    char id[512], name[512];
+} llama_stream_tool;
+
+/* Tool indices belong to OpenAI; Anthropic content indices also include text
+ * and thinking. Keep their mapping for interleaved parallel tool arguments. */
+static int llama_stream_tools_delta(idletoken_sse *s, const char *array, size_t len,
+                                     llama_stream_tool tools[128]) {
+    if (!s->anthropic) {
+        size_t cap = len + 512;
+        char *body = malloc(cap);
+        if (!body) return -1;
+        int n = snprintf(body, cap,
+            "{\"id\":\"chatcmpl_idletoken_%s\",\"object\":\"chat.completion.chunk\","
+            "\"created\":%lld,\"model\":\"%s\",\"choices\":[{\"index\":0,"
+            "\"delta\":{\"tool_calls\":%.*s},\"finish_reason\":null}]}",
+            s->id, s->created, coord_model()->id, (int)len, array);
+        int rc = n < 0 || (size_t)n >= cap ? -1 : idletoken_http_sse_event(s->fd, NULL, body, (size_t)n);
+        free(body);
+        if (rc) s->failed = 1;
+        return rc;
+    }
+    const char *p = array + 1, *end = array + len;
+    while (p < end) {
+        while (p < end && (*p == ' ' || *p == ',' || *p == '\n' || *p == '\r' || *p == '\t')) p++;
+        if (p == end || *p == ']') return 0;
+        long n = idletoken_json_value_len(p, end);
+        if (n <= 0 || *p != '{') return -1;
+        int index = coord_json_top_int(p, (size_t)n, "index", -1);
+        if (index < 0 || index >= 128) return -1;
+        llama_stream_tool *t = &tools[index];
+        const char *id = NULL, *name = NULL, *args = NULL;
+        size_t ilen = 0, nlen = 0, alen = 0;
+        idletoken_json_obj_str(p, (size_t)n, "id", &id, &ilen);
+        const char *fn = idletoken_json_obj_get(p, (size_t)n, "function");
+        long flen = fn ? idletoken_json_value_len(fn, p + n) : 0;
+        if (fn && flen > 0) {
+            idletoken_json_obj_str(fn, (size_t)flen, "name", &name, &nlen);
+            idletoken_json_obj_str(fn, (size_t)flen, "arguments", &args, &alen);
+        }
+        if ((t->opened && (ilen || nlen)) || strlen(t->id) + ilen >= sizeof(t->id) || strlen(t->name) + nlen >= sizeof(t->name)) return -1;
+        if (ilen) { size_t old = strlen(t->id); memcpy(t->id + old, id, ilen); t->id[old + ilen] = 0; }
+        if (nlen) { size_t old = strlen(t->name); memcpy(t->name + old, name, nlen); t->name[old + nlen] = 0; }
+        if (!t->opened && t->id[0] && t->name[0]) {
+            sse_block_close(s);
+            t->block = s->blk_index++; t->opened = 1; s->blk_any = 1;
+            sse_emitf(s, "content_block_start", "{\"type\":\"content_block_start\",\"index\":%d,"
+                "\"content_block\":{\"type\":\"tool_use\",\"id\":\"%s\",\"name\":\"%s\",\"input\":{}}}", t->block, t->id, t->name);
+        }
+        if (alen) {
+            if (!t->opened) return -1;
+            size_t cap = alen + 160;
+            char *body = malloc(cap);
+            if (!body) return -1;
+            int bl = snprintf(body, cap, "{\"type\":\"content_block_delta\",\"index\":%d,"
+                "\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"%.*s\"}}", t->block, (int)alen, args);
+            int rc = bl < 0 || (size_t)bl >= cap ? -1 : idletoken_http_sse_event(s->fd, "content_block_delta", body, (size_t)bl);
+            free(body);
+            if (rc) { s->failed = 1; return -1; }
+        }
+        p += n;
+    }
+    return -1;
+}
+
 /* Streaming chat: consume the engine's SSE incrementally and re-emit through
  * OUR emitters, so the wire shapes stay identical to the cluster path's
  * (OpenAI chunk frames + [DONE]; Anthropic message_start...message_stop). */
@@ -4733,7 +4884,8 @@ static void llama_chat_stream(int conn_fd, int is_anthropic,
     char *stop_escaped = NULL;
     size_t stop_escaped_len = 0;
     size_t llen = 0, lcap = 0;
-    int done = 0, eos_stop = 0, broke = 0;
+    int done = 0, eos_stop = 0, broke = 0, finish_tools = 0;
+    llama_stream_tool tools[128] = {{0}};
     int n_deltas = 0, up_in = -1, up_out = -1, cached = -1;
     double tps = 0.0;
     for (;;) {
@@ -4787,10 +4939,22 @@ static void llama_chat_stream(int conn_fd, int is_anthropic,
                         if (n_deltas == 0) llama_account_ttft(t0, now_ms());
                         n_deltas++;
                     }
+                    if (idletoken_json_obj_get(d, dlen, "error")) { broke = 1; goto stream_end; }
+                    const char *delta = json_value_pos(d, dlen, "delta");
+                    long delta_len = delta ? idletoken_json_value_len(delta, d + dlen) : 0;
+                    const char *tc = delta && delta_len > 0 ? idletoken_json_obj_get(delta, (size_t)delta_len, "tool_calls") : NULL;
+                    long tc_len = tc ? idletoken_json_value_len(tc, delta + delta_len) : 0;
+                    if (tc && tc_len > 2) {
+                        if (*tc != '[' || llama_stream_tools_delta(&s, tc, (size_t)tc_len, tools)) { broke = 1; goto stream_end; }
+                        if (n_deltas == 0) llama_account_ttft(t0, now_ms());
+                        n_deltas++;
+                    }
                     const char *fr;
                     size_t frlen;
-                    if (json_raw_str_span(d, dlen, "finish_reason", &fr, &frlen) == 0)
+                    if (json_raw_str_span(d, dlen, "finish_reason", &fr, &frlen) == 0) {
                         eos_stop = (frlen == 4 && !memcmp(fr, "stop", 4));
+                        finish_tools = (frlen == 10 && !memcmp(fr, "tool_calls", 10));
+                    }
                     const char *matched;
                     size_t matched_len;
                     if (json_raw_str_span(d, dlen, "idletoken_stop_sequence",
@@ -4838,11 +5002,25 @@ stream_end:
      * field" there says nothing about the engine — only complete streams are
      * evidence worth warning about. */
     if (cached < 0 && done && !broke) llama_warn_no_cache_field();
+    if (!done) broke = 1;
     if (broke) sse_error(&s, "engine connection lost mid-generation");
     const int matched_stop = eos_stop && !broke && stop_escaped != NULL;
-    sse_finish_matched(&s, n_in, n_out, eos_stop && !broke, cached,
+    if (!broke) {
+        if (s.anthropic) for (int ti = 0; ti < 128; ti++) if (tools[ti].opened)
+            sse_emitf(&s, "content_block_stop", "{\"type\":\"content_block_stop\",\"index\":%d}", tools[ti].block);
+        if (finish_tools) {
+            if (s.anthropic) {
+                sse_block_close(&s);
+                sse_anthropic_finish_event(&s, "tool_use", NULL, 0, n_out, cached);
+                sse_emitf(&s, "message_stop", "{\"type\":\"message_stop\"}");
+            } else {
+                sse_openai_finish_event(&s, "tool_calls", NULL, 0, n_in, n_out, cached);
+                sse_emitf(&s, NULL, "[DONE]");
+            }
+        } else sse_finish_matched(&s, n_in, n_out, eos_stop, cached,
                        matched_stop ? stop_escaped : NULL,
                        matched_stop ? stop_escaped_len : 0);
+    }
     fprintf(stderr, "coord: chat: generated %d tok (llama.cpp relay), stop=%s "
                     "(streamed), prefix reuse %d/%d tok\n",
             n_out, broke ? "decode_failed" :
@@ -5050,223 +5228,6 @@ static void coord_overflow_stream_reply(int conn_fd, int is_anthropic,
     free(msg);
 }
 
-/* Streaming chat WITH tools declared. Streaming idletoken-server's OpenAI
- * tool_calls deltas through an incremental re-emitter would need a full
- * delta-merge state machine on both faces; instead the UPSTREAM request runs
- * non-stream and the complete result goes out as one legal SSE sequence
- * (Anthropic: message_start .. tool_use blocks with input_json_delta ..
- * message_stop; OpenAI: chunk frames + [DONE]). Correctness over streaming
- * latency — tools are never silently dropped. */
-static void llama_chat_stream_tools(int conn_fd, int is_anthropic,
-                                    const char *up, size_t uplen,
-    int n_input, uint64_t req_id, long long t0) {
-    idletoken_llama_conn c;
-    if (idletoken_llama_http_open_relay(idletoken_llama_endpoint_of(g_llama),
-                                        "POST", IDLETOKEN_PATH_OPENAI,
-                                        up, uplen, 0, conn_fd, &c) != 0) {
-        if (c.cancelled) return;
-        llama_error_json(conn_fd, 503, "api_error", "inference engine connection failed");
-        return;
-    }
-    size_t rlen = 0;
-    char *resp = idletoken_llama_http_read_all(&c, &rlen, 64u << 20);
-    int status = c.status;
-    int cancelled = c.cancelled;
-    idletoken_llama_http_close(&c);
-    if (cancelled) {
-        free(resp);
-        return;
-    }
-    if (!resp) {
-        llama_error_json(conn_fd, 503, "api_error",
-                         "inference engine connection lost mid-response");
-        return;
-    }
-    if (status != 200) {
-        /* our stream has not started: a real HTTP status is still possible */
-        idletoken_http_send_json(conn_fd, status, resp, rlen);
-        free(resp);
-        return;
-    }
-
-    const char *msg = NULL;
-    size_t mlen = 0;
-    if (idletoken_oai_resp_message(resp, rlen, &msg, &mlen) != 0) {
-        llama_error_json(conn_fd, 502, "api_error",
-                         "inference engine returned no message object");
-        free(resp);
-        return;
-    }
-    const char *text = "";
-    size_t textl = 0;
-    idletoken_json_obj_str(msg, mlen, "content", &text, &textl);
-    /* Tools are the common case for an agentic client, so this path — not the
-     * live relay above — is where Claude Code's thinking actually comes from. */
-    const char *think = "";
-    size_t thinkl = 0;
-    idletoken_json_obj_str(msg, mlen, "reasoning_content", &think, &thinkl);
-    int up_in  = extract_int_field(resp, rlen, "prompt_tokens", n_input);
-    int n_out  = extract_int_field(resp, rlen, "completion_tokens", 0);
-    double tps = json_double_field(resp, rlen, "predicted_per_second", 0.0);
-    /* The upstream request ran NON-stream here, so the reuse count sits in the
-     * response body exactly as on the non-stream path -- and so does the
-     * engine's prefill time, which is this path's honest TTFT. */
-    const double prefill_ms = json_double_field(resp, rlen, "prompt_ms", -1.0);
-    int cached = llama_cached_prompt_tokens(resp, rlen);
-    if (cached < 0) llama_warn_no_cache_field();
-    const int cached_n = cached > 0 ? cached : 0;
-    const char *stop_seq = NULL;
-    size_t stop_len = 0;
-    if (json_raw_str_span(resp, rlen, "idletoken_stop_sequence",
-                          &stop_seq, &stop_len) != 0)
-        stop_seq = NULL;
-    char sreason[16] = "max_tokens";
-    {
-        char *probe = idletoken_oai_resp_to_anthropic_content(resp, rlen, sreason,
-                                                              sizeof(sreason), NULL);
-        free(probe);   /* only wanted the finish_reason mapping */
-    }
-
-    idletoken_sse s = (idletoken_sse){ .fd = conn_fd, .anthropic = is_anthropic };
-    snprintf(s.id, sizeof(s.id), "%llu", (unsigned long long)req_id);
-    s.created = (long long)time(NULL);
-
-    if (is_anthropic) {
-        if (idletoken_http_send_sse_head(s.fd) != 0) { free(resp); return; }
-        sse_emitf(&s, "message_start",
-            "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_idletoken_%s\","
-             "\"type\":\"message\",\"role\":\"assistant\","
-             "\"model\":\"%s\",\"content\":[],"
-             "\"stop_reason\":null,\"stop_sequence\":null,"
-             "\"usage\":{\"input_tokens\":%d,\"output_tokens\":0}}}",
-            s.id, coord_model()->id, up_in);
-        int idx = 0;
-        size_t probe = 0;
-        idletoken_tool_call tc;
-        int have_calls = idletoken_oai_next_tool_call(msg, mlen, &probe, &tc);
-        if (thinkl > 0) {
-            sse_emitf(&s, "content_block_start",
-                "{\"type\":\"content_block_start\",\"index\":%d,"
-                 "\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}", idx);
-            for (size_t i = 0; i < thinkl && !s.failed; ) {
-                size_t n = esc_chunk_len(think + i, thinkl - i, 2048);
-                sse_emitf(&s, "content_block_delta",
-                    "{\"type\":\"content_block_delta\",\"index\":%d,"
-                     "\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"%.*s\"}}",
-                    idx, (int)n, think + i);
-                i += n;
-            }
-            sse_emitf(&s, "content_block_stop",
-                "{\"type\":\"content_block_stop\",\"index\":%d}", idx);
-            idx++;
-        }
-        if (textl > 0 || !have_calls) {
-            sse_emitf(&s, "content_block_start",
-                "{\"type\":\"content_block_start\",\"index\":%d,"
-                 "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}", idx);
-            for (size_t i = 0; i < textl && !s.failed; ) {
-                size_t n = esc_chunk_len(text + i, textl - i, 2048);
-                sse_emitf(&s, "content_block_delta",
-                    "{\"type\":\"content_block_delta\",\"index\":%d,"
-                     "\"delta\":{\"type\":\"text_delta\",\"text\":\"%.*s\"}}",
-                    idx, (int)n, text + i);
-                i += n;
-            }
-            sse_emitf(&s, "content_block_stop",
-                "{\"type\":\"content_block_stop\",\"index\":%d}", idx);
-            idx++;
-        }
-        size_t it = 0;
-        while (idletoken_oai_next_tool_call(msg, mlen, &it, &tc)) {
-            sse_emitf(&s, "content_block_start",
-                "{\"type\":\"content_block_start\",\"index\":%d,"
-                 "\"content_block\":{\"type\":\"tool_use\",\"id\":\"%.*s\","
-                 "\"name\":\"%.*s\",\"input\":{}}}",
-                idx, (int)tc.id_len, tc.id, (int)tc.name_len, tc.name);
-            for (size_t i = 0; i < tc.args_len && !s.failed; ) {
-                size_t n = esc_chunk_len(tc.args + i, tc.args_len - i, 2048);
-                sse_emitf(&s, "content_block_delta",
-                    "{\"type\":\"content_block_delta\",\"index\":%d,"
-                     "\"delta\":{\"type\":\"input_json_delta\","
-                     "\"partial_json\":\"%.*s\"}}",
-                    idx, (int)n, tc.args + i);
-                i += n;
-            }
-            sse_emitf(&s, "content_block_stop",
-                "{\"type\":\"content_block_stop\",\"index\":%d}", idx);
-            idx++;
-        }
-        const int matched_stop = !have_calls && !strcmp(sreason, "end_turn") &&
-                                 stop_seq != NULL;
-        sse_anthropic_finish_event(&s, sreason,
-                                   matched_stop ? stop_seq : NULL,
-                                   matched_stop ? stop_len : 0,
-                                   n_out, cached_n);
-        sse_emitf(&s, "message_stop", "{\"type\":\"message_stop\"}");
-    } else {
-        sse_begin(&s, up_in);      /* role preamble frame */
-        for (size_t i = 0; i < thinkl && !s.failed; ) {
-            size_t n = esc_chunk_len(think + i, thinkl - i, 2048);
-            char frame[2560];
-            snprintf(frame, sizeof(frame), "%.*s", (int)n, think + i);
-            sse_delta_reasoning(&s, frame);
-            i += n;
-        }
-        for (size_t i = 0; i < textl && !s.failed; ) {
-            size_t n = esc_chunk_len(text + i, textl - i, 2048);
-            char frame[2560];
-            snprintf(frame, sizeof(frame), "%.*s", (int)n, text + i);
-            sse_delta(&s, frame);
-            i += n;
-        }
-        size_t it = 0;
-        idletoken_tool_call tc;
-        int call_idx = 0, have_calls = 0;
-        while (idletoken_oai_next_tool_call(msg, mlen, &it, &tc)) {
-            have_calls = 1;
-            /* one delta names the call, follow-ups append arguments (OpenAI
-             * clients concatenate tool_calls[i].function.arguments deltas) */
-            sse_emitf(&s, NULL,
-                "{\"id\":\"chatcmpl_idletoken_%s\",\"object\":\"chat.completion.chunk\","
-                 "\"created\":%lld,\"model\":\"%s\","
-                 "\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
-                 "\"index\":%d,\"id\":\"%.*s\",\"type\":\"function\","
-                 "\"function\":{\"name\":\"%.*s\",\"arguments\":\"\"}}]},"
-                 "\"finish_reason\":null}]}",
-                s.id, s.created, coord_model()->id, call_idx,
-                (int)tc.id_len, tc.id, (int)tc.name_len, tc.name);
-            for (size_t i = 0; i < tc.args_len && !s.failed; ) {
-                size_t n = esc_chunk_len(tc.args + i, tc.args_len - i, 2048);
-                sse_emitf(&s, NULL,
-                    "{\"id\":\"chatcmpl_idletoken_%s\",\"object\":\"chat.completion.chunk\","
-                     "\"created\":%lld,\"model\":\"%s\","
-                     "\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
-                     "\"index\":%d,\"function\":{\"arguments\":\"%.*s\"}}]},"
-                     "\"finish_reason\":null}]}",
-                    s.id, s.created, coord_model()->id, call_idx,
-                    (int)n, tc.args + i);
-                i += n;
-            }
-            call_idx++;
-        }
-        const char *fr = have_calls ? "tool_calls"
-                       : (!strcmp(sreason, "end_turn") ? "stop" : "length");
-        const int matched_stop = !have_calls && !strcmp(fr, "stop") &&
-                                 stop_seq != NULL;
-        sse_openai_finish_event(&s, fr,
-                                matched_stop ? stop_seq : NULL,
-                                matched_stop ? stop_len : 0,
-                                up_in, n_out, cached_n);
-        sse_emitf(&s, NULL, "[DONE]");
-    }
-    free(resp);
-    fprintf(stderr, "coord: chat: generated %d tok (llama.cpp relay), stop=%s "
-                    "(streamed, tools one-shot), prefix reuse %d/%d tok\n",
-            n_out, sreason, cached_n, up_in);
-    llama_account(up_in, n_out, tps, t0, cached);
-    llama_account_ttft_ms(prefill_ms);
-}
-
 /* The chat entry point for llamacpp mode (both faces, both stream modes).
  *
  * `origin` and `hops_in` are carried in for the admission point below: this is
@@ -5281,17 +5242,13 @@ static void llama_chat_route(int conn_fd, const idletoken_http_req *req,
                              int is_anthropic, int want_stream,
                              idletoken_origin origin, int hops_in) {
     if (llama_gate_ready(conn_fd) != 0) return;
-    /* Tools + stream => the one-shot path above; the upstream body must then
-     * be built WITHOUT "stream":true. */
-    const int tools_oneshot = want_stream &&
-        idletoken_body_has_tools((const char *)req->body, req->body_len);
     size_t uplen = 0;
     char *up;
     if (is_anthropic) {
         size_t alen = 0;
         char *aup = idletoken_anthropic_to_openai((const char *)req->body,
                                                   req->body_len,
-                                                  want_stream && !tools_oneshot,
+                                                  want_stream,
                                                   g_max_decode, &alen);
         /* What the translation returns IS an OpenAI body, so it takes the same
          * engine-side injections — the thinking budget above in particular.
@@ -5318,8 +5275,8 @@ static void llama_chat_route(int conn_fd, const idletoken_http_req *req,
         up = llama_openai_upstream_body(demoted ? demoted
                                                 : (const char *)req->body,
                                         demoted ? dlen : req->body_len,
-                                        want_stream && !tools_oneshot,
-                                        tools_oneshot, &uplen);
+                                        want_stream,
+                                        0, &uplen);
         free(demoted);
     }
     if (!up) {
@@ -5435,10 +5392,7 @@ static void llama_chat_route(int conn_fd, const idletoken_http_req *req,
     if (queued_for_local) infer_gate_waiter_remove();
     const long long t0 = now_ms();
     const uint64_t req_id = coord_next_req_id();
-    if (want_stream && tools_oneshot)
-        llama_chat_stream_tools(conn_fd, is_anthropic, up, uplen, n_input,
-                                req_id, t0);
-    else if (want_stream)
+    if (want_stream)
         llama_chat_stream(conn_fd, is_anthropic, up, uplen, n_input, req_id, t0);
     else
         llama_chat_nonstream(conn_fd, is_anthropic, up, uplen, n_input, req_id, t0);
@@ -7788,7 +7742,7 @@ static int run_llamacpp_mode(const char *llama_bin, const char *llama_gguf,
                              const char *postload_prefetch_url,
                              unsigned postload_prefetch_layers,
                              const idletoken_node_mem *capability_nodes,
-                             int n_capability_nodes) {
+                             int n_capability_nodes, int mtp_enabled) {
     memset(g_capability_nodes, 0, sizeof(g_capability_nodes));
     g_n_capability_nodes = 0;
     if (capability_nodes && n_capability_nodes > 0) {
@@ -8025,6 +7979,7 @@ static int run_llamacpp_mode(const char *llama_bin, const char *llama_gguf,
                 g_model->id, g_model->mmproj->gguf);
     }
 
+    idletoken_llama_mtp_draft draft = {g_mtp_draft_path, coord_local_device_name()};
     char err[256] = "";
     g_llama = idletoken_llama_start(llama_bin, llama_gguf, llama_port,
                                     engine_sock, ctx_size, yarn_orig,
@@ -8032,7 +7987,8 @@ static int run_llamacpp_mode(const char *llama_bin, const char *llama_gguf,
                                     n_cpu_moe,
                                     ngl_arg, cluster_args, log_path, g_shared_mode,
                                     NULL,
-                                    vision_arg,
+                                    vision_arg, mtp_enabled,
+                                    g_mtp_draft_path[0] ? &draft : NULL,
                                     err, sizeof(err));
     if (!g_llama) {
         fprintf(stderr, "idletoken-coord: could not start the inference engine: %s\n",
@@ -8477,7 +8433,7 @@ static int run_llamacpp_tokenizer_mode(const char *llama_bin,
         "--vocab-only --no-warmup --cache-ram 0",
         log_path,
         1, /* lock engine arguments and disable the prompt-revealing /slots */
-        NULL, NULL, err, sizeof(err));
+        NULL, NULL, 0, NULL, err, sizeof(err));
     if (!g_llama) {
         g_tokenizer_only_mode = 0;
         fprintf(stderr,
@@ -9648,7 +9604,7 @@ static int run_llamacpp_cluster_mode(
         g_llama_gpu_only = 1;
         return run_llamacpp_mode(llama_bin, llama_gguf, llama_port, api_bind,
                                  api_token, ctx_size, NULL, NULL, 0, NULL, 0,
-                                 NULL, 0, me, 1);
+                                 NULL, 0, me, 1, msize->mtp_enabled);
     }
 
     /* CLUSTER. Build --rpc / --device / --tensor-split from the plan.
@@ -9949,12 +9905,17 @@ static int run_llamacpp_cluster_mode(
         return 3;
     }
     const int placement_ngl = 99;
+    /* GGUF block_count includes the appended NextN blocks. llama.cpp uses
+     * them in its split denominator even when a diagnostic disables MTP.
+     * Patch 0052 pins complete MTP blocks locally for prompt privacy, so remote
+     * cache assignments are clamped to the target transformer blocks. */
+    const unsigned engine_n_layers = msize->n_layers + msize->mtp_layers;
     unsigned peer_layer_lo[IDLETOKEN_LLPLAN_MAX_NODES] = {0};
     unsigned peer_layer_hi[IDLETOKEN_LLPLAN_MAX_NODES] = {0};
     uint64_t cache_request[IDLETOKEN_LLPLAN_MAX_NODES] = {0};
     for (int i = 0; i < n_peers; i++) {
         if (idletoken_llama_device_layer_range(
-                msize->n_layers, placement_ngl,
+                engine_n_layers, placement_ngl,
                 placement_shares, placement_devices,
                 peer_dev_lo[i], peer_dev_hi[i],
                 &peer_layer_lo[i], &peer_layer_hi[i]) != 0) {
@@ -9964,6 +9925,8 @@ static int run_llamacpp_cluster_mode(
             close(lfd);
             return 1;
         }
+        if (peer_layer_lo[i] > msize->n_layers) peer_layer_lo[i] = msize->n_layers;
+        if (peer_layer_hi[i] > msize->n_layers) peer_layer_hi[i] = msize->n_layers;
     }
 
     /* The coordinator owns the CPU prefix plus the first placement device.
@@ -9972,11 +9935,11 @@ static int run_llamacpp_cluster_mode(
      * interval. Validate the complete partition before downloading a byte: a
      * hole or overlap here would otherwise become either corrupt local
      * weights or a privacy-breaking remote layer 0. */
-    const int cpu_prefix = (int)msize->n_layers + 1 - placement_ngl > 0
-                               ? (int)msize->n_layers + 1 - placement_ngl : 0;
+    const int cpu_prefix = (int)engine_n_layers + 1 - placement_ngl > 0
+                               ? (int)engine_n_layers + 1 - placement_ngl : 0;
     unsigned local_dev_lo = 0, local_dev_hi = 0;
     if (idletoken_llama_device_layer_range(
-            msize->n_layers, placement_ngl,
+            engine_n_layers, placement_ngl,
             placement_shares, placement_devices, 0, 1,
             &local_dev_lo, &local_dev_hi) != 0) {
         fprintf(stderr, "idletoken-coord: cannot derive the coordinator's "
@@ -9985,8 +9948,12 @@ static int run_llamacpp_cluster_mode(
         close(lfd);
         return 1;
     }
+    if (local_dev_lo > msize->n_layers) local_dev_lo = msize->n_layers;
+    if (local_dev_hi > msize->n_layers) local_dev_hi = msize->n_layers;
     if (lplan.cluster_moe_hybrid &&
-        (local_dev_lo != lplan.layer_lo[0] || local_dev_hi != lplan.layer_hi[0])) {
+        (local_dev_lo != lplan.layer_lo[0] ||
+         (local_dev_hi < msize->n_layers ? local_dev_hi : msize->n_layers) !=
+             lplan.layer_hi[0])) {
         fprintf(stderr, "idletoken-coord: Hybrid tensor split moved the "
                         "coordinator from planned layers [%u,%u) to [%u,%u)\n",
                 lplan.layer_lo[0], lplan.layer_hi[0], local_dev_lo, local_dev_hi);
@@ -10011,7 +9978,8 @@ static int run_llamacpp_cluster_mode(
         const int slot = peer_plan_slot[i];
         if (lplan.cluster_moe_hybrid &&
             (peer_layer_lo[i] != lplan.layer_lo[slot] ||
-             peer_layer_hi[i] != lplan.layer_hi[slot])) {
+             (peer_layer_hi[i] < msize->n_layers ? peer_layer_hi[i] : msize->n_layers)
+                 != lplan.layer_hi[slot])) {
             fprintf(stderr, "idletoken-coord: Hybrid tensor split moved %s "
                             "from planned layers [%u,%u) to [%u,%u)\n",
                     peers[i].hostname,
@@ -10159,7 +10127,7 @@ static int run_llamacpp_cluster_mode(
         NULL, cluster_args, 0, peers, n_peers,
         lplan.working_set_fits && cpu_prefix > 0 ? weight_repo : NULL,
         lplan.working_set_fits && cpu_prefix > 0 ? (unsigned)cpu_prefix : 0,
-        nodes, n_nodes);
+        nodes, n_nodes, msize->mtp_enabled);
 }
 
 int main(int argc, char **argv) {
@@ -10264,6 +10232,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--model-id")    && i + 1 < argc) model_id    = argv[++i];
         else if (!strcmp(a, "--model-path")  && i + 1 < argc) model_path  = argv[++i];
         else if (!strcmp(a, "--gguf-dir")    && i + 1 < argc) gguf_dir    = argv[++i];
+        else if (!strcmp(a, "--mtp-draft-path") && i + 1 < argc)
+            snprintf(g_mtp_draft_path, sizeof(g_mtp_draft_path), "%s", argv[++i]);
         else if (!strcmp(a, "--mmproj-path") && i + 1 < argc)
             snprintf(g_mmproj_path, sizeof(g_mmproj_path), "%s", argv[++i]);
         else if (!strcmp(a, "--quant")       && i + 1 < argc) quant       = argv[++i];
@@ -10627,10 +10597,18 @@ int main(int argc, char **argv) {
             if (idletoken_model_size_resolve(g_model, quant, llama_gguf,
                                              &msize, budget_src,
                                              sizeof budget_src) != 0) {
-                fprintf(stderr, "idletoken-coord: internal error: cannot size %s\n",
-                        g_model->id);
+                fprintf(stderr, "idletoken-coord: cannot size %s: %s\n",
+                        g_model->id, budget_src[0] ? budget_src : "invalid model metadata");
                 return 1;
             }
+            if (idletoken_model_size_validate_mtp_draft(g_model, quant, llama_gguf,
+                    g_mtp_draft_path, &msize, budget_src, sizeof budget_src) != 0) {
+                fprintf(stderr, "idletoken-coord: refuse: %s\n", budget_src);
+                return 2;
+            }
+            if (msize.mtp_external_weight_bytes)
+                fprintf(stderr, "coord: verified standalone MTP: %.2f MiB local weights (%s)\n",
+                    (double)msize.mtp_external_weight_bytes / 1048576.0, g_mtp_draft_path);
             /* One line, always printed, naming the number every later decision
              * (slot count, SINGLE vs cluster, tensor split, ctx grant) is built
              * on. Without it a log months later cannot answer "what was it
@@ -10965,7 +10943,7 @@ int main(int argc, char **argv) {
             return run_llamacpp_mode(llama_bin, llama_gguf, llama_port,
                                      api_bind, api_token, ctx_size,
                                      NULL, NULL, lplan.n_cpu_moe,
-                                     NULL, 0, NULL, 0, &me, 1);
+                                     NULL, 0, NULL, 0, &me, 1, msize.mtp_enabled);
         }
     }
 

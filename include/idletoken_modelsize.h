@@ -59,6 +59,14 @@ uint64_t idletoken_gguf_bytes_on_disk(const char *path, char *why, size_t why_ca
  * (and touches nothing) when the name is not a split name. */
 int idletoken_gguf_split_parts(const char *basename, unsigned *idx, unsigned *total);
 
+/* Inspect immutable GGUF metadata and all split tensor directories for a
+ * complete MTP head supported by the pinned engine. No weight data is read.
+ * 0/0 layers means this file has no usable head. A malformed declared head or
+ * unreadable shard returns -1, so startup cannot quietly change strategies. */
+int idletoken_gguf_mtp_info(const char *path, uint16_t *layers,
+                            uint64_t *weight_bytes, uint64_t *kv_bytes_per_token,
+                            char *why, size_t why_cap);
+
 /* Fill `out` with the scheduler's view of the model that will actually be
  * loaded. See the header comment for the three sources.
  *
@@ -87,6 +95,17 @@ int idletoken_model_size_resolve(const idletoken_model_spec *spec,
                                  const char *gguf_path,
                                  idletoken_llm_model_size *out,
                                  char *why, size_t why_cap);
+
+/* Resolve a remote split asset name against the actual local first shard,
+ * preserving the client's model-specific filename prefix. */
+int idletoken_mtp_draft_shard_path(const char *first_path, const char *remote_part,
+                                  char *out, size_t cap);
+
+/* Runtime admission of a declared standalone MTP asset. Missing, modified or
+ * incompatible assets fail closed; the caller must never silently disable it. */
+int idletoken_model_size_validate_mtp_draft(const idletoken_model_spec *spec,
+        const char *quant, const char *target_path, const char *draft_path,
+        const idletoken_llm_model_size *size, char *why, size_t why_cap);
 
 /* Re-point the measured workspace at an explicitly chosen KV cache tier
  * (IDLETOKEN_KV_TIER_*), overriding the one the precision implies.

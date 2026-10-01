@@ -1918,7 +1918,8 @@ int main(int argc, char **argv) {
         char source[512] = "";
         if (idletoken_model_size_resolve(spec, layout_quant, layout_gguf,
                                          &size, source, sizeof source) != 0) {
-            fprintf(stderr, "idletoken-worker: could not inspect model layout\n");
+            fprintf(stderr, "idletoken-worker: could not inspect model layout: %s\n",
+                    source[0] ? source : "invalid model metadata");
             return 1;
         }
         if (!size.expert_bytes_complete) {
@@ -1978,7 +1979,8 @@ int main(int argc, char **argv) {
         char source[512] = "";
         if (idletoken_model_size_resolve(spec, pj_quant, gguf, &size,
                                          source, sizeof source) != 0) {
-            fprintf(stderr, "idletoken-worker: could not size %s\n", pj_model);
+            fprintf(stderr, "idletoken-worker: could not size %s: %s\n", pj_model,
+                    source[0] ? source : "invalid model metadata");
             return 1;
         }
         /* The coordinator picks the KV dtype from the weight precision before
@@ -2068,7 +2070,8 @@ int main(int argc, char **argv) {
                        i ? "," : "", plan.order[i],
                        nodes[plan.order[i]].label,
                        (unsigned long long)plan.gpu_need_bytes_per_node[i],
-                       (unsigned long long)plan.cpu_moe_bytes_per_node[i],
+                       (unsigned long long)(plan.cpu_moe_bytes_per_node[i] +
+                           (i == 0 ? plan.mtp_host_ram_bytes : 0)),
                        (unsigned long long)nodes[plan.order[i]].vram_usable);
         } else if (plan.kind == IDLETOKEN_LLPLAN_SINGLE) {
             printf("{\"index\":%d,\"label\":\"%s\",\"gpu\":%llu,\"ram\":%llu,"

@@ -104,7 +104,10 @@
       "sha256": "3a67140a6be1e51716ef28d32f52e3190295557c3ed04c8444a3a38eb82b756c",
       "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
       "expert_weight_bytes": 32312918016,
-      "expert_max_tensor_bytes": 257949696
+      "expert_max_tensor_bytes": 257949696,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "IQ2_M",
@@ -115,7 +118,10 @@
       "sha256": "5466fa1ac7d2dc7c213db5f3030190af5a7107ca85e9ab28b39fe7cd9c97446e",
       "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
       "expert_weight_bytes": 34728837120,
-      "expert_max_tensor_bytes": 308281344
+      "expert_max_tensor_bytes": 308281344,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q2_K_XL",
@@ -126,7 +132,10 @@
       "sha256": "be44a62acb10d79f501d75ef3faee0219b50b305352f3db4bad13f76591121bd",
       "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
       "expert_weight_bytes": 37415288832,
-      "expert_max_tensor_bytes": 427819008
+      "expert_max_tensor_bytes": 427819008,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "IQ3_XXS",
@@ -137,7 +146,10 @@
       "sha256": "a40f83c53128a739814132f30a442b029d02ff3224e32d0f52946427d48efe3c",
       "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
       "expert_weight_bytes": 39560675328,
-      "expert_max_tensor_bytes": 308281344
+      "expert_max_tensor_bytes": 308281344,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "IQ3_S",
@@ -148,7 +160,10 @@
       "sha256": "5e810f890244ce3e3699f1e9a3611fa6567a8f50123523a9fcf9bf4175d89947",
       "revision": "51eab4d59d53f573fb9206cb3ce613f1d0aa392b",
       "expert_weight_bytes": 41372614656,
-      "expert_max_tensor_bytes": 346030080
+      "expert_max_tensor_bytes": 346030080,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q3_K_S",
@@ -171,7 +186,10 @@
         }
       ],
       "expert_weight_bytes": 46204452864,
-      "expert_max_tensor_bytes": 346030080
+      "expert_max_tensor_bytes": 346030080,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q3_K_M",
@@ -194,7 +212,10 @@
         }
       ],
       "expert_weight_bytes": 50130321408,
-      "expert_max_tensor_bytes": 427819008
+      "expert_max_tensor_bytes": 427819008,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q3_K_XL",
@@ -217,7 +238,10 @@
         }
       ],
       "expert_weight_bytes": 50495225856,
-      "expert_max_tensor_bytes": 553648128
+      "expert_max_tensor_bytes": 553648128,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "IQ4_XS",
@@ -240,7 +264,10 @@
         }
       ],
       "expert_weight_bytes": 53754200064,
-      "expert_max_tensor_bytes": 427819008
+      "expert_max_tensor_bytes": 427819008,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "IQ4_NL",
@@ -263,7 +290,10 @@
         }
       ],
       "expert_weight_bytes": 54962159616,
-      "expert_max_tensor_bytes": 452984832
+      "expert_max_tensor_bytes": 452984832,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q4_K_S",
@@ -286,7 +316,10 @@
         }
       ],
       "expert_weight_bytes": 65229815808,
-      "expert_max_tensor_bytes": 452984832
+      "expert_max_tensor_bytes": 452984832,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "MXFP4_MOE",
@@ -309,7 +342,10 @@
         }
       ],
       "expert_weight_bytes": 68004347904,
-      "expert_max_tensor_bytes": 660602880
+      "expert_max_tensor_bytes": 660602880,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q4_K_M",
@@ -332,7 +368,10 @@
         }
       ],
       "expert_weight_bytes": 70061654016,
-      "expert_max_tensor_bytes": 553648128
+      "expert_max_tensor_bytes": 553648128,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q4_K_XL",
@@ -355,7 +394,10 @@
         }
       ],
       "expert_weight_bytes": 70369935360,
-      "expert_max_tensor_bytes": 660602880
+      "expert_max_tensor_bytes": 660602880,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q5_K_S",
@@ -378,7 +420,10 @@
         }
       ],
       "expert_weight_bytes": 79725330432,
-      "expert_max_tensor_bytes": 553648128
+      "expert_max_tensor_bytes": 553648128,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q5_K_M",
@@ -401,7 +446,10 @@
         }
       ],
       "expert_weight_bytes": 84859158528,
-      "expert_max_tensor_bytes": 660602880
+      "expert_max_tensor_bytes": 660602880,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q5_K_XL",
@@ -424,7 +472,10 @@
         }
       ],
       "expert_weight_bytes": 85268103168,
-      "expert_max_tensor_bytes": 855638016
+      "expert_max_tensor_bytes": 855638016,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q6_K",
@@ -452,7 +503,10 @@
         }
       ],
       "expert_weight_bytes": 95126814720,
-      "expert_max_tensor_bytes": 660602880
+      "expert_max_tensor_bytes": 660602880,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q6_K_XL",
@@ -480,7 +534,10 @@
         }
       ],
       "expert_weight_bytes": 104878571520,
-      "expert_max_tensor_bytes": 855638016
+      "expert_max_tensor_bytes": 855638016,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q8_0",
@@ -508,7 +565,10 @@
         }
       ],
       "expert_weight_bytes": 123211874304,
-      "expert_max_tensor_bytes": 855638016
+      "expert_max_tensor_bytes": 855638016,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "Q8_K_XL",
@@ -541,7 +601,10 @@
         }
       ],
       "expert_weight_bytes": 159450660864,
-      "expert_max_tensor_bytes": 1610612736
+      "expert_max_tensor_bytes": 1610612736,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     },
     {
       "quant": "BF16",
@@ -574,7 +637,10 @@
         }
       ],
       "expert_weight_bytes": 231928233984,
-      "expert_max_tensor_bytes": 1610612736
+      "expert_max_tensor_bytes": 1610612736,
+      "mtp_layers": 0,
+      "mtp_weight_bytes": 0,
+      "mtp_draft_compatible": true
     }
   ],
   "default_quant": "IQ2_XXS",
@@ -680,5 +746,76 @@
       "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
       "quant": "BF16"
     }
-  ]
+  ],
+  "mtp_compute_bytes_128k_cuda": [
+    213928064,
+    213928064,
+    213928064
+  ],
+  "mtp_host_compute_bytes_128k_cuda": [
+    140527648,
+    140527648,
+    140527648
+  ],
+  "mtp_compute_bytes_256k_cuda": [
+    348145792,
+    348145792,
+    348145792
+  ],
+  "mtp_host_compute_bytes_256k_cuda": [
+    274745376,
+    274745376,
+    274745376
+  ],
+  "mtp_compute_bytes_1m_cuda": [
+    1153452160,
+    1153452160,
+    1153452160
+  ],
+  "mtp_host_compute_bytes_1m_cuda": [
+    1080051744,
+    1080051744,
+    1080051744
+  ],
+  "mtp_compute_bytes_128k_metal": [
+    253195296,
+    250300448,
+    250300448
+  ],
+  "mtp_host_compute_bytes_128k_metal": [
+    281055296,
+    281055296,
+    281055296
+  ],
+  "mtp_compute_bytes_256k_metal": [
+    387544096,
+    384649248,
+    384649248
+  ],
+  "mtp_host_compute_bytes_256k_metal": [
+    549490752,
+    549490752,
+    549490752
+  ],
+  "mtp_compute_bytes_1m_metal": [
+    1193636896,
+    1190742048,
+    1190742048
+  ],
+  "mtp_host_compute_bytes_1m_metal": [
+    2160103488,
+    2160103488,
+    2160103488
+  ],
+  "mtp_draft": {
+    "repo": "a4lg/Qwen3.5-122B-A10B-MTP-ONLY-GGUF",
+    "revision": "d42166351be2485fa54a5b9951f200d4d13fe42c",
+    "gguf": "Qwen3.5-122B-A10B-MTP-ONLY-Q4_K_M.gguf",
+    "sha256": "8ae28ef2c226cb9bdd10e7ee13625aa0627c6f1e014bc0024b12afa36d0a82bb",
+    "bytes": 3208468224,
+    "layers": 1,
+    "weight_bytes": 3197523968,
+    "kv_bytes_per_token": 2048
+  },
+  "mtp_kv_bytes_per_token": 2048
 }

@@ -100,6 +100,137 @@ uint64_t idletoken_gguf_bytes_on_disk(const char *path, char *why, size_t why_ca
 #undef BAIL
 }
 
+static int mtp_arch_supported(const char *arch) {
+    /* Actual DECODER_MTP graph implementations in the pinned engine. Keeping
+     * unused NextN tensors (glm4/glm4moe) is not inference support. */
+    static const char *const arches[] = {
+        "deepseek2", "deepseek32", "deepseek4", "glm-dsa", "qwen35",
+        "qwen35moe", "qwen3next", "hy-v3", "mimo2", "nemotron-h-moe",
+        "step35", "bailingmoe3", "cohere2moe"
+    };
+    for (size_t i = 0; i < sizeof arches / sizeof arches[0]; i++)
+        if (!strcmp(arch, arches[i])) return 1;
+    return 0;
+}
+
+int idletoken_gguf_mtp_info(const char *path, uint16_t *layers,
+                            uint64_t *weight_bytes, uint64_t *kv_bytes_per_token,
+                            char *why, size_t why_cap) {
+    idletoken_gguf_meta *m = NULL;
+    uint8_t *seen = NULL;
+    uint64_t weights = 0;
+    if (layers) *layers = 0;
+    if (weight_bytes) *weight_bytes = 0;
+    if (kv_bytes_per_token) *kv_bytes_per_token = 0;
+    if (why && why_cap) why[0] = '\0';
+#define MTP_FAIL(...) do { if (why && why_cap) snprintf(why, why_cap, __VA_ARGS__); \
+    idletoken_gguf_meta_close(m); free(seen); return -1; } while (0)
+    if (!path || !path[0]) MTP_FAIL("no GGUF path for MTP inspection");
+    m = idletoken_gguf_meta_open(path, why, why_cap);
+    if (!m) return -1;
+    char arch[64], key[128];
+    if (idletoken_gguf_meta_str(m, "general.architecture", arch, sizeof arch))
+        MTP_FAIL("GGUF has no architecture for MTP inspection");
+    uint32_t blocks = 0, nextn = 0;
+    snprintf(key, sizeof key, "%s.nextn_predict_layers", arch);
+    (void)idletoken_gguf_meta_u32(m, key, &nextn);
+    if (!nextn || !mtp_arch_supported(arch)) {
+        idletoken_gguf_meta_close(m);
+        return 0;
+    }
+    snprintf(key, sizeof key, "%s.block_count", arch);
+    (void)idletoken_gguf_meta_u32(m, key, &blocks);
+    if (nextn >= blocks || nextn > 65535)
+        MTP_FAIL("invalid MTP block geometry (%u NextN of %u blocks)", nextn, blocks);
+    uint32_t rank = 0, rope = 0, heads = 0, key_len = 0, value_len = 0;
+#define MTP_META(suffix, dst) do { snprintf(key, sizeof key, "%s.%s", arch, suffix); \
+    (void)idletoken_gguf_meta_u32(m, key, &(dst)); } while (0)
+    MTP_META("attention.kv_lora_rank", rank);
+    MTP_META("rope.dimension_count", rope);
+    MTP_META("attention.head_count_kv", heads);
+    MTP_META("attention.key_length", key_len);
+    MTP_META("attention.value_length", value_len);
+    if (!value_len) value_len = key_len;
+    uint64_t kv = (rank ? (uint64_t)rank + rope :
+                         (uint64_t)heads * (key_len + value_len)) * 2ull * nextn;
+    uint32_t split_count = 0;
+    (void)idletoken_gguf_meta_u32(m, "split.count", &split_count);
+    unsigned idx = 1, total = 1;
+    const int split = idletoken_gguf_split_parts(basename_of(path), &idx, &total);
+    if ((split_count > 1 && (!split || total != split_count)) || idx != 1)
+        MTP_FAIL("MTP inspection requires part 1 and all original split filenames");
+    seen = (uint8_t *)calloc(nextn, 1);
+    if (!seen) MTP_FAIL("out of memory inspecting MTP tensors");
+    char part_path[1024];
+    if (strlen(path) >= sizeof part_path) MTP_FAIL("GGUF path too long");
+    for (unsigned part = 1; part <= total; part++) {
+        snprintf(part_path, sizeof part_path, "%s", path);
+        if (part > 1) {
+            char digits[6];
+            snprintf(digits, sizeof digits, "%05u", part);
+            memcpy(part_path + strlen(part_path) - strlen("00001-of-00001.gguf"), digits, 5);
+            m = idletoken_gguf_meta_open(part_path, why, why_cap);
+            if (!m) { free(seen); return -1; }
+        }
+        struct stat st;
+        const uint64_t start = idletoken_gguf_data_offset(m);
+        if (stat(part_path, &st) || st.st_size <= 0 || (uint64_t)st.st_size < start)
+            MTP_FAIL("cannot size MTP GGUF part %s", part_path);
+        const uint64_t n = idletoken_gguf_meta_n_tensors(m);
+        typedef struct { uint64_t offset; uint8_t mtp; } mtp_ent;
+        mtp_ent *entries = (mtp_ent *)calloc(n ? (size_t)n : 1, sizeof(*entries));
+        if (!entries) MTP_FAIL("out of memory inspecting MTP tensor offsets");
+        for (uint64_t t = 0; t < n; t++) {
+            idletoken_gguf_tensor info;
+            if (idletoken_gguf_tensor_info(m, t, &info)) {
+                free(entries); MTP_FAIL("invalid MTP tensor directory");
+            }
+            unsigned block = 0;
+            int used = 0;
+            entries[t].offset = info.offset;
+            if (sscanf(info.name, "blk.%u.%n", &block, &used) == 1 && used &&
+                block >= blocks - nextn && block < blocks) {
+                entries[t].mtp = 1;
+                const char *tail = info.name + used;
+                uint8_t bit = !strcmp(tail, "nextn.eh_proj.weight") ? 1 :
+                              !strcmp(tail, "nextn.enorm.weight") ? 2 :
+                              !strcmp(tail, "nextn.hnorm.weight") ? 4 : 0;
+                seen[block - (blocks - nextn)] |= bit;
+            }
+        }
+        for (uint64_t t = 1; t < n; t++) {
+            mtp_ent entry = entries[t];
+            uint64_t j = t;
+            while (j && entries[j - 1].offset > entry.offset) {
+                entries[j] = entries[j - 1]; j--;
+            }
+            entries[j] = entry;
+        }
+        for (uint64_t t = 0; t < n; t++) {
+            uint64_t end = t + 1 < n ? entries[t + 1].offset : (uint64_t)st.st_size - start;
+            if (end < entries[t].offset) {
+                free(entries); MTP_FAIL("invalid MTP tensor offsets");
+            }
+            if (entries[t].mtp) weights += end - entries[t].offset;
+        }
+        free(entries);
+        idletoken_gguf_meta_close(m); m = NULL;
+    }
+    for (uint32_t i = 0; i < nextn; i++)
+        if (seen[i] != 7) MTP_FAIL("GGUF declares MTP but block %u lacks required NextN tensors", blocks - nextn + i);
+    free(seen);
+    if (!weights || !kv) {
+        if (why && why_cap) snprintf(why, why_cap, "MTP has incomplete weight/cache geometry");
+        return -1;
+    }
+    if (layers) *layers = (uint16_t)nextn;
+    if (weight_bytes) *weight_bytes = weights;
+    if (kv_bytes_per_token) *kv_bytes_per_token = kv;
+    return 0;
+#undef MTP_META
+#undef MTP_FAIL
+}
+
 /* Does this tensor belong to the exact family moved by llama.cpp's
  * `--n-cpu-moe` override? Keep this spelling aligned with the pinned engine's
  * LLM_FFN_EXPS_REGEX in vendor/llama.cpp/common/common.h. Regex-search there
@@ -471,6 +602,18 @@ void idletoken_model_size_set_kv_tier(const idletoken_model_spec *spec,
         { &out->compute_bytes_128k_metal, spec->compute_bytes_128k_metal },
         { &out->compute_bytes_256k_metal, spec->compute_bytes_256k_metal },
         { &out->compute_bytes_1m_metal,   spec->compute_bytes_1m_metal   },
+        { &out->mtp_compute_bytes_128k_cuda,  spec->mtp_compute_bytes_128k_cuda  },
+        { &out->mtp_compute_bytes_256k_cuda,  spec->mtp_compute_bytes_256k_cuda  },
+        { &out->mtp_compute_bytes_1m_cuda,    spec->mtp_compute_bytes_1m_cuda    },
+        { &out->mtp_compute_bytes_128k_metal, spec->mtp_compute_bytes_128k_metal },
+        { &out->mtp_compute_bytes_256k_metal, spec->mtp_compute_bytes_256k_metal },
+        { &out->mtp_compute_bytes_1m_metal,   spec->mtp_compute_bytes_1m_metal   },
+        { &out->mtp_host_compute_bytes_128k_cuda, spec->mtp_host_compute_bytes_128k_cuda },
+        { &out->mtp_host_compute_bytes_256k_cuda, spec->mtp_host_compute_bytes_256k_cuda },
+        { &out->mtp_host_compute_bytes_1m_cuda, spec->mtp_host_compute_bytes_1m_cuda },
+        { &out->mtp_host_compute_bytes_128k_metal, spec->mtp_host_compute_bytes_128k_metal },
+        { &out->mtp_host_compute_bytes_256k_metal, spec->mtp_host_compute_bytes_256k_metal },
+        { &out->mtp_host_compute_bytes_1m_metal, spec->mtp_host_compute_bytes_1m_metal },
     };
     for (size_t i = 0; i < sizeof(f) / sizeof(f[0]); i++) {
         if (tier >= 0 && tier < IDLETOKEN_KV_TIER_COUNT) {
@@ -484,6 +627,169 @@ void idletoken_model_size_set_kv_tier(const idletoken_model_spec *spec,
     }
     out->kv_tier = (uint8_t)(tier >= 0 && tier < IDLETOKEN_KV_TIER_COUNT
                                  ? tier : IDLETOKEN_KV_TIER_COUNT);
+}
+
+static const idletoken_model_spec *mtp_catalog_spec(const idletoken_model_spec *spec) {
+    if (spec->mtp_draft) return spec;
+    const idletoken_model_spec *known = idletoken_model_get(spec->id);
+    return known ? known : spec;
+}
+
+static void apply_external_mtp_size(const idletoken_model_spec *spec,
+                                    const char *quant, const char *path,
+                                    idletoken_llm_model_size *out) {
+    if (out->mtp_enabled) return; /* embedded head takes precedence */
+    const idletoken_model_spec *known = mtp_catalog_spec(spec);
+    const idletoken_model_variant *v = idletoken_model_variant_get(known, quant);
+    if (quant && quant[0] && (!v || strcmp(v->quant, quant))) return;
+    if (path && path[0]) {
+        v = NULL;
+        for (uint8_t i = 0; i < known->n_variants; ++i)
+            if (!strcmp(basename_of(path), basename_of(known->variants[i].gguf))) {
+                v = &known->variants[i]; break;
+            }
+    }
+    const idletoken_model_mtp_draft *d = known->mtp_draft;
+    if (!d || !v || !v->mtp_draft_compatible) return;
+    out->mtp_enabled = 1;
+    out->mtp_external_weight_bytes = d->weight_bytes;
+    out->mtp_kv_bytes_per_token = d->kv_bytes_per_token;
+    if (spec->kv_kind == IDLETOKEN_KV_HYBRID)
+        out->kv_fixed_bytes_per_seq *= 4;
+    idletoken_model_size_set_kv_tier(known, out, out->kv_tier);
+}
+
+int idletoken_mtp_draft_shard_path(const char *first_path, const char *remote_part,
+                          char *out, size_t cap) {
+    unsigned first_idx = 0, first_count = 0, part_idx = 0, part_count = 0;
+    if (!first_path || !remote_part || !out || !cap || strlen(first_path) >= cap ||
+        !idletoken_gguf_split_parts(basename_of(first_path), &first_idx, &first_count) ||
+        !idletoken_gguf_split_parts(basename_of(remote_part), &part_idx, &part_count) ||
+        first_idx != 1 || part_idx <= 1 || part_count != first_count || part_idx > part_count)
+        return -1;
+    snprintf(out, cap, "%s", first_path);
+    char digits[6];
+    snprintf(digits, sizeof digits, "%05u", part_idx);
+    memcpy(out + strlen(out) - strlen("00001-of-00001.gguf"), digits, 5);
+    return 0;
+}
+
+int idletoken_model_size_validate_mtp_draft(const idletoken_model_spec *spec,
+        const char *quant, const char *target_path, const char *draft_path,
+        const idletoken_llm_model_size *size, char *why, size_t why_cap) {
+    (void)quant;
+    idletoken_gguf_meta *target = NULL, *draft = NULL;
+#define DRAFT_FAIL(...) do { if (why && why_cap) snprintf(why, why_cap, __VA_ARGS__); \
+    idletoken_gguf_meta_close(target); idletoken_gguf_meta_close(draft); return -1; } while (0)
+    if (!spec || !size) DRAFT_FAIL("invalid standalone MTP admission");
+    const idletoken_model_spec *known = mtp_catalog_spec(spec);
+    const idletoken_model_mtp_draft *d = known->mtp_draft;
+    if (!size->mtp_external_weight_bytes) {
+        if (draft_path && draft_path[0]) DRAFT_FAIL("standalone MTP asset was not admitted for this target GGUF");
+        return 0;
+    }
+    if (!d || !draft_path || !draft_path[0])
+        DRAFT_FAIL("[MODEL_ASSET_MISSING] required MTP weights are missing; repair this model's download");
+    if (!d->sha256 || strlen(d->sha256) != 64 || !d->layers || !d->weight_bytes ||
+        (d->n_parts && !d->parts))
+        DRAFT_FAIL("standalone MTP manifest has incomplete integrity or geometry data");
+    unsigned first_index = 1, shard_count = 1;
+    const int is_split = idletoken_gguf_split_parts(basename_of(draft_path), &first_index, &shard_count);
+    if (first_index != 1 || shard_count != (unsigned)d->n_parts + 1 || (d->n_parts && !is_split))
+        DRAFT_FAIL("standalone MTP manifest must declare every split shard");
+    for (uint16_t i = 0; i < d->n_parts; ++i) {
+        unsigned index = 0, count = 0;
+        if (!d->parts[i].gguf || !idletoken_gguf_split_parts(basename_of(d->parts[i].gguf), &index, &count) ||
+            index != (unsigned)i + 2 || count != shard_count)
+            DRAFT_FAIL("standalone MTP shard manifest is incomplete or unordered");
+    }
+    uint64_t first_bytes = d->bytes;
+    for (uint16_t i = 0; i < d->n_parts; ++i) {
+        if (d->parts[i].bytes >= first_bytes) DRAFT_FAIL("invalid MTP shard sizes");
+        first_bytes -= d->parts[i].bytes;
+    }
+    for (uint16_t i = 0; i <= d->n_parts; ++i) {
+        char part[1024];
+        const uint64_t bytes = i ? d->parts[i - 1].bytes : first_bytes;
+        const char *sha = i ? d->parts[i - 1].sha256 : d->sha256;
+        if (!sha || strlen(sha) != 64) DRAFT_FAIL("MTP shard has no SHA-256");
+        if (!i) snprintf(part, sizeof part, "%s", draft_path);
+        else if (idletoken_mtp_draft_shard_path(draft_path, d->parts[i - 1].gguf, part, sizeof part))
+            DRAFT_FAIL("invalid standalone MTP shard filename");
+        struct stat st;
+        if (stat(part, &st) || !S_ISREG(st.st_mode) || (uint64_t)st.st_size != bytes)
+            DRAFT_FAIL("[MODEL_ASSET_MISSING] required MTP weights are missing or incomplete: %s", part);
+        uint8_t digest[32]; char hex[65];
+        if (idletoken_gguf_file_sha256(part, digest, 4096, why, why_cap)) return -1;
+        for (unsigned j = 0; j < 32; ++j) snprintf(hex + 2 * j, 3, "%02x", digest[j]);
+        if (strcmp(hex, sha)) DRAFT_FAIL("[MODEL_ASSET_INVALID] MTP weights failed SHA-256 verification: %s", part);
+    }
+    uint16_t layers = 0; uint64_t weights = 0, kv = 0;
+    if (idletoken_gguf_mtp_info(draft_path, &layers, &weights, &kv, why, why_cap)) return -1;
+    if (layers != d->layers || kv != d->kv_bytes_per_token)
+        DRAFT_FAIL("standalone MTP head/cache geometry does not match its manifest");
+    target = idletoken_gguf_meta_open(target_path, why, why_cap);
+    draft = idletoken_gguf_meta_open(draft_path, why, why_cap);
+    if (!target || !draft) DRAFT_FAIL("cannot inspect the target/MTP metadata pair");
+    char ta[64], da[64], key[128];
+    if (idletoken_gguf_meta_str(target, "general.architecture", ta, sizeof ta) ||
+        idletoken_gguf_meta_str(draft, "general.architecture", da, sizeof da) || strcmp(ta, da))
+        DRAFT_FAIL("target and standalone MTP architectures differ");
+    static const char *fields[] = {"embedding_length", "attention.head_count", "attention.head_count_kv",
+        "attention.key_length", "attention.value_length", "expert_count", "expert_used_count"};
+    for (unsigned i = 0; i < sizeof fields / sizeof fields[0]; ++i) {
+        uint32_t a = 0, b = 0;
+        snprintf(key, sizeof key, "%s.%s", ta, fields[i]);
+        const int ar = idletoken_gguf_meta_u32(target, key, &a);
+        const int br = idletoken_gguf_meta_u32(draft, key, &b);
+        if (ar != br || a != b) DRAFT_FAIL("target/MTP geometry differs: %s", fields[i]);
+    }
+    uint32_t a = 0, b = 0;
+    snprintf(key, sizeof key, "%s.block_count", ta);
+    if (idletoken_gguf_meta_u32(target, key, &a) || idletoken_gguf_meta_u32(draft, key, &b) || b != a + layers)
+        DRAFT_FAIL("standalone MTP block indices do not match the target");
+    idletoken_gguf_tensor ti;
+    int has_embd = idletoken_gguf_tensor_find(draft, "token_embd.weight", &ti) == 0;
+    int has_norm = idletoken_gguf_tensor_find(draft, "output_norm.weight", &ti) == 0;
+    for (uint16_t i = 0; i < d->n_parts; ++i) {
+        char part[1024];
+        if (idletoken_mtp_draft_shard_path(draft_path, d->parts[i].gguf, part, sizeof part))
+            DRAFT_FAIL("invalid standalone MTP shard filename");
+        idletoken_gguf_meta *m = idletoken_gguf_meta_open(part, why, why_cap);
+        if (!m) DRAFT_FAIL("cannot inspect standalone MTP shard metadata");
+        has_embd |= idletoken_gguf_tensor_find(m, "token_embd.weight", &ti) == 0;
+        has_norm |= idletoken_gguf_tensor_find(m, "output_norm.weight", &ti) == 0;
+        idletoken_gguf_meta_close(m);
+    }
+    if (!has_embd || !has_norm)
+        DRAFT_FAIL("standalone MTP is missing its required embedding/output tensors");
+    uint64_t na = 0, nb = 0;
+    idletoken_gguf_str_iter ia, ib;
+    if (idletoken_gguf_meta_arr_str_begin(target, "tokenizer.ggml.tokens", &ia, &na) ||
+        idletoken_gguf_meta_arr_str_begin(draft, "tokenizer.ggml.tokens", &ib, &nb) || na != nb)
+        DRAFT_FAIL("target and standalone MTP token vocabularies differ");
+    for (uint64_t i = 0; i < na; ++i) {
+        char at[16384], bt[16384];
+        const int64_t al = idletoken_gguf_meta_arr_str_next(&ia, at, sizeof at);
+        const int64_t bl = idletoken_gguf_meta_arr_str_next(&ib, bt, sizeof bt);
+        if (al < 0 || bl < 0 || al >= (int64_t)sizeof at || bl >= (int64_t)sizeof bt || al != bl || memcmp(at, bt, (size_t)al))
+            DRAFT_FAIL("target and standalone MTP token IDs differ");
+    }
+    idletoken_gguf_meta_close(target); idletoken_gguf_meta_close(draft);
+    return 0;
+#undef DRAFT_FAIL
+}
+
+static void apply_mtp_size(const idletoken_model_spec *spec,
+                           idletoken_llm_model_size *out, uint16_t layers,
+                           uint64_t weights, uint64_t kv) {
+    out->mtp_enabled = layers > 0;
+    out->mtp_layers = layers;
+    out->mtp_weight_bytes = weights;
+    out->mtp_kv_bytes_per_token = kv;
+    if (layers && spec->kv_kind == IDLETOKEN_KV_HYBRID)
+        out->kv_fixed_bytes_per_seq *= 4; /* target rollback: 1 + --draft-max 3 */
+    idletoken_model_size_set_kv_tier(spec, out, out->kv_tier);
 }
 
 int idletoken_model_size_resolve(const idletoken_model_spec *spec,
@@ -626,6 +932,20 @@ int idletoken_model_size_resolve(const idletoken_model_spec *spec,
                         " — WARNING: exact MoE expert placement is unavailable (%s); "
                         "GPU-only remains usable but Hybrid will refuse", xerr);
             }
+            uint16_t mtp_layers = 0;
+            uint64_t mtp_weights = 0, mtp_kv = 0;
+            char merr[256] = "";
+            if (idletoken_gguf_mtp_info(gguf_path, &mtp_layers, &mtp_weights,
+                                       &mtp_kv, merr, sizeof merr) != 0) {
+                if (why && why_cap) snprintf(why, why_cap,
+                    "cannot verify GGUF MTP capability: %s", merr);
+                return -1;
+            }
+            apply_mtp_size(spec, out, mtp_layers, mtp_weights, mtp_kv);
+            apply_external_mtp_size(spec, quant, gguf_path, out);
+            if (mtp_layers) app(why, why_cap,
+                "; MTP enabled (%u head, %.2f MiB draft weights)",
+                (unsigned)mtp_layers, (double)mtp_weights / 1048576.0);
             return 0;
         }
         /* Falling back is allowed; falling back quietly is not. The engine is
@@ -643,6 +963,9 @@ int idletoken_model_size_resolve(const idletoken_model_spec *spec,
         estimate_expert_layout(spec, layer_b, shared_b,
                                v ? v->expert_weight_bytes : 0,
                                v ? v->expert_max_tensor_bytes : 0, out);
+    apply_mtp_size(spec, out, v ? v->mtp_layers : 0,
+                   v ? v->mtp_weight_bytes : 0, spec->mtp_kv_bytes_per_token);
+    apply_external_mtp_size(spec, quant, NULL, out);
     const char *resolved = v ? v->quant : "";
     const int quant_honoured = has_quant && v && strcmp(v->quant, quant) == 0;
 

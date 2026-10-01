@@ -65,10 +65,11 @@ export interface SelfInfo {
   // worker imports only its assigned tensors from that file.
   modelPath?: string;
   // This machine's local mmproj (vision tower), as resolved and hash-verified
-  // alongside the weights. Empty = text-only model, or a vision model whose
-  // tower the user has not downloaded — the coordinator then starts text-only
-  // and says so, rather than serving a multimodal model blind.
+  // alongside the weights. A model with a tower must prepare it before joining
+  // or creating; an empty path is only valid for a text-only model.
   mmprojPath?: string;
+  /** Verified external NextN draft for this exact model and precision. */
+  mtpDraftPath?: string;
   // Settings-derived engine tuning (API bind/token, inter-stage port,
   // discovery port). Omitted = the Rust side's defaults (the historical
   // hard-coded ports). See settings.engineTuning().
@@ -215,7 +216,8 @@ export interface PairingProvider {
   start(allowSolo?: boolean, modelPath?: string, overflow?: OverflowTuning): Promise<void>;
   // Publish a newly downloaded and verified local copy to the roster. The
   // path stays on this machine; peers receive only modelReady.
-  updateModel(modelId: string, quant: string, modelPath: string): Promise<void>;
+  updateModel(modelId: string, quant: string, modelPath: string,
+    paths?: Pick<SelfInfo, "mmprojPath" | "mtpDraftPath">): Promise<void>;
   leave(): Promise<void>;
   setCoordinator(peerId: string): Promise<void>;
   subscribe(cb: (s: PairingSnapshot) => void): () => void;
@@ -373,7 +375,8 @@ class DevSimPairing implements PairingProvider {
     this.orchestrate();
   }
 
-  async updateModel(_modelId: string, _quant: string, _modelPath: string): Promise<void> {}
+  async updateModel(_modelId: string, _quant: string, _modelPath: string,
+    _paths?: Pick<SelfInfo, "mmprojPath" | "mtpDraftPath">): Promise<void> {}
 
   async leave(): Promise<void> {
     this.clearTimers();
@@ -508,6 +511,7 @@ class EnginePairing implements PairingProvider {
       gpu: self.gpu,
       modelPath: self.modelPath ?? "",
       mmprojPath: self.mmprojPath ?? "",
+      mtpDraftPath: self.mtpDraftPath ?? "",
       tuning: self.tuning ?? null,
     });
   }
@@ -519,6 +523,7 @@ class EnginePairing implements PairingProvider {
       gpu: self.gpu,
       modelPath: self.modelPath ?? "",
       mmprojPath: self.mmprojPath ?? "",
+      mtpDraftPath: self.mtpDraftPath ?? "",
       tuning: self.tuning ?? null,
     });
   }
@@ -530,6 +535,7 @@ class EnginePairing implements PairingProvider {
       gpu: self.gpu,
       modelPath: self.modelPath ?? "",
       mmprojPath: self.mmprojPath ?? "",
+      mtpDraftPath: self.mtpDraftPath ?? "",
       tuning: self.tuning ?? null,
       account: true,
     });
@@ -542,6 +548,7 @@ class EnginePairing implements PairingProvider {
       gpu: self.gpu,
       modelPath: self.modelPath ?? "",
       mmprojPath: self.mmprojPath ?? "",
+      mtpDraftPath: self.mtpDraftPath ?? "",
       tuning: self.tuning ?? null,
       account: true,
     });
@@ -555,8 +562,10 @@ class EnginePairing implements PairingProvider {
     });
   }
 
-  async updateModel(modelId: string, quant: string, modelPath: string): Promise<void> {
-    await this.call("pairing_update_model", { modelId, quant, modelPath });
+  async updateModel(modelId: string, quant: string, modelPath: string,
+    paths?: Pick<SelfInfo, "mmprojPath" | "mtpDraftPath">): Promise<void> {
+    await this.call("pairing_update_model", { modelId, quant, modelPath,
+      mmprojPath: paths?.mmprojPath ?? null, mtpDraftPath: paths?.mtpDraftPath ?? null });
   }
 
   async leave(): Promise<void> {
